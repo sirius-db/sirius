@@ -12,14 +12,14 @@
 //! thrift servers, never framed).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -72,8 +72,8 @@ pub struct HeartbeatStateSnapshot {
     pub registered_host: Option<String>,
     /// FE leader's thrift address (`TMasterInfo.network_address`).
     pub frontend_address: Option<types::TNetworkAddress>,
-    /// Wall-clock timestamp of the latest accepted heartbeat.
-    pub last_heartbeat_ms: Option<u128>,
+    /// Monotonic arrival time of the latest accepted heartbeat.
+    pub last_heartbeat_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +84,7 @@ struct HeartbeatState {
     backend_id: Option<i64>,
     registered_host: Option<String>,
     frontend_address: Option<types::TNetworkAddress>,
-    last_heartbeat_ms: Option<u128>,
+    last_heartbeat_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,18 +106,14 @@ impl SharedHeartbeatState {
             backend_id: state.backend_id,
             registered_host: state.registered_host.clone(),
             frontend_address: state.frontend_address.clone(),
-            last_heartbeat_ms: state.last_heartbeat_ms,
+            last_heartbeat_at: state.last_heartbeat_at,
         }
     }
 
     /// Returns how long ago the last accepted heartbeat arrived, if any.
     pub fn last_heartbeat_elapsed(&self) -> Option<Duration> {
         let state = self.0.lock().expect("heartbeat state mutex poisoned");
-        let last_heartbeat_ms = state.last_heartbeat_ms?;
-        let elapsed_ms = unix_time_millis().saturating_sub(last_heartbeat_ms);
-        Some(Duration::from_millis(
-            elapsed_ms.min(u64::MAX as u128) as u64
-        ))
+        state.last_heartbeat_at.map(|at| at.elapsed())
     }
 }
 
@@ -208,7 +204,7 @@ impl BackendHeartbeatHandler {
             state.backend_id = Some(backend_id);
         }
         state.frontend_address = Some(master_info.network_address.clone());
-        state.last_heartbeat_ms = Some(unix_time_millis());
+        state.last_heartbeat_at = Some(Instant::now());
 
         Ok(())
     }
@@ -592,7 +588,8 @@ impl ThriftServerShutdown {
     fn new(wake_addr: SocketAddr) -> Self {
         Self(Arc::new(ThriftServerShutdownState {
             requested: AtomicBool::new(false),
-            active_connection: Arc::new(Mutex::new(None)),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
+            next_connection_id: AtomicUsize::new(0),
             wake_addr,
         }))
     }
@@ -603,7 +600,7 @@ impl ThriftServerShutdown {
             return;
         }
 
-        self.close_active_connection();
+        self.close_active_connections();
         let _ = TcpStream::connect(self.0.wake_addr);
     }
 
@@ -618,34 +615,36 @@ impl ThriftServerShutdown {
             .try_clone()
             .context("failed to clone thrift client connection")?;
 
-        let mut active_connection = self
+        let mut active_connections = self
             .0
-            .active_connection
+            .active_connections
             .lock()
             .map_err(|_| anyhow!("active thrift connection mutex poisoned"))?;
-        *active_connection = Some(shutdown_stream);
+        let connection_id = self.0.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        active_connections.insert(connection_id, shutdown_stream);
 
         // Close the race with shutdown(): if shutdown was requested between the accept loop's
-        // is_requested() check and this store, close_active_connection() may already have run
+        // is_requested() check and this store, close_active_connections() may already have run
         // on an empty slot and will not run again. Re-checking under the same lock guarantees
         // this connection is interrupted rather than blocking the processor forever.
         if self.0.requested.load(Ordering::SeqCst)
-            && let Some(connection) = active_connection.as_ref()
+            && let Some(connection) = active_connections.get(&connection_id)
         {
             let _ = connection.shutdown(Shutdown::Both);
         }
 
         Ok(ActiveConnectionGuard {
-            active_connection: self.0.active_connection.clone(),
+            active_connections: self.0.active_connections.clone(),
+            connection_id,
         })
     }
 
     /// Closes the active client connection if the processor is blocked waiting for input.
-    fn close_active_connection(&self) {
-        if let Ok(active_connection) = self.0.active_connection.lock()
-            && let Some(connection) = active_connection.as_ref()
-        {
-            let _ = connection.shutdown(Shutdown::Both);
+    fn close_active_connections(&self) {
+        if let Ok(active_connections) = self.0.active_connections.lock() {
+            for connection in active_connections.values() {
+                let _ = connection.shutdown(Shutdown::Both);
+            }
         }
     }
 }
@@ -653,22 +652,23 @@ impl ThriftServerShutdown {
 struct ThriftServerShutdownState {
     // Atomic flag lets the listener thread observe shutdown without locking.
     requested: AtomicBool,
-    // The current thrift connection is closed to unblock processor reads on shutdown.
-    active_connection: Arc<Mutex<Option<TcpStream>>>,
+    // All thrift connections are closed to unblock processor reads on shutdown.
+    active_connections: Arc<Mutex<HashMap<usize, TcpStream>>>,
+    next_connection_id: AtomicUsize,
     // A loopback connection to this address wakes `TcpListener::incoming`.
     wake_addr: SocketAddr,
 }
 
 struct ActiveConnectionGuard {
-    // Dropping this guard clears the shutdown state's current active connection.
-    active_connection: Arc<Mutex<Option<TcpStream>>>,
+    // Dropping this guard removes its connection from the shutdown registry.
+    active_connections: Arc<Mutex<HashMap<usize, TcpStream>>>,
+    connection_id: usize,
 }
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
-        if let Ok(mut active_connection) = self.active_connection.lock() {
-            // The processor finished or disconnected, so future shutdowns should not close it.
-            *active_connection = None;
+        if let Ok(mut active_connections) = self.active_connections.lock() {
+            active_connections.remove(&self.connection_id);
         }
     }
 }
@@ -688,7 +688,7 @@ pub fn start_heartbeat_server(
     let server_shutdown = shutdown.clone();
 
     info!(address = %local_addr, "starting heartbeat Thrift server");
-    // The generated processor owns the handler and is shared across sequential connections.
+    // The generated processor owns the handler and is shared across connections.
     let processor = Arc::new(HeartbeatServiceSyncProcessor::new(
         BackendHeartbeatHandler::new(config, state),
     ));
@@ -731,9 +731,7 @@ pub fn start_backend_server(config: &BackendConfig) -> Result<BackendServer> {
 
 /// Runs one generated thrift processor behind a blocking TCP listener.
 ///
-/// Connections are served one at a time. The FE keeps one pooled connection per service and
-/// issues calls sequentially on it, so this is enough for heartbeats and probes; a second
-/// connection waits until the first disconnects.
+/// Each accepted connection gets a worker because the FE pools idle thrift connections.
 fn run_thrift_server<P>(
     name: &'static str,
     listener: TcpListener,
@@ -743,6 +741,7 @@ fn run_thrift_server<P>(
 where
     P: TProcessor + Send + Sync + 'static,
 {
+    let mut workers = Vec::new();
     for stream in listener.incoming() {
         if shutdown.is_requested() {
             break;
@@ -753,6 +752,7 @@ where
                 if shutdown.is_requested() {
                     break;
                 }
+                workers.retain(|worker: &JoinHandle<()>| !worker.is_finished());
                 // A transient per-connection error (e.g. fd exhaustion on try_clone/split, or a
                 // poisoned mutex) must not tear down the whole server — log and keep accepting.
                 let active_connection = match shutdown.track_connection(&stream) {
@@ -762,11 +762,14 @@ where
                         continue;
                     }
                 };
-                if let Err(err) =
-                    handle_thrift_connection(name, processor.clone(), stream, active_connection)
-                {
-                    warn!(service = name, error = %err, "failed to handle thrift connection; continuing");
-                }
+                let processor = processor.clone();
+                workers.push(thread::spawn(move || {
+                    if let Err(err) =
+                        handle_thrift_connection(name, processor, stream, active_connection)
+                    {
+                        warn!(service = name, error = %err, "failed to handle thrift connection; continuing");
+                    }
+                }));
                 if shutdown.is_requested() {
                     break;
                 }
@@ -776,7 +779,10 @@ where
         }
     }
 
-    shutdown.close_active_connection();
+    shutdown.close_active_connections();
+    for worker in workers {
+        let _ = worker.join();
+    }
     info!(service = name, "Thrift server stopped");
     Ok(())
 }
@@ -1025,7 +1031,7 @@ mod tests {
             snapshot.frontend_address,
             Some(types::TNetworkAddress::new("127.0.0.1".to_string(), 9020))
         );
-        assert!(snapshot.last_heartbeat_ms.is_some());
+        assert!(snapshot.last_heartbeat_at.is_some());
     }
 
     #[test]
@@ -1255,6 +1261,43 @@ mod tests {
         assert_eq!(state.snapshot().backend_id, Some(10001));
 
         drop(client);
+        server.shutdown();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn idle_pooled_connection_does_not_block_another_heartbeat() {
+        use doris_thrift::heartbeat_service::{
+            HeartbeatServiceSyncClient, THeartbeatServiceSyncClient,
+        };
+
+        let mut config = test_config();
+        config.bind_host = Host::local();
+        config.heartbeat_port = 0;
+        let server = match start_heartbeat_server(config, SharedHeartbeatState::new()) {
+            Ok(server) => server,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+        let idle = TcpStream::connect(server.local_addr()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let channel = TTcpChannel::with_stream(stream);
+        let (reader, writer) = channel.split().unwrap();
+        let mut client = HeartbeatServiceSyncClient::new(
+            TBinaryInputProtocol::new(TBufferedReadTransport::new(reader), true),
+            TBinaryOutputProtocol::new(TBufferedWriteTransport::new(writer), true),
+        );
+        assert_eq!(
+            client.heartbeat(master(7)).unwrap().status.status_code,
+            TStatusCode::OK
+        );
+        drop(client);
+        drop(idle);
         server.shutdown();
         server.join().unwrap();
     }

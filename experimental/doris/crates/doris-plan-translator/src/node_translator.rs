@@ -786,7 +786,8 @@ fn translate_hash_join(
             || join
                 .other_join_conjuncts
                 .as_ref()
-                .is_some_and(|conjuncts| !conjuncts.is_empty()))
+                .is_some_and(|conjuncts| !conjuncts.is_empty())
+            || join.vother_join_conjunct.is_some())
     {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
@@ -826,7 +827,9 @@ fn translate_hash_join(
         let left_key = ctx.expr_over(&eq.left, &join_row.row_tuples, &join_row.child_overrides)?;
         let right_key =
             ctx.expr_over(&eq.right, &join_row.row_tuples, &join_row.child_overrides)?;
-        if first_key.is_none() {
+        // The padded side of an outer join is identifiable through a NULL key only
+        // when a real match cannot itself have a NULL in that key.
+        if first_key.is_none() && name == "equal" {
             first_key = Some((left_key.clone(), right_key.clone()));
         }
         conditions.push(ctx.function(URN_COMPARISON, name, vec![left_key, right_key]));
@@ -838,7 +841,10 @@ fn translate_hash_join(
             &join_row.intermediate_overrides,
         )?);
     }
-    if conditions.is_empty()
+    if join
+        .other_join_conjuncts
+        .as_ref()
+        .is_none_or(|conjuncts| conjuncts.is_empty())
         && let Some(expr) = &join.vother_join_conjunct
     {
         conditions.push(ctx.expr_over(
@@ -1289,6 +1295,13 @@ fn apply_conjuncts(
     node: &TPlanNode,
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
+    if node.vconjunct.is_some() {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "legacy vconjunct filters are not supported",
+        });
+    }
     let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let conditions = conjuncts
         .iter()
@@ -1637,9 +1650,11 @@ fn bool_type() -> Type {
 
 /// Whether a node carries filter conjuncts.
 fn has_conjuncts(node: &TPlanNode) -> bool {
-    node.conjuncts
-        .as_ref()
-        .is_some_and(|conjuncts| !conjuncts.is_empty())
+    node.vconjunct.is_some()
+        || node
+            .conjuncts
+            .as_ref()
+            .is_some_and(|conjuncts| !conjuncts.is_empty())
 }
 
 /// Validates the reconstructed child count for a node.
@@ -1842,6 +1857,16 @@ mod tests {
         unnamed.row_tuples = vec![4];
         let err = translate(vec![unnamed], &scan_ranges(0)).unwrap_err();
         assert!(matches!(err, TranslateError::Descriptor(_)), "{err}");
+    }
+
+    #[test]
+    fn legacy_node_filter_is_refused_instead_of_dropped() {
+        let mut node = scan(0);
+        node.vconjunct = Some(slot_ref(0, 1, TPrimitiveType::INT));
+        assert!(matches!(
+            translate(vec![node], &scan_ranges(0)).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { reason, .. } if reason.contains("vconjunct")
+        ));
     }
 
     #[test]
@@ -2057,7 +2082,7 @@ mod tests {
         match translate(vec![update, exchange(0, vec![0])], &ScanRanges::default()).unwrap_err() {
             TranslateError::UnsupportedPlanNode { reason, .. } => {
                 // G-14: a lone phase of a multi-phase aggregate is refused; the stitcher folds
-                // both phases before translation (MVP-A0).
+                // both phases before translation (single-plan execution).
                 assert!(reason.contains("update-phase aggregate"), "{reason}")
             }
             other => panic!("{other:?}"),
@@ -2197,6 +2222,63 @@ mod tests {
 
     #[test]
     fn join_gates() {
+        let mut null_safe_anti = hash_join(TJoinOp::LEFT_ANTI_JOIN);
+        null_safe_anti
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .eq_join_conjuncts[0]
+            .opcode = Some(TExprOpcode::EQ_FOR_NULL);
+        assert!(matches!(
+            translate(join_plan(null_safe_anti), &ScanRanges::default()).unwrap_err(),
+            TranslateError::MalformedPlan(reason) if reason.contains("no equality key")
+        ));
+
+        let mut computed_anti_key = hash_join(TJoinOp::LEFT_ANTI_JOIN);
+        computed_anti_key
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .eq_join_conjuncts[0]
+            .right = TExpr {
+            nodes: vec![TExprNode {
+                node_type: TExprNodeType::INT_LITERAL,
+                type_: scalar_desc(TPrimitiveType::INT),
+                num_children: 0,
+                output_scale: -1,
+                int_literal: Some(TIntLiteral { value: 1 }),
+                ..Default::default()
+            }],
+        };
+        assert!(matches!(
+            translate(join_plan(computed_anti_key), &ScanRanges::default()).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { reason, .. } if reason.contains("plain column")
+        ));
+
+        let mut null_aware_with_legacy_predicate = hash_join(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+        null_aware_with_legacy_predicate
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .vother_join_conjunct = Some(slot_ref(3, 7, TPrimitiveType::INT));
+        assert!(matches!(
+            translate(join_plan(null_aware_with_legacy_predicate), &ScanRanges::default()).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { reason, .. } if reason.contains("null-aware")
+        ));
+
+        let mut join_with_legacy_predicate = hash_join(TJoinOp::INNER_JOIN);
+        join_with_legacy_predicate
+            .hash_join_node
+            .as_mut()
+            .unwrap()
+            .vother_join_conjunct = Some(slot_ref(3, 7, TPrimitiveType::INT));
+        let (_, text) = translate(
+            join_plan(join_with_legacy_predicate),
+            &ScanRanges::default(),
+        )
+        .unwrap();
+        assert!(text.contains("and(equal("), "{text}");
+
         let mut two_keys = hash_join(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
         two_keys
             .hash_join_node

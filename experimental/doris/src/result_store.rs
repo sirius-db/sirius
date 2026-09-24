@@ -11,13 +11,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use doris_proto::PUniqueId;
 use doris_thrift::data::TResultBatch;
 use doris_thrift::types::TUniqueId;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+const MAX_QUEUED_RESULT_BYTES: usize = 64 * 1024 * 1024;
+const RESULT_SLOT_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// A Doris 128-bit unique id (`TUniqueId` on dispatch, `PUniqueId` on `fetch_data`), held as
 /// a [`Uuid`] so the two wire forms compare equal.
@@ -69,29 +74,45 @@ pub(crate) enum FetchOutcome {
 #[derive(Debug, Default)]
 struct SlotState {
     batches: VecDeque<TResultBatch>,
+    queued_bytes: usize,
     /// `Some(Ok(rows))` once the producer finished, `Some(Err)` once it failed.
     closed: Option<Result<i64, String>>,
     packet_seq: i64,
     returned_rows: i64,
+    last_activity: Option<Instant>,
 }
 
 /// Producer/consumer handle for one query's results.
 #[derive(Debug, Default)]
 pub(crate) struct ResultSlot {
     state: Mutex<SlotState>,
+    cancelled: Arc<AtomicBool>,
     /// Wakes parked `fetch_data` polls when a batch arrives or the producer closes.
     notify: Notify,
 }
 
 impl ResultSlot {
     /// Queues one batch of rows for delivery.
-    pub(crate) fn push(&self, batch: TResultBatch) {
+    pub(crate) fn push(&self, batch: TResultBatch) -> Result<(), String> {
         {
             let mut state = self.lock();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err("query was cancelled".to_string());
+            }
+            let bytes = batch.rows.iter().map(Vec::len).sum::<usize>();
+            if state.queued_bytes.saturating_add(bytes) > MAX_QUEUED_RESULT_BYTES {
+                return Err(format!(
+                    "queued result exceeds the {}-byte limit",
+                    MAX_QUEUED_RESULT_BYTES
+                ));
+            }
+            state.queued_bytes += bytes;
             state.returned_rows += batch.rows.len() as i64;
             state.batches.push_back(batch);
+            state.last_activity = Some(Instant::now());
         }
         self.notify.notify_waiters();
+        Ok(())
     }
 
     /// Marks the producer finished; polls drain the remaining batches, then see EOS.
@@ -101,6 +122,7 @@ impl ResultSlot {
             if state.closed.is_none() {
                 state.closed = Some(Ok(state.returned_rows));
             }
+            state.last_activity = Some(Instant::now());
         }
         self.notify.notify_waiters();
     }
@@ -109,7 +131,10 @@ impl ResultSlot {
     pub(crate) fn fail(&self, message: impl Into<String>) {
         {
             let mut state = self.lock();
+            state.batches.clear();
+            state.queued_bytes = 0;
             state.closed = Some(Err(message.into()));
+            state.last_activity = Some(Instant::now());
         }
         self.notify.notify_waiters();
     }
@@ -129,12 +154,15 @@ impl ResultSlot {
                     return FetchOutcome::Failed(message.clone());
                 }
                 if let Some(mut batch) = state.batches.pop_front() {
+                    state.queued_bytes -= batch.rows.iter().map(Vec::len).sum::<usize>();
+                    state.last_activity = Some(Instant::now());
                     let packet_seq = state.packet_seq;
                     state.packet_seq += 1;
                     batch.packet_seq = packet_seq;
                     return FetchOutcome::Data { batch, packet_seq };
                 }
                 if let Some(Ok(returned_rows)) = state.closed {
+                    state.last_activity = Some(Instant::now());
                     let packet_seq = state.packet_seq;
                     state.packet_seq += 1;
                     return FetchOutcome::Eos {
@@ -152,6 +180,25 @@ impl ResultSlot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.fail("query was cancelled");
+    }
+
+    fn is_expired(&self) -> bool {
+        self.lock()
+            .last_activity
+            .is_some_and(|at| at.elapsed() > RESULT_SLOT_TTL)
+    }
 }
 
 /// Process-wide registry of result slots keyed by query id and result instance id.
@@ -161,6 +208,7 @@ impl ResultSlot {
 #[derive(Debug, Default)]
 pub(crate) struct ResultStore {
     inner: Mutex<HashMap<UniqueId, Arc<ResultSlot>>>,
+    cancelled: Mutex<HashMap<UniqueId, Instant>>,
 }
 
 impl ResultStore {
@@ -173,7 +221,21 @@ impl ResultStore {
         instance_ids: impl IntoIterator<Item = UniqueId>,
     ) -> Arc<ResultSlot> {
         let slot = Arc::new(ResultSlot::default());
+        slot.lock().last_activity = Some(Instant::now());
         let mut map = self.lock();
+        let instance_ids: Vec<_> = instance_ids.into_iter().collect();
+        let mut cancelled = self.cancelled.lock().unwrap_or_else(|p| p.into_inner());
+        cancelled.retain(|_, at| at.elapsed() < RESULT_SLOT_TTL);
+        if cancelled.contains_key(&query_id)
+            || instance_ids.iter().any(|id| cancelled.contains_key(id))
+        {
+            slot.cancel();
+            return slot;
+        }
+        if let Some(previous) = map.get(&query_id).cloned() {
+            map.retain(|_, other| !Arc::ptr_eq(other, &previous));
+            previous.cancel();
+        }
         map.insert(query_id, slot.clone());
         for instance_id in instance_ids {
             map.insert(instance_id, slot.clone());
@@ -191,15 +253,31 @@ impl ResultStore {
     pub(crate) fn evict(&self, id: UniqueId) {
         let mut map = self.lock();
         let Some(slot) = map.remove(&id) else {
+            self.cancelled
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id, Instant::now());
             return;
         };
         map.retain(|_, other| !Arc::ptr_eq(other, &slot));
-        let mut state = slot.lock();
-        if state.closed.is_none() {
-            state.closed = Some(Err("query was cancelled".to_string()));
-        }
-        drop(state);
-        slot.notify.notify_waiters();
+        slot.cancel();
+    }
+
+    /// Releases abandoned results and old cancellation tombstones.
+    pub(crate) fn expire(&self) {
+        let mut map = self.lock();
+        map.retain(|_, slot| {
+            if slot.is_expired() {
+                slot.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        self.cancelled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, at| at.elapsed() < RESULT_SLOT_TTL);
     }
 
     /// Number of registered keys.
@@ -236,8 +314,8 @@ mod tests {
         let query = UniqueId::from_halves(1, 2);
         let instance = UniqueId::from_halves(1, 3);
         let slot = store.register(query, [instance]);
-        slot.push(batch(&["a", "b"]));
-        slot.push(batch(&["c"]));
+        slot.push(batch(&["a", "b"])).unwrap();
+        slot.push(batch(&["c"])).unwrap();
         slot.close();
 
         // Either key reaches the same slot.
@@ -287,7 +365,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!poll.is_finished());
 
-        slot.push(batch(&["late"]));
+        slot.push(batch(&["late"])).unwrap();
         match tokio::time::timeout(Duration::from_secs(5), poll)
             .await
             .unwrap()
@@ -355,6 +433,28 @@ mod tests {
                 .unwrap(),
             FetchOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn cancel_before_registration_is_preserved() {
+        let store = ResultStore::default();
+        let query = UniqueId::from_halves(7, 8);
+        store.evict(query);
+        let slot = store.register(query, [UniqueId::from_halves(7, 9)]);
+        assert!(slot.is_cancelled());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn stale_result_is_released() {
+        let store = ResultStore::default();
+        let query = UniqueId::from_halves(7, 8);
+        let slot = store.register(query, []);
+        slot.push(batch(&["unclaimed"])).unwrap();
+        slot.lock().last_activity = Some(Instant::now() - RESULT_SLOT_TTL - Duration::from_secs(1));
+        store.expire();
+        assert!(store.get(query).is_none());
+        assert!(slot.is_cancelled());
     }
 
     #[test]

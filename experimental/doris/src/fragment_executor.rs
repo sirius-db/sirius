@@ -1,10 +1,11 @@
 //! Execution of a translated fragment into Arrow result batches.
 //!
-//! The engine→BE result interchange is the Arrow C Data Interface (see the `SiriusExecutor`
-//! TODO). Today a [`StubExecutor`] stands in for the GPU engine so the Doris dispatch and
-//! result-return plumbing can be exercised end to end without a build tree or a GPU.
+//! The engine→BE result interchange is the Arrow C Data Interface. [`StubExecutor`] is the
+//! engine-less (`--no-default-features`) executor; [`crate::SiriusEngine`] runs GPU plans in
+//! engine-linked builds.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -27,6 +28,11 @@ impl FragmentResult {
     pub fn batches(&self) -> &[RecordBatch] {
         &self.batches
     }
+
+    /// Moves batches out so the result encoder can release each Arrow batch after encoding it.
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.batches
+    }
 }
 
 /// Runs a translated fragment and returns its result batches.
@@ -35,14 +41,18 @@ impl FragmentResult {
 /// milestone: `exec_plan_fragment` runs it to completion before returning, and `fetch_data` then
 /// drains the buffered rows.
 ///
-/// TODO(doris-execute): a real GPU executor should not block dispatch on full materialization.
-/// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
+/// The streaming follow-up is tracked in #137: dispatch should register a running fragment and return after
 /// startup, the executor pushes Arrow batches (e.g. via an Arrow C stream) into a bounded channel
-/// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
-/// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
+/// the `ResultStore` drains. Cancellation currently skips requests queued for the engine; a
+/// request already executing cannot be interrupted. Large/slow result queries should stream
+/// through `fetch_data` instead of risking dispatch-time timeout/OOM.
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Executes `translated` and returns its Arrow result batches.
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+    fn execute(
+        &self,
+        translated: &TranslatedPlan,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<FragmentResult, String>;
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
@@ -50,13 +60,16 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
 pub struct StubExecutor;
 
 impl FragmentExecutor for StubExecutor {
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
-        // TODO(doris-execute): replace with a SiriusExecutor that hands
-        // `translated.to_substrait_bytes()` to the embedded Sirius engine, executes it on the
-        // GPU, and imports the result via the Arrow C Data Interface. That executor will hold an
-        // `Arc<sirius::SiriusContext>` threaded in from `main` (see `SiriusBackendService::with_executor`). For now
-        // we emit one placeholder string row per output column so the FE→client path is exercised.
-        let names = &translated.output_names;
+    fn execute(
+        &self,
+        translated: &TranslatedPlan,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<FragmentResult, String> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("query was cancelled before execution".to_string());
+        }
+        // Emit one placeholder string row per output column for the engine-less protocol path.
+        let names = translated.output_names();
         if names.is_empty() {
             return Ok(FragmentResult {
                 batches: Vec::new(),
@@ -83,16 +96,26 @@ mod tests {
     use super::*;
 
     fn plan_with_outputs(names: &[&str]) -> TranslatedPlan {
-        TranslatedPlan {
-            plan: Default::default(),
-            output_names: names.iter().map(|name| name.to_string()).collect(),
-        }
+        use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
+        TranslatedPlan::new(Plan {
+            relations: vec![PlanRel {
+                rel_type: Some(plan_rel::RelType::Root(RelRoot {
+                    input: None,
+                    names: names.iter().map(|name| name.to_string()).collect(),
+                })),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     #[test]
     fn stub_executor_emits_one_row_matching_output_names() {
         let result = StubExecutor
-            .execute(&plan_with_outputs(&["id", "name"]))
+            .execute(
+                &plan_with_outputs(&["id", "name"]),
+                Arc::new(AtomicBool::new(false)),
+            )
             .unwrap();
         assert_eq!(result.batches.len(), 1);
         let batch = &result.batches[0];
@@ -104,7 +127,9 @@ mod tests {
 
     #[test]
     fn stub_executor_handles_empty_output() {
-        let result = StubExecutor.execute(&plan_with_outputs(&[])).unwrap();
+        let result = StubExecutor
+            .execute(&plan_with_outputs(&[]), Arc::new(AtomicBool::new(false)))
+            .unwrap();
         assert!(result.batches.is_empty());
     }
 }

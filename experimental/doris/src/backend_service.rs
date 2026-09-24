@@ -34,16 +34,14 @@ use crate::params::{self, DispatchedFragment, FragmentBatch};
 use crate::result_encoder::{MysqlResultEncoder, ThriftBinary};
 use crate::result_store::{FetchOutcome, ResultStore, UniqueId};
 
-/// Environment variable that puts the backend in survey mode: every dispatched batch is
-/// accepted (and dumped when [`params::DUMP_FRAGMENTS_ENV`] is set) and translated, but not
-/// executed; the query then fails at `fetch_data` with a message naming the translation
-/// outcome. On by default (the engine-less build has nothing to execute with); set to `0`
-/// to execute.
+/// Environment variable for the startup survey-mode flag. A translate-only dispatch is
+/// dumped and translated, then fails at `fetch_data` with the translation outcome.
 pub const TRANSLATE_ONLY_ENV: &str = "SIRIUS_BE_TRANSLATE_ONLY";
 
 /// Largest gRPC message accepted/emitted; a plan for a wide TPC-H query or a result batch
 /// can exceed tonic's 4 MiB default. The FE side is bounded by `max_msg_size_of_result_receiver`.
 const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024 * 1024 - 1;
+const RESULT_PACKET_BYTES: usize = 8 * 1024 * 1024;
 
 /// Generates `PBackendService` methods that answer gRPC `UNIMPLEMENTED` naming the RPC.
 ///
@@ -88,32 +86,28 @@ pub struct SiriusBackendService {
     executor: Arc<dyn FragmentExecutor>,
     /// Buffers query results for FE `fetch_data` collection, shared across connections.
     results: Arc<ResultStore>,
+    translate_only: bool,
 }
 
 impl SiriusBackendService {
     /// Test-only constructor with the placeholder [`StubExecutor`].
     #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
+        Self::with_options(Arc::new(StubExecutor), true)
     }
 
     /// Builds the service with a caller-provided executor (e.g. the GPU-backed `SiriusEngine`).
     pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
+        Self::with_options(executor, !cfg!(feature = "sirius-engine"))
+    }
+
+    /// Builds the service with an explicit startup mode parsed by the CLI.
+    pub fn with_options(executor: Arc<dyn FragmentExecutor>, translate_only: bool) -> Self {
         Self {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
-        }
-    }
-
-    /// Whether survey (translate-only) mode is on: unset or anything but `0`/`false`/`off`.
-    fn translate_only() -> bool {
-        match std::env::var(TRANSLATE_ONLY_ENV) {
-            Ok(value) => !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            ),
-            Err(_) => true,
+            translate_only,
         }
     }
 
@@ -141,14 +135,17 @@ impl SiriusBackendService {
                 .into_iter()
                 .flat_map(|fragment| fragment.instance_ids().map(UniqueId::from)),
         );
+        if slot.is_cancelled() {
+            return Err(format!("query {query_id} was cancelled before dispatch"));
+        }
 
         let translated = self.translate_batch_logged(&batch);
-        if Self::translate_only() {
+        if self.translate_only {
             let outcome = match &translated {
                 Ok(plan) => format!(
                     "all {} fragments translated into one plan with output {:?}",
                     batch.fragments.len(),
-                    plan.output_names
+                    plan.output_names()
                 ),
                 Err(err) => format!("translation failed: {err}"),
             };
@@ -158,7 +155,7 @@ impl SiriusBackendService {
             return Ok(());
         }
 
-        // MVP-A0 execution: the whole dispatch runs as one plan on this backend, and its
+        // Single-plan execution: the whole dispatch runs as one plan on this backend, and its
         // rows are delivered under the RESULT_SINK fragment's instance (the only one the FE
         // fetches). A translation error is reported through the result slot rather than
         // failing dispatch: the FE has already committed the query to us at this point.
@@ -170,14 +167,18 @@ impl SiriusBackendService {
             return Ok(());
         }
         match translated {
-            Ok(plan) => match self.execute_timed(query_id, &plan) {
-                Ok(result) => match MysqlResultEncoder::encode(result.batches(), 0) {
-                    Ok(batch) => {
-                        slot.push(batch);
-                        slot.close();
+            Ok(plan) => match self.execute_timed(query_id, &plan, &slot) {
+                Ok(result) => {
+                    let encoded = result.into_batches().into_iter().try_for_each(|batch| {
+                        MysqlResultEncoder::encode_bounded(&batch, RESULT_PACKET_BYTES, |packet| {
+                            slot.push(packet)
+                        })
+                    });
+                    match encoded {
+                        Ok(()) => slot.close(),
+                        Err(err) => slot.fail(err),
                     }
-                    Err(err) => slot.fail(err),
-                },
+                }
                 Err(err) => slot.fail(err),
             },
             Err(err) => slot.fail(err),
@@ -191,9 +192,10 @@ impl SiriusBackendService {
         &self,
         query_id: UniqueId,
         plan: &TranslatedPlan,
+        slot: &Arc<crate::result_store::ResultSlot>,
     ) -> Result<FragmentResult, String> {
         let started = Instant::now();
-        let outcome = self.executor.execute(plan);
+        let outcome = self.executor.execute(plan, slot.cancellation());
         let engine_ms = (started.elapsed().as_secs_f64() * 1e4).round() / 10.0;
         match &outcome {
             Ok(result) => {
@@ -205,7 +207,7 @@ impl SiriusBackendService {
         outcome
     }
 
-    /// Stitches the batch into one plan (MVP-A0) and translates it, logging the explain
+    /// Stitches the batch into one plan (single-plan execution) and translates it, logging the explain
     /// text; on failure, also logs how each fragment fares on its own to narrow down the
     /// offending one (two-phase aggregate halves are expected to be rejected there).
     #[instrument(skip_all, fields(query_id = %UniqueId::from(&batch.query_id)))]
@@ -215,7 +217,7 @@ impl SiriusBackendService {
             Ok(translated) => {
                 info!(
                     fragments = batch.fragments.len(),
-                    output_names = ?translated.output_names,
+                    output_names = ?translated.output_names(),
                     plan = %translated.explain(),
                     "translated Doris dispatch into one plan"
                 );
@@ -240,7 +242,7 @@ impl SiriusBackendService {
         match self.translator.translate_fragment(&fragment.params) {
             Ok(translated) => {
                 info!(
-                    output_names = ?translated.output_names,
+                    output_names = ?translated.output_names(),
                     plan = %translated.explain(),
                     "fragment translates on its own"
                 );
@@ -538,6 +540,14 @@ pub async fn serve_backend_service(
         .local_addr()
         .expect("bound listener has a local address");
     info!(address = %local_addr, "starting PBackendService gRPC server");
+    let results = service.results.clone();
+    let cleanup = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            results.expire();
+        }
+    });
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let result = tonic::transport::Server::builder()
         .add_service(
@@ -547,6 +557,7 @@ pub async fn serve_backend_service(
         )
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
+    cleanup.abort();
     info!("PBackendService gRPC server stopped");
     result
 }
@@ -714,49 +725,10 @@ mod tests {
         (client, token)
     }
 
-    /// Runs a closure with `TRANSLATE_ONLY_ENV` forced to `value` for its duration.
-    /// Tests that touch the variable are serialized through this lock.
-    fn with_translate_only<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os(TRANSLATE_ONLY_ENV);
-        // SAFETY: tests touching this variable are serialized by LOCK and restore it before
-        // releasing the lock.
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var(TRANSLATE_ONLY_ENV, value),
-                None => std::env::remove_var(TRANSLATE_ONLY_ENV),
-            }
-        }
-        let result = body();
-        unsafe {
-            match previous {
-                Some(previous) => std::env::set_var(TRANSLATE_ONLY_ENV, previous),
-                None => std::env::remove_var(TRANSLATE_ONLY_ENV),
-            }
-        }
-        result
-    }
-
-    #[test]
-    fn translate_only_defaults_on_and_honors_off_values() {
-        with_translate_only(None, || assert!(SiriusBackendService::translate_only()));
-        with_translate_only(
-            Some("1"),
-            || assert!(SiriusBackendService::translate_only()),
-        );
-        with_translate_only(Some("0"), || {
-            assert!(!SiriusBackendService::translate_only())
-        });
-        with_translate_only(Some("false"), || {
-            assert!(!SiriusBackendService::translate_only())
-        });
-    }
-
     #[test]
     fn translate_only_dispatch_accepts_and_fails_at_fetch() {
         let service = SiriusBackendService::new();
-        with_translate_only(Some("1"), || service.dispatch(&result_dispatch())).unwrap();
+        service.dispatch(&result_dispatch()).unwrap();
 
         // Both the query id and the result instance id resolve to the same slot.
         let query = UniqueId::from_halves(1, 2);
@@ -796,7 +768,7 @@ mod tests {
             version: Some(PFragmentRequestVersion::Version3 as i32),
         };
         let service = SiriusBackendService::new();
-        with_translate_only(Some("1"), || service.dispatch(&request)).unwrap();
+        service.dispatch(&request).unwrap();
         let batch = params::decode_fragment_params_list(&request).unwrap();
         let slot = service
             .results
@@ -820,8 +792,8 @@ mod tests {
 
     #[test]
     fn execute_mode_reports_translator_errors_through_the_slot() {
-        let service = SiriusBackendService::new();
-        with_translate_only(Some("0"), || service.dispatch(&result_dispatch())).unwrap();
+        let service = SiriusBackendService::with_options(Arc::new(StubExecutor), false);
+        service.dispatch(&result_dispatch()).unwrap();
         let slot = service.results.get(UniqueId::from_halves(1, 2)).unwrap();
         let outcome = tokio::runtime::Runtime::new()
             .unwrap()
@@ -830,6 +802,45 @@ mod tests {
             matches!(&outcome, FetchOutcome::Failed(message) if message.contains("unsupported scan range at node 0")),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn execute_mode_delivers_stub_rows_under_result_instance_id() {
+        let payload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tpch/q06/batch-00-request.tcompact");
+        let request = PExecPlanFragmentRequest {
+            request: Some(std::fs::read(payload).unwrap()),
+            compact: Some(true),
+            version: Some(PFragmentRequestVersion::Version3 as i32),
+        };
+        let dispatched = params::decode_fragment_params_list(&request).unwrap();
+        let result_instance = dispatched
+            .fragments
+            .iter()
+            .find(|fragment| fragment.is_result_fragment())
+            .unwrap()
+            .instance_ids()
+            .next()
+            .map(UniqueId::from)
+            .unwrap();
+        let service = SiriusBackendService::with_options(Arc::new(StubExecutor), false);
+        service.dispatch(&request).unwrap();
+        let slot = service.results.get(result_instance).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        match runtime.block_on(slot.fetch()) {
+            FetchOutcome::Data { batch, packet_seq } => {
+                assert_eq!(packet_seq, 0);
+                assert_eq!(batch.rows, vec![vec![4, b's', b't', b'u', b'b']]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            runtime.block_on(slot.fetch()),
+            FetchOutcome::Eos {
+                packet_seq: 1,
+                returned_rows: 1
+            }
+        ));
     }
 
     #[test]
@@ -849,7 +860,8 @@ mod tests {
     async fn fetch_data_streams_batches_then_eos_over_grpc() {
         let service = SiriusBackendService::new();
         let slot = service.results.register(UniqueId::from_halves(5, 6), []);
-        slot.push(TResultBatch::new(vec![vec![0x01, b'x']], false, 0, None));
+        slot.push(TResultBatch::new(vec![vec![0x01, b'x']], false, 0, None))
+            .unwrap();
         slot.close();
         let (mut client, token) = start_server(service).await;
 

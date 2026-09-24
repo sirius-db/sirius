@@ -34,7 +34,7 @@ client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "
 # thrift IDL (both under the `doris/` submodule).
 libprotobuf = ">=7.35,<8"
 rust = "*"
-thrift-compiler = "*"
+thrift-compiler = "0.22.*"
 
 [feature.be.tasks]
 # Build libsirius from source via the repo-root build (creates build/release, which
@@ -43,9 +43,9 @@ engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",de
 
 # Engine-linked BE (default `sirius-engine` feature); needs the engine artifact and
 # the `engine` feature's toolchain/libs (in the default env).
-be-build = {cmd = "cargo build --release -p sirius-doris-be",depends-on = ["engine-build"],description = "Build the engine-linked Doris BE release binary"}
-be-test = {cmd = "cargo test -p sirius-doris-be",depends-on = ["engine-build"],description = "Run engine-linked Doris BE tests"}
-be-run = {cmd = "cargo run --release -p sirius-doris-be --",depends-on = ["engine-build"],description = "Run the engine-linked Doris BE with local FE defaults"}
+be-build = {cmd = "bash scripts/engine-cargo.sh build --release -p sirius-doris-be",depends-on = ["engine-build"],description = "Build the engine-linked Doris BE release binary"}
+be-test = {cmd = "bash scripts/engine-cargo.sh test -p sirius-doris-be",depends-on = ["engine-build"],description = "Run engine-linked Doris BE tests"}
+be-run = {cmd = "bash scripts/engine-cargo.sh run --release -p sirius-doris-be --bin sirius-doris-be --",depends-on = ["engine-build"],description = "Run the engine-linked Doris BE with local FE defaults"}
 
 # Pure-Rust path (no engine, build tree, or GPU). What CI runs, and what a Mac can run.
 be-build-no-engine = {cmd = "cargo build -p sirius-doris-be --no-default-features",description = "Build the Doris BE without the embedded Sirius engine"}

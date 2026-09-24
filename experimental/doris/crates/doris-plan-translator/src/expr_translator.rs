@@ -34,7 +34,7 @@
 //!   result type that DuckDB would infer differently (decimal `avg`, `year` → `SMALLINT`) has
 //!   to be re-imposed with an explicit cast at tuple boundaries; the node translator does that.
 //!
-//! # Gates (`G-nn` numbers per *Semantic gaps* in the crate's `README.md`)
+//! # Gates (`G-nn` numbers per `experimental/doris/docs/semantics-gaps.md`)
 //!
 //! - `LARGE_INT_LITERAL` → rejected (G-01).
 //! - `concat` → rejected (G-02: Doris is NULL-strict, DuckDB's `concat` ignores NULLs).
@@ -419,7 +419,7 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             lit.value
         )));
     }
-    let precision = precision.max(type_mapper::MIN_DECIMAL_PRECISION_EXCLUSIVE + 1);
+    let precision = precision.max(type_mapper::MIN_DECIMAL_PRECISION);
     let value = encode_decimal(&lit.value, scale)?;
     Ok(literal(expression::literal::LiteralType::Decimal(
         expression::literal::Decimal {

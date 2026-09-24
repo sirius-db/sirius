@@ -19,6 +19,9 @@ on:
       - 'experimental/**'
       - '.github/workflows/experimental.yml'
   merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -70,6 +73,7 @@ jobs:
   doris:
     name: doris
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       # CPU runner: no GPU/driver. The workspace platforms are CUDA-pinned (the
       # `engine` feature targets CUDA 13), so assert `__cuda` for the `be` env to
@@ -110,6 +114,46 @@ jobs:
       # Includes tests/corpus.rs, which replays the captured TPC-H dispatch fixtures.
       - name: test
         run: pixi run -e be cargo test --workspace --no-default-features
+
+  doris-cpu-diff:
+    name: doris-cpu-diff
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CONDA_OVERRIDE_CUDA: "13"
+    defaults:
+      run:
+        working-directory: experimental/doris
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+
+      - name: Init translator and DuckDB Substrait sources
+        working-directory: ${{ github.workspace }}
+        run: git submodule update --init --depth=1 experimental/doris/doris substrait
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          cache: true
+          pixi-version: v0.71.1
+          manifest-path: experimental/doris/pixi.toml
+          environments: check
+
+      - name: Generate SF0.1 parquet and expected rows
+        run: |
+          pixi run -e check python scripts/generate-cpu-diff-data.py --out /tmp/doris-tpch-sf01
+          pixi run -e check python scripts/validate_tpch_results.py expected --data /tmp/doris-tpch-sf01 --out /tmp/doris-expected-tpch
+          pixi run -e check python scripts/validate_tpch_results.py expected --data /tmp/doris-tpch-sf01 --sql-dir sql/gaps --queries g13-distinct,g13-distinct-topn,null-not-in,null-left-join,null-not-exists --out /tmp/doris-expected-gaps
+
+      - name: Build DuckDB Substrait consumer
+        run: pixi run -e check duckdb-substrait-build
+
+      - name: Compare all translated queries with DuckDB results
+        run: |
+          bash scripts/cpu-diff.sh --data /tmp/doris-tpch-sf01 --expected /tmp/doris-expected-tpch
+          bash scripts/cpu-diff.sh --data /tmp/doris-tpch-sf01 --corpus tests/fixtures/gaps --sql-dir sql/gaps --expected /tmp/doris-expected-gaps --queries g13-distinct,g13-distinct-topn,null-not-in,null-left-join,null-not-exists --out log/cpu-diff-gaps
 
   experimental:
     name: experimental

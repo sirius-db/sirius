@@ -1,0 +1,81 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    n_nationkey[#11]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  5:VSORT(428)
+  |  order by: n_nationkey[#11] ASC
+  |  algorithm: full sort
+  |  offset: 0
+  |  distribute expr lists:
+  |
+  4:VEXCHANGE
+     offset: 0
+     distribute expr lists:
+
+PLAN FRAGMENT 1
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:VHASH JOIN(420)
+  |  join op: NULL AWARE LEFT ANTI JOIN(BROADCAST)[]
+  |  equal join conjunct: (n_nationkey[#8] = case when r_regionkey = 1 then cast(null as int) else r_regionkey end[#3])
+  |  cardinality=0
+  |  vec output tuple id: 5
+  |  output tuple id: 5
+  |  vIntermediate tuple ids: 4
+  |  hash output slot ids: 8
+  |  final projections: n_nationkey[#9]
+  |  final project output tuple id: 5
+  |  distribute expr lists:
+  |  distribute expr lists:
+  |
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists:
+  |
+  2:VTVF_SCAN_NODE(395)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.n_nationkey[#4] IN (0, 1, 2)
+     inputSplitNum=1, totalFileSize=2308, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#4]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    UNPARTITIONED
+
+  0:VTVF_SCAN_NODE(404)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.r_regionkey[#0] IN (0, 1)
+     inputSplitNum=1, totalFileSize=1068, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: if((_tvf_local.r_regionkey[#0] = 1), NULL, _tvf_local.r_regionkey[#0])
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

@@ -22,8 +22,11 @@ const REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 // Upper bound on the exponential backoff delay so a large attempt count stays bounded.
 const REGISTRATION_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REGISTRATION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
-// The FE heartbeats every 5 s (`heartbeat_interval_second`); three misses is stale.
-const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(30);
+// The FE heartbeats every 5 s (`heartbeat_interval_second`); six misses is stale.
+const FE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_MISSES_BEFORE_STALE: u32 = 6;
+const HEARTBEAT_STALE_AFTER: Duration =
+    Duration::from_secs(FE_HEARTBEAT_INTERVAL.as_secs() * HEARTBEAT_MISSES_BEFORE_STALE as u64);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -57,6 +60,9 @@ struct EngineConfig {
     /// Path to a Sirius YAML config file. When unset, built-in engine defaults are used.
     #[arg(long)]
     sirius_config: Option<PathBuf>,
+    /// Translate dispatched plans without executing them.
+    #[arg(long, env = "SIRIUS_BE_TRANSLATE_ONLY", default_value_t = !cfg!(feature = "sirius-engine"), action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+    translate_only: bool,
 }
 
 impl Args {
@@ -85,7 +91,8 @@ impl Args {
         let backend_server = start_backend_server(&self.backend)?;
         // PBackendService (gRPC) takes TVF schema requests, fragments, and result polls on
         // brpc_port.
-        let grpc_server = GrpcServer::start(&self.backend, executor.clone()).await?;
+        let grpc_server =
+            GrpcServer::start(&self.backend, executor.clone(), self.engine.translate_only).await?;
         self.registration
             .register_node_with_retries(&self.fe, &self.backend)
             .await?;
@@ -202,7 +209,11 @@ struct GrpcServer {
 impl GrpcServer {
     /// Binds `brpc_port` (fail-fast on a clash) and serves `PBackendService` dispatching
     /// fragments to `executor`.
-    async fn start(backend: &BackendConfig, executor: Arc<dyn FragmentExecutor>) -> Result<Self> {
+    async fn start(
+        backend: &BackendConfig,
+        executor: Arc<dyn FragmentExecutor>,
+        translate_only: bool,
+    ) -> Result<Self> {
         let listen_addr = format!("{}:{}", backend.bind_host, backend.brpc_port);
         let listener = tokio::net::TcpListener::bind(&listen_addr)
             .await
@@ -211,7 +222,7 @@ impl GrpcServer {
             })?;
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
-        let service = SiriusBackendService::with_executor(executor);
+        let service = SiriusBackendService::with_options(executor, translate_only);
         let join = tokio::spawn(async move {
             serve_backend_service(listener, service, server_shutdown.cancelled_owned())
                 .await
@@ -324,4 +335,18 @@ async fn main() -> Result<()> {
         .init();
 
     Args::parse().run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_only_accepts_script_values_and_rejects_typos() {
+        let on = Args::try_parse_from(["sirius-doris-be", "--translate-only", "1"]).unwrap();
+        assert!(on.engine.translate_only);
+        let off = Args::try_parse_from(["sirius-doris-be", "--translate-only", "0"]).unwrap();
+        assert!(!off.engine.translate_only);
+        assert!(Args::try_parse_from(["sirius-doris-be", "--translate-only", "fasle"]).is_err());
+    }
 }

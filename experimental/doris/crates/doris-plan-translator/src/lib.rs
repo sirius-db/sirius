@@ -23,7 +23,7 @@
 //! - [`descriptor_table`]: `TDescriptorTable` → tuples, slots in wire order, and
 //!   `(tuple_id, slot_id)` → column-index resolution for a node's `row_tuples`.
 //! - [`type_mapper`]: `TTypeDesc` → Substrait type, and the type gate (what is
-//!   rejected and which gap, `G-nn` under *Semantic gaps* in `README.md`, says why).
+//!   rejected and which gap, `G-nn` in `docs/semantics-gaps.md`, says why).
 //! - [`expr_translator`]: `TExpr` → Substrait expression (literals, slot references,
 //!   predicates, arithmetic, casts, `IN`, `CASE`, the scalar-function allowlist)
 //!   and the decomposition of `AGG_EXPR` roots into aggregate measures.
@@ -31,7 +31,7 @@
 //!   (scan, exchange as a named stream, joins, aggregate, sort; conjuncts, limit
 //!   and the projection chain on every node).
 //! - [`scan_ranges`]: the parquet paths a fragment's scans read, validated.
-//! - [`stitcher`]: the MVP-A0 single-plan stitcher — the fragments of one dispatch
+//! - [`stitcher`]: the single-plan execution single-plan stitcher — the fragments of one dispatch
 //!   joined into one fragment (exchanges replaced by their senders, two-phase
 //!   aggregates collapsed) for [`PlanTranslator::translate_batch`].
 //! - [`explain`]: `substrait-explain` text for a plan, with the constructs the formatter
@@ -46,7 +46,7 @@
 //!   become `ReadRel`s over `sirius_stream_<node_id>` (the shape MVP-A's real
 //!   fragments need), two-phase aggregates are rejected.
 //! - [`PlanTranslator::translate_batch`]: every fragment the FE sent this backend,
-//!   stitched into one plan (MVP-A0).
+//!   stitched into one plan (single-plan execution).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -89,12 +89,39 @@ pub const URN_AGGREGATE: &str = "extension:io.substrait:functions_aggregate_gene
 #[derive(Clone, PartialEq)]
 pub struct TranslatedPlan {
     /// Structured Substrait protobuf plan.
-    pub plan: Plan,
+    plan: Plan,
     /// Root output names as emitted in the Substrait plan.
-    pub output_names: Vec<String>,
+    output_names: Vec<String>,
 }
 
 impl TranslatedPlan {
+    /// Builds a translated plan from a Substrait root, deriving names from that root.
+    pub fn new(plan: Plan) -> Result<Self> {
+        let output_names = match plan
+            .relations
+            .first()
+            .and_then(|relation| relation.rel_type.as_ref())
+        {
+            Some(plan_rel::RelType::Root(root)) => root.names.clone(),
+            _ => {
+                return Err(TranslateError::malformed(
+                    "Substrait plan has no root relation",
+                ));
+            }
+        };
+        Ok(Self { plan, output_names })
+    }
+
+    /// The immutable Substrait plan.
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    /// Names that the root relation declares for the output columns.
+    pub fn output_names(&self) -> &[String] {
+        &self.output_names
+    }
+
     /// Returns a human-readable Substrait text formatter for logging and debugging.
     pub fn explain(&self) -> PlanExplain<'_> {
         PlanExplain { plan: &self.plan }
@@ -229,10 +256,10 @@ impl PlanTranslator {
             }],
             ..Default::default()
         };
-        Ok(TranslatedPlan { plan, output_names })
+        TranslatedPlan::new(plan)
     }
 
-    /// Stitches the fragments of one dispatch into a single plan (MVP-A0) and translates it.
+    /// Stitches the fragments of one dispatch into a single plan (single-plan execution) and translates it.
     pub fn translate_batch(
         &self,
         fragments: &[&TPipelineFragmentParams],
@@ -477,13 +504,13 @@ mod tests {
         let plan = PlanTranslator::new()
             .translate_fragment(&scan_fragment())
             .unwrap();
-        assert_eq!(plan.output_names, vec!["total"]);
+        assert_eq!(plan.output_names(), vec!["total"]);
         let text = plan.explain().to_string();
         assert!(text.contains("Root[total]"), "{text}");
         assert!(text.contains("Project[$1]"), "{text}");
         assert!(text.contains("a:i32?, b:i32?"), "{text}");
         assert_eq!(
-            plan.plan.version.as_ref().unwrap().producer,
+            plan.plan().version.as_ref().unwrap().producer,
             "sirius-doris-plan-translator"
         );
         assert!(!plan.to_substrait_bytes().is_empty());
@@ -494,7 +521,7 @@ mod tests {
         let mut params = scan_fragment();
         params.fragment.as_mut().unwrap().output_exprs = None;
         let plan = PlanTranslator::new().translate_fragment(&params).unwrap();
-        assert_eq!(plan.output_names, vec!["a", "b"]);
+        assert_eq!(plan.output_names(), vec!["a", "b"]);
         assert_eq!(
             unique_names(["x", "x", "y", "x"].map(String::from)).collect::<Vec<_>>(),
             vec!["x", "x_1", "y", "x_2"]

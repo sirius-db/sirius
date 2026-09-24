@@ -10,21 +10,19 @@ one row per tuple, `NULL` for nulls, decimals with their scale) and one comparis
             [--extension PATH] [--out DIR]   from `dump-fragments --stitch --write-plan`) through
                                              DuckDB's substrait consumer — the reader Sirius
                                              compiles into libsirius — and compare them with the
-                                             expected results (the CPU differential, MVP-A0 prep)
+                                             expected results (the CPU differential, single-plan execution prep)
   validate  --actual DIR --expected DIR      compare a run-tpch.sh output tree (<actual>/qNN/
                                              result.tsv, the mysql client's tab-separated output)
                                              with the expected results
 
 Comparison (from origin/doris's validate_tpch_results.py, adapted):
   - column names are compared case-insensitively; column count must match;
-  - numbers are compared with a tolerance: relative --tolerance (default 1e-9, scaled by the
-    magnitude; loosen it on the GPU if FP64 accumulation drifts) or --ulps units of the coarser
-    side's decimal scale (default 0.5), whichever is larger. The second rule is what makes
-    Doris's declared result types acceptable: the FE types `avg(DECIMAL)` as DECIMAL(38,4) while
-    DuckDB computes a DOUBLE, so `0.0500` must match `0.04998529583839761`. `--ulps 1` also
-    accepts a truncated last digit (`0.0499`): Sirius casts DOUBLE to DECIMAL with cudf, which
-    truncates instead of rounding (G-19 in README.md); a verdict says how many values needed
-    that slack;
+  - numbers are compared with relative --tolerance (default 1e-9) or --ulps units of the
+    expected value's decimal scale (default 0.5), whichever is larger. Only the named
+    Doris result casts Q1 `avg_*` and Q8 `mkt_share` use the declared output scale: Q1 allows
+    one unit because cudf truncates DOUBLE to DECIMAL where DuckDB rounds (G-19 in README.md),
+    while Q8 allows one unit for the same last-digit truncation. A verdict reports values
+    that needed the named-column slack;
   - a query with a top-level ORDER BY is compared row by row; if that fails, the result still
     passes when it is the same multiset of rows, both sides respect the ORDER BY and the
     ORDER BY key sequences are identical (ties in a different order). A query without ORDER
@@ -102,7 +100,7 @@ class Summary:
                     writer.writerow([v.query, v.status, v.detail])
         ok, mismatch, error, skipped = (self.count(s) for s in ("OK", "MISMATCH", "ERROR", "SKIPPED"))
         print(f"==> {ok} ok, {mismatch} mismatch, {error} error, {skipped} skipped", flush=True)
-        return 1 if mismatch or error else 0
+        return 1 if mismatch or error or skipped or not ok else 0
 
 
 # --- result files -------------------------------------------------------------------------
@@ -206,28 +204,35 @@ def canonical(value: str) -> str:
 
 @dataclass
 class Tolerance:
-    """Numeric slack: relative (scaled by magnitude) or `ulps` units of the coarser decimal scale,
-    whichever is larger. `beyond_half_ulp` counts the values that only matched thanks to ulps > 0.5
-    (a truncated rather than rounded last digit); `compare` resets it per query."""
+    """Numeric slack at the expected decimal scale, except named Doris result casts.
+
+    `beyond_half_ulp` counts values that needed more than half a unit of slack.
+    `compare` resets it per query."""
 
     relative: decimal.Decimal = decimal.Decimal("1e-9")
     ulps: decimal.Decimal = decimal.Decimal("0.5")
     beyond_half_ulp: int = 0
+    # Named result casts whose declared Doris scale is coarser than DuckDB's expression scale.
+    # The value is the allowed number of units at the declared scale.
+    declared_scale_columns: dict[int, decimal.Decimal] = field(default_factory=dict)
 
 
-def scalars_match(lhs: str, rhs: str, tolerance: Tolerance) -> bool:
+def scalars_match(
+    lhs: str, rhs: str, tolerance: Tolerance, declared_ulps: decimal.Decimal | None = None
+) -> bool:
     if lhs == rhs:
         return True
     lnum, rnum = to_decimal(lhs), to_decimal(rhs)
     if lnum is None or rnum is None:
         return canonical(lhs) == canonical(rhs)
-    coarse_scale = min(scale_of(lhs), scale_of(rhs))
-    ulp = decimal.Decimal(10) ** -coarse_scale
+    expected_scale = min(scale_of(lhs), scale_of(rhs)) if declared_ulps is not None else scale_of(rhs)
+    ulp = decimal.Decimal(10) ** -expected_scale
     relative = tolerance.relative * max(decimal.Decimal(1), abs(lnum), abs(rnum))
     difference = abs(lnum - rnum)
     if difference <= max(ulp / 2, relative):
         return True
-    if difference <= max(tolerance.ulps * ulp, relative):
+    allowed_ulps = max(tolerance.ulps, declared_ulps) if declared_ulps is not None else tolerance.ulps
+    if difference <= max(allowed_ulps * ulp, relative):
         tolerance.beyond_half_ulp += 1
         return True
     return False
@@ -241,7 +246,7 @@ def rows_match(lhs: list[list[str]], rhs: list[list[str]], tolerance: Tolerance)
         if len(lrow) != len(rrow):
             return f"row {row_idx}: column count {len(lrow)} != {len(rrow)}"
         for col_idx, (lval, rval) in enumerate(zip(lrow, rrow)):
-            if not scalars_match(lval, rval, tolerance):
+            if not scalars_match(lval, rval, tolerance, tolerance.declared_scale_columns.get(col_idx)):
                 return f"row {row_idx} col {col_idx}: {lval!r} != {rval!r}"
     return None
 
@@ -332,6 +337,15 @@ def compare(query: str, sql: str, actual: Result, expected: Result, tolerance: T
     e_cols = [c.lower() for c in expected.columns]
     if a_cols != e_cols:
         return Verdict(query, "MISMATCH", f"columns {actual.columns} != {expected.columns}")
+    declared_scales = {
+        "q01": {"avg_qty": decimal.Decimal(1), "avg_price": decimal.Decimal(1), "avg_disc": decimal.Decimal(1)},
+        "q08": {"mkt_share": decimal.Decimal(1)},
+    }
+    tolerance.declared_scale_columns = {
+        index: declared_scales[query][name]
+        for index, name in enumerate(e_cols)
+        if query in declared_scales and name in declared_scales[query]
+    }
     order = order_by_columns(sql)
     indices = [(e_cols.index(name), desc) for name, desc in order if name in e_cols]
     ordered = bool(order) and len(indices) == len(order)
@@ -339,7 +353,8 @@ def compare(query: str, sql: str, actual: Result, expected: Result, tolerance: T
     def ok(note: str = "") -> Verdict:
         # A truncated last digit is a real (if tolerated) difference; keep it visible.
         if tolerance.beyond_half_ulp:
-            slack = f"{tolerance.beyond_half_ulp} value(s) beyond half an ulp, within --ulps {tolerance.ulps}"
+            allowance = "named-column allowance" if tolerance.declared_scale_columns else f"--ulps {tolerance.ulps}"
+            slack = f"{tolerance.beyond_half_ulp} value(s) beyond half an ulp, within {allowance}"
             note = f"{note}; {slack}" if note else slack
         return Verdict(query, "OK", note, len(actual.rows))
 
@@ -508,16 +523,24 @@ def cmd_validate(args) -> int:
     for query in query_names(args.queries, args.sql_dir):
         actual_path = args.actual / query / "result.tsv"
         expected_path = find_result(args.expected, query)
+        error = args.actual / query / "error.txt"
+        if error.exists() and error.stat().st_size:
+            summary.add(Verdict(query, "ERROR", error.read_text().strip().splitlines()[0][:200]))
+            continue
         if not actual_path.exists():
-            error = args.actual / query / "error.txt"
-            detail = error.read_text().strip().splitlines()[0][:200] if error.exists() else "no result.tsv"
-            summary.add(Verdict(query, "ERROR", detail))
+            summary.add(Verdict(query, "ERROR", "no result.tsv"))
             continue
         if expected_path is None:
             summary.add(Verdict(query, "SKIPPED", f"no expected result in {args.expected}"))
             continue
+        expected = read_result(expected_path)
+        actual = read_result(actual_path)
+        # The mysql CLI writes a zero-byte file for a successful SELECT with no rows.
+        # The expected baseline supplies the header that mysql omitted.
+        if not actual.columns and not actual.rows and actual_path.stat().st_size == 0:
+            actual = Result(columns=expected.columns, rows=[])
         summary.add(
-            compare(query, load_sql(args.sql_dir, query), read_result(actual_path), read_result(expected_path), tolerance_of(args))
+            compare(query, load_sql(args.sql_dir, query), actual, expected, tolerance_of(args))
         )
     return summary.finish(args.csv)
 
@@ -538,7 +561,7 @@ def main() -> int:
             "--ulps",
             type=decimal.Decimal,
             default=decimal.Decimal("0.5"),
-            help="units of the coarser decimal scale accepted (0.5 = rounding only; 1 also accepts a truncated last digit)",
+            help="units of the expected decimal scale accepted (default 0.5; known result casts are scoped by query and column)",
         )
         sub.add_argument("--csv", type=Path, help="write a query,status,detail summary")
 

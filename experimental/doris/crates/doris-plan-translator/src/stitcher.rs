@@ -1,4 +1,4 @@
-//! The single-plan stitcher (MVP-A0): the fragments the FE dispatched to this backend, joined
+//! The single-plan stitcher (single-plan execution): the fragments the FE dispatched to this backend, joined
 //! back into one plan tree.
 //!
 //! The FE cuts a query into plan fragments connected by exchanges: a sender fragment ends in
@@ -37,7 +37,7 @@
 //! limited non-merging exchange, a merge aggregate over anything but a matching update
 //! aggregate — is refused rather than approximated.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::descriptors::TDescriptorTable;
@@ -127,6 +127,16 @@ struct Sender<'a> {
 
 /// Joins the fragments of one dispatch into a single fragment rooted at the `RESULT_SINK`.
 pub fn stitch_fragments(fragments: &[&TPipelineFragmentParams]) -> Result<TPipelineFragmentParams> {
+    let local_instances: HashSet<(i64, i64)> = fragments
+        .iter()
+        .flat_map(|params| params.local_params.iter().flatten())
+        .map(|instance| {
+            (
+                instance.fragment_instance_id.hi,
+                instance.fragment_instance_id.lo,
+            )
+        })
+        .collect();
     let mut root = None;
     let mut senders: HashMap<i32, Sender<'_>> = HashMap::new();
     for params in fragments {
@@ -141,6 +151,18 @@ pub fn stitch_fragments(fragments: &[&TPipelineFragmentParams]) -> Result<TPipel
             context: "TPipelineFragmentParams.fragment",
             field: "plan",
         })?;
+        for exchange in plan
+            .nodes
+            .iter()
+            .filter(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE)
+        {
+            if params.per_exch_num_senders.get(&exchange.node_id) != Some(&1) {
+                return Err(TranslateError::malformed(format!(
+                    "exchange node {} must have exactly one sender across all backends",
+                    exchange.node_id
+                )));
+            }
+        }
         let instances = params.local_params.as_deref().unwrap_or_default();
         if instances.len() != 1 {
             return Err(TranslateError::malformed(format!(
@@ -166,6 +188,19 @@ pub fn stitch_fragments(fragments: &[&TPipelineFragmentParams]) -> Result<TPipel
                 }
             }
             TDataSinkType::DATA_STREAM_SINK => {
+                let destinations = params.destinations.as_deref().unwrap_or_default();
+                if destinations.is_empty()
+                    || destinations.iter().any(|destination| {
+                        !local_instances.contains(&(
+                            destination.fragment_instance_id.hi,
+                            destination.fragment_instance_id.lo,
+                        ))
+                    })
+                {
+                    return Err(TranslateError::malformed(
+                        "stream sink has a destination outside this backend's dispatch",
+                    ));
+                }
                 let stream = sink
                     .stream_sink
                     .as_ref()
@@ -367,9 +402,11 @@ fn already_sorted(node: &TPlanNode, sort_info: &TSortInfo, limit: i64, offset: i
 
 /// Whether a node carries conjuncts or projections of its own.
 fn has_node_work(node: &TPlanNode) -> bool {
-    node.conjuncts
-        .as_ref()
-        .is_some_and(|exprs| !exprs.is_empty())
+    node.vconjunct.is_some()
+        || node
+            .conjuncts
+            .as_ref()
+            .is_some_and(|exprs| !exprs.is_empty())
         || node
             .projections
             .as_ref()
@@ -648,7 +685,7 @@ fn aggregate_names(exprs: &[TExpr]) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use doris_thrift::data_sinks::{TDataSink, TDataStreamSink};
+    use doris_thrift::data_sinks::{TDataSink, TDataStreamSink, TPlanFragmentDestination};
     use doris_thrift::descriptors::{TSlotDescriptor, TTupleDescriptor};
     use doris_thrift::exprs::{TAggregateExpr, TExprNode, TSlotRef};
     use doris_thrift::palo_internal_service::TPipelineInstanceParams;
@@ -781,6 +818,17 @@ mod tests {
         TPipelineFragmentParams {
             query_id: TUniqueId::new(1, 2),
             fragment_id: Some(fragment_id),
+            per_exch_num_senders: nodes
+                .iter()
+                .filter(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE)
+                .map(|node| (node.node_id, 1))
+                .collect(),
+            destinations: (sink == TDataSinkType::DATA_STREAM_SINK).then(|| {
+                vec![TPlanFragmentDestination {
+                    fragment_instance_id: TUniqueId::new(1, (fragment_id + 1) as i64),
+                    ..Default::default()
+                }]
+            }),
             desc_tbl: Some(desc_tbl()),
             fragment: Some(TPlanFragment {
                 plan: Some(TPlan { nodes }),
@@ -1330,6 +1378,78 @@ mod tests {
 
     #[test]
     fn stitching_gates() {
+        let mut fragments = two_phase_dispatch();
+        fragments[0].per_exch_num_senders.insert(4, 2);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::MalformedPlan(reason) if reason.contains("exactly one sender")
+        ));
+
+        let mut fragments = two_phase_dispatch();
+        fragments[1].destinations.as_mut().unwrap()[0].fragment_instance_id =
+            TUniqueId::new(99, 99);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::MalformedPlan(reason) if reason.contains("outside this backend")
+        ));
+
+        let mut fragments = two_phase_dispatch();
+        fragments[1]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .output_sink
+            .as_mut()
+            .unwrap()
+            .stream_sink
+            .as_mut()
+            .unwrap()
+            .output_exprs = Some(vec![TExpr::default()]);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { reason, .. } if reason.contains("stream sinks")
+        ));
+
+        let mut fragments = two_phase_dispatch();
+        let mut duplicate = fragments[1].clone();
+        duplicate.fragment_id = Some(9);
+        duplicate.local_params.as_mut().unwrap()[0].fragment_instance_id = TUniqueId::new(1, 9);
+        fragments.push(duplicate);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::MalformedPlan(reason) if reason.contains("more than one sender fragment")
+        ));
+
+        let mut fragments = two_phase_dispatch();
+        fragments[0]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[1]
+            .conjuncts = Some(vec![TExpr::default()]);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { reason, .. } if reason.contains("exchange with conjuncts")
+        ));
+
+        let mut fragments = two_phase_dispatch();
+        fragments[1].local_params.as_mut().unwrap()[0]
+            .per_node_scan_ranges
+            .insert(0, vec![TScanRangeParams::default()]);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::MalformedPlan(reason) if reason.contains("more than one fragment")
+        ));
+
         // A limited exchange without a merge order.
         let mut fragments = two_phase_dispatch();
         fragments[0]
@@ -1378,13 +1498,16 @@ mod tests {
             vec![scan(9, 0)],
             None,
         ));
+        fragments.last_mut().unwrap().destinations.as_mut().unwrap()[0].fragment_instance_id =
+            TUniqueId::new(1, 2);
         let refs: Vec<_> = fragments.iter().collect();
         assert!(matches!(
             stitch_fragments(&refs).unwrap_err(),
             TranslateError::MalformedPlan(msg) if msg.contains("not reachable")
         ));
         // No result fragment.
-        let fragments = two_phase_dispatch();
+        let mut fragments = two_phase_dispatch();
+        fragments[1].destinations.as_mut().unwrap()[0].fragment_instance_id = TUniqueId::new(1, 0);
         let refs: Vec<_> = fragments.iter().skip(1).collect();
         assert!(matches!(
             stitch_fragments(&refs).unwrap_err(),

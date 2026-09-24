@@ -6,15 +6,27 @@
 //! those row bodies straight to the MySQL client.
 
 use arrow_array::temporal_conversions::{as_date, as_datetime};
-use arrow_array::types::{Date32Type, TimestampMicrosecondType};
+use arrow_array::types::{
+    Date32Type, TimestampMicrosecondType, TimestampMillisecondType, TimestampSecondType,
+};
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray,
+    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use doris_thrift::data::TResultBatch;
 use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
+
+const MYSQL_NULL_MARKER: u8 = 0xFB;
+const LENENC_2_BYTE_PREFIX: u8 = 0xFC;
+const LENENC_3_BYTE_PREFIX: u8 = 0xFD;
+const LENENC_8_BYTE_PREFIX: u8 = 0xFE;
+const MYSQL_INLINE_LENGTH_LIMIT: usize = 251;
+const LENENC_2_BYTE_LIMIT: usize = 1 << 16;
+const LENENC_3_BYTE_LIMIT: usize = 1 << 24;
+const MILLIS_PER_SECOND: i64 = 1_000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
 
 /// Encodes Arrow result batches into a Doris `TResultBatch` of MySQL text rows.
 #[derive(Default)]
@@ -24,6 +36,7 @@ pub(crate) struct MysqlResultEncoder {
 
 impl MysqlResultEncoder {
     /// Encodes `batches` into a `TResultBatch` tagged with `packet_seq`.
+    #[cfg(test)]
     pub(crate) fn encode(batches: &[RecordBatch], packet_seq: i64) -> Result<TResultBatch, String> {
         let mut encoder = Self::default();
         for batch in batches {
@@ -32,13 +45,58 @@ impl MysqlResultEncoder {
         Ok(encoder.into_result_batch(packet_seq))
     }
 
+    /// Encodes rows into bounded thrift batches and emits each as soon as it fills. A single
+    /// row larger than the limit is refused because the FE cannot receive that packet.
+    pub(crate) fn encode_bounded(
+        batch: &RecordBatch,
+        max_bytes: usize,
+        mut emit: impl FnMut(TResultBatch) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut encoder = Self::default();
+        let mut bytes = 0usize;
+        let renderers = batch
+            .columns()
+            .iter()
+            .map(|column| CellRenderer::new(column.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in 0..batch.num_rows() {
+            let mut encoded = MysqlTextRow {
+                buf: Vec::with_capacity(batch.num_columns() * 16),
+            };
+            for renderer in &renderers {
+                renderer.write(row, &mut encoded)?;
+            }
+            let row_bytes = encoded.buf.len().saturating_add(4); // thrift binary row-length prefix
+            if row_bytes > max_bytes {
+                return Err(format!(
+                    "encoded result row exceeds the {max_bytes}-byte packet limit"
+                ));
+            }
+            if bytes + row_bytes > max_bytes && !encoder.rows.is_empty() {
+                emit(std::mem::take(&mut encoder).into_result_batch(0))?;
+                bytes = 0;
+            }
+            bytes += row_bytes;
+            encoder.rows.push(encoded.into_bytes());
+        }
+        if !encoder.rows.is_empty() {
+            emit(encoder.into_result_batch(0))?;
+        }
+        Ok(())
+    }
+
     /// Encodes every row of `batch` as a MySQL text row.
+    #[cfg(test)]
     fn add_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
-        let columns = batch.columns();
+        let renderers = batch
+            .columns()
+            .iter()
+            .map(|column| CellRenderer::new(column.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         for row in 0..batch.num_rows() {
             let mut encoded = MysqlTextRow::default();
-            for column in columns {
-                encoded.push_cell(Self::render_cell(column.as_ref(), row)?.as_deref());
+            for renderer in &renderers {
+                renderer.write(row, &mut encoded)?;
             }
             self.rows.push(encoded.into_bytes());
         }
@@ -50,85 +108,145 @@ impl MysqlResultEncoder {
     fn into_result_batch(self, packet_seq: i64) -> TResultBatch {
         TResultBatch::new(self.rows, false, packet_seq, None)
     }
+}
 
-    /// Renders one column value as raw text bytes, or `None` for SQL NULL.
-    fn render_cell(array: &dyn Array, row: usize) -> Result<Option<Vec<u8>>, String> {
-        if array.is_null(row) {
-            return Ok(None);
+/// A column downcast once per Arrow batch, then rendered directly into each MySQL row.
+enum CellKind<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Utf8View(&'a StringViewArray),
+    Boolean(&'a BooleanArray),
+    Int8(&'a Int8Array),
+    Int16(&'a Int16Array),
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
+    Decimal128(&'a Decimal128Array),
+    Date32(&'a Date32Array),
+    TimestampSecond(&'a TimestampSecondArray),
+    TimestampMillisecond(&'a TimestampMillisecondArray),
+    TimestampMicrosecond(&'a TimestampMicrosecondArray),
+}
+
+struct CellRenderer<'a> {
+    array: &'a dyn Array,
+    kind: CellKind<'a>,
+}
+
+impl<'a> CellRenderer<'a> {
+    fn new(array: &'a dyn Array) -> Result<Self, String> {
+        macro_rules! downcast {
+            ($ty:ty) => {
+                array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+                    format!(
+                        "arrow array did not downcast to {}",
+                        std::any::type_name::<$ty>()
+                    )
+                })?
+            };
         }
-        // Render the value as the MySQL client expects in the text protocol: a decimal/string form.
-        macro_rules! render_primitive {
-            ($ty:ty) => {{
-                let typed = Self::downcast::<$ty>(array)?;
-                Ok(Some(typed.value(row).to_string().into_bytes()))
-            }};
-        }
-        match array.data_type() {
-            DataType::Utf8 => {
-                let typed = Self::downcast::<StringArray>(array)?;
-                Ok(Some(typed.value(row).as_bytes().to_vec()))
+        let kind = match array.data_type() {
+            DataType::Utf8 => CellKind::Utf8(downcast!(StringArray)),
+            DataType::LargeUtf8 => CellKind::LargeUtf8(downcast!(LargeStringArray)),
+            DataType::Utf8View => CellKind::Utf8View(downcast!(StringViewArray)),
+            DataType::Boolean => CellKind::Boolean(downcast!(BooleanArray)),
+            DataType::Int8 => CellKind::Int8(downcast!(Int8Array)),
+            DataType::Int16 => CellKind::Int16(downcast!(Int16Array)),
+            DataType::Int32 => CellKind::Int32(downcast!(Int32Array)),
+            DataType::Int64 => CellKind::Int64(downcast!(Int64Array)),
+            DataType::Float32 => CellKind::Float32(downcast!(Float32Array)),
+            DataType::Float64 => CellKind::Float64(downcast!(Float64Array)),
+            DataType::Decimal128(_, _) => CellKind::Decimal128(downcast!(Decimal128Array)),
+            DataType::Date32 => CellKind::Date32(downcast!(Date32Array)),
+            DataType::Timestamp(TimeUnit::Second, None) => {
+                CellKind::TimestampSecond(downcast!(TimestampSecondArray))
             }
-            DataType::Boolean => {
-                let typed = Self::downcast::<BooleanArray>(array)?;
-                Ok(Some(if typed.value(row) {
-                    b"1".to_vec()
-                } else {
-                    b"0".to_vec()
-                }))
+            DataType::Timestamp(TimeUnit::Millisecond, None) => {
+                CellKind::TimestampMillisecond(downcast!(TimestampMillisecondArray))
             }
-            DataType::Int8 => render_primitive!(Int8Array),
-            DataType::Int16 => render_primitive!(Int16Array),
-            DataType::Int32 => render_primitive!(Int32Array),
-            DataType::Int64 => render_primitive!(Int64Array),
-            DataType::Float32 => render_primitive!(Float32Array),
-            DataType::Float64 => render_primitive!(Float64Array),
-            DataType::LargeUtf8 => {
-                let typed = Self::downcast::<LargeStringArray>(array)?;
-                Ok(Some(typed.value(row).as_bytes().to_vec()))
-            }
-            DataType::Utf8View => {
-                let typed = Self::downcast::<StringViewArray>(array)?;
-                Ok(Some(typed.value(row).as_bytes().to_vec()))
-            }
-            DataType::Decimal128(_, _) => {
-                let typed = Self::downcast::<Decimal128Array>(array)?;
-                Ok(Some(typed.value_as_string(row).into_bytes()))
-            }
-            DataType::Date32 => {
-                let typed = Self::downcast::<Date32Array>(array)?;
-                let date = as_date::<Date32Type>(i64::from(typed.value(row)))
-                    .ok_or_else(|| format!("date32 value {} out of range", typed.value(row)))?;
-                Ok(Some(date.format("%Y-%m-%d").to_string().into_bytes()))
-            }
-            // Doris DATETIME is timezone-naive wall-clock; a tz-aware timestamp would need
-            // offset handling we don't implement, so let `Some(tz)` fall through to the error arm.
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                let typed = Self::downcast::<TimestampMicrosecondArray>(array)?;
-                let value = typed.value(row);
-                let datetime = as_datetime::<TimestampMicrosecondType>(value)
-                    .ok_or_else(|| format!("timestamp value {value} out of range"))?;
-                // MySQL text format; the fractional part is omitted when it is zero.
-                let format = if value % 1_000_000 == 0 {
-                    "%Y-%m-%d %H:%M:%S"
-                } else {
-                    "%Y-%m-%d %H:%M:%S%.6f"
-                };
-                Ok(Some(datetime.format(format).to_string().into_bytes()))
+                CellKind::TimestampMicrosecond(downcast!(TimestampMicrosecondArray))
             }
-            other => Err(format!(
-                "result encoding for arrow type {other:?} is not implemented yet"
-            )),
-        }
+            other => {
+                return Err(format!(
+                    "result encoding for arrow type {other:?} is not implemented yet"
+                ));
+            }
+        };
+        Ok(Self { array, kind })
     }
 
-    /// Downcasts an Arrow array to a concrete type, mapping a mismatch to a descriptive error.
-    fn downcast<T: 'static>(array: &dyn Array) -> Result<&T, String> {
-        array.as_any().downcast_ref::<T>().ok_or_else(|| {
-            format!(
-                "arrow array did not downcast to {}",
-                std::any::type_name::<T>()
-            )
-        })
+    fn write(&self, row: usize, output: &mut MysqlTextRow) -> Result<(), String> {
+        if self.array.is_null(row) {
+            output.push_cell(None);
+            return Ok(());
+        }
+        macro_rules! integer {
+            ($typed:expr) => {{
+                let mut buffer = itoa::Buffer::new();
+                output.push_cell(Some(buffer.format($typed.value(row)).as_bytes()));
+            }};
+        }
+        macro_rules! floating {
+            ($typed:expr) => {{
+                let mut buffer = ryu::Buffer::new();
+                output.push_cell(Some(buffer.format($typed.value(row)).as_bytes()));
+            }};
+        }
+        macro_rules! timestamp {
+            ($typed:expr, $arrow_type:ty, $units_per_second:expr, $fraction_format:expr) => {{
+                let value = $typed.value(row);
+                let datetime = as_datetime::<$arrow_type>(value)
+                    .ok_or_else(|| format!("timestamp value {value} out of range"))?;
+                let format = if value % $units_per_second == 0 {
+                    "%Y-%m-%d %H:%M:%S"
+                } else {
+                    $fraction_format
+                };
+                output.push_cell(Some(datetime.format(format).to_string().as_bytes()));
+            }};
+        }
+        match &self.kind {
+            CellKind::Utf8(v) => output.push_cell(Some(v.value(row).as_bytes())),
+            CellKind::LargeUtf8(v) => output.push_cell(Some(v.value(row).as_bytes())),
+            CellKind::Utf8View(v) => output.push_cell(Some(v.value(row).as_bytes())),
+            CellKind::Boolean(v) => output.push_cell(Some(if v.value(row) { b"1" } else { b"0" })),
+            CellKind::Int8(v) => integer!(v),
+            CellKind::Int16(v) => integer!(v),
+            CellKind::Int32(v) => integer!(v),
+            CellKind::Int64(v) => integer!(v),
+            CellKind::Float32(v) => floating!(v),
+            CellKind::Float64(v) => floating!(v),
+            CellKind::Decimal128(v) => output.push_cell(Some(v.value_as_string(row).as_bytes())),
+            CellKind::Date32(v) => {
+                let date = as_date::<Date32Type>(i64::from(v.value(row)))
+                    .ok_or_else(|| format!("date32 value {} out of range", v.value(row)))?;
+                output.push_cell(Some(date.format("%Y-%m-%d").to_string().as_bytes()));
+            }
+            // Doris DATETIME is timezone-naive; a timestamp with a timezone is rejected above.
+            CellKind::TimestampSecond(v) => {
+                let value = v.value(row);
+                let datetime = as_datetime::<TimestampSecondType>(value)
+                    .ok_or_else(|| format!("timestamp value {value} out of range"))?;
+                output.push_cell(Some(
+                    datetime.format("%Y-%m-%d %H:%M:%S").to_string().as_bytes(),
+                ));
+            }
+            CellKind::TimestampMillisecond(v) => timestamp!(
+                v,
+                TimestampMillisecondType,
+                MILLIS_PER_SECOND,
+                "%Y-%m-%d %H:%M:%S%.3f"
+            ),
+            CellKind::TimestampMicrosecond(v) => timestamp!(
+                v,
+                TimestampMicrosecondType,
+                MICROS_PER_SECOND,
+                "%Y-%m-%d %H:%M:%S%.6f"
+            ),
+        }
+        Ok(())
     }
 }
 
@@ -146,23 +264,23 @@ impl MysqlTextRow {
                 self.push_length(bytes.len());
                 self.buf.extend_from_slice(bytes);
             }
-            None => self.buf.push(0xFB),
+            None => self.buf.push(MYSQL_NULL_MARKER),
         }
     }
 
     /// Writes a MySQL `length-encoded integer` prefix. `0xFB` is reserved for NULL, so a one-byte
     /// length never reaches 251.
     fn push_length(&mut self, len: usize) {
-        if len < 251 {
+        if len < MYSQL_INLINE_LENGTH_LIMIT {
             self.buf.push(len as u8);
-        } else if len < 1 << 16 {
-            self.buf.push(0xFC);
+        } else if len < LENENC_2_BYTE_LIMIT {
+            self.buf.push(LENENC_2_BYTE_PREFIX);
             self.buf.extend_from_slice(&(len as u16).to_le_bytes());
-        } else if len < 1 << 24 {
-            self.buf.push(0xFD);
+        } else if len < LENENC_3_BYTE_LIMIT {
+            self.buf.push(LENENC_3_BYTE_PREFIX);
             self.buf.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
         } else {
-            self.buf.push(0xFE);
+            self.buf.push(LENENC_8_BYTE_PREFIX);
             self.buf.extend_from_slice(&(len as u64).to_le_bytes());
         }
     }
@@ -198,6 +316,84 @@ mod tests {
 
     use arrow_array::ArrayRef;
     use arrow_schema::{Field, Schema};
+
+    #[test]
+    fn length_prefix_boundaries_do_not_collide_with_null() {
+        let mut row = MysqlTextRow::default();
+        row.push_length(250);
+        row.push_length(251);
+        row.push_length(1 << 16);
+        row.push_length(1 << 24);
+        assert_eq!(&row.buf[..4], &[250, LENENC_2_BYTE_PREFIX, 251, 0]);
+        assert_eq!(row.buf[4], LENENC_3_BYTE_PREFIX);
+        assert_eq!(&row.buf[5..8], &[0, 0, 1]);
+        assert_eq!(row.buf[8], LENENC_8_BYTE_PREFIX);
+        assert_eq!(&row.buf[9..17], &(1_u64 << 24).to_le_bytes());
+    }
+
+    #[test]
+    fn encodes_second_and_millisecond_timestamps() {
+        let second = TimestampSecondArray::from(vec![Some(1_500_000_000)]);
+        let millisecond = TimestampMillisecondArray::from(vec![Some(1_500_000_000_123)]);
+        let mut second_row = MysqlTextRow::default();
+        CellRenderer::new(&second)
+            .unwrap()
+            .write(0, &mut second_row)
+            .unwrap();
+        let mut millisecond_row = MysqlTextRow::default();
+        CellRenderer::new(&millisecond)
+            .unwrap()
+            .write(0, &mut millisecond_row)
+            .unwrap();
+        assert_eq!(&second_row.buf[1..], b"2017-07-14 02:40:00");
+        assert_eq!(&millisecond_row.buf[1..], b"2017-07-14 02:40:00.123");
+    }
+
+    #[test]
+    fn bounded_encoding_emits_more_than_one_packet() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "text",
+            Arc::new(StringArray::from(vec!["abcdef", "ghijkl"])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut packets = Vec::new();
+        MysqlResultEncoder::encode_bounded(&batch, 15, |packet| {
+            packets.push(packet);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].rows, vec![b"\x06abcdef".to_vec()]);
+        assert_eq!(packets[1].rows, vec![b"\x06ghijkl".to_vec()]);
+        assert!(MysqlResultEncoder::encode_bounded(&batch, 5, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn encodes_remaining_primitive_types_and_refuses_binary() {
+        use arrow_array::BinaryArray;
+        let batch = RecordBatch::try_from_iter(vec![
+            ("bool", Arc::new(BooleanArray::from(vec![true])) as ArrayRef),
+            ("i8", Arc::new(Int8Array::from(vec![-8])) as ArrayRef),
+            ("i16", Arc::new(Int16Array::from(vec![16])) as ArrayRef),
+            ("i32", Arc::new(Int32Array::from(vec![32])) as ArrayRef),
+            ("f32", Arc::new(Float32Array::from(vec![1.5])) as ArrayRef),
+            ("f64", Arc::new(Float64Array::from(vec![2.5])) as ArrayRef),
+            (
+                "view",
+                Arc::new(StringViewArray::from(vec!["view"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let row = &MysqlResultEncoder::encode(&[batch], 0).unwrap().rows[0];
+        assert_eq!(row, b"\x011\x02-8\x0216\x0232\x031.5\x032.5\x04view");
+
+        let unsupported = BinaryArray::from(vec![b"bytes".as_slice()]);
+        let error = match CellRenderer::new(&unsupported) {
+            Ok(_) => panic!("binary array should not be encoded"),
+            Err(error) => error,
+        };
+        assert!(error.contains("not implemented"));
+    }
 
     #[test]
     fn encodes_length_prefixed_text_rows() {

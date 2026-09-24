@@ -59,10 +59,10 @@ pub struct SlotInfo {
 }
 
 impl SlotInfo {
-    /// Stable output name for the slot: its column name, or `col_<slot_id>` for a derived slot.
+    /// Stable output name for the slot: its column name, or `slot_<slot_id>` for a derived slot.
     pub fn output_name(&self) -> String {
         if self.col_name.is_empty() {
-            format!("col_{}", self.slot_id)
+            format!("slot_{}", self.slot_id)
         } else {
             self.col_name.clone()
         }
@@ -131,7 +131,8 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
             };
             // Non-nullable slots get -1 for the bit (SlotDescriptor.toThrift); anything else is
             // a nullable slot with a real (always 0) bit index.
-            let nullable = slot.null_indicator_bit != -1;
+            const NOT_NULLABLE_INDICATOR_BIT: i32 = -1;
+            let nullable = slot.null_indicator_bit != NOT_NULLABLE_INDICATOR_BIT;
             let map_type = || -> Result<(TPrimitiveType, Type)> {
                 Ok((
                     type_mapper::scalar_primitive(&slot.slot_type)?,
@@ -458,8 +459,8 @@ mod tests {
             table_descriptors: None,
         };
         let desc = DescriptorTable::try_from(&desc_tbl).unwrap();
-        assert_eq!(desc.slot(3, 17).unwrap().output_name(), "col_17");
-        assert_eq!(desc.output_names_for_tuples(&[3]).unwrap(), vec!["col_17"]);
+        assert_eq!(desc.slot(3, 17).unwrap().output_name(), "slot_17");
+        assert_eq!(desc.output_names_for_tuples(&[3]).unwrap(), vec!["slot_17"]);
     }
 
     /// The wire order is the column order: it is neither sorted by slot id nor by name.

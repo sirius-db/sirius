@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CPU differential of the translator (MVP-A0 preparation, no GPU): every captured dispatch in
+# CPU differential of the translator (single-plan execution preparation, no GPU): every captured dispatch in
 # the corpus is stitched into one Substrait plan, the plan bytes are run through DuckDB's
 # substrait consumer (the reader Sirius compiles into libsirius, built by
 # scripts/build-duckdb-substrait.sh) and the rows are validated against the DuckDB baseline
@@ -16,9 +16,9 @@
 #   --expected DIR  expected results (default: tests/expected/tpch-sf1)
 #   --out DIR       plans, explain text and per-query results (default: log/cpu-diff)
 #
-# The gap probes that translate (G-13 SELECT DISTINCT) go through the same path:
+# The gap probes that translate (G-13 SELECT DISTINCT and the NULL-bearing joins) use the same path:
 #   scripts/cpu-diff.sh --corpus tests/fixtures/gaps --sql-dir sql/gaps --expected tests/expected/gaps-sf1 \
-#       --queries g13-distinct,g13-distinct-topn --out log/cpu-diff-gaps
+#       --queries g13-distinct,g13-distinct-topn,null-not-in,null-left-join,null-not-exists --out log/cpu-diff-gaps
 #
 # Runs cargo through the `be` pixi environment and python through `check`; call it as
 # `pixi run -e check tpch-cpu-diff -- [args]` or directly.

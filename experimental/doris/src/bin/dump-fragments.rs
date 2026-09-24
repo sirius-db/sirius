@@ -36,7 +36,7 @@ struct Args {
     /// Translate each fragment on its own and print the Substrait explain text (or the error).
     #[arg(long)]
     translate: bool,
-    /// Stitch the dispatch into one plan (MVP-A0) and print its Substrait explain text.
+    /// Stitch the dispatch into one plan (single-plan execution) and print its Substrait explain text.
     #[arg(long)]
     stitch: bool,
     /// With --stitch: write the stitched plan as Substrait protobuf bytes to this file.
@@ -79,7 +79,11 @@ fn main() -> Result<()> {
                 if let Some(path) = &args.write_plan {
                     std::fs::write(path, plan.to_substrait_bytes())
                         .with_context(|| format!("failed to write {}", path.display()))?;
-                    eprintln!("wrote {} (output {:?})", path.display(), plan.output_names);
+                    eprintln!(
+                        "wrote {} (output {:?})",
+                        path.display(),
+                        plan.output_names()
+                    );
                 }
             }
             Err(err) => {

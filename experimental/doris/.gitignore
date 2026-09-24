@@ -4,5 +4,6 @@ target/
 .doris-be/
 .duckdb-substrait/
 log/
+__pycache__/
 # The repo-root .gitignore drops *.tsv; the DuckDB result baselines are source.
 !tests/expected/**/*.tsv

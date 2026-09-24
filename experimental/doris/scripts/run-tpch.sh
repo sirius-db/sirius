@@ -21,28 +21,20 @@
 #   --dump-dir DIR     the backend's SIRIUS_BE_DUMP_FRAGMENTS (default: log/dump)
 #   --expected DIR     execution mode: validate every result.tsv against the DuckDB baseline
 #                      in DIR with scripts/validate_tpch_results.py (default:
-#                      tests/expected/tpch-sf1 when --sql-dir is sql/tpch; the check is skipped
-#                      when DIR does not exist). A mismatch fails the run. Regenerate the
+#                      tests/expected/tpch-sf1 when --sql-dir is sql/tpch; a missing baseline
+#                      fails the run). A mismatch fails the run. Regenerate the
 #                      baseline for another dataset with `validate_tpch_results.py expected`.
-#   --ulps N           execution mode: units of the coarser decimal scale the validator accepts
-#                      (default 1: the GPU's DOUBLE→DECIMAL cast truncates the last digit where
-#                      DuckDB rounds, G-19 in README.md; the validator's own default is 0.5 and
-#                      it reports how many values needed the extra slack)
+#   --ulps N           execution mode: units of the expected decimal scale the validator accepts
+#                      (default 0.5; Q1's avg columns and Q8's mkt_share allow one unit
+#                      for known last-digit truncation, G-19 in docs/semantics-gaps.md)
 #   --tolerance T      execution mode: the validator's relative tolerance (default 1e-9)
 #   --no-validate      execution mode: skip that check
 #   --be-log FILE      execution mode: the backend's log (default log/be.log, what be.sh writes);
 #                      the engine time of each query is read back from its "query executed on
 #                      the engine" line into --out/timings.csv (query, rows, wall_ms, engine_ms,
-#                      query_id, start_ms, end_ms); wall_ms is the mysql client's round trip,
-#                      start_ms/end_ms its epoch-millisecond window (scripts/fe-audit.py joins
-#                      the FE's audit log on it). A backend without that log line (the native
-#                      Doris BE of the benchmark) leaves engine_ms as `-`.
-#   --session-sql FILE the session variables to apply GLOBAL before the run (default
-#                      sql/session.sql, the Sirius backend's; sql/session-native.sql restores
-#                      the Doris defaults for the native BE)
-#   --db NAME          database the queries run in (default tpch, the parquet views; tpch_olap
-#                      holds the internal-table copy scripts/olap-load.sh makes). The views
-#                      over --data are (re)created in tpch either way.
+#                      query_id, start_ms, end_ms); wall_ms is the mysql client's round trip.
+#   --session-sql FILE the session variables to apply GLOBAL before the run (default sql/session.sql)
+#   --db NAME          database the queries run in (default tpch, the parquet views).
 #
 # Needs the `mysql` client and python-duckdb (pixi run -e fe ...) and a healthy FE +
 # registered backend (scripts/fe.sh start; scripts/be.sh start).
@@ -60,7 +52,7 @@ OUT=""
 DUMP_DIR="${SIRIUS_BE_DUMP_FRAGMENTS:-${ROOT}/log/dump}"
 EXPECTED=""
 VALIDATE=true
-ULPS=1
+ULPS=0.5
 TOLERANCE=1e-9
 BE_LOG="${SIRIUS_BE_LOG:-${ROOT}/log/be.log}"
 SESSION_SQL="sql/session.sql"
@@ -205,7 +197,8 @@ for n in "${query_numbers[@]}"; do
         passed=$((passed + 1))
     else
         if [ "${status}" = ok ]; then
-            rows=$(($(wc -l < "${qdir}/result.tsv") - 1))
+            lines=$(wc -l < "${qdir}/result.tsv")
+            rows=$((lines > 0 ? lines - 1 : 0))
             echo "  ${q}: ok, ${rows} row(s) in ${elapsed} ms (engine ${engine_ms} ms)"
             passed=$((passed + 1))
         else
@@ -247,7 +240,8 @@ else
             --sql-dir "${SQL_DIR}" --queries "${QUERIES}" --csv "${OUT}/summary.csv" \
             --ulps "${ULPS}" --tolerance "${TOLERANCE}" || validated=$?
     elif [ "${VALIDATE}" = true ]; then
-        echo "==> no expected results to validate against (${EXPECTED:-none}); see --expected"
+        echo "error: no expected results to validate against (${EXPECTED:-none}); pass --expected or --no-validate" >&2
+        validated=1
     fi
     [ "${failed}" -eq 0 ] && [ "${validated}" -eq 0 ]
 fi

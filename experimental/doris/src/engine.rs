@@ -11,10 +11,12 @@
 //! the tonic runtime stays free to serve `fetch_data`, connection cleanup, and
 //! shutdown cancellation while a query runs. The single-fragment limitations are elsewhere: the
 //! whole result is materialized before dispatch returns, and the single process-global context
-//! serializes queries — both lifted by the streaming evolution.
+//! serializes queries. Streaming execution is tracked in #137.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
@@ -31,6 +33,7 @@ struct ExecuteRequest {
     plan: Vec<u8>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Vec<RecordBatch>, String>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
@@ -94,13 +97,21 @@ fn engine_thread(
     info!("sirius-engine thread ready");
     // One query at a time until the handle (and its sender) is dropped.
     while let Ok(request) = requests.recv() {
+        if request.cancelled.load(Ordering::Acquire) {
+            let _ = request
+                .respond
+                .send(Err("query was cancelled before execution".to_string()));
+            continue;
+        }
         // `execute_substrait` drains the Arrow stream and drops the context-referencing wrapper
         // here, on the engine thread, returning owned batches whose buffers are released via their
         // own Arrow C release callbacks — independent of the context. So the batches are safe to
         // send to, and drop on, the caller's thread.
-        let result = context
-            .execute_substrait(&request.plan)
-            .map_err(|err| err.to_string());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            context.execute_substrait(&request.plan)
+        }))
+        .map_err(|_| "sirius-engine panicked while executing query".to_string())
+        .and_then(|result| result.map_err(|err| err.to_string()));
         // Ignore a send error: the waiting fragment may have been dropped/cancelled.
         let _ = request.respond.send(result);
     }
@@ -119,11 +130,19 @@ fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
 }
 
 impl FragmentExecutor for SiriusEngine {
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+    fn execute(
+        &self,
+        translated: &TranslatedPlan,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<FragmentResult, String> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("query was cancelled before execution".to_string());
+        }
         let (respond_tx, respond_rx) = channel();
         let request = ExecuteRequest {
             plan: translated.to_substrait_bytes(),
             respond: respond_tx,
+            cancelled,
         };
         self.requests
             .lock()
@@ -201,10 +220,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        TranslatedPlan {
-            plan,
-            output_names: names,
-        }
+        TranslatedPlan::new(plan).unwrap()
     }
 
     /// Like [`local_files_plan`] but declares a `base_schema` (names + types) on the read — the
@@ -269,10 +285,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        TranslatedPlan {
-            plan,
-            output_names: names,
-        }
+        TranslatedPlan::new(plan).unwrap()
     }
 
     /// Replays a Substrait plan dumped via `SIRIUS_BE_DUMP_FRAGMENTS` (path in
@@ -294,6 +307,7 @@ mod tests {
             .send(ExecuteRequest {
                 plan,
                 respond: respond_tx,
+                cancelled: Arc::new(AtomicBool::new(false)),
             })
             .unwrap();
         let batches = respond_rx
@@ -335,7 +349,9 @@ mod tests {
         );
 
         let engine = SiriusEngine::start(None).expect("bring up sirius engine");
-        let result = engine.execute(&plan).expect("execute fragment on GPU");
+        let result = engine
+            .execute(&plan, Arc::new(AtomicBool::new(false)))
+            .expect("execute fragment on GPU");
         let total_rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "expected 3 rows from the parquet fixture");
 
@@ -370,7 +386,7 @@ mod tests {
             &[("name", true), ("id", false)],
         );
         let result = engine
-            .execute(&pruned)
+            .execute(&pruned, Arc::new(AtomicBool::new(false)))
             .expect("execute pruned fragment on GPU");
         let batch = result
             .batches

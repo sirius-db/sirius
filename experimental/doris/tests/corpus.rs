@@ -4,8 +4,8 @@
 //! the reviewed snapshot in `tests/snapshots/`.
 //!
 //! - `tests/fixtures/tpch/qNN/`: the 22 TPC-H queries, all of which translate into one plan.
-//! - `tests/fixtures/gaps/<gNN-name>/`: probes for the semantic gaps (README.md) that only show
-//!   at plan-node level (G-11 window, G-12 UNION, G-13 DISTINCT); the verdict of each is
+//! - `tests/fixtures/gaps/<name>/`: probes for the semantic gaps (README.md) that only show
+//!   at plan-node level (G-11 window, G-12 UNION, G-13 DISTINCT) and NULL-bearing joins; each verdict is
 //!   pinned by [`gap_corpus_verdicts`].
 //!
 //! Each `batch-NN-request.tcompact` is a real `TPipelineFragmentParamsList` from Doris FE
@@ -254,7 +254,7 @@ fn node_tuple_ids(node: &TPlanNode) -> Vec<i32> {
     ids
 }
 
-/// P1.1: the descriptor table of every query builds (every slot type passes the type gate),
+/// the descriptor table of every query builds (every slot type passes the type gate),
 /// and every tuple and `(tuple_id, slot_id)` the plans and sinks name resolves against it.
 #[test]
 fn every_descriptor_table_builds_and_every_slot_ref_resolves() {
@@ -378,11 +378,11 @@ fn q01_descriptor_layout_matches_the_captured_plan() {
     let count_star = desc.slot(6, 66).unwrap();
     assert_eq!(count_star.primitive, TPrimitiveType::BIGINT);
     assert!(!count_star.nullable);
-    assert_eq!(count_star.output_name(), "col_66");
+    assert_eq!(count_star.output_name(), "slot_66");
     assert_eq!(desc.slot_global_index(6, 66, &[6]).unwrap(), 9);
 }
 
-/// P1.2: every expression the corpus carries translates — the scalar ones through
+/// every expression the corpus carries translates — the scalar ones through
 /// `translate_expr`, the `AGG_EXPR` roots through `aggregate_call`. Slot references are
 /// resolved with a permissive override (every slot maps to its index inside its own tuple)
 /// because which row layout an expression is evaluated over is the node translator's job.
@@ -442,7 +442,7 @@ fn every_corpus_expression_translates() {
     assert_eq!(merge_exprs, 37);
 }
 
-/// P1.3: every fragment translates on its own, except those carrying one half of a two-phase
+/// every fragment translates on its own, except those carrying one half of a two-phase
 /// aggregate (update phase emits partial states, merge phase consumes them), which the
 /// single-plan stitcher rewrites before translation. Every accepted plan renders through
 /// `substrait-explain`.
@@ -462,7 +462,7 @@ fn every_corpus_fragment_translates_or_is_a_two_phase_aggregate() {
                     assert_renders_cleanly(&text, &format!("{query} fragment {}", fragment.index));
                     explained_chars += text.len();
                     assert!(
-                        !plan.output_names.is_empty(),
+                        !plan.output_names().is_empty(),
                         "{query} fragment {}",
                         fragment.index
                     );
@@ -487,7 +487,7 @@ fn every_corpus_fragment_translates_or_is_a_two_phase_aggregate() {
     assert_eq!(two_phase, 49, "fragments with a two-phase aggregate");
 }
 
-/// P1.4: every query stitches into one plan (MVP-A0) whose root names are the query's
+/// every query stitches into one plan (single-plan execution) whose root names are the query's
 /// output columns.
 #[test]
 fn every_corpus_query_stitches_into_one_plan() {
@@ -504,7 +504,7 @@ fn every_corpus_query_stitches_into_one_plan() {
             "{query}: an exchange survived stitching\n{text}"
         );
         assert_renders_cleanly(&text, &query);
-        assert!(!plan.output_names.is_empty(), "{query}");
+        assert!(!plan.output_names().is_empty(), "{query}");
     }
 }
 
@@ -554,14 +554,15 @@ fn snapshot_text(
     )
 }
 
-/// P1.5: the stitched plan (or refusal) of every corpus query matches its reviewed snapshot in
-/// `tests/snapshots/<query>.txt` (set `UPDATE_SNAPSHOTS=1` to rewrite them, then review the
+/// The stitched plan (or refusal) of every corpus query matches its reviewed snapshot in
+/// `tests/snapshots/<corpus>/<query>.txt` (set `UPDATE_SNAPSHOTS=1` to rewrite them, then review the
 /// diff).
 #[test]
 fn every_corpus_query_matches_its_snapshot() {
     let translator = PlanTranslator::new();
     let update = std::env::var_os(UPDATE_SNAPSHOTS_ENV).is_some();
     let mut mismatches = Vec::new();
+    let mut expected_paths = BTreeSet::new();
     let all = captured_batches()
         .into_iter()
         .map(|batch| ("tpch", batch))
@@ -574,9 +575,14 @@ fn every_corpus_query_matches_its_snapshot() {
         let batch = decode(&payload);
         let actual = snapshot_text(corpus, &query, &batch, &translator);
         assert_renders_cleanly(&actual, &query);
-        let path = snapshot_dir().join(format!("{query}.txt"));
+        let path = snapshot_dir().join(corpus).join(format!("{query}.txt"));
+        assert!(
+            expected_paths.insert(path.clone()),
+            "duplicate snapshot key: {}",
+            path.display()
+        );
         if update {
-            std::fs::create_dir_all(snapshot_dir()).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &actual).unwrap();
             continue;
         }
@@ -597,6 +603,19 @@ fn every_corpus_query_matches_its_snapshot() {
             ));
         }
     }
+    let actual_paths: BTreeSet<_> = ["tpch", "gaps"]
+        .into_iter()
+        .flat_map(|corpus| {
+            std::fs::read_dir(snapshot_dir().join(corpus))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "snapshots must match captured fixtures exactly"
+    );
     assert!(
         mismatches.is_empty(),
         "{} snapshot(s) out of date (review, then `{UPDATE_SNAPSHOTS_ENV}=1 cargo test --test \
@@ -606,9 +625,8 @@ fn every_corpus_query_matches_its_snapshot() {
     );
 }
 
-/// The node-level semantic gaps (README.md), probed with real FE 4.1.4 dispatches
-/// (`sql/gaps/*.sql`): G-11 and G-12 are refused naming the offending node, G-13 folds into
-/// a group-by without measures (Nereids never plans a distinct operator).
+/// Real FE 4.1.4 dispatches for semantic gaps and NULL-bearing joins (`sql/gaps/*.sql`):
+/// G-11 and G-12 are refused, G-13 folds into a group-by, and the NULL probes translate.
 #[test]
 fn gap_corpus_verdicts() {
     let translator = PlanTranslator::new();
@@ -629,7 +647,7 @@ fn gap_corpus_verdicts() {
             "g13-distinct" => {
                 let text = outcome.as_ref().unwrap().explain().to_string();
                 assert!(text.contains("Aggregate[$0 => $0]"), "{query}: {text}");
-                assert_eq!(outcome.as_ref().unwrap().output_names, ["n_regionkey"]);
+                assert_eq!(outcome.as_ref().unwrap().output_names(), ["n_regionkey"]);
             }
             "g13-distinct-topn" => {
                 let text = outcome.as_ref().unwrap().explain().to_string();
@@ -639,9 +657,27 @@ fn gap_corpus_verdicts() {
                 );
                 assert!(text.contains("Fetch[limit=3"), "{query}: {text}");
             }
+            "null-not-in" => {
+                let text = outcome.as_ref().unwrap().explain().to_string();
+                assert!(text.contains("Join[&LeftMark"), "{query}: {text}");
+                assert!(text.contains("not($1)"), "{query}: {text}");
+                assert!(text.contains("null:i32"), "{query}: {text}");
+            }
+            "null-left-join" => {
+                let text = outcome.as_ref().unwrap().explain().to_string();
+                assert!(text.contains("Join[&Right"), "{query}: {text}");
+                assert!(text.contains("is_null("), "{query}: {text}");
+                assert!(text.contains("null:i32"), "{query}: {text}");
+            }
+            "null-not-exists" => {
+                let text = outcome.as_ref().unwrap().explain().to_string();
+                assert!(text.contains("Join[&Left"), "{query}: {text}");
+                assert!(text.contains("is_null("), "{query}: {text}");
+                assert!(text.contains("null:i32"), "{query}: {text}");
+            }
             other => panic!("{other}: no verdict recorded for this gap probe; add one here"),
         }
         seen.insert(query);
     }
-    assert_eq!(seen.len(), 5, "gap probes present: {seen:?}");
+    assert_eq!(seen.len(), 8, "gap probes present: {seen:?}");
 }

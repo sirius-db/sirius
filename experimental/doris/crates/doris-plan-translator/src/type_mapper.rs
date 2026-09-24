@@ -41,7 +41,7 @@ use crate::error::{Result, TranslateError};
 pub const MAX_DECIMAL_PRECISION: i32 = 38;
 /// Decimal precisions at or below this are stored as INT16 by DuckDB and have no cuDF carrier
 /// (`sirius::get_cudf_type` throws; G-06).
-pub const MIN_DECIMAL_PRECISION_EXCLUSIVE: i32 = 4;
+pub const MIN_DECIMAL_PRECISION: i32 = 5;
 /// Highest fractional-second scale Doris allows on `DATETIMEV2`.
 const MAX_DATETIMEV2_SCALE: i32 = 6;
 
@@ -161,7 +161,7 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
                     "decimal precision above 38 exceeds the 128-bit decimal carrier",
                 ));
             }
-            if precision <= MIN_DECIMAL_PRECISION_EXCLUSIVE {
+            if precision < MIN_DECIMAL_PRECISION {
                 return Err(reject(
                     "DECIMAL with precision <= 4 is stored as INT16 by DuckDB and has no cuDF \
                      carrier (G-06)",

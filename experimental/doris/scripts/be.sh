@@ -49,7 +49,7 @@ case "${1:-}" in
             # conf/sirius.yaml points the spill tier and telemetry under log/; cucascade only
             # creates files inside an existing spill directory.
             mkdir -p "${LOG_DIR}/sirius-spill" "${LOG_DIR}/telemetry"
-            cargo build --release -p sirius-doris-be
+            bash scripts/engine-cargo.sh build --release -p sirius-doris-be
             binary="target/release/sirius-doris-be"
         else
             export SIRIUS_BE_TRANSLATE_ONLY="${SIRIUS_BE_TRANSLATE_ONLY:-1}"
@@ -74,28 +74,56 @@ case "${1:-}" in
         echo "warning: backend did not report registration within 60s; see ${BE_LOG}" >&2
         ;;
     stop)
-        pid=""
+        pids=()
         if [ -f "${PID_FILE}" ]; then
-            pid="$(cat "${PID_FILE}")"
-            kill "${pid}" 2>/dev/null || true
+            pids+=("$(cat "${PID_FILE}")")
             rm -f "${PID_FILE}"
         else
-            pkill -f "sirius-doris-be --fe-host" 2>/dev/null || true
+            mapfile -t pids < <(pgrep -f '[s]irius-doris-be --fe-host' || true)
         fi
-        # SIGTERM returns before the process is gone, and the engine's GPU pool (90 % of the
-        # device) is only released when the CUDA context is torn down; a start right behind a
-        # stop then fails its bring-up with cudaErrorMemoryAllocation. Wait for the process,
-        # then for the device to be free again (nvidia-smi is absent on the no-engine path).
+        for pid in "${pids[@]}"; do kill "${pid}" 2>/dev/null || true; done
+        # The engine releases its GPU pool only after process teardown. Check this backend's
+        # PIDs rather than device-wide memory, which may belong to another user or GPU.
         for _ in $(seq 1 60); do
-            [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null || break
+            alive=false
+            for pid in "${pids[@]}"; do
+                if kill -0 "${pid}" 2>/dev/null; then alive=true; break; fi
+            done
+            [ "${alive}" = true ] || break
             sleep 0.5
+        done
+        forced=false
+        for pid in "${pids[@]}"; do
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "warning: backend pid ${pid} did not exit after SIGTERM; sending SIGKILL" >&2
+                kill -9 "${pid}" 2>/dev/null || true
+                forced=true
+            fi
         done
         if command -v nvidia-smi >/dev/null 2>&1; then
             for _ in $(seq 1 60); do
-                used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-                [ -n "${used}" ] && [ "${used}" -gt 2048 ] || break
+                gpu_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true)"
+                gpu_held=false
+                for pid in "${pids[@]}"; do
+                    if printf '%s\n' "${gpu_pids}" | grep -qx "${pid}"; then gpu_held=true; break; fi
+                done
+                [ "${gpu_held}" = true ] || break
                 sleep 0.5
             done
+            if [ "${gpu_held}" = true ]; then
+                echo "error: backend GPU context is still present after shutdown" >&2
+                exit 1
+            fi
+        fi
+        for pid in "${pids[@]}"; do
+            if kill -0 "${pid}" 2>/dev/null; then
+                echo "error: backend pid ${pid} is still running" >&2
+                exit 1
+            fi
+        done
+        if [ "${forced}" = true ]; then
+            echo "error: backend required SIGKILL to stop" >&2
+            exit 1
         fi
         echo "backend stopped"
         ;;

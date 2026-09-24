@@ -112,6 +112,12 @@ impl FromStr for SecretString {
     }
 }
 
+const DORIS_DEFAULT_HEARTBEAT_PORT: u16 = 9050;
+const DORIS_DEFAULT_BE_PORT: u16 = 9060;
+const DORIS_DEFAULT_HTTP_PORT: u16 = 8040;
+const DORIS_DEFAULT_BRPC_PORT: u16 = 8060;
+const DORIS_DEFAULT_FE_QUERY_PORT: u16 = 9030;
+
 /// Listener and advertised-identity settings of this backend.
 ///
 /// The port defaults are the stock Doris BE ports so a stock `fe.conf` and the usual
@@ -126,16 +132,16 @@ pub struct BackendConfig {
     #[arg(long, default_value = "127.0.0.1")]
     pub advertise_host: Host,
     /// Thrift `HeartbeatService` port (Doris default 9050).
-    #[arg(long, default_value_t = 9050)]
+    #[arg(long, default_value_t = DORIS_DEFAULT_HEARTBEAT_PORT)]
     pub heartbeat_port: u16,
     /// Thrift `BackendService` port, advertised as `be_port` (Doris default 9060).
-    #[arg(long = "be-port", default_value_t = 9060)]
+    #[arg(long = "be-port", default_value_t = DORIS_DEFAULT_BE_PORT)]
     pub be_port: u16,
     /// Advertised HTTP port (Doris default 8040). Nothing listens there yet.
-    #[arg(long, default_value_t = 8040)]
+    #[arg(long, default_value_t = DORIS_DEFAULT_HTTP_PORT)]
     pub http_port: u16,
     /// gRPC `PBackendService` port, advertised as `brpc_port` (Doris default 8060).
-    #[arg(long, default_value_t = 8060)]
+    #[arg(long, default_value_t = DORIS_DEFAULT_BRPC_PORT)]
     pub brpc_port: u16,
     /// Version string reported in heartbeats (FE displays it, never compares it).
     #[arg(skip = default_backend_version())]
@@ -147,10 +153,10 @@ impl Default for BackendConfig {
         Self {
             bind_host: Host::unspecified(),
             advertise_host: Host::local(),
-            heartbeat_port: 9050,
-            be_port: 9060,
-            http_port: 8040,
-            brpc_port: 8060,
+            heartbeat_port: DORIS_DEFAULT_HEARTBEAT_PORT,
+            be_port: DORIS_DEFAULT_BE_PORT,
+            http_port: DORIS_DEFAULT_HTTP_PORT,
+            brpc_port: DORIS_DEFAULT_BRPC_PORT,
             version: default_backend_version(),
         }
     }
@@ -165,7 +171,7 @@ fn default_backend_version() -> String {
 pub struct FeConfig {
     #[arg(long = "fe-host", default_value = "127.0.0.1")]
     pub host: Host,
-    #[arg(long = "fe-query-port", default_value_t = 9030)]
+    #[arg(long = "fe-query-port", default_value_t = DORIS_DEFAULT_FE_QUERY_PORT)]
     pub query_port: u16,
     #[arg(long = "fe-user", default_value = "root")]
     pub user: String,
@@ -177,7 +183,7 @@ impl Default for FeConfig {
     fn default() -> Self {
         Self {
             host: Host::local(),
-            query_port: 9030,
+            query_port: DORIS_DEFAULT_FE_QUERY_PORT,
             user: "root".to_string(),
             password: SecretString::default(),
         }
