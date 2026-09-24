@@ -1382,7 +1382,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
       launch_decode_fused_tree_mask_out(
         *region->built.tree, region->labeled, region->dtype, region->num_rows, *range, mask, frame);
     }
-    return mask_source_status::accepted;
+    return mask_source_status::ACCEPTED;
   }
   auto const& source = std::get<membership_source>(request.source);
   if (!source.probe) throw std::invalid_argument("decode: empty membership probe");
@@ -1410,7 +1410,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
                        sizeof(std::uint32_t);
     auto status = cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().value());
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-    return mask_source_status::declined;
+    return mask_source_status::DECLINED;
   }
   if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != destination.num_rows ||
       flags->null_count() != 0) {
@@ -1418,7 +1418,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
   }
   sirius::codegen::mask_from_bool8(
     flags.view().data<std::uint8_t>(), destination.num_rows, destination.words, frame.stream());
-  return mask_source_status::accepted;
+  return mask_source_status::ACCEPTED;
 }
 
 bool decompress_column_selection_mask(PlanTree const& tree,

@@ -209,8 +209,9 @@ std::size_t decode_frame::retained_host_bytes() const noexcept
   return bytes;
 }
 
+//===----------decode_session::impl----------===//
 struct decode_session::impl {
-  enum class phase { open, failed, finished };
+  enum class phase { OPEN, FAILED, FINISHED };
   struct result_slot {
     std::unique_ptr<cudf::column> column;
     std::optional<cudf::data_type> stored_type;
@@ -255,7 +256,7 @@ struct decode_session::impl {
   // loaded kernel until the final stream drain, not merely its frame's earlier retirement.
   std::vector<std::shared_ptr<codegen::jit::CompiledKernel const>> kernels;
   decode_session_stats stats;
-  phase state           = phase::open;
+  phase state           = phase::OPEN;
   std::size_t next_lane = 0;
   bool submitted        = false;
   bool drained          = false;
@@ -270,10 +271,10 @@ struct decode_session::impl {
   {
     if (std::this_thread::get_id() != thread)
       throw std::logic_error("decode_session thread changed");
-    if (state != phase::open) throw std::logic_error("decode_session is no longer open");
+    if (state != phase::OPEN) throw std::logic_error("decode_session is no longer open");
   }
 
-  bool first_stream_handle(std::size_t lane) const noexcept
+  [[nodiscard]] bool first_stream_handle(std::size_t lane) const noexcept
   {
     for (std::size_t earlier = 0; earlier < lane; ++earlier)
       if (streams[earlier].value() == streams[lane].value()) return false;
@@ -301,14 +302,14 @@ struct decode_session::impl {
 
   void abort() noexcept
   {
-    state             = phase::failed;
+    state             = phase::FAILED;
     auto const status = drain();
     if (status != cudaSuccess) {
       std::fprintf(stderr, "simpatico decode cleanup failed: %s\n", cudaGetErrorString(status));
     }
   }
 
-  retained_totals retained_snapshot() const
+  [[nodiscard]] retained_totals retained_snapshot() const
   {
     retained_totals totals;
     totals.frame_count = frames.size();
@@ -378,6 +379,7 @@ struct decode_session::impl {
   }
 };
 
+//===----------decode_session----------===//
 decode_session::decode_session(std::span<rmm::cuda_stream_view const> streams,
                                rmm::device_async_resource_ref mr)
   : state_(std::make_unique<impl>(streams, mr))
@@ -479,7 +481,7 @@ std::vector<std::unique_ptr<cudf::column>> decode_session::finish()
         result.column = restore_type(std::move(result.column), *result.stored_type);
       outputs.push_back(std::move(result.column));
     }
-    state_->state = impl::phase::finished;
+    state_->state = impl::phase::FINISHED;
     return outputs;
   } catch (...) {
     state_->abort();

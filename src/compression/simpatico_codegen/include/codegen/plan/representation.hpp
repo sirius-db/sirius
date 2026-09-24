@@ -182,7 +182,16 @@ struct compressed_representation {
 struct standalone_compressed_representation : compressed_representation {
   using compressed_representation::compressed_representation;
 
+  /**
+   * @brief Decode into an empty frame-owned slot using the frame's stream and resource.
+   *
+   * Implementations retain temporary data in @p frame before submitting work. The output may still
+   * be pending on return; the representation must remain alive until session completion.
+   */
   virtual void decompress(decode_frame& frame, decode_column_slot output) const = 0;
+  /**
+   * @brief Decode through a single-request session and return a completed column.
+   */
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const;
 };
@@ -258,8 +267,14 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   // unknown. Decode observes unknown widths locally without modifying the representation.
   std::int64_t constant_key_width = -1;
 
-  /// Complete construction and observe key width using the supplied stream and resource before
-  /// publishing a long-lived dictionary representation.
+  /**
+   * @brief Take ownership of an encoded dictionary and prepare its key-width metadata.
+   *
+   * Waits for @p stream before returning. Decode can then read the prepared width without modifying
+   * the representation.
+   *
+   * @throw std::invalid_argument if @p dict_col is null
+   */
   static std::unique_ptr<dictionary_compressed_representation> from_encoded_column(
     std::unique_ptr<cudf::column> dict_col,
     rmm::cuda_stream_view stream,
@@ -278,7 +293,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   void decompress(decode_frame& frame, decode_column_slot output) const override;
 
   /// Evaluate @p pred against the dictionary *keys* and map the result over the
-  /// indices, returning a BOOL8 column of @c num_rows without ever gathering the
+  /// indices, filling @p output with a BOOL8 column of @c num_rows without ever gathering the
   /// key chars into a decoded STRING column.
   ///
   /// The keys column is the distinct-value set (four entries for
@@ -286,6 +301,9 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   /// full-length pass is a 1-byte-per-row lookup over the already-materialised
   /// INT32 indices. Nulls propagate from the dictionary column, matching the
   /// semantics of comparing the decoded STRING column against the same values.
+  /// The frame retains temporary data until session completion; output may still be pending on
+  /// return. Returns false without filling @p output when the predicate is inactive or the
+  /// dictionary shape is unsupported.
   bool decompress_predicate(decode_predicate const& pred,
                             decode_frame& frame,
                             decode_column_slot output) const;

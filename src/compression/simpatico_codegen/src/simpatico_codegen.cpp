@@ -276,8 +276,9 @@ std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
   for (std::size_t i = 0; i < selected.size(); ++i) {
     auto const& column = table.columns[selected[i]];
     column_decode_request request{std::cref(*column.plan_tree), value_result{column.dtype}, {}};
-    if (!predicates.empty() && predicates[i].active())
+    if (!predicates.empty() && predicates[i].active()) {
       request.result = predicate_result{predicates[i], {}};
+    }
     session.append(std::move(request));
   }
   return std::make_unique<cudf::table>(session.finish());
@@ -584,7 +585,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         auto const& directive = request.filters[f];
         auto const& column    = table.columns[selected[directive.column]];
         if (wave1.append(mask_decode_request{*column.plan_tree, directive.pred, destination}) !=
-            mask_source_status::accepted)
+            mask_source_status::ACCEPTED)
           throw plan_error("filtered decode: preflighted range source declined");
       });
     }
@@ -604,7 +605,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         auto const& column    = table.columns[selected[directive.column]];
         auto status           = wave1.append(mask_decode_request{
           *column.plan_tree, membership_source{directive.probe, column.dtype}, destination});
-        declined_members += status == mask_source_status::declined;
+        declined_members += status == mask_source_status::DECLINED;
       });
     }
 

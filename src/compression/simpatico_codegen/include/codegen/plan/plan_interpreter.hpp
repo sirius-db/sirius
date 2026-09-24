@@ -140,8 +140,10 @@ struct decode_selection {
 
 /// Decompress a plan tree produced by compress_column. DecodeWalk performs a
 /// single reverse walk: each codegen-fused subtree root is inverted by one
-/// high-level ``decode_fused_subtree`` call and every other step by its rep's
-/// own decompress(). Runs entirely on ``stream``.
+/// fused decode launch and every other step by its rep's
+/// own decompress(). Runs entirely on ``stream`` and returns only after completion.
+/// Host validation failures return nullptr with @p error_out set. Execution failures
+/// attempt to complete submitted work and then propagate the original exception.
 /// @param pred  Optional set-membership directive. When non-null and active the
 ///              result is a BOOL8 column of the same row count carrying
 ///              `value ∈ pred->equals_any` instead of the reconstructed column
@@ -219,7 +221,8 @@ column_decode_caps probe_column(PlanTree const& tree);
 /// must hold ``selection_mask::AllocWordsFor(num_rows)`` words; every word of
 /// every covered chunk is written (out-of-range lanes ballot to 0, so tail
 /// bits are zero by construction). Returns false + @p error_out when the plan
-/// is not bitpack-rooted or the launch fails; no device state is corrupted.
+/// or destination fails host validation. Returns true only after mask writes complete.
+/// Execution failures throw; mask contents must not be used after a failed call.
 bool decompress_column_selection_mask(PlanTree const& tree,
                                       sirius::codegen::range_predicate pred,
                                       std::uint32_t* mask_words,
@@ -250,7 +253,7 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
 /// names/arity/type and reconstructs the rep. ``meta`` carries per-node decode
 /// metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
 /// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered
-/// from the channel buffers alone. Used by the decode driver.
+/// from the channel buffers alone. Used when loading stored representations.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
