@@ -158,7 +158,14 @@ platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 [feature.docs.dependencies]
 coreutils = "9.*"
 curl = "8.*"
+cxx-compiler = "*"
 doxygen = "1.13.*"
+rust = "1.*"
+
+[feature.docs.tasks.docs-rust]
+description = "Build the Sirius Rust API reference without libsirius."
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
 
 [feature.docs.tasks.docs-theme]
 description = "Download and verify Doxygen Awesome v2.5.0."
@@ -171,7 +178,12 @@ tar -xzf build/docs/theme.tar.gz --strip-components=1 -C build/docs/theme doxyge
 inputs = ["pixi.toml"]
 outputs = ["build/docs/theme/doxygen-awesome.css", "build/docs/theme/LICENSE"]
 
-[feature.docs.tasks.docs]
+[feature.docs.tasks.docs-cpp]
 description = "Build the Sirius public C++ API reference in build/docs/html."
 cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
 depends-on = ["docs-theme"]
+
+[feature.docs.tasks.docs]
+description = "Build the combined C++ and Rust documentation site in build/docs/site."
+cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
+depends-on = ["docs-cpp", "docs-rust"]

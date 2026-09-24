@@ -20,12 +20,14 @@
 
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_nested_loop_join.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -47,6 +49,17 @@ using namespace sirius::test::operator_utils;
 struct mark_join_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
+};
+
+struct finishable_mark_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit finishable_mark_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+
+  [[nodiscard]] bool is_pipeline_finished() const override { return finished; }
+
+  bool finished = false;
 };
 
 //! Depth-first, root-first numbering of a bare operator tree, standing in for
@@ -360,6 +373,88 @@ TEST_CASE("sirius_physical_hash_join mark join - empty right side", "[physical_m
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == left_ids);
   REQUIRE(copy_column_to_host<int32_t>(out_view.column(1)) == left_payload);
   REQUIRE(copy_column_to_host<bool>(out_view.column(2)) == std::vector<bool>{false, false, false});
+}
+
+TEST_CASE("MARK join drains probe batches when its build pipeline emits no batches",
+          "[physical_mark_join][build_probe]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto f          = create_mark_join();
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true};
+  auto build_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  auto probe_pipeline = std::make_shared<finishable_mark_pipeline>(ctx);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*build_pipeline, *f.hash_join->children[1]);
+  build_state.add_pipeline_operator(*probe_pipeline, *f.hash_join->children[0]);
+
+  auto attach_port = [&](std::string_view name,
+                         cucascade::shared_data_repository& repo,
+                         std::shared_ptr<finishable_mark_pipeline> source) {
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = MemoryBarrierType::PARTIAL;
+    port->repo         = &repo;
+    port->src_pipeline = std::move(source);
+    f.hash_join->add_port(name, std::move(port));
+  };
+  attach_port("build", *build_repo, build_pipeline);
+  attach_port("default", *probe_repo, probe_pipeline);
+
+  // Before either side is sized, the build producer is the next source of work.
+  auto hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[1].get());
+
+  // The build finishes without ever publishing a batch. The join must switch to the probe
+  // producer, then process each probe batch without trying to build a hash table.
+  build_pipeline->finished = true;
+  hint                     = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[0].get());
+
+  auto probe_key = make_numeric_batch_with_nulls<int32_t>(
+    *space, {1, 0, 2}, {true, false, true}, cudf::type_id::INT32);
+  auto payload = make_numeric_batch<int32_t>(*space, {10, 20, 30}, cudf::type_id::INT32);
+  probe_repo->add_data_batch(concatenate_batches_horizontal({probe_key, payload}, *space));
+
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  auto input = f.hash_join->get_next_task_input_data();
+  REQUIRE(input != nullptr);
+  auto output         = f.hash_join->execute(*input, cudf::get_default_stream());
+  auto const& batches = dynamic_cast<const pipelineable_operator_data&>(*output).get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto view = sirius::get_cudf_table_view(*batches[0]);
+  REQUIRE(copy_column_to_host<int32_t>(view.column(1)) == std::vector<int32_t>{10, 20, 30});
+  REQUIRE(view.column(2).null_count() == 0);
+  REQUIRE(copy_column_to_host<bool>(view.column(2)) == std::vector<bool>{false, false, false});
+
+  // A second poll must wait for more probe work, and both finished inputs end the join.
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == f.hash_join->children[0].get());
+
+  probe_repo->add_data_batch(make_two_column_batch<int32_t, int32_t>(
+    *space, {7}, {70}, cudf::type_id::INT32, std::nullopt, cudf::type_id::INT32));
+  hint = f.hash_join->get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  auto second_input = f.hash_join->get_next_task_input_data();
+  REQUIRE(second_input != nullptr);
+  auto second_output = f.hash_join->execute(*second_input, cudf::get_default_stream());
+  auto second_view   = sirius::get_cudf_table_view(
+    *dynamic_cast<const pipelineable_operator_data&>(*second_output).get_data_batches()[0]);
+  REQUIRE(copy_column_to_host<bool>(second_view.column(2)) == std::vector<bool>{false});
+
+  probe_pipeline->finished = true;
+  REQUIRE_FALSE(f.hash_join->get_next_task_hint().has_value());
 }
 
 TEST_CASE("sirius_physical_hash_join mark join - duplicate keys on right side",

@@ -8,20 +8,31 @@ this project), which then pulls in SiriusDB as an extension. We use
 
 ## Public API documentation
 
-Build the C++ reference for `include/sirius/` with:
+Build the C++ reference for `include/sirius/` and the Rust `sirius` crate reference:
 
 ```bash
 pixi run -e docs docs
 ```
 
-Open `build/docs/html/index.html` in your browser.
+Open `build/docs/site/index.html` in your browser. The site has a landing page at
+`/`, the C++ reference at `/cpp/`, and the Rust reference at `/rust/` (which opens
+`/rust/sirius/`). These paths are relative to the GitHub Pages project URL.
+
+Build either reference individually with `pixi run -e docs docs-cpp` or
+`pixi run -e docs docs-rust`.
 
 The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
 Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
-submodules. The task runs Doxygen directly; no Python or helper script is needed.
-The theme and Sirius logo follow the system light/dark preference using CSS and
-Doxygen's default header. Doxygen configuration and styling live in `docs/api/`;
-generated output stays under `build/docs/`.
+submodules. It includes Rust and a C++ compiler for Rust dependencies. The Rust
+task sets `DOCS_RS=1` to skip Sirius's native build and link steps, and treats
+Rustdoc warnings as errors. Both builds run directly through Pixi tasks, with no
+Python or helper script.
+
+The landing page and C++ theme follow the system light/dark preference; the Rust
+reference uses Rustdoc's built-in themes. Doxygen configuration and styling live
+in `docs/api/`, and the landing page lives in `docs/site/`. Generated output stays
+under `build/docs/`. The `docs` task assembles both references into a fresh
+`build/docs/site/` directory for publication.
 
 The `docs-theme` dependency task downloads [Doxygen Awesome](https://github.com/jothepro/doxygen-awesome-css)
 v2.5.0 at commit `46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da`, verifies the archive's
@@ -31,11 +42,11 @@ builds reuse the cached assets. The license is included in the generated site.
 To upgrade the theme, update the commit, version, and checksum in `pixi.toml`,
 then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
 
-The **Docs** workflow builds pull requests and merge-queue entries, uploading
-the HTML as a `github-pages` artifact. Pushes to `dev` build and deploy the site;
-deployment runs only for those pushes.
+The **Docs** workflow builds both references on pull requests and merge-queue
+entries, uploading the combined site as one `github-pages` artifact. Pushes to
+`main` build and deploy the site; deployment runs only for those pushes.
 For the first deployment, set **Settings → Pages → Build and deployment → Source**
-to **GitHub Actions**, and allow `dev` in the `github-pages` environment's deployment
+to **GitHub Actions**, and allow `main` in the `github-pages` environment's deployment
 rules. The published URL appears on the deployment job.
 
 ## Building Sirius

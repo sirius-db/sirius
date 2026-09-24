@@ -1183,7 +1183,7 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::append_virtual_columns(
   std::string const& file_path,
   std::size_t file_index,
   std::int64_t file_row_offset,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   if (_plan->carrier_batch_index && !reader_options.get_column_names().has_value()) {
@@ -1251,7 +1251,6 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
   sirius::op::dynamic_filter_snapshot dynamic_snapshot;
-  bool dynamic_reader_filter = false;
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
   if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
@@ -1265,9 +1264,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     if (ast_expression) { reader_filter_root = &ast_expression->back(); }
   }
 
-  if (!split.disable_filter_pushdown && _sirius_dynamic_filters) {
-    dynamic_snapshot          = _sirius_dynamic_filters->snapshot();
-    auto const* previous_root = reader_filter_root;
+  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
+      _sirius_dynamic_filters->has_filters()) {
+    dynamic_snapshot = _sirius_dynamic_filters->snapshot();
     if (ast_expression) {
       reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
                                                           reader_filter_root,
@@ -1283,95 +1282,87 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                                           mem_space.get_device_id());
       if (!reader_filter_root) { dynamic_ast_expression.reset(); }
     }
-    dynamic_reader_filter = reader_filter_root != previous_root;
   }
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   std::unique_ptr<cudf::table> table;
-  try {
-    if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
-      // Preserve provenance without relying on multi-source output order.
-      auto const layout     = build_batch_layout(split);
-      std::size_t run_index = 0;
-      std::vector<std::unique_ptr<cudf::table>> pieces;
-      for (auto const& slice : split.rg_slices) {
-        for (auto const rg_index : slice.row_group_indices) {
-          auto const& run = layout.at(run_index++);
-          std::vector<std::unique_ptr<cudf::io::datasource>> one_source;
-          one_source.push_back(slice.datasource
-                                 ? cudf::io::datasource::create(slice.datasource.get())
-                                 : cudf::io::datasource::create(slice.file_path));
-          std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
-          auto one_opts = *split.reader_options;
-          one_opts.set_row_groups({{rg_index}});
-          auto [decoded, metadata] = cudf::io::read_parquet(
-            std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
-          if (decoded->num_rows() != run.num_rows) {
-            throw sirius::internal_exception(
-              "parquet virtual scan: decoded row count does not match footer");
-          }
-          pieces.push_back(append_virtual_columns(std::move(decoded),
-                                                  *split.reader_options,
-                                                  run.data_file_path,
-                                                  run.file_index,
-                                                  run.file_row_offset,
-                                                  stream,
-                                                  mr_ref));
+  if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
+    // Preserve provenance without relying on multi-source output order.
+    auto const layout     = build_batch_layout(split);
+    std::size_t run_index = 0;
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    for (auto const& slice : split.rg_slices) {
+      for (auto const rg_index : slice.row_group_indices) {
+        auto const& run = layout.at(run_index++);
+        std::vector<std::unique_ptr<cudf::io::datasource>> one_source;
+        one_source.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
+                                              : cudf::io::datasource::create(slice.file_path));
+        std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
+        auto one_opts = *split.reader_options;
+        one_opts.set_row_groups({{rg_index}});
+        if (reader_filter_root) { one_opts.set_filter(*reader_filter_root); }
+        auto [decoded, metadata] = cudf::io::read_parquet(
+          std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
+        if (decoded->num_rows() != run.num_rows) {
+          throw sirius::internal_exception(
+            "parquet virtual scan: decoded row count does not match footer");
         }
-      }
-      if (run_index != layout.size()) {
-        throw sirius::internal_exception(
-          "parquet virtual scan: provenance layout does not match selected row groups");
-      }
-      if (pieces.empty()) {
-        throw sirius::internal_exception(
-          "parquet virtual scan: non-pruned split produced no row-group pieces");
-      }
-      if (pieces.size() == 1) {
-        table = std::move(pieces.front());
-      } else {
-        std::vector<cudf::table_view> views;
-        views.reserve(pieces.size());
-        for (auto const& piece : pieces) {
-          views.push_back(piece->view());
-        }
-        table = cudf::concatenate(views, stream, mr_ref);
-      }
-    } else {
-      std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-      std::vector<cudf::io::parquet::FileMetaData> metadatas;
-      std::vector<std::vector<cudf::size_type>> rg_per_src;
-      sources.reserve(split.rg_slices.size());
-      metadatas.reserve(split.rg_slices.size());
-      rg_per_src.reserve(split.rg_slices.size());
-      for (auto const& slice : split.rg_slices) {
-        sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
-                                           : cudf::io::datasource::create(slice.file_path));
-        metadatas.push_back(*slice.file_metadata);
-        rg_per_src.push_back(slice.row_group_indices);
-      }
-      if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
-      auto [decoded, metadata] =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
-      table = std::move(decoded);
-      if (_plan->has_user_virtual_columns()) {
-        auto const& slice = split.rg_slices.front();
-        table             = append_virtual_columns(std::move(table),
-                                       *split.reader_options,
-                                       slice.file_path,
-                                       slice.file_index,
-                                       0,
-                                       stream,
-                                       mr_ref);
+        pieces.push_back(append_virtual_columns(std::move(decoded),
+                                                *split.reader_options,
+                                                run.data_file_path,
+                                                run.file_index,
+                                                run.file_row_offset,
+                                                stream,
+                                                mr_ref));
       }
     }
-    // The reader AST borrows scalars owned by this checkpoint's snapshot.
-    if (dynamic_reader_filter) { stream.sync(); }
-  } catch (...) {
-    if (dynamic_reader_filter) { stream.sync(); }
-    throw;
+    if (run_index != layout.size()) {
+      throw sirius::internal_exception(
+        "parquet virtual scan: provenance layout does not match selected row groups");
+    }
+    if (pieces.empty()) {
+      throw sirius::internal_exception(
+        "parquet virtual scan: non-pruned split produced no row-group pieces");
+    }
+    if (pieces.size() == 1) {
+      table = std::move(pieces.front());
+    } else {
+      std::vector<cudf::table_view> views;
+      views.reserve(pieces.size());
+      for (auto const& piece : pieces) {
+        views.push_back(piece->view());
+      }
+      table = cudf::concatenate(views, stream, mr_ref);
+    }
+  } else {
+    std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+    std::vector<cudf::io::parquet::FileMetaData> metadatas;
+    std::vector<std::vector<cudf::size_type>> rg_per_src;
+    sources.reserve(split.rg_slices.size());
+    metadatas.reserve(split.rg_slices.size());
+    rg_per_src.reserve(split.rg_slices.size());
+    for (auto const& slice : split.rg_slices) {
+      sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
+                                         : cudf::io::datasource::create(slice.file_path));
+      metadatas.push_back(*slice.file_metadata);
+      rg_per_src.push_back(slice.row_group_indices);
+    }
+    if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
+    auto [decoded, metadata] =
+      cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+    table = std::move(decoded);
+    if (_plan->has_user_virtual_columns()) {
+      auto const& slice = split.rg_slices.front();
+      table             = append_virtual_columns(std::move(table),
+                                     *split.reader_options,
+                                     slice.file_path,
+                                     slice.file_index,
+                                     0,
+                                     stream,
+                                     mr_ref);
+    }
   }
 
   // Hive-partition scans assemble inline here: partition_values are per-split

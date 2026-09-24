@@ -35,7 +35,7 @@ namespace {
 
 namespace scan = sirius::op::scan;
 
-rmm::cuda_stream_view test_stream() { return cudf::get_default_stream(); }
+::cuda::stream_ref test_stream() { return cudf::get_default_stream(); }
 
 std::unique_ptr<cudf::column> int32_column(std::vector<std::int32_t> const& values)
 {
@@ -49,8 +49,8 @@ std::unique_ptr<cudf::column> int32_column(std::vector<std::int32_t> const& valu
                                   values.data(),
                                   values.size() * sizeof(std::int32_t),
                                   cudaMemcpyHostToDevice,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   }
   return column;
 }
@@ -74,8 +74,8 @@ std::vector<std::int32_t> to_host(cudf::column_view const& column)
                                   column.data<std::int32_t>(),
                                   values.size() * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   }
   return values;
 }

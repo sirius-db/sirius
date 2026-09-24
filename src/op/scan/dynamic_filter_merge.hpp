@@ -34,7 +34,7 @@ namespace sirius::op::scan {
 
 /**
  * @brief Selects membership-only application after scan-time AST filtering, or AST plus membership
- *        otherwise.
+ * otherwise.
  */
 enum class dynamic_filter_apply_mode { MEMBERSHIP_MASKS_ONLY, INCLUDE_AST_ROW_MASKS };
 

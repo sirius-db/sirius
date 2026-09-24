@@ -337,7 +337,9 @@ class sirius_dynamic_filter_set;
  */
 class dynamic_filter_snapshot final {
  public:
-  /** @brief One filter and its target column in the consumer's output schema */
+  /**
+   * @brief One filter and its target column in the consumer's output schema
+   */
   struct entry {
     std::size_t column_index;
     std::shared_ptr<sirius_dynamic_filter const> filter;
@@ -350,9 +352,12 @@ class dynamic_filter_snapshot final {
   [[nodiscard]] std::size_t generation() const noexcept { return _entries.size(); }
   /**
    * @brief Indicates if the snapshot represents a terminal state (no more filters will be added to
-   * the endpoint)
+   *        the endpoint)
    */
   [[nodiscard]] bool terminal() const noexcept { return _terminal; }
+  /**
+   * @brief Indicates if the snapshot is empty (no filters have been added to the endpoint)
+   */
   [[nodiscard]] bool empty() const noexcept { return _entries.empty(); }
 
  private:
@@ -373,7 +378,7 @@ class sirius_dynamic_filter_set {
   struct state;
 
  public:
-  enum class completion { published, skipped, failed, cancelled };
+  enum class completion { PUBLISHED, SKIPPED, FAILED, CANCELLED };
 
   /**
    * @brief Move-only publication right retaining its channel's state
@@ -410,7 +415,7 @@ class sirius_dynamic_filter_set {
      *
      * @param result The completion result of the producer
      */
-    void finish(completion result = completion::skipped) const noexcept;
+    void finish(completion result = completion::SKIPPED) const noexcept;
 
    private:
     friend class sirius_dynamic_filter_set;
@@ -432,20 +437,6 @@ class sirius_dynamic_filter_set {
    *       the snapshot is taken (the snapshot owns its entries).
    */
   [[nodiscard]] dynamic_filter_snapshot snapshot() const;
-
-  /**
-   * @brief Returns an insertion-order owning snapshot valid after later pushes or destruction
-   */
-  [[nodiscard]] std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters_for_column(
-    std::size_t col_idx) const;
-
-  /**
-   * @brief Returns the columns that have filters
-   *
-   * @note Meaningful only with producers and no unscoped producer.
-   */
-  [[nodiscard]] std::vector<std::size_t> filtered_columns() const;
-  [[nodiscard]] bool empty() const;
 
   /**
    * @brief Rejects future pushes for these output columns; existing filters remain

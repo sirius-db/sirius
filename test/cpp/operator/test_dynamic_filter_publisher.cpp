@@ -84,9 +84,7 @@ using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
 sirius::op::dynamic_filter_publication_outcome publish_for_test(
-  dynamic_filter_publish_plan const& plan,
-  cudf::table_view const& table,
-  rmm::cuda_stream_view stream)
+  dynamic_filter_publish_plan const& plan, cudf::table_view const& table, ::cuda::stream_ref stream)
 {
   std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
   for (auto const& target : plan.probe_targets()) {
@@ -101,17 +99,17 @@ sirius::op::dynamic_filter_publication_outcome publish_for_test(
   }
   try {
     auto result = sirius::op::publish_dynamic_filters(plan, table, stream, producers);
-    stream.synchronize();
+    stream.sync();
     for (auto const& producer : producers) {
       producer.finish(result.filters_pushed != 0
-                        ? sirius::op::sirius_dynamic_filter_set::completion::published
-                        : sirius::op::sirius_dynamic_filter_set::completion::skipped);
+                        ? sirius::op::sirius_dynamic_filter_set::completion::PUBLISHED
+                        : sirius::op::sirius_dynamic_filter_set::completion::SKIPPED);
     }
     return result;
   } catch (...) {
-    stream.synchronize();
+    stream.sync();
     for (auto const& producer : producers) {
-      producer.finish(sirius::op::sirius_dynamic_filter_set::completion::failed);
+      producer.finish(sirius::op::sirius_dynamic_filter_set::completion::FAILED);
     }
     throw;
   }
@@ -255,6 +253,17 @@ std::size_t count_filters_of_kind(
     }));
 }
 
+std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter const>> filters_on_column(
+  sirius::op::sirius_dynamic_filter_set const& set, std::size_t col_idx)
+{
+  auto const snapshot = set.snapshot();
+  std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter const>> out;
+  for (auto const& entry : snapshot.entries()) {
+    if (entry.column_index == col_idx) { out.push_back(entry.filter); }
+  }
+  return out;
+}
+
 template <typename ExpectedFilter>
 void require_published_membership(
   std::size_t rows,
@@ -291,7 +300,7 @@ void require_published_membership(
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
-  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
   REQUIRE(snapshot.size() == 1);
   auto const* selected = dynamic_cast<ExpectedFilter const*>(snapshot.front().get());
   REQUIRE(selected != nullptr);
@@ -389,8 +398,8 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
 
   auto const gated_ordinal     = gated_key_index == 0 ? kKey0PushOrdinal : kKey1PushOrdinal;
   auto const surviving_ordinal = gated_key_index == 0 ? kKey1PushOrdinal : kKey0PushOrdinal;
-  REQUIRE(channel->filters_for_column(gated_ordinal).empty());
-  auto const surviving = channel->filters_for_column(surviving_ordinal);
+  REQUIRE(filters_on_column(*channel, gated_ordinal).empty());
+  auto const surviving = filters_on_column(*channel, surviving_ordinal);
   REQUIRE(surviving.size() == 1);
 
   // Applying the filter distinguishes the two build columns, not just their push ordinals.
@@ -531,17 +540,17 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
   REQUIRE(outcome.keys_skipped_domain_gate == 0);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
 
-  REQUIRE(channel_a->filters_for_column(3).size() == 1);
-  REQUIRE(channel_a->filters_for_column(5).empty());
-  REQUIRE(channel_b->filters_for_column(5).size() == 1);
-  REQUIRE(channel_b->filters_for_column(3).empty());
+  REQUIRE(filters_on_column(*channel_a, 3).size() == 1);
+  REQUIRE(filters_on_column(*channel_a, 5).empty());
+  REQUIRE(filters_on_column(*channel_b, 5).size() == 1);
+  REQUIRE(filters_on_column(*channel_b, 3).empty());
 
   // Verify key identity, not just placement: channel A must hold build column 1's domain
   // ({0,1,2}) and channel B build column 0's ({100,101,102}).
   auto const probe = make_int64_values(fixture, {0, 100});
-  REQUIRE(membership_mask(*channel_a->filters_for_column(3).front(), probe->view(), fixture) ==
+  REQUIRE(membership_mask(*filters_on_column(*channel_a, 3).front(), probe->view(), fixture) ==
           std::vector<std::uint8_t>{1, 0});
-  REQUIRE(membership_mask(*channel_b->filters_for_column(5).front(), probe->view(), fixture) ==
+  REQUIRE(membership_mask(*filters_on_column(*channel_b, 5).front(), probe->view(), fixture) ==
           std::vector<std::uint8_t>{0, 1});
 }
 
@@ -596,9 +605,9 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps for floating-point keys
   REQUIRE(outcome.filters_pushed == 2);
 
   // With no filter published, every probe row (NaN included) reaches the authoritative join.
-  REQUIRE(channel->filters_for_column(kFloat64PushOrdinal).empty());
+  REQUIRE(filters_on_column(*channel, kFloat64PushOrdinal).empty());
 
-  auto const int64_snapshot = channel->filters_for_column(kInt64PushOrdinal);
+  auto const int64_snapshot = filters_on_column(*channel, kInt64PushOrdinal);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(int64_snapshot) == 1);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(int64_snapshot) ==
           1);
@@ -673,14 +682,14 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps per binding on probe-ty
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
-  auto const matching_snapshot = matching_channel->filters_for_column(kProbeColumnIndex);
+  auto const matching_snapshot = filters_on_column(*matching_channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(matching_snapshot) ==
           1);
   REQUIRE(
     count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(matching_snapshot) == 1);
 
   // The membership filter still arrives; only the zone map is suppressed for this binding.
-  auto const mismatched_snapshot = mismatched_channel->filters_for_column(kProbeColumnIndex);
+  auto const mismatched_snapshot = filters_on_column(*mismatched_channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(mismatched_snapshot) ==
           0);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(
@@ -715,12 +724,12 @@ TEST_CASE("dynamic-filter publisher keeps zone maps out of membership-only targe
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
-  auto const scan_snapshot = scan_channel->filters_for_column(kProbeColumnIndex);
+  auto const scan_snapshot = filters_on_column(*scan_channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(scan_snapshot) == 1);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(scan_snapshot) ==
           1);
 
-  auto const edge_snapshot = edge_channel->filters_for_column(2);
+  auto const edge_snapshot = filters_on_column(*edge_channel, 2);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(edge_snapshot) == 0);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(edge_snapshot) ==
           1);
@@ -768,7 +777,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing from an empty build",
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
-  REQUIRE(channel->empty());
+  REQUIRE(channel->snapshot().empty());
   REQUIRE_FALSE(channel->has_filters());
 }
 
@@ -795,7 +804,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing once every target has drai
 
   auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
-  REQUIRE(channel->empty());
+  REQUIRE(channel->snapshot().empty());
   REQUIRE_FALSE(channel->has_filters());
 }
 
@@ -834,8 +843,8 @@ TEST_CASE("dynamic-filter publisher serves a live target beside a drained one",
   REQUIRE(outcome.active_targets == 1);
   REQUIRE(outcome.filters_pushed == 1);
 
-  REQUIRE(live_channel->filters_for_column(5).size() == 1);
-  REQUIRE(drained_channel->empty());
+  REQUIRE(filters_on_column(*live_channel, 5).size() == 1);
+  REQUIRE(drained_channel->snapshot().empty());
 }
 
 TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
@@ -1047,7 +1056,7 @@ TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
 
   // Verify both the bound push ordinal and the selected build column.
-  auto const published = channel->filters_for_column(kBoundPushOrdinal);
+  auto const published = filters_on_column(*channel, kBoundPushOrdinal);
   REQUIRE(published.size() == 1);
   auto const probe = make_int64_values(fixture, {0, 100});
   REQUIRE(membership_mask(*published.front(), probe->view(), fixture) ==

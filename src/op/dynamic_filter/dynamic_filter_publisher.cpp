@@ -94,8 +94,8 @@ struct dynamic_filter_publication_session::state {
     }
     current = phase::terminal;
     if (!stats || !account_attempt) { return; }
-    if (result == sirius_dynamic_filter_set::completion::published ||
-        result == sirius_dynamic_filter_set::completion::skipped) {
+    if (result == sirius_dynamic_filter_set::completion::PUBLISHED ||
+        result == sirius_dynamic_filter_set::completion::SKIPPED) {
       stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
     } else {
       // result == completion::cancelled or completion::failed
@@ -154,7 +154,7 @@ void dynamic_filter_publication_session::restrict_replicas_to(
       "during execution");
   }
   _state->plan.restrict_replicas_to(admitted_gpu_ids);
-  if (!_state->plan.enabled()) { _state->complete(sirius_dynamic_filter_set::completion::skipped); }
+  if (!_state->plan.enabled()) { _state->complete(sirius_dynamic_filter_set::completion::SKIPPED); }
 }
 
 void dynamic_filter_publication_session::seal_plan() noexcept
@@ -170,7 +170,7 @@ void dynamic_filter_publication_session::finish_input() noexcept
   operation->seal();
   operation->input_closed = true;
   if (operation->current == state::phase::open) {
-    operation->complete(sirius_dynamic_filter_set::completion::skipped);
+    operation->complete(sirius_dynamic_filter_set::completion::SKIPPED);
   }
 }
 
@@ -181,7 +181,7 @@ void dynamic_filter_publication_session::cancel() noexcept
   operation->input_closed = true;
   operation->cancelled    = true;
   if (operation->current == state::phase::open) {
-    operation->complete(sirius_dynamic_filter_set::completion::cancelled);
+    operation->complete(sirius_dynamic_filter_set::completion::CANCELLED);
   }
 }
 
@@ -214,7 +214,7 @@ void dynamic_filter_publication_session::observe_whole_build(
       return pinned;
     } catch (...) {
       std::scoped_lock lock(operation->mutex);
-      operation->complete(sirius_dynamic_filter_set::completion::failed, true);
+      operation->complete(sirius_dynamic_filter_set::completion::FAILED, true);
       throw;
     }
   }();
@@ -230,8 +230,8 @@ void dynamic_filter_publication_session::observe_whole_build(
           1, std::memory_order_relaxed);
       }
       if (operation->input_closed) {
-        operation->complete(operation->cancelled ? sirius_dynamic_filter_set::completion::cancelled
-                                                 : sirius_dynamic_filter_set::completion::skipped);
+        operation->complete(operation->cancelled ? sirius_dynamic_filter_set::completion::CANCELLED
+                                                 : sirius_dynamic_filter_set::completion::SKIPPED);
       } else {
         operation->current = state::phase::open;
       }
@@ -272,15 +272,15 @@ void dynamic_filter_publication_session::observe_whole_build(
     std::scoped_lock lock(operation->mutex);
     operation->record(outcome);
     auto const result = operation->cancelled && !operation->fanout_started
-                          ? sirius_dynamic_filter_set::completion::cancelled
+                          ? sirius_dynamic_filter_set::completion::CANCELLED
                         : outcome.filters_pushed != 0
-                          ? sirius_dynamic_filter_set::completion::published
-                          : sirius_dynamic_filter_set::completion::skipped;
+                          ? sirius_dynamic_filter_set::completion::PUBLISHED
+                          : sirius_dynamic_filter_set::completion::SKIPPED;
     operation->complete(result, true);
   } catch (rmm::out_of_memory const& error) {
     {
       std::scoped_lock lock(operation->mutex);
-      operation->complete(sirius_dynamic_filter_set::completion::failed, true);
+      operation->complete(sirius_dynamic_filter_set::completion::FAILED, true);
     }
     SIRIUS_LOG_WARN(
       "[publish_dynamic_filters] publication exhausted device memory; continuing without filters: "
@@ -288,7 +288,7 @@ void dynamic_filter_publication_session::observe_whole_build(
       error.what());
   } catch (...) {
     std::scoped_lock lock(operation->mutex);
-    operation->complete(sirius_dynamic_filter_set::completion::failed, true);
+    operation->complete(sirius_dynamic_filter_set::completion::FAILED, true);
     throw;
   }
 }

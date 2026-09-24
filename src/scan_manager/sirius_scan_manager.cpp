@@ -353,7 +353,8 @@ struct cached_databatch_provider : public databatch_provider {
         // The drain usually precedes join publication. Decode-time refresh replaces this early
         // snapshot; snapshot_membership_probes owns the shared output-to-slot mapping contract.
         // Masked chunks compose these probes with the visibility mask attached above.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters) {
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
+            _dynamic_filters->has_filters()) {
           auto const snapshot = _dynamic_filters->snapshot();
           if (!snapshot.empty()) {
             auto snap =

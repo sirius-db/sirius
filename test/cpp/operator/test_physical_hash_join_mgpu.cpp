@@ -788,7 +788,7 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   // the not-published diagnostic.
   REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
   REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
-  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "dynamic filter NOT published"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "build is not one whole delivery"));
 
   fs::remove_all(tmp, ec);
 }

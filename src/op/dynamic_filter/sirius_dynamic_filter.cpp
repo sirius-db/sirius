@@ -467,7 +467,7 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
 struct sirius_dynamic_filter_set::state {
   struct producer_state {
     bool terminal     = false;
-    completion result = completion::skipped;
+    completion result = completion::SKIPPED;
   };
 
   mutable std::mutex mutex;
@@ -616,28 +616,6 @@ void sirius_dynamic_filter_set::close_for_new_filters()
   std::scoped_lock lock(_state->mutex);
   _state->accepting.store(false, std::memory_order_release);
 }
-
-std::vector<std::shared_ptr<sirius_dynamic_filter const>>
-sirius_dynamic_filter_set::filters_for_column(std::size_t col_idx) const
-{
-  std::scoped_lock lock(_state->mutex);
-  auto it = _state->filters.find(col_idx);
-  if (it == _state->filters.end()) { return {}; }
-  return it->second;
-}
-
-std::vector<std::size_t> sirius_dynamic_filter_set::filtered_columns() const
-{
-  std::scoped_lock lock(_state->mutex);
-  std::vector<std::size_t> out;
-  out.reserve(_state->filters.size());
-  for (auto const& [k, _] : _state->filters) {
-    out.push_back(k);
-  }
-  return out;
-}
-
-bool sirius_dynamic_filter_set::empty() const { return !has_filters(); }
 
 cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(
   cudf::ast::tree& tree,

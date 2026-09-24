@@ -163,7 +163,8 @@ void scan_operator_input::prepare_for_processing(
       // drain-time one. The mapping invariant lives in
       // snapshot_membership_probes. A masked split takes probes only if its rep carries
       // the visibility mask too, so the two compose into one selection.
-      if (sirius::decompression_pushdown_enabled() && dynamic_filters) {
+      if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
+          dynamic_filters->has_filters()) {
         auto const snapshot = dynamic_filters->snapshot();
         auto snapshot_onto  = [&](auto* rep) {
           if (mvcc_keep_mask.has_mask() && !rep->visibility_mask().has_mask()) { return; }
