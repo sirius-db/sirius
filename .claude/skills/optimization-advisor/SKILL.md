@@ -80,11 +80,11 @@ export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing (accurate cold/hot without nsys overhead)
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine gpu --iterations <N> [--queries 1,3,6-10]
+    --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # Full DuckDB vs Sirius benchmark + result validation
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine both --iterations <N> --validation
+    --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 
 Compare the resulting `<bench>/csv/runtimes.csv` against a previous non-profiled baseline to confirm the optimization actually improved wall-clock performance. Then run a new profiled analysis (`nsys_report.sh`) to understand what changed internally.
