@@ -35,35 +35,33 @@ namespace sirius::op::scan {
 cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& filters,
   scan_plan const& plan,
   int device_id)
 {
   device_id        = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
   auto const* root = existing_root;
-  for (auto const col_idx : filters.filtered_columns()) {
+  for (auto const& [col_idx, filter] : filters.entries()) {
     if (col_idx >= plan.output_layout.size()) { continue; }
     auto const& entry = plan.output_layout[col_idx];
     if (entry.source != scan_plan::output_entry::DATA) { continue; }  // hive — skip
     auto const& parquet_col_name = plan.data_columns[entry.idx].name;
 
-    for (auto const& f : filters.filters_for_column(col_idx)) {
-      if (!f->is_available_on_device(device_id)) { continue; }
-      auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
-      if (!lowerable) { continue; }
-      auto const& col_ref  = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
-      auto const& fragment = lowerable->to_ast(tree, col_ref, device_id);
-      root                 = root ? &tree.emplace<cudf::ast::operation>(
-                      cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
-                                  : &fragment;
-    }
+    if (!filter->is_available_on_device(device_id)) { continue; }
+    auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
+    if (!lowerable) { continue; }
+    auto const& col_ref  = tree.emplace<cudf::ast::column_name_reference>(parquet_col_name);
+    auto const& fragment = lowerable->to_ast(tree, col_ref, device_id);
+    root                 = root ? &tree.emplace<cudf::ast::operation>(
+                    cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
+                                : &fragment;
   }
   return root;
 }
 
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& filters,
   ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
@@ -88,63 +86,65 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
 
-  if (include_ast_masks) {
-    cudf::ast::tree tree;
-    cudf::ast::expression const* root = nullptr;
-    for (auto const col_idx : filters.filtered_columns()) {
-      if (col_idx >= num_cols) { continue; }
-      cudf::ast::expression const* col_ref = nullptr;
-      for (auto const& f : filters.filters_for_column(col_idx)) {
-        if (!f->is_available_on_device(device_id)) { continue; }
-        auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
+  bool submitted = false;
+  try {
+    if (include_ast_masks) {
+      cudf::ast::tree tree;
+      cudf::ast::expression const* root = nullptr;
+      for (auto const& [col_idx, filter] : filters.entries()) {
+        if (col_idx >= num_cols) { continue; }
+        if (!filter->is_available_on_device(device_id)) { continue; }
+        auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(filter.get());
         if (!lowerable) { continue; }
-        if (!col_ref) {
-          col_ref =
-            &tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
-        }
-        auto const& fragment = lowerable->to_ast(tree, *col_ref, device_id);
+        auto const& col_ref =
+          tree.emplace<cudf::ast::column_reference>(static_cast<cudf::size_type>(col_idx));
+        auto const& fragment = lowerable->to_ast(tree, col_ref, device_id);
         root                 = root ? &tree.emplace<cudf::ast::operation>(
                         cudf::ast::ast_operator::LOGICAL_AND, *root, fragment)
                                     : &fragment;
       }
+      if (root) {
+        // Cross-column AST masks update only the scan-level gate.
+        submitted = true;
+        (void)cascade_step(cudf::compute_column(current, *root, stream, mr));
+      }
     }
-    if (root) {
-      // Cross-column AST masks update only the scan-level gate.
-      (void)cascade_step(cudf::compute_column(current, *root, stream, mr));
-    }
-  }
 
-  struct membership_entry {
-    std::size_t col_idx;
-    sirius::op::sirius_mask_applicable const* filter;
-    sirius::op::sirius_dynamic_filter const* identity;
-    std::optional<double> recorded;
-  };
-  // Use one filter-count snapshot for every gate measurement in this pass.
-  auto const observed_filter_count = filters.filter_count();
-  std::vector<membership_entry> entries;
-  for (auto const col_idx : filters.filtered_columns()) {
-    if (col_idx >= num_cols) { continue; }
-    for (auto const& f : filters.filters_for_column(col_idx)) {
-      if (!f->is_available_on_device(device_id)) { continue; }
-      auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
+    struct membership_entry {
+      std::size_t col_idx;
+      sirius::op::sirius_mask_applicable const* filter;
+      sirius::op::sirius_dynamic_filter const* identity;
+      std::optional<double> recorded;
+    };
+    auto const observed_filter_count = filters.generation();
+    std::vector<membership_entry> entries;
+    for (auto const& [col_idx, filter] : filters.entries()) {
+      if (col_idx >= num_cols) { continue; }
+      if (!filter->is_available_on_device(device_id)) { continue; }
+      auto const* applicable =
+        dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
       if (!applicable) { continue; }
-      auto recorded = gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
+      auto recorded =
+        gate ? gate->filter_keep_ratio(filter.get(), observed_filter_count) : std::nullopt;
       if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
-      entries.push_back({col_idx, applicable, f.get(), recorded});
+      entries.push_back({col_idx, applicable, filter.get(), recorded});
     }
-  }
-  std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
-    return a.recorded.value_or(1.0) < b.recorded.value_or(1.0);
-  });
+    std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
+      return a.recorded.value_or(1.0) < b.recorded.value_or(1.0);
+    });
 
-  for (auto const& e : entries) {
-    if (current.num_rows() == 0) { break; }
-    auto const& probe = current.column(static_cast<cudf::size_type>(e.col_idx));
-    auto const kept   = cascade_step(e.filter->compute_mask(probe, device_id, stream, mr));
-    if (gate && !e.recorded) {
-      gate->record_filter_keep_ratio(e.identity, kept, observed_filter_count);
+    for (auto const& e : entries) {
+      if (current.num_rows() == 0) { break; }
+      auto const& probe = current.column(static_cast<cudf::size_type>(e.col_idx));
+      submitted         = true;
+      auto const kept   = cascade_step(e.filter->compute_mask(probe, device_id, stream, mr));
+      if (gate && !e.recorded) {
+        gate->record_filter_keep_ratio(e.identity, kept, observed_filter_count);
+      }
     }
+  } catch (...) {
+    if (submitted) { stream.sync(); }
+    throw;
   }
 
   if (!owned) { return nullptr; }
@@ -193,11 +193,13 @@ void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_fi
   }
 }
 
-bool dynamic_filter_gate::applicable(sirius::op::sirius_dynamic_filter_set const& filters) const
+bool dynamic_filter_gate::applicable(sirius::op::dynamic_filter_snapshot const& filters) const
 {
-  if (!filters.has_filters()) { return false; }
+  if (filters.empty()) { return false; }
   if (_state.load(std::memory_order_relaxed) != state::disabled) { return true; }
-  return filters.filter_count() > _decided_filter_count.load(std::memory_order_relaxed);
+  // Renewed filters may change the gate's verdict, so we check if the snapshot is newer than the
+  // last one that disabled the gate.
+  return filters.generation() > _decided_filter_count.load(std::memory_order_relaxed);
 }
 
 void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
@@ -224,17 +226,16 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
 
 std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& snapshot,
   dynamic_filter_gate& gate,
   ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   int device_id)
 {
-  if (!gate.applicable(filters)) { return nullptr; }
-  // Attribute the result to the channel-size snapshot used to start this apply.
-  auto const observed_filters = filters.filter_count();
+  if (!gate.applicable(snapshot)) { return nullptr; }
+  auto const observed_filters = snapshot.generation();
   auto const rows_before      = input.num_rows();
-  auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
+  auto filtered = apply_dynamic_filters_to_view(input, snapshot, stream, mode, &gate, device_id);
   if (!filtered) { return nullptr; }
   gate.record_keep_ratio(
     rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);

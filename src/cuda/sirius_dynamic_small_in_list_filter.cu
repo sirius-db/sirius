@@ -261,16 +261,16 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
         continue;
       }
 
-      rmm::device_buffer destination{bytes, stream, reservation->allocator()};
-      detail::enqueue_replica_copy(destination.data(),
+      auto replica = std::make_unique<needle_store::needle_replica>(
+        device_id, rmm::device_buffer{bytes, stream, reservation->allocator()});
+      detail::enqueue_replica_copy(replica->needles.data(),
                                    rmm::cuda_device_id{device_id},
                                    source->needles.data(),
                                    source_space,
                                    bytes,
                                    stream,
                                    target.get_host_staging_space());
-      pending.emplace_back(
-        std::make_unique<needle_store::needle_replica>(device_id, std::move(destination)), stream);
+      pending.emplace_back(std::move(replica), stream);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "

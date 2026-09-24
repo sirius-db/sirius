@@ -281,16 +281,7 @@ graph LR
 - Build-side CONCAT pushes to the HASH_JOIN's `"build"` port with `FULL` barrier (default)
 - The probe and build PARTITION operators are linked as siblings for partition count coordination
 
-For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
-its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
-channel publication before downstream task creation follows that join into its **immediate** probe
-producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each
-doing a `concat_all` push of the full build; the first to arrive publishes (exactly-once via the
-`OPEN -> PUBLISHING` compare-exchange). This edge ordering does not gate a base scan reached
-transitively through an intervening join; such a scan samples the channel opportunistically under
-normal scheduler order. See
-[Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
-[Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
+For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and channel publication before downstream task creation follows that join into its **immediate** probe producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each doing a `concat_all` push of the full build. `dynamic_filter_publication_session` elects and pins one delivery, invokes the hash join's repository deposit, then checks source usability/readiness and publishes inline before the push returns. An unusable delivery can release the claim only while input remains open. This edge ordering does not gate a base scan reached transitively through an intervening join; such a scan samples the channel opportunistically under normal scheduler order. See [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
 ### ORDER_BY → 3-Phase Sort
 

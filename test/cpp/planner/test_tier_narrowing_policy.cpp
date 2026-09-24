@@ -417,7 +417,7 @@ TEST_CASE("tier_narrowing_policy - join payloads keep narrow, join keys retract"
                      duckdb_integer_types(4));
     auto& probe = plan->children[0]->Cast<sirius::op::sirius_physical_table_scan>();
     probe.sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    probe.sirius_dynamic_filters->register_producer({1});
+    auto producer                = probe.sirius_dynamic_filters->register_producer({1});
 
     auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
 

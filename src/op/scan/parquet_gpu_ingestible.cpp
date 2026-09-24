@@ -1250,6 +1250,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
+  sirius::op::dynamic_filter_snapshot dynamic_snapshot;
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
   if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
@@ -1265,17 +1266,18 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
       _sirius_dynamic_filters->has_filters()) {
+    dynamic_snapshot = _sirius_dynamic_filters->snapshot();
     if (ast_expression) {
       reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
                                                           reader_filter_root,
-                                                          *_sirius_dynamic_filters,
+                                                          dynamic_snapshot,
                                                           *split.plan,
                                                           mem_space.get_device_id());
     } else {
       dynamic_ast_expression.emplace();
       reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
                                                           /*existing_root=*/nullptr,
-                                                          *_sirius_dynamic_filters,
+                                                          dynamic_snapshot,
                                                           *split.plan,
                                                           mem_space.get_device_id());
       if (!reader_filter_root) { dynamic_ast_expression.reset(); }
@@ -1300,6 +1302,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
         auto one_opts = *split.reader_options;
         one_opts.set_row_groups({{rg_index}});
+        if (reader_filter_root) { one_opts.set_filter(*reader_filter_root); }
         auto [decoded, metadata] = cudf::io::read_parquet(
           std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
         if (decoded->num_rows() != run.num_rows) {

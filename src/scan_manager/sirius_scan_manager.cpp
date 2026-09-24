@@ -350,34 +350,15 @@ struct cached_databatch_provider : public databatch_provider {
           projected->set_visibility_mask(
             sirius::decode_visibility_mask{mask.words, mask.row_count});
         }
-        // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
-        // builds publish mid-scan, so later batches legitimately carry more
-        // filters, and `generation` (the channel's monotonic count, read BEFORE
-        // the walk so it never claims filters the walk did not capture) says
-        // which snapshot this batch used.
-        //
-        // THE MAPPING INVARIANT: provider slot order == the ingestible's
-        // materialized_column_order == output columns FIRST, IN OUTPUT ORDER,
-        // then pure-filter columns (gather_by_primary_index at construction),
-        // while the filter set keys by the consumer's OUTPUT-COLUMN position
-        // (parquet installs set_consumer_column_remap with
-        // scan_plan::output_position_by_column_id). Slot i therefore maps to
-        // output position i for every output column, so slot i's filters are
-        // exactly filters_for_column(i); trailing pure-filter slots query keys
-        // the set can never hold (push_filter rejects non-output columns) and
-        // come back empty by construction — no output-arity knowledge is needed
-        // here. Masked chunks participate too: their mask is attached above, so probes
-        // and keep-mask land in one selection.
-        //
-        // This drain runs on the metadata thread at query PREPARE, before any
-        // join build has published, so this snapshot is almost always EMPTY. It
-        // is kept as a free early base; the authoritative snapshot is taken at
-        // decode time by scan_operator_input::prepare_for_processing (same
-        // builder, same mapping invariant), which replaces this one.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters) {
-          if (_dynamic_filters->has_filters()) {
-            auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
-                                                                     _column_indices.size());
+        // The drain usually precedes join publication. Decode-time refresh replaces this early
+        // snapshot; snapshot_membership_probes owns the shared output-to-slot mapping contract.
+        // Masked chunks compose these probes with the visibility mask attached above.
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
+            _dynamic_filters->has_filters()) {
+          auto const snapshot = _dynamic_filters->snapshot();
+          if (!snapshot.empty()) {
+            auto snap =
+              sirius::op::scan::snapshot_membership_probes(snapshot, _column_indices.size());
             SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
               "[decompression-pushdown] join filter attach (drain) channel={}: slots={} "
               "attached={} "

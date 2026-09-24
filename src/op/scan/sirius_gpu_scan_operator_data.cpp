@@ -61,55 +61,50 @@ sirius::decompression_pushdown_scan::compaction_forecast pushdown_compaction_for
 
 }  // namespace
 
-membership_snapshot snapshot_membership_probes(sirius::op::sirius_dynamic_filter_set const& set,
+membership_snapshot snapshot_membership_probes(sirius::op::dynamic_filter_snapshot const& snapshot,
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  // generation FIRST: it must never claim probes the walk below did not
-  // capture (see the header doc).
-  snap.generation = set.filter_count();
+  snap.generation = snapshot.generation();
   snap.probes.resize(n_slots);
-  for (std::size_t i = 0; i < n_slots; ++i) {
-    auto filters = set.filters_for_column(i);
-    for (auto& filter : filters) {
-      // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
-      // at decode; zone-map filters have no per-row form.
-      auto const* applicable =
-        dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
-      if (applicable == nullptr) {
-        ++snap.skipped_non_mask;
-        continue;
-      }
-      // Ordering signal (sirius::membership_probe doc): rank by ascending
-      // expected keep-rate, num_keys where the concrete filter exposes it.
-      // Bloom has no size accessor — the rank alone places it last.
-      std::uint8_t kind_rank = 255;
-      std::uint64_t num_keys = 0;
-      if (auto const* small =
-            dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
-        kind_rank = 0;
-        num_keys  = small->size();
-      } else if (auto const* set =
-                   dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
-        kind_rank = 1;
-        num_keys  = set->size();
-      } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
-        kind_rank = 2;
-      }
-      // The closure co-owns the filter. It is snapshotted before the balancer
-      // assigns this split's chunk to a GPU, so the device isn't known yet
-      // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
-      // device at probe time, which the task scheduler has already set to
-      // the chunk's assigned GPU by then.
-      snap.probes[i].push_back(
-        {[f = std::move(filter), applicable](
-           cudf::column_view const& keys, ::cuda::stream_ref s, rmm::device_async_resource_ref mr) {
-           return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
-         },
-         kind_rank,
-         num_keys});
-      ++snap.attached_probes;
+  for (auto const& [i, filter] : snapshot.entries()) {
+    if (i >= n_slots) { continue; }
+    // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
+    // at decode; zone-map filters have no per-row form.
+    auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
+    if (applicable == nullptr) {
+      ++snap.skipped_non_mask;
+      continue;
     }
+    // Ordering signal (sirius::membership_probe doc): rank by ascending
+    // expected keep-rate, num_keys where the concrete filter exposes it.
+    // Bloom has no size accessor — the rank alone places it last.
+    std::uint8_t kind_rank = 255;
+    std::uint64_t num_keys = 0;
+    if (auto const* small =
+          dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
+      kind_rank = 0;
+      num_keys  = small->size();
+    } else if (auto const* set =
+                 dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
+      kind_rank = 1;
+      num_keys  = set->size();
+    } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
+      kind_rank = 2;
+    }
+    // The closure co-owns the filter. It is snapshotted before the balancer
+    // assigns this split's chunk to a GPU, so the device isn't known yet
+    // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
+    // device at probe time, which the task scheduler has already set to
+    // the chunk's assigned GPU by then.
+    snap.probes[i].push_back(
+      {[f = filter, applicable](
+         cudf::column_view const& keys, ::cuda::stream_ref s, rmm::device_async_resource_ref mr) {
+         return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
+       },
+       kind_rank,
+       num_keys});
+    ++snap.attached_probes;
   }
   return snap;
 }
@@ -170,16 +165,17 @@ void scan_operator_input::prepare_for_processing(
       // the visibility mask too, so the two compose into one selection.
       if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
           dynamic_filters->has_filters()) {
-        auto snapshot_onto = [&](auto* rep) {
+        auto const snapshot = dynamic_filters->snapshot();
+        auto snapshot_onto  = [&](auto* rep) {
           if (mvcc_keep_mask.has_mask() && !rep->visibility_mask().has_mask()) { return; }
           std::size_t const n_slots = rep->selected_indices().has_value()
-                                        ? rep->selected_indices()->size()
-                                        : rep->column_names().size();
-          auto snap                 = snapshot_membership_probes(*dynamic_filters, n_slots);
+                                         ? rep->selected_indices()->size()
+                                         : rep->column_names().size();
+          auto snap                 = snapshot_membership_probes(snapshot, n_slots);
           SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
             "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} "
-            "attached={} "
-            "generation={} skipped_non_maskable={}",
+             "attached={} "
+             "generation={} skipped_non_maskable={}",
             static_cast<void const*>(dynamic_filters.get()),
             n_slots,
             snap.attached_probes,
@@ -187,8 +183,8 @@ void scan_operator_input::prepare_for_processing(
             snap.skipped_non_mask);
           if (snap.attached_probes == 0) { return; }
           auto const base = rep->pushdown_scan()
-                              ? rep->pushdown_scan()
-                              : std::make_shared<const ::sirius::decompression_pushdown_scan>(
+                               ? rep->pushdown_scan()
+                               : std::make_shared<const ::sirius::decompression_pushdown_scan>(
                                   ::sirius::pushdown_request{});
           rep->set_pushdown_scan(
             base->with_membership_probes(std::move(snap.probes), snap.generation));

@@ -637,15 +637,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                            .probe_storage_type   = key.probe_storage_type}}});
         }
       }
-      // Register after all keys bind so each declaration covers every planned push.
-      for (auto const& target : targets) {
-        std::vector<std::size_t> planned_columns;
-        planned_columns.reserve(target.key_bindings.size());
-        for (auto const& binding : target.key_bindings) {
-          planned_columns.push_back(binding.channel_push_ordinal);
-        }
-        target.filter_set->register_producer(std::move(planned_columns));
-      }
     }
     if (!targets.empty()) {
       SIRIUS_LOG_INFO(
