@@ -25,7 +25,10 @@ from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal
 
 import duckdb
-from queries import QUERIES
+from queries import (
+    queries_for_scale_factor,
+    scale_factor_metadata_value,
+)
 from tpch_pin_columns import (
     emit_pin,
     emit_pin_all,
@@ -219,6 +222,8 @@ def setup_benchmark_dir(
     queries,
     config_path,
     pin,
+    scale_factor,
+    query_texts,
     name=None,
     precmd="none",
     data_source="parquet",
@@ -231,6 +236,7 @@ def setup_benchmark_dir(
         <benchmark_name>/
           config.yml         (copy of Sirius config, if provided)
           metadata.json
+          queries/q<N>.sql           (effective query text)
           csv/runtimes.csv
           log_dir/                  (SIRIUS_LOG_DIR target)
           <engine>/q<N>/result.txt  (one repr(row) per line)
@@ -250,6 +256,12 @@ def setup_benchmark_dir(
     os.makedirs(csv_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
+    query_sql_dir = os.path.join(benchmark_dir, "queries")
+    os.makedirs(query_sql_dir, exist_ok=True)
+    for qnum in queries:
+        with open(os.path.join(query_sql_dir, f"q{qnum}.sql"), "w") as f:
+            f.write(query_texts[f"q{qnum}"].rstrip().rstrip(";") + ";\n")
+
     runtime_csv = os.path.join(csv_dir, "runtimes.csv")
 
     if config_path and os.path.isfile(config_path):
@@ -263,6 +275,7 @@ def setup_benchmark_dir(
         "profile": profile_label,
         "iterations": iterations,
         "engine": engine,
+        "scale_factor": scale_factor,
         "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
@@ -675,7 +688,7 @@ def _execute_multi(con, sql):
         con.execute(stmt).fetchall()
 
 
-def time_query(con, qnum, use_gpu, profile_path=None):
+def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
     engine_label = "GPU/sirius" if use_gpu else "CPU/duckdb"
     if use_gpu:
         log("  SET gpu_execution = true (GPU/sirius)")
@@ -692,7 +705,7 @@ def time_query(con, qnum, use_gpu, profile_path=None):
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
     start = time.perf_counter()
-    rows = con.execute(QUERIES[f"q{qnum}"]).fetchall()
+    rows = con.execute(query_sql).fetchall()
     elapsed = time.perf_counter() - start
     log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
     return elapsed, rows
@@ -744,7 +757,15 @@ class RuntimeCsv:
 
 
 def _run_one(
-    writer, con, name, qnum, it, use_gpu, benchmark_dir, duckdb_profiling=False
+    writer,
+    con,
+    name,
+    qnum,
+    it,
+    use_gpu,
+    benchmark_dir,
+    query_texts,
+    duckdb_profiling=False,
 ):
     profile_path = None
     if duckdb_profiling and not use_gpu:
@@ -753,7 +774,9 @@ def _run_one(
         profile_path = os.path.join(
             _query_dir(benchmark_dir, name, qnum), f"profile_iter{it}.json"
         )
-    elapsed, rows = time_query(con, qnum, use_gpu, profile_path=profile_path)
+    elapsed, rows = time_query(
+        con, qnum, query_texts[f"q{qnum}"], use_gpu, profile_path=profile_path
+    )
     writer.record(name, qnum, it, elapsed)
     _write_result(benchmark_dir, name, qnum, rows)
 
@@ -782,6 +805,7 @@ def run_grouped(
     benchmark_dir,
     pin,
     profile,
+    query_texts,
     data_source="parquet",
     duckdb_profiling=False,
     pin_after_iteration=0,
@@ -833,6 +857,7 @@ def run_grouped(
                             it,
                             use_gpu,
                             benchmark_dir,
+                            query_texts,
                             duckdb_profiling,
                         )
                 finally:
@@ -854,6 +879,7 @@ def run_sequential(
     benchmark_dir,
     pin,
     profile,
+    query_texts,
     data_source="parquet",
     duckdb_profiling=False,
     pin_after_iteration=0,
@@ -904,6 +930,7 @@ def run_sequential(
                             it,
                             use_gpu,
                             benchmark_dir,
+                            query_texts,
                             duckdb_profiling,
                         )
             finally:
@@ -924,7 +951,7 @@ RUNNERS = {
 
 
 def _build_precmd_temp_sql(
-    qnum, source, iterations, pin, qdir, precmd, data_source="parquet"
+    qnum, query_sql, source, iterations, pin, qdir, precmd, data_source="parquet"
 ):
     """Write the DuckDB SQL script for one external pre-command invocation.
 
@@ -975,7 +1002,7 @@ def _build_precmd_temp_sql(
     # iteration) is captured.
     if precmd == "nsys":
         parts.append("CALL profiler_start();")
-    query_sql = QUERIES[f"q{qnum}"].rstrip().rstrip(";") + ";"
+    query_sql = query_sql.rstrip().rstrip(";") + ";"
     for i in range(1, iterations + 1):
         parts.append(query_sql)
         parts.append(
@@ -1017,6 +1044,7 @@ def run_nsys_profile(
     *,
     benchmark_dir,
     pin,
+    query_texts,
     config_path,
     query_timeout,
     data_source="parquet",
@@ -1053,7 +1081,14 @@ def run_nsys_profile(
         os.makedirs(sub_log_dir, exist_ok=True)
 
         sql_path = _build_precmd_temp_sql(
-            qnum, source, iterations, pin, qdir, "nsys", data_source
+            qnum,
+            query_texts[f"q{qnum}"],
+            source,
+            iterations,
+            pin,
+            qdir,
+            "nsys",
+            data_source,
         )
         nsys_output = os.path.join(qdir, "nsys")
         stdout_path = os.path.join(qdir, "nsys_stdout.txt")
@@ -1175,6 +1210,7 @@ def run_gdb(
     *,
     benchmark_dir,
     pin,
+    query_texts,
     config_path,
     query_timeout,
     data_source="parquet",
@@ -1206,7 +1242,7 @@ def run_gdb(
         os.makedirs(sub_log_dir, exist_ok=True)
 
         sql_path = _build_precmd_temp_sql(
-            qnum, source, iterations, pin, qdir, "gdb", data_source
+            qnum, query_texts[f"q{qnum}"], source, iterations, pin, qdir, "gdb", data_source
         )
         stdout_path = os.path.join(qdir, "gdb_stdout.txt")
 
@@ -1351,12 +1387,12 @@ def print_runtime_summary(runtime_csv):
     print()
 
 
-def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
+def split_sirius_log(log_dir, benchmark_dir, queries, iterations, query_texts):
     """Split the combined Sirius spdlog into one log file per query.
 
     A query's segment runs from its `QueryBegin: SQL: <sql>` marker to the next such
     marker. Benchmarked-query begins are identified by matching the logged
-    (whitespace-normalized) SQL against the known QUERIES text, so interleaved control
+    (whitespace-normalized) SQL against the rendered query text, so interleaved control
     statements (`SET gpu_execution`, `CALL pin_table`/`unpin_table`, `CREATE VIEW`,
     `LOAD`) are ignored and segments are grouped by query content. This is robust
     across data sources (parquet/duckdb), pinning on/off, and every profile --
@@ -1376,7 +1412,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
         # and lowercase so the match is exact but tolerant of formatting differences.
         return " ".join(sql.split()).rstrip(";").strip().lower()
 
-    known = {_norm(QUERIES[f"q{q}"]): q for q in queries}
+    known = {_norm(query_texts[f"q{q}"]): q for q in queries}
 
     begin_marker = "QueryBegin: "
     sql_marker = " SQL: "
@@ -1511,6 +1547,16 @@ def parse_args():
         "file or subdir per table), an s3:// prefix holding one <table>/ subdir "
         "per table (--engine gpu only), or a single .duckdb file "
         "(--data-source duckdb)",
+    )
+    p.add_argument(
+        "--scale-factor",
+        type=str,
+        default=None,
+        help=(
+            "TPC-H scale factor used to render scale-dependent query parameters, "
+            "notably Q11's FRACTION. Defaults to 1 with a warning for backward "
+            "compatibility."
+        ),
     )
     p.add_argument(
         "--data-source",
@@ -1740,6 +1786,17 @@ def _resolve_duckdb_results_dir(path):
 
 def main():
     args = parse_args()
+    if args.scale_factor is None:
+        log(
+            "WARNING: --scale-factor was not provided; defaulting to SF1. "
+            "Pass the dataset's scale factor so Q11 uses 0.0001 / SF."
+        )
+        args.scale_factor = "1"
+    try:
+        query_texts = queries_for_scale_factor(args.scale_factor)
+        scale_factor = scale_factor_metadata_value(args.scale_factor)
+    except ValueError as exc:
+        raise SystemExit(f"--scale-factor: {exc}") from exc
     source = args.input
     if args.data_source == "duckdb":
         if not os.path.isfile(source):
@@ -1892,6 +1949,8 @@ def main():
         queries,
         config_path,
         args.pin,
+        scale_factor,
+        query_texts,
         name=args.name,
         precmd=precmd,
         data_source=args.data_source,
@@ -1919,6 +1978,7 @@ def main():
     log(f"Mode:          {args.mode or '(unset)'}")
     log(f"Iterations:    {args.iterations}")
     log(f"Engine:        {args.engine}")
+    log(f"Scale factor:  {scale_factor}")
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
@@ -1948,6 +2008,7 @@ def main():
                 writer,
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
+                query_texts=query_texts,
                 config_path=config_path,
                 query_timeout=args.query_timeout,
                 data_source=args.data_source,
@@ -1960,6 +2021,7 @@ def main():
                 writer,
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
+                query_texts=query_texts,
                 config_path=config_path,
                 query_timeout=args.query_timeout,
                 data_source=args.data_source,
@@ -1974,6 +2036,7 @@ def main():
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
                 profile=profile,
+                query_texts=query_texts,
                 data_source=args.data_source,
                 duckdb_profiling=args.duckdb_profiling,
                 pin_after_iteration=args.pin_after_iteration,
@@ -1986,7 +2049,7 @@ def main():
     # the long-running Python connection. External runners already isolate each
     # query under <bench>/sirius/q<N>/log_dir/.
     if not uses_precmd and any(use_gpu for _, use_gpu in engine_modes):
-        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations)
+        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations, query_texts)
 
     if do_validate:
         log("Starting validation")
