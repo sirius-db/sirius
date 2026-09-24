@@ -41,7 +41,7 @@ namespace op {
  * Provide functionalities including:
  * - Local ungrouped aggregation;
  * - Local grouped aggregation
- * - Local whole-row distinct
+ * - Local one row per key
  *
  * Require caller to have already upgraded input data batches into `gpu_table_representation`.
  */
@@ -94,13 +94,13 @@ class gpu_aggregate_impl {
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
-   * @brief Perform a local whole-row distinct: keep one arbitrary row per distinct key.
+   * @brief Keep one arbitrary row per distinct key in one batch.
    *
    * Runs `cudf::distinct` over the whole input keyed on `group_idx`, with `KEEP_ANY`, NULL keys
    * equal to each other and every NaN equal to every other NaN, then emits the columns `select`
-   * names in that order. `select` comes from `whole_row_distinct_select`, so the output is the
+   * names in that order. `select` comes from `one_row_per_key_select`, so the output is the
    * group keys followed by the carried columns, the layout `PARTITION` and
-   * `gpu_merge_impl::merge_whole_row_distinct` expect.
+   * `gpu_merge_impl::merge_one_row_per_key` expect.
    *
    * @throw std::runtime_error if an entry of `group_idx` or `select` is outside the input's columns
    *
@@ -113,7 +113,7 @@ class gpu_aggregate_impl {
    *
    * @return The output data batch.
    */
-  static std::shared_ptr<cucascade::data_batch> local_whole_row_distinct(
+  static std::shared_ptr<cucascade::data_batch> local_one_row_per_key(
     const cucascade::read_only_data_batch& input,
     const std::vector<int>& group_idx,
     const std::vector<int>& select,

@@ -38,7 +38,7 @@ namespace op {
  * count_distinct case to add here.
  *
  * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg` (decomposes
- * into SUM + COUNT_VALID) and `first` (a whole-row distinct in the grouped aggregate, NTH_ELEMENT
+ * into SUM + COUNT_VALID) and `first` (one row per key in the grouped aggregate, NTH_ELEMENT
  * in the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
@@ -78,7 +78,7 @@ struct CudfAggregateDefinitions {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
-  /// True if any aggregate is FIRST. Presence only: whole_row_distinct_select() decides whether
+  /// True if any aggregate is FIRST. Presence only: one_row_per_key_select() decides whether
   /// cudf::distinct can run the list, so a second FIRST implementation can sit beside it.
   bool has_first = false;
 };
@@ -101,25 +101,26 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 /**
- * @brief Child columns a whole-row distinct keeps, in output order
+ * @brief Child columns emitted by keeping one row per key, in output order
  *
- * A grouped aggregate is a whole-row distinct when every slot is a FIRST and `group_idx` together
- * with the slots' `first_input_idx` values name each of `0 .. output_width - 1` once.
- * `cudf::distinct` on the `group_idx` keys then computes the whole operator: it keeps one row per
- * group, and the returned list selects `group_idx` followed by each slot's `first_input_idx` out of
+ * Keeping one row per key computes the whole operator when every slot is a FIRST and `group_idx`
+ * together with the slots' `first_input_idx` values name each of `0 .. output_width - 1` once. A
+ * key is the tuple of all `group_idx` columns. `cudf::distinct` on those columns keeps one row per
+ * key, and the returned list selects `group_idx` followed by each slot's `first_input_idx` out of
  * that row. `sirius_physical_grouped_aggregate` and `sirius_physical_grouped_aggregate_merge` both
  * route on this function, so they cannot disagree about the shape.
  *
  * An empty `aggregate_slots` returns nullopt, which keeps a zero-aggregate `SELECT DISTINCT` on the
- * ordinary groupby path.
+ * ordinary groupby path. `sirius_physical_grouped_aggregate::is_one_row_per_key` states the full
+ * routing rule.
  *
  * @param group_idx Child column read by each group key
  * @param aggregate_slots One entry per aggregate expression
  * @param output_width Number of output columns the operator declares
- * @return Child column for each output column, or nullopt when the request list is not a whole-row
- * distinct
+ * @return Child column for each output column, or nullopt when keeping one row per key does not
+ * compute the operator
  */
-std::optional<std::vector<int>> whole_row_distinct_select(
+std::optional<std::vector<int>> one_row_per_key_select(
   std::vector<int> const& group_idx,
   std::vector<AggregateSlot> const& aggregate_slots,
   std::size_t output_width);

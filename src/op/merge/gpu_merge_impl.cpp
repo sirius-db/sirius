@@ -301,7 +301,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_whole_row_distinct(
+std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_one_row_per_key(
   const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   ::cuda::stream_ref stream,
@@ -310,7 +310,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_whole_row_distinct(
 {
   if (input.size() < 2) {
     throw std::runtime_error(
-      "`input` in `merge_whole_row_distinct()` should at least contain two data batches");
+      "`input` in `merge_one_row_per_key()` should at least contain two data batches");
   }
 
   std::vector<cudf::table_view> input_cudf_table_views;
@@ -320,7 +320,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_whole_row_distinct(
   }
   if (input_cudf_table_views[0].num_columns() < num_group_cols) {
     throw std::runtime_error(
-      "`num columns >= num_group_cols` not true in `merge_whole_row_distinct()`");
+      "`num columns >= num_group_cols` not true in `merge_one_row_per_key()`");
   }
   auto mr           = memory_space.get_default_allocator();
   auto concatenated = cudf::concatenate(input_cudf_table_views, stream, mr);
@@ -336,7 +336,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_whole_row_distinct(
                                 cudf::nan_equality::ALL_EQUAL,
                                 stream,
                                 mr);
-  SIRIUS_LOG_DEBUG("merge_whole_row_distinct: {} batches, {} rows in, {} rows out",
+  SIRIUS_LOG_DEBUG("merge_one_row_per_key: {} batches, {} rows in, {} rows out",
                    input.size(),
                    concatenated->num_rows(),
                    deduped->num_rows());

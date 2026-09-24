@@ -134,7 +134,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       continue;
     }
 
-    // FIRST adds no cuDF aggregation: the list is only runnable as a whole-row distinct, which
+    // FIRST adds no cuDF aggregation: the list is only runnable as one row per key, which
     // reads first_input_idx instead of the three parallel cudf_* vectors.
     if (fid == sirius::aggregate_id::first) {
       if (children.size() != 1 || !children[0]->is_reference()) {
@@ -186,7 +186,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   return result;
 }
 
-std::optional<std::vector<int>> whole_row_distinct_select(
+std::optional<std::vector<int>> one_row_per_key_select(
   std::vector<int> const& group_idx,
   std::vector<AggregateSlot> const& aggregate_slots,
   std::size_t output_width)

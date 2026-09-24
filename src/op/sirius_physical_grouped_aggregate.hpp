@@ -99,8 +99,12 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
 
-  //! Whether whole_row_distinct_select() accepts this operator, so execute() runs cudf::distinct.
-  [[nodiscard]] bool is_whole_row_distinct() const;
+  //! Whether execute() keeps one row per key with cudf::distinct instead of running cudf::groupby.
+  //! A list with no FIRST, including DISTINCT's empty list, runs cudf::groupby. A list of only
+  //! FIRSTs whose inputs and the group keys cover every output column once keeps one row per key,
+  //! which answers every FIRST at once. A FIRST beside any other aggregate is refused at
+  //! construction. The merge routes the same way on the fields it copies from this operator.
+  [[nodiscard]] bool is_one_row_per_key() const;
 
   // Source interface
   bool is_source() const override { return true; }

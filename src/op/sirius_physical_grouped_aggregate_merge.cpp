@@ -154,9 +154,9 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_first                         = cudf_defs.has_first;
 }
 
-bool sirius_physical_grouped_aggregate_merge::is_whole_row_distinct() const
+bool sirius_physical_grouped_aggregate_merge::is_one_row_per_key() const
 {
-  return whole_row_distinct_select(group_idx, aggregate_slots, types.size()).has_value();
+  return one_row_per_key_select(group_idx, aggregate_slots, types.size()).has_value();
 }
 
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
@@ -231,12 +231,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       clone_batch_id,
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
-  } else if (is_whole_row_distinct()) {
-    merged = gpu_merge_impl::merge_whole_row_distinct(input_batches,
-                                                      group_idx.size(),
-                                                      stream,
-                                                      *input_batches[0].get_memory_space(),
-                                                      batch_telemetry());
+  } else if (is_one_row_per_key()) {
+    merged = gpu_merge_impl::merge_one_row_per_key(input_batches,
+                                                   group_idx.size(),
+                                                   stream,
+                                                   *input_batches[0].get_memory_space(),
+                                                   batch_telemetry());
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),

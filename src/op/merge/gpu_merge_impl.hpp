@@ -44,7 +44,7 @@ namespace op {
  * - Concatenate multiple data batches;
  * - Merge aggregation over multiple data batches (presumably each input data batch is a local
  * aggregation result);
- * - Merge whole-row distinct over multiple local whole-row distinct results;
+ * - Merge one row per key over multiple local one-row-per-key results;
  * - Merge sort over multiple sorted data batches.
  *
  * Require caller to have already upgraded input data batches into `gpu_table_representation`.
@@ -109,10 +109,10 @@ class gpu_merge_impl {
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
   /**
-   * @brief Perform a whole-row distinct over multiple local whole-row distinct results.
+   * @brief Keep one row per key across multiple local one-row-per-key results.
    *
    * Each batch holds `num_group_cols` key columns followed by carried columns, as
-   * `gpu_aggregate_impl::local_whole_row_distinct` emits them. The batches are concatenated and
+   * `gpu_aggregate_impl::local_one_row_per_key` emits them. The batches are concatenated and
    * deduplicated again on the leading `num_group_cols` columns with the same `cudf::distinct`
    * options, so the output keeps the input's column layout.
    *
@@ -126,7 +126,7 @@ class gpu_merge_impl {
    *
    * @return The output data batch.
    */
-  static std::shared_ptr<cucascade::data_batch> merge_whole_row_distinct(
+  static std::shared_ptr<cucascade::data_batch> merge_one_row_per_key(
     const std::vector<cucascade::read_only_data_batch>& input,
     int num_group_cols,
     ::cuda::stream_ref stream,

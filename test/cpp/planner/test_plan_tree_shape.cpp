@@ -1131,19 +1131,19 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - carried DISTINCT columns lower to a whole-row distinct",
+                 "plan tree shape - carried DISTINCT columns lower to one row per key",
                  "[plan_tree_shape][isolated_context]")
 {
   // The chain the carried shapes share: one HASH_GROUP_BY whose aggregate list is all FIRST and
   // emits no cuDF aggregation, with the merge inheriting the FIRST flag. `first_inputs` is each
   // slot's child column in slot order.
-  auto require_whole_row_distinct_chain = [](sirius_physical_operator* plan,
-                                             std::vector<int> const& first_inputs) {
+  auto require_one_row_per_key_chain = [](sirius_physical_operator* plan,
+                                          std::vector<int> const& first_inputs) {
     auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     REQUIRE(merge != nullptr);
     auto& merge_op = merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>();
     CHECK(merge_op.has_first);
-    CHECK(merge_op.is_whole_row_distinct());
+    CHECK(merge_op.is_one_row_per_key());
     REQUIRE(merge->children.size() == 1);
 
     auto* partition = merge->children[0].get();
@@ -1158,7 +1158,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK_FALSE(aggregate.has_avg);
     CHECK_FALSE(aggregate.has_count_distinct);
     CHECK(aggregate.has_first);
-    CHECK(aggregate.is_whole_row_distinct());
+    CHECK(aggregate.is_one_row_per_key());
     // DISTINCT builds no grouping set and a plain GROUP BY builds one.
     CHECK(aggregate.grouping_sets.size() <= 1);
     CHECK(aggregate.get_types().size() == aggregate.group_idx.size() + first_inputs.size());
@@ -1191,7 +1191,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id) id, val FROM big_left");
     INFO(tree_to_string(plan.get()));
 
-    auto* aggregate = require_whole_row_distinct_chain(plan.get(), {1});
+    auto* aggregate = require_one_row_per_key_chain(plan.get(), {1});
     CHECK(aggregate->group_idx == std::vector<int>{0});
     // The select list the builder writes is [#0, #1] over an operator already in that order, so
     // push_projection drops it.
@@ -1205,7 +1205,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id FROM big_left ORDER BY val");
     INFO(tree_to_string(plan.get()));
 
-    auto* aggregate = require_whole_row_distinct_chain(plan.get(), {1});
+    auto* aggregate = require_one_row_per_key_chain(plan.get(), {1});
     CHECK(aggregate->group_idx == std::vector<int>{0});
     CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
   }
@@ -1218,7 +1218,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id + val) id, val FROM big_left");
     INFO(tree_to_string(plan.get()));
 
-    auto* aggregate = require_whole_row_distinct_chain(plan.get(), {0, 1});
+    auto* aggregate = require_one_row_per_key_chain(plan.get(), {0, 1});
     CHECK(aggregate->group_idx == std::vector<int>{2});
     CHECK(aggregate->get_types().size() == 3);
 
@@ -1239,7 +1239,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = generate_sirius_plan(*con, "SELECT id, first(val) FROM big_left GROUP BY id");
     INFO(tree_to_string(plan.get()));
 
-    auto* aggregate = require_whole_row_distinct_chain(plan.get(), {1});
+    auto* aggregate = require_one_row_per_key_chain(plan.get(), {1});
     CHECK(aggregate->group_idx == std::vector<int>{0});
   }
 }
@@ -1330,9 +1330,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   SECTION("an all-FIRST list over several grouping sets is refused")
   {
     // ROLLUP adds no output column, so the cover holds and only the grouping-set count refuses it.
-    // A whole-row distinct would return the per-id rows and drop the grand-total row.
+    // Keeping one row per key would return the per-id rows and drop the grand-total row.
     require_rejected("SELECT id, first(val) FROM big_left GROUP BY ROLLUP (id)",
-                     "grouped FIRST is only supported as a whole-row DISTINCT");
+                     "grouped FIRST is only supported as one row per key");
   }
 
   SECTION("an all-FIRST list beside a grouping function fails the cover")
@@ -1340,12 +1340,13 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // GROUPING(id) is an output column no group key or FIRST input covers.
     require_rejected(
       "SELECT id, first(val), GROUPING(id) FROM big_left GROUP BY GROUPING SETS ((id))",
-      "grouped FIRST is only supported as a whole-row DISTINCT");
+      "grouped FIRST is only supported as one row per key");
   }
 
-  SECTION("a FIRST with a FILTER is refused before it can reach the whole-row route")
+  SECTION("a FIRST with a FILTER is refused before it can reach the one-row-per-key route")
   {
-    // The filter would be hoisted into a projected column that the whole-row route never reads.
+    // The filter would be hoisted into a projected column that the one-row-per-key route never
+    // reads.
     require_rejected("SELECT id, first(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
                      "first() with a FILTER or ORDER BY");
   }

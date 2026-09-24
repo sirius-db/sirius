@@ -36,7 +36,7 @@
 
 // Lowering for `SELECT DISTINCT`: a LogicalDistinct becomes one grouped aggregate whose groups are
 // the distinct targets. An output column no target covers is carried by a FIRST over that column,
-// as DuckDB's own builder does, and the operator runs an all-FIRST list as a whole-row distinct.
+// as DuckDB's own builder does, and the operator runs an all-FIRST list by keeping one row per key.
 
 namespace sirius::planner {
 

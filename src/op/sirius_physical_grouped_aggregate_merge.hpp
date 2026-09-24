@@ -117,8 +117,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     return indices;
   }
 
-  //! Whether whole_row_distinct_select() accepts this operator, so execute() runs cudf::distinct.
-  [[nodiscard]] bool is_whole_row_distinct() const;
+  //! Same routing as sirius_physical_grouped_aggregate::is_one_row_per_key(), on copied fields.
+  [[nodiscard]] bool is_one_row_per_key() const;
 
   // Source interface
   bool is_source() const override { return true; }

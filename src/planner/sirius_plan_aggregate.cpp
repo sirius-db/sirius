@@ -693,7 +693,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   }
 
   // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and an all-FIRST list runs as a
-  // whole-row distinct that would silently ignore either one.
+  // one-row-per-key route that would silently ignore either one.
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
     if ((aggregate.filter || aggregate.order_bys) &&

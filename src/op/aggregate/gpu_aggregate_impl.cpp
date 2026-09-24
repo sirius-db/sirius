@@ -417,7 +417,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_whole_row_distinct(
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_one_row_per_key(
   const cucascade::read_only_data_batch& input,
   const std::vector<int>& group_idx,
   const std::vector<int>& select,
@@ -430,7 +430,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_whole_row_disti
   // The operator bounded these indices by its declared width, not by this batch's.
   auto const require_in_range = [&](int idx) {
     if (idx < 0 || idx >= input_table.num_columns()) {
-      throw std::runtime_error("whole-row distinct: column " + std::to_string(idx) +
+      throw std::runtime_error("one row per key: column " + std::to_string(idx) +
                                " is out of range for a batch of " +
                                std::to_string(input_table.num_columns()) + " columns");
     }
