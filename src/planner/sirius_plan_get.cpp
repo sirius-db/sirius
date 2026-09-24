@@ -531,14 +531,13 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
-// An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
-// neither contributes to the predicate convert_table_filters_to_expression builds
-// (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
+// Only OPTIONAL_FILTER is advisory. Required predicates, including IS_NOT_NULL,
+// must translate for the scan's row-level evaluator. Keep this in step with
+// convert_table_filters_to_expression (scan_utils.cpp): probing a filter the
 // scan discharges would reject plans the scan handles correctly.
 [[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
 {
-  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-         filter_type == duckdb::TableFilterType::IS_NOT_NULL;
+  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER;
 }
 
 // Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
@@ -963,14 +962,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // With FILTER_PUSHDOWN enabled, filters from WHERE clauses are pushed into table_filters.
   // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
   // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
-  // We track the original projection_ids so we can project back after filtering.
-  duckdb::vector<std::size_t> original_projection_ids = projection_ids;
+  // Empty projection_ids means all column_ids are already read and emitted.
+  // Do not turn that into an explicit projection containing only filter columns.
 
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
 
-  if (table_filters) {
+  if (table_filters && !projection_ids.empty()) {
     for (auto& entry : table_filters->filters) {
       // entry.first is the column index in the table_filters (after remapping by
       // create_table_filter_set) We need to ensure this column is in projection_ids so it gets

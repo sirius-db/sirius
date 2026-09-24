@@ -83,6 +83,19 @@ Two polymorphic carriers separate per-table from per-split state (`gpu_ingestibl
 
 The operator skips `post_filter_and_project` only when the state is already `ROW_FILTERED_AND_PROJECTED`.
 
+Required scan predicates, including `IS NOT NULL` introduced by DuckDB's string-predicate
+rewrites, belong to the scan's row-level evaluator. Native reads and pinned batches retain
+them through materialization and evaluate them before dropping filter-only columns. An empty
+`projection_ids` means all `column_ids` are read; an explicit projection is extended with
+filter-only columns while preserving the original output arity.
+
+Parquet (and its Iceberg subclass) also retains NULL predicates in the residual. Null-count
+statistics can prune whole row groups, but mixed groups still need row filtering. NULL tests
+never enter cuDF's min/max statistics expression; a partial reader pushdown cannot claim the
+whole predicate was applied. Numeric decode-range analysis likewise retains the residual when
+it cannot represent required NULL rejection. Advisory `OPTIONAL_FILTER`s and hive partition
+predicates already enforced by DuckDB's file selection remain omitted.
+
 ### Factories
 
 There is no factory class. Each implementation provides a free `make_ingestible(std::unique_ptr<...table_info>)` overload (defined in its `.cpp`); the pipeline converter calls the right overload by the concrete `table_info` type it built.
