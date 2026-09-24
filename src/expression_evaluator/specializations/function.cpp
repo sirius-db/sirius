@@ -32,6 +32,7 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -47,6 +48,7 @@
 
 // standard library
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <string>
@@ -285,11 +287,55 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   if (resolved_id == function_id::second) {
     return execute_datetime_extract_func(cudf::datetime::datetime_component::SECOND);
   }
-  if (resolved_id == function_id::millisecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MILLISECOND);
-  }
-  if (resolved_id == function_id::microsecond) {
-    return execute_datetime_extract_func(cudf::datetime::datetime_component::MICROSECOND);
+  if (resolved_id == function_id::millisecond || resolved_id == function_id::microsecond) {
+    D_ASSERT(args.size() == 1);
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      input = evaluate_result(
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    auto const extract = [&](cudf::datetime::datetime_component component) {
+      return cudf::datetime::extract_datetime_component(
+        input.get_column_view(), component, _stream, _mr);
+    };
+
+    // cuDF returns separate base-1000 components; DuckDB includes the seconds
+    // within the minute. In particular, MICROSECOND excludes whole milliseconds.
+    // cuDF's time-of-day decomposition also handles pre-epoch timestamps without
+    // a signed epoch remainder. Widen before arithmetic: 59999 does not fit INT16.
+    auto const output_type = cudf::data_type{cudf::type_id::INT64};
+    cudf::numeric_scalar<int64_t> thousand(1000, true, _stream, _mr);
+    auto seconds = extract(cudf::datetime::datetime_component::SECOND);
+    auto millis  = extract(cudf::datetime::datetime_component::MILLISECOND);
+    auto scaled  = cudf::binary_operation(
+      seconds->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+    auto result = cudf::binary_operation(
+      scaled->view(), millis->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    if (resolved_id == function_id::microsecond) {
+      auto micros = extract(cudf::datetime::datetime_component::MICROSECOND);
+      scaled      = cudf::binary_operation(
+        result->view(), thousand, cudf::binary_operator::MUL, output_type, _stream, _mr);
+      result = cudf::binary_operation(
+        scaled->view(), micros->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
+    }
+    // DuckDB returns NULL for infinite dates/timestamps as well as NULL input.
+    auto const days  = input.get_column_view().type().id() == cudf::type_id::TIMESTAMP_DAYS;
+    auto const ticks = cudf::bit_cast(
+      input.get_column_view(), cudf::data_type{days ? cudf::type_id::INT32 : cudf::type_id::INT64});
+    int64_t const limit =
+      days ? std::numeric_limits<int32_t>::max() : std::numeric_limits<int64_t>::max();
+    cudf::numeric_scalar<int64_t> lower(-limit, true, _stream, _mr);
+    cudf::numeric_scalar<int64_t> upper(limit, true, _stream, _mr);
+    auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
+    auto above =
+      cudf::binary_operation(ticks, lower, cudf::binary_operator::GREATER, bool_type, _stream, _mr);
+    auto below =
+      cudf::binary_operation(ticks, upper, cudf::binary_operator::LESS, bool_type, _stream, _mr);
+    auto finite = cudf::binary_operation(
+      above->view(), below->view(), cudf::binary_operator::LOGICAL_AND, bool_type, _stream, _mr);
+    cudf::numeric_scalar<int64_t> null_result(0, false, _stream, _mr);
+    result = cudf::copy_if_else(result->view(), null_result, finite->view(), _stream, _mr);
+    return evaluate_result(std::move(result));
   }
 
   //----------Date Truncation Function----------//
