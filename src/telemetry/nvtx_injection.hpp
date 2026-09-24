@@ -16,7 +16,13 @@
 
 #pragma once
 
+#include <string>
+
 namespace sirius::telemetry::detail {
+
+// Select NVTX discovery before the first instrumented call.
+__attribute__((visibility("hidden"))) void configure_nvtx_injection(
+  bool enabled, const std::string& library) noexcept;
 
 // NVTX passes this private token to dlopen. The statically linked Sirius host
 // recognizes it and returns a handle to the running executable instead.

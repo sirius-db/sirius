@@ -201,7 +201,7 @@ set(EXTENSION_SOURCES
     src/sirius_context.cpp
     src/sirius_engine.cpp
     src/sirius_extension.cpp
-    src/sirius_extension_entry.cpp
+    src/telemetry/nvtx_injection.cpp
     src/sirius_ffi.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
