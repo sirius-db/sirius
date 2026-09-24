@@ -16,7 +16,6 @@ name: Check
 on:
   push:
     branches:
-      - dev
       - main
   pull_request:
   merge_group:

@@ -3,7 +3,6 @@ name: Docs
 on:
   push:
     branches:
-      - dev
       - main
   pull_request:
   merge_group:
@@ -29,7 +28,7 @@ jobs:
 
   deploy:
     needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-slim
     permissions:
       pages: write
