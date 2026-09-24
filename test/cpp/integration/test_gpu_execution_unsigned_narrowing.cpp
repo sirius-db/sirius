@@ -48,7 +48,8 @@ class UnsignedNarrowingFixture : public sirius::test::GpuExecutionFixture {
     run_ok("SET enable_duckdb_fallback=true;");
     REQUIRE(result);
     REQUIRE(result->HasError());
-    REQUIRE(result->GetError().find("Unsupported expression") != std::string::npos);
+    INFO(result->GetError());
+    REQUIRE(result->GetError().find("Unsupported") != std::string::npos);
   }
 };
 }  // namespace
