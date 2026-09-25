@@ -68,6 +68,7 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 using namespace duckdb;
@@ -1165,10 +1166,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     std::vector<int> actual_inputs;
     for (auto const& slot : aggregate.aggregate_slots) {
-      CHECK(slot.is_first);
-      CHECK_FALSE(slot.is_avg);
-      CHECK_FALSE(slot.is_count_distinct);
-      actual_inputs.push_back(slot.first_input_idx);
+      auto const* first = std::get_if<sirius::op::first_slot>(&slot);
+      REQUIRE(first != nullptr);
+      CHECK(first->carried_idx == actual_inputs.size());
+      actual_inputs.push_back(first->input_idx);
     }
     CHECK(actual_inputs == first_inputs);
     return &aggregate;

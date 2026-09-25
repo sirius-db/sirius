@@ -15,6 +15,7 @@
  */
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
+#include "cucascade/utils/overloaded.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -27,6 +28,8 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
+
+#include <variant>
 
 namespace sirius {
 namespace op {
@@ -269,14 +272,16 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     output_cols.push_back(std::move(merged_cols[i]));
   }
 
-  // Process each original aggregate
-  for (auto const& slot : aggregate_slots) {
-    if (slot.is_avg) {
-      int sum_col_idx   = num_group_cols + static_cast<int>(slot.cudf_idx);
-      int count_col_idx = num_group_cols + static_cast<int>(slot.cudf_idx) + 1;
-
-      auto sum_view   = merged_cols[sum_col_idx]->view();
-      auto count_view = merged_cols[count_col_idx]->view();
+  // Partials follow the keys, and the carried block follows the partials.
+  auto const partials_begin = group_idx.size();
+  auto const carried_begin  = partials_begin + cudf_aggregates.size();
+  auto const finalize       = cucascade::utils::overloaded{
+    [&](plain_slot const& slot) {
+      return std::move(merged_cols[partials_begin + slot.partial_idx]);
+    },
+    [&](avg_slot const& slot) {
+      auto sum_view   = merged_cols[partials_begin + slot.sum_idx]->view();
+      auto count_view = merged_cols[partials_begin + slot.sum_idx + 1]->view();
 
       std::unique_ptr<cudf::column> avg_col;
       bool is_decimal = sirius::IsCudfTypeDecimal(slot.output_type);
@@ -296,22 +301,22 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
                                          stream,
                                          mr);
       }
-
-      output_cols.push_back(std::move(avg_col));
-    } else if (slot.is_count_distinct) {
+      return avg_col;
+    },
+    [&](count_distinct_slot const& slot) {
       // The merged column is a LIST column (output of MERGE_SETS). Count elements per row to
       // produce the final distinct count, then cast to INT64.
-      int col_idx      = num_group_cols + static_cast<int>(slot.cudf_idx);
-      auto list_view   = cudf::lists_column_view(merged_cols[col_idx]->view());
+      auto list_view =
+        cudf::lists_column_view(merged_cols[partials_begin + slot.partial_idx]->view());
       auto count_int32 = cudf::lists::count_elements(list_view, stream, mr);
-      auto count_int64 =
-        cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-      output_cols.push_back(std::move(count_int64));
-    } else {
-      // Move non-AVG, non-count-distinct aggregate columns directly (zero-copy)
-      int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
-      output_cols.push_back(std::move(merged_cols[col_idx]));
-    }
+      return cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+    },
+    [&](first_slot const& slot) {
+      return std::move(merged_cols[carried_begin + slot.carried_idx]);
+    },
+  };
+  for (auto const& slot : aggregate_slots) {
+    output_cols.push_back(std::visit(finalize, slot));
   }
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
