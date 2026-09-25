@@ -25,7 +25,10 @@
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/scan_plan.hpp>
 
+#include <cstddef>
 #include <memory>
+#include <optional>
+#include <span>
 
 namespace sirius::op::scan {
 
@@ -33,7 +36,53 @@ namespace sirius::op::scan {
  * @brief Selects membership-only application after scan-time AST filtering, or AST plus membership
  * otherwise.
  */
-enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };
+enum class dynamic_filter_apply_mode { MEMBERSHIP_MASKS_ONLY, INCLUDE_AST_ROW_MASKS };
+
+namespace detail {
+
+/**
+* @brief Compaction strategy for dynamic filter application
+*
+* @details The compaction strategy is used to determine how and when payload columns are compacted
+*          during dynamic filter application.
+* - CASCADE: Payload columns are compacted after each filter application.
+* - DEFERRED_KEYS: Compact only the next filter's key column and row ids,
+                   deferring compaction of payload until all filters have been applied.
+* - GATHER_ONCE: AND all masks in original row space, then compact all columns once.
+*/
+enum class compaction_strategy { CASCADE, DEFERRED_KEYS, GATHER_ONCE };
+
+/**
+ * @brief Input parameters for compaction strategy selection.
+ */
+struct compaction_policy_input {
+  std::size_t rows;
+  std::optional<std::size_t> input_bytes;
+  std::size_t candidate_step_count;
+  std::span<std::optional<double> const> membership;
+};
+
+/**
+ * @brief Chooses the compaction strategy based on the input policy.
+ */
+[[nodiscard]] compaction_strategy choose_compaction_strategy(
+  compaction_policy_input const& input) noexcept;
+
+/**
+ * @brief Applies one explicitly selected compaction strategy with test-only invariant checks
+ *
+ * This seam bypasses strategy policy so tests can compare complete outputs from the same snapshot.
+ */
+[[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_for_testing(
+  cudf::table_view const& input,
+  sirius::op::dynamic_filter_snapshot const& filters,
+  ::cuda::stream_ref stream,
+  compaction_strategy strategy,
+  dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
+  dynamic_filter_gate* gate      = nullptr,
+  int device_id                  = -1);
+
+}  // namespace detail
 
 /**
  * @brief ANDs compatible filters into @p tree
@@ -54,15 +103,17 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
  *
  * Input uses scan output layout. A gate may suppress low-value masks; a negative device ID selects
  * the current device. Submitted work completes before the snapshot can be released, including on
- * exceptional exits; no consumer waits for channel publication.
+ * exceptional exits; no consumer waits for channel publication. Exact input bytes enable deferred
+ * compaction policy decisions; callers without byte accounting retain the conservative cascade.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
   ::cuda::stream_ref stream,
-  dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
-  dynamic_filter_gate* gate      = nullptr,
-  int device_id                  = -1);
+  dynamic_filter_apply_mode mode         = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
+  dynamic_filter_gate* gate              = nullptr,
+  int device_id                          = -1,
+  std::optional<std::size_t> input_bytes = std::nullopt);
 
 /**
  * @brief Applies filters through the scan-level gate
@@ -75,6 +126,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
   dynamic_filter_gate& gate,
   ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
-  int device_id = -1);
+  int device_id                          = -1,
+  std::optional<std::size_t> input_bytes = std::nullopt);
 
 }  // namespace sirius::op::scan
