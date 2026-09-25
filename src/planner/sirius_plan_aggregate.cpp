@@ -692,16 +692,37 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and an all-FIRST list runs as a
-  // one-row-per-key route that would silently ignore either one.
+  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and the grouped operator also
+  // computes a DISTINCT sum or avg without the DISTINCT. A grouped FIRST refuses all three rather
+  // than return a wrong answer beside them.
+  auto const aggregate_id_of = [](duckdb::unique_ptr<duckdb::Expression> const& expression) {
+    return sirius::from_duckdb_aggregate_name(
+      expression->Cast<duckdb::BoundAggregateExpression>().function.name);
+  };
+  bool const has_grouped_first =
+    (!op.groups.empty() || op.grouping_sets.size() > 1) &&
+    std::ranges::any_of(op.expressions, [&](auto const& expression) {
+      return aggregate_id_of(expression) == sirius::aggregate_id::first;
+    });
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if ((aggregate.filter || aggregate.order_bys) &&
-        sirius::from_duckdb_aggregate_name(aggregate.function.name) ==
-          sirius::aggregate_id::first) {
+    auto const id         = aggregate_id_of(expression);
+    if ((aggregate.filter || aggregate.order_bys) && id == sirius::aggregate_id::first) {
       throw duckdb::NotImplementedException(
         "first() with a FILTER or ORDER BY clause is not supported on the GPU (falling back to "
         "CPU): " +
+        aggregate.ToString());
+    }
+    if (has_grouped_first && aggregate.filter) {
+      throw duckdb::NotImplementedException(
+        "FILTER beside first() is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
+    }
+    if (has_grouped_first && aggregate.IsDistinct() &&
+        (id == sirius::aggregate_id::sum || id == sirius::aggregate_id::sum_no_overflow ||
+         id == sirius::aggregate_id::avg)) {
+      throw duckdb::NotImplementedException(
+        "a DISTINCT sum or avg beside first() is not supported on the GPU (falling back to CPU): " +
         aggregate.ToString());
     }
   }

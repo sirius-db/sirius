@@ -174,17 +174,19 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     result.aggregate_slots.push_back(plain_slot{.partial_idx = current_position});
   }
 
-  // A FIRST beside a real aggregate would reach the ordinary groupby, which emits nothing for the
-  // FIRST and so returns one column fewer than the operator declares.
-  if (result.has_first && std::any_of(result.aggregate_slots.begin(),
-                                      result.aggregate_slots.end(),
-                                      [](AggregateSlot const& slot) {
-                                        return !std::holds_alternative<first_slot>(slot);
-                                      })) {
-    throw_unsupported_aggregate(sirius::aggregate_id::first, "mixed with other aggregates");
-  }
-
   return result;
+}
+
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots)
+{
+  std::vector<int> inputs;
+  for (auto const& slot : aggregate_slots) {
+    if (auto const* first = std::get_if<first_slot>(&slot)) {
+      D_ASSERT(first->carried_idx == inputs.size());
+      inputs.push_back(first->input_idx);
+    }
+  }
+  return inputs;
 }
 
 std::optional<std::vector<int>> one_row_per_key_select(

@@ -222,7 +222,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // Fast path: single batch with no post-processing needed
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
+  if (input_batches.size() == 1 && partials_are_output()) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -234,24 +234,19 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       clone_batch_id,
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
-  } else if (is_one_row_per_key()) {
-    merged = gpu_merge_impl::merge_one_row_per_key(input_batches,
-                                                   group_idx.size(),
-                                                   stream,
-                                                   *input_batches[0].get_memory_space(),
-                                                   batch_telemetry());
   } else {
-    merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                     group_idx.size(),
-                                                     cudf_aggregates,
-                                                     0,
-                                                     stream,
-                                                     *input_batches[0].get_memory_space(),
-                                                     batch_telemetry());
+    merged = gpu_merge_impl::merge_grouped_aggregate(
+      input_batches,
+      group_idx.size(),
+      cudf_aggregates,
+      static_cast<int>(carried_inputs(aggregate_slots).size()),
+      stream,
+      *input_batches[0].get_memory_space(),
+      batch_telemetry());
   }
 
   // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct) {
+  if (partials_are_output()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }

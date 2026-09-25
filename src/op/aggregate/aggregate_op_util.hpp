@@ -116,6 +116,14 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
 
 /**
+ * @brief Child column read by each FIRST slot, indexed by its `carried_idx`
+ *
+ * @param aggregate_slots One entry per aggregate expression
+ * @return The columns a grouped aggregate carries after its partials, in carried-block order
+ */
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots);
+
+/**
  * @brief Child columns emitted by keeping one row per key, in output order
  *
  * Keeping one row per key computes the whole operator when every slot is a FIRST and `group_idx`

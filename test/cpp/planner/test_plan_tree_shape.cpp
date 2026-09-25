@@ -1234,6 +1234,34 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 2);
   }
 
+  SECTION("a FIRST beside another aggregate carries its column after the partials")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, first(val), sum(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    auto const& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.has_first);
+    CHECK(aggregate.cudf_aggregates ==
+          std::vector<cudf::aggregation::Kind>{cudf::aggregation::Kind::SUM});
+    REQUIRE(aggregate.aggregate_slots.size() == 2);
+    auto const* first = std::get_if<sirius::op::first_slot>(&aggregate.aggregate_slots[0]);
+    REQUIRE(first != nullptr);
+    CHECK(first->input_idx == 1);
+    CHECK(first->carried_idx == 0);
+    auto const* sum = std::get_if<sirius::op::plain_slot>(&aggregate.aggregate_slots[1]);
+    REQUIRE(sum != nullptr);
+    CHECK(sum->partial_idx == 0);
+    CHECK(sirius::op::carried_inputs(aggregate.aggregate_slots) == std::vector<int>{1});
+
+    auto* merge = find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    CHECK_FALSE(
+      merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
+  }
+
   SECTION("a GROUP BY whose only aggregates are FIRST takes the same route")
   {
     // The recognition reads the request list, so the aggregate builder's operator qualifies too.
@@ -1330,18 +1358,17 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("an all-FIRST list over several grouping sets is refused")
   {
-    // ROLLUP adds no output column, so the cover holds and only the grouping-set count refuses it.
-    // Keeping one row per key would return the per-id rows and drop the grand-total row.
+    // One carried row per key would drop the grand-total row.
     require_rejected("SELECT id, first(val) FROM big_left GROUP BY ROLLUP (id)",
-                     "grouped FIRST is only supported as one row per key");
+                     "over several grouping sets");
   }
 
-  SECTION("an all-FIRST list beside a grouping function fails the cover")
+  SECTION("an all-FIRST list beside a grouping function fails the arity check")
   {
-    // GROUPING(id) is an output column no group key or FIRST input covers.
+    // GROUPING(id) is an output column no slot computes.
     require_rejected(
       "SELECT id, first(val), GROUPING(id) FROM big_left GROUP BY GROUPING SETS ((id))",
-      "grouped FIRST is only supported as one row per key");
+      "beside a grouping function");
   }
 
   SECTION("a FIRST with a FILTER is refused before it can reach the one-row-per-key route")
@@ -1359,13 +1386,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_rejected("SELECT id, first(val ORDER BY val DESC) FROM big_left GROUP BY id",
                      "first() with a FILTER or ORDER BY",
                      {OptimizerType::EXPRESSION_REWRITER});
-  }
-
-  SECTION("a FIRST beside another aggregate is refused by the converter")
-  {
-    // throw_unsupported_aggregate throws std::runtime_error, so this asserts the message only.
-    require_rejected_any("SELECT id, first(val), sum(val) FROM big_left GROUP BY id",
-                         "first mixed with other aggregates");
   }
 
   SECTION("a DISTINCT node that disagrees with its planned child's schema is rejected")

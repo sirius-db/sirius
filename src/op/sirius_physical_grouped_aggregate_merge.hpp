@@ -120,6 +120,13 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   //! Same routing as sirius_physical_grouped_aggregate::is_one_row_per_key(), on copied fields.
   [[nodiscard]] bool is_one_row_per_key() const;
 
+  //! Whether the partial layout [keys..., partials..., carried...] is already the declared output.
+  //! An all-FIRST list qualifies because the converter numbers its carried block in slot order.
+  [[nodiscard]] bool partials_are_output() const noexcept
+  {
+    return !has_avg && !has_count_distinct && (!has_first || cudf_aggregates.empty());
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 

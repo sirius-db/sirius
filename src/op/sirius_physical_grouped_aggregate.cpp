@@ -23,7 +23,6 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
 
-#include <string>
 #include <variant>
 
 namespace sirius {
@@ -74,14 +73,13 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
   has_first                         = cudf_defs.has_first;
-  // Grouping functions add output columns no slot covers, which fails the cover. Several grouping
-  // sets add none, so they are refused by name: cudf::distinct would dedup on every key at once and
-  // drop the other sets' rows.
-  if (has_first && (grouping_sets.size() > 1 || !is_one_row_per_key())) {
+  // One carried row per key answers one grouping set, and a grouping function adds a column no
+  // slot computes.
+  if (has_first &&
+      (grouping_sets.size() > 1 || types.size() != group_idx.size() + aggregate_slots.size())) {
     throw duckdb::NotImplementedException(
-      "grouped FIRST is only supported as one row per key over one grouping set: the group "
-      "keys and FIRST inputs must cover the operator's " +
-      std::to_string(types.size()) + " output columns exactly once (falling back to CPU)");
+      "grouped FIRST is not supported over several grouping sets or beside a grouping function "
+      "(falling back to CPU)");
   }
 }
 
@@ -94,9 +92,10 @@ duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
   auto const aggregate_offset = group_idx.size();
-  if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
+  if (!has_count_distinct || has_avg || has_first ||
+      types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
-      "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
+      "COUNT(DISTINCT) local schema requires a non-AVG, non-FIRST one-slot-per-aggregate layout");
   }
 
   auto local_types = types;
@@ -115,22 +114,19 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
-  auto const one_row_select = one_row_per_key_select(group_idx, aggregate_slots, types.size());
+  auto const carried = carried_inputs(aggregate_slots);
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
-    auto result = one_row_select
-                    ? gpu_aggregate_impl::local_one_row_per_key(
-                        input_batch, group_idx, *one_row_select, stream, *space, batch_telemetry())
-                    : gpu_aggregate_impl::local_grouped_aggregate(input_batch,
-                                                                  group_idx,
-                                                                  cudf_aggregates,
-                                                                  cudf_aggregate_idx,
-                                                                  cudf_aggregate_struct_col_indices,
-                                                                  {},
-                                                                  stream,
-                                                                  *space,
-                                                                  batch_telemetry());
+    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+                                                              group_idx,
+                                                              cudf_aggregates,
+                                                              cudf_aggregate_idx,
+                                                              cudf_aggregate_struct_col_indices,
+                                                              carried,
+                                                              stream,
+                                                              *space,
+                                                              batch_telemetry());
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

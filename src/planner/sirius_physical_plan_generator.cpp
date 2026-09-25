@@ -549,7 +549,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     auto& grouped = hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>();
     bool const has_supported_count_distinct_layout =
-      grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
+      grouped.has_count_distinct && !grouped.has_avg && !grouped.has_first &&
+      !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
     if (has_supported_count_distinct_layout) {
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();

@@ -329,6 +329,13 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT k, first(v) FROM dist_fd GROUP BY k");
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside another aggregate runs on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  compare_gpu_vs_cpu("SELECT k, first(v), sum(v) FROM dist_fd GROUP BY k");
+}
+
 //===----------------------------------------------------------------------===//
 // Composition with the operators either side of the DISTINCT
 //===----------------------------------------------------------------------===//
@@ -441,14 +448,6 @@ TEST_CASE_METHOD(DistinctFixture,
   // one: a plausible wrong answer rather than an error.
   expect_plan_fallback_matches_cpu(
     "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
-}
-
-TEST_CASE_METHOD(DistinctFixture,
-                 "gpu_execution FIRST beside another aggregate falls back at plan time",
-                 "[integration][gpu_execution][distinct][aggregate]")
-{
-  // The ordinary groupby would emit nothing for the FIRST, so the converter refuses the list.
-  expect_plan_fallback_matches_cpu("SELECT k, first(v), sum(v) FROM dist_fd GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
