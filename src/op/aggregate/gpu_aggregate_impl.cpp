@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <new>
+#include <numeric>
 #include <string>
 
 namespace sirius {
@@ -158,6 +159,27 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     };
     std::ranges::for_each(group_idx, require_in_range);
     std::ranges::for_each(carried_idx, require_in_range);
+  }
+
+  // With no request, grouping would only pick a row of each group, and cudf::distinct keeps one row
+  // per key in one pass. It needs a key: with none it returns no rows.
+  if (aggregates.empty() && !carried_idx.empty() && !group_idx.empty()) {
+    std::vector<cudf::size_type> selected(group_idx.begin(), group_idx.end());
+    selected.insert(selected.end(), carried_idx.begin(), carried_idx.end());
+    std::vector<cudf::size_type> keys(group_idx.size());
+    std::iota(keys.begin(), keys.end(), cudf::size_type{0});
+    auto deduped = cudf::distinct(input_table.select(selected),
+                                  keys,
+                                  cudf::duplicate_keep_option::KEEP_ANY,
+                                  cudf::null_equality::EQUAL,
+                                  cudf::nan_equality::ALL_EQUAL,
+                                  stream,
+                                  mr);
+    SIRIUS_LOG_DEBUG(
+      "local_grouped_agg: one row per key via cudf::distinct ({} rows in, {} rows out)",
+      input_table.num_rows(),
+      deduped->num_rows());
+    return make_data_batch(std::move(deduped), memory_space, stream, telemetry_info);
   }
 
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its

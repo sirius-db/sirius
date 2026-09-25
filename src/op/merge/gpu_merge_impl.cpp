@@ -191,6 +191,26 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
 
   auto mr = memory_space.get_default_allocator();
 
+  // With no request, grouping would only pick a row of each group, and cudf::distinct keeps one row
+  // per key in one pass. It needs a key: with none it returns no rows.
+  if (aggregates.empty() && num_carried > 0 && num_group_cols > 0) {
+    std::vector<cudf::size_type> keys(static_cast<std::size_t>(num_group_cols));
+    std::iota(keys.begin(), keys.end(), cudf::size_type{0});
+    auto deduped = cudf::distinct(concatenated->view(),
+                                  keys,
+                                  cudf::duplicate_keep_option::KEEP_ANY,
+                                  cudf::null_equality::EQUAL,
+                                  cudf::nan_equality::ALL_EQUAL,
+                                  stream,
+                                  mr);
+    SIRIUS_LOG_DEBUG(
+      "merge_grouped_agg: one row per key via cudf::distinct ({} batches, {} rows in, {} rows out)",
+      input.size(),
+      concatenated->num_rows(),
+      deduped->num_rows());
+    return make_data_batch(std::move(deduped), memory_space, stream, telemetry_info);
+  }
+
   // Dictionary-encode STRING group keys when:
   //  1. Average string length >= 4 bytes (short strings hash nearly as fast as
   //     int32, so the encode/decode overhead is not worthwhile), AND

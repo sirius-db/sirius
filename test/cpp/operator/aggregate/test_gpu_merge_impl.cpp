@@ -1003,6 +1003,68 @@ TEST_CASE("Grouped aggregate carries columns from one row of each group",
   }
 }
 
+TEST_CASE("Grouped aggregate with no request keeps one row per key",
+          "[operator][merge_grouped_agg]")
+{
+  auto* mem_space                                       = get_shared_mem_space();
+  std::vector<int> const group_idx                      = {0};
+  std::vector<cudf::aggregation::Kind> const aggregates = {};
+  constexpr int rows_per_batch                          = 20;
+
+  SECTION("local, with a repeated carried column and a carried key")
+  {
+    auto input    = make_int64_batch(make_carried_columns(rows_per_batch, 0), *mem_space);
+    auto ro_batch = input->to_read_only();
+    auto output   = gpu_aggregate_impl::local_grouped_aggregate(
+      ro_batch, group_idx, aggregates, {}, {}, {2, 2, 0}, cudf::get_default_stream(), *mem_space);
+
+    cudf::table_view output_table_view = sirius::get_cudf_table_view(*output);
+    REQUIRE(output_table_view.num_columns() == 4);
+    REQUIRE(output_table_view.num_rows() == 3);
+    std::vector<std::vector<int64_t>> actual(4);
+    copy_data_to_host(output_table_view, actual);
+    std::set<int64_t> seen_keys;
+    for (int r = 0; r < output_table_view.num_rows(); ++r) {
+      CHECK(seen_keys.insert(actual[0][r]).second);
+      CHECK(actual[1][r] % 10 == actual[0][r]);
+      CHECK(actual[2][r] == actual[1][r]);
+      CHECK(actual[3][r] == actual[0][r]);
+    }
+  }
+
+  SECTION("merge")
+  {
+    constexpr int num_batches = 3;
+    std::vector<std::shared_ptr<data_batch>> partials;
+    for (int b = 0; b < num_batches; ++b) {
+      auto columns = make_carried_columns(rows_per_batch, b * rows_per_batch);
+      partials.push_back(make_int64_batch({columns[0], columns[2]}, *mem_space));
+    }
+    std::vector<read_only_data_batch> ro_batches;
+    for (auto& batch : partials) {
+      ro_batches.push_back(batch->to_read_only());
+    }
+    auto output = gpu_merge_impl::merge_grouped_aggregate(ro_batches,
+                                                          static_cast<int>(group_idx.size()),
+                                                          aggregates,
+                                                          /*num_carried=*/1,
+                                                          cudf::get_default_stream(),
+                                                          *mem_space);
+    ro_batches.clear();
+
+    cudf::table_view output_table_view = sirius::get_cudf_table_view(*output);
+    REQUIRE(output_table_view.num_columns() == 2);
+    REQUIRE(output_table_view.num_rows() == 3);
+    std::vector<std::vector<int64_t>> actual(2);
+    copy_data_to_host(output_table_view, actual);
+    std::set<int64_t> seen_keys;
+    for (int r = 0; r < output_table_view.num_rows(); ++r) {
+      CHECK(seen_keys.insert(actual[0][r]).second);
+      CHECK(actual[1][r] % 10 == actual[0][r]);
+    }
+  }
+}
+
 namespace {
 
 batches_with_handles create_batches_with_local_orderby_result(
