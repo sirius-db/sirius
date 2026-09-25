@@ -39,6 +39,27 @@ pixi run bash test/tpch_performance/generate_tpch_refresh.sh 1000 9   # one-time
 DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 ```
 
+### Compression codecs alone: `run-compression.sh`
+
+`run-compression.sh` runs the simpatico CLI (compress / decompress / benchmark) on a single
+SF1000 Parquet part file with the plans in `plans/`, building the standalone CLI on first use.
+Each stage is wall-clocked and prints its NVRTC JIT statistics. Measured 2026-09-22 on the
+GB300 with a cold JIT cache: lineitem `part.0.parquet` (2.8 GB on disk, 12.9 GB in memory,
+16 columns) takes **27 s** for all three stages (compress 15 s of which 6 s is JIT compile,
+decompress 5 s, per-column benchmark 7 s); orders `part.0.parquet` takes 19 s. Anything in the
+many-minutes range is not this path — check the `compiles` count (cold or disabled on-disk
+cache) or whether `simpatico explore` (the beam-search plan sweep) was run instead.
+
+```bash
+pixi run bash bench/sf1000-repro/run-compression.sh all --table lineitem          # compress+decompress+benchmark
+pixi run bash bench/sf1000-repro/run-compression.sh benchmark --table orders --part 3
+MODE=full-table THREADS=16 pixi run bash bench/sf1000-repro/run-compression.sh benchmark --input "$DATA/lineitem/part.7.parquet"
+```
+
+Knobs: `DATA`, `PLANS`, `OUT_DIR`, `SIMPATICO` (prebuilt CLI), `WARMUP`/`ITERS`/`MODE`/`THREADS`
+(benchmark), `VERIFY` (round-trip check, default on), `KEEP_PARQUET` (write the decompressed
+Parquet). Run `run-compression.sh --help` for the full list.
+
 ### run-power.sh knobs
 
 All knobs are environment variables with working defaults; extra arguments after the script name
