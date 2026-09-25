@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    "cublas",
+    "cusparse"
+  ],
+  "description": "NVIDIA cusolver static redistributables for CUDA 12 and 13.",
+  "license": "LicenseRef-Proprietary",
+  "name": "cusolver",
+  "supports": "linux & (x64 | arm64)",
+  "version": "12.2.2.18"
+}

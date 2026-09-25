@@ -1,0 +1,17 @@
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -200,10 +200,11 @@
+   raft INTERFACE "RAFT_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${LIBRAFT_LOGGING_LEVEL}"
+ )
+ 
+-set(RAFT_CUSOLVER_DEPENDENCY CUDA::cusolver${_ctk_static_suffix})
+-set(RAFT_CUBLAS_DEPENDENCY CUDA::cublas${_ctk_static_suffix})
++find_package(cusolver CONFIG REQUIRED)
++set(RAFT_CUSOLVER_DEPENDENCY cusolver::cusolver_static)
++set(RAFT_CUBLAS_DEPENDENCY cublas::cublas_static)
+ set(RAFT_CURAND_DEPENDENCY CUDA::curand${_ctk_static_suffix})
+-set(RAFT_CUSPARSE_DEPENDENCY CUDA::cusparse${_ctk_static_suffix})
++set(RAFT_CUSPARSE_DEPENDENCY cusparse::cusparse_static)
+ 
+ set(RAFT_CTK_MATH_DEPENDENCIES ${RAFT_CUBLAS_DEPENDENCY} ${RAFT_CUSOLVER_DEPENDENCY}
+                                ${RAFT_CUSPARSE_DEPENDENCY} ${RAFT_CURAND_DEPENDENCY}

@@ -32,13 +32,17 @@ if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
   find_package(nvjitlink CONFIG REQUIRED)
   # FindCUDAToolkit also adds nvJitLink through cuSPARSE's link interface.
-  get_target_property(_cusparse_links CUDA::cusparse INTERFACE_LINK_LIBRARIES)
-  if(_cusparse_links)
-    list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink$"
-                                           "nvjitlink::nvjitlink_static")
-    set_target_properties(CUDA::cusparse PROPERTIES INTERFACE_LINK_LIBRARIES
-                                                    "${_cusparse_links}")
-  endif()
+  foreach(target CUDA::cusparse CUDA::cusparse_static)
+    if(TARGET ${target})
+      get_target_property(_cusparse_links ${target} INTERFACE_LINK_LIBRARIES)
+      if(_cusparse_links)
+        list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink(_static)?$"
+                                               "nvjitlink::nvjitlink_static")
+        set_target_properties(${target} PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                   "${_cusparse_links}")
+      endif()
+    endif()
+  endforeach()
 endif()
 
 # --- cuCollections (cuco) --- #
