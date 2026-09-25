@@ -454,7 +454,7 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution FIRST with a FILTER falls back at plan time",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  // The CPU answer is (1, NULL) (2, 20) (3, 30) (NULL, NULL). A one-row-per-key route that ignored
+  // The CPU answer is (1, NULL) (2, 20) (3, 30) (NULL, NULL). A route that ignored
   // the filter would return (1, 10), so a result comparison alone would also catch the defect.
   expect_plan_fallback_matches_cpu(
     "SELECT k, first(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");

@@ -83,11 +83,6 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   }
 }
 
-bool sirius_physical_grouped_aggregate::is_one_row_per_key() const
-{
-  return one_row_per_key_select(group_idx, aggregate_slots, types.size()).has_value();
-}
-
 duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {

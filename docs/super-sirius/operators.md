@@ -376,7 +376,7 @@ Hash-based GROUP BY.
 - **AVG handling:** Decomposed into SUM + COUNT_VALID via `AggregateSlot`
 - **COUNT(DISTINCT):** Implemented via `COLLECT_SET` aggregation with struct column synthesis
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input has at least 1,048,576 rows, the non-nested key is not already a single null-free fixed-width column, and an HLL estimate puts group cardinality below 1% of rows, distinct key rows are sorted lexicographically with nulls last and installed as the build side of a `cudf::distinct_hash_join`. Probing the original rows yields their dense sorted-key indices, so cuDF's `stable_sorted_order` takes its single-column INT32 radix path; representative keys are recovered by a gather at group cardinality. A single nullable or variable-width key can therefore qualify, as can a multi-column key. Non-fatal label construction failures fall back to the original key columns, and an active label path bypasses STRING dictionary encoding.
-- **One row per key:** an all-`FIRST` list whose keys and `FIRST` inputs cover the output once runs `gpu_aggregate_impl::local_one_row_per_key()` (`cudf::distinct`) instead of `cudf::groupby()`, and `MERGE_GROUP_BY` runs `gpu_merge_impl::merge_one_row_per_key()`. `SELECT DISTINCT ON (k)` with carried columns lowers to this
+- **FIRST:** each `FIRST` is a carried column, not a cuDF request. The local batch is `[keys..., partials..., carried...]`: one `ARGMIN` over row positions rides the same `cudf::groupby()` call and every carried column is gathered at its result, so all of them come from one row of each group. With carried columns, at least one key and no cuDF request (every all-`FIRST` list, including `SELECT DISTINCT ON (k)` with carried columns), `local_grouped_aggregate()` runs `cudf::distinct` on `[keys..., carried...]` instead
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`, `has_first`
 
 ### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
@@ -467,7 +467,7 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
 
-- **One row per key:** when the local stage ran `local_one_row_per_key()`, the merge concatenates the partials and dedups them again with `merge_one_row_per_key()`
+- **FIRST:** `merge_grouped_aggregate()` picks one partial row per group with `ARGMIN` over row positions and gathers the carried columns from it, or runs `cudf::distinct` when there is no cuDF request. `partials_are_output()` decides whether the merged partial layout is already the declared output; a list mixing `FIRST` with other aggregates is always reordered into the declared order
 
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
 **File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
@@ -534,7 +534,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | SORT_PARTITION | Sort | Range partition by boundaries |
 | MERGE_SORT | Sort | `gpu_merge_impl::merge_order_by()` |
 | UNGROUPED_AGGREGATE | Agg | `gpu_aggregate_impl::local_ungrouped_aggregate()` |
-| HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()`, or `local_one_row_per_key()` for an all-`FIRST` list |
+| HASH_GROUP_BY | Agg | `gpu_aggregate_impl::local_grouped_aggregate()` |
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |

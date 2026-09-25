@@ -44,7 +44,6 @@ namespace op {
  * - Concatenate multiple data batches;
  * - Merge aggregation over multiple data batches (presumably each input data batch is a local
  * aggregation result);
- * - Merge one row per key over multiple local one-row-per-key results;
  * - Merge sort over multiple sorted data batches.
  *
  * Require caller to have already upgraded input data batches into `gpu_table_representation`.
@@ -109,31 +108,6 @@ class gpu_merge_impl {
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     int num_carried,
-    ::cuda::stream_ref stream,
-    cucascade::memory::memory_space& memory_space,
-    const telemetry::batch_telemetry_info& telemetry_info = {});
-
-  /**
-   * @brief Keep one row per key across multiple local one-row-per-key results.
-   *
-   * Each batch holds `num_group_cols` key columns followed by carried columns, as
-   * `gpu_aggregate_impl::local_one_row_per_key` emits them. The batches are concatenated and
-   * deduplicated again on the leading `num_group_cols` columns with the same `cudf::distinct`
-   * options, so the output keeps the input's column layout.
-   *
-   * @throw std::runtime_error if `input` has fewer than two batches or fewer than `num_group_cols`
-   * columns
-   *
-   * @param input The input batches to be merged.
-   * @param num_group_cols The number of leading key columns.
-   * @param stream CUDA stream used for device memory operations and kernel launches.
-   * @param memory_space The memory space used to allocate memory for the output data batch.
-   *
-   * @return The output data batch.
-   */
-  static std::shared_ptr<cucascade::data_batch> merge_one_row_per_key(
-    const std::vector<cucascade::read_only_data_batch>& input,
-    int num_group_cols,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});

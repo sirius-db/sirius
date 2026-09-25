@@ -21,7 +21,6 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 
-#include <algorithm>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -134,8 +133,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       continue;
     }
 
-    // FIRST adds no cuDF aggregation: the list is only runnable as one row per key, which
-    // reads first_input_idx instead of the three parallel cudf_* vectors.
+    // FIRST adds no cuDF aggregation; it reads input_idx into the carried block.
     if (fid == sirius::aggregate_id::first) {
       if (children.size() != 1 || !children[0]->is_reference()) {
         throw_unsupported_aggregate(fid, "over anything but a single column reference");
@@ -187,36 +185,6 @@ std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slot
     }
   }
   return inputs;
-}
-
-std::optional<std::vector<int>> one_row_per_key_select(
-  std::vector<int> const& group_idx,
-  std::vector<AggregateSlot> const& aggregate_slots,
-  std::size_t output_width)
-{
-  if (aggregate_slots.empty() || group_idx.empty()) { return std::nullopt; }
-  if (group_idx.size() + aggregate_slots.size() != output_width) { return std::nullopt; }
-
-  // output_width distinct values in [0, output_width) are a permutation of it.
-  std::vector<bool> seen(output_width, false);
-  std::vector<int> select;
-  select.reserve(output_width);
-  auto const take = [&](int idx) {
-    if (idx < 0) { return false; }
-    auto const pos = static_cast<std::size_t>(idx);
-    if (pos >= output_width || seen[pos]) { return false; }
-    seen[pos] = true;
-    select.push_back(idx);
-    return true;
-  };
-  for (int const idx : group_idx) {
-    if (!take(idx)) { return std::nullopt; }
-  }
-  for (auto const& slot : aggregate_slots) {
-    auto const* first = std::get_if<first_slot>(&slot);
-    if (first == nullptr || !take(first->input_idx)) { return std::nullopt; }
-  }
-  return select;
 }
 
 }  // namespace op

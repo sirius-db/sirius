@@ -359,49 +359,6 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_one_row_per_key(
-  const std::vector<cucascade::read_only_data_batch>& input,
-  int num_group_cols,
-  ::cuda::stream_ref stream,
-  cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
-{
-  if (input.size() < 2) {
-    throw std::runtime_error(
-      "`input` in `merge_one_row_per_key()` should at least contain two data batches");
-  }
-
-  std::vector<cudf::table_view> input_cudf_table_views;
-  input_cudf_table_views.reserve(input.size());
-  for (const auto& batch : input) {
-    input_cudf_table_views.push_back(get_cudf_table_view(batch));
-  }
-  if (input_cudf_table_views[0].num_columns() < num_group_cols) {
-    throw std::runtime_error(
-      "`num columns >= num_group_cols` not true in `merge_one_row_per_key()`");
-  }
-  auto mr           = memory_space.get_default_allocator();
-  auto concatenated = cudf::concatenate(input_cudf_table_views, stream, mr);
-
-  // The local stage wrote the keys to the leading columns, so this keys positionally and must not
-  // reuse the operator's group_idx, which addresses the local stage's child.
-  std::vector<cudf::size_type> keys(static_cast<std::size_t>(num_group_cols));
-  std::iota(keys.begin(), keys.end(), cudf::size_type{0});
-  auto deduped = cudf::distinct(concatenated->view(),
-                                keys,
-                                cudf::duplicate_keep_option::KEEP_ANY,
-                                cudf::null_equality::EQUAL,
-                                cudf::nan_equality::ALL_EQUAL,
-                                stream,
-                                mr);
-  SIRIUS_LOG_DEBUG("merge_one_row_per_key: {} batches, {} rows in, {} rows out",
-                   input.size(),
-                   concatenated->num_rows(),
-                   deduped->num_rows());
-
-  return make_data_batch(std::move(deduped), memory_space, stream, telemetry_info);
-}
-
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   const std::vector<cucascade::read_only_data_batch>& input,
   const std::vector<int>& order_key_idx,

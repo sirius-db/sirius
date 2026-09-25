@@ -480,49 +480,5 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_one_row_per_key(
-  const cucascade::read_only_data_batch& input,
-  const std::vector<int>& group_idx,
-  const std::vector<int>& select,
-  ::cuda::stream_ref stream,
-  cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
-{
-  auto input_table = get_cudf_table_view(input);
-
-  // The operator bounded these indices by its declared width, not by this batch's.
-  auto const require_in_range = [&](int idx) {
-    if (idx < 0 || idx >= input_table.num_columns()) {
-      throw std::runtime_error("one row per key: column " + std::to_string(idx) +
-                               " is out of range for a batch of " +
-                               std::to_string(input_table.num_columns()) + " columns");
-    }
-  };
-  std::for_each(group_idx.begin(), group_idx.end(), require_in_range);
-  std::for_each(select.begin(), select.end(), require_in_range);
-
-  // No dictionary encoding or label keys: those gates exist for cudf::groupby, and
-  // cudf::distinct takes the key columns as they are.
-  std::vector<cudf::size_type> const keys(group_idx.begin(), group_idx.end());
-  auto deduped = cudf::distinct(input_table,
-                                keys,
-                                cudf::duplicate_keep_option::KEEP_ANY,
-                                cudf::null_equality::EQUAL,
-                                cudf::nan_equality::ALL_EQUAL,
-                                stream,
-                                memory_space.get_default_allocator());
-
-  // A select rather than a reorder: an unselected column is dropped with `released`.
-  auto released = deduped->release();
-  std::vector<std::unique_ptr<cudf::column>> output_cols;
-  output_cols.reserve(select.size());
-  for (int const idx : select) {
-    output_cols.push_back(std::move(released[static_cast<std::size_t>(idx)]));
-  }
-
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
-  return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
-}
-
 }  // namespace op
 }  // namespace sirius

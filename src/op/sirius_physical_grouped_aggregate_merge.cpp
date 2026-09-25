@@ -157,11 +157,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_first                         = cudf_defs.has_first;
 }
 
-bool sirius_physical_grouped_aggregate_merge::is_one_row_per_key() const
-{
-  return one_row_per_key_select(group_idx, aggregate_slots, types.size()).has_value();
-}
-
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
@@ -251,7 +246,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
 
-  // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
+  // Post-merge projection: handle AVG (SUM/COUNT), COUNT DISTINCT (list element count) and
+  // carried FIRST columns (moved into declared order).
   // Release ownership of the merged table's columns so we can move (not copy) them.
   // Acquire EXCLUSIVE lock since release_table() is a mutating operation
   auto merged_mut    = merged->to_mutable();
