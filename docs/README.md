@@ -57,11 +57,19 @@ LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
 Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
 
 ```sql
+-- Load the TPC-H extension and generate data (scale factor 10 = ~10 GB)
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=10);
+
 -- Plain SQL runs on GPU automatically
 SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
+
+-- TPC-H data is exported as Parquet for use in later examples
+COPY lineitem TO '/path/to/lineitem.parquet' (FORMAT PARQUET);
 
 -- Disable transparent GPU execution for this connection
 SET gpu_execution = false;
@@ -238,7 +246,7 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 
