@@ -278,6 +278,32 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
   return aggregate;
 }
 
+// A HASH_GROUP_BY over @p child grouping on column 0 with `first(#1)` beside `sum(#2)`.
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_first_beside_sum(
+  duckdb::unique_ptr<sirius_physical_operator> child)
+{
+  duckdb::vector<sirius::logical_type> output_types{
+    integer_type(),
+    sirius::logical_type::make(sirius::type_id::BIGINT),
+    sirius::logical_type::make(sirius::type_id::BIGINT)};
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+  groups.push_back(make_reference(0));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  expressions.push_back(make_aggregate_expression(1, sirius::aggregate_id::first));
+  expressions.push_back(make_aggregate_expression(2, sirius::aggregate_id::sum));
+  auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    std::move(output_types),
+    std::move(expressions),
+    std::move(groups),
+    duckdb::vector<duckdb::GroupingSet>{},
+    duckdb::vector<duckdb::unsafe_vector<std::size_t>>{},
+    /*estimated_cardinality=*/1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  aggregate->children.push_back(std::move(child));
+  return aggregate;
+}
+
 // A two-column scan of `types` carried as `physical`, filtered by the column-versus-column
 // comparison `c0 < c1` and funnelled into a constant-only projection, so each column's verdict is
 // decided purely by how the filter classifies the reference pair.
@@ -484,6 +510,15 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
     // columns retract.
     auto plan = make_grouped_aggregate(
       {0}, {1}, make_integer_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(!plan->children[0]->has_physical_overrides());
+  }
+
+  SECTION("FIRST beside SUM makes the aggregate ineligible")
+  {
+    auto plan = make_first_beside_sum(make_integer_scan(3, {k_int8, k_int8, k_int8}));
 
     sirius::planner::apply_tier_narrowing_policy(*plan);
 

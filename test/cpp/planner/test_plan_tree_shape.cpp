@@ -1264,6 +1264,35 @@ TEST_CASE_METHOD(
       merge->Cast<sirius::op::sirius_physical_grouped_aggregate_merge>().partials_are_output());
   }
 
+  SECTION("a FIRST after AVG's two partials is carried after both")
+  {
+    auto plan =
+      generate_sirius_plan(*con, "SELECT id, avg(val), first(val) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* hgb = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(hgb != nullptr);
+    auto const& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.cudf_aggregates.size() == 2);
+    REQUIRE(aggregate.aggregate_slots.size() == 2);
+    auto const* avg = std::get_if<sirius::op::avg_slot>(&aggregate.aggregate_slots[0]);
+    REQUIRE(avg != nullptr);
+    CHECK(avg->sum_idx == 0);
+    auto const* first = std::get_if<sirius::op::first_slot>(&aggregate.aggregate_slots[1]);
+    REQUIRE(first != nullptr);
+    CHECK(first->carried_idx == 0);
+  }
+
+  SECTION("a FIRST of a group key builds")
+  {
+    // The hoist gives the FIRST's argument its own child column, so the key is carried as a copy.
+    auto plan = generate_sirius_plan(*con, "SELECT id, first(id) FROM big_left GROUP BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+  }
+
   SECTION("a GROUP BY whose only aggregates are FIRST takes the same route")
   {
     // An all-FIRST GROUP BY builds the same operator.
@@ -1378,6 +1407,27 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // The filter would be hoisted into a projected column that no FIRST route reads.
     require_rejected("SELECT id, first(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
                      "first() with a FILTER or ORDER BY");
+  }
+
+  SECTION("a FILTER beside a grouped FIRST is refused")
+  {
+    // The grouped operator drops every FILTER, so the SUM would count rows the filter excludes.
+    require_rejected(
+      "SELECT id, first(val), sum(val) FILTER (WHERE val > 0) FROM big_left GROUP BY id",
+      "FILTER beside first()");
+  }
+
+  SECTION("a DISTINCT sum beside a grouped FIRST is refused")
+  {
+    // The grouped operator computes sum(DISTINCT x) as sum(x).
+    require_rejected("SELECT id, first(val), sum(DISTINCT val) FROM big_left GROUP BY id",
+                     "DISTINCT sum or avg beside first()");
+  }
+
+  SECTION("a FIRST beside another aggregate over several grouping sets is refused")
+  {
+    require_rejected("SELECT id, first(val), sum(val) FROM big_left GROUP BY ROLLUP (id)",
+                     "over several grouping sets");
   }
 
   SECTION("an ordered FIRST is refused when the expression rewriter leaves it in place")

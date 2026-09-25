@@ -336,6 +336,53 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT k, first(v), sum(v) FROM dist_fd GROUP BY k");
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside other aggregates keeps the declared column order",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The partial layout is [k, partials..., carried...], so each result must be moved into the
+  // declared order. With both value columns BIGINT, a swap passes every type check and only the
+  // row comparison catches it.
+  SECTION("count")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v::BIGINT), count(*) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("avg before the FIRST")
+  {
+    compare_gpu_vs_cpu("SELECT k, avg(v), first(v) FROM dist_fd GROUP BY k");
+  }
+
+  // COLLECT_SET puts the groupby on its sort path, where ARGMIN maps back through the sort order.
+  SECTION("COUNT(DISTINCT)")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), count(DISTINCT v) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("two FIRSTs and a min")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), first(-v), min(v) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("a carried key beside a sum, with a NULL-key group")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(k), sum(v) FROM dist_fd GROUP BY k");
+  }
+}
+
+TEST_CASE_METHOD(
+  DistinctFixture,
+  "gpu_execution an all-FIRST list with an expression or key argument runs on the GPU",
+  "[integration][gpu_execution][distinct][aggregate]")
+{
+  SECTION("two arguments, one an expression")
+  {
+    compare_gpu_vs_cpu("SELECT k, first(v), first(-v) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("key argument") { compare_gpu_vs_cpu("SELECT k, first(k) FROM dist_fd GROUP BY k"); }
+}
+
 //===----------------------------------------------------------------------===//
 // Composition with the operators either side of the DISTINCT
 //===----------------------------------------------------------------------===//
@@ -436,6 +483,26 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   }
 }
 
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution FIRST beside other aggregates over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Small scan batches make the merge combine partial rows. `payload` varies within each group, so
+  // the check is structural rather than a row comparison: `a % 10 = k` catches a gather from the
+  // wrong group, `a + b` two FIRSTs taken from different rows, and `c` a column swap.
+  scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT k, first(payload) AS a, first(1000000 - payload) AS b, count(*) AS c,"
+    "         sum(payload) AS s"
+    "  FROM dist_dup GROUP BY k) "
+    "WHERE a % 10 <> k OR a + b <> 1000000 OR c <> 100000");
+  compare_gpu_vs_cpu_on_keys(*this,
+                             "SELECT k, first(payload) AS a, first(1000000 - payload) AS b, "
+                             "count(*) AS c, sum(payload) AS s FROM dist_dup GROUP BY k",
+                             {0, 3, 4});
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
@@ -448,6 +515,24 @@ TEST_CASE_METHOD(DistinctFixture,
   // one: a plausible wrong answer rather than an error.
   expect_plan_fallback_matches_cpu(
     "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside a FILTER or a DISTINCT sum falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The grouped operator would drop the FILTER and the DISTINCT. On this table both change the
+  // answer: the filter excludes k = 1, and every group holds a duplicated v.
+  SECTION("FILTER")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT k, first(v), sum(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
+  }
+
+  SECTION("DISTINCT sum")
+  {
+    expect_plan_fallback_matches_cpu("SELECT k, first(v), sum(DISTINCT v) FROM dist_fd GROUP BY k");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFixture,
