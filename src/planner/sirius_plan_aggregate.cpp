@@ -693,8 +693,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   }
 
   // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and the grouped operator also
-  // computes a DISTINCT sum or avg without the DISTINCT. A grouped FIRST refuses all three rather
-  // than return a wrong answer beside them.
+  // computes a DISTINCT sum or avg without the DISTINCT. Any FIRST, grouped or not, refuses its own
+  // FILTER or ORDER BY; a grouped FIRST also refuses a FILTER or a DISTINCT sum or avg beside it.
   auto const aggregate_id_of = [](duckdb::unique_ptr<duckdb::Expression> const& expression) {
     return sirius::from_duckdb_aggregate_name(
       expression->Cast<duckdb::BoundAggregateExpression>().function.name);

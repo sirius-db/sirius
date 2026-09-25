@@ -359,9 +359,10 @@ TEST_CASE_METHOD(DistinctFixture,
     compare_gpu_vs_cpu("SELECT k, first(v), count(DISTINCT v) FROM dist_fd GROUP BY k");
   }
 
+  // `0 - v`, not `-v`: the expression evaluator reads a second argument for unary minus.
   SECTION("two FIRSTs and a min")
   {
-    compare_gpu_vs_cpu("SELECT k, first(v), first(-v), min(v) FROM dist_fd GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v), min(v) FROM dist_fd GROUP BY k");
   }
 
   SECTION("a carried key beside a sum, with a NULL-key group")
@@ -377,7 +378,7 @@ TEST_CASE_METHOD(
 {
   SECTION("two arguments, one an expression")
   {
-    compare_gpu_vs_cpu("SELECT k, first(v), first(-v) FROM dist_fd GROUP BY k");
+    compare_gpu_vs_cpu("SELECT k, first(v), first(0 - v) FROM dist_fd GROUP BY k");
   }
 
   SECTION("key argument") { compare_gpu_vs_cpu("SELECT k, first(k) FROM dist_fd GROUP BY k"); }
@@ -430,6 +431,40 @@ TEST_CASE_METHOD(DistinctFixture,
     compare_gpu_vs_cpu(
       "SELECT r.a, r.x, s.b FROM dist_r r, "
       "LATERAL (SELECT DISTINCT t.b FROM dist_t t WHERE t.a = r.a AND t.b < r.x) s");
+  }
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT over a materialized CTE",
+                 "[integration][gpu_execution][distinct]")
+{
+  // With equal widths Sirius omits the identity projection, so the CTE node is the DISTINCT's
+  // direct child. The narrower select keeps its projection.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT a FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution nested carried columns run on the GPU",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The scan refuses stored LIST and STRUCT columns, so a stored fixed-size array and a computed
+  // struct are the nested payloads that reach the DISTINCT. Each is a function of `k`.
+  SECTION("fixed-size array")
+  {
+    run_ok(
+      "CREATE TABLE dist_nest AS SELECT k, [k, k + 1, k + 2]::INTEGER[3] AS arr FROM dist_fd;");
+    run_ok("CHECKPOINT;");
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, arr FROM dist_nest");
+    compare_gpu_vs_cpu("SELECT k, first(arr), count(*) FROM dist_nest GROUP BY k");
+  }
+
+  SECTION("struct")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, {'x': k, 'y': k * 10} AS st FROM dist_fd");
+    compare_gpu_vs_cpu("SELECT k, first({'x': k, 'y': k * 10}), sum(k) FROM dist_fd GROUP BY k");
   }
 }
 
@@ -503,6 +538,36 @@ TEST_CASE_METHOD(DistinctBulkFixture,
                              {0, 3, 4});
 }
 
+TEST_CASE_METHOD(DistinctBulkFixture,
+                 "gpu_execution nested carried columns over many batches",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+  run_ok("CREATE TABLE dist_dup_arr AS SELECT k, [k, k]::BIGINT[2] AS arr FROM dist_dup;");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, arr FROM dist_dup_arr");
+  compare_gpu_vs_cpu("SELECT k, first(arr), count(*) FROM dist_dup_arr GROUP BY k");
+  compare_gpu_vs_cpu("SELECT k, first({'x': k, 'y': k * 10}), count(*) FROM dist_dup GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution FIRST beside a COUNT(DISTINCT) over a label-encoded key",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // COLLECT_SET, a VARCHAR key and at least 2^20 rows in one batch make the local groupby
+  // label-encode its keys, so ARGMIN runs over the encoded groupby.
+  run_ok(
+    "CREATE TABLE dist_big AS "
+    "SELECT (i % 10)::VARCHAR AS ks, i AS payload FROM range(2000000) t(i);");
+  run_ok("CHECKPOINT;");
+  // `min(payload)` is the group's digit, which avoids a VARCHAR cast in the outer filter.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT ks, first(payload) AS a, min(payload) AS m, count(DISTINCT payload % 7) AS c"
+    "  FROM dist_big GROUP BY ks) "
+    "WHERE a % 10 <> m OR c <> 7");
+}
+
 //===----------------------------------------------------------------------===//
 // Guarded shapes: plan-time CPU fallback, not a result divergence
 //===----------------------------------------------------------------------===//
@@ -543,6 +608,15 @@ TEST_CASE_METHOD(DistinctFixture,
   // the filter would return (1, 10), so a result comparison alone would also catch the defect.
   expect_plan_fallback_matches_cpu(
     "SELECT k, first(v) FILTER (WHERE v > 15) FROM dist_fd GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution ungrouped FIRST with a FILTER falls back at plan time",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // Only v = 30 passes the filter, so the CPU answer is deterministic. Ignoring the filter would
+  // return whichever row comes first.
+  expect_plan_fallback_matches_cpu("SELECT first(v) FILTER (WHERE v > 25) FROM dist_fd");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
