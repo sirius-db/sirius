@@ -4,6 +4,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
+    test/cpp/config/test_scan_manager_config.cpp
     test/cpp/config/test_topology_config.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
@@ -100,18 +101,31 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_late_mat_resolver.cpp
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/late_mat/test_pin_uniqueness.cpp
+    test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
+    test/cpp/io/cache/test_cache_read_arbitration.cpp
+    test/cpp/io/cache/test_chunk_state.cpp
+    test/cpp/io/cache/test_dispose_eviction.cpp
+    test/cpp/io/cache/test_explicit_eviction.cpp
+    test/cpp/io/cache/test_stage_machines.cpp
+    test/cpp/io/kvikio/test_kvikio_remote.cpp
+    test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
+    test/cpp/scan_manager/test_prefetching_scheduler.cpp
+    test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/scan_manager/test_pin_parquet.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
@@ -265,6 +279,7 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/utils/s3_container.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
+    test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
