@@ -236,8 +236,8 @@ void record_marginal_keep(dynamic_filter_gate* gate,
   gate->record_filter_keep_ratio(step.identity, kept, observed_generation);
 }
 
-//===----------cascade compaction strategy----------===//
-/// @brief Apply the cascade compaction strategy.
+//===----------CASCADE compaction strategy----------===//
+/// @brief Apply the CASCADE compaction strategy.
 filter_application_result apply_cascade(cudf::table_view const& input,
                                         std::unique_ptr<cudf::column> ast_mask,
                                         std::span<membership_step const> steps,
@@ -276,7 +276,7 @@ filter_application_result apply_cascade(cudf::table_view const& input,
   return result;
 }
 
-//===----------deferred_keys compaction strategy----------===//
+//===----------DEFERRED_KEYS compaction strategy----------===//
 std::unique_ptr<cudf::column> make_identity_row_ids(cudf::size_type rows,
                                                     ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref mr)
@@ -335,7 +335,7 @@ std::unique_ptr<cudf::table> materialize_deferred_result(cudf::table_view const&
   return std::make_unique<cudf::table>(std::move(state.output_columns));
 }
 
-/// @brief Apply the deferred_keys compaction strategy.
+/// @brief Apply the DEFERRED_KEYS compaction strategy.
 filter_application_result apply_deferred_keys(cudf::table_view const& input,
                                               std::unique_ptr<cudf::column> ast_mask,
                                               std::span<membership_step const> steps,
@@ -408,8 +408,8 @@ filter_application_result apply_deferred_keys(cudf::table_view const& input,
   return result;
 }
 
-//===----------gather_once compaction strategy----------===//
-/// @brief Apply the gather_once compaction strategy.
+//===----------GATHER_ONCE compaction strategy----------===//
+/// @brief Apply the GATHER_ONCE compaction strategy.
 filter_application_result apply_gather_once(cudf::table_view const& input,
                                             std::unique_ptr<cudf::column> ast_mask,
                                             std::span<membership_step const> steps,
