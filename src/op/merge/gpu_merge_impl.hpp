@@ -89,21 +89,26 @@ class gpu_merge_impl {
   /**
    * @brief Perform grouped merge aggregate on multiple data batches.
    * For each batch, the first `num_group_cols` are the group columns, followed by aggregate columns
-   * corresponding to `aggregates`.
+   * corresponding to `aggregates`, followed by `num_carried` carried columns.
+   *
+   * @throw std::runtime_error if `input` has fewer than two batches or its width is not
+   * `num_group_cols + aggregates.size() + num_carried`
    *
    * @param input The input batches to be merged.
    * @param num_group_cols The number of group columns.
-   * @param aggregates The aggregate functions. Should satisfy `num_group_cols + group_idx.size() =
-   * num input columns`.
+   * @param aggregates The aggregate functions.
+   * @param num_carried The number of trailing carried columns. The output keeps one row per group
+   * for them, all from the same input row.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
-   * @return The output data batch.
+   * @return The output data batch, in the input's column layout.
    */
   static std::shared_ptr<cucascade::data_batch> merge_grouped_aggregate(
     const std::vector<cucascade::read_only_data_batch>& input,
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
+    int num_carried,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});

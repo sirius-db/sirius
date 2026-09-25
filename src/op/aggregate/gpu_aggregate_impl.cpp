@@ -24,7 +24,9 @@
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
@@ -128,6 +130,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  const std::vector<int>& carried_idx,
   ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
@@ -143,6 +146,19 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   auto input_table = get_cudf_table_view(input);
   auto mr          = memory_space.get_default_allocator();
+
+  if (!carried_idx.empty()) {
+    // The operator bounded these indices by its declared width, not by this batch's.
+    auto const require_in_range = [&](int idx) {
+      if (idx < 0 || idx >= input_table.num_columns()) {
+        throw std::runtime_error("local_grouped_aggregate: column " + std::to_string(idx) +
+                                 " is out of range for a batch of " +
+                                 std::to_string(input_table.num_columns()) + " columns");
+      }
+    };
+    std::ranges::for_each(group_idx, require_in_range);
+    std::ranges::for_each(carried_idx, require_in_range);
+  }
 
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
   // single-column radix path while preserving the original keys' lexicographic order. A
@@ -342,6 +358,18 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     requests.push_back(std::move(request));
   }
 
+  // The selector is the last request and outside input_col_order, so the result loop skips it.
+  // ARGMIN over row positions names one input row of each group.
+  std::unique_ptr<cudf::column> row_positions;
+  if (!carried_idx.empty()) {
+    row_positions = cudf::sequence(
+      input_table.num_rows(), cudf::numeric_scalar<cudf::size_type>(0, true, stream), stream, mr);
+    cudf::groupby::aggregation_request request;
+    request.values = row_positions->view();
+    request.aggregations.push_back(cudf::make_argmin_aggregation<cudf::groupby_aggregation>());
+    requests.push_back(std::move(request));
+  }
+
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
   auto output_cols    = groupby_result.first->release();
@@ -409,6 +437,19 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       }
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[j]);
+    }
+  }
+
+  if (row_positions) {
+    // The selector has no nulls, so every gathered row is in range.
+    std::vector<cudf::size_type> const carried(carried_idx.begin(), carried_idx.end());
+    auto carried_table = cudf::gather(input_table.select(carried),
+                                      groupby_result.second.back().results.front()->view(),
+                                      cudf::out_of_bounds_policy::DONT_CHECK,
+                                      stream,
+                                      mr);
+    for (auto& column : carried_table->release()) {
+      output_cols.push_back(std::move(column));
     }
   }
 

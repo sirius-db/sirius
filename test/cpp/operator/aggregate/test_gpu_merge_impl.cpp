@@ -23,9 +23,14 @@
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
+
+#include <cstdint>
+#include <map>
+#include <set>
 
 using namespace sirius;
 using namespace cucascade;
@@ -565,8 +570,14 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
   batches_with_handles result;
   for (int i = 0; i < num_batches; ++i) {
     auto ro_batch = base_input.batches[i]->to_read_only();
-    auto batch    = gpu_aggregate_impl::local_grouped_aggregate(
-      ro_batch, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), mem_space);
+    auto batch    = gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                             group_idx,
+                                                             aggregates,
+                                                             aggregate_idx,
+                                                                {},
+                                                                {},
+                                                             cudf::get_default_stream(),
+                                                             mem_space);
     result.batches.push_back(std::move(batch));
   }
 
@@ -713,7 +724,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -743,9 +754,10 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     for (auto& b : input.batches) {
       ro.push_back(b->to_read_only());
     }
-    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
-                        ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(
+      gpu_merge_impl::merge_grouped_aggregate(
+        ro, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space),
+      std::runtime_error);
   }
 
   // Invalid input: mismatch between num columns, num_groups, and num aggregations
@@ -759,9 +771,10 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     for (auto& b : input2.batches) {
       ro.push_back(b->to_read_only());
     }
-    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
-                        ro, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(
+      gpu_merge_impl::merge_grouped_aggregate(
+        ro, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space),
+      std::runtime_error);
   }
 }
 
@@ -797,7 +810,7 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
 }
@@ -836,9 +849,158 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
     ro_batches.push_back(b->to_read_only());
   }
   auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
-    ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
+    ro_batches, group_idx.size(), aggregates, 0, cudf::get_default_stream(), *mem_space);
   ro_batches.clear();
   validate_grouped_aggregate(input.batches, *output_batch, group_idx.size(), aggregates);
+}
+
+namespace {
+
+std::shared_ptr<data_batch> make_int64_batch(std::vector<std::vector<int64_t>> const& columns,
+                                             memory_space& mem_space)
+{
+  auto const stream = cudf::get_default_stream();
+  std::vector<std::unique_ptr<cudf::column>> device_columns;
+  for (auto const& values : columns) {
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                            static_cast<cudf::size_type>(values.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mem_space.get_default_allocator());
+    cudaMemcpy(column->mutable_view().data<int64_t>(),
+               values.data(),
+               sizeof(int64_t) * values.size(),
+               cudaMemcpyHostToDevice);
+    device_columns.push_back(std::move(column));
+  }
+  return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(device_columns)),
+                                 mem_space,
+                                 stream,
+                                 sirius::telemetry::batch_telemetry_info{});
+}
+
+/// Columns `[k, w, a, b]` over three keys, with `a % 10 == k`, `b == -a` and `a` distinct across
+/// every row starting at `first_row`: a carried `(a, b)` pair names its group and a single row.
+std::vector<std::vector<int64_t>> make_carried_columns(int num_rows, int first_row)
+{
+  std::vector<std::vector<int64_t>> columns(4);
+  for (int r = 0; r < num_rows; ++r) {
+    int64_t const k = r % 3;
+    int64_t const a = k + 10 * static_cast<int64_t>(first_row + r);
+    columns[0].push_back(k);
+    columns[1].push_back(r);
+    columns[2].push_back(a);
+    columns[3].push_back(-a);
+  }
+  return columns;
+}
+
+/// Checks a `[k, sum(w), a, b]` result: one row per key, the expected sum, and a carried pair from
+/// one row of that key's group.
+void validate_carried_output(data_batch& output, std::map<int64_t, int64_t> const& expected_sums)
+{
+  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
+  REQUIRE(output_table_view.num_columns() == 4);
+  REQUIRE(static_cast<std::size_t>(output_table_view.num_rows()) == expected_sums.size());
+
+  std::vector<std::vector<int64_t>> actual(4);
+  copy_data_to_host(output_table_view, actual);
+  std::set<int64_t> seen_keys;
+  for (int r = 0; r < output_table_view.num_rows(); ++r) {
+    auto const k = actual[0][r];
+    CHECK(seen_keys.insert(k).second);
+    CHECK(actual[1][r] == expected_sums.at(k));
+    CHECK(actual[2][r] % 10 == k);
+    CHECK(actual[2][r] + actual[3][r] == 0);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("Grouped aggregate carries columns from one row of each group",
+          "[operator][merge_grouped_agg]")
+{
+  auto* mem_space                                       = get_shared_mem_space();
+  std::vector<int> const group_idx                      = {0};
+  std::vector<cudf::aggregation::Kind> const aggregates = {cudf::aggregation::Kind::SUM};
+  std::vector<int> const aggregate_idx                  = {1};
+  std::vector<int> const carried_idx                    = {2, 3};
+  constexpr int num_batches                             = 3;
+  constexpr int rows_per_batch                          = 20;
+
+  std::vector<std::shared_ptr<data_batch>> inputs;
+  std::vector<std::shared_ptr<data_batch>> locals;
+  std::vector<std::map<int64_t, int64_t>> batch_sums(num_batches);
+  std::map<int64_t, int64_t> total_sums;
+  for (int b = 0; b < num_batches; ++b) {
+    auto const columns = make_carried_columns(rows_per_batch, b * rows_per_batch);
+    for (int r = 0; r < rows_per_batch; ++r) {
+      batch_sums[b][columns[0][r]] += columns[1][r];
+      total_sums[columns[0][r]] += columns[1][r];
+    }
+    inputs.push_back(make_int64_batch(columns, *mem_space));
+    auto ro_batch = inputs.back()->to_read_only();
+    locals.push_back(gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                                 group_idx,
+                                                                 aggregates,
+                                                                 aggregate_idx,
+                                                                 {},
+                                                                 carried_idx,
+                                                                 cudf::get_default_stream(),
+                                                                 *mem_space));
+  }
+
+  SECTION("local")
+  {
+    for (int b = 0; b < num_batches; ++b) {
+      validate_carried_output(*locals[b], batch_sums[b]);
+    }
+  }
+
+  SECTION("merge")
+  {
+    std::vector<read_only_data_batch> ro_batches;
+    for (auto& batch : locals) {
+      ro_batches.push_back(batch->to_read_only());
+    }
+    auto output_batch = gpu_merge_impl::merge_grouped_aggregate(ro_batches,
+                                                                static_cast<int>(group_idx.size()),
+                                                                aggregates,
+                                                                /*num_carried=*/2,
+                                                                cudf::get_default_stream(),
+                                                                *mem_space);
+    ro_batches.clear();
+    validate_carried_output(*output_batch, total_sums);
+  }
+
+  SECTION("merge refuses a width that does not count the carried columns")
+  {
+    std::vector<read_only_data_batch> ro_batches;
+    for (auto& batch : locals) {
+      ro_batches.push_back(batch->to_read_only());
+    }
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(ro_batches,
+                                                              static_cast<int>(group_idx.size()),
+                                                              aggregates,
+                                                              /*num_carried=*/1,
+                                                              cudf::get_default_stream(),
+                                                              *mem_space),
+                      std::runtime_error);
+  }
+
+  SECTION("local refuses a carried column outside the batch")
+  {
+    auto ro_batch = inputs[0]->to_read_only();
+    REQUIRE_THROWS_AS(gpu_aggregate_impl::local_grouped_aggregate(ro_batch,
+                                                                  group_idx,
+                                                                  aggregates,
+                                                                  aggregate_idx,
+                                                                  {},
+                                                                  {4},
+                                                                  cudf::get_default_stream(),
+                                                                  *mem_space),
+                      std::runtime_error);
+  }
 }
 
 namespace {

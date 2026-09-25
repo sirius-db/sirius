@@ -244,6 +244,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
+                                                     0,
                                                      stream,
                                                      *input_batches[0].get_memory_space(),
                                                      batch_telemetry());
