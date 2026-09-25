@@ -63,6 +63,11 @@ namespace {
  *    use deferred_keys strategy;
  *  - otherwise, use gather_once strategy.
  *
+ * Measured filters keeping more than dynamic_filter_gate::filter_skippable() allows are skipped
+ * before selection, except that rows at least k_deferred_minimum_row_width wide keep filters up to
+ * k_wide_row_skip_keep_ratio: gather once applies such weak filters for roughly the cost per
+ * removed row that cascade pays at the gate's threshold.
+ *
  * See evaluate_compaction_policy() for the implementation.
  * @note These are empirically chosen parameters from experiments on a GB300 machine. They may not
  *       extrapolate perfectly to all architectures.
@@ -70,6 +75,7 @@ namespace {
 constexpr std::size_t k_deferred_minimum_row_width       = 64;
 constexpr double k_deferred_selective_keep_ratio         = 0.35;
 constexpr double k_gather_once_minimum_narrow_keep_ratio = 0.40;
+constexpr double k_wide_row_skip_keep_ratio              = 0.60;
 
 struct membership_step {
   std::size_t column_index;                               ///< The key column index of the batch.
@@ -130,6 +136,26 @@ struct compaction_policy_decision {
   return estimate && std::isfinite(*estimate) && *estimate >= 0.0 && *estimate <= 1.0;
 }
 
+/// @brief Average bytes per row, or empty when the byte accounting cannot size the batch.
+[[nodiscard]] std::optional<std::size_t> average_row_width(
+  std::size_t rows, std::optional<std::size_t> input_bytes) noexcept
+{
+  if (rows == 0 || !input_bytes || *input_bytes == 0 ||
+      *input_bytes == std::numeric_limits<std::size_t>::max() || *input_bytes < rows) {
+    return std::nullopt;
+  }
+  return *input_bytes / rows;
+}
+
+/// @brief Whether a measured membership filter is too weak to apply at this row width.
+[[nodiscard]] bool skip_measured_filter(double kept, std::optional<std::size_t> row_width) noexcept
+{
+  if (row_width && *row_width >= k_deferred_minimum_row_width) {
+    return kept > k_wide_row_skip_keep_ratio;
+  }
+  return dynamic_filter_gate::filter_skippable(kept);
+}
+
 /// @brief Choose the optimal compaction strategy.
 [[nodiscard]] compaction_policy_decision evaluate_compaction_policy(
   detail::compaction_policy_input const& input) noexcept
@@ -138,13 +164,10 @@ struct compaction_policy_decision {
   if (input.candidate_step_count < 2) {
     return {compaction_strategy::CASCADE, "fewer_than_two_candidates"};
   }
-  if (input.rows == 0 || !input.input_bytes || *input.input_bytes == 0 ||
-      *input.input_bytes == std::numeric_limits<std::size_t>::max() ||
-      *input.input_bytes < input.rows) {
-    return {compaction_strategy::CASCADE, "invalid_width"};
-  }
+  auto const width = average_row_width(input.rows, input.input_bytes);
+  if (!width) { return {compaction_strategy::CASCADE, "invalid_width"}; }
 
-  auto const row_width = *input.input_bytes / input.rows;
+  auto const row_width = *width;
   auto const all_known = std::ranges::all_of(
     input.membership, [](auto const& keep) { return is_known_keep_ratio(keep); });
   if (!all_known) {
@@ -513,6 +536,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   }
 
   auto const observed_filter_count = filters.generation();
+  auto const row_width = average_row_width(static_cast<std::size_t>(input.num_rows()), input_bytes);
   std::vector<membership_step> entries;
   for (auto const& [col_idx, filter] : filters.entries()) {
     if (col_idx >= num_cols) { continue; }
@@ -521,7 +545,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
     if (!applicable) { continue; }
     auto recorded =
       gate ? gate->filter_keep_ratio(filter.get(), observed_filter_count) : std::nullopt;
-    if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
+    if (recorded && skip_measured_filter(*recorded, row_width)) { continue; }
     entries.push_back({col_idx, applicable, filter.get(), recorded});
   }
   std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
@@ -571,9 +595,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   auto const* mode_name     = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS
                                 ? "include_ast_row_masks"
                                 : "membership_masks_only";
-  auto const row_width      = policy_input.rows != 0 && policy_input.input_bytes
-                                ? *policy_input.input_bytes / policy_input.rows
-                                : 0;
   std::optional<double> strongest_keep;
   for (auto const& estimate : estimates) {
     if (is_known_keep_ratio(estimate)) {
@@ -588,7 +609,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
     strategy_name,
     strategy_override ? "forced" : decision.reason,
     input_bytes.value_or(0),
-    row_width,
+    row_width.value_or(0),
     policy_input.candidate_step_count,
     entries.size(),
     strongest_keep.value_or(-1.0),
@@ -652,8 +673,8 @@ void dynamic_filter_gate::record_filter_keep_ratio(sirius::op::sirius_dynamic_fi
     filter, filter_measurement{.kept = kept, .observed_filter_count = observed_filter_count});
   if (filter_skippable(kept)) {
     SIRIUS_LOG_DEBUG(
-      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} against {} filters -> SKIP "
-      "filter permanently.",
+      "[apply_dynamic_filters] per-filter gate: marginal kept {:.3f} against {} filters -> weak "
+      "verdict frozen (skipped on narrow rows).",
       kept,
       observed_filter_count);
   }

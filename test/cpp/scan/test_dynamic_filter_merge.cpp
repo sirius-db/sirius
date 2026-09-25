@@ -2285,3 +2285,121 @@ TEST_CASE("deferred keys realign after nullable mask decline without training it
   REQUIRE(to_host_int64(out->view().column(1), stream) == std::vector<int64_t>{0, 1, 2});
   REQUIRE(to_host_int64(out->view().column(2), stream) == std::vector<int64_t>{100, 101, 102});
 }
+
+TEST_CASE("wide rows keep weak measured filters that narrow rows skip",
+          "[dynamic_filter][scan_merge][gather_once][gate][production_policy]")
+{
+  // 20 rows at 80 bytes are wide; 20 rows at 32 bytes are narrow.
+  auto const [input_bytes, wide] =
+    GENERATE(std::pair{std::size_t{1600}, true}, std::pair{std::size_t{640}, false});
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(cudf::sequence(20,
+                                   cudf::numeric_scalar<int64_t>(0, true, stream),
+                                   cudf::numeric_scalar<int64_t>(1, true, stream),
+                                   stream));
+  columns.push_back(cudf::sequence(20,
+                                   cudf::numeric_scalar<int64_t>(100, true, stream),
+                                   cudf::numeric_scalar<int64_t>(1, true, stream),
+                                   stream));
+  auto input = std::make_unique<cudf::table>(std::move(columns));
+
+  // Marginal keeps of 11/20 and 6/11: both above the gate's 50% cutoff, both at or below 60%.
+  auto first  = std::make_shared<counting_in_list_filter>(make_in_list_prefix(11, stream));
+  auto second = std::make_shared<counting_in_list_filter>(make_in_list_prefix(6, stream));
+  sirius_dynamic_filter_set filters;
+  auto producer = filters.register_producer({0});
+  REQUIRE(producer.push_filter(0, first));
+  REQUIRE(producer.push_filter(0, second));
+  sirius::op::scan::dynamic_filter_gate gate;
+
+  auto trained = sirius::op::scan::apply_dynamic_filters_gated_view(
+    input->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+    -1,
+    input_bytes);
+  stream.sync();
+  REQUIRE(trained != nullptr);
+  REQUIRE(trained->num_rows() == 6);
+  auto const first_keep  = gate.filter_keep_ratio(first.get(), filters.filter_count());
+  auto const second_keep = gate.filter_keep_ratio(second.get(), filters.filter_count());
+  REQUIRE(first_keep == Approx(0.55));
+  REQUIRE(second_keep == Approx(6.0 / 11.0));
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*first_keep));
+  REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*second_keep));
+
+  auto again = sirius::op::scan::apply_dynamic_filters_gated_view(
+    input->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+    -1,
+    input_bytes);
+  stream.sync();
+
+  if (wide) {
+    // Both weak filters stay, every marginal is known, so gather once probes the original rows.
+    REQUIRE(again != nullptr);
+    REQUIRE(to_host_int64(again->view().column(0), stream) ==
+            std::vector<int64_t>{0, 1, 2, 3, 4, 5});
+    REQUIRE(to_host_int64(again->view().column(1), stream) ==
+            std::vector<int64_t>{100, 101, 102, 103, 104, 105});
+    REQUIRE(first->probe_rows() == std::vector<cudf::size_type>{20, 20});
+    REQUIRE(second->probe_rows() == std::vector<cudf::size_type>{11, 20});
+  } else {
+    // Narrow rows skip both, so nothing is probed and the batch passes through unchanged.
+    REQUIRE(again == nullptr);
+    REQUIRE(first->probe_rows() == std::vector<cudf::size_type>{20});
+    REQUIRE(second->probe_rows() == std::vector<cudf::size_type>{11});
+  }
+}
+
+TEST_CASE("wide rows skip measured filters that keep more than sixty percent",
+          "[dynamic_filter][scan_merge][gate][production_policy]")
+{
+  auto const [prefix, applied] =
+    GENERATE(std::pair{int64_t{12}, true}, std::pair{int64_t{13}, false});
+  ::cuda::stream_ref stream = cudf::get_default_stream();
+  auto input                = make_int64_sequence_table(20, stream);
+  auto filter = std::make_shared<counting_in_list_filter>(make_in_list_prefix(prefix, stream));
+  sirius_dynamic_filter_set filters;
+  auto producer = filters.register_producer({0});
+  REQUIRE(producer.push_filter(0, filter));
+  sirius::op::scan::dynamic_filter_gate gate;
+  constexpr std::size_t wide_bytes = 1600;
+
+  auto trained = sirius::op::scan::apply_dynamic_filters_gated_view(
+    input->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+    -1,
+    wide_bytes);
+  stream.sync();
+  REQUIRE(trained != nullptr);
+  REQUIRE(trained->num_rows() == prefix);
+
+  auto again = sirius::op::scan::apply_dynamic_filters_gated_view(
+    input->view(),
+    filters.snapshot(),
+    gate,
+    stream,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+    -1,
+    wide_bytes);
+  stream.sync();
+
+  if (applied) {
+    REQUIRE(again != nullptr);
+    REQUIRE(again->num_rows() == prefix);
+    REQUIRE(filter->mask_calls() == 2);
+  } else {
+    REQUIRE(again == nullptr);
+    REQUIRE(filter->mask_calls() == 1);
+  }
+}
