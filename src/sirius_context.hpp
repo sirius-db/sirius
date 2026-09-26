@@ -352,7 +352,11 @@ class SiriusContext : public ClientContextState {
     uint64_t setting_lookups_per_attempt = 0;
     uint64_t window_tasks_started        = 0;
     std::map<std::string, uint64_t> parquet_reader_calls, native_decoder_calls;
-    uint64_t split_physical_checks = 0;
+    uint64_t iceberg_manifest_walks       = 0;
+    uint64_t iceberg_dv_manifest_reads    = 0;
+    uint64_t iceberg_delete_payload_loads = 0;
+    uint64_t iceberg_inventory_bytes_peak = 0;
+    uint64_t split_physical_checks        = 0;
     std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
     uint64_t parquet_type_mismatch_observed = 0;
     uint64_t parquet_type_refusals          = 0;

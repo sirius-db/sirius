@@ -175,9 +175,15 @@ enum class verdict_reason : uint16_t {
 };
 
 struct physical_check_counters {
+  std::atomic<uint64_t> iceberg_manifest_walks{0};
+  std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
+  std::atomic<uint64_t> iceberg_delete_payload_loads{0};
+  std::atomic<uint64_t> iceberg_inventory_bytes_peak{0};
+
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
+  std::function<void()> after_certify_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
     if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);

@@ -120,6 +120,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-sanitizer-api-12.9.79-h10ca0ad_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cxx-compiler-1.11.0-hfcd1e18_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/dlpack-0.8-h59595ed_3.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/fastavro-1.12.2-py312h1b36aeb_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc-14.4.0-hc6a0c74_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc_impl_linux-64-14.4.0-heaf7ae8_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc_linux-64-14.4.0-hc469d41_1.conda
@@ -384,6 +385,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-sanitizer-api-12.9.79-h299c5c6_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cxx-compiler-1.11.0-h7b35c40_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/dlpack-0.8-h2f0025b_3.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/fastavro-1.12.2-py312h898233f_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc-14.4.0-hfdd745d_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc_impl_linux-aarch64-14.4.0-h15aaa9e_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc_linux-aarch64-14.4.0-hab84b30_1.conda
@@ -655,6 +657,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-sanitizer-api-13.4.92-h0cf1943_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cxx-compiler-2.0.0-hdab9b82_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/dlpack-0.8-h59595ed_3.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/fastavro-1.12.2-py312h1b36aeb_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc-15.3.0-hc6a0c74_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc_impl_linux-64-15.3.0-h6f13dc8_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gcc_linux-64-15.3.0-h7df7c86_1.conda
@@ -919,6 +922,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-sanitizer-api-13.4.92-he41a712_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cxx-compiler-2.0.0-hf41333a_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/dlpack-0.8-h2f0025b_3.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/fastavro-1.12.2-py312h898233f_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc-15.3.0-hfdd745d_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc_impl_linux-aarch64-15.3.0-hfe63468_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/gcc_linux-aarch64-15.3.0-h2b28b3f_1.conda
@@ -2802,7 +2806,7 @@ packages:
   - zstd >=1.5.7,<1.6.0a0
   license: BSD-3-Clause AND MIT AND EPL-2.0
   purls:
-  - pkg:pypi/backports-zstd?source=compressed-mapping
+  - pkg:pypi/backports-zstd?source=hash-mapping
   run_exports: {}
   size: 241113
   timestamp: 1788491295568
@@ -3887,6 +3891,21 @@ packages:
   run_exports: {}
   size: 13148627
   timestamp: 1738164137421
+- conda: https://conda.anaconda.org/conda-forge/linux-64/fastavro-1.12.2-py312h1b36aeb_2.conda
+  sha256: aad8ba38bb3054bf864d0079fe46bfda48b39f6599237c9a244b9082917c2f1a
+  md5: cce61ddcd5ecafd1da294b92617221b3
+  depends:
+  - python
+  - __glibc >=2.17,<3.0.a0
+  - libgcc >=15
+  - python_abi 3.12.* *_cp312
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/fastavro?source=hash-mapping
+  run_exports: {}
+  size: 566885
+  timestamp: 1788535281379
 - conda: https://conda.anaconda.org/conda-forge/linux-64/flex-2.6.4-h58526e2_1004.tar.bz2
   sha256: 5a6dba5af1127e859eefd68e77b7af062b42f85401efbb43a970da977ba3e344
   md5: b1029ec81c7e0969e84a8179d039a9ce
@@ -7740,7 +7759,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/cffi?source=hash-mapping
+  - pkg:pypi/cffi?source=compressed-mapping
   run_exports: {}
   size: 325201
   timestamp: 1788485261662
@@ -8668,6 +8687,20 @@ packages:
   run_exports: {}
   size: 13227405
   timestamp: 1738171320483
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/fastavro-1.12.2-py312h898233f_2.conda
+  sha256: 3ec04985067735cf197b7cce324015d3786e2fdb9c50aae17b82a43f7733b06c
+  md5: 097d6e4a54965675f4f65ca80bfcbc60
+  depends:
+  - python
+  - libgcc >=15
+  - python_abi 3.12.* *_cp312
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/fastavro?source=hash-mapping
+  run_exports: {}
+  size: 542826
+  timestamp: 1788535646981
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/flex-2.6.4-h884eca8_1004.tar.bz2
   sha256: 876d5b6b79d431174668b05b67fc8c931e03101efaefb117a7fadd98727edbb0
   md5: 1e81594037ba4a15a83f42497fee59f3
@@ -12813,7 +12846,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/python-discovery?source=hash-mapping
+  - pkg:pypi/python-discovery?source=compressed-mapping
   run_exports: {}
   size: 38928
   timestamp: 1787953569064
