@@ -559,7 +559,11 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       }
     }
 
-    compute_input_sources(*plan_tree);
+    try {
+      compute_input_sources(*plan_tree);
+    } catch (std::invalid_argument const& error) {
+      return fail(std::string{error.what()} + " in col " + std::to_string(ci));
+    }
     out_col.plan_tree = std::move(plan_tree);
   }
 

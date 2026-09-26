@@ -126,16 +126,16 @@ void io_roundtrip(char const* label,
            (std::string(label) + ": data mismatch col " + std::to_string(i)).c_str());
 }
 
-// In-memory (pinned-blob) roundtrip via the production pin-path entry points:
+// Serialize `ct` through the production pin-path entry points and read it back:
 // build_compressed_table_header enumerates payload buffers, we assemble the
 // payload host-side, then read_compressed_table_from_memory reconstructs
-// through the same fetch seam pin_table uses.
-void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+// through the same fetch seam pin_table uses. Read errors land in `rerr`.
+simpatico::compressed_table memory_reread(char const* label,
+                                          simpatico::compressed_table const& ct,
+                                          std::string& rerr)
 {
   rmm::cuda_stream_view stream = cudf::get_default_stream();
   auto mr                      = rmm::mr::get_current_device_resource_ref();
-
-  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
 
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> buffers;
@@ -162,9 +162,18 @@ void memory_roundtrip(char const* label, cudf::table_view input, std::string con
         throw std::runtime_error("memory_roundtrip: fetch copy failed");
     };
 
+  return simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+}
+
+// In-memory (pinned-blob) roundtrip; see memory_reread.
+void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
+{
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = rmm::mr::get_current_device_resource_ref();
+
+  simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
   std::string rerr;
-  simpatico::compressed_table ct2 =
-    simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &rerr);
+  simpatico::compressed_table ct2 = memory_reread(label, ct, rerr);
   expect(rerr.empty(), (std::string(label) + ": read error: " + rerr).c_str());
 
   auto out = simpatico::decompress(ct2, stream, mr);
@@ -529,6 +538,26 @@ void test_error_not_found()
   expect(ct.columns.empty(), "error_not_found: expected empty result");
 }
 
+// Error: a stored edge that names a channel its producer does not output is reported through the
+// reader's error string, not thrown and not wired to another channel.
+void test_error_unknown_edge_channel()
+{
+  auto t         = make_int32_table(1, 4096, 17);
+  auto ct        = simpatico::compress_with_plan(t->view(),
+                                          "input -> for -> deltas, references\n"
+                                                 "for.deltas -> bitpack\n",
+                                          cudf::get_default_stream(),
+                                          rmm::mr::get_current_device_resource_ref());
+  auto& producer = ct.columns[0].plan_tree->nodes[1];
+  expect(producer.op == "for" && producer.children.size() == 1, "error_unknown_edge: plan shape");
+  producer.children.front().channel = "unknown";
+  std::string err;
+  auto const reread = memory_reread("error_unknown_edge", ct, err);
+  expect(err.find("does not output") != std::string::npos,
+         ("error_unknown_edge: unexpected error '" + err + "'").c_str());
+  expect(reread.columns.empty(), "error_unknown_edge: expected empty result");
+}
+
 // Error: a non-HPLN file (garbage) is rejected rather than crashing.
 void test_error_garbage()
 {
@@ -671,6 +700,7 @@ int main()
     {"column_names_survive", test_column_names_survive},
     {"zero_rows", test_zero_rows},
     {"error_not_found", test_error_not_found},
+    {"error_unknown_edge_channel", test_error_unknown_edge_channel},
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},

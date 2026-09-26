@@ -60,9 +60,10 @@ bool launch_encode_fused_tree(CodegenHead const& head,
                               fused_leaf_builder& builder,
                               std::string* error_out);
 
-/// Callback used by the high-level decode bridge to materialize an entropy-tail
-/// child while binding a fused subtree.
-using decode_materialize_fn = std::function<cudf::column const*(NodeId)>;
+/// Callback used by the high-level decode bridge to decode an entropy tail while binding a fused
+/// subtree: materialize the consumer node and return the decoded value it consumes. A consumer may
+/// take several inputs (a bitjoin), so the value, not the consumer, selects the column.
+using decode_materialize_fn = std::function<cudf::column const*(NodeId consumer, ValueId value)>;
 
 /// Launch an already-prepared fused decode tree. ``labeled`` must contain all
 /// persisted buffers; frame-owned scratch and kernels remain live through session completion.

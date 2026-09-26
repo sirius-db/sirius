@@ -110,10 +110,14 @@ class DecodeWalk {
              std::string* error_out,
              decode_predicate const* pred,
              decode_selection const* sel);
-  cudf::column const* materialize(NodeId nid);
+  // Materialize `consumer` and return the decoded `value` it consumes, for a fused region to bind.
+  cudf::column const* bind(NodeId consumer, ValueId value);
   void run(decode_column_slot output);
 
  private:
+  // Decode the values that `nid` encoded into the memo: every input of a bitjoin, otherwise its
+  // single input.
+  void materialize(NodeId nid);
   void materialize_fused_node(NodeId nid,
                               decode_selection const* node_sel,
                               decode_column_slot output);
@@ -205,10 +209,10 @@ std::unordered_map<std::string, cudf::column_view> channels_by_name(
 //   and ``offsets``; bind them directly.
 //
 //   Entropy-tail (data was routed to a downstream non-fused op, e.g. ans):
-//   the RawFused rep holds only ``offsets``; ``data`` is resolved by calling
-//   materialize on the downstream PlanTree child node (the non-fused op that
-//   compressed the raw bytes). The result is a view into the shared memo, which
-//   owns it through the decode launch.
+//   the RawFused rep holds only ``offsets``; ``data`` is resolved through ``materialize`` for the
+//   downstream PlanTree child node (the non-fused op that compressed the raw bytes) and the
+//   parent's output value. The result is a view into the shared memo, which owns it through the
+//   decode launch.
 //
 // Element size for the data slot:
 //   rle.runs  -> always sizeof(int32_t) (run counts are int32 regardless of
@@ -279,7 +283,14 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                        std::to_string(parent_id) + " for entropy-tail resolve";
         return false;
       }
-      cudf::column const* resolved = materialize(child_id);
+      auto const port = output_port(tree, parent_id, channel_name);
+      if (!port) {
+        if (error_out)
+          *error_out = "codegen decode: node " + std::to_string(parent_id) +
+                       " does not output routed channel '" + channel_name + "'";
+        return false;
+      }
+      cudf::column const* resolved = materialize(child_id, ValueId{parent_id, *port});
       if (!resolved) {
         if (error_out && error_out->empty())
           *error_out = "codegen decode: entropy-tail resolve failed for RawFused channel '" +
@@ -309,13 +320,12 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
 // rep ``named_channels()`` in per-op CONSUMED-slot order (``consumed_slots``);
 // every rep is dense, so decode always uses the Compact gather.
 //
-// Entropy-tail-routed channels — a CONSUMED slot consumed downstream by
-// another op (e.g. ``…packed -> snappy``, ``…packed -> bitcomp -> ans``, or a
-// codegen tail ``…chunk_min -> zigzag``), detected as a child edge — are
-// RESOLVED here via ``materialize`` (the downstream subtree), which returns a
-// view into the shared memo that owns it through completion of the decode
-// launch. An identity NO-OP terminal (``…chunk_min -> identity``) leaves the
-// bytes inside THIS rep and is bound directly.
+// Entropy-tail-routed channels — a CONSUMED slot consumed downstream by another op (e.g. ``…packed
+// -> snappy``, ``…packed -> bitcomp -> ans``, or a codegen tail ``…chunk_min -> zigzag``), detected
+// as a child edge — are RESOLVED here via ``materialize`` (the downstream subtree), which returns a
+// view of this node's output value in the shared memo that owns it through completion of the decode
+// launch. An identity NO-OP terminal (``…chunk_min -> identity``) leaves the bytes inside THIS rep
+// and is bound directly.
 bool bind_real_node_buffers(std::int32_t node_id,
                             NodeId plan_node,
                             PlanTree const& tree,
@@ -371,7 +381,14 @@ bool bind_real_node_buffers(std::int32_t node_id,
       // shared memo, which owns it through completion of the launch. One path for
       // both, no empty-map special case (e.g. …bitpack -> chunk_min -> zigzag
       // resolves the nested codegen tail through the same memo).
-      cudf::column const* col = materialize(eit->second);
+      auto const port = output_port(tree, plan_node, slot);
+      if (!port) {
+        if (error_out)
+          *error_out = "codegen decode: node " + std::to_string(plan_node) +
+                       " does not output routed slot '" + slot + "'";
+        return false;
+      }
+      cudf::column const* col = materialize(eit->second, ValueId{plan_node, *port});
       if (!col) {
         if (error_out && error_out->empty())
           *error_out = "codegen decode: failed to resolve tail slot '" + slot + "' at node " +
@@ -658,24 +675,39 @@ void DecodeWalk::materialize_fused_node(NodeId nid,
                                         decode_selection const* node_sel,
                                         decode_column_slot output)
 {
-  decode_materialize_fn resolve = [this](NodeId dependency) { return materialize(dependency); };
+  decode_materialize_fn resolve = [this](NodeId consumer, ValueId value) {
+    return bind(consumer, value);
+  };
   decode_fused_subtree_impl(tree, nid, resolve, frame, output, error_out, node_sel);
 }
 
-cudf::column const* DecodeWalk::materialize(NodeId nid)
+cudf::column const* DecodeWalk::bind(NodeId consumer, ValueId value)
+{
+  // Look the value up first: materializing a bitjoin checks only its first input, which that
+  // input's producer may already have consumed while rebuilding its representation.
+  auto const key = value_id_key(value);
+  if (!frame.contains_memo(key)) materialize(consumer);
+  if (auto const* column = frame.find_memo(key)) return column;
+  if (frame.contains_memo(key))
+    throw std::runtime_error("decode: memo value already consumed " + value_label(value));
+  throw std::runtime_error("decode: node " + std::to_string(consumer) +
+                           " does not consume bound value " + value_label(value));
+}
+
+void DecodeWalk::materialize(NodeId nid)
 {
   auto const& node   = tree.nodes.at(nid);
   auto const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
   auto const key     = value_id_key(primary);
   if (frame.contains_memo(key)) {
-    auto* value = frame.find_memo(key);
-    if (!value)
+    if (!frame.find_memo(key))
       throw std::runtime_error("decode: memo value already consumed " + value_label(primary));
-    return value;
+    return;
   }
+  // A bitjoin decodes every input value it consumes, not only the first.
   if (node.attrs.bitjoin) {
     decode_bitjoin(nid, tree, frame);
-    return frame.find_memo(key);
+    return;
   }
   auto output = frame.memo_column(key);
   if (is_codegen_compressor(node.op)) {
@@ -722,7 +754,6 @@ cudf::column const* DecodeWalk::materialize(NodeId nid)
     if (!output) decode_standalone(rep, frame, output);
   }
   if (!output) throw std::runtime_error("decode: leaf returned no column");
-  return &output.get();
 }
 
 DecodeWalk::DecodeWalk(PlanTree const& tree,
@@ -921,7 +952,9 @@ bool try_dict_gather_fast_path(PlanTree const& tree,
     if (edge.channel == "indices") codes_nid = edge.child;
   if (codes_nid >= tree.nodes.size()) return false;
   std::string error;
-  decode_materialize_fn resolve = [&walk](NodeId nid) { return walk.materialize(nid); };
+  decode_materialize_fn resolve = [&walk](NodeId consumer, ValueId value) {
+    return walk.bind(consumer, value);
+  };
   auto region = bind_fused_region(tree, codes_nid, resolve, frame.stream(), frame.mr(), &error);
   if (!region) throw std::runtime_error(error);
   auto const survivors = static_cast<cudf::size_type>(sel.survivor_count);
@@ -997,7 +1030,9 @@ void decode_str_split_selected(PlanTree const& tree,
   }
   auto const chars = channels.front().view;
   std::string error;
-  decode_materialize_fn resolve = [&walk](NodeId nid) { return walk.materialize(nid); };
+  decode_materialize_fn resolve = [&walk](NodeId consumer, ValueId value) {
+    return walk.bind(consumer, value);
+  };
   auto region =
     bind_fused_region(tree, shape->offsets_nid, resolve, frame.stream(), frame.mr(), &error);
   if (!region) throw std::runtime_error(error);
@@ -1369,8 +1404,8 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
       throw std::invalid_argument("decode: plan cannot produce a range ballot");
     }
     auto const root               = root_value_producer(request.plan);
-    decode_materialize_fn resolve = [&walk](NodeId dependency) {
-      return walk.materialize(dependency);
+    decode_materialize_fn resolve = [&walk](NodeId consumer, ValueId value) {
+      return walk.bind(consumer, value);
     };
     auto region =
       bind_fused_region(request.plan, root, resolve, frame.stream(), frame.mr(), &error);
