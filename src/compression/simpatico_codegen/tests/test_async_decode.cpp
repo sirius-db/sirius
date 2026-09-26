@@ -747,6 +747,52 @@ void test_completed_public_return(rmm::device_async_resource_ref upstream)
   }
 }
 
+// The span overloads borrow their streams. Repeated views are accepted and give the same result as
+// the stream_pool overloads; the call waits on each distinct stream at most once, and that wait
+// also covers work others queued there; the streams stay usable afterwards.
+void test_borrowed_stream_views(rmm::device_async_resource_ref upstream)
+{
+  auto input      = make_int32_table(6, 65549, 59);
+  auto compressed = simpatico::compress_with_plan(
+    input->view(),
+    repeated_plan("input -> delta -> differences\ndelta.differences -> bitpack\n", 6),
+    cudf::get_default_stream(),
+    upstream);
+  std::array<std::size_t, 4> const selected{5, 2, 2, 0};
+  std::array<simpatico::decode_predicate, 4> const inactive{};
+  simpatico::stream_pool pool;
+  expect(pool.init(2), "borrowed-view pool init");
+  std::array const views{rmm::cuda_stream_view{pool.streams[0]},
+                         rmm::cuda_stream_view{pool.streams[1]},
+                         rmm::cuda_stream_view{pool.streams[0]},
+                         rmm::cuda_stream_view{pool.streams[0]}};
+  // Also compiles the kernels, so the observed calls below make no first-use waits.
+  auto const pooled = simpatico::decompress(compressed, selected, pool, upstream);
+  verify_projection(input->view(), pooled->view(), selected);
+  for (bool const predicated : {false, true}) {
+    cuda_check(pool.sync_all());
+    stream_gate gate(pool.streams[1]);
+    event_markers markers(pool);
+    markers.record();
+    gate.release_after_delay.store(true);
+    std::unique_ptr<cudf::table> table;
+    {
+      stream_observation_scope observed;
+      table = predicated ? simpatico::decompress(compressed, selected, inactive, views, upstream)
+                         : simpatico::decompress(compressed, selected, views, upstream);
+      for (auto handle : pool.streams)
+        expect(observed.count(handle).queries <= 1 && observed.count(handle).synchronizations <= 1,
+               "borrowed views were waited on beyond the final wait");
+    }
+    expect(gate.released.load() && markers.complete(),
+           "the final wait skipped work queued on a borrowed stream");
+    expect(!gate.timed_out.load(), "borrowed-view watchdog expired");
+    verify_projection(input->view(), table->view(), selected);
+  }
+  for (auto handle : pool.streams)
+    cuda_check(cudaStreamSynchronize(handle));
+}
+
 void test_identity_owned_children(rmm::device_async_resource_ref upstream)
 {
   rmm::cuda_stream input_stream(rmm::cuda_stream::flags::non_blocking);
@@ -2398,6 +2444,7 @@ int main()
     current_resource_guard current(upstream);
     test_table_contracts(upstream);
     test_completed_public_return(upstream);
+    test_borrowed_stream_views(upstream);
     test_identity_owned_children(upstream);
     test_dictionary_width_metadata(upstream);
     test_dictionary_offsets_validation(upstream);

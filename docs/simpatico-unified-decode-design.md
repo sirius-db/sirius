@@ -32,6 +32,8 @@ This document describes the current ownership and execution contracts. Benchmark
 
 Public decode calls return only after all their output and mask writes complete. The engine can then release compressed inputs or rebind output allocation streams according to its existing converter contract. Changing an RMM buffer's deallocation stream is not itself a CUDA ordering edge.
 
+The supplied streams may be borrowed views, possibly repeated and possibly shared with other callers, such as streams from a memory space's pool. Every wait on a supplied stream also waits for whatever others queued there, so work on the supplied streams, including other callers', must never be host-gated.
+
 Callers establish input readiness and retain borrowed plans, representations, masks, row sets, and indices through session completion or destruction. Stream views and memory-resource references do not own those resources. The supplied resource must outlive returned allocations, and their stored streams must remain valid until rebinding or destruction.
 
 Submission and destruction stay on the constructing CPU thread and current device. This preserves the engine's per-thread reservation attachment: every device temporary is allocated and released inside the `append` call that needs it, and outputs are released by the caller or by the session destructor. Explicit decode allocations use the supplied memory resource; opaque library temporaries use cuDF's current device resource.
@@ -117,6 +119,7 @@ The session does not expose lane assignments or pending column views to implemen
 
 - [`test_async_decode.cpp`](../src/compression/simpatico_codegen/tests/test_async_decode.cpp): completed returns, concurrent submission, dictionary metadata, duplicate stream handles, release of temporaries during submission without waits (including the predicate, dictionary-gather, selected-string, full-width-then-gather, and mask routes), host-upload lifetime, abandonment, typed failures (including failure after enqueue), and error-priority drainage.
 - [`test_scan_filter_session.cpp`](../src/compression/simpatico_codegen/tests/test_scan_filter_session.cpp): phase integration, predicate dual delivery, membership acceptance/decline, and selected output.
+- Borrowed stream views: [`test_async_decode.cpp`](../src/compression/simpatico_codegen/tests/test_async_decode.cpp) checks that a table decode waits on each distinct view at most once and covers work others queued there; [`test_scan_filter_session.cpp`](../src/compression/simpatico_codegen/tests/test_scan_filter_session.cpp) decodes with repeated views that include the output stream and checks every result against expected values: a range, keep-mask, and full-width request and a table decode through both the `stream_pool` and view overloads, then membership, BOOL8-only (empty second wave), and predicate table requests through the views.
 - [`test_masked_decode_variants.cpp`](../src/compression/simpatico_codegen/tests/test_masked_decode_variants.cpp): compacted kernel variants and selection boundaries.
 - [`test_decode_reservation.cpp`](../test/cpp/compression/test_decode_reservation.cpp): actual engine reservation behavior, a peak charge of earlier outputs plus one request's temporaries, and preserved OOM handling.
 

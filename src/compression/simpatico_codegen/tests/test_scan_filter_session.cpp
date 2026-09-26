@@ -311,6 +311,119 @@ void bool8_delivery(simpatico::stream_pool& pool,
     expect((flags[i] != 0) == (i % 97 != 0), "unselected BOOL8 predicate value");
 }
 
+// Borrowed lanes may repeat and may include the output stream, as lanes taken from a shared pool
+// do. The phase joins, the index waits, and the cleanup waits must stay correct; results must match
+// the stream_pool overloads; and the call must leave every lane usable.
+void aliased_borrowed_lanes(simpatico::stream_pool& pool,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(sequence(0, stream, mr));
+  columns.push_back(sequence(10000, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed = simpatico::compress_with_plan(
+    input.view(), "input -> bitpack\n---\ninput -> identity\n", stream, mr);
+  // Non-blocking, as production lanes are: no implicit ordering with the legacy default stream.
+  rmm::cuda_stream lane{rmm::cuda_stream::flags::non_blocking};
+  rmm::cuda_stream out{rmm::cuda_stream::flags::non_blocking};
+  std::array const lanes{lane.view(), out.view(), lane.view(), out.view()};
+  std::array<std::size_t, 2> selected{0, 1};
+
+  // Two sources on different lanes, a full-width column, and a keep mask exercise every join.
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+  request.filters.push_back({0, {0, 19}});
+  request.filters.push_back({0, {5, row_count - 1}});
+  std::vector<std::uint32_t> keep((row_count + 31) / 32, ~std::uint32_t{0});
+  request.keep_mask_words = keep.data();
+  request.keep_mask_rows  = row_count;
+  std::vector<std::int32_t> survivors(15);
+  std::iota(survivors.begin(), survivors.end(), 5);
+  for (bool pooled : {true, false}) {
+    sc::scan_filter_result result;
+    auto output =
+      pooled
+        ? simpatico::decompress_scan_filter(compressed, selected, request, result, pool, out, mr)
+        : simpatico::decompress_scan_filter(compressed, selected, request, result, lanes, out, mr);
+    expect(result.applied && result.survivor_count == 15,
+           "borrowed lanes: filtered decode applied");
+    verify_values(output->view(), survivors, stream);
+  }
+
+  // A membership probe runs on its assigned lane, whichever handle that repeats.
+  request.filters.pop_back();
+  request.keep_mask_words = nullptr;
+  request.keep_mask_rows  = 0;
+  cudf::numeric_scalar<std::int32_t> const lower(10005, true, stream, mr);
+  stream.synchronize();
+  request.membership_filters.push_back(
+    {1,
+     [&lanes, &lower](cudf::column_view keys,
+                      rmm::cuda_stream_view assigned,
+                      rmm::device_async_resource_ref resource) {
+       expect(std::find(lanes.begin(), lanes.end(), assigned) != lanes.end(),
+              "probe uses a borrowed lane");
+       return cudf::binary_operation(keys,
+                                     lower,
+                                     cudf::binary_operator::GREATER_EQUAL,
+                                     cudf::data_type{cudf::type_id::BOOL8},
+                                     assigned,
+                                     resource);
+     }});
+  {
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, lanes, out, mr);
+    expect(result.applied && result.survivor_count == 15, "borrowed lanes: membership source");
+    verify_values(output->view(), survivors, stream);
+  }
+
+  std::vector<std::int32_t> all(row_count);
+  std::iota(all.begin(), all.end(), 0);
+  std::array<simpatico::decode_predicate, 2> const no_predicates{};
+  verify_values(simpatico::decompress(compressed, selected, pool, mr)->view(), all, stream);
+  verify_values(simpatico::decompress(compressed, selected, lanes, mr)->view(), all, stream);
+  verify_values(
+    simpatico::decompress(compressed, selected, no_predicates, lanes, mr)->view(), all, stream);
+
+  // A BOOL8-only request leaves wave 2 empty, so the phase itself waits on the repeated lanes.
+  {
+    std::vector<std::string> strings(row_count, "other");
+    cudf::size_type matches = 0;
+    for (int i = 0; i < row_count; i += 97, ++matches)
+      strings[i] = "match";
+    std::vector<std::unique_ptr<cudf::column>> string_columns;
+    string_columns.push_back(make_strings_column(strings, {}, stream));
+    cudf::table string_input{std::move(string_columns)};
+    auto dictionary =
+      simpatico::compress_with_plan(string_input.view(),
+                                    "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                                    "dictionary.indices -> bitpack\n",
+                                    stream,
+                                    mr);
+    std::array<std::size_t, 1> const only{0};
+    sc::scan_filter_request bool8;
+    bool8.routes = {sc::decode_route::dict_codes};
+    bool8.bool8_filters.push_back({0, {"match"}});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(dictionary, only, bool8, result, lanes, out, mr);
+    expect(result.applied && output->num_rows() == matches, "borrowed lanes: BOOL8-only request");
+    auto flags = read<std::uint8_t>(output->view().column(0), stream);
+    expect(std::all_of(flags.begin(), flags.end(), [](auto flag) { return flag != 0; }),
+           "borrowed lanes: BOOL8 values");
+  }
+
+  // The borrowed lanes still accept work after the calls.
+  rmm::device_buffer probe(sizeof(std::uint32_t), stream, mr);
+  stream.synchronize();
+  for (auto const borrowed : lanes) {
+    check(cudaMemsetAsync(probe.data(), 0, probe.size(), borrowed.value()));
+    check(cudaStreamSynchronize(borrowed.value()));
+  }
+}
+
 }  // namespace
 
 int main()
@@ -337,6 +450,7 @@ int main()
     expect(pool.init(4), "stream pool initialization");
     numeric_sources(pool, stream.view(), resource);
     bool8_delivery(pool, stream.view(), resource);
+    aliased_borrowed_lanes(pool, stream.view(), resource);
     check(pool.sync_all());
     stream.synchronize();
     std::puts("test_scan_filter_session: OK");

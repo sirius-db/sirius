@@ -324,4 +324,44 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
+// ── Decompression across borrowed streams ────────────────────────────────────
+//
+// Each overload below behaves like its stream_pool counterpart above, which forwards to it, but
+// borrows the streams as views, for callers whose streams are owned elsewhere (for example, a
+// memory space's stream pool). `streams` must be non-empty, and every stream must belong to the
+// current device. A call neither creates nor destroys the streams and does not keep the span, but
+// returned allocations may record a stream for deallocation: returned columns record the stream
+// that produced them (a view, or the scan-filter output stream), and the mask, offset, and index
+// buffers of a scan_filter_result record `streams.front()`. The streams must outlive those
+// allocations. Views may repeat: requests are assigned to them in rotation, and each wait covers
+// each distinct stream at most once. They may include the scan-filter output stream and may carry
+// other callers' work, which every wait on that stream also covers, so work on the supplied
+// streams, including other callers', must never be host-gated.
+
+/// Decompress a column subset across borrowed streams from the calling CPU thread.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const rmm::cuda_stream_view> streams,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset with predicate pushdown across borrowed streams.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  std::span<const rmm::cuda_stream_view> streams,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset with the scan's row filter applied, across borrowed streams.
+std::unique_ptr<cudf::table> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  std::span<const rmm::cuda_stream_view> streams,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
+  std::string* error_out            = nullptr);
+
 }  // namespace simpatico
