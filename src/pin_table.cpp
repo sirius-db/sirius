@@ -434,9 +434,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   return {};
 }
 
-// Streams for cross-column encode parallelism, one pool per thread and device —
-// the same accessor the decode path uses, so a thread that both pins and
-// decodes holds one pool rather than two.
+// Streams for cross-column encode parallelism, one pool per thread and device.
 simpatico::stream_pool& compress_pool() { return simpatico::thread_device_stream_pool(4); }
 
 // Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
