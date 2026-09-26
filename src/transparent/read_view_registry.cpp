@@ -18,6 +18,8 @@
 
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -412,14 +414,93 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
   return result;
 }
 
-void read_view_registry::publish_supported(
+void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,
+                                                   uint64_t elapsed_us)
+{
+  entries_.at(by_contract_id_.at(id)).eligibility.cost.delete_preparation_time_us += elapsed_us;
+}
+
+void read_view_registry::record_verdict(op::scan::scan_contract_id id,
+                                        op::scan::certification_result const& result)
+{
+  auto const found = by_contract_id_.find(id);
+  if (found == by_contract_id_.end()) {
+    throw std::runtime_error("unknown scan contract id " + std::to_string(id));
+  }
+  auto& certificate = entries_[found->second].eligibility;
+  if (certificate.verdict != op::scan::eligibility_verdict::not_evaluated) {
+    throw std::logic_error("scan verdict already recorded for contract " + std::to_string(id));
+  }
+  if (result.verdict == op::scan::eligibility_verdict::not_evaluated) {
+    throw std::logic_error("cannot record an unevaluated scan verdict");
+  }
+  if ((result.verdict == op::scan::eligibility_verdict::supported &&
+       result.reason != op::scan::verdict_reason::none) ||
+      (result.verdict != op::scan::eligibility_verdict::supported &&
+       result.reason == op::scan::verdict_reason::none)) {
+    throw std::logic_error("scan verdict and reason disagree");
+  }
+  if (result.verdict == op::scan::eligibility_verdict::incomplete &&
+      result.reason != op::scan::verdict_reason::budget_time &&
+      result.reason != op::scan::verdict_reason::budget_bytes &&
+      result.reason != op::scan::verdict_reason::evidence_missing &&
+      result.reason != op::scan::verdict_reason::interface_unavailable) {
+    throw std::logic_error("incomplete scan verdict has a non-incomplete reason");
+  }
+  certificate.verdict          = result.verdict;
+  certificate.reason           = result.reason;
+  certificate.reason_text      = result.reason_text;
+  certificate.later_checks     = result.later_checks;
+  certificate.cost             = result.cost;
+  certificate.storage_version  = result.storage_version;
+  certificate.semantic_columns = result.semantic_columns;
+}
+
+op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
+  op::sirius_physical_table_scan const& scan, planner::connector const& connector)
+{
+  if (!scan.read_views || scan.read_views.get() != this) {
+    throw std::logic_error("declined scan is not owned by this read-view registry");
+  }
+  op::scan::column_requirements columns;
+  columns.column_ids     = scan.column_ids;
+  columns.projection_ids = scan.projection_ids;
+  for (auto const& column : scan.column_ids) {
+    if (column.IsRowIdColumn()) columns.requires_row_id = true;
+    if (column.IsVirtualColumn() && column.HasPrimaryIndex()) {
+      columns.virtual_columns.push_back(column.GetPrimaryIndex());
+    }
+  }
+  auto kind = op::scan::materializer_kind::parquet;
+  if (connector.kind == op::scan::source_kind::duckdb_native) {
+    kind = op::scan::materializer_kind::duckdb_native;
+  } else if (connector.kind == op::scan::source_kind::stream_source) {
+    kind = op::scan::materializer_kind::stream;
+  } else if (connector.function_name == "iceberg_scan") {
+    kind = op::scan::materializer_kind::iceberg;
+  }
+  return op::scan::allocate_scan_contract(*this,
+                                          scan.contract_window_id,
+                                          scan.contract_finalize_generation,
+                                          scan.scan_node_id,
+                                          nullptr,
+                                          std::move(columns),
+                                          {},
+                                          {kind, connector.registry_profile},
+                                          scan.duckdb_types,
+                                          scan.table_index);
+}
+
+void read_view_registry::publish_correspondence(
   op::scan::certificate_evidence_scope scope,
   std::string correspondence,
   std::span<op::scan::bound_read_view const> physical_original)
 {
   std::vector<bool> consumed(physical_original.size(), false);
   for (auto& entry : entries_) {
-    entry.eligibility.verdict        = op::scan::eligibility_verdict::supported;
+    if (entry.eligibility.verdict == op::scan::eligibility_verdict::not_evaluated) {
+      entry.eligibility.verdict = op::scan::eligibility_verdict::supported;
+    }
     entry.eligibility.evidence_scope = scope;
     entry.eligibility.correspondence = correspondence;
     if (entry.contract.view && entry.contract.view->identity) {
@@ -514,9 +595,13 @@ scan_contract_id allocate_scan_contract(transparent::read_view_registry& registr
   eligibility.depth        = contract.view ? contract.view->depth : evidence_depth::path;
   eligibility.materializer = contract.materializer;
   switch (contract.materializer.kind) {
-    case materializer_kind::duckdb_native: eligibility.later_checks = {"segments_per_range"}; break;
+    case materializer_kind::duckdb_native:
+      eligibility.later_checks = check_bit(later_check::segments_per_range);
+      break;
     case materializer_kind::parquet:
-    case materializer_kind::iceberg: eligibility.later_checks = {"footer_per_file"}; break;
+    case materializer_kind::iceberg:
+      eligibility.later_checks = check_bit(later_check::footer_per_file);
+      break;
     case materializer_kind::stream: eligibility.later_checks = {}; break;
   }
 

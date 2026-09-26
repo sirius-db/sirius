@@ -27,6 +27,14 @@
 namespace sirius::transparent {
 
 class read_view_registry;
+}
+namespace sirius::planner {
+struct connector;
+}
+namespace sirius::op {
+class sirius_physical_table_scan;
+}
+namespace sirius::transparent {
 
 enum class candidate_origin : uint8_t { copy, replan };
 
@@ -90,10 +98,14 @@ class read_view_registry {
     return entries_;
   }
   [[nodiscard]] std::vector<candidate_binding> candidate_bindings() const;
-  void publish_supported(op::scan::certificate_evidence_scope scope,
-                         std::string correspondence,
-                         std::span<op::scan::bound_read_view const> physical_original);
+  void record_verdict(op::scan::scan_contract_id id, op::scan::certification_result const& result);
+  op::scan::scan_contract_id allocate_declined_scan(op::sirius_physical_table_scan const& scan,
+                                                    planner::connector const& connector);
+  void publish_correspondence(op::scan::certificate_evidence_scope scope,
+                              std::string correspondence,
+                              std::span<op::scan::bound_read_view const> physical_original);
   void inject_mismatch_for_testing(bool swap);
+  void record_delete_preparation(op::scan::scan_contract_id id, uint64_t elapsed_us);
 
  private:
   friend op::scan::scan_contract_id op::scan::allocate_scan_contract(

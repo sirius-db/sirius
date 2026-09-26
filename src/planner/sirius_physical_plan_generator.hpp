@@ -20,12 +20,14 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
@@ -70,6 +72,12 @@ namespace sirius::planner {
 struct scan_contract_provenance {
   std::optional<uint64_t> window_id;
   uint64_t finalize_generation = 0;
+  op::scan::certification_budget budget;
+  op::scan::test_injections injections;
+  uint64_t setting_lookups          = 0;
+  uint64_t certification_scan_index = 0;
+  uint64_t lineage_time_us          = 0;
+  std::optional<std::pair<op::scan::verdict_reason, std::string>> first_pre_decline;
 };
 
 /// Resolved parquet file set identifying a parquet-family scan

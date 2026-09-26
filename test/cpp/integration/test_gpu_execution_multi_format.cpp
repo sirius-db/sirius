@@ -30,13 +30,17 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/types/blob.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/table_scan/bound_read_view.hpp>
+#include <op/sirius_physical_table_scan.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <transparent/read_view_registry.hpp>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
@@ -1309,6 +1313,73 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(eq_path) + " ORDER BY count;",
                       kEqualityDeleteRoute,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
+                 "R2a pre-capture marks Iceberg equality refusal on scan node",
+                 "[integration][gpu_execution][iceberg][verdict]")
+{
+  auto transaction = con->Query("BEGIN TRANSACTION READ ONLY");
+  REQUIRE(transaction);
+  REQUIRE_FALSE(transaction->HasError());
+  auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(eq_path));
+  REQUIRE(logical);
+  auto* current = logical.get();
+  while (current->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+    REQUIRE_FALSE(current->children.empty());
+    current = current->children.front().get();
+  }
+  struct probe_generator : sirius::planner::sirius_physical_plan_generator {
+    using sirius_physical_plan_generator::create_plan;
+    using sirius_physical_plan_generator::sirius_physical_plan_generator;
+  } generator(*con->context, sirius::planner::scan_contract_provenance{std::nullopt, 17});
+  auto physical = generator.create_plan(current->Cast<duckdb::LogicalGet>());
+  REQUIRE(physical);
+  auto* node = physical.get();
+  while (node->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    REQUIRE_FALSE(node->children.empty());
+    node = node->children.front().get();
+  }
+  auto const& scan = node->Cast<sirius::op::sirius_physical_table_scan>();
+  REQUIRE(scan.pre_declined);
+  CHECK(scan.pre_declined->verdict == sirius::op::scan::eligibility_verdict::unsupported);
+  CHECK(scan.pre_declined->reason == sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  CHECK(scan.bound_view == nullptr);
+  CHECK(scan.contract_id == 0);
+  CHECK(generator.read_views->entries().empty());
+  REQUIRE(generator.contract_provenance.first_pre_decline);
+  CHECK(generator.contract_provenance.first_pre_decline->first ==
+        sirius::op::scan::verdict_reason::iceberg_equality_deletes);
+  auto rollback = con->Query("ROLLBACK");
+  REQUIRE(rollback);
+  REQUIRE_FALSE(rollback->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "R2a pre-capture refusal keeps first planning error",
+                 "[integration][gpu_execution][iceberg][verdict]")
+{
+  auto enabled = con->Query("SET gpu_execution=true");
+  REQUIRE(enabled);
+  REQUIRE_FALSE(enabled->HasError());
+  auto strict = con->Query("SET enable_duckdb_fallback=false");
+  REQUIRE(strict);
+  REQUIRE_FALSE(strict->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto result       = con->Query("SELECT sin(count) FROM iceberg_scan('" + v1_path + "')");
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("without 'snapshot_from_id'") != std::string::npos);
+  CHECK(result->GetError().find("Unsupported expression in projection") == std::string::npos);
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  auto const reason =
+    static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_no_snapshot_id);
+  CHECK(after.semantic_declines[reason] == before.semantic_declines[reason] + 1);
+  auto projection_only = con->Query("SELECT sin(count) FROM " + pinned_scan(v1_path));
+  REQUIRE(projection_only);
+  REQUIRE(projection_only->HasError());
+  CHECK(projection_only->GetError().find("Unsupported expression in projection") !=
+        std::string::npos);
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
@@ -2804,4 +2875,32 @@ TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
                      " WHERE x IN (0, 2048, 4096, 6143) ORDER BY x");
   compare_gpu_vs_cpu("SELECT x, sentinel, file_row_number FROM " + scan() +
                      " WHERE x >= 4096 ORDER BY x");
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "R2a pre-capture text precedes an earlier L0 refusal",
+                 "[integration][iceberg][verdict]")
+{
+  REQUIRE_FALSE(con->Query("CREATE TEMP TABLE r2a_first_l0(i INTEGER)")->HasError());
+  REQUIRE_FALSE(con->Query("INSERT INTO r2a_first_l0 VALUES (1)")->HasError());
+  REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con->Query("BEGIN TRANSACTION READ ONLY")->HasError());
+  auto logical = con->ExtractPlan("SELECT i FROM r2a_first_l0 UNION ALL SELECT count FROM " +
+                                  ("iceberg_scan('" + v1_path + "')"));
+  sirius::planner::sirius_physical_plan_generator generator(*con->context);
+  bool refused = false;
+  try {
+    generator.create_plan(std::move(logical));
+  } catch (sirius::op::scan::scan_verdict_declined const& decline) {
+    refused = true;
+    CHECK(std::string(decline.what()).find("without 'snapshot_from_id'") != std::string::npos);
+    CHECK(decline.declined.size() == 2);
+  }
+  CHECK(refused);
+  REQUIRE(generator.read_views->entries().size() == 2);
+  CHECK(generator.read_views->entries()[0].eligibility.reason ==
+        sirius::op::scan::verdict_reason::native_block_manager);
+  CHECK(generator.read_views->entries()[1].contract.view == nullptr);
+  CHECK(generator.read_views->entries()[1].eligibility.cost.delete_preparation_time_us == 0);
+  REQUIRE_FALSE(con->Query("ROLLBACK")->HasError());
 }

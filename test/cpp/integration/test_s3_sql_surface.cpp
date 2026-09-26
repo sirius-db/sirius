@@ -3325,3 +3325,24 @@ TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
   CHECK(replays == 0);
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
 }
+
+TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
+          "[s3][integration][transparent][verdict]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  set_gpu_execution(con, true);
+  REQUIRE_FALSE(con.Query("SET sirius_test_inject_scan_verdict='unsupported'")->HasError());
+  auto before = sirius::test::get_transparent_execution_stats(con);
+  auto result = con.Query("SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation"));
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(con);
+  CHECK(after.semantic_verdicts[1] == before.semantic_verdicts[1] + 1);
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.scan_lowerings == before.scan_lowerings);
+  CHECK(after.window_tasks_started == before.window_tasks_started);
+}

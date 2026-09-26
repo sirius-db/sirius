@@ -17,14 +17,18 @@
 #include "planner/connector_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/duckdb_host.hpp"
 #include "sirius_registration.hpp"
 
 #include <dlfcn.h>
 #include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
@@ -36,6 +40,9 @@
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
+#include <link.h>
 #include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
 
@@ -56,6 +63,136 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
+op::scan::certification_result supported_parquet(op::scan::bound_table_scan const&,
+                                                 op::sirius_physical_table_scan const&,
+                                                 duckdb::ClientContext&,
+                                                 scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::footer_per_file) |
+                        op::scan::check_bit(op::scan::later_check::profile_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_iceberg(op::scan::bound_table_scan const& contract,
+                                                 op::sirius_physical_table_scan const& scan,
+                                                 duckdb::ClientContext& context,
+                                                 scan_contract_provenance& provenance)
+{
+  auto result = supported_parquet(contract, scan, context, provenance);
+  result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
+  return result;
+}
+
+op::scan::certification_result supported_native(op::scan::bound_table_scan const&,
+                                                op::sirius_physical_table_scan const& scan,
+                                                duckdb::ClientContext&,
+                                                scan_contract_provenance&)
+{
+  op::scan::certification_result result;
+  result.verdict      = op::scan::eligibility_verdict::supported;
+  result.later_checks = op::scan::check_bit(op::scan::later_check::segments_per_range) |
+                        op::scan::check_bit(op::scan::later_check::matrix_per_range);
+
+  duckdb::vector<duckdb::idx_t> fallback_ids;
+  if (scan.projection_ids.empty()) {
+    for (duckdb::idx_t index = 0; index < scan.column_ids.size(); ++index) {
+      fallback_ids.push_back(index);
+    }
+  }
+  auto const& source_ids = scan.projection_ids.empty() ? fallback_ids : scan.projection_ids;
+  std::vector<op::scan::projected_column> projected_cols;
+  std::vector<sirius::logical_type> projected_types;
+  projected_cols.reserve(source_ids.size());
+  projected_types.reserve(source_ids.size());
+  for (std::size_t index = 0; index < source_ids.size(); ++index) {
+    auto const& column = scan.column_ids.at(source_ids[index]);
+    op::scan::projected_column projected;
+    projected.is_rowid = column.IsRowIdColumn();
+    if (!projected.is_rowid) {
+      projected.storage_idx = duckdb::StorageIndex(column.GetPrimaryIndex());
+    }
+    projected_cols.push_back(projected);
+    projected_types.push_back(index < scan.types.size()
+                                ? scan.types[index]
+                                : scan.returned_types.at(column.GetPrimaryIndex()));
+  }
+  if (auto text = op::scan::unsupported_projected_type_reason(projected_cols, projected_types)) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_type_unenumerated;
+    for (std::size_t index = 0; index < projected_types.size(); ++index) {
+      if (projected_cols[index].is_rowid) continue;
+      if (!op::scan::unsupported_projected_type_reason({projected_cols[index]},
+                                                       {projected_types[index]})) {
+        continue;
+      }
+      auto const& type = projected_types[index];
+      switch (type.id()) {
+        case sirius::type_id::HUGEINT:
+        case sirius::type_id::UHUGEINT:
+          result.reason = op::scan::verdict_reason::native_type_128bit;
+          break;
+        case sirius::type_id::STRUCT:
+        case sirius::type_id::LIST:
+          result.reason = op::scan::verdict_reason::native_type_nested;
+          break;
+        case sirius::type_id::DECIMAL:
+          result.reason = op::scan::verdict_reason::native_type_decimal128;
+          break;
+        case sirius::type_id::ARRAY:
+          result.reason = type.has_child() ? op::scan::verdict_reason::native_array_element
+                                           : op::scan::verdict_reason::native_array_child;
+          break;
+        case sirius::type_id::INVALID:
+        case sirius::type_id::SQLNULL:
+          result.reason = op::scan::verdict_reason::native_type_sentinel;
+          break;
+        default: break;
+      }
+      break;
+    }
+    result.reason_text = "duckdb-native scan rejected query: " + *text;
+    return result;
+  }
+
+  auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(scan.bind_data.get());
+  if (!bind || !bind->table.IsDuckTable()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  auto& storage = bind->table.Cast<duckdb::DuckTableEntry>().GetStorage();
+  auto& manager = storage.GetAttached().GetStorageManager();
+  if (!dynamic_cast<duckdb::SingleFileBlockManager const*>(&manager.GetBlockManager())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_block_manager;
+    result.reason_text =
+      "[prepare_duckdb_native_walk] duckdb-native scan rejected query: "
+      "requires a single-file block manager";
+    return result;
+  }
+  if (manager.IsEncrypted()) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::native_encrypted;
+    result.reason_text =
+      "duckdb-native scan rejected query: encrypted storage is not GPU-decodable";
+    return result;
+  }
+  if (!manager.HasStorageVersion() || manager.GetStorageVersion() < 1 ||
+      manager.GetStorageVersion() > 7) {
+    result.verdict     = op::scan::eligibility_verdict::unsupported;
+    result.reason      = op::scan::verdict_reason::native_storage_version_unqualified;
+    result.reason_text = "duckdb-native scan rejected query: storage version is not qualified";
+    return result;
+  }
+  result.storage_version = manager.GetStorageVersion();
+  return result;
+}
+
 connector make_seq_scan_connector()
 {
   return {.function_name              = "seq_scan",
@@ -68,7 +205,8 @@ connector make_seq_scan_connector()
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_native};
 }
 
 connector make_parquet_scan_connector()
@@ -83,7 +221,8 @@ connector make_parquet_scan_connector()
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_read_parquet_connector()
@@ -98,7 +237,8 @@ connector make_read_parquet_connector()
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_sirius_read_parquet_connector()
@@ -113,7 +253,8 @@ connector make_sirius_read_parquet_connector()
           .permits_cpu_replay         = false,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_parquet};
 }
 
 connector make_iceberg_scan_connector()
@@ -128,7 +269,8 @@ connector make_iceberg_scan_connector()
           .permits_cpu_replay         = true,
           .selector_outside_bind_data = true,
           .decline_reason             = registered_iceberg_decline_reason,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = supported_iceberg};
 }
 
 connector make_sirius_stream_source_connector()
@@ -143,7 +285,8 @@ connector make_sirius_stream_source_connector()
           .permits_cpu_replay         = false,
           .selector_outside_bind_data = false,
           .decline_reason             = nullptr,
-          .provider                   = std::nullopt};
+          .provider                   = std::nullopt,
+          .certify                    = nullptr};
 }
 
 std::array<connector, 6> const entries{make_seq_scan_connector(),

@@ -1366,7 +1366,7 @@ shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& con
 SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execution_stats()
   const noexcept
 {
-  return transparent_execution_stats{
+  auto snapshot = transparent_execution_stats{
     .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
     .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
@@ -1384,6 +1384,69 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
       checkpoint_revalidation_failure_count_.load(std::memory_order_relaxed),
     .lease_held_at_replay = lease_held_at_replay_count_.load(std::memory_order_relaxed),
   };
+  for (std::size_t i = 0; i < snapshot.semantic_declines.size(); ++i) {
+    snapshot.semantic_declines[i] = semantic_decline_counts_[i].load(std::memory_order_relaxed);
+  }
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  snapshot.semantic_verdicts               = certification_stats_.semantic_verdicts;
+  snapshot.certification_added_time_us_sum = certification_stats_.certification_added_time_us_sum;
+  snapshot.certification_added_time_us_max = certification_stats_.certification_added_time_us_max;
+  snapshot.certification_added_bytes       = certification_stats_.certification_added_bytes;
+  snapshot.inherited_capture_bytes         = certification_stats_.inherited_capture_bytes;
+  snapshot.certification_borrowed_files    = certification_stats_.certification_borrowed_files;
+  snapshot.delete_preparation_time_us      = certification_stats_.delete_preparation_time_us;
+  snapshot.budget_exceeded                 = certification_stats_.budget_exceeded;
+  snapshot.setting_lookups_per_attempt     = certification_stats_.setting_lookups_per_attempt;
+  snapshot.scan_lowerings                  = certification_stats_.scan_lowerings;
+  snapshot.window_tasks_started            = window_tasks_started_->load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+void SiriusContext::record_scan_certification(sirius::op::scan::eligibility_certificate const& cert)
+{
+  using sirius::op::scan::eligibility_verdict;
+  if (cert.verdict == eligibility_verdict::not_evaluated) return;
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  auto& stats = certification_stats_;
+  ++stats.semantic_verdicts.at(static_cast<std::size_t>(cert.verdict) - 1);
+  stats.certification_added_time_us_sum += cert.cost.added_time_us;
+  stats.certification_added_time_us_max =
+    std::max(stats.certification_added_time_us_max, cert.cost.added_time_us);
+  stats.certification_added_bytes += cert.cost.added_bytes;
+  stats.inherited_capture_bytes += cert.cost.inherited_capture_bytes;
+  stats.certification_borrowed_files += cert.cost.borrowed_files;
+  stats.delete_preparation_time_us += cert.cost.delete_preparation_time_us;
+}
+
+void SiriusContext::record_certification_budget(bool time, bool bytes, uint64_t lookups)
+{
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  certification_stats_.budget_exceeded[0] += time;
+  certification_stats_.budget_exceeded[1] += bytes;
+  certification_stats_.setting_lookups_per_attempt += lookups;
+  if (time || bytes)
+    SIRIUS_LOG_INFO("Scan certification budget exceeded: time={} bytes={}", time, bytes);
+}
+
+void SiriusContext::record_delete_preparation(uint64_t elapsed_us)
+{
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  certification_stats_.delete_preparation_time_us += elapsed_us;
+}
+
+void SiriusContext::record_scan_lowering(uint64_t contract)
+{
+  auto const* enabled = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
+  if (!enabled || std::string_view(enabled) != "1") return;
+  std::lock_guard<std::mutex> lock(certification_stats_mutex_);
+  ++certification_stats_.scan_lowerings[contract];
+}
+
+void SiriusContext::record_semantic_decline(sirius::op::scan::verdict_reason reason) noexcept
+{
+  auto const index = static_cast<std::size_t>(reason);
+  if (index == 0 || index >= semantic_decline_counts_.size()) return;
+  semantic_decline_counts_[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_decline(sirius::transparent::decline_reason reason) noexcept
@@ -1721,7 +1784,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_original_views ? &*logical_original_views : nullptr,
       physical_original_views,
       *planner->read_views);
-    planner->read_views->publish_supported(
+    planner->read_views->publish_correspondence(
       sirius::op::scan::certificate_evidence_scope::binding_correspondence,
       comparison.correspondence,
       physical_original_views);

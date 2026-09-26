@@ -42,6 +42,7 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -49,6 +50,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -262,8 +264,8 @@ class certificate_test_split final : public scan_info {
  public:
   explicit certificate_test_split(scan_contract_id id) : id_(id)
   {
-    certificates_.push_back(
-      split_materializer_certificate{id, 7, "one.parquet|footer=128", "projection=0", "host"});
+    certificates_.push_back(split_materializer_certificate{
+      id, 7, "one.parquet|footer=128", 0, check_bit(later_check::host_staged)});
     dependencies_.emplace_back();
   }
 
@@ -354,12 +356,12 @@ TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certif
 {
   struct expectation {
     materializer_kind kind;
-    std::vector<std::string> later_checks;
+    later_check_set later_checks;
   };
   auto const expectations = std::vector<expectation>{
-    {materializer_kind::duckdb_native, {"segments_per_range"}},
-    {materializer_kind::parquet, {"footer_per_file"}},
-    {materializer_kind::iceberg, {"footer_per_file"}},
+    {materializer_kind::duckdb_native, check_bit(later_check::segments_per_range)},
+    {materializer_kind::parquet, check_bit(later_check::footer_per_file)},
+    {materializer_kind::iceberg, check_bit(later_check::footer_per_file)},
     {materializer_kind::stream, {}},
   };
 
@@ -376,6 +378,26 @@ TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certif
                                                   {expected.kind, "test.v1"});
     CHECK(registry.entry(id).eligibility.later_checks == expected.later_checks);
   }
+}
+
+TEST_CASE("Certification budget charges only explicit added work", "[scan][certificate]")
+{
+  certification_budget budget(std::chrono::milliseconds{5}, 1024, true);
+  budget.charge(std::chrono::microseconds{2500}, 512);
+  CHECK_FALSE(budget.exceeded());
+  std::this_thread::sleep_for(std::chrono::milliseconds{6});
+  CHECK_FALSE(budget.exceeded());
+  budget.charge(std::chrono::microseconds{2500}, 512);
+  CHECK_FALSE(budget.exceeded());  // Exact allowance is admitted.
+  budget.charge(std::chrono::microseconds{1}, 0);
+  CHECK(budget.exceeded());
+  CHECK(budget.declines());
+  CHECK(budget.consumed().added_time_us == 5001);
+
+  certification_budget production(std::chrono::milliseconds{5}, 1024);
+  production.charge(std::chrono::microseconds{0}, 1025);
+  CHECK(production.exceeded());
+  CHECK_FALSE(production.declines());
 }
 
 TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][certificate]")
@@ -592,7 +614,7 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   info->read_views          = registry;
   auto ingestible           = make_ingestible(std::move(info));
   // Finalize can publish evidence after constructing the ingestible, before metadata dispatch.
-  registry->publish_supported(
+  registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
   auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
   auto resolve = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
@@ -665,7 +687,7 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
     sirius::transparent::candidate_origin::copy, &logical, physical, *registry);
   INFO(sirius::transparent::describe_read_view_mismatch(comparison));
   REQUIRE(comparison.equal);
-  registry->publish_supported(
+  registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, comparison.correspondence, physical);
   auto const evidence = registry->entry(id).physical_evidence;
   REQUIRE(evidence);
