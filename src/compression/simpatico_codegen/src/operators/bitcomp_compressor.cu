@@ -105,16 +105,15 @@ bool parse_bitcomp_suffix(std::string_view suffix, int* algorithm)
   return false;
 }
 
-void bitcomp_compressed_representation::decompress(decode_frame& frame,
-                                                   decode_column_slot output) const
+std::unique_ptr<cudf::column> bitcomp_compressed_representation::decompress(
+  decode_frame& frame) const
 {
-  detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
-                                 payload_data(),
-                                 payload_size(),
-                                 original_type,
-                                 num_rows,
-                                 frame,
-                                 output);
+  return detail::nvcomp_decompress_impl(make_bitcomp_ops(compress_algorithm),
+                                        payload_data(),
+                                        payload_size(),
+                                        original_type,
+                                        num_rows,
+                                        frame);
 }
 
 std::unique_ptr<compressed_representation> bitcomp_compressor::compress(

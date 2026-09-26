@@ -246,8 +246,8 @@ void launch_check_truncation(cudf::column_view const& input_col,
 
 // ── bitextract_compressed_representation::decompress ─────────────────────────
 
-void bitextract_compressed_representation::decompress(decode_frame& frame,
-                                                      decode_column_slot out_col) const
+std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
+  decode_frame& frame) const
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
@@ -259,8 +259,8 @@ void bitextract_compressed_representation::decompress(decode_frame& frame,
   cudf::data_type out_type = spec.output_type;
 
   // Allocate output column
-  out_col.adopt(cudf::make_fixed_width_column(
-    out_type, static_cast<cudf::size_type>(n), cudf::mask_state::UNALLOCATED, stream, mr));
+  auto out_col = cudf::make_fixed_width_column(
+    out_type, static_cast<cudf::size_type>(n), cudf::mask_state::UNALLOCATED, stream, mr);
 
   // Zero-initialise
   throw_if_cuda_error(
@@ -288,6 +288,7 @@ void bitextract_compressed_representation::decompress(decode_frame& frame,
     offset_from_msb += field_spec.bits;
   }
   throw_if_cuda_error(cudaGetLastError(), "bitextract decompress launch");
+  return out_col;
 }
 
 // ── bitextract_compressor::compress ──────────────────────────────────────────

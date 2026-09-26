@@ -16,8 +16,9 @@
 //      warm hits are cheap. CUfunction is derived per-device at launch time.
 //   3. cuLaunchKernel binds the labeled buffers as flat per-field device
 //      pointers in the kernel's parameter order, runs over the rendered
-//      __global__ kernel. The mandatory decode frame retains scratch and loaded
-//      kernels until its session proves completion.
+//      __global__ kernel. Scratch is released on the decode frame's stream
+//      once the launch is queued; the frame keeps loaded kernels until its
+//      session proves completion.
 //
 // Fused leaf kinds are bitpack/delta/rle/for/zigzag and synthesized raw passthrough.
 // The plan walker dispatches other codecs through their standalone leaves.
@@ -224,8 +225,9 @@ void check_decode_driver(CUresult status, char const* operation)
                            (description ? description : "unknown CUDA driver error"));
 }
 
-// CUDA consumes the argument values during this call. Device pointers and the loaded module remain
-// owned by the frame or by its documented input/output borrows.
+// CUDA consumes the argument values during this call. The frame keeps the loaded module until the
+// session completes. The device buffers the arguments point to are either borrowed through session
+// completion or released on the frame's stream after this launch is queued.
 void launch_decode_kernel(cdj::DecodeKernelSpec const& spec,
                           void** args,
                           unsigned grid,
@@ -401,12 +403,12 @@ void dfs_nodes(const jit::FusedTree& node, std::vector<const jit::FusedTree*>& o
 }
 
 // ---------------------------------------------------------------------------
-// synthesize_decode_transients: computes decode-only buffers the encoder
-// never stores, reading the already-bound real buffers out of `out` (keyed by
-// DFS-preorder node_id). Used by the structural PlanTree decode binder
-// (bind_fused_subtree in plan/decompress.cpp):
+// synthesize_decode_transients: computes the decode-only buffers (which the encoder never stores)
+// into `out`, reading the already-bound real buffers from `persisted` (both keyed by DFS-preorder
+// node_id). Used by the structural PlanTree decode binder (bind_fused_subtree in
+// plan/decompress.cpp):
 //   * Bitpack bp_offsets: exclusive cumsum of n_words[c] via CUB (device-side
-//       scan + 1-thread tail patch), reading chunk_count/chunk_bits from `out`.
+//       scan + 1-thread tail patch), reading chunk_count/chunk_bits.
 //   * Rle scatter-scan-gather transients (rle_scratch / rle_run_values):
 //       registered as null placeholders (length only) — the rendered RLE decode
 //       kernel sizes its grid from them but does not read their contents.
@@ -415,6 +417,7 @@ void synthesize_decode_transients(const jit::FusedTree& tree,
                                   std::size_t element_size,
                                   const std::function<CUdeviceptr(std::size_t)>& alloc,
                                   void* stream_v,
+                                  jit::LabeledBuffers const& persisted,
                                   jit::LabeledBuffers& out)
 {
   std::vector<const jit::FusedTree*> nodes;
@@ -423,9 +426,9 @@ void synthesize_decode_transients(const jit::FusedTree& tree,
   for (std::int32_t node_id = 0; node_id < static_cast<std::int32_t>(nodes.size()); ++node_id) {
     const auto& node = *nodes[node_id];
     if (node.op == cc::OpKind::Bitpack) {
-      auto cc_it = out.find(jit::buffer_key(node_id, "chunk_count"));
-      auto cb_it = out.find(jit::buffer_key(node_id, "chunk_bits"));
-      if (cc_it == out.end() || cb_it == out.end()) {
+      auto cc_it = persisted.find(jit::buffer_key(node_id, "chunk_count"));
+      auto cb_it = persisted.find(jit::buffer_key(node_id, "chunk_bits"));
+      if (cc_it == persisted.end() || cb_it == persisted.end()) {
         throw std::invalid_argument("simpatico decode: Bitpack node " + std::to_string(node_id) +
                                     " missing chunk_count/chunk_bits");
       }
@@ -463,8 +466,8 @@ void synthesize_decode_transients(const jit::FusedTree& tree,
                                                        sizeof(std::int32_t)};
       }
     } else if (node.op == cc::OpKind::Rle) {
-      auto ro_it = out.find(jit::buffer_key(node_id, "rle_runs_offsets"));
-      if (ro_it == out.end()) {
+      auto ro_it = persisted.find(jit::buffer_key(node_id, "rle_runs_offsets"));
+      if (ro_it == persisted.end()) {
         throw std::invalid_argument("simpatico decode: Rle node " + std::to_string(node_id) +
                                     " missing rle_runs_offsets");
       }
@@ -669,11 +672,13 @@ struct TrailingArgStorage {
   }
 };
 
-// Bind the renderer's ordered buffers and trailing arguments. The frame already owns every
-// synthesized buffer before any kernel can read it.
+// Bind the renderer's ordered buffers and trailing arguments, looking up decode-only `transients`
+// before the persisted buffers. The caller owns every synthesized buffer until this launch has been
+// queued.
 void launch_rendered_decode(jit::FusedTree const& tree,
                             char const* cxx_dtype,
-                            jit::LabeledBuffers const& labeled,
+                            jit::LabeledBuffers const& persisted,
+                            jit::LabeledBuffers const& transients,
                             std::int64_t num_rows,
                             void* out,
                             VariantLaunchArgs const& va,
@@ -685,10 +690,13 @@ void launch_rendered_decode(jit::FusedTree const& tree,
   std::vector<CUdeviceptr> pointers;
   pointers.reserve(spec.buffers.size());
   for (auto const& buffer : spec.buffers) {
-    auto const key   = jit::buffer_key(buffer.node_id, buffer.field);
-    auto const found = labeled.find(key);
-    if (found == labeled.end()) {
-      throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
+    auto const key = jit::buffer_key(buffer.node_id, buffer.field);
+    auto found     = transients.find(key);
+    if (found == transients.end()) {
+      found = persisted.find(key);
+      if (found == persisted.end()) {
+        throw std::invalid_argument("simpatico decode: missing labeled buffer '" + key + "'");
+      }
     }
     auto const& field       = buffer.field;
     bool const is_offset    = field == "rle_runs_offsets" || field == "bp_offsets";
@@ -727,11 +735,11 @@ namespace simpatico {
 
 namespace {
 
-// All fused decode variants share validation, frame-owned scratch, rendering and throwing launch
+// All fused decode variants share validation, decode-only scratch, rendering and throwing launch
 // behavior. The offsets consumer alone uses a kernel domain one row larger than its selection
 // domain.
 void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
-                                   codegen::jit::LabeledBuffers& labeled,
+                                   codegen::jit::LabeledBuffers const& persisted,
                                    char const* dtype,
                                    std::int64_t num_rows,
                                    void* out,
@@ -754,17 +762,23 @@ void launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
                                    : std::strcmp(cxx_dtype, "int16_t") == 0 ? 2u
                                    : std::strcmp(cxx_dtype, "int8_t") == 0  ? 1u
                                                                             : 4u;
-  auto allocate                  = [&](std::size_t bytes) {
-    return reinterpret_cast<CUdeviceptr>(frame.allocate_buffer(bytes).data());
+  // Scratch is bound in a local overlay, so the caller's map never points at it. It is released on
+  // the frame's stream after the launch has been queued.
+  std::vector<rmm::device_buffer> scratch;
+  auto allocate = [&](std::size_t bytes) {
+    return reinterpret_cast<CUdeviceptr>(
+      scratch.emplace_back(bytes, frame.stream(), frame.mr()).data());
   };
-  synthesize_decode_transients(tree, element_size, allocate, frame.stream().value(), labeled);
-  launch_rendered_decode(tree, cxx_dtype, labeled, kernel_rows, out, variant, frame);
+  codegen::jit::LabeledBuffers transients;
+  synthesize_decode_transients(
+    tree, element_size, allocate, frame.stream().value(), persisted, transients);
+  launch_rendered_decode(tree, cxx_dtype, persisted, transients, kernel_rows, out, variant, frame);
 }
 
 }  // namespace
 
 void launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
-                              codegen::jit::LabeledBuffers& labeled,
+                              codegen::jit::LabeledBuffers const& labeled,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,
@@ -874,7 +888,7 @@ void report_enumeration(char const* what,
 
 // Range ballot: fused decode + range predicate -> selection-mask words (masked_launch.hpp).
 void launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
-                                       codegen::jit::LabeledBuffers& labeled,
+                                       codegen::jit::LabeledBuffers const& labeled,
                                        char const* dtype,
                                        std::int64_t num_rows,
                                        ::sirius::codegen::range_predicate pred,
@@ -894,7 +908,7 @@ void launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
 // enumerator is chosen by the caller's `row_indices`: the shape, the contract
 // and the trailing args all follow from it, so the two walks cannot drift.
 void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
-                                        codegen::jit::LabeledBuffers& labeled,
+                                        codegen::jit::LabeledBuffers const& labeled,
                                         char const* dtype,
                                         std::int64_t num_rows,
                                         ::sirius::codegen::selection_mask const& mask,
@@ -916,7 +930,7 @@ void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
 // str_split phase 1: survivor metadata (masked_launch.hpp). The kernel runs over
 // the OFFSETS domain (rows + 1) while the mask stays row-space.
 void launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree,
-                                             codegen::jit::LabeledBuffers& labeled,
+                                             codegen::jit::LabeledBuffers const& labeled,
                                              char const* dtype,
                                              std::int64_t num_string_rows,
                                              ::sirius::codegen::selection_mask const& mask,
@@ -947,7 +961,7 @@ void launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
 
 // Dictionary gather: constant-width key gather (masked_launch.hpp).
 void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
-                                          codegen::jit::LabeledBuffers& labeled,
+                                          codegen::jit::LabeledBuffers const& labeled,
                                           char const* dtype,
                                           std::int64_t num_rows,
                                           ::sirius::codegen::selection_mask const& mask,

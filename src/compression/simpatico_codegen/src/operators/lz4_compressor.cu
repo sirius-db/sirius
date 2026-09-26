@@ -67,10 +67,10 @@ detail::batched_codec_ops const& lz4_ops()
 
 }  // namespace
 
-void lz4_compressed_representation::decompress(decode_frame& frame, decode_column_slot output) const
+std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(decode_frame& frame) const
 {
-  detail::nvcomp_decompress_impl(
-    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, frame, output);
+  return detail::nvcomp_decompress_impl(
+    lz4_ops(), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> lz4_compressor::compress(

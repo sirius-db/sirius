@@ -7,8 +7,8 @@
  * already be readable on the supplied stream(s) and remain alive until return. The supplied
  * resource and streams must outlive allocations that retain them for deallocation. All codecs and
  * predicate/row-selection routes use `decode_session` on the calling CPU thread. Submission may
- * wait for required host observations or retained-temporary pressure; the session completes
- * submitted work before publishing results.
+ * wait for required host observations; the session completes submitted work before publishing
+ * results.
  */
 #pragma once
 

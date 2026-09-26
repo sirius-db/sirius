@@ -65,12 +65,13 @@ bool launch_encode_fused_tree(CodegenHead const& head,
 /// take several inputs (a bitjoin), so the value, not the consumer, selects the column.
 using decode_materialize_fn = std::function<cudf::column const*(NodeId consumer, ValueId value)>;
 
-/// Launch an already-prepared fused decode tree. ``labeled`` must contain all
-/// persisted buffers; frame-owned scratch and kernels remain live through session completion.
-/// Inputs and output must be frame-owned or borrowed through that completion. Errors propagate;
-/// this function never completes the stream.
+/// Launch an already-prepared fused decode tree. ``labeled`` must contain all persisted buffers;
+/// decode-only scratch is allocated and released on the frame's stream, and the frame keeps the
+/// kernel loaded through session completion. Inputs and output must either be released in the
+/// frame's stream order or remain borrowed through that completion. Errors propagate; this function
+/// never completes the stream.
 void launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
-                              codegen::jit::LabeledBuffers& labeled,
+                              codegen::jit::LabeledBuffers const& labeled,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,

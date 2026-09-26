@@ -21,17 +21,16 @@
 
 namespace simpatico {
 
-void str_split_compressed_representation::decompress(decode_frame& frame,
-                                                     decode_column_slot output) const
+std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
+  decode_frame& frame) const
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
-  auto& offsets   = channels_[0];
-  auto& chars     = channels_[1];
-  auto* null_mask = channels_.size() > 2 ? channels_[2].get() : nullptr;
+  auto& offsets     = channels_[0];
+  auto& chars       = channels_[1];
+  auto* null_mask   = channels_.size() > 2 ? channels_[2].get() : nullptr;
   if (num_rows == 0 || !offsets) {
-    output.adopt(cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING)));
-    return;
+    return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
 
   auto const chars_bytes = static_cast<std::size_t>(chars->size()) *
@@ -47,8 +46,8 @@ void str_split_compressed_representation::decompress(decode_frame& frame,
     offsets->type(), offsets->size(), cudf::mask_state::UNALLOCATED, stream, mr);
   rmm::device_buffer chars_buf(chars_bytes, stream, mr);
   rmm::device_buffer mask_buf(mask_bytes, stream, mr);
-  output.adopt(cudf::make_strings_column(
-    num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf)));
+  auto output = cudf::make_strings_column(
+    num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf));
 
   auto const result = output->mutable_view();
   throw_if_cuda_error(
@@ -74,6 +73,7 @@ void str_split_compressed_representation::decompress(decode_frame& frame,
                                         stream.value()),
                         "str_split: copy null mask");
   }
+  return output;
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(

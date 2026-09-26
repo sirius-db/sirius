@@ -101,7 +101,8 @@ std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> batched_compress_byt
 
 // Decompress a frame produced by batched_compress_bytes into device `dst`, which
 // must hold exactly `out_bytes` (the original uncompressed size). No-op when
-// `out_bytes == 0`. The decode frame retains metadata and upload storage until completion.
+// `out_bytes == 0`. Enqueued on `owner.stream()`; the chunk tables uploaded from
+// the host live in `owner` until session completion.
 void batched_decompress_bytes(batched_codec_ops const& ops,
                               void const* frame,
                               std::size_t frame_size,

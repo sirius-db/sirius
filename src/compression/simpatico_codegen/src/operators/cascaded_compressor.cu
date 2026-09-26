@@ -141,13 +141,12 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
   return true;
 }
 
-void cascaded_compressed_representation::decompress(decode_frame& frame,
-                                                    decode_column_slot output) const
+std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
+  decode_frame& frame) const
 {
   if (num_rows == 0 || payload_data() == nullptr || payload_size() == 0) {
-    output.adopt(cudf::make_fixed_width_column(
-      original_type, num_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()));
-    return;
+    return cudf::make_fixed_width_column(
+      original_type, num_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
   }
 
   nvcompBatchedCascadedCompressOpts_t copts = nvcompBatchedCascadedCompressDefaultOpts;
@@ -156,13 +155,8 @@ void cascaded_compressed_representation::decompress(decode_frame& frame,
   copts.num_RLEs                            = compress_num_RLEs;
   copts.use_bp                              = compress_use_bp;
 
-  detail::nvcomp_decompress_impl(make_cascaded_ops(copts),
-                                 payload_data(),
-                                 payload_size(),
-                                 original_type,
-                                 num_rows,
-                                 frame,
-                                 output);
+  return detail::nvcomp_decompress_impl(
+    make_cascaded_ops(copts), payload_data(), payload_size(), original_type, num_rows, frame);
 }
 
 std::unique_ptr<compressed_representation> cascaded_compressor::compress(

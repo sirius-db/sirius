@@ -1,11 +1,11 @@
 // Masked JIT decode launchers — the kernels that evaluate a scan's filter
 // while decompressing, and decode only the rows that survive it.
 //
-// Companions to simpatico::launch_decode_fused_tree (codegen_bridge.hpp).
-// Every launcher enqueues into the mandatory decode_frame and propagates errors.
-// Input, selection, and destination storage must be owned by the frame or remain
-// borrowed through its session's completion; the caller establishes semantic
-// applicability before launching. No launcher completes the stream.
+// Companions to simpatico::launch_decode_fused_tree (codegen_bridge.hpp). Every launcher enqueues
+// into the mandatory decode_frame and propagates errors. Input, selection, and destination storage
+// must either be released in the frame's stream order or remain borrowed through its session's
+// completion; the caller establishes semantic applicability before launching. No launcher completes
+// the stream.
 //
 // Mask and chunk_offsets layout: codegen/selection/selection.hpp.  Every
 // consuming launcher needs ``mask.chunk_offsets``, i.e. the CNT wave must have
@@ -51,7 +51,7 @@ struct row_enumeration {
 /// the CNT wave.  Float columns must NOT be routed here — they decode as
 /// bit-reinterpreted integers, so an integer-domain compare is meaningless.
 void launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
-                                       codegen::jit::LabeledBuffers& labeled,
+                                       codegen::jit::LabeledBuffers const& labeled,
                                        char const* dtype,
                                        std::int64_t num_rows,
                                        ::sirius::codegen::range_predicate pred,
@@ -74,7 +74,7 @@ void launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
 /// pick is the caller's.  Bitpack leaf roots only — a Delta root is refused
 /// (throws a renderer error); choose the mask walk before launch instead.
 void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
-                                        codegen::jit::LabeledBuffers& labeled,
+                                        codegen::jit::LabeledBuffers const& labeled,
                                         char const* dtype,
                                         std::int64_t num_rows,
                                         ::sirius::codegen::selection_mask const& mask,
@@ -90,7 +90,7 @@ void launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
 /// full-width code column and a separate key gather.  The offsets column is
 /// analytic (j*key_width) and the caller assembles it.
 void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
-                                          codegen::jit::LabeledBuffers& labeled,
+                                          codegen::jit::LabeledBuffers const& labeled,
                                           char const* dtype,
                                           std::int64_t num_rows,
                                           ::sirius::codegen::selection_mask const& mask,
@@ -109,7 +109,7 @@ void launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
 /// are never read here, so entropy-coded chars are out of scope by
 /// construction — route those through full decode + gather.
 void launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree,
-                                             codegen::jit::LabeledBuffers& labeled,
+                                             codegen::jit::LabeledBuffers const& labeled,
                                              char const* dtype,
                                              std::int64_t num_string_rows,
                                              ::sirius::codegen::selection_mask const& mask,

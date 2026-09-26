@@ -4,8 +4,10 @@
 #include "codegen/jit/kernel_cache.hpp"
 #include "decode/decode_session.hpp"
 #include "decode_session_test_access.hpp"
+#include "operators/constant_width_offsets.hpp"
 #include "test_utils.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
@@ -17,12 +19,14 @@
 
 #include <cuda/memory_resource>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -30,6 +34,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <variant>
 
 // Linker wrappers affect only explicit calls from this executable. Injection is scoped to the
 // submitting thread and one raw stream; event markers and independent gate controllers stay real.
@@ -181,6 +186,7 @@ class injected_out_of_memory final : public rmm::out_of_memory {
 };
 
 // Shared state keeps resource copies observable. Deallocation is stream ordered and never waits.
+// Byte counters change when allocate and deallocate are called, not when the GPU reaches them.
 class checked_resource {
  public:
   struct allocation {
@@ -197,10 +203,14 @@ class checked_resource {
     event_markers* failure_markers             = nullptr;
     std::atomic<bool>* release_required        = nullptr;
     std::atomic<bool>* second_release_required = nullptr;
-    bool wrong_thread                          = false;
-    bool wrong_stream                          = false;
-    bool early_release                         = false;
-    bool synchronous_access                    = false;
+    // Set by the first deallocation, so a test can order a release before a stream gate opens.
+    std::atomic<bool>* signal_on_deallocate = nullptr;
+    std::size_t live_bytes                  = 0;
+    std::size_t peak_live_bytes             = 0;
+    bool wrong_thread                       = false;
+    bool wrong_stream                       = false;
+    bool early_release                      = false;
+    bool synchronous_access                 = false;
   };
 
   explicit checked_resource(rmm::device_async_resource_ref upstream)
@@ -226,6 +236,11 @@ class checked_resource {
       upstream_.deallocate(stream, ptr, bytes, alignment);
       throw;
     }
+    if (ptr) {
+      observations->live_bytes += bytes;
+      observations->peak_live_bytes =
+        std::max(observations->peak_live_bytes, observations->live_bytes);
+    }
     return ptr;
   }
 
@@ -240,12 +255,16 @@ class checked_resource {
         (observations->second_release_required && !observations->second_release_required->load())) {
       observations->early_release = true;
     }
+    if (observations->signal_on_deallocate) observations->signal_on_deallocate->store(true);
     if (ptr) {
       auto const found = observations->live.find(ptr);
       observations->wrong_stream |= found == observations->live.end() ||
                                     found->second.stream != stream.get() ||
                                     found->second.bytes != bytes;
-      if (found != observations->live.end()) observations->live.erase(found);
+      if (found != observations->live.end()) {
+        observations->live_bytes -= found->second.bytes;
+        observations->live.erase(found);
+      }
     }
     upstream_.deallocate(stream, ptr, bytes, alignment);
   }
@@ -280,6 +299,9 @@ class checked_resource {
     observations->failure_markers         = nullptr;
     observations->release_required        = nullptr;
     observations->second_release_required = nullptr;
+    observations->signal_on_deallocate    = nullptr;
+    observations->live_bytes              = 0;
+    observations->peak_live_bytes         = 0;
     observations->wrong_thread            = false;
     observations->wrong_stream            = false;
     observations->early_release           = false;
@@ -366,7 +388,8 @@ class pinned_scalar_resource {
     }
     observations->live             = true;
     observations->allocated_stream = stream.get();
-    // Poison each recycled slot so reading it before the GPU result cannot look like valid metadata.
+    // Poison each recycled slot so reading it before the GPU result cannot look like valid
+    // metadata.
     *static_cast<int64_t*>(observations->storage.data()) = std::numeric_limits<int64_t>::min();
     return observations->storage.data();
   }
@@ -865,30 +888,24 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       std::array const streams{stream.view()};
       simpatico::decode_session session(streams, mr);
       auto& frame = simpatico::decode_session_test_access::frame(session);
-      std::vector<simpatico::decode_column_slot> slots;
-      for (auto const& channel : original->named_channels(stream.view())) {
-        auto slot = frame.memo_column(slots.size());
-        slot.adopt(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
-        slots.push_back(slot);
-      }
-      auto const retained = frame.retained_device_bytes();
-      auto& rebuilt       = simpatico::reconstruct_decode_representation(
-        "dictionary", channel_names, slots, simpatico::leaf_meta::none{}, frame);
-      for (std::size_t i = 0; i < slots.size(); ++i) {
-        expect(frame.contains_memo(i) && !frame.find_memo(i) && !slots[i],
-               "dictionary reconstruction left a consumed memo value available");
-      }
-      expect(frame.retained_device_bytes() == retained,
-             "dictionary reconstruction lost or double-counted an owned buffer");
+      std::vector<std::unique_ptr<cudf::column>> decoded;
+      for (auto const& channel : original->named_channels(stream.view()))
+        decoded.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+      auto const rebuilt = simpatico::reconstruct_decode_representation(
+        "dictionary", channel_names, std::move(decoded), simpatico::leaf_meta::none{}, frame);
       expect_failure(
         [&] {
           (void)simpatico::reconstruct_decode_representation(
-            "dictionary", channel_names, slots, simpatico::leaf_meta::none{}, frame);
+            "dictionary",
+            channel_names,
+            std::vector<std::unique_ptr<cudf::column>>(channel_names.size()),
+            simpatico::leaf_meta::none{},
+            frame);
         },
-        "dictionary reconstruction reused consumed channels");
-      simpatico::decode_standalone(rebuilt, frame, frame.output());
+        "dictionary reconstruction accepted missing channels");
+      auto const output = simpatico::decode_standalone(*rebuilt, frame);
       stream.synchronize();
-      expect(strings_equal_completed(input->view(), frame.output().view(), stream.view()),
+      expect(strings_equal_completed(input->view(), output->view(), stream.view()),
              "frame-reconstructed dictionary roundtrip mismatch");
       expect(session.finish().empty(), "raw dictionary fixture published a session result");
     }
@@ -961,26 +978,27 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
     for (auto const& fixture : fixtures) {
       simpatico::decode_session session(streams, mr);
       auto& frame = simpatico::decode_session_test_access::frame(session);
-      std::array const slots{frame.memo_column(0), frame.memo_column(1), frame.memo_column(2)};
-      slots[0].adopt(cudf::make_numeric_column(
+      std::vector<std::unique_ptr<cudf::column>> channels;
+      channels.push_back(cudf::make_numeric_column(
         cudf::data_type{type}, fixture.offsets, fixture.mask, stream.view(), mr));
       if (fixture.offsets > 0) {
-        cuda_check(cudaMemsetAsync(slots[0]->mutable_view().head<void>(),
+        cuda_check(cudaMemsetAsync(channels[0]->mutable_view().head<void>(),
                                    0,
                                    fixture.offsets * cudf::size_of(cudf::data_type{type}),
                                    stream.value()));
       }
-      slots[1].adopt(cudf::make_empty_column(cudf::data_type{cudf::type_id::UINT8}));
-      slots[2].adopt(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+      channels.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::UINT8}));
+      channels.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
       stream.synchronize();
       {
         stream_observation_scope observed;
         bool accepted = false;
         try {
-          auto& rebuilt = static_cast<simpatico::dictionary_compressed_representation&>(
-            simpatico::reconstruct_decode_representation(
-              "dictionary", names, slots, simpatico::leaf_meta::none{}, frame));
-          auto const keys = cudf::dictionary_column_view(rebuilt.dict_column->view()).keys();
+          auto const rebuilt = simpatico::reconstruct_decode_representation(
+            "dictionary", names, std::move(channels), simpatico::leaf_meta::none{}, frame);
+          auto const& dictionary =
+            dynamic_cast<simpatico::dictionary_compressed_representation const&>(*rebuilt);
+          auto const keys = cudf::dictionary_column_view(dictionary.dict_column->view()).keys();
           expect(keys.size() == fixture.offsets - 1 && keys.child(0).null_count() == 0,
                  "dictionary reconstruction changed key offsets metadata");
           expect(keys.child(0).nullable() == (fixture.mask == cudf::mask_state::ALL_VALID),
@@ -992,10 +1010,6 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
             "dictionary offsets validation lost its diagnostic");
         }
         expect(accepted == fixture.accepted, "dictionary offsets acceptance mismatch");
-        for (std::size_t i = 0; i < slots.size(); ++i) {
-          expect(frame.contains_memo(i) && static_cast<bool>(slots[i]) != accepted,
-                 "dictionary offsets validation consumed an invalid channel or kept a valid one");
-        }
         for (auto const& calls : stream_fault::counts) {
           expect(calls.queries == 0 && calls.synchronizations == 0,
                  "dictionary offsets validation queried or synchronized a stream");
@@ -1155,7 +1169,7 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
            "failed dictionary observation bypassed supplied resource");
     expect(!gate.timed_out.load(), "dictionary observation failure watchdog expired");
   }
-  // Unknown metadata uses the same reduction with frame-owned device result and scratch storage.
+  // Unknown metadata uses the same reduction with local device result and scratch storage.
   resource.reset();
   {
     simpatico::dictionary_compressed_representation unknown(
@@ -1326,7 +1340,6 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
     session.append(value_request(compressed.columns[index]));
     expect(!gate.released.load(), "column submission waited for the gated lane");
   }
-  expect(session.stats().pressure_waits == 0, "small submissions triggered memory pressure");
   markers.record();
   cache.clear();
   expect(!retained.expired(), "cache clear unloaded a pending kernel");
@@ -1402,112 +1415,6 @@ void test_session_state_contracts(rmm::device_async_resource_ref upstream)
                  "failed session accepted another request");
 }
 
-void test_pressure_waits_for_external_tail(rmm::device_async_resource_ref upstream)
-{
-  auto input      = make_int32_table(2, 65549, 73);
-  auto compressed = simpatico::compress_with_plan(input->view(),
-                                                  "input -> bitpack\n---\ninput -> identity\n",
-                                                  cudf::get_default_stream(),
-                                                  upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(1), "tail-pressure pool init");
-  checked_resource resource(upstream);
-  auto& cache = codegen::jit::KernelCache::instance();
-  cache.clear();
-  {
-    auto warm = simpatico::decompress(compressed, pool, resource);
-  }
-  cuda_check(pool.sync_all());
-  resource.check();
-
-  auto shape = codegen::jit::FusedTree::make(codegen::OpKind::Bitpack);
-  auto spec =
-    codegen::decode::jit::render(*shape, "int32_t", codegen::num_chunks_for(input->num_rows()));
-  codegen::jit::CompileOptions options;
-  options.arch_cc        = codegen::jit::arch_cc_for_current_device();
-  options.default_device = true;
-  auto handle            = cache.get_or_compile_plain(spec.source, spec.entry_symbol, options);
-  std::weak_ptr<codegen::jit::CompiledKernel const> first_kernel = handle;
-  handle.reset();
-
-  auto streams = stream_views(pool);
-  simpatico::decode_session session(streams, resource);
-  session.append(value_request(compressed.columns[0]));
-  cache.clear();
-  stream_gate gate(pool.streams[0]);
-  while (!gate.entered.load() && !gate.timed_out.load())
-    std::this_thread::yield();
-  expect(!gate.timed_out.load(), "tail-pressure gate did not start");
-  // Frame A is complete, but its stream tail is gated. Under-limit submission neither queries
-  // nor reclaims that prefix; pressure must wait for the independently progressing controller.
-  constexpr std::size_t window_frames = 64;
-  for (std::size_t i = 1; i < window_frames; ++i) {
-    session.append(value_request(compressed.columns[1]));
-    expect(!gate.released.load(), "under-limit append waited for the external tail");
-  }
-  expect(session.stats().retirement_stream_queries == 0 && session.stats().pressure_waits == 0,
-         "under-limit appends performed retirement work");
-  expect(!first_kernel.expired(), "pending session lost its loaded kernel");
-  release_observation observation(resource, gate.released);
-  gate.release_after_delay.store(true);
-  session.append(value_request(compressed.columns[1]));
-  expect(gate.released.load() && session.stats().pressure_waits > 0,
-         "pressure reclaimed a completed prefix without completing its stream tail");
-  expect(
-    session.stats().retirement_stream_queries > 0 && session.stats().peak_frames <= window_frames,
-    "tail retirement skipped pressure accounting");
-  expect(!first_kernel.expired(), "tail retirement unloaded a session-pinned module");
-  expect(session.stats().peak_retained_device_bytes <
-           static_cast<std::size_t>(input->num_rows()) * sizeof(std::int32_t),
-         "terminal outputs were charged as retained scratch");
-  auto outputs = session.finish();
-  expect(first_kernel.expired(), "completed session retained its kernel module");
-  expect(outputs.size() == window_frames + 1, "tail retirement lost an output");
-  expect(columns_equal_completed(input->view().column(0), outputs[0]->view()),
-         "retired frame output mismatch");
-  for (std::size_t i = 1; i < outputs.size(); ++i)
-    expect(columns_equal_completed(input->view().column(1), outputs[i]->view()),
-           "post-tail output mismatch");
-  outputs.clear();
-  resource.check();
-  expect(!gate.timed_out.load(), "tail-pressure watchdog expired");
-}
-
-void test_frame_window_backpressure(rmm::device_async_resource_ref upstream)
-{
-  auto input      = make_int32_table(1, 1037, 79);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(1), "backpressure pool init");
-  checked_resource resource(upstream);
-  auto streams = stream_views(pool);
-  simpatico::decode_session session(streams, resource);
-  stream_gate gate(pool.streams[0]);
-  constexpr std::size_t window_frames = 64;
-  for (std::size_t i = 0; i < window_frames; ++i) {
-    session.append(value_request(compressed.columns[0]));
-    expect(!gate.released.load(), "lane reuse waited before reaching the frame window");
-  }
-  expect(session.stats().pressure_waits == 0, "under-window submissions waited for pressure");
-  expect(session.stats().retirement_stream_queries == 0,
-         "under-window submissions queried stream completion");
-  gate.release_after_delay.store(true);
-  session.append(value_request(compressed.columns[0]));
-  expect(gate.released.load(), "over-window request did not wait for pending ownership");
-  expect(session.stats().pressure_waits > 0, "frame window did not report its pressure wait");
-  expect(session.stats().peak_frames <= window_frames, "frame window allowed unbounded admission");
-  auto output = session.finish();
-  expect(output.size() == window_frames + 1, "backpressure lost an output");
-  for (auto const& column : output) {
-    expect(columns_equal_completed(input->view().column(0), column->view()),
-           "backpressure output mismatch");
-  }
-  output.clear();
-  resource.check();
-  expect(!gate.timed_out.load(), "backpressure watchdog expired");
-}
-
 void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
 {
   auto input      = make_int32_table(1, 1037, 83);
@@ -1522,136 +1429,153 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
                            rmm::cuda_stream_view{pool.streams[0]},
                            rmm::cuda_stream_view{pool.streams[1]},
                            rmm::cuda_stream_view{pool.streams[2]}};
-  for (bool pressure : {false, true}) {
-    for (auto operation : {stream_fault::operation::query, stream_fault::operation::synchronize}) {
-      event_markers markers(pool);
-      stream_gate first_gate(pool.streams[0]);
-      stream_gate second_gate(pool.streams[1]);
-      stream_gate external_gate(pool.streams[2]);
-      std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
-      auto const count = pressure ? std::size_t{64} : std::size_t{2};
-      for (std::size_t i = 0; i < count; ++i)
-        session->append(value_request(compressed.columns[0]));
-      markers.record();
-      release_observation observation(resource, first_gate.released, &second_gate.released);
-      first_gate.release_after_delay.store(true);
-      second_gate.release_after_delay.store(true);
-      external_gate.release_after_delay.store(true);
-      bool propagated = false;
-      {
-        stream_observation_scope observed;
-        stream_failure_scope fault(operation, pool.streams[0]);
-        try {
-          if (pressure)
-            session->append(value_request(compressed.columns[0]));
-          else
-            (void)session->finish();
-        } catch (std::runtime_error const& error) {
-          propagated = std::string(error.what()) == cudaGetErrorString(cudaErrorInvalidValue);
-        }
-        expect(stream_fault::next == stream_fault::operation::none,
-               "stream failure injection was not consumed");
-        // Pressure's failed wait follows a query sweep; require a fresh abort query in that case.
-        auto const minimum_queries =
-          pressure && operation == stream_fault::operation::synchronize ? 2U : 1U;
-        for (auto stream : pool.streams)
-          expect(observed.count(stream).queries >= minimum_queries,
-                 "stream failure cleanup skipped a supplied physical stream");
+  for (auto operation : {stream_fault::operation::query, stream_fault::operation::synchronize}) {
+    event_markers markers(pool);
+    stream_gate first_gate(pool.streams[0]);
+    stream_gate second_gate(pool.streams[1]);
+    stream_gate external_gate(pool.streams[2]);
+    std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
+    for (std::size_t i = 0; i < 2; ++i)
+      session->append(value_request(compressed.columns[0]));
+    markers.record();
+    release_observation observation(resource, first_gate.released, &second_gate.released);
+    first_gate.release_after_delay.store(true);
+    second_gate.release_after_delay.store(true);
+    external_gate.release_after_delay.store(true);
+    bool propagated = false;
+    {
+      stream_observation_scope observed;
+      stream_failure_scope fault(operation, pool.streams[0]);
+      try {
+        (void)session->finish();
+      } catch (std::runtime_error const& error) {
+        propagated = std::string(error.what()) == cudaGetErrorString(cudaErrorInvalidValue);
       }
-      expect(propagated, "stream completion failure lost the original CUDA error");
-      expect(first_gate.released.load() && second_gate.released.load() && markers.complete(),
-             "stream failure escaped before all supplied lanes completed");
-      expect(!resource.observations->early_release,
-             "stream failure released an owner before all lanes completed");
-      expect_failure([&] { session->finish(); }, "failed session published partial output");
-      expect_failure([&] { session->append(value_request(compressed.columns[0])); },
-                     "stream failure left a reusable session");
-      session.reset();
-      resource.check();
-      expect(!first_gate.timed_out.load() && !second_gate.timed_out.load() &&
-               !external_gate.timed_out.load(),
-             "stream failure watchdog expired");
-      {
-        auto recovered = simpatico::decompress(compressed, pool, resource);
-        expect(columns_equal_completed(input->view().column(0), recovered->view().column(0)),
-               "pool was not reusable after recoverable stream API failure");
-      }
-      resource.check();
+      expect(stream_fault::next == stream_fault::operation::none,
+             "stream failure injection was not consumed");
+      for (auto stream : pool.streams)
+        expect(observed.count(stream).queries >= 1,
+               "stream failure cleanup skipped a supplied physical stream");
     }
+    expect(propagated, "stream completion failure lost the original CUDA error");
+    expect(first_gate.released.load() && second_gate.released.load() && markers.complete(),
+           "stream failure escaped before all supplied lanes completed");
+    expect(!resource.observations->early_release,
+           "stream failure released an output before all lanes completed");
+    expect_failure([&] { session->finish(); }, "failed session published partial output");
+    expect_failure([&] { session->append(value_request(compressed.columns[0])); },
+                   "stream failure left a reusable session");
+    session.reset();
+    resource.check();
+    expect(!first_gate.timed_out.load() && !second_gate.timed_out.load() &&
+             !external_gate.timed_out.load(),
+           "stream failure watchdog expired");
+    {
+      auto recovered = simpatico::decompress(compressed, pool, resource);
+      expect(columns_equal_completed(input->view().column(0), recovered->view().column(0)),
+             "pool was not reusable after recoverable stream API failure");
+    }
+    resource.check();
   }
 }
 
-class retirement_probe_representation final
-  : public simpatico::standalone_compressed_representation {
+class probe_failure final : public std::runtime_error {
  public:
-  retirement_probe_representation()
-    : standalone_compressed_representation(cudf::data_type{cudf::type_id::UINT8}, 1)
+  probe_failure() : std::runtime_error("injected probe failure after enqueue") {}
+};
+
+// A one-byte output derived from device scratch that is released when decompress() returns, while
+// the work reading it may still be queued.
+class scratch_probe_representation final : public simpatico::standalone_compressed_representation {
+ public:
+  explicit scratch_probe_representation(std::size_t scratch_bytes = 16,
+                                        std::uint8_t value        = 0x2a,
+                                        bool fail                 = false)
+    : standalone_compressed_representation(cudf::data_type{cudf::type_id::UINT8}, 1),
+      scratch_bytes_(scratch_bytes),
+      value_(value),
+      fail_(fail)
   {
   }
-  void decompress(simpatico::decode_frame& frame,
-                  simpatico::decode_column_slot output) const override
+  [[nodiscard]] std::unique_ptr<cudf::column> decompress(
+    simpatico::decode_frame& frame) const override
   {
-    output.adopt(cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT8},
-                                           1,
-                                           cudf::mask_state::UNALLOCATED,
-                                           frame.stream(),
-                                           frame.mr()));
-    auto& scratch = frame.allocate_buffer(16);
-    cuda_check(cudaMemsetAsync(scratch.data(), 0x2a, scratch.size(), frame.stream().value()));
+    auto output = cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT8},
+                                            1,
+                                            cudf::mask_state::UNALLOCATED,
+                                            frame.stream(),
+                                            frame.mr());
+    rmm::device_buffer scratch(scratch_bytes_, frame.stream(), frame.mr());
+    cuda_check(cudaMemsetAsync(scratch.data(), value_, scratch.size(), frame.stream().value()));
+    if (fail_) throw probe_failure{};
     cuda_check(cudaMemcpyAsync(output->mutable_view().head<void>(),
                                scratch.data(),
                                1,
                                cudaMemcpyDeviceToDevice,
                                frame.stream().value()));
+    return output;
   }
+
+ private:
+  std::size_t scratch_bytes_;
+  std::uint8_t value_;
+  bool fail_;
 };
 
-void test_ready_stream_and_alias_retirement(rmm::device_async_resource_ref upstream)
+simpatico::column_decode_request probe_request(scratch_probe_representation const& representation)
+{
+  return {.source = std::cref(
+            static_cast<simpatico::standalone_compressed_representation const&>(representation))};
+}
+
+void expect_probe_outputs(std::vector<std::unique_ptr<cudf::column>> const& outputs,
+                          std::vector<std::uint8_t> const& expected)
+{
+  expect(outputs.size() == expected.size(), "scratch probe output count mismatch");
+  rmm::cuda_stream consumer(rmm::cuda_stream::flags::non_blocking);
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    expect(outputs[i]->type().id() == cudf::type_id::UINT8 && outputs[i]->size() == 1,
+           "scratch probe output shape mismatch");
+    std::uint8_t byte = 0;
+    cuda_check(cudaMemcpyAsync(
+      &byte, outputs[i]->view().head<void>(), 1, cudaMemcpyDeviceToHost, consumer.value()));
+    consumer.synchronize();
+    expect(byte == expected[i], "scratch probe output lost its queued value");
+  }
+}
+
+void test_duplicate_stream_handles(rmm::device_async_resource_ref upstream)
 {
   for (bool aliases : {false, true}) {
     simpatico::stream_pool pool;
-    expect(pool.init(2), "ready-stream pool init");
+    expect(pool.init(2), "duplicate-handle pool init");
     std::vector<rmm::cuda_stream_view> streams{pool.streams[0], pool.streams[1]};
     if (aliases) streams.insert(streams.begin(), pool.streams[0]);
     auto const blocked = pool.streams[aliases ? 1 : 0];
     auto const ready   = pool.streams[aliases ? 0 : 1];
     checked_resource resource(upstream);
-    retirement_probe_representation representation;
-    simpatico::column_decode_request const request{
-      .source = std::cref(
-        static_cast<simpatico::standalone_compressed_representation const&>(representation))};
+    scratch_probe_representation const representation;
+    auto const request = probe_request(representation);
     simpatico::decode_session session(streams, resource);
     stream_gate blocked_gate(blocked);
-    std::size_t ready_frames = 0;
-    for (std::size_t i = 0; i < 64; ++i) {
+    for (std::size_t i = 0; i < 64; ++i)
       session.append(request);
-      if (streams[i % streams.size()].value() == ready) ++ready_frames;
-    }
+    expect(!blocked_gate.released.load(), "submission waited for a gated lane");
+    // Each request's scratch is released during its append, on its allocation stream.
     expect(
-      resource.observations->attempts.size() == 128 && resource.observations->live.size() == 128,
-      "retirement probe did not retain one output and one scratch allocation per frame");
+      resource.observations->attempts.size() == 128 && resource.observations->live.size() == 64,
+      "scratch probe did not allocate one output and one scratch buffer, or kept its scratch");
+    expect(!resource.observations->wrong_stream, "scratch was released on another stream");
     for (std::size_t i = 0; i < 64; ++i) {
       auto const assigned = streams[i % streams.size()].value();
       expect(resource.observations->attempts[2 * i] == assigned &&
                resource.observations->attempts[2 * i + 1] == assigned,
              "duplicate handles changed round-robin weighting");
     }
-    cuda_check(__real_cudaStreamSynchronize(ready));
-    {
-      stream_observation_scope observed;
-      session.append(request);
-      expect(observed.count(ready).queries == 1 && observed.count(blocked).queries == 1,
-             "pressure did not query each eligible physical stream exactly once");
-    }
-    expect(!blocked_gate.released.load() && session.stats().pressure_waits == 0,
-           "ready-stream reclamation waited for another stream's tail");
-    expect(session.stats().retirement_stream_queries == 2 && session.stats().peak_frames == 64,
-           "ready-stream reclamation lost query or frame accounting");
-    expect(resource.observations->live.size() == 130 - ready_frames,
-           "completed physical stream did not retire every sealed alias, or released outputs");
 
-    // In the non-alias case this handle has no remaining frames. Its new external tail must
-    // nevertheless be included in final completion, not cached from the pressure query above.
+    // The ready handle's requests have completed. Work queued on it afterwards must still be
+    // included in final completion.
+    cuda_check(__real_cudaStreamSynchronize(ready));
     stream_gate ready_tail(ready);
     event_markers markers(pool);
     markers.record();
@@ -1666,125 +1590,12 @@ void test_ready_stream_and_alias_retirement(rmm::device_async_resource_ref upstr
                "finish did not deduplicate supplied physical handles");
     }
     expect(blocked_gate.released.load() && ready_tail.released.load() && markers.complete(),
-           "finish skipped an external tail on a retired stream");
-    expect(output.size() == 65, "ready-stream retirement lost outputs");
-    rmm::cuda_stream consumer(rmm::cuda_stream::flags::non_blocking);
-    for (auto const& column : output) {
-      expect(column->type().id() == cudf::type_id::UINT8 && column->size() == 1,
-             "retirement probe output shape mismatch");
-      std::uint8_t byte = 0;
-      cuda_check(cudaMemcpyAsync(
-        &byte, column->view().head<void>(), 1, cudaMemcpyDeviceToHost, consumer.value()));
-      consumer.synchronize();
-      expect(byte == 0x2a, "ready-stream retirement corrupted an output");
-    }
+           "finish skipped an external tail on a completed stream");
+    expect_probe_outputs(output, std::vector<std::uint8_t>(64, 0x2a));
     output.clear();
     resource.check();
     expect(!blocked_gate.timed_out.load() && !ready_tail.timed_out.load(),
-           "ready-stream retirement watchdog expired");
-  }
-}
-
-class retained_scratch_representation final
-  : public simpatico::standalone_compressed_representation {
- public:
-  static constexpr std::size_t output_bytes    = 40U << 20;
-  static constexpr std::size_t device_bytes    = 40U << 20;
-  static constexpr std::size_t host_bytes      = 5U << 20;
-  static constexpr cudf::size_type output_rows = static_cast<cudf::size_type>(output_bytes);
-
-  explicit retained_scratch_representation(bool host)
-    : standalone_compressed_representation(cudf::data_type{cudf::type_id::UINT8}, output_rows),
-      host_(host)
-  {
-  }
-
-  void decompress(simpatico::decode_frame& frame,
-                  simpatico::decode_column_slot output) const override
-  {
-    // Make the large terminal output first. Neither its active ownership nor the already-sealed
-    // previous column's output belongs in the temporary-retirement budget.
-    output.adopt(cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT8},
-                                           output_rows,
-                                           cudf::mask_state::UNALLOCATED,
-                                           frame.stream(),
-                                           frame.mr()));
-    auto* destination = output->mutable_view().head<std::uint8_t>();
-    if (host_) {
-      auto upload = frame.host_array<std::uint8_t>(host_bytes);
-      std::fill(upload.begin(), upload.end(), std::uint8_t{0x2a});
-      // Exercise retained upload accounting without a pageable H2D call that could implicitly
-      // wait on the deliberately gated stream before the frame is sealed.
-      cuda_check(
-        cudaMemsetAsync(destination, upload.front(), output_bytes, frame.stream().value()));
-    } else {
-      auto& scratch = frame.allocate_buffer(device_bytes);
-      cuda_check(cudaMemsetAsync(scratch.data(), 0x2a, scratch.size(), frame.stream().value()));
-      cuda_check(cudaMemcpyAsync(destination,
-                                 scratch.data(),
-                                 output_bytes,
-                                 cudaMemcpyDeviceToDevice,
-                                 frame.stream().value()));
-    }
-  }
-
- private:
-  bool host_;
-};
-
-void test_sealed_frame_byte_accounting(rmm::device_async_resource_ref upstream)
-{
-  for (bool host_pressure : {false, true}) {
-    simpatico::stream_pool pool;
-    expect(pool.init(2), "sealed-frame accounting pool init");
-    checked_resource resource(upstream);
-    auto streams = stream_views(pool);
-    retained_scratch_representation representation(host_pressure);
-    simpatico::column_decode_request const request{
-      .source = std::cref(
-        static_cast<simpatico::standalone_compressed_representation const&>(representation))};
-    simpatico::decode_session session(streams, resource);
-    stream_gate first_gate(pool.streams[0]);
-    session.append(request);
-    expect(!first_gate.released.load() && session.stats().pressure_waits == 0,
-           "first frame counted its terminal output as retained scratch");
-    release_observation observation(resource, first_gate.released);
-    first_gate.release_after_delay.store(true);
-    session.append(request);
-    expect(first_gate.released.load() && session.stats().pressure_waits > 0,
-           "second allocation omitted the first sealed frame's retained bytes");
-    auto const& stats = session.stats();
-    expect(stats.peak_retained_device_bytes ==
-             (host_pressure ? 0 : retained_scratch_representation::device_bytes),
-           "sealed-frame accounting included output bytes or exceeded the device window");
-    expect(stats.peak_retained_host_bytes ==
-             (host_pressure ? retained_scratch_representation::host_bytes : 0),
-           "sealed-frame accounting omitted uploads or exceeded the host window");
-    expect(stats.peak_retained_device_bytes <= (64U << 20) &&
-             stats.peak_retained_host_bytes <= (8U << 20),
-           "two ordinary frames exceeded the retained-byte windows");
-    auto output = session.finish();
-    expect(output.size() == 2, "sealed-frame pressure lost a terminal output");
-    expect(output[0]->view().head<void>() != output[1]->view().head<void>(),
-           "sealed-frame pressure aliased terminal outputs");
-    std::vector<std::uint8_t> bytes(retained_scratch_representation::output_bytes);
-    rmm::cuda_stream consumer(rmm::cuda_stream::flags::non_blocking);
-    for (auto const& column : output) {
-      expect(column->type().id() == cudf::type_id::UINT8 &&
-               column->size() == retained_scratch_representation::output_rows,
-             "sealed-frame output metadata mismatch");
-      cuda_check(cudaMemcpyAsync(bytes.data(),
-                                 column->view().head<void>(),
-                                 bytes.size(),
-                                 cudaMemcpyDeviceToHost,
-                                 consumer.value()));
-      consumer.synchronize();
-      expect(std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 0x2a; }),
-             "sealed-frame pressure corrupted a terminal output");
-    }
-    output.clear();
-    resource.check();
-    expect(!first_gate.timed_out.load(), "sealed-frame pressure watchdog expired");
+           "duplicate-handle watchdog expired");
   }
 }
 
@@ -1800,7 +1611,7 @@ void test_external_phase_tail(rmm::device_async_resource_ref upstream)
   simpatico::decode_session session(streams, resource);
   session.append(value_request(compressed.columns[0]));
   // The request's own work is complete before this external tail starts. Final completion must
-  // observe the current supplied stream, not an earlier frame or pressure observation.
+  // observe the current supplied stream, not a host observation made during submission.
   stream_gate gate(pool.streams[0]);
   while (!gate.entered.load() && !gate.timed_out.load())
     std::this_thread::yield();
@@ -1879,387 +1690,627 @@ void test_request_copy_failure(rmm::device_async_resource_ref upstream)
   expect(!gate.timed_out.load(), "request copy failure watchdog expired");
 }
 
-void test_byte_window_and_active_frame(rmm::device_async_resource_ref upstream)
+void test_host_upload_growth(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 1037, 101);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
-  for (bool host_pressure : {false, true}) {
-    simpatico::stream_pool pool;
-    expect(pool.init(2), "byte-pressure pool init");
-    checked_resource resource(upstream);
-    auto streams = stream_views(pool);
-    simpatico::decode_session session(streams, resource);
-    stream_gate first_gate(pool.streams[0]);
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{stream.view()};
+  constexpr std::size_t uploads = 97;
+  rmm::device_buffer device(uploads * 2 * sizeof(std::uint64_t), stream.view(), upstream);
+  {
+    simpatico::decode_session session(streams, upstream);
+    auto& frame = simpatico::decode_session_test_access::frame(session);
+    auto first  = frame.host_array<std::uint64_t>(2);
+    expect(reinterpret_cast<std::uintptr_t>(first.data()) % alignof(std::max_align_t) == 0,
+           "upload storage is not fundamentally aligned");
+    first.front()      = 0x12345678;
+    first.back()       = 0xabcdef;
+    auto* const origin = first.data();
+    std::vector<std::span<std::uint64_t>> spans{first};
+    // Keep earlier spans while the frame's upload records grow and reallocate.
+    for (std::size_t i = 1; i < uploads; ++i) {
+      auto extra    = frame.host_array<std::uint64_t>(2);
+      extra.front() = i;
+      extra.back()  = ~i;
+      spans.push_back(extra);
+    }
+    expect(first.data() == origin && first.front() == 0x12345678 && first.back() == 0xabcdef,
+           "upload growth invalidated an upload span");
+    auto* const destination = static_cast<std::uint64_t*>(device.data());
+    for (std::size_t i = 0; i < uploads; ++i) {
+      cuda_check(cudaMemcpyAsync(destination + 2 * i,
+                                 spans[i].data(),
+                                 spans[i].size_bytes(),
+                                 cudaMemcpyHostToDevice,
+                                 stream.value()));
+    }
+    expect(session.finish().empty(), "raw upload fixture published an output");
+  }
+  std::vector<std::uint64_t> host(uploads * 2);
+  cuda_check(cudaMemcpyAsync(
+    host.data(), device.data(), device.size(), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  bool equal = host[0] == 0x12345678 && host[1] == 0xabcdef;
+  for (std::size_t i = 1; i < uploads; ++i)
+    equal = equal && host[2 * i] == i && host[2 * i + 1] == ~i;
+  expect(equal, "grown upload storage lost queued data");
+}
+
+// An asynchronous copy from pageable memory may read its source after the call returns, so upload
+// storage must outlive its copy. The first part is a smoke test of the frame's storage: it detects
+// only storage released before the session drains, and only where the driver defers pageable
+// host-to-device copies; a driver that stages the copy before returning makes it pass trivially.
+// The second part checks that a real leaf (nvCOMP) keeps its uploaded chunk tables in the frame
+// until the drain. Whether every leaf uploads only from frame storage or the request copy is
+// enforced by review, not by this test.
+void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref upstream)
+{
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{stream.view()};
+  // Below the default mmap threshold, so freed storage returns to the heap the churn draws from.
+  constexpr std::size_t words = 4096;
+  auto const pattern          = [](std::size_t i) { return 0x9e3779b97f4a7c15ULL * (i + 1); };
+  rmm::device_buffer device(words * sizeof(std::uint64_t), stream.view(), upstream);
+  cuda_check(cudaMemsetAsync(device.data(), 0, device.size(), stream.value()));
+  stream.synchronize();
+  {
+    simpatico::decode_session session(streams, upstream);
+    auto& frame = simpatico::decode_session_test_access::frame(session);
+    stream_gate gate(stream.view());
+    // A copy that waits for the stream before returning must not outlive the watchdog.
+    gate.release_after_delay.store(true);
+    auto upload = frame.host_array<std::uint64_t>(words);
+    for (std::size_t i = 0; i < words; ++i)
+      upload[i] = pattern(i);
+    cuda_check(cudaMemcpyAsync(
+      device.data(), upload.data(), upload.size_bytes(), cudaMemcpyHostToDevice, stream.value()));
+    std::vector<std::unique_ptr<std::uint64_t[]>> churn;
+    for (int block = 0; block < 64; ++block) {
+      churn.push_back(std::make_unique_for_overwrite<std::uint64_t[]>(words));
+      std::fill_n(churn.back().get(), words, ~std::uint64_t{0});
+    }
+    expect(session.finish().empty(), "raw upload fixture published an output");
+    expect(gate.released.load() && !gate.timed_out.load(), "upload gate did not release normally");
+  }
+  std::vector<std::uint64_t> host(words);
+  cuda_check(cudaMemcpyAsync(
+    host.data(), device.data(), device.size(), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  bool equal = true;
+  for (std::size_t i = 0; i < words; ++i)
+    equal = equal && host[i] == pattern(i);
+  expect(equal, "host upload storage was reused before its copy completed");
+
+  auto const input      = make_int32_table(1, 65549, 127);
+  auto const compressed = simpatico::compress_with_plan(
+    input->view(), "input -> ans\n", cudf::get_default_stream(), upstream);
+  cudf::get_default_stream().synchronize();
+  std::vector<std::unique_ptr<cudf::column>> outputs;
+  {
+    simpatico::decode_session session(streams, upstream);
     session.append(value_request(compressed.columns[0]));
-    // The low-level fixture is session-owned but remains active throughout these allocations.
-    auto& frame = simpatico::decode_session_test_access::frame(session);
-    first_gate.release_after_delay.store(true);
-    constexpr std::size_t device_bytes = 80U << 20;
-    constexpr std::size_t host_bytes   = 9U << 20;
-    if (host_pressure) {
-      auto storage = frame.host_array<std::uint64_t>(host_bytes / sizeof(std::uint64_t));
-      expect(reinterpret_cast<std::uintptr_t>(storage.data()) % alignof(std::uint64_t) == 0,
-             "upload storage is misaligned");
-      storage.front() = 17;
-      storage.back()  = 23;
-    } else {
-      (void)frame.allocate_buffer(device_bytes);
-    }
-    expect(first_gate.released.load() && session.stats().pressure_waits > 0,
-           "retained-byte pressure did not retire prior pending work");
-    // Once the sealed predecessor is gone, intrinsic active-frame pressure cannot query or wait
-    // on this frame's own stream. Its storage may still be used by later work in the same request.
-    stream_gate active_gate(pool.streams[1]);
-    auto const queries = session.stats().retirement_stream_queries;
-    auto& scratch      = frame.allocate_buffer(16);
-    cuda_check(cudaMemsetAsync(scratch.data(), 0, scratch.size(), streams[1].value()));
-    expect(!active_gate.released.load(), "active intrinsic frame caused a lane-tail wait");
-    expect(session.stats().retirement_stream_queries == queries,
-           "active-only stream was queried for retirement");
-    auto const& stats = session.stats();
-    expect(host_pressure ? stats.peak_retained_host_bytes >= host_bytes
-                         : stats.peak_retained_device_bytes >= device_bytes,
-           "oversized active-frame bytes were missing from accounting");
-    release_observation observation(resource, active_gate.released);
-    active_gate.release_after_delay.store(true);
-    auto output = session.finish();
-    expect(active_gate.released.load(), "finish released an active frame early");
-    expect(output.size() == 1 &&
-             columns_equal_completed(input->view().column(0), output.front()->view()),
-           "pressure lost the earlier frame's terminal output");
-    output.clear();
-    resource.check();
-    expect(!first_gate.timed_out.load() && !active_gate.timed_out.load(),
-           "byte-pressure watchdog expired");
+    // Compressed sizes, compressed and output pointers, and output sizes.
+    expect(simpatico::decode_session_test_access::host_uploads(session) == 4,
+           "an nvCOMP leaf did not keep its chunk tables until the session drains");
+    outputs = session.finish();
+    expect(simpatico::decode_session_test_access::host_uploads(session) == 0,
+           "a finished session kept host uploads");
   }
+  expect(columns_equal_completed(input->view().column(0), outputs.front()->view()),
+         "nvCOMP decode with retained uploads mismatch");
 }
 
-void test_active_frame_on_retired_alias(rmm::device_async_resource_ref upstream)
+// Device temporaries are released during the append that allocates them, so the call-time ledger
+// holds only prior outputs plus the active request's working set. Library temporaries count too,
+// because the ledger is also the current device resource.
+void test_temporaries_released_at_submission(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 1037, 103);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
+  struct fixture {
+    char const* plan;
+    bool strings;
+    bool observes_host;  ///< Needs a host readback, so its stream cannot stay gated.
+  };
+  std::array<fixture, 6> const fixtures{{
+    {"input -> bitpack\n", false, false},
+    {"input -> rle -> values, runs\nrle.values -> bitpack\nrle.runs -> bitpack\n", false, false},
+    {"input -> for -> deltas, references\nfor.deltas -> bitpack\nfor.references -> bitpack\n",
+     false,
+     false},
+    {"input -> dictionary -> keys_offsets, keys_chars, indices\ndictionary.indices -> bitpack\n",
+     true,
+     true},
+    {"input -> str_split -> offsets, chars\nstr_split.offsets -> delta -> differences\n"
+     "str_split.offsets.differences -> bitpack\n",
+     true,
+     true},
+    // ANS, like LZ4, exercises nvCOMP's metadata and scratch uploads; nvCOMP's LZ4 path also tries
+    // a hardware decompression call that compute-sanitizer reports independently of this code.
+    {"input -> ans\n", false, true},
+  }};
+  constexpr int rows = 65549;
+  auto const numbers = make_int32_table(1, rows, 113);
+  auto const words   = make_string_table(rows, cudf::get_default_stream());
+  std::vector<simpatico::compressed_column> columns;
+  for (auto const& fixture : fixtures) {
+    auto const& input = fixture.strings ? *words : *numbers;
+    auto compressed   = simpatico::compress_with_plan(
+      input.view(), fixture.plan, cudf::get_default_stream(), upstream);
+    columns.push_back(std::move(compressed.columns.front()));
+  }
+  cudf::get_default_stream().synchronize();
+  auto const expected = [&](std::size_t i) {
+    return fixtures[i].strings ? words->view().column(0) : numbers->view().column(0);
+  };
+  auto const verify = [&](std::vector<std::size_t> const& order,
+                          std::vector<std::unique_ptr<cudf::column>> const& outputs) {
+    expect(outputs.size() == order.size(), "temporary fixture lost an output");
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      expect(fixtures[order[i]].strings
+               ? strings_equal_completed(
+                   expected(order[i]), outputs[i]->view(), cudf::get_default_stream())
+               : columns_equal_completed(expected(order[i]), outputs[i]->view()),
+             "temporary fixture output mismatch");
+    }
+  };
+
   simpatico::stream_pool pool;
-  expect(pool.init(1), "active-alias pool init");
-  std::array const streams{rmm::cuda_stream_view{pool.streams[0]},
-                           rmm::cuda_stream_view{pool.streams[0]}};
-  checked_resource resource(upstream);
-  simpatico::decode_session session(streams, resource);
-  session.append(value_request(compressed.columns[0]));
-  cuda_check(__real_cudaStreamSynchronize(pool.streams[0]));
-  auto& active     = simpatico::decode_session_test_access::frame(session);
-  auto sentinel    = active.host_array<std::uint64_t>(1);
-  sentinel.front() = 0x12345678;
-  auto& large      = active.allocate_buffer(80U << 20);
-  expect(session.stats().retirement_stream_queries == 1 && session.stats().pressure_waits == 0,
-         "ready sealed alias was not reclaimed with one physical-stream query");
-  expect(sentinel.front() == 0x12345678 && large.size() == (80U << 20),
-         "ready-stream reclamation destroyed its active alias");
+  expect(pool.init(2), "temporary fixture pool init");
+  auto const streams = stream_views(pool);
+  checked_resource ledger(upstream);
+  current_resource_guard current(ledger);
 
-  stream_gate gate(pool.streams[0]);
-  release_observation observation(resource, gate.released);
-  auto const queries = session.stats().retirement_stream_queries;
-  auto& scratch      = active.allocate_buffer(16);
-  cuda_check(cudaMemsetAsync(scratch.data(), 0x2a, scratch.size(), active.stream().value()));
-  expect(!gate.released.load() && session.stats().retirement_stream_queries == queries &&
-           session.stats().pressure_waits == 0,
-         "intrinsically oversized active alias queried or waited on itself");
-  gate.release_after_delay.store(true);
-  auto output = session.finish();
-  expect(gate.released.load() && output.size() == 1,
-         "finish lost the sealed output or failed to drain its active alias");
-  expect(columns_equal_completed(input->view().column(0), output.front()->view()),
-         "active-alias retirement corrupted the sealed output");
-  output.clear();
-  resource.check();
-  expect(!gate.timed_out.load(), "active-alias watchdog expired");
-}
-
-void test_frame_owner_growth(rmm::device_async_resource_ref upstream)
-{
-  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
-  std::array const streams{stream.view()};
-  checked_resource resource(upstream);
-  simpatico::decode_session session(streams, resource);
-  auto& frame       = simpatico::decode_session_test_access::frame(session);
-  auto first_column = frame.make_column();
-  first_column.adopt(cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT8},
-                                               1,
-                                               cudf::mask_state::UNALLOCATED,
-                                               frame.stream(),
-                                               frame.mr()));
-  auto* const column_owner = &first_column.get();
-  auto& first_buffer       = frame.allocate_buffer(16);
-  auto& first_output       = frame.allocate_output_buffer(16);
-  auto* const buffer_data  = first_buffer.data();
-  auto* const output_data  = first_output.data();
-  auto upload              = frame.host_array<std::uint64_t>(2);
-  upload.front()           = 0x12345678;
-  upload.back()            = 0xabcdef;
-  auto* const upload_data  = upload.data();
-
-  // Retain handles while each owner collection grows and the upload-record vector reallocates.
-  for (std::size_t i = 0; i < 96; ++i) {
-    (void)frame.make_column();
-    (void)frame.allocate_buffer(16);
-    (void)frame.allocate_output_buffer(16);
-    auto extra    = frame.host_array<std::uint64_t>(2);
-    extra.front() = i;
-  }
-  expect(&first_column.get() == column_owner && first_column->size() == 1,
-         "owner growth invalidated a column slot");
-  expect(first_buffer.data() == buffer_data && first_buffer.size() == 16 &&
-           first_output.data() == output_data && first_output.size() == 16,
-         "owner growth invalidated a buffer reference");
-  expect(upload.data() == upload_data && upload.front() == 0x12345678 && upload.back() == 0xabcdef,
-         "owner growth invalidated an upload span");
-  expect(session.stats().retirement_stream_queries == 0 && session.stats().pressure_waits == 0,
-         "small active-owner growth performed retirement work");
-
-  cuda_check(cudaMemsetAsync(first_column->mutable_view().head<void>(), 0x2a, 1, stream.value()));
-  cuda_check(cudaMemcpyAsync(
-    first_buffer.data(), upload.data(), 16, cudaMemcpyHostToDevice, stream.value()));
-  cuda_check(cudaMemcpyAsync(
-    first_output.data(), first_buffer.data(), 16, cudaMemcpyDeviceToDevice, stream.value()));
-  auto const column_value = frame.read_scalar(first_column->view().head<std::uint8_t>());
-  auto const buffer_value =
-    frame.read_scalar(static_cast<std::uint64_t const*>(first_output.data()));
-  expect(column_value == 0x2a && buffer_value == upload.front(),
-         "grown frame owners lost queued data");
-  expect(session.finish().empty(), "raw owner-growth fixture published an output");
-  resource.check();
-}
-
-struct estimate_only_representation : simpatico::compressed_representation {
-  std::vector<simpatico::compressible_output> named_channels(rmm::cuda_stream_view) const override
-  {
-    throw std::logic_error("byte estimate requested channel views");
-  }
-};
-
-void test_representation_byte_estimate(rmm::device_async_resource_ref upstream)
-{
-  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
-  std::array const streams{stream.view()};
-  checked_resource resource(upstream);
-  checked_resource default_resource(upstream);
-  current_resource_guard current(default_resource);
-  {
-    // Record sizes and capacities before cuDF hides the RMM owners. Its alloc_size() reports buffer
-    // sizes, not the capacity retained after shrinking these deliberate slack fixtures.
-    struct buffer_extent {
-      std::size_t size;
-      std::size_t capacity;
-    };
-    std::vector<buffer_extent> recorded_buffers;
-    auto column = [&](std::size_t data_capacity, std::size_t mask_capacity = 0) {
-      rmm::device_buffer data(data_capacity, stream.view(), resource);
-      data.resize(1, stream.view());
-      rmm::device_buffer mask(mask_capacity, stream.view(), resource);
-      if (mask_capacity) mask.resize(sizeof(cudf::bitmask_type), stream.view());
-      recorded_buffers.push_back({data.size(), data.capacity()});
-      recorded_buffers.push_back({mask.size(), mask.capacity()});
-      return std::make_unique<cudf::column>(
-        cudf::data_type{cudf::type_id::UINT8}, 1, std::move(data), std::move(mask), 0);
-    };
-    auto base = std::make_unique<estimate_only_representation>();
-    std::vector<std::unique_ptr<cudf::column>> children;
-    children.push_back(column(128, 64));
-    children.push_back(column(256));
-    base->channels_.push_back(std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRUCT},
-                                                             1,
-                                                             rmm::device_buffer{},
-                                                             rmm::device_buffer{},
-                                                             0,
-                                                             std::move(children)));
-    base->channels_.push_back(nullptr);
-    base->channels_.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::UINT8}));
-    std::size_t base_buffer_sizes      = 0;
-    std::size_t base_buffer_capacities = 0;
-    for (auto const& buffer : recorded_buffers) {
-      base_buffer_sizes += buffer.size;
-      base_buffer_capacities += buffer.capacity;
+  // Each request's ledger peak and output bytes when it is decoded alone.
+  std::vector<std::size_t> solo_peak(fixtures.size());
+  std::vector<std::size_t> output_bytes(fixtures.size());
+  for (std::size_t i = 0; i < fixtures.size(); ++i) {
+    std::vector<std::unique_ptr<cudf::column>> outputs;
+    {
+      simpatico::decode_session session(streams, ledger);
+      session.append(value_request(columns[i]));
+      outputs = session.finish();
     }
-    expect(base_buffer_capacities == 448 && base_buffer_sizes == 6,
-           "slack fixture must retain 448 capacity bytes behind 6 buffer-size bytes");
-    constexpr std::size_t base_bytes = 6;
+    solo_peak[i]    = ledger.observations->peak_live_bytes;
+    output_bytes[i] = ledger.observations->live_bytes;
+    expect(output_bytes[i] > 0 && solo_peak[i] > output_bytes[i],
+           "temporary fixture has no decode temporaries");
+    outputs.clear();
+    ledger.check();
+    ledger.reset();
+  }
 
-    auto empty_dict = std::make_unique<simpatico::dictionary_compressed_representation>(
-      cudf::make_empty_column(cudf::data_type{cudf::type_id::DICTIONARY32}));
-    auto input = make_strings_column({"aa", "bb", "aa"}, {true, false, true}, stream.view());
-    auto dictionary =
-      simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), resource);
-    auto& dict = dynamic_cast<simpatico::dictionary_compressed_representation&>(*dictionary);
-    auto const dictionary_column_bytes = dict.dict_column->alloc_size();
-    dict.channels_.push_back(column(64));
-    dict.keys_chars_copy        = column(128);
-    dict.keys_offsets_synth     = column(256);
-    dict.indices_synth          = column(512);
-    dict.null_mask_copy         = column(1024);
-    auto const dictionary_bytes = dictionary_column_bytes + 5;
-    auto const dictionary_width = dict.constant_key_width;
+  // Every request in one session: after each append only the outputs so far remain allocated.
+  std::vector<std::size_t> all(fixtures.size());
+  std::iota(all.begin(), all.end(), std::size_t{0});
+  std::size_t prior_outputs = 0;
+  std::size_t bound         = 0;
+  {
+    simpatico::decode_session session(streams, ledger);
+    for (auto const i : all) {
+      bound = std::max(bound, prior_outputs + solo_peak[i]);
+      session.append(value_request(columns[i]));
+      prior_outputs += output_bytes[i];
+      expect(ledger.observations->live_bytes == prior_outputs,
+             "an append kept device temporaries beyond its call");
+    }
+    expect(ledger.observations->peak_live_bytes <= bound,
+           "session peak exceeded prior outputs plus one request's working set");
+    expect(!ledger.observations->wrong_stream, "a temporary was released on another stream");
+    verify(all, session.finish());
+  }
+  ledger.check();
+  ledger.reset();
 
-    auto fused = std::make_unique<simpatico::codegen_fused_representation>(
-      simpatico::OpId::Bitpack, cudf::data_type{cudf::type_id::INT32}, 1);
-    fused->channels_.push_back(column(64));
-    fused->buffers.emplace_back("payload", column(512, 128));
-    fused->buffers.emplace_back("empty", nullptr);
-    constexpr std::size_t fused_bytes = 6;
-    std::vector<std::unique_ptr<cudf::column>> fields;
-    fields.push_back(column(256));
-    fields.push_back(nullptr);
-    auto extracted = std::make_unique<simpatico::bitextract_compressed_representation>(
-      simpatico::bitextract_spec_result{}, std::move(fields));
-    extracted->channels_.push_back(column(128));
-    constexpr std::size_t extracted_bytes = 2;
-
-    std::array<simpatico::compressed_representation const*, 5> const representations{
-      base.get(), empty_dict.get(), dictionary.get(), fused.get(), extracted.get()};
-    std::array<std::size_t, 5> expected{
-      base_bytes, 0, dictionary_bytes, fused_bytes, extracted_bytes};
-    auto* const lazy_dict       = empty_dict.get();
-    auto* const fused_owner     = fused.get();
-    auto* const extracted_owner = extracted.get();
-    simpatico::decode_session session(streams, resource);
-    auto& frame = simpatico::decode_session_test_access::frame(session);
-    frame.keep_representation(std::move(base));
-    frame.keep_representation(std::move(empty_dict));
-    frame.keep_representation(std::move(dictionary));
-    frame.keep_representation(std::move(fused));
-    frame.keep_representation(std::move(extracted));
-    frame.allocate_buffer(640).resize(1, stream.view());
-    frame.keep_column(column(768, 64));
-    frame.memo_column(1).adopt(column(1024));
-    frame.terminal_memo(2);
-    frame.memo_column(2).adopt(column(2048));
-    frame.allocate_output_buffer(4096);
-    frame.output().adopt(column(8192));
-    (void)frame.host_array<std::byte>(17);
-    constexpr std::size_t other_temporary_bytes = 640 + 5 + 1;
-
-    auto observe = [&] {
-      auto const allocations         = resource.observations->attempts.size();
-      auto const default_allocations = default_resource.observations->attempts.size();
+  // Requests without host readbacks never wait: temporaries are released while every lane is
+  // gated, so the work that reads them is still queued.
+  std::vector<std::size_t> gated_order;
+  for (std::size_t repeat = 0; repeat < 2; ++repeat)
+    for (auto const i : all)
+      if (!fixtures[i].observes_host) gated_order.push_back(i);
+  {
+    simpatico::decode_session session(streams, ledger);
+    stream_gate first_gate(pool.streams[0]);
+    stream_gate second_gate(pool.streams[1]);
+    prior_outputs = 0;
+    {
       stream_observation_scope observed;
-      cuda_check(cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeGlobal));
-      cudaGraph_t graph = nullptr;
-      try {
-        std::size_t total = other_temporary_bytes;
-        for (std::size_t i = 0; i < representations.size(); ++i) {
-          auto const actual = representations[i]->owned_device_bytes_estimate();
-          if (actual != expected[i])
-            throw std::runtime_error(
-              "representation byte estimate mismatch at index " + std::to_string(i) +
-              ": expected " + std::to_string(expected[i]) + ", actual " + std::to_string(actual));
-          total += expected[i];
-        }
-        expect(frame.retained_device_bytes() == total && frame.retained_host_bytes() == 17,
-               "representation observer changed frame totals or output exclusions");
-      } catch (...) {
-        (void)cudaStreamEndCapture(stream.value(), &graph);
-        if (graph) (void)cudaGraphDestroy(graph);
-        throw;
+      for (auto const i : gated_order) {
+        session.append(value_request(columns[i]));
+        prior_outputs += output_bytes[i];
+        expect(ledger.observations->live_bytes == prior_outputs,
+               "a gated append kept device temporaries beyond its call");
       }
-      cuda_check(cudaStreamEndCapture(stream.value(), &graph));
-      std::size_t nodes         = 0;
-      auto const count_status   = cudaGraphGetNodes(graph, nullptr, &nodes);
-      auto const destroy_status = cudaGraphDestroy(graph);
-      cuda_check(count_status);
-      cuda_check(destroy_status);
-      expect(nodes == 0, "byte estimate enqueued CUDA work");
       for (auto const& calls : stream_fault::counts)
         expect(calls.queries == 0 && calls.synchronizations == 0,
-               "byte estimate queried or synchronized a stream");
-      expect(resource.observations->attempts.size() == allocations &&
-               default_resource.observations->attempts.size() == default_allocations,
-             "byte estimate allocated device storage");
-      expect(!lazy_dict->keys_chars_copy && !lazy_dict->keys_offsets_synth &&
-               !lazy_dict->indices_synth && !lazy_dict->null_mask_copy &&
-               lazy_dict->constant_key_width == -1 && dict.constant_key_width == dictionary_width,
-             "byte estimate mutated lazy dictionary state");
-    };
-    observe();
-    // Moved-out owners and empty columns no longer contribute to the frame's estimate.
-    auto moved_field  = std::move(extracted_owner->fields.front());
-    auto moved_buffer = fused_owner->buffers.front().second->release();
-    auto moved_output = frame.release(frame.output());
-    expected[3] -= 5;
-    expected[4] -= 1;
-    observe();
-    expect(session.stats().retirement_stream_queries == 0 && session.stats().pressure_waits == 0,
-           "small estimate fixtures changed retirement policy");
-    expect(session.finish().empty(), "estimate fixture unexpectedly published a result");
+               "an append without host readbacks queried or synchronized a stream");
+    }
+    expect(!first_gate.released.load() && !second_gate.released.load(),
+           "an append without host readbacks waited for its lane");
+    expect(!ledger.observations->wrong_stream, "a gated temporary was released on another stream");
+    first_gate.release_after_delay.store(true);
+    second_gate.release_after_delay.store(true);
+    verify(gated_order, session.finish());
+    expect(!first_gate.timed_out.load() && !second_gate.timed_out.load(),
+           "gated temporary watchdog expired");
   }
-  resource.check();
-  default_resource.check();
-  stream.synchronize();
+  ledger.check();
 }
 
-void test_single_op_byte_estimate(rmm::device_async_resource_ref upstream)
+// Submission never waits to release memory: 256 requests with 32 MiB of scratch each queue behind
+// one gated lane, while the call-time ledger never holds more than one request's scratch. Each
+// request writes its own byte, so a scratch block reused out of stream order would show up in a
+// neighbour's output.
+void test_submission_never_waits_for_memory(rmm::device_async_resource_ref upstream)
 {
-  auto input = make_int32_table(1, 1037, 107);
-  cudf::get_default_stream().synchronize();
+  constexpr std::size_t requests      = 256;
+  constexpr std::size_t scratch_bytes = 32U << 20;
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
   std::array const streams{stream.view()};
   checked_resource resource(upstream);
-  for (auto const* op : {"delta", "for", "rle"}) {
-    {
-      std::string error;
-      auto rep =
-        simpatico::compress_single_op(op, input->view().column(0), stream.view(), resource, &error);
-      expect(rep != nullptr && error.empty(), "single-op estimate fixture compression failed");
-      auto const plan_estimate = rep->owned_device_bytes_estimate();
-      expect(plan_estimate > 0, "single-op estimate omitted its owned plan");
-      auto const channels = rep->named_channels(stream.view());
-      expect(!channels.empty(), "single-op estimate fixture has no borrowed output channels");
-      expect(rep->owned_device_bytes_estimate() == plan_estimate,
-             "exposing borrowed channels changed the single-op byte estimate");
-      // The wrapper's own channels are normally empty; exercise the base-owner contract too.
-      rep->channels_.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::UINT8},
-                                                         17,
-                                                         cudf::mask_state::UNALLOCATED,
-                                                         stream.view(),
-                                                         resource));
-      expect(rep->channels_.front()->alloc_size() == 17,
-             "single-op inherited column fixture has an unexpected buffer size");
-      auto const expected               = plan_estimate + 17;
-      std::size_t live_allocation_bytes = 0;
-      for (auto const& [pointer, allocation] : resource.observations->live)
-        live_allocation_bytes += allocation.bytes;
-      expect(expected <= live_allocation_bytes,
-             "single-op byte estimate exceeded its live allocation ledger");
-      auto const allocations = resource.observations->attempts.size();
-      {
-        stream_observation_scope observed;
-        for (int i = 0; i < 3; ++i)
-          expect(rep->owned_device_bytes_estimate() == expected,
-                 "single-op byte estimate lost its inherited contribution or changed on repeat");
-        for (auto const& calls : stream_fault::counts)
-          expect(calls.queries == 0 && calls.synchronizations == 0,
-                 "single-op byte estimate queried or synchronized a stream");
-      }
-      expect(resource.observations->attempts.size() == allocations,
-             "single-op byte estimate allocated device storage");
-      auto const channels_after = rep->named_channels(stream.view());
-      expect(channels_after.size() == channels.size(),
-             "single-op byte estimate changed borrowed channel count");
-      for (std::size_t i = 0; i < channels.size(); ++i)
-        expect(channels_after[i].name == channels[i].name &&
-                 channels_after[i].view.head<void>() == channels[i].view.head<void>() &&
-                 channels_after[i].view.size() == channels[i].view.size(),
-               "single-op byte estimate changed a borrowed channel view");
-      simpatico::decode_session session(streams, resource);
-      auto& frame = simpatico::decode_session_test_access::frame(session);
-      frame.keep_representation(std::move(rep));
-      expect(frame.retained_device_bytes() == expected,
-             "single-op plan estimate did not reach frame accounting");
-      expect(session.finish().empty(), "single-op estimate fixture published a result");
-    }
-    resource.check();
-    resource.reset();
+  std::vector<std::unique_ptr<scratch_probe_representation>> representations;
+  std::vector<std::uint8_t> expected;
+  for (std::size_t i = 0; i < requests; ++i) {
+    expected.push_back(static_cast<std::uint8_t>(i));
+    representations.push_back(
+      std::make_unique<scratch_probe_representation>(scratch_bytes, expected.back()));
   }
+  simpatico::decode_session session(streams, resource);
+  stream_gate gate(stream.view());
+  {
+    stream_observation_scope observed;
+    for (auto const& representation : representations)
+      session.append(probe_request(*representation));
+    for (auto const& calls : stream_fault::counts)
+      expect(calls.queries == 0 && calls.synchronizations == 0,
+             "submission queried or synchronized a stream to release memory");
+  }
+  expect(!gate.released.load(), "submission waited for its gated lane");
+  expect(resource.observations->live.size() == requests,
+         "submission kept scratch beyond the appending call");
+  expect(resource.observations->peak_live_bytes <= requests + scratch_bytes,
+         "submission held more than one request's scratch at a time");
+  gate.release_after_delay.store(true);
+  expect_probe_outputs(session.finish(), expected);
+  expect(!gate.timed_out.load(), "gated scratch probe watchdog expired");
+}
+
+// A failure after work was queued releases the request's temporaries during unwinding, on their
+// allocation stream and before the stream completes; the session then drains before rethrowing.
+void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resource_ref upstream)
+{
+  simpatico::stream_pool pool;
+  expect(pool.init(1), "failure-unwind pool init");
+  auto const streams = stream_views(pool);
+  checked_resource resource(upstream);
+  scratch_probe_representation const representation(1U << 20, 0x2a, true);
+  std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
+  stream_gate gate(pool.streams[0]);
+  event_markers markers(pool);
+  markers.record();
+  release_observation observation(resource, gate.released);
+  // The first release opens the gate after a delay, so every release precedes GPU completion.
+  resource.observations->signal_on_deallocate = &gate.release_after_delay;
+  bool propagated                             = false;
+  try {
+    session->append(probe_request(representation));
+  } catch (probe_failure const&) {
+    propagated = true;
+  }
+  resource.observations->signal_on_deallocate = nullptr;
+  expect(propagated, "failure after enqueue lost its exception subtype");
+  expect(gate.released.load() && markers.complete(),
+         "failure after enqueue escaped before its lane drained");
+  expect(resource.observations->early_release && resource.observations->live.empty(),
+         "failure after enqueue did not release temporaries before GPU completion");
+  expect(!resource.observations->wrong_stream && !resource.observations->wrong_thread,
+         "failure after enqueue released a temporary on another stream or thread");
+  expect_failure([&] { session->finish(); }, "failed session published a result");
+  expect_failure([&] { session->append(probe_request(representation)); },
+                 "failed session accepted another request");
+  session.reset();
+  expect(resource.observations->live.empty(), "failed session leaked device storage");
+  expect(!gate.timed_out.load(), "failure-unwind watchdog expired");
+}
+
+// A selection over `rows` rows, built on the host and uploaded, so no CNT wave runs.
+class host_selection {
+ public:
+  host_selection(std::int64_t rows,
+                 std::function<bool(std::int64_t)> const& keep,
+                 rmm::cuda_stream_view stream,
+                 rmm::device_async_resource_ref mr)
+  {
+    using sirius::codegen::selection_mask;
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(selection_mask::WordsFor(rows)));
+    std::vector<std::uint32_t> offsets(static_cast<std::size_t>(selection_mask::ChunksFor(rows)) +
+                                       1);
+    for (std::int64_t row = 0; row < rows; ++row) {
+      if (!keep(row)) continue;
+      words[static_cast<std::size_t>(row / 32)] |= 1U << (row % 32);
+      ++offsets[static_cast<std::size_t>(row / sirius::codegen::SELECTION_CHUNK_ROWS) + 1];
+      survivors.push_back(static_cast<std::int32_t>(row));
+    }
+    std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+    words_   = rmm::device_buffer(words.data(), words.size() * sizeof(words[0]), stream, mr);
+    offsets_ = rmm::device_buffer(offsets.data(), offsets.size() * sizeof(offsets[0]), stream, mr);
+    indices_ =
+      rmm::device_buffer(survivors.data(), survivors.size() * sizeof(survivors[0]), stream, mr);
+    stream.synchronize();
+    mask_ = {static_cast<std::uint32_t*>(words_.data()),
+             rows,
+             static_cast<std::int64_t>(survivors.size()),
+             static_cast<std::uint32_t*>(offsets_.data())};
+  }
+  host_selection(host_selection const&)            = delete;
+  host_selection& operator=(host_selection const&) = delete;
+
+  [[nodiscard]] simpatico::decode_selection selection(sirius::codegen::decode_route route) const
+  {
+    simpatico::decode_selection result;
+    result.mask             = &mask_;
+    result.survivor_count   = mask_.survivor_count;
+    result.route            = route;
+    result.survivor_indices = cudf::column_view{cudf::data_type{cudf::type_id::INT32},
+                                                static_cast<cudf::size_type>(survivors.size()),
+                                                indices_.data(),
+                                                nullptr,
+                                                0};
+    return result;
+  }
+
+  std::vector<std::int32_t> survivors;
+
+ private:
+  rmm::device_buffer words_;
+  rmm::device_buffer offsets_;
+  rmm::device_buffer indices_;
+  sirius::codegen::selection_mask mask_;
+};
+
+template <typename Error>
+bool offsets_rejected(cudf::size_type rows, std::int32_t width, rmm::device_async_resource_ref mr)
+{
+  try {
+    (void)simpatico::make_constant_width_offsets(rows, width, cudf::get_default_stream(), mr);
+  } catch (Error const&) {
+    return true;
+  }
+  return false;
+}
+
+// Out-of-range arguments are rejected on the host, before any allocation or device work.
+void test_constant_width_offsets_bounds(rmm::device_async_resource_ref upstream)
+{
+  constexpr auto max_rows = std::numeric_limits<cudf::size_type>::max();
+  expect(offsets_rejected<std::invalid_argument>(-1, 4, upstream), "negative row count accepted");
+  expect(offsets_rejected<std::invalid_argument>(4, -1, upstream), "negative width accepted");
+  expect(offsets_rejected<std::overflow_error>(max_rows / 2 + 1, 2, upstream),
+         "total bytes beyond INT32 accepted");
+  expect(offsets_rejected<std::overflow_error>(max_rows, 0, upstream),
+         "offset count beyond INT32 accepted");
+}
+
+// The routes whose temporaries changed most, each submitted through sessions: predicates on a
+// stored dictionary, a rebuilt dictionary, and a generic (str_split) plan; the dictionary gather
+// specialization and its fallback; selected str_split; full-width decode plus gather; and
+// membership and range masks. After each append only earlier outputs remain charged; values must
+// match. Use after release on these paths is visible only to tools such as compute-sanitizer, not
+// to this test.
+void test_selection_and_predicate_routes(rmm::device_async_resource_ref upstream)
+{
+  namespace sc                   = sirius::codegen;
+  constexpr cudf::size_type rows = 5000;
+  auto const stream              = cudf::get_default_stream();
+  std::array<char const*, 10> const words{
+    "apple", "banana", "cherry", "apple", "date", "banana", "apple", "elderberry", "fig", "banana"};
+  std::vector<std::string> varied(rows);
+  std::vector<std::string> fixed(rows);
+  for (cudf::size_type row = 0; row < rows; ++row) {
+    varied[row] = words[row % words.size()];
+    fixed[row]  = std::string{"k"} + static_cast<char>('a' + row % 7);
+  }
+  auto const varied_input = make_strings_table(varied, {}, stream);
+  auto const fixed_input  = make_strings_table(fixed, {}, stream);
+  auto const numbers      = make_int32_table(1, rows, 131);
+  std::vector<std::int32_t> values(rows);
+  cuda_check(cudaMemcpy(values.data(),
+                        numbers->view().column(0).head<void>(),
+                        values.size() * sizeof(values[0]),
+                        cudaMemcpyDeviceToHost));
+
+  auto const compress = [&](cudf::table const& input, char const* plan) {
+    auto compressed = simpatico::compress_with_plan(input.view(), plan, stream, upstream);
+    return std::move(compressed.columns.front());
+  };
+  char const* const rebuilt_dictionary =
+    "input -> dictionary -> keys_offsets, keys_chars, indices\ndictionary.indices -> bitpack\n";
+  auto const stored_dict = compress(*varied_input, "input -> dictionary\n");
+  auto const varied_dict = compress(*varied_input, rebuilt_dictionary);
+  auto const fixed_dict  = compress(*fixed_input, rebuilt_dictionary);
+  auto const split =
+    compress(*varied_input, "input -> str_split -> offsets, chars\nstr_split.offsets -> bitpack\n");
+  auto const packed = compress(*numbers, "input -> bitpack\n");
+  // Chunk 2 keeps no rows.
+  host_selection const selected(
+    rows, [](std::int64_t row) { return row / 1024 != 2 && row % 3 == 0; }, stream, upstream);
+
+  auto const mask_words = static_cast<std::size_t>(sc::selection_mask::WordsFor(rows));
+  std::array<rmm::device_buffer, 3> destinations{
+    rmm::device_buffer(mask_words * sizeof(std::uint32_t), stream, upstream),
+    rmm::device_buffer(mask_words * sizeof(std::uint32_t), stream, upstream),
+    rmm::device_buffer(mask_words * sizeof(std::uint32_t), stream, upstream)};
+  auto const destination = [&](std::size_t index) {
+    return simpatico::mask_destination{static_cast<std::uint32_t*>(destinations[index].data()),
+                                       rows};
+  };
+  // The membership probe compares with a device column, so the probe itself uploads nothing.
+  auto const threshold = values[rows / 2];
+  std::vector<std::int32_t> const thresholds(rows, threshold);
+  auto const threshold_column = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, rows, cudf::mask_state::UNALLOCATED, stream, upstream);
+  cuda_check(cudaMemcpy(threshold_column->mutable_view().head<void>(),
+                        thresholds.data(),
+                        thresholds.size() * sizeof(thresholds[0]),
+                        cudaMemcpyHostToDevice));
+  auto const threshold_view = threshold_column->view();
+  simpatico::membership_source const below_threshold{
+    [threshold_view](cudf::column_view keys,
+                     rmm::cuda_stream_view probe_stream,
+                     rmm::device_async_resource_ref mr) {
+      return cudf::binary_operation(keys,
+                                    threshold_view,
+                                    cudf::binary_operator::LESS,
+                                    cudf::data_type{cudf::type_id::BOOL8},
+                                    probe_stream,
+                                    mr);
+    },
+    cudf::data_type{cudf::type_id::INT32}};
+  sc::range_predicate const range{threshold - 200, threshold + 200};
+  for (auto& buffer : destinations)
+    cuda_check(cudaMemsetAsync(buffer.data(), 0, buffer.size(), stream.value()));
   stream.synchronize();
+
+  auto const plan = [](simpatico::compressed_column const& column) -> simpatico::PlanTree const& {
+    return *column.plan_tree;
+  };
+  auto const predicate = [&](simpatico::compressed_column const& column,
+                             std::vector<std::string> equals_any,
+                             std::optional<simpatico::mask_destination> ballot) {
+    return simpatico::column_decode_request{
+      .source = std::cref(plan(column)),
+      .result =
+        simpatico::predicate_result{simpatico::decode_predicate{std::move(equals_any)}, ballot}};
+  };
+  auto const select = [&](simpatico::compressed_column const& column, sc::decode_route route) {
+    return simpatico::column_decode_request{
+      .source    = std::cref(plan(column)),
+      .selection = simpatico::validated_selection(plan(column), selected.selection(route))};
+  };
+  using request = std::variant<simpatico::column_decode_request, simpatico::mask_decode_request>;
+  std::vector<request> const requests{
+    predicate(stored_dict, {"apple", "fig"}, destination(0)),
+    predicate(varied_dict, {"banana"}, std::nullopt),
+    predicate(split, {"cherry", "date"}, std::nullopt),
+    select(fixed_dict, sc::decode_route::dict_codes),
+    select(varied_dict, sc::decode_route::dict_codes),
+    select(split, sc::decode_route::str_split),
+    select(packed, sc::decode_route::full),
+    simpatico::mask_decode_request{plan(packed), below_threshold, destination(1)},
+    simpatico::mask_decode_request{plan(packed), range, destination(2)},
+  };
+  auto const append = [](simpatico::decode_session& session, request const& item) {
+    std::visit([&](auto const& typed) { (void)session.append(typed); }, item);
+  };
+
+  simpatico::stream_pool pool;
+  expect(pool.init(2), "route coverage pool init");
+  auto const streams = stream_views(pool);
+  checked_resource ledger(upstream);
+  current_resource_guard current(ledger);
+  std::vector<std::size_t> solo_peak(requests.size());
+  std::vector<std::size_t> output_bytes(requests.size());
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    std::vector<std::unique_ptr<cudf::column>> outputs;
+    {
+      simpatico::decode_session session(streams, ledger);
+      append(session, requests[i]);
+      outputs = session.finish();
+    }
+    solo_peak[i]    = ledger.observations->peak_live_bytes;
+    output_bytes[i] = ledger.observations->live_bytes;
+    outputs.clear();
+    ledger.check();
+    ledger.reset();
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> outputs;
+  {
+    simpatico::decode_session session(streams, ledger);
+    std::size_t prior_outputs = 0;
+    std::size_t bound         = 0;
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      bound = std::max(bound, prior_outputs + solo_peak[i]);
+      append(session, requests[i]);
+      prior_outputs += output_bytes[i];
+      expect(ledger.observations->live_bytes == prior_outputs,
+             "a routed append kept device temporaries beyond its call");
+    }
+    expect(ledger.observations->peak_live_bytes <= bound,
+           "routed session peak exceeded prior outputs plus one request's working set");
+    expect(!ledger.observations->wrong_stream, "a routed temporary was released on another stream");
+    outputs = session.finish();
+  }
+
+  auto const in = [&](std::vector<std::string> set) {
+    return [&varied, set = std::move(set)](std::int64_t row) {
+      return std::find(set.begin(), set.end(), varied[static_cast<std::size_t>(row)]) != set.end();
+    };
+  };
+  auto const flags_match = [&](cudf::column_view column, auto const& expected) {
+    if (column.type().id() != cudf::type_id::BOOL8 || column.size() != rows ||
+        column.null_count() != 0)
+      return false;
+    std::vector<std::uint8_t> host(rows);
+    cuda_check(cudaMemcpy(host.data(), column.head<void>(), host.size(), cudaMemcpyDeviceToHost));
+    for (cudf::size_type row = 0; row < rows; ++row)
+      if ((host[row] != 0) != expected(row)) return false;
+    return true;
+  };
+  auto const mask_matches = [&](std::size_t index, auto const& expected) {
+    std::vector<std::uint32_t> host(mask_words);
+    cuda_check(cudaMemcpy(host.data(),
+                          destinations[index].data(),
+                          host.size() * sizeof(host[0]),
+                          cudaMemcpyDeviceToHost));
+    for (std::size_t word = 0; word < host.size(); ++word) {
+      std::uint32_t want = 0;
+      for (int bit = 0; bit < 32; ++bit) {
+        auto const row = static_cast<std::int64_t>(word * 32 + bit);
+        if (row < rows && expected(row)) want |= 1U << bit;
+      }
+      if (host[word] != want) return false;
+    }
+    return true;
+  };
+  auto const selected_strings = [&](std::vector<std::string> const& source) {
+    std::vector<std::string> subset;
+    for (auto const row : selected.survivors)
+      subset.push_back(source[static_cast<std::size_t>(row)]);
+    return make_strings_column(subset, {}, stream);
+  };
+  std::vector<std::int32_t> selected_values;
+  for (auto const row : selected.survivors)
+    selected_values.push_back(values[static_cast<std::size_t>(row)]);
+  auto const expected_values =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                              static_cast<cudf::size_type>(selected_values.size()),
+                              cudf::mask_state::UNALLOCATED,
+                              stream,
+                              upstream);
+  cuda_check(cudaMemcpy(expected_values->mutable_view().head<void>(),
+                        selected_values.data(),
+                        selected_values.size() * sizeof(selected_values[0]),
+                        cudaMemcpyHostToDevice));
+
+  expect(outputs.size() == 7, "routed session lost a column output");
+  expect(
+    flags_match(outputs[0]->view(), in({"apple", "fig"})) && mask_matches(0, in({"apple", "fig"})),
+    "stored-dictionary predicate or its ballot mismatch");
+  expect(flags_match(outputs[1]->view(), in({"banana"})), "rebuilt-dictionary predicate mismatch");
+  expect(flags_match(outputs[2]->view(), in({"cherry", "date"})), "generic predicate mismatch");
+  expect(strings_equal_completed(selected_strings(fixed)->view(), outputs[3]->view(), stream),
+         "dictionary gather specialization mismatch");
+  expect(strings_equal_completed(selected_strings(varied)->view(), outputs[4]->view(), stream),
+         "dictionary codes fallback mismatch");
+  expect(strings_equal_completed(selected_strings(varied)->view(), outputs[5]->view(), stream),
+         "selected str_split mismatch");
+  expect(columns_equal_completed(expected_values->view(), outputs[6]->view()),
+         "full-width decode plus gather mismatch");
+  expect(mask_matches(1, [&](std::int64_t row) { return values[row] < threshold; }),
+         "membership mask mismatch");
+  expect(mask_matches(
+           2, [&](std::int64_t row) { return values[row] >= range.lo && values[row] <= range.hi; }),
+         "range mask mismatch");
+  outputs.clear();
+  ledger.check();
 }
 
 void test_resources_and_failures(rmm::device_async_resource_ref upstream)
@@ -2357,18 +2408,17 @@ int main()
     test_submission_and_kernel_lifetime(upstream);
     test_abandoned_session(upstream);
     test_session_state_contracts(upstream);
-    test_pressure_waits_for_external_tail(upstream);
-    test_frame_window_backpressure(upstream);
     test_stream_completion_failures(upstream);
-    test_ready_stream_and_alias_retirement(upstream);
-    test_sealed_frame_byte_accounting(upstream);
+    test_duplicate_stream_handles(upstream);
     test_external_phase_tail(upstream);
     test_request_copy_failure(upstream);
-    test_byte_window_and_active_frame(upstream);
-    test_active_frame_on_retired_alias(upstream);
-    test_frame_owner_growth(upstream);
-    test_representation_byte_estimate(upstream);
-    test_single_op_byte_estimate(upstream);
+    test_host_upload_growth(upstream);
+    test_host_uploads_survive_until_completion(upstream);
+    test_temporaries_released_at_submission(upstream);
+    test_submission_never_waits_for_memory(upstream);
+    test_failure_after_enqueue_unwinds_stream_ordered(upstream);
+    test_constant_width_offsets_bounds(upstream);
+    test_selection_and_predicate_routes(upstream);
     test_resources_and_failures(upstream);
     cuda_check(cudaDeviceSynchronize());
     std::puts("test_async_decode: OK");

@@ -6,6 +6,7 @@
 #include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "constant_width_offsets.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -129,15 +130,16 @@ int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
 int64_t measure_constant_key_width(cudf::strings_column_view const& keys, decode_frame& frame)
 {
   if (keys.size() <= 0) return 0;
+  std::optional<rmm::device_buffer> storage;
   auto const* width = enqueue_constant_key_width(
     keys, frame.stream(), [&](std::size_t scratch_bytes) -> key_width_storage {
       if (scratch_bytes > std::numeric_limits<std::size_t>::max() - sizeof(int64_t)) {
         throw std::overflow_error("dictionary key width scratch size overflow");
       }
-      auto& storage = frame.allocate_buffer(sizeof(int64_t) + scratch_bytes);
+      storage.emplace(sizeof(int64_t) + scratch_bytes, frame.stream(), frame.mr());
       // CUB's queried size includes padding to align the scratch following the scalar.
-      return {static_cast<char*>(storage.data()) + sizeof(int64_t),
-              static_cast<int64_t*>(storage.data())};
+      return {static_cast<char*>(storage->data()) + sizeof(int64_t),
+              static_cast<int64_t*>(storage->data())};
     });
   return frame.read_scalar(width);
 }
@@ -191,32 +193,25 @@ void padded_gather_chunks(
 }
 
 // Constant-width null-free decode: analytic offsets + flat byte gather (skips cudf's
-// batched-memcpy gather, offsets scan, and null-mask pass). false = ineligible.
-bool try_decode_constant_width(cudf::strings_column_view const& keys,
-                               cudf::column_view const& indices,
-                               std::int64_t cached_width,
-                               decode_frame& frame,
-                               decode_column_slot output)
+// batched-memcpy gather, offsets scan, and null-mask pass). nullptr = ineligible.
+std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_view const& keys,
+                                                        cudf::column_view const& indices,
+                                                        std::int64_t cached_width,
+                                                        decode_frame& frame)
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
-  if (indices.null_count() > 0 || keys.parent().null_count() > 0) return false;
-  if (indices.type().id() != cudf::type_id::INT32) return false;
+  if (indices.null_count() > 0 || keys.parent().null_count() > 0) return nullptr;
+  if (indices.type().id() != cudf::type_id::INT32) return nullptr;
   int64_t const width = cached_width < 0 ? measure_constant_key_width(keys, frame) : cached_width;
-  if (width <= 0) return false;
+  if (width <= 0) return nullptr;
   auto const n_rows    = indices.size();
   int64_t const nbytes = static_cast<int64_t>(n_rows) * width;
-  if (nbytes > std::numeric_limits<cudf::size_type>::max()) return false;
+  if (nbytes > std::numeric_limits<cudf::size_type>::max()) return nullptr;
 
-  auto offsets = cudf::make_fixed_width_column(
-    cudf::data_type(cudf::type_id::INT32), n_rows + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto offsets = make_constant_width_offsets(n_rows, static_cast<std::int32_t>(width), stream, mr);
   rmm::device_buffer chars(nbytes, stream, mr);
-  output.adopt(cudf::make_strings_column(n_rows, std::move(offsets), std::move(chars), 0, {}));
-  auto* d_off = output->mutable_view().child(0).data<int32_t>();
-  thrust::tabulate(
-    rmm::exec_policy_nosync(stream, mr), d_off, d_off + n_rows + 1, [=] __device__(int64_t i) {
-      return static_cast<int32_t>(i * width);
-    });
+  auto output = cudf::make_strings_column(n_rows, std::move(offsets), std::move(chars), 0, {});
 
   auto* out      = output->mutable_view().head<char>();
   auto const* kc = keys.chars_begin(stream);
@@ -230,7 +225,7 @@ bool try_decode_constant_width(cudf::strings_column_view const& keys,
   auto const n_keys     = keys.size();
   bool const big_pool   = static_cast<int64_t>(n_keys) * width > (1 << 20);
   if (width <= 16 && big_pool) {
-    auto& padded = frame.allocate_buffer(static_cast<std::size_t>(n_keys) * 16);
+    rmm::device_buffer padded(static_cast<std::size_t>(n_keys) * 16, stream, mr);
     {
       auto* p = static_cast<char*>(padded.data());
       thrust::for_each_n(rmm::exec_policy_nosync(stream, mr),
@@ -291,7 +286,7 @@ bool try_decode_constant_width(cudf::strings_column_view const& keys,
                          }
                        });
   }
-  return true;
+  return output;
 }
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
@@ -330,6 +325,29 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
 
 }  // namespace
 
+std::unique_ptr<cudf::column> make_constant_width_offsets(cudf::size_type rows,
+                                                          std::int32_t width,
+                                                          rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr)
+{
+  if (rows < 0 || width < 0) {
+    throw std::invalid_argument("constant-width offsets: negative row count or width");
+  }
+  if (rows == std::numeric_limits<cudf::size_type>::max() ||
+      static_cast<std::int64_t>(rows) * width > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::overflow_error(
+      "constant-width offsets: offset count or total bytes exceed the INT32 range");
+  }
+  auto offsets = cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT32}, rows + 1, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto* const data = offsets->mutable_view().data<std::int32_t>();
+  thrust::tabulate(
+    rmm::exec_policy_nosync(stream, mr), data, data + rows + 1, [=] __device__(int64_t i) {
+      return static_cast<std::int32_t>(i * width);
+    });
+  return offsets;
+}
+
 std::unique_ptr<dictionary_compressed_representation>
 dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::column> dict_col,
                                                           rmm::cuda_stream_view stream,
@@ -366,8 +384,8 @@ dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::
   }
 }
 
-void dictionary_compressed_representation::decompress(decode_frame& frame,
-                                                      decode_column_slot output) const
+std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
+  decode_frame& frame) const
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
@@ -375,29 +393,30 @@ void dictionary_compressed_representation::decompress(decode_frame& frame,
   // Decode from the stored dictionary column.
   if (dict_column == nullptr) { throw std::invalid_argument("dictionary decode: missing column"); }
   if (dict_column->size() == 0) {
-    output.adopt(cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING)));
-    return;
+    return cudf::make_empty_column(cudf::data_type(cudf::type_id::STRING));
   }
   if (cudf::dictionary_column_view(dict_column->view()).keys().size() == 0) {
     // Zero keys with rows present: every row is null (encode drops null rows
     // from the key set), so build the all-null strings column directly.
-    auto& empty =
-      frame.keep_scalar(std::make_unique<cudf::string_scalar>("", false, stream, mr), sizeof(bool));
-    output.adopt(cudf::make_column_from_scalar(empty, dict_column->size(), stream, mr));
-    return;
+    auto const rows = dict_column->size();
+    return cudf::make_strings_column(
+      rows,
+      make_constant_width_offsets(rows, 0, stream, mr),
+      rmm::device_buffer{},
+      rows,
+      cudf::create_null_mask(rows, cudf::mask_state::ALL_NULL, stream, mr));
   }
   if (dict_column->null_count() == 0) {
     cudf::dictionary_column_view dv(dict_column->view());
-    if (try_decode_constant_width(
-          cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, frame, output))
-      return;
+    if (auto output = try_decode_constant_width(
+          cudf::strings_column_view(dv.keys()), dv.indices(), constant_key_width, frame))
+      return output;
   }
-  output.adopt(cudf::dictionary::decode(dict_column->view(), stream, mr));
+  return cudf::dictionary::decode(dict_column->view(), stream, mr);
 }
 
-bool dictionary_compressed_representation::decompress_predicate(decode_predicate const& pred,
-                                                                decode_frame& frame,
-                                                                decode_column_slot output) const
+std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_predicate(
+  decode_predicate const& pred, decode_frame& frame) const
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
@@ -405,14 +424,11 @@ bool dictionary_compressed_representation::decompress_predicate(decode_predicate
   if (dict_column == nullptr) {
     throw std::invalid_argument("dictionary predicate: missing column");
   }
-  if (!pred.active()) { return false; }
+  if (!pred.active()) { return nullptr; }
 
   auto const n_rows = dict_column->size();
   auto const bool_t = cudf::data_type{cudf::type_id::BOOL8};
-  if (n_rows == 0) {
-    output.adopt(cudf::make_empty_column(bool_t));
-    return true;
-  }
+  if (n_rows == 0) { return cudf::make_empty_column(bool_t); }
 
   cudf::dictionary_column_view const dv(dict_column->view());
   auto const keys    = dv.keys();
@@ -422,54 +438,52 @@ bool dictionary_compressed_representation::decompress_predicate(decode_predicate
   // Zero keys with rows present: encode drops null rows from the key set, so
   // every row is null and the comparison is null throughout.
   if (n_keys == 0) {
-    output.adopt(
-      cudf::make_fixed_width_column(bool_t, n_rows, cudf::mask_state::ALL_NULL, stream, mr));
+    auto output =
+      cudf::make_fixed_width_column(bool_t, n_rows, cudf::mask_state::ALL_NULL, stream, mr);
     output->set_null_count(n_rows);
-    return true;
+    return output;
   }
   // The index lookup below reads indices[i] unconditionally, so anything other
   // than the INT32 index type encode produces is left to the generic path.
-  if (indices.type().id() != cudf::type_id::INT32) { return false; }
-  if (keys.type().id() != cudf::type_id::STRING) { return false; }
+  if (indices.type().id() != cudf::type_id::INT32) { return nullptr; }
+  if (keys.type().id() != cudf::type_id::STRING) { return nullptr; }
   // A null key would make the per-key comparison null rather than false, and the
   // OR-accumulate below would then propagate it. cudf::dictionary::encode never
   // produces one (nulls live on the parent's mask, not in the key set), so leave
   // the shape to the generic path instead of carrying a tri-state accumulate.
-  if (keys.null_count() > 0) { return false; }
+  if (keys.null_count() > 0) { return nullptr; }
 
   // One bool per distinct value: keys ∈ equals_any. The key set is the column's
   // whole distinct-value population (four entries for l_shipinstruct), so these
   // kernels are noise next to the row-length pass below — which is the entire
   // point: this is the work that replaces the decode gather.
-  std::optional<decode_column_slot> lut;
+  std::unique_ptr<cudf::column> lut;
   for (auto const& value : pred.equals_any) {
-    auto hit     = frame.make_column();
-    auto& needle = frame.keep_scalar(std::make_unique<cudf::string_scalar>(value, true, stream, mr),
-                                     value.size() + sizeof(bool));
-    hit.adopt(
-      cudf::binary_operation(keys, needle, cudf::binary_operator::EQUAL, bool_t, stream, mr));
-    if (lut) {
-      auto combined = frame.make_column();
-      combined.adopt(cudf::binary_operation(
-        lut->view(), hit.view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr));
-      lut = combined;
+    // Each needle waits for the stream while cuDF allocates its pinned validity buffer. Its bytes
+    // upload from `value`, which the caller keeps until session completion.
+    cudf::string_scalar const needle(value, true, stream, mr);
+    auto hit =
+      cudf::binary_operation(keys, needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
+    if (!lut) {
+      lut = std::move(hit);
     } else {
-      lut = hit;
+      lut = cudf::binary_operation(
+        lut->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr);
     }
   }
-  if (!lut || lut->get().size() != n_keys) {
+  if (!lut || lut->size() != n_keys) {
     throw std::logic_error("dictionary predicate: invalid lookup table");
   }
 
   // Only the *row* validity needs carrying: the keys are non-null (checked
   // above), so a matching code is unambiguously true.
   auto const null_count = dict_column->null_count();
-  output.adopt(cudf::make_fixed_width_column(
+  auto output           = cudf::make_fixed_width_column(
     bool_t,
     n_rows,
     null_count > 0 ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED,
     stream,
-    mr));
+    mr);
   output->set_null_count(null_count);
   if (null_count > 0) {
     throw_if_cuda_error(cudaMemcpyAsync(output->mutable_view().null_mask(),
@@ -492,7 +506,7 @@ bool dictionary_compressed_representation::decompress_predicate(decode_predicate
                     [d_lut, n_keys] __device__(int32_t code) {
                       return code >= 0 && code < n_keys ? d_lut[code] : false;
                     });
-  return true;
+  return output;
 }
 
 std::unique_ptr<compressed_representation> dictionary_compressor::compress(

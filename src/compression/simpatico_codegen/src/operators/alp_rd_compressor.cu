@@ -469,23 +469,21 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
 }
 
 template <typename T>
-void alp_rd_decompress_impl(alp_rd_compressed_representation const& repr,
-                            decode_frame& frame,
-                            decode_column_slot out)
+std::unique_ptr<cudf::column> alp_rd_decompress_impl(alp_rd_compressed_representation const& repr,
+                                                     decode_frame& frame)
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
-  using traits = alp_rd_traits<T>;
-  using uint_t = typename traits::uint_t;
+  using traits      = alp_rd_traits<T>;
+  using uint_t      = typename traits::uint_t;
 
   if (repr.num_rows == 0) {
-    out.adopt(cudf::make_fixed_width_column(
-      repr.original_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
-    return;
+    return cudf::make_fixed_width_column(
+      repr.original_type, 0, cudf::mask_state::UNALLOCATED, stream, mr);
   }
 
-  out.adopt(cudf::make_fixed_width_column(
-    repr.original_type, repr.num_rows, cudf::mask_state::UNALLOCATED, stream, mr));
+  auto out = cudf::make_fixed_width_column(
+    repr.original_type, repr.num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
 
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
@@ -510,6 +508,7 @@ void alp_rd_decompress_impl(alp_rd_compressed_representation const& repr,
   }
 
   throw_if_cuda_error(cudaGetLastError(), "alp_rd_decompress launch");
+  return out;
 }
 
 }  // namespace
@@ -538,12 +537,12 @@ alp_rd_compressed_representation::alp_rd_compressed_representation(
   channels_.push_back(std::move(exception_positions_in));
 }
 
-void alp_rd_compressed_representation::decompress(decode_frame& frame,
-                                                  decode_column_slot output) const
+std::unique_ptr<cudf::column> alp_rd_compressed_representation::decompress(
+  decode_frame& frame) const
 {
   switch (original_type.id()) {
-    case cudf::type_id::FLOAT32: return alp_rd_decompress_impl<float>(*this, frame, output);
-    case cudf::type_id::FLOAT64: return alp_rd_decompress_impl<double>(*this, frame, output);
+    case cudf::type_id::FLOAT32: return alp_rd_decompress_impl<float>(*this, frame);
+    case cudf::type_id::FLOAT64: return alp_rd_decompress_impl<double>(*this, frame);
     default:
       throw std::runtime_error("alp_rd: only FLOAT32 / FLOAT64 are supported (got " +
                                type_id_to_name(original_type) + ")");

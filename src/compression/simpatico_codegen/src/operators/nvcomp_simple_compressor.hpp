@@ -53,24 +53,22 @@ inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compre
 }
 
 // Decompress a frame produced by nvcomp_compress_impl back to a fixed-width column.
-inline void nvcomp_decompress_impl(batched_codec_ops const& ops,
-                                   const void* compressed_data,
-                                   std::size_t compressed_size,
-                                   cudf::data_type orig_type,
-                                   cudf::size_type n_rows,
-                                   decode_frame& frame,
-                                   decode_column_slot output)
+inline std::unique_ptr<cudf::column> nvcomp_decompress_impl(batched_codec_ops const& ops,
+                                                            const void* compressed_data,
+                                                            std::size_t compressed_size,
+                                                            cudf::data_type orig_type,
+                                                            cudf::size_type n_rows,
+                                                            decode_frame& frame)
 {
-  auto const stream = frame.stream();
-  auto const mr     = frame.mr();
-  output.adopt(
-    cudf::make_fixed_width_column(orig_type, n_rows, cudf::mask_state::UNALLOCATED, stream, mr));
-  if (n_rows == 0 || compressed_data == nullptr || compressed_size == 0) { return; }
+  auto output = cudf::make_fixed_width_column(
+    orig_type, n_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr());
+  if (n_rows == 0 || compressed_data == nullptr || compressed_size == 0) { return output; }
 
   std::size_t const out_bytes =
     static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(cudf::size_of(orig_type));
   batched_decompress_bytes(
     ops, compressed_data, compressed_size, output->mutable_view().head<void>(), out_bytes, frame);
+  return output;
 }
 
 }  // namespace detail

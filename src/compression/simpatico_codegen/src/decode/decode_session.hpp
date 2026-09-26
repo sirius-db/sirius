@@ -4,52 +4,21 @@
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 
-#include <cudf/scalar/scalar.hpp>
-
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <functional>
-#include <list>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
 namespace simpatico {
-
-class decode_frame;
-class decode_session;
-
-/**
- * @brief A handle to a column owner reserved in a decode_frame.
- *
- * Adding other owners to the frame does not invalidate the handle.
- * The handle does not extend the frame's lifetime.
- */
-class decode_column_slot final {
- public:
-  /**
-   * @brief Transfer a column into an empty slot without allocating or waiting.
-   *
-   * Adopting into an occupied slot terminates the process.
-   */
-  void adopt(std::unique_ptr<cudf::column> column) const noexcept;
-  /**
-   * @brief Access the owned column without waiting for its data to be ready.
-   *
-   * @throw std::logic_error if the slot is empty
-   */
-  [[nodiscard]] cudf::column& get() const;
-  [[nodiscard]] cudf::column* operator->() const { return &get(); }
-  [[nodiscard]] cudf::column_view view() const { return get().view(); }
-  [[nodiscard]] explicit operator bool() const noexcept { return owner_ && *owner_; }
-
- private:
-  friend class decode_frame;
-  explicit decode_column_slot(std::unique_ptr<cudf::column>& owner) : owner_(&owner) {}
-  std::unique_ptr<cudf::column>* owner_;
-};
 
 struct mask_destination {
   std::uint32_t* words;  ///< Caller-owned device storage for selection bitmask.
@@ -60,7 +29,8 @@ struct mask_destination {
  * @brief The result of a column_decode_request is either a value_result or a predicate_result.
  *
  * A value_result represents a column of the requested type, optionally restored from a stored type.
- * A predicate_result represents a BOOL8 selection mask, optionally written into a caller-owned BITmask.
+ * A predicate_result represents a BOOL8 selection mask, optionally written into a caller-owned
+ * BITmask.
  */
 struct value_result {
   /// Restore this logical type without converting bytes when the fixed-width sizes match.
@@ -127,19 +97,20 @@ struct mask_decode_request {
 enum class mask_source_status { ACCEPTED, DECLINED };
 
 /**
- * @brief Hold temporary data for one decode request until its GPU work completes.
+ * @brief The context of one decode request: its stream, its memory resource, and the host state
+ * that its queued GPU work may still read.
  *
- * The decoder and codec helpers use the frame's stream and memory resource. Register owners before
- * queuing work that uses them. Adding owners does not invalidate existing slots or storage
- * references. All helpers run on the session's CPU thread.
+ * The frame owns no device memory. Decoders hold device temporaries in RAII owners allocated on
+ * stream() and let them release at scope end, even while work that reads them is still queued. This
+ * is safe because deallocation through a `device_async_resource_ref` is stream-ordered: the memory
+ * is reused only after earlier work on the same stream. A temporary must therefore never be read or
+ * written by work queued on another stream.
  *
- * If recording a column, buffer, representation, or scalar owner fails, the frame waits for its
- * stream before releasing that owner. Transferring an owner out of the frame does not wait for GPU
- * completion; its new owner must preserve its lifetime.
+ * Storage from host_array() and kernels passed to keep_kernel() stay valid until the owning
+ * decode_session has drained its streams. All calls run on the session's CPU thread.
  */
 class decode_frame final {
  public:
-  ~decode_frame();
   decode_frame(decode_frame const&)            = delete;
   decode_frame& operator=(decode_frame const&) = delete;
 
@@ -147,44 +118,11 @@ class decode_frame final {
   [[nodiscard]] rmm::device_async_resource_ref mr() const noexcept { return mr_; }
 
   /**
-   * @brief Reserve an empty column slot before creating or submitting work for the column.
-   */
-  decode_column_slot make_column();
-  decode_column_slot keep_column(std::unique_ptr<cudf::column> column);
-  /**
-   * @brief Find or reserve a column slot shared by plan steps using the same key.
-   */
-  decode_column_slot memo_column(std::uint64_t key);
-  [[nodiscard]] cudf::column* find_memo(std::uint64_t key) const;
-  /**
-   * @brief Check whether a key was registered, even if its column has since been released.
-   */
-  [[nodiscard]] bool contains_memo(std::uint64_t key) const;
-  void terminal_memo(std::uint64_t key) noexcept { terminal_memo_ = key; }
-  /**
-   * @brief Transfer ownership out of a slot, leaving it empty without waiting.
-   */
-  std::unique_ptr<cudf::column> release(decode_column_slot slot) noexcept;
-  std::unique_ptr<cudf::column> release_memo(std::uint64_t key);
-  decode_column_slot output() noexcept { return decode_column_slot{output_}; }
-
-  rmm::device_buffer& allocate_buffer(std::size_t bytes);
-  /**
-   * @brief Allocate final-output storage, excluded from the temporary-memory estimate.
-   */
-  rmm::device_buffer& allocate_output_buffer(std::size_t bytes);
-  rmm::device_buffer& keep_buffer(rmm::device_buffer buffer);
-  compressed_representation& keep_representation(std::unique_ptr<compressed_representation> rep);
-  cudf::scalar& keep_scalar(std::unique_ptr<cudf::scalar> scalar, std::size_t device_bytes);
-  /**
-   * @brief Keep a compiled kernel loaded until the session completes, even if its cache is cleared.
-   */
-  void keep_kernel(std::shared_ptr<codegen::jit::CompiledKernel const> kernel);
-
-  /**
-   * @brief Allocate host storage that stays valid while the request is pending.
+   * @brief Allocate host storage for the source of an asynchronous upload.
    *
-   * Storage is uninitialized; initialize every byte before reading or copying it to the device.
+   * An asynchronous copy from pageable memory may read its source after the call returns, so this
+   * storage stays valid until session completion. Storage is uninitialized; initialize every byte
+   * before reading or copying it to the device.
    *
    * @throw std::length_error if the requested byte count overflows
    */
@@ -200,61 +138,38 @@ class decode_frame final {
 
   /**
    * @brief Copy device bytes to host storage and wait for the frame's stream before returning.
+   *
+   * On failure, waits for the stream before rethrowing, so @p destination may be local storage.
    */
   void read_bytes(void* destination, void const* source, std::size_t bytes);
+
+  /**
+   * @brief Read one value from device memory with read_bytes(); @p source must be readable by work
+   * on the frame's stream.
+   */
   template <typename T>
     requires std::is_trivially_copyable_v<T>
   T read_scalar(T const* source)
   {
-    auto storage = host_array<T>(1);
-    read_bytes(storage.data(), source, sizeof(T));
-    return storage.front();
+    std::array<std::byte, sizeof(T)> bytes{};
+    read_bytes(bytes.data(), source, sizeof(T));
+    return std::bit_cast<T>(bytes);
   }
 
   /**
-   * @brief Estimate temporary device storage retained by this request.
-   *
-   * Counts buffer capacities, owned columns' `alloc_size()` (including representation-owned
-   * columns), and supplied scalar sizes. Excludes borrowed input, final output, hidden column
-   * capacity, and allocator overhead; this is not a physical-memory bound.
+   * @brief Keep a compiled kernel loaded until the session completes, even if its cache is cleared.
    */
-  [[nodiscard]] std::size_t retained_device_bytes() const;
-  [[nodiscard]] std::size_t retained_host_bytes() const noexcept;
-  std::unordered_map<std::uint64_t, std::size_t> remaining_consumers;
+  void keep_kernel(std::shared_ptr<codegen::jit::CompiledKernel const> kernel);
 
  private:
   friend class decode_session;
-  decode_frame(rmm::cuda_stream_view stream,
-               rmm::device_async_resource_ref mr,
-               decode_session& session);
+  decode_frame(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) noexcept;
   std::span<std::byte> host_bytes(std::size_t bytes);
   rmm::cuda_stream_view stream_;
   rmm::device_async_resource_ref mr_;
-  decode_session& session_;
-  std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> memo_;
-  std::optional<std::uint64_t> terminal_memo_;
-  std::list<std::unique_ptr<cudf::column>> columns_;
-  std::list<rmm::device_buffer> buffers_;
-  std::list<rmm::device_buffer> output_buffers_;
-  std::vector<std::unique_ptr<compressed_representation>> representations_;
-  std::vector<std::unique_ptr<cudf::scalar>> scalars_;
-  std::size_t scalar_bytes_ = 0;
-  struct host_upload {
-    std::unique_ptr<std::byte[]> bytes;
-    std::size_t capacity;
-  };
-  static_assert(std::is_nothrow_move_constructible_v<host_upload>);
-  std::vector<host_upload> uploads_;
-  std::unique_ptr<cudf::column> output_;
-};
-
-/** Diagnostic peaks of `decode_frame` retained-state estimates, not allocator high-water marks. */
-struct decode_session_stats {
-  std::size_t peak_frames                = 0;
-  std::size_t peak_retained_device_bytes = 0;
-  std::size_t peak_retained_host_bytes   = 0;
-  std::size_t retirement_stream_queries  = 0;
-  std::size_t pressure_waits             = 0;
+  std::vector<std::unique_ptr<std::byte[]>> uploads_;
+  // Dropping the final module handle can synchronize the CUDA context.
+  std::vector<std::shared_ptr<codegen::jit::CompiledKernel const>> kernels_;
 };
 
 /**
@@ -263,8 +178,9 @@ struct decode_session_stats {
  *
  * The decode_session has 3 main responsibilities:
  *  1. Submission: assign requests to the supplied CUDA streams and invoke the decoder (append()).
- *  2. Lifetime management: keep temporary buffers, request metadata, and pending outputs alive as
- * long as needed by the GPU.
+ *  2. Lifetime management: keep each request's copy, its decode_frame host state, and pending
+ * outputs alive until the streams drain. Device temporaries are released during append() in stream
+ * order.
  *  3. Completion: wait for all streams to finish and return the final outputs (finish())
  */
 class decode_session final {
@@ -278,12 +194,14 @@ class decode_session final {
    * returned columns.
    *
    * @param streams Nonempty list of borrowed streams, assigned to requests in rotation
-   * @param mr Borrowed resource for device allocations
+   * @param mr Borrowed resource for device allocations; it must honor the stream-ordered
+   * deallocation contract of `device_async_resource_ref` (a synchronous resource stays correct but
+   * synchronizes the device on every release, which is unsuitable for production and gated tests)
    */
   decode_session(std::span<rmm::cuda_stream_view const> streams, rmm::device_async_resource_ref mr);
   /**
-   * @brief Attempt to complete pending work before releasing owners; log cleanup errors without
-   * throwing.
+   * @brief Attempt to complete pending work before releasing results and host state; log cleanup
+   * errors without throwing.
    */
   ~decode_session() noexcept;
   decode_session(decode_session const&)            = delete;
@@ -294,10 +212,11 @@ class decode_session final {
   /**
    * @brief Copy a request and submit its decode work, retaining the result until finish().
    *
-   * May wait for required host readbacks or to release temporary storage. Such waits can include
-   * other work already queued on a supplied stream, so that work must not depend on a later call
-   * from this CPU thread. Submission failures attempt to complete pending work, close the session,
-   * and rethrow the original exception.
+   * Waits only on the request's own stream, for host readbacks the request needs and inside cuDF
+   * calls that synchronize it (such as constructing a predicate needle); it never waits to release
+   * memory. Such waits can include other work already queued on that stream, so that work must not
+   * depend on a later call from this CPU thread. Submission failures attempt to complete pending
+   * work, close the session, and rethrow the original exception.
    */
   void append(column_decode_request const& request);
   /**
@@ -318,34 +237,38 @@ class decode_session final {
    * @return Completed columns, excluding mask-only requests
    */
   std::vector<std::unique_ptr<cudf::column>> finish();
-  [[nodiscard]] decode_session_stats const& stats() const noexcept;
 
  private:
-  friend class decode_frame;
   friend struct decode_session_test_access;
   decode_frame& register_test_frame();
-  void allocation_checkpoint(std::size_t device_bytes, std::size_t host_bytes);
-  void keep_kernel(std::shared_ptr<codegen::jit::CompiledKernel const> kernel);
+  [[nodiscard]] std::size_t retained_host_uploads() const noexcept;
   struct impl;
   std::unique_ptr<impl> state_;
 };
 
-void decode_request(column_decode_request const& request, decode_frame& frame);
+/**
+ * @brief Decode one column request on the frame's stream.
+ *
+ * @return An owning column whose writes may still be pending on the frame's stream
+ */
+[[nodiscard]] std::unique_ptr<cudf::column> decode_request(column_decode_request const& request,
+                                                           decode_frame& frame);
 mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame);
-void decode_standalone(compressed_representation const& rep,
-                       decode_frame& frame,
-                       decode_column_slot output);
+[[nodiscard]] std::unique_ptr<cudf::column> decode_standalone(compressed_representation const& rep,
+                                                              decode_frame& frame);
 
 /**
- * @brief Rebuild a codec representation from decoded channels owned by the frame.
+ * @brief Rebuild a codec representation from channels decoded on the frame's stream.
  *
- * May transfer columns out of the supplied slots. The returned representation and any remaining
- * channel storage stay owned by the frame while GPU work is pending.
+ * Consumes @p channels. The result owns them and releases them on that stream, so it may be
+ * destroyed as soon as the work that decodes from it has been queued.
+ *
+ * @throw std::invalid_argument if the channel names, count, or types do not match the codec
  */
-compressed_representation& reconstruct_decode_representation(
+[[nodiscard]] std::unique_ptr<compressed_representation> reconstruct_decode_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
-  std::span<decode_column_slot const> outputs,
+  std::vector<std::unique_ptr<cudf::column>> channels,
   leaf_meta_v const& meta,
   decode_frame& frame);
 
