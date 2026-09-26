@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "transparent/replay_admission.hpp"
+
 // sirius
 #include "op/scan/owning_table_view.hpp"
 
@@ -82,6 +84,13 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       throw std::invalid_argument(
         "native split requires one certificate and dependency per row group");
     }
+    if (!scan_info->datasource) throw std::invalid_argument("native range requires a datasource");
+    for (auto const& dependency : scan_info->dependencies()) {
+      if (!dependency.datasource ||
+          &dependency.datasource->get_io_object() != &scan_info->datasource->get_io_object()) {
+        throw std::invalid_argument("native row-group dependency does not match its range");
+      }
+    }
 
     if (!_have_template) {
       _datasource    = scan_info->datasource;
@@ -119,7 +128,12 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       }
       _acc.push_back(std::move(rg));
       _certificates.push_back(scan_info->certificates()[certificate_position]);
-      _dependencies.push_back(scan_info->dependencies()[certificate_position]);
+      auto dependency = scan_info->dependencies()[certificate_position];
+      // The output split reads through the coalescer's datasource. Each range opened
+      // the same database file separately, so retain the physical proof while
+      // binding its dependency to the source that will actually be consumed.
+      dependency.datasource = _datasource;
+      _dependencies.push_back(std::move(dependency));
     }
     return emitted;
   }
@@ -293,7 +307,8 @@ void duckdb_native_gpu_ingestible::run_metadata_walk()
       }
     } catch (...) {
     }
-    throw std::runtime_error(
+    throw transparent::classified_execution_error(
+      transparent::late_failure_cause::checkpoint_revalidation,
       "duckdb-native checkpoint iteration changed during metadata preparation");
   }
   if (!bind.injections.synthetic_native_segment.empty()) {
@@ -461,7 +476,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
         }
       } catch (...) {
       }
-      throw std::runtime_error(
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::checkpoint_revalidation,
         "duckdb-native checkpoint iteration changed before metadata materialization");
     }
   }

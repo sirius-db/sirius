@@ -10,7 +10,7 @@ import shutil
 import fastavro
 import pyarrow.parquet as pq
 
-repo = Path.cwd()
+repo = Path(__file__).resolve().parents[4]
 source = repo / "test/cpp/integration/data/iceberg_v3_deletion_vector"
 out = Path(sys.argv[1]).resolve()
 

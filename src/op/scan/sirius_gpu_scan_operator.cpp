@@ -461,7 +461,8 @@ void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input) 
       }
     } else if (input.is_resident()) {
       if (input.resident_contract_id != _contract_id)
-        throw std::runtime_error("resident scan contract mismatch");
+        throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
+                                                      "resident scan contract mismatch");
       if (!input.resident_validation)
         throw certificate_incomplete(_contract_id, {}, "resident admission missing");
       if (_ingestible &&

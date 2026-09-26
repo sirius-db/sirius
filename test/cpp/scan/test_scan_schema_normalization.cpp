@@ -216,6 +216,14 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
 
 constexpr std::size_t kRows = 8;
 
+void admit_fixture_resident_input(sirius::op::scan::scan_operator_input& input)
+{
+  sirius::op::scan::pin_validation validation;
+  validation.identity = validation.layout = validation.structure = {true, true};
+  input.resident_contract_id                                     = 1;
+  input.resident_validation                                      = validation;
+}
+
 }  // namespace
 
 TEST_CASE("an ingestible cannot report survivors until it says so", "[scan][late_mat]")
@@ -261,6 +269,7 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
@@ -284,6 +293,7 @@ TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
@@ -307,6 +317,7 @@ TEST_CASE("scan execute restores a narrowed resident carrier to its native outpu
 
   sirius::op::scan::scan_operator_input input(batch);
   input.gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(input);
   REQUIRE(input.is_resident());
 
   auto output        = scan.execute(input, e.stream());
@@ -344,6 +355,7 @@ TEST_CASE("scan execute transactionally restores a fresh cached conversion",
                                                   /*contract_id=*/1};
 
   sirius::op::scan::scan_operator_input input(batch);
+  admit_fixture_resident_input(input);
   input.needs_carrier_conversion = true;
   input.prepare_for_processing(e.gpu_space, e.stream());
   REQUIRE(input.converted_table_steal_pending);

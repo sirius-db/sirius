@@ -244,7 +244,11 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->partition_values == file.partition_values);
   CHECK(split->disable_filter_pushdown == file.disable_filter_pushdown);
   CHECK(split->reader_options == file.reader_options);
-  REQUIRE_NOTHROW(validate_split_for_gpu(file.contract_id(), *split));
+  REQUIRE_NOTHROW(validate_split_for_gpu(
+    file.contract_id(),
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file),
+    {},
+    *split));
 }
 
 bound_read_view test_view()
@@ -350,6 +354,36 @@ TEST_CASE("Split certificates expose parallel dependencies and unevaluated eligi
   eligibility.contract_id = split.contract_id();
   CHECK(eligibility.verdict == eligibility_verdict::not_evaluated);
   CHECK(eligibility.evidence_scope == certificate_evidence_scope::none);
+}
+
+TEST_CASE("Certificate diagnostic reports retained checks and profiles without identity",
+          "[scan][certificate][diagnostic]")
+{
+  scan_info split;
+  auto profiles = std::make_shared<physical_profile_table>();
+  physical_profile profile;
+  profile.storage_version = 7;
+  profile.columns.push_back(
+    physical_column_profile{.type = 2, .data_codecs = 4, .validity_or_encodings = 8});
+  auto id = profiles->add(std::move(profile));
+  split_materializer_certificate certificate;
+  certificate.contract_id    = 41;
+  certificate.input_identity = "sensitive-source-path";
+  certificate.profile        = id;
+  certificate.validation =
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
+  split_dependencies dependency;
+  dependency.profiles = profiles;
+  split.set_contract_payload(41, {certificate}, {dependency});
+  auto text = format_split_certificates_for_dump(split);
+  CHECK(text.find("validation=segments_per_range,matrix_per_range") != std::string::npos);
+  CHECK(text.find("storage_version:7") != std::string::npos);
+  CHECK(text.find("data_codecs:4") != std::string::npos);
+  CHECK(text.find("sensitive-source-path") == std::string::npos);
+
+  certificate.profile = 0;
+  split.set_contract_payload(41, {certificate}, {dependency});
+  CHECK(format_split_certificates_for_dump(split).find("profile=missing") != std::string::npos);
 }
 
 TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certificate]")
@@ -575,7 +609,9 @@ TEST_CASE("Parquet split validation requires one matching certificate per slice"
   REQUIRE(split->rg_slices.size() == 2);
   REQUIRE(split->certificates().size() == 2);
   REQUIRE(split->dependencies().size() == 2);
-  REQUIRE_NOTHROW(validate_split_for_gpu(fixture.contract_id, *split));
+  auto const required =
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+  REQUIRE_NOTHROW(validate_split_for_gpu(fixture.contract_id, required, {}, *split));
 
   std::vector<split_materializer_certificate> certificates(split->certificates().begin(),
                                                            split->certificates().end());
@@ -596,7 +632,8 @@ TEST_CASE("Parquet split validation requires one matching certificate per slice"
   }
   split->set_contract_payload(
     fixture.contract_id, std::move(certificates), std::move(dependencies));
-  REQUIRE_THROWS_AS(validate_split_for_gpu(fixture.contract_id, *split), std::runtime_error);
+  REQUIRE_THROWS_AS(validate_split_for_gpu(fixture.contract_id, required, {}, *split),
+                    std::runtime_error);
 }
 
 TEST_CASE("Parquet certificates include physical-original file evidence after comparison",
@@ -805,7 +842,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   constexpr scan_contract_id contract_id = 61;
   native_database fixture;
   exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
-  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(300000)");
+  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(1000000)");
   exec_ok(*fixture.connection, "CHECKPOINT");
 
   auto info                    = native_info(fixture, contract_id);
@@ -814,10 +851,12 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
   auto coalescer               = ingestible->create_batch_coalescer();
   std::size_t input_slices     = 0;
+  std::size_t input_ranges     = 0;
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
     auto range = provider();
+    ++input_ranges;
     REQUIRE(range);
     auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
     REQUIRE(native_range);
@@ -836,6 +875,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   }
 
   REQUIRE(input_slices > 1);
+  REQUIRE(input_ranges > 1);
   REQUIRE(splits.size() > 1);
   std::size_t output_slices = 0;
   for (auto const& split : splits) {
@@ -940,7 +980,11 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   CHECK(empty->contract_id() == contract_id);
   CHECK(empty->certificates().empty());
   CHECK(empty->dependencies().empty());
-  CHECK_NOTHROW(validate_split_for_gpu(contract_id, *empty));
+  CHECK_NOTHROW(validate_split_for_gpu(
+    contract_id,
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range),
+    {},
+    *empty));
 }
 
 TEST_CASE("GPU scan construction requires an explicit contract",

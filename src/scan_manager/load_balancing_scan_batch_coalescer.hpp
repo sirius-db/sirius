@@ -187,11 +187,11 @@ class load_balancing_scan_batch_coalescer {
                                     bool row_filter_pending,
                                     op::scan::scan_contract_id expected,
                                     uint64_t query_token,
-                                    duckdb::SiriusContext* observer = nullptr,
-                                    bool invalidate_witness = false,
-                                    bool native_pin = false,
+                                    duckdb::SiriusContext* observer                   = nullptr,
+                                    bool invalidate_witness                           = false,
+                                    bool native_pin                                   = false,
                                     std::shared_ptr<readahead_scan_manager> readahead = nullptr,
-                                    std::size_t operator_id = 0);
+                                    std::size_t operator_id                           = 0);
 
   /// Spawn one sequencer task per slot on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when the

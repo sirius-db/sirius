@@ -16,11 +16,16 @@
 
 #pragma once
 
+#include "transparent/replay_admission.hpp"
+
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <future>
 #include <memory>
+#include <mutex>
 
 namespace sirius::pipeline {
 
@@ -58,12 +63,28 @@ class completion_handler {
    *
    * @param error The exception pointer to report.
    */
-  void report_error(std::exception_ptr error) noexcept
+  void report_error(
+    std::exception_ptr error,
+    transparent::late_failure_cause fallback = transparent::late_failure_cause::other) noexcept
   {
     bool expected = false;
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
-        _has_error.store(true);
+        {
+          std::lock_guard lock(failure_mutex_);
+          // Save only the terminal winner, before waking the query thread. Allocation failure
+          // in diagnostics must never prevent delivery of the original error.
+          try {
+            failure_ = transparent::classify_failure(error, fallback);
+          } catch (...) {
+            failure_.cause = fallback;
+          }
+        }
+        {
+          std::lock_guard lock(publication_mutex_);
+          _has_error.store(true);
+        }
+        published_changed_.notify_all();
         _promise.set_exception(error);
       } catch (...) {
         // Promise already satisfied or other error - ignore
@@ -81,14 +102,10 @@ class completion_handler {
    */
   void report_error(std::string_view error) noexcept
   {
-    bool expected = false;
-    if (_completed.compare_exchange_strong(expected, true)) {
-      try {
-        _has_error.store(true);
-        _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
-      } catch (...) {
-        // Promise already satisfied or other error - ignore
-      }
+    try {
+      report_error(std::make_exception_ptr(std::runtime_error(std::string(error))));
+    } catch (...) {
+      report_error(std::current_exception());
     }
   }
 
@@ -131,7 +148,50 @@ class completion_handler {
    */
   [[nodiscard]] bool has_error() const noexcept { return _has_error.load(); }
 
+  // Test rendezvous: publication, footer release, and terminal failure share one predicate lock.
+  void record_publication_for_testing()
+  {
+    std::lock_guard lock(publication_mutex_);
+    ++publications_;
+    published_changed_.notify_all();
+  }
+  bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock(publication_mutex_);
+    return published_changed_.wait_for(lock, timeout, [&] {
+      return publications_ > 0 || has_error();
+    }) && publications_ > 0;
+  }
+  void release_footer_for_testing(uint64_t file)
+  {
+    std::lock_guard lock(publication_mutex_);
+    released_footer_ = file;
+    published_changed_.notify_all();
+  }
+  void hold_footer_for_testing(uint64_t file)
+  {
+    std::unique_lock lock(publication_mutex_);
+    if (!published_changed_.wait_for(
+          lock, std::chrono::seconds(20), [&] { return released_footer_ == file || has_error(); }))
+      throw std::runtime_error("footer publication rendezvous timed out");
+  }
+  [[nodiscard]] transparent::failure_cause failure() const
+  {
+    std::lock_guard lock(failure_mutex_);
+    return failure_;
+  }
+  std::shared_ptr<op::scan::test_injections const> injections;
+  std::atomic<uint64_t> injected_oom_attempts{0};
+  std::atomic<uint64_t> injected_launch_attempts{0};
+  bool non_rollbackable_state = false;  // Latched by the query thread before task submission.
+
  private:
+  std::mutex publication_mutex_;
+  std::condition_variable published_changed_;
+  uint64_t publications_    = 0;
+  uint64_t released_footer_ = 0;
+  mutable std::mutex failure_mutex_;
+  transparent::failure_cause failure_;
   std::shared_ptr<std::atomic<uint64_t>> tasks_started_;
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};

@@ -11,6 +11,7 @@
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/sirius_httpfs.hpp"
+#include "io/sirius_datasource.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
@@ -43,8 +44,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -300,7 +303,7 @@ struct sirius_memory_limits {
 sirius_memory_limits large_sirius_memory_limits(std::string cache_mode)
 {
   sirius_memory_limits limits;
-  limits.gpu_usage     = "5 GiB";
+  limits.gpu_usage     = "3 GiB";
   limits.host_capacity = "8 GiB";
   limits.disk_capacity = "32 GiB";
   limits.cache_mode    = std::move(cache_mode);
@@ -1407,10 +1410,8 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
 }
 
-TEST_CASE(
-  "transparent S3 glob rejects parquet files whose schemas differ instead of decoding them "
-  "together",
-  "[s3][integration][sql][transparent][glob]")
+TEST_CASE("transparent S3 glob refuses semantic type drift before decoding",
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1445,6 +1446,7 @@ TEST_CASE(
   }
   REQUIRE(sirius::test::put_s3_test_object("schema-drift/b.parquet", bytes_b));
 
+  auto before = sirius::test::get_transparent_execution_stats(fixture.con);
   auto result =
     fixture.con.Query("SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "schema-drift/*.parquet"));
   REQUIRE(result);
@@ -1452,9 +1454,10 @@ TEST_CASE(
   REQUIRE(result->HasError());
   auto const error = result->GetError();
   CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
-  CHECK(error.find("All sources must have the same schema") != std::string::npos);
-  CHECK(error.find("schema-drift/a.parquet") != std::string::npos);
-  CHECK(error.find("schema-drift/b.parquet") != std::string::npos);
+  CHECK(error.find("Parquet column 'x' has unqualified type drift") != std::string::npos);
+  auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+  CHECK(after.parquet_type_refusals == before.parquet_type_refusals + 1);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
 }
 
 TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",
@@ -3345,4 +3348,191 @@ TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(after.scan_lowerings == before.scan_lowerings);
   CHECK(after.window_tasks_started == before.window_tasks_started);
+}
+
+TEST_CASE("S3 late physical refusal follows a published GPU batch and never replays",
+          "[s3][integration][transparent][late_failure]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
+  sirius::test::scratch_dir directory("s3_late_physical");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT i::INTEGER x FROM range(4096) t(i)) TO " +
+                     directory.file_literal("a.parquet") +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  require_query_ok(fixture.con,
+                   "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
+                     directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    if (!sirius::test::put_s3_container_object(std::string("r2a-late/") + file,
+                                               read_binary_file(directory.path() / file))) {
+      SUCCEED("managed MinIO is required to upload the late-failure fixture");
+      return;
+    }
+  }
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET scan_task_batch_size=1");
+  require_query_ok(fixture.con, "SET sirius_test_hold_footer_index=2");
+  auto& context = require_sirius_context(fixture);
+  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "r2a-late/*.parquet");
+  // The explicit SQL rewriter accepts a single S3 URI, not a glob. The view
+  // preserves this same two-file bound scan without rewriting the glob as an object key.
+  require_query_ok(fixture.con,
+                   "CREATE VIEW late_s3_input AS SELECT * FROM " +
+                     s3_parquet_glob_scan(*env, "r2a-late/*.parquet"));
+  for (bool explicit_entry : {false, true}) {
+    auto before = context.get_transparent_execution_stats();
+    std::promise<void> footer_started;
+    auto started = footer_started.get_future();
+    std::atomic<bool> notified{false};
+    auto counters                       = context.physical_counters();
+    counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+      if (footer && !notified.exchange(true)) footer_started.set_value();
+    };
+    auto pending   = std::async(std::launch::async, [&] {
+      return fixture.con.Query(
+        explicit_entry ? "CALL gpu_execution('SELECT sum(x) FROM late_s3_input')" : sql);
+    });
+    auto ready     = started.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+    auto published = ready && context.get_scan_manager().wait_for_publication_for_testing(
+                                std::chrono::seconds(20));
+    context.get_scan_manager().release_footer_hold_for_testing(2);
+    auto result                         = pending.get();
+    counters->parquet_phase_for_testing = {};
+    INFO("explicit=" << explicit_entry);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE(ready);
+    REQUIRE(published);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    auto after = context.get_transparent_execution_stats();
+    auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::physical_input);
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+    CHECK(after.late_replays == before.late_replays);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    std::vector<sirius::op::scan::scan_publication_observation> observations;
+    for (auto const& [query, observation] : after.publications_by_query) {
+      if (!before.publications_by_query.contains(query)) observations.push_back(observation);
+    }
+    REQUIRE(observations.size() == 1);
+    auto const& registrations = observations.front().readahead_registrations;
+    CHECK(registrations.contains(s3_uri(env->bucket, "r2a-late/a.parquet")));
+    CHECK_FALSE(registrations.contains(s3_uri(env->bucket, "r2a-late/b.parquet")));
+  }
+}
+
+TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated reads",
+          "[s3][integration][sql][transparent][glob][d7]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  auto limits = large_sirius_memory_limits("sirius");
+  bool bulk   = true;
+  SECTION("REST bulk") {}
+  SECTION("kvikIO general")
+  {
+    limits.backend    = sirius::scan_manager::io_backend::kvikio;
+    limits.cache_mode = "none";
+    bulk              = false;
+  }
+  s3_sql_fixture fixture(*env, limits);
+  sirius::test::scratch_dir directory("s3_d7_mixed");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(
+    fixture.con,
+    "COPY (SELECT 10::INTEGER x) TO " + directory.file_literal("a.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(
+    fixture.con,
+    "COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    REQUIRE(sirius::test::put_s3_container_object(std::string("r2a-d7/") + file,
+                                                  read_binary_file(directory.path() / file)));
+  }
+  auto local = require_query_ok(
+    fixture.con, "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
+  auto expected = collect_rows(*local);
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(expected.size() == 2);
+  CHECK(expected[0][0] == "10");
+  CHECK(expected[1][0] == "20");
+  set_gpu_execution(fixture.con, true);
+  auto local_query = "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")";
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = require_query_ok(fixture.con, local_query);
+    auto rows   = collect_rows(*result);
+    std::sort(rows.begin(), rows.end());
+    CHECK(rows == expected);
+    CHECK(result->types == local->types);
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+    CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+  }
+  auto& manager     = require_sirius_context(fixture).get_scan_manager();
+  auto local_source = manager.create_datasource((directory.path() / "a.parquet").string());
+  REQUIRE(local_source);
+  CHECK_FALSE(local_source->prefers_bulk_io());
+  if (bulk) {
+    require_query_ok(fixture.con,
+                     "CALL pin_table(" + directory.file_literal("*.parquet") +
+                       ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto pinned       = require_query_ok(
+      fixture.con, "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
+    auto pinned_rows = collect_rows(*pinned);
+    std::sort(pinned_rows.begin(), pinned_rows.end());
+    CHECK(pinned_rows == expected);
+    CHECK(pinned->types == local->types);
+    auto local_after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(local_after.successful_rebinds == local_before.successful_rebinds + 1);
+    CHECK(local_after.executions == local_before.executions + 1);
+    CHECK(local_after.runtime_fallbacks == local_before.runtime_fallbacks);
+    CHECK(local_after.split_physical_rejections == local_before.split_physical_rejections);
+  }
+  auto query    = "SELECT x FROM " + s3_parquet_glob_scan(*env, "r2a-d7/*.parquet");
+  auto counters = require_sirius_context(fixture).physical_counters();
+  std::mutex hits_mutex;
+  std::map<std::string, int> hits;
+  counters->parquet_metadata_for_testing = [&](std::string const& file, bool hit) {
+    if (hit) {
+      std::lock_guard lock(hits_mutex);
+      ++hits[file];
+    }
+  };
+  struct reset_metadata_hook {
+    std::shared_ptr<sirius::op::scan::physical_check_counters> counters;
+    ~reset_metadata_hook() { counters->parquet_metadata_for_testing = {}; }
+  } reset_hook{counters};
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    {
+      std::lock_guard lock(hits_mutex);
+      hits.clear();
+    }
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = require_query_ok(fixture.con, query);
+    auto rows   = collect_rows(*result);
+    std::sort(rows.begin(), rows.end());
+    CHECK(rows == expected);
+    CHECK(result->types == local->types);
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+    CHECK(after.executions == before.executions + 1);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+    CHECK(after.budget_exceeded == before.budget_exceeded);
+    for (auto file : {"a.parquet", "b.parquet"}) {
+      auto uri    = s3_uri(env->bucket, std::string("r2a-d7/") + file);
+      auto source = manager.create_datasource(uri);
+      REQUIRE(source);
+      CHECK(source->prefers_bulk_io() == bulk);
+      if (bulk) CHECK(source->metadata() != nullptr);
+      if (attempt == 1 && bulk) {
+        std::lock_guard lock(hits_mutex);
+        CHECK(hits[uri] > 0);
+      }
+    }
+  }
 }

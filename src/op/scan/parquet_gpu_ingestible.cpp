@@ -337,12 +337,14 @@ class parquet_batch_coalescer : public batch_coalescer {
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
                           std::shared_ptr<scan_plan const> plan,
-                          scan_contract_id contract_id)
+                          scan_contract_id contract_id,
+                          std::shared_ptr<physical_check_counters> counters)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
       _needs_assembly(needs_output_assembly(*_plan)),
-      _contract_id(contract_id)
+      _contract_id(contract_id),
+      _counters(std::move(counters))
   {
   }
 
@@ -379,10 +381,19 @@ class parquet_batch_coalescer : public batch_coalescer {
         std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
-    if (!_slices.empty() && (_partition_values != file->partition_values ||
+    bool const schema_changed =
+      !file->row_groups.empty() && !_slices.empty() &&
+      (_run_original_schema != file->original_schema || _run_arrow_schema != file->arrow_schema);
+    if (!_slices.empty() && (schema_changed || _partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown ||
                              _run_reader_options != file->reader_options)) {
       emitted.push_back(emit_current());
+      if (schema_changed && _counters)
+        _counters->split_flushed_for_schema.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!file->row_groups.empty()) {
+      _run_original_schema = file->original_schema;
+      _run_arrow_schema    = file->arrow_schema;
     }
     _run_reader_options = file->reader_options;
     _partition_values   = file->partition_values;
@@ -517,6 +528,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
   const scan_contract_id _contract_id;
+  std::shared_ptr<physical_check_counters> _counters;
+  std::vector<uint8_t> _run_original_schema;
+  std::string _run_arrow_schema;
 
   std::vector<row_group_slice> _slices;
   std::vector<split_materializer_certificate> _certificates;
@@ -845,8 +859,11 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan, _info->contract_id);
+  return std::make_unique<parquet_batch_coalescer>(_info->approximate_batch_size,
+                                                   _reader_options,
+                                                   _plan,
+                                                   _info->contract_id,
+                                                   _info->profiles->counters);
 }
 
 //===----------------------------------------------------------------------===//
@@ -872,7 +889,16 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
   return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, idx, io_ctx);
+    try {
+      return build_file_scan_info(file_path, idx, io_ctx);
+    } catch (unsupported_physical_input const&) {
+      throw;
+    } catch (transparent::classified_execution_error const&) {
+      throw;
+    } catch (std::exception const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    }
   };
 }
 
@@ -882,6 +908,10 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
 {
+  if (_execution_completion && _execution_completion->injections &&
+      _execution_completion->injections->hold_footer_index == file_index + 1) {
+    _execution_completion->hold_footer_for_testing(file_index + 1);
+  }
   auto stream = cudf::get_default_stream();
   if (_info->profiles->counters) _info->profiles->counters->parquet_phase(file_path, true);
 
@@ -913,42 +943,26 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   parquet_encryption_evidence encryption;
+  std::shared_ptr<parquet_metadata> resolved_metadata;
   std::size_t footer_len = 0;
-  if (sirius_ds) {
-    if (auto cached = sirius_ds->metadata()) {
-      if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
-        file_metadata = pm->file_metadata();
-        encryption    = pm->encryption_evidence;
-        footer_len    = pm->footer_byte_len();
-      }
-    }
-  }
   try {
-    if (!file_metadata) {
-      auto footer = [&] {
-        try {
-          return fetch_plaintext_parquet_footer(*sirius_ds, _info->contract_id, file_path);
-        } catch (unsupported_physical_input const& error) {
-          if (_info->profiles->counters && !_info->physical_schema)
-            _info->profiles->counters->record(error.reason);
-          throw;
-        }
-      }();
-      encryption = inspect_parquet_encryption({footer->data(), footer->size()});
-      footer_len = footer->size();
-      // The carrier projection is only known to match this file after the footer
-      // is parsed, so the parse itself runs without a column selection.
-      hybrid_scan_reader footer_reader(
-        cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-        _plan->carrier_batch_index ? *_natural_reader_options : opts);
-      file_metadata =
-        std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
-      // Park the parse in the ioctx metadata store so a later scan of the same
-      // file skips the footer fetch + Thrift parse (the read above already
-      // dereferences *sirius_ds, so it is non-null here). Best-effort.
-      [[maybe_unused]] auto const stored = sirius_ds->store_metadata(
-        std::make_shared<parquet_metadata>(file_metadata, footer_len, encryption));
-    }
+    // The carrier projection is only known to match after parsing this footer.
+    bool cache_hit = false;
+    resolved_metadata =
+      resolve_parquet_metadata(*sirius_ds,
+                               _info->contract_id,
+                               file_path,
+                               _plan->carrier_batch_index ? *_natural_reader_options : opts,
+                               &cache_hit);
+    if (_info->profiles->counters)
+      _info->profiles->counters->parquet_metadata(file_path, cache_hit);
+    file_metadata = resolved_metadata->file_metadata();
+    encryption    = resolved_metadata->encryption_evidence;
+    footer_len    = resolved_metadata->footer_byte_len();
+  } catch (unsupported_physical_input const& error) {
+    if (_info->profiles->counters && !_info->physical_schema)
+      _info->profiles->counters->record(error.reason);
+    throw;
   } catch (std::exception const& error) {
     if (_info->physical_schema && !_info->physical_schema->fields.empty()) {
       if (_info->profiles->counters)
@@ -962,7 +976,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
           std::string(error.what()) +
           "), so the files could not be proven to carry the table's current schema");
     }
-      throw;
+    throw;
   }
   // Mutate a private descriptor, never the published metadata store or file.
   if (!_info->injections.synthetic_parquet_codec.empty()) {
@@ -1410,6 +1424,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 
   auto out                     = std::make_unique<parquet_file_scan_info>();
   out->file_metadata           = file_metadata;
+  out->original_schema         = resolved_metadata->original_schema;
+  out->arrow_schema            = resolved_metadata->arrow_schema;
   out->file_path               = file_path;
   out->file_index              = file_index;
   out->datasource              = std::move(sirius_ds);
@@ -1685,6 +1701,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                      stream,
                                      mr_ref);
     }
+    if (!all_slices_pruned && _info->profiles->counters)
+      for (auto const& slice : split.rg_slices)
+        _info->profiles->counters->parquet_phase(slice.file_path, false);
   }
 
   // Hive-partition scans assemble inline here: partition_values are per-split

@@ -600,6 +600,9 @@ void run_s3mix_scenario(std::string const& scenario)
     CHECK(after.successful_rebinds == before.successful_rebinds + 1);
     CHECK(after.fallbacks == before.fallbacks);
     CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+    auto const cause = static_cast<size_t>(sirius::transparent::late_failure_cause::reader_io);
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+    CHECK(after.late_replays[cause] == before.late_replays[cause] + 1);
     bool footer_failure = false;
     for (auto const& record : logs.records()) {
       if (record.message.find("Transparent GPU execution error:") != std::string::npos) {

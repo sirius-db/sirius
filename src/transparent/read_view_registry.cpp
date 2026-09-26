@@ -22,12 +22,15 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "transparent/replay_admission.hpp"
 
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -460,6 +463,26 @@ void read_view_registry::record_verdict(op::scan::scan_contract_id id,
   certificate.semantic_columns = result.semantic_columns;
 }
 
+bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
+                                                planner::lookup_decline decline)
+{
+  using L  = planner::lookup_decline;
+  using R  = op::scan::verdict_reason;
+  R reason = R::none;
+  switch (decline) {
+    case L::unknown_function: reason = R::unknown_function; break;
+    case L::bind_data_mismatch: reason = R::bind_data_mismatch; break;
+    case L::catalog_entry_missing: reason = R::catalog_entry_missing; break;
+    case L::no_trusted_reference: reason = R::no_trusted_reference; break;
+    case L::callback_mismatch: reason = R::callback_mismatch; break;
+    case L::none: return false;
+  }
+  return declined_lookups_
+    .emplace(get.table_index,
+             declined_lookup_record{op::scan::eligibility_verdict::unsupported, reason})
+    .second;
+}
+
 op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
   op::sirius_physical_table_scan const& scan, planner::connector const& connector)
 {
@@ -623,6 +646,54 @@ bound_table_scan const& contract_of(transparent::read_view_registry const& regis
   return registry.entry(contract_id).contract;
 }
 
+std::string format_split_certificates_for_dump(scan_info const& split)
+{
+  static constexpr char const* checks[] = {"footer_per_file",
+                                           "profile_per_file",
+                                           "schema_per_file",
+                                           "segments_per_range",
+                                           "matrix_per_range",
+                                           "host_staged",
+                                           "key_held"};
+  auto const certificates               = split.certificates();
+  auto const dependencies               = split.dependencies();
+  std::ostringstream out;
+  if (certificates.empty()) return "certificates=none";
+  for (std::size_t index = 0; index < certificates.size(); ++index) {
+    auto const& certificate = certificates[index];
+    if (index) out << '\n';
+    out << "certificate[" << index << "] validation=";
+    bool any = false;
+    for (std::size_t bit = 0; bit < std::size(checks); ++bit) {
+      if (!certificate.validation.test(bit)) continue;
+      if (any) out << ',';
+      out << checks[bit];
+      any = true;
+    }
+    if (!any) out << "none";
+    out << " profile=";
+    if (index >= dependencies.size() || !dependencies[index].profiles ||
+        !dependencies[index].profiles->contains(certificate.profile)) {
+      out << "missing";
+      continue;
+    }
+    auto profile = dependencies[index].profiles->get(certificate.profile);
+    out << "storage_version:" << profile.storage_version << " columns:[";
+    for (std::size_t column = 0; column < profile.columns.size(); ++column) {
+      if (column) out << ',';
+      auto const& value = profile.columns[column];
+      out << "{type:" << value.type << " data_codecs:" << value.data_codecs
+          << " validity_or_encodings:" << value.validity_or_encodings
+          << " type_mismatch:" << value.type_mismatch
+          << " logical_annotation:" << value.logical_annotation
+          << " converted_annotation:" << value.converted_annotation << " scale:" << value.scale
+          << " precision:" << value.precision << '}';
+    }
+    out << ']';
+  }
+  return out.str();
+}
+
 void validate_split_for_gpu(scan_contract_id expected,
                             later_check_set const& required,
                             std::optional<key_held_witness> const& expected_key,
@@ -630,14 +701,17 @@ void validate_split_for_gpu(scan_contract_id expected,
 {
   // Preserve R1's handle mismatch and its precedence.
   if (split.contract_id() != expected) {
-    throw std::runtime_error("scan split contract mismatch: expected " + std::to_string(expected) +
-                             ", got " + std::to_string(split.contract_id()));
+    throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
+                                                  "scan split contract mismatch: expected " +
+                                                    std::to_string(expected) + ", got " +
+                                                    std::to_string(split.contract_id()));
   }
   for (auto const& certificate : split.certificates()) {
     if (certificate.contract_id != expected) {
-      throw std::runtime_error("scan split certificate contract mismatch: expected " +
-                               std::to_string(expected) + ", got " +
-                               std::to_string(certificate.contract_id));
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::certificate,
+        "scan split certificate contract mismatch: expected " + std::to_string(expected) +
+          ", got " + std::to_string(certificate.contract_id));
     }
   }
   auto fail = [&](std::string text, later_check_set missing = {}) {

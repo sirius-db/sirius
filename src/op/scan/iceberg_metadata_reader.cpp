@@ -188,6 +188,28 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // The materialized five-column result coexists with the node-owned classification state.
   uint64_t bytes = sizeof(iceberg_delete_inventory) + meta_result->Collection().AllocationSize();
   uint64_t peak_bytes = bytes;
+  // A refused equality-delete table needs only the count. Scan the already
+  // materialized content column before copying long data-file paths into the
+  // inventory; admitted tables still build the full inventory below.
+  duckdb::ColumnDataScanState count_scan;
+  duckdb::DataChunk content_chunk;
+  auto& collection = meta_result->Collection();
+  collection.InitializeScan(count_scan, std::vector<duckdb::column_t>{0});
+  collection.InitializeScanChunk(count_scan, content_chunk);
+  while (collection.Scan(count_scan, content_chunk)) {
+    for (duckdb::idx_t i = 0; i < content_chunk.size(); ++i) {
+      if (content_chunk.GetValue(0, i).ToString() == "EQUALITY_DELETES") ++result.equality_count;
+    }
+  }
+  if (result.equality_count) {
+    if (counters) {
+      auto peak = counters->iceberg_inventory_bytes_peak.load();
+      while (peak < peak_bytes &&
+             !counters->iceberg_inventory_bytes_peak.compare_exchange_weak(peak, peak_bytes)) {}
+    }
+    result.inventory.reset();
+    return result;
+  }
   while (auto chunk = meta_result->Fetch()) {
     if (chunk->size() == 0) break;
     for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
@@ -196,7 +218,6 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
                                           chunk->GetValue(2, i).GetValue<int64_t>(),
                                           chunk->GetValue(3, i).ToString(),
                                           chunk->GetValue(4, i).ToString()};
-      if (row.content == "EQUALITY_DELETES") ++result.equality_count;
       bytes += row.content.capacity() + row.file_path.capacity() + row.file_format.capacity() +
                row.manifest_path.capacity() + 4;
       auto old_capacity = result.inventory->entries.capacity();
@@ -213,7 +234,6 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
     while (peak < peak_bytes &&
            !counters->iceberg_inventory_bytes_peak.compare_exchange_weak(peak, peak_bytes)) {}
   }
-  if (result.equality_count) result.inventory.reset();
   return result;
 }
 
