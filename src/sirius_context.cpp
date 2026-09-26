@@ -1404,6 +1404,14 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     snapshot.parquet_reader_calls = physical_counters_->parquet_reader_calls;
     snapshot.native_decoder_calls = physical_counters_->native_decoder_calls;
   }
+  snapshot.iceberg_manifest_walks =
+    physical_counters_->iceberg_manifest_walks.load(std::memory_order_relaxed);
+  snapshot.iceberg_dv_manifest_reads =
+    physical_counters_->iceberg_dv_manifest_reads.load(std::memory_order_relaxed);
+  snapshot.iceberg_delete_payload_loads =
+    physical_counters_->iceberg_delete_payload_loads.load(std::memory_order_relaxed);
+  snapshot.iceberg_inventory_bytes_peak =
+    physical_counters_->iceberg_inventory_bytes_peak.load(std::memory_order_relaxed);
   snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
   snapshot.parquet_type_mismatch_observed =
     physical_counters_->type_mismatches.load(std::memory_order_relaxed);

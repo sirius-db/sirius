@@ -292,6 +292,20 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   return info;
 }
 
+void collect_iceberg_schema(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
+                            sirius::op::scan::iceberg_table_schema& schema)
+{
+  for (auto const& column : columns) {
+    if (!column.identifier.IsNull() &&
+        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
+      schema.fields.push_back({column.name,
+                               column.identifier.GetValue<int32_t>(),
+                               column.children.empty() ? column.type.ToString() : std::string{}});
+    }
+    collect_iceberg_schema(column.children, schema);
+  }
+}
+
 //! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
 //! data, resolved here at plan time.
 //!
@@ -306,6 +320,13 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
 {
   auto info = std::make_unique<sirius::op::scan::iceberg_ingestible_table_info>();
   populate_parquet_table_info(*info, scan_op, op_params);
+  if (auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get())) {
+    sirius::op::scan::iceberg_table_schema schema;
+    collect_iceberg_schema(
+      bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema, schema);
+    if (!schema.fields.empty() && !info->file_paths().empty())
+      info->physical_schema = std::move(schema);
+  }
 
   if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
     throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
@@ -337,8 +358,15 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   // the query being planned. Same guard the delete gate uses.
   duckdb::SiriusContext::InternalQueryGuard guard(context);
   auto const delete_started = std::chrono::steady_clock::now();
-  info->delete_data         = sirius::op::scan::read_iceberg_delete_data(
-    context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id);
+  if (!scan_op.delete_inventory) {
+    throw duckdb::InternalException("iceberg_scan reached lowering without its delete inventory");
+  }
+  auto inventory = std::move(*scan_op.delete_inventory);
+  scan_op.delete_inventory.reset();
+  auto discovery =
+    sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
+  info->delete_data = sirius::op::scan::load_delete_payload(
+    context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();
@@ -1732,6 +1760,9 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       first_message = contract_provenance.first_pre_decline->second;
     throw op::scan::scan_verdict_declined(std::move(first_message), std::move(declined));
   }
+  if (sirius_ctx && sirius_ctx->physical_counters()->track_units &&
+      sirius_ctx->physical_counters()->after_certify_for_testing)
+    sirius_ctx->physical_counters()->after_certify_for_testing();
   if (contract_provenance.injections.pause_after_certify_ms)
     std::this_thread::sleep_for(
       std::chrono::milliseconds{contract_provenance.injections.pause_after_certify_ms});

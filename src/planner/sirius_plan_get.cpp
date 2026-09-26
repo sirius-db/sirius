@@ -43,6 +43,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/iceberg_metadata_connection.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
@@ -129,208 +130,6 @@ std::optional<std::string> iceberg_retired_field_id_decline_reason(duckdb::Logic
          "read a dropped column's data in place of the re-added one";
 }
 
-std::string escape_sql_literal(std::string const& s)
-{
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c == '\'') { out += '\''; }
-    out += c;
-  }
-  return out;
-}
-
-/// Type is empty for a nested container: parquet_schema() reports NULL there.
-using iceberg_field_key = std::pair<std::string, int32_t>;
-using iceberg_field_map = std::map<iceberg_field_key, std::string>;
-
-/// Descends into children so nested fields count toward the schema each file must match.
-///
-/// @p order receives the same ids in recursive PREORDER — the walk order is load-bearing, because
-/// it is what a file's physical layout is compared against.
-void collect_field_id_names(std::vector<duckdb::MultiFileColumnDefinition> const& columns,
-                            iceberg_field_map& out,
-                            std::vector<int32_t>& order)
-{
-  for (auto const& column : columns) {
-    if (!column.identifier.IsNull() &&
-        column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER) {
-      auto const id = column.identifier.GetValue<int32_t>();
-      out.emplace(iceberg_field_key{column.name, id},
-                  column.children.empty() ? column.type.ToString() : std::string{});
-      order.push_back(id);
-    }
-    collect_field_id_names(column.children, out, order);
-  }
-}
-
-/**
- * @brief Refuse tables whose data files do not all carry the table's current (name, field id,
- *        type) schema, in the same physical ORDER.
- *
- * The scan resolves columns by NAME and emits them in the FILE's order, so every evolution
- * mis-reads: rename and add throw at SCAN time, which takes the runtime fallback and deadlocks the
- * connection; promotion (int -> long) throws nothing and returns the file's narrower type; and a
- * permutation returns the right columns under the wrong names. Over-declining is the intended
- * bias, and a valid-but-declined Iceberg layout is read correctly by DuckDB.
- *
- * Replaced wholesale once columns resolve by field id (DuckDB's MultiFileColumnMapper).
- *
- * @warning Reads every data file's Parquet footer on the planning thread. Fold into the footer
- *          cache the scan needs anyway rather than leaving two passes.
- */
-std::optional<pre_decline> iceberg_schema_evolution_decline_reason(
-  duckdb::LogicalGet& op, duckdb::SiriusContext::internal_connection& conn)
-{
-  auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
-  if (bind_data == nullptr) { return std::nullopt; }
-
-  iceberg_field_map table_schema;
-  std::vector<int32_t> table_field_order;
-  collect_field_id_names(
-    bind_data->reader_bind.schema.empty() ? bind_data->columns : bind_data->reader_bind.schema,
-    table_schema,
-    table_field_order);
-  // No field ids at all means a name-mapped table, which is what this path already assumes.
-  if (table_schema.empty()) { return std::nullopt; }
-
-  auto const files =
-    resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
-  if (files.empty()) { return std::nullopt; }
-
-  // Apache writers record URIs in manifests, so these paths can arrive as `file:///...`. Strip
-  // the scheme for the same reason the datasource boundary does: an unstripped path makes this
-  // probe fail, and a failing probe declines -- which would quietly send every Apache-written
-  // table to the CPU and undo the file:// fix this branch already landed.
-  std::vector<std::string> probe_paths;
-  probe_paths.reserve(files.size());
-  std::string file_list = "[";
-  for (std::size_t i = 0; i < files.size(); ++i) {
-    probe_paths.push_back(sirius::io::strip_file_scheme(files[i]));
-    if (i > 0) { file_list += ','; }
-    file_list += "'" + escape_sql_literal(probe_paths.back()) + "'";
-  }
-  file_list += "]";
-
-  // Do NOT filter `field_id IS NOT NULL` here: that drops every row of a file that has no ids,
-  // and a file with no rows is indistinguishable from one that was never probed.
-  // column_id is the row's index into the Parquet footer's flattened schema, i.e. its position in
-  // the file's own recursive preorder. It is how physical ORDER is compared, which membership in a
-  // (name, field id) map cannot see.
-  auto result =
-    conn.Query("SELECT file_name, name, field_id, duckdb_type, column_id FROM parquet_schema(" +
-               file_list + ")");
-  if (!result || result->HasError()) {
-    return iceberg_decline(
-      scan_reason::iceberg_schema_footers_unreadable,
-      "the iceberg schema probe could not read this table's data-file footers (" +
-        std::string(result ? result->GetError() : "null result") +
-        "), so the files could not be proven to carry the table's current schema");
-  }
-
-  struct file_footer {
-    iceberg_field_map schema;
-    /// (column_id, field_id) for every ID-bearing footer row, sorted into physical order below.
-    std::vector<std::pair<int64_t, int32_t>> id_order;
-  };
-  std::map<std::string, file_footer> per_file;
-  while (true) {
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) { break; }
-    for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
-      auto& footer  = per_file[chunk->GetValue(0, i).ToString()];
-      auto const id = chunk->GetValue(2, i);
-      // A row with no field id is either the schema root or a synthetic nesting level (a 3-level
-      // list's `list` group, a map's `key_value`); neither is a field the table declares.
-      if (id.IsNull()) { continue; }
-      auto const type     = chunk->GetValue(3, i);
-      auto const field_id = static_cast<int32_t>(id.GetValue<int64_t>());
-      footer.schema.emplace(iceberg_field_key{chunk->GetValue(1, i).ToString(), field_id},
-                            type.IsNull() ? std::string{} : type.ToString());
-      auto const column_id = chunk->GetValue(4, i);
-      footer.id_order.emplace_back(column_id.IsNull() ? 0 : column_id.GetValue<int64_t>(),
-                                   field_id);
-    }
-  }
-
-  for (auto const& path : probe_paths) {
-    auto const it = per_file.find(path);
-    if (it == per_file.end()) {
-      return iceberg_decline(
-        scan_reason::iceberg_schema_no_rows,
-        "iceberg_scan data file '" + path +
-          "' returned no Parquet schema rows, so it could not be proven to carry the table's "
-          "current schema");
-    }
-    auto const& file_schema = it->second.schema;
-    if (file_schema.empty()) {
-      return iceberg_decline(
-        scan_reason::iceberg_schema_no_field_ids,
-        "iceberg_scan data file '" + path +
-          "' carries no Parquet field ids while the table's schema declares them, so it is "
-          "name-mapped; this scan path resolves columns by name and would read the wrong "
-          "column or fail at scan time");
-    }
-
-    for (auto const& [key, table_type] : table_schema) {
-      auto const found = file_schema.find(key);
-      if (found == file_schema.end()) {
-        return iceberg_decline(
-          scan_reason::iceberg_schema_missing_field,
-          "iceberg_scan data file '" + path +
-            "' does not carry the table's current schema (no match for " + key.first + "#" +
-            std::to_string(key.second) +
-            "), so the table's schema has evolved; this scan path resolves columns by name and "
-            "would read the wrong column or fail at scan time");
-      }
-      // Empty on either side is a nested container, whose type is implied by its children.
-      if (!table_type.empty() && !found->second.empty() && found->second != table_type) {
-        return iceberg_decline(
-          scan_reason::iceberg_schema_promoted_type,
-          "iceberg_scan data file '" + path + "' stores " + key.first + "#" +
-            std::to_string(key.second) + " as " + found->second + " while the table declares " +
-            table_type +
-            ", so the column's type was promoted; this scan path reads the file's own physical "
-            "type and would hand back a column of the wrong type");
-      }
-    }
-    // Extra fields are dropped columns, which a name-based lookup would happily resolve to.
-    if (file_schema.size() != table_schema.size()) {
-      return iceberg_decline(
-        scan_reason::iceberg_schema_field_count,
-        "iceberg_scan data file '" + path + "' carries " + std::to_string(file_schema.size()) +
-          " field ids where the table declares " + std::to_string(table_schema.size()) +
-          ", so the table's schema has evolved; this scan path resolves columns by name and "
-          "would read the wrong column or fail at scan time");
-    }
-
-    // Everything above is MEMBERSHIP, which a permuted file satisfies. Order matters because the
-    // GPU path does not map columns by field id: for a full `SELECT *`, build_scan_plan leaves
-    // needs_reader_projection false, so cuDF emits columns in the first footer's order while the
-    // rest of the plan expects the bound snapshot's. DuckDB's own reader uses BY_FIELD_ID and is
-    // unaffected, so the two disagree silently -- and a castable permutation converts the values
-    // rather than erroring, since the runtime schema check only logs. Nested children are included
-    // because a reordered struct child fails the same way.
-    auto id_order = it->second.id_order;
-    std::sort(id_order.begin(), id_order.end());
-    std::vector<int32_t> file_field_order;
-    file_field_order.reserve(id_order.size());
-    for (auto const& [column_id, field_id] : id_order) {
-      file_field_order.push_back(field_id);
-    }
-    if (file_field_order != table_field_order) {
-      return iceberg_decline(
-        scan_reason::iceberg_schema_physical_order,
-        "iceberg_scan data file '" + path +
-          "' stores the table's fields in a different physical order than the bound snapshot's "
-          "schema declares; this scan path emits columns in the file's own order and would hand "
-          "back the right columns under the wrong names");
-    }
-  }
-
-  return std::nullopt;
-}
-
 // Why an `iceberg_scan` table must decline the GPU path, or nullopt when it may run there.
 //
 // V2 positional deletes and V3 deletion vectors are applied on GPU. Equality deletes are not:
@@ -342,9 +141,12 @@ std::optional<pre_decline> iceberg_schema_evolution_decline_reason(
 //
 // Each decline returns the reason it actually hit — a probe that never managed to look is not
 // the same as a table that really carries equality deletes.
-std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& op,
-                                                           duckdb::ClientContext& context,
-                                                           uint64_t& delete_time_us)
+std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
+  duckdb::LogicalGet& op,
+  duckdb::ClientContext& context,
+  uint64_t& delete_time_us,
+  std::optional<op::scan::iceberg_delete_inventory>& inventory,
+  std::string_view injection)
 {
   if (op.parameters.empty() || op.parameters.front().IsNull()) {
     return iceberg_decline(
@@ -354,6 +156,9 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
 
   std::string table_path;
   try {
+    // GetValue<string>() calls ToString() even for INTEGER at this DuckDB pin.
+    if (op.parameters.front().type().id() != duckdb::LogicalTypeId::VARCHAR)
+      throw duckdb::InvalidInputException("Iceberg table path must be VARCHAR");
     table_path = op.parameters.front().GetValue<std::string>();
   } catch (...) {
     return iceberg_decline(
@@ -429,19 +234,12 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
     return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
   }
 
-  std::string escaped;
-  escaped.reserve(table_path.size());
-  for (char c : table_path) {
-    if (c == '\'') { escaped += '\''; }
-    escaped += c;
-  }
-
-  std::string query = "SELECT count(*) FROM iceberg_metadata('" + escaped + "'";
+  std::optional<int64_t> snapshot_id;
   // Inspect the same snapshot the scan will read.
   auto sid_it = op.named_parameters.find("snapshot_from_id");
   if (sid_it != op.named_parameters.end() && !sid_it->second.IsNull()) {
     try {
-      query += ", snapshot_from_id = " + std::to_string(sid_it->second.GetValue<int64_t>());
+      snapshot_id = sid_it->second.GetValue<int64_t>();
     } catch (...) {
       return iceberg_decline(
         scan_reason::iceberg_snapshot_id_not_integer,
@@ -449,12 +247,6 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
         "cannot be inspected for delete files");
     }
   }
-  // status <> 'DELETED' matches discover_from_manifests: a manifest keeps listing entries later
-  // commits retired, so without it a table whose only equality-delete file has been compacted away
-  // is refused the GPU forever over a delete that no longer applies. Both sites must agree on
-  // which entries are live, or the gate's verdict describes a different table than the scan reads.
-  query += ") WHERE content = 'EQUALITY_DELETES' AND status <> 'DELETED'";
-
   try {
     // Opening a second Connection to the same database re-registers the SAME SiriusContext, so
     // its query-lifecycle callbacks would fire QueryBegin (resetting next_operator_id and
@@ -492,27 +284,8 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
       }
       ~probe_timer() { stop(); }
     } timer{delete_time_us};
-    sirius::op::scan::iceberg_metadata_connection metadata_conn(context);
-    auto result = metadata_conn.Query(query);
-    if (!result || result->HasError()) {
-      SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg delete probe failed for '{}': {} — CPU fallback",
-                       table_path,
-                       result ? result->GetError() : "null result");
-      return iceberg_decline(scan_reason::evidence_missing,
-                             "the iceberg delete probe could not read this table's metadata (" +
-                               std::string(result ? result->GetError() : "null result") +
-                               "), so it could not be proven free of equality-delete files",
-                             scan_verdict::incomplete);
-    }
-    auto chunk = result->Fetch();
-    if (!chunk || chunk->size() == 0) {
-      return iceberg_decline(
-        scan_reason::evidence_missing,
-        "the iceberg delete probe returned no rows, so the table could not be proven free of "
-        "equality-delete files",
-        scan_verdict::incomplete);
-    }
-    auto const n_delete_files = chunk->GetValue(0, 0).GetValue<int64_t>();
+    auto result = op::scan::read_delete_inventory(context, table_path, snapshot_id, injection);
+    auto const n_delete_files = result.equality_count;
     timer.stop();
     if (n_delete_files > 0) {
       return iceberg_decline(
@@ -521,14 +294,22 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(duckdb::LogicalGet& o
           " equality-delete file(s), which the GPU scan path does not apply yet");
     }
 
-    // Reuses this connection deliberately: it is already bracketed as an internal query, and a
-    // third Connection here would re-register the same SiriusContext underneath the query being
-    // planned.
-    if (auto reason = iceberg_schema_evolution_decline_reason(op, metadata_conn.get())) {
-      return reason;
-    }
+    inventory = std::move(result.inventory);
 
     return std::nullopt;
+  } catch (op::scan::inventory_query_error const& e) {
+    if (e.missing_result) {
+      return iceberg_decline(
+        scan_reason::evidence_missing,
+        "the iceberg delete probe returned no rows, so the table could not be proven free of "
+        "equality-delete files",
+        scan_verdict::incomplete);
+    }
+    return iceberg_decline(scan_reason::evidence_missing,
+                           "the iceberg delete probe could not read this table's metadata (" +
+                             std::string(e.what()) +
+                             "), so it could not be proven free of equality-delete files",
+                           scan_verdict::incomplete);
   } catch (std::exception const& e) {
     SIRIUS_LOG_DEBUG("[sirius_plan_get] iceberg plan-time probe threw for '{}': {} — CPU fallback",
                      table_path,
@@ -673,11 +454,14 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
 
 op::scan::pre_capture_result registered_iceberg_decline_reason(duckdb::LogicalGet& op,
                                                                duckdb::ClientContext& context,
-                                                               scan_contract_provenance&)
+                                                               scan_contract_provenance& provenance)
 {
   op::scan::pre_capture_result result;
-  result.decline =
-    iceberg_gpu_scan_decline_reason(op, context, result.cost.delete_preparation_time_us);
+  result.decline = iceberg_gpu_scan_decline_reason(op,
+                                                   context,
+                                                   result.cost.delete_preparation_time_us,
+                                                   result.inventory,
+                                                   provenance.injections.iceberg_discovery);
   return result;
 }
 
