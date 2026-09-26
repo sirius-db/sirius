@@ -709,6 +709,7 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
 
   auto info                 = std::make_unique<parquet_ingestible_table_info>();
   info->resolved_file_paths = file_paths;
+  info->bound_types         = desc.return_types;
   info->returned_types      = sirius::from_duckdb_vec(desc.return_types);  // full schema
   info->names               = desc.names;                                  // full schema
   for (auto idx : keep) {
@@ -2942,6 +2943,24 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     option_visibility::internal,
                     "sirius_test_lineage_unmodelled",
                     "R2a test-only lineage_unmodelled",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_synthetic_parquet_codec",
+                    "R2a test-only synthetic_parquet_codec",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_synthetic_native_segment",
+                    "R2a test-only synthetic_native_segment",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_strip_encryption_evidence",
+                    "R2a test-only strip_encryption_evidence",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(false));
   add_sirius_option(config,

@@ -425,6 +425,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   info->sirius_dynamic_filters = dynamic_filters;
   info->contract_id            = scan.contract_id;
+  info->profiles               = scan.read_views->profiles;
+  info->injections             = scan.read_views->injections;
+  if constexpr (std::is_base_of_v<op::scan::parquet_ingestible_table_info, InfoT>) {
+    info->physical_contract          = scan.read_views->entry(scan.contract_id).contract;
+    info->physical_contract.profiles = info->profiles;
+    info->bound_types                = info->physical_contract.view->identity->bound_types;
+    info->semantic_columns = scan.read_views->entry(scan.contract_id).eligibility.semantic_columns;
+  }
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
@@ -1484,9 +1492,14 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
     contract_provenance(std::move(provenance)),
     context(context)
 {
+  if (context.registered_state) {
+    auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (state) read_views->profiles->counters = state->physical_counters();
+  }
   // Match option registration: production performs no setting lookups.
   auto const* enabled = std::getenv("SIRIUS_ENABLE_TEST_OPTIONS");
   if (enabled && std::string_view(enabled) == "1") {
+    if (read_views->profiles->counters) read_views->profiles->counters->track_units = true;
     duckdb::Value value;
     ++contract_provenance.setting_lookups;
     if (context.TryGetCurrentSetting("sirius_test_inject_certification_delay_ms", value))
@@ -1509,9 +1522,19 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
     ++contract_provenance.setting_lookups;
     if (context.TryGetCurrentSetting("sirius_test_lineage_unmodelled", value))
       contract_provenance.injections.lineage_unmodelled = value.GetValue<bool>();
+    ++contract_provenance.setting_lookups;
+    if (context.TryGetCurrentSetting("sirius_test_synthetic_parquet_codec", value))
+      contract_provenance.injections.synthetic_parquet_codec = value.GetValue<std::string>();
+    ++contract_provenance.setting_lookups;
+    if (context.TryGetCurrentSetting("sirius_test_synthetic_native_segment", value))
+      contract_provenance.injections.synthetic_native_segment = value.GetValue<std::string>();
+    ++contract_provenance.setting_lookups;
+    if (context.TryGetCurrentSetting("sirius_test_strip_encryption_evidence", value))
+      contract_provenance.injections.strip_encryption_evidence = value.GetValue<bool>();
     contract_provenance.budget = op::scan::certification_budget(
       std::chrono::milliseconds{50}, 8u << 20, contract_provenance.injections.budget_declines);
   }
+  read_views->injections    = contract_provenance.injections;
   auto const has_window     = contract_provenance.window_id.has_value();
   auto const has_generation = contract_provenance.finalize_generation != 0;
   if (has_window == has_generation) {

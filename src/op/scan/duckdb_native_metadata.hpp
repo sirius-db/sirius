@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cudf/types.hpp>
 
@@ -35,6 +36,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -114,11 +116,18 @@ struct duckdb_row_group_metadata {
   std::vector<std::size_t> varchar_bytes_per_col;
 };
 
+physical_profile native_row_group_profile(duckdb_row_group_metadata const& group,
+                                          std::span<sirius::logical_type const> types,
+                                          uint64_t storage_version);
+
 /// cuDF strings columns offset limit.
 constexpr std::size_t kCudfInt32StringsThreshold =
   static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
 
 /// Exposed for direct unit-testing of the codec-rejection logic
+[[nodiscard]] bool native_matrix_supports(duckdb::LogicalTypeId type,
+                                          duckdb::CompressionType data,
+                                          duckdb::CompressionType validity) noexcept;
 bool is_supported_data_compression(duckdb::CompressionType c);
 bool is_supported_validity_compression(duckdb::CompressionType c);
 
@@ -141,6 +150,7 @@ std::optional<std::string> unsupported_projected_type_reason(
 /// filter-statistics pruning results. A fully pruned plan remains viable and
 /// produces empty range results.
 struct duckdb_native_walk_plan {
+  std::optional<duckdb::CompressionType> synthetic_data_codec;
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
 
@@ -233,6 +243,7 @@ struct duckdb_native_row_group_range {
   /// `row_groups` is then partial and must not be consumed.
   bool viable = true;
   std::string viability_failure_reason;
+  verdict_reason failure_reason = verdict_reason::native_segment_codec;
 };
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);

@@ -1,0 +1,1536 @@
+{
+  "files": [
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-NONE-PLAIN.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-NONE-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-NONE-DICTIONARY.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-NONE-PLAIN.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-NONE-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-NONE-DICTIONARY.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-NONE-PLAIN.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-NONE-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-NONE-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "UNCOMPRESSED",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-NONE-DICTIONARY.parquet",
+      "requested_codec": "NONE",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-SNAPPY-PLAIN.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-SNAPPY-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-SNAPPY-DICTIONARY.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-SNAPPY-PLAIN.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-SNAPPY-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-SNAPPY-DICTIONARY.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-SNAPPY-PLAIN.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-SNAPPY-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-SNAPPY-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-SNAPPY-DICTIONARY.parquet",
+      "requested_codec": "SNAPPY",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-GZIP-PLAIN.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-GZIP-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-GZIP-DICTIONARY.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-GZIP-PLAIN.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-GZIP-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-GZIP-DICTIONARY.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-GZIP-PLAIN.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-GZIP-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-GZIP-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "GZIP",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-GZIP-DICTIONARY.parquet",
+      "requested_codec": "GZIP",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-ZSTD-PLAIN.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-ZSTD-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-ZSTD-DICTIONARY.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-ZSTD-PLAIN.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-ZSTD-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-ZSTD-DICTIONARY.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-ZSTD-PLAIN.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-ZSTD-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-ZSTD-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "ZSTD",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-ZSTD-DICTIONARY.parquet",
+      "requested_codec": "ZSTD",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-LZ4-PLAIN.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-LZ4-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-LZ4-DICTIONARY.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-LZ4-PLAIN.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-LZ4-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-LZ4-DICTIONARY.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-LZ4-PLAIN.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-LZ4-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-LZ4-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "LZ4",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-LZ4-DICTIONARY.parquet",
+      "requested_codec": "LZ4",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-BROTLI-PLAIN.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "PLAIN",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_BINARY_PACKED"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-BROTLI-DELTA_BINARY_PACKED.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DELTA_BINARY_PACKED",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "INT32"
+        }
+      ],
+      "file": "int-BROTLI-DICTIONARY.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DICTIONARY",
+      "type": "int32"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-BROTLI-PLAIN.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "PLAIN",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "BYTE_STREAM_SPLIT"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-BROTLI-BYTE_STREAM_SPLIT.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "BYTE_STREAM_SPLIT",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "DOUBLE"
+        }
+      ],
+      "file": "double-BROTLI-DICTIONARY.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DICTIONARY",
+      "type": "double"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "PLAIN"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-BROTLI-PLAIN.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "PLAIN",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_LENGTH_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-BROTLI-DELTA_LENGTH_BYTE_ARRAY.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DELTA_LENGTH_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "RLE",
+            "DELTA_BYTE_ARRAY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-BROTLI-DELTA_BYTE_ARRAY.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DELTA_BYTE_ARRAY",
+      "type": "string"
+    },
+    {
+      "actual": [
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        },
+        {
+          "codec": "BROTLI",
+          "encodings": [
+            "PLAIN",
+            "RLE",
+            "RLE_DICTIONARY"
+          ],
+          "physical_type": "BYTE_ARRAY"
+        }
+      ],
+      "file": "string-BROTLI-DICTIONARY.parquet",
+      "requested_codec": "BROTLI",
+      "requested_encoding": "DICTIONARY",
+      "type": "string"
+    },
+    {
+      "encryption": "footer",
+      "file": "encrypted-footer.parquet",
+      "magic": "PARE",
+      "readback": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "encryption": "columns",
+      "file": "encrypted-columns.parquet",
+      "magic": "PAR1",
+      "readback": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "BIT_PACKED"
+          ]
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": [
+            "PLAIN",
+            "BIT_PACKED"
+          ]
+        }
+      ],
+      "file": "int-SNAPPY-levels.parquet",
+      "footer_variant": "levels"
+    },
+    {
+      "actual": [
+        {
+          "codec": "SNAPPY",
+          "encodings": []
+        },
+        {
+          "codec": "SNAPPY",
+          "encodings": []
+        }
+      ],
+      "file": "int-SNAPPY-empty.parquet",
+      "footer_variant": "empty"
+    }
+  ],
+  "libcudf": "26.08.01",
+  "pyarrow": "25.0.0"
+}

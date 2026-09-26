@@ -189,12 +189,17 @@ class cache_entry_info {
  * which columns the user pinned) along with the data batches making up the
  * pinned table. The vector may be empty until splits are populated.
  */
+using pin_validation = op::scan::pin_validation;
+
 struct pinned_entry {
   /// Identity of this materialization, independent of the source table's identity.
   /// ANN indexes must match it before using row positions from their build snapshot.
   std::shared_ptr<const pin_snapshot_identity> snapshot_identity{
     std::make_shared<const pin_snapshot_identity>()};
 
+  // Pin-time evidence only. Query-dependent checks belong to the provider.
+  pin_validation::check identity_evidence{true, false};
+  pin_validation::check layout_evidence{true, false};
   /// Cache identity + column layout for this pinned table. Drives the cache-hit
   /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
   /// gather; replaces the heavyweight read-side ingestible_table_info.
@@ -1115,6 +1120,7 @@ class sirius_scan_manager {
   struct checkpoint_lock_entry {
     duckdb::AttachedDatabase* database;
     duckdb::unique_ptr<duckdb::StorageLockKey> key;
+    uint64_t query_token = 0;
   };
   void release_checkpoint_keys(sirius::query_id_t query_id);
   std::map<sirius::query_id_t, std::vector<checkpoint_lock_entry>> _checkpoint_locks;

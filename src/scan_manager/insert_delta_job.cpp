@@ -133,13 +133,29 @@ insert_delta_workset prepare_insert_delta_tasks(
         try {
           work_ptr->out = op::scan::capture_insert_delta_row_group_range(
             req->plan, work_ptr->rg_begin, work_ptr->rg_end, req->union_cols, req->union_types);
+        } catch (op::scan::unsupported_physical_input const& e) {
+          throw op::scan::unsupported_physical_input(
+            req->first_consuming_contract,
+            req->entry_name + "|" + e.input_identity,
+            e.reason,
+            "[prepare_insert_delta_tasks] pinned entry '" + req->entry_name + "': " + e.what());
         } catch (std::exception const& e) {
           throw std::runtime_error("[prepare_insert_delta_tasks] pinned entry '" + req->entry_name +
                                    "': " + e.what());
         }
       });
     }
-    fan_out_and_join(dispatcher, std::move(range_tasks), "insert-delta capture");
+    try {
+      fan_out_and_join(dispatcher, std::move(range_tasks), "insert-delta capture");
+    } catch (op::scan::unsupported_physical_input const& error) {
+      for (auto const& request : requests) {
+        if (request.first_consuming_contract == error.contract) {
+          if (request.profiles->counters) request.profiles->counters->record(error.reason);
+          break;
+        }
+      }
+      throw;
+    }
     for (auto& work : range_works) {
       for (std::size_t i = 0; i < work->out.size(); ++i) {
         work->request->plan.row_groups[work->rg_begin + i] = std::move(work->out[i]);
@@ -429,15 +445,42 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
     std::vector<op::scan::split_dependencies> dependencies;
     certificates.reserve(info->row_groups.size());
     dependencies.reserve(info->row_groups.size());
-    for (auto const& row_group : info->row_groups) {
+    for (std::size_t row_index = 0; row_index < info->row_groups.size(); ++row_index) {
+      auto const& row_group = info->row_groups[row_index];
+      auto const& original  = request.plan.row_groups[bundle.rg_indices[row_index]];
+      op::scan::validation_set validation;
+      auto add_segments = [&](auto const& segments) {
+        for (auto const& segment : segments) {
+          validation |= segment.is_transient
+                          ? op::scan::check_bit(op::scan::later_check::host_staged)
+                          : op::scan::check_bit(op::scan::later_check::segments_per_range) |
+                              op::scan::check_bit(op::scan::later_check::matrix_per_range);
+        }
+      };
+      for (auto ui : union_idx) {
+        auto const& column = original.columns[ui];
+        add_segments(column.data_segments);
+        add_segments(column.validity_segments);
+        add_segments(column.array_child_data_segments);
+        add_segments(column.array_child_validity_segments);
+      }
+      if (request.checkpoint_witness)
+        validation |= op::scan::check_bit(op::scan::later_check::key_held);
+      std::vector<sirius::logical_type> selected_types;
+      for (auto ui : union_idx)
+        selected_types.push_back(request.union_types.at(ui));
+      if (request.profiles->counters)
+        request.profiles->counters->record(op::scan::verdict_reason::none);
+      auto profile = request.profiles->add(
+        op::scan::native_row_group_profile(row_group, selected_types, request.storage_version));
       certificates.push_back(
         {contract_id,
          static_cast<uint64_t>(row_group.row_group_index),
          request.entry_name + "|row_group=" + std::to_string(row_group.row_group_index),
-         0,
-         info->host_backed_only ? op::scan::check_bit(op::scan::later_check::host_staged)
-                                : op::scan::check_bit(op::scan::later_check::segments_per_range)});
-      dependencies.push_back({nullptr, info->datasource, std::nullopt});
+         profile,
+         validation,
+         request.checkpoint_witness});
+      dependencies.push_back({nullptr, info->datasource, std::nullopt, request.profiles});
     }
     info->set_contract_payload(contract_id, std::move(certificates), std::move(dependencies));
 

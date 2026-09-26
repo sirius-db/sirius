@@ -1346,6 +1346,19 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   snapshot.setting_lookups_per_attempt     = certification_stats_.setting_lookups_per_attempt;
   snapshot.scan_lowerings                  = certification_stats_.scan_lowerings;
   snapshot.window_tasks_started            = window_tasks_started_->load(std::memory_order_relaxed);
+  {
+    std::lock_guard lock(physical_counters_->units_mutex);
+    snapshot.parquet_reader_calls = physical_counters_->parquet_reader_calls;
+    snapshot.native_decoder_calls = physical_counters_->native_decoder_calls;
+  }
+  snapshot.split_physical_checks = physical_counters_->checks.load(std::memory_order_relaxed);
+  snapshot.parquet_type_mismatch_observed =
+    physical_counters_->type_mismatches.load(std::memory_order_relaxed);
+  snapshot.parquet_type_refusals =
+    physical_counters_->type_refusals.load(std::memory_order_relaxed);
+  for (std::size_t i = 0; i < snapshot.split_physical_rejections.size(); ++i)
+    snapshot.split_physical_rejections[i] =
+      physical_counters_->rejections[i].load(std::memory_order_relaxed);
   return snapshot;
 }
 

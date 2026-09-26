@@ -131,3 +131,14 @@ TEST_CASE("split_connector::get_next_split wakes on a push, parks again, then en
   REQUIRE(pops.load() == 2);
   REQUIRE(connector.is_closed());
 }
+
+TEST_CASE("split_connector failure before the first pop remains schedulable",
+          "[split_connector][scan_manager]")
+{
+  split_connector connector;
+  connector.close(std::make_exception_ptr(std::runtime_error("early metadata refusal")));
+  connector.close();
+  CHECK_FALSE(connector.is_closed());
+  CHECK(connector.is_discovery_complete());
+  CHECK_THROWS_WITH(connector.get_next_split(), "early metadata refusal");
+}
