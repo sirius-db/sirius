@@ -103,3 +103,21 @@ TEST_CASE_METHOD(JoinNullFixture,
   // l.k=NULL is still NULL and matches are TRUE) -- this exercises FALSE.
   compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r WHERE k IS NOT NULL) AS m FROM l");
 }
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution mixed SEMI and ANTI joins keep matches after NULL build rows",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  run_ok("CREATE TABLE mixed_left (k BIGINT, v UINTEGER);");
+  run_ok("INSERT INTO mixed_left VALUES (1, 134), (2, 7), (NULL, 3);");
+  run_ok("CREATE TABLE mixed_right (k BIGINT, v UINTEGER);");
+  run_ok("INSERT INTO mixed_right VALUES (1, NULL), (1, 0), (2, NULL);");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu(
+    "SELECT l.* FROM mixed_left l SEMI JOIN mixed_right r "
+    "ON l.k = r.k AND l.v <> r.v");
+  compare_gpu_vs_cpu(
+    "SELECT l.* FROM mixed_left l ANTI JOIN mixed_right r "
+    "ON l.k = r.k AND l.v <> r.v");
+}

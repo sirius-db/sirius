@@ -88,6 +88,27 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
     expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
 }
 
+// The mixed SEMI/ANTI build deduplication can discard a later valid match when an
+// earlier row has a NULL conditional value. Check only columns used by the residual
+// predicate so unrelated nullable payload columns keep the hash-join fast path.
+static bool has_nullable_residual_build_column(
+  duckdb::vector<sirius::join_condition> const& conditions,
+  std::size_t first_residual,
+  bool build_is_left,
+  cudf::table_view const& build)
+{
+  std::unordered_set<std::size_t> indices;
+  for (std::size_t i = first_residual; i < conditions.size(); ++i) {
+    auto const& side = build_is_left ? conditions[i].left : conditions[i].right;
+    auto expression  = sirius::ast::to_duckdb(*side);
+    collect_bound_ref_indices(*expression, indices);
+  }
+  for (auto const index : indices) {
+    if (build.column(static_cast<cudf::size_type>(index)).has_nulls()) { return true; }
+  }
+  return false;
+}
+
 // Mixed plain/null-safe keys require different null policies, so route the null-safe keys
 // to the conditional predicate. MARK joins cannot use MIXED_JOIN.
 static bool wants_null_safe_routing(duckdb::vector<sirius::join_condition> const& conditions,
@@ -2082,11 +2103,35 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::SEMI) {
-      left_indices = cudf::mixed_left_semi_join(
-        left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
+      if (has_nullable_residual_build_column(
+            conditions, num_equality_conditions, false, right_full)) {
+        auto full_pred = translator.translate_join_conditions(conditions, 0, conditions.size());
+        if (!full_pred) { throw std::runtime_error("Failed to translate mixed SEMI predicate"); }
+        left_indices = cudf::conditional_left_semi_join(left_full,
+                                                        right_full,
+                                                        full_pred->back(),
+                                                        std::nullopt,
+                                                        stream,
+                                                        cudf::get_current_device_resource_ref());
+      } else {
+        left_indices = cudf::mixed_left_semi_join(
+          left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
+      }
     } else if (join_type == duckdb::JoinType::ANTI) {
-      left_indices = cudf::mixed_left_anti_join(
-        left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
+      if (has_nullable_residual_build_column(
+            conditions, num_equality_conditions, false, right_full)) {
+        auto full_pred = translator.translate_join_conditions(conditions, 0, conditions.size());
+        if (!full_pred) { throw std::runtime_error("Failed to translate mixed ANTI predicate"); }
+        left_indices = cudf::conditional_left_anti_join(left_full,
+                                                        right_full,
+                                                        full_pred->back(),
+                                                        std::nullopt,
+                                                        stream,
+                                                        cudf::get_current_device_resource_ref());
+      } else {
+        left_indices = cudf::mixed_left_anti_join(
+          left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
+      }
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
       auto swapped_pred = translator.translate_join_conditions(
         conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
@@ -2095,8 +2140,23 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI "
           "mixed join");
       }
-      right_indices = cudf::mixed_left_semi_join(
-        right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
+      if (has_nullable_residual_build_column(
+            conditions, num_equality_conditions, true, left_full)) {
+        auto full_pred =
+          translator.translate_join_conditions(conditions, 0, conditions.size(), true);
+        if (!full_pred) {
+          throw std::runtime_error("Failed to translate mixed RIGHT_SEMI predicate");
+        }
+        right_indices = cudf::conditional_left_semi_join(right_full,
+                                                         left_full,
+                                                         full_pred->back(),
+                                                         std::nullopt,
+                                                         stream,
+                                                         cudf::get_current_device_resource_ref());
+      } else {
+        right_indices = cudf::mixed_left_semi_join(
+          right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
+      }
     } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
       auto swapped_pred = translator.translate_join_conditions(
         conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
@@ -2105,8 +2165,23 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_ANTI "
           "mixed join");
       }
-      right_indices = cudf::mixed_left_anti_join(
-        right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
+      if (has_nullable_residual_build_column(
+            conditions, num_equality_conditions, true, left_full)) {
+        auto full_pred =
+          translator.translate_join_conditions(conditions, 0, conditions.size(), true);
+        if (!full_pred) {
+          throw std::runtime_error("Failed to translate mixed RIGHT_ANTI predicate");
+        }
+        right_indices = cudf::conditional_left_anti_join(right_full,
+                                                         left_full,
+                                                         full_pred->back(),
+                                                         std::nullopt,
+                                                         stream,
+                                                         cudf::get_current_device_resource_ref());
+      } else {
+        right_indices = cudf::mixed_left_anti_join(
+          right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
+      }
     } else {
       throw std::runtime_error("Unsupported join type for mixed join: " +
                                duckdb::JoinTypeToString(join_type));
