@@ -1379,6 +1379,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .read_view_mismatches = transparent_read_view_mismatch_count_.load(std::memory_order_relaxed),
     .certificate_mismatches =
       transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
+    .certificate_incompletes =
+      transparent_certificate_incomplete_count_.load(std::memory_order_relaxed),
     .execution_rebuilds = transparent_execution_rebuild_count_.load(std::memory_order_relaxed),
     .checkpoint_revalidation_failures =
       checkpoint_revalidation_failure_count_.load(std::memory_order_relaxed),
@@ -1505,6 +1507,11 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_certificate_incomplete() noexcept
+{
+  transparent_certificate_incomplete_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void SiriusContext::record_transparent_certificate_mismatch() noexcept

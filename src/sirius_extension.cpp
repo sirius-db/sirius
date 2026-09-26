@@ -2995,6 +2995,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     Value(""));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_invalidate_pin_witness",
+                    "R2a test-only invalidate resident query token before publication",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_strip_encryption_evidence",
                     "R2a test-only strip_encryption_evidence",
                     LogicalType::BOOLEAN,

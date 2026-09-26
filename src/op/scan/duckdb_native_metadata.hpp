@@ -75,6 +75,8 @@ struct duckdb_segment_descriptor {
   /// Blockless — no bytes exist anywhere; the decoder synthesizes zero
   /// validity bits for the covered rows.
   bool all_null = false;
+  // Preserve capture classification even for blockless CONSTANT/all-NULL segments.
+  bool is_transient = false;
   /// CONSTANT data segments: snapshot of the segment's own statistics, taken
   /// while the segment is in hand. The decoder must take the constant value
   /// from here — row-group-level stats merge later appends into the same row

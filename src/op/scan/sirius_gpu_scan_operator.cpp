@@ -425,6 +425,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
+    if (scan_input->is_resident()) validate_input(*scan_input);
     // Share the operator's "compaction is unprofitable" latch with the split
     // BEFORE any reservation estimate runs: one such batch decides the whole
     // scan (uniform per-batch selectivity), and both the working-set estimator
@@ -442,6 +443,46 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
 // scan_manager wiring
 //===----------------------------------------------------------------------===//
 gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_ingestible; }
+
+void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input) const
+{
+  if (!_contract_id) return;  // standalone unbound operator fixtures
+  try {
+    if (input.has_scan_metadata()) {
+      auto required =
+        _read_views ? _read_views->entry(_contract_id).eligibility.later_checks : later_check_set{};
+      validate_split_for_gpu(_contract_id, required, _expected_key, input.get_scan_info());
+      if (!_read_views)
+        throw certificate_incomplete(_contract_id, {}, "bound scan registry missing");
+      for (auto const& dependency : input.get_scan_info().dependencies()) {
+        if (dependency.profiles && dependency.profiles != _read_views->profiles)
+          throw certificate_incomplete(
+            _contract_id, {}, "physical profile belongs to another scan registry");
+      }
+    } else if (input.is_resident()) {
+      if (input.resident_contract_id != _contract_id)
+        throw std::runtime_error("resident scan contract mismatch");
+      if (!input.resident_validation)
+        throw certificate_incomplete(_contract_id, {}, "resident admission missing");
+      if (_ingestible &&
+          dynamic_cast<duckdb_native_ingestible_table_info const*>(&_ingestible->table_info()) &&
+          (!input.resident_validation->iteration.applies ||
+           !input.resident_validation->visibility.applies))
+        throw certificate_incomplete(_contract_id, {}, "resident native applicability missing");
+      admit_resident_batch(_contract_id, *input.resident_validation, _query_token);
+    } else {
+      throw certificate_incomplete(_contract_id, {}, "scan payload missing");
+    }
+  } catch (certificate_incomplete const&) {
+    if (_compressed_materialization_observer)
+      _compressed_materialization_observer->record_transparent_certificate_incomplete();
+    throw;
+  } catch (...) {
+    if (_compressed_materialization_observer)
+      _compressed_materialization_observer->record_transparent_certificate_mismatch();
+    throw;
+  }
+}
 
 bound_table_scan const& sirius_gpu_scan_operator::scan_contract() const
 {
@@ -468,16 +509,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
       std::string(typeid(input_data).name()));
   }
-  if (scan_input->has_scan_metadata()) {
-    try {
-      validate_split_for_gpu(_contract_id, scan_input->get_scan_info());
-    } catch (...) {
-      if (_compressed_materialization_observer) {
-        _compressed_materialization_observer->record_transparent_certificate_mismatch();
-      }
-      throw;
-    }
-  }
+  validate_input(*scan_input);
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   auto const has_explicit_physical_schema      = has_physical_overrides();

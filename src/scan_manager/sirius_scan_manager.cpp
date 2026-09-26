@@ -1937,6 +1937,31 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   state->pending_mvcc_mask_jobs.clear();
   state->pending_insert_delta_jobs.clear();
 
+  auto const query_token = sirius::value_of(query_id);
+  for (auto const& scan_entry : state->scans) {
+    auto* scan = scan_entry.op;
+    std::optional<op::scan::key_held_witness> expected_key;
+    if (auto* native =
+          dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&scan->get_ingestible())) {
+      auto* database = &native->attached_database();
+      bool key_held  = false;
+      {
+        std::lock_guard lk{_checkpoint_locks_mutex};
+        auto const it = _checkpoint_locks.find(query_id);
+        if (it != _checkpoint_locks.end()) {
+          key_held = std::ranges::any_of(it->second, [&](auto const& entry) {
+            return entry.database == database && entry.key && entry.query_token == query_token;
+          });
+        }
+      }
+      if (key_held) {
+        expected_key = op::scan::key_held_witness{
+          database, database->GetStorageManager().GetDBPath(), query_token};
+      }
+    }
+    scan->set_query_validation(query_token, std::move(expected_key));
+  }
+
   // Publish only once the state is fully built: a prepare that threw above destroys `state`
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
   {

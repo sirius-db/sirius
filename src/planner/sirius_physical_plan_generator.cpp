@@ -1580,6 +1580,9 @@ sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientCon
     ++contract_provenance.setting_lookups;
     if (context.TryGetCurrentSetting("sirius_test_strip_encryption_evidence", value))
       contract_provenance.injections.strip_encryption_evidence = value.GetValue<bool>();
+    ++contract_provenance.setting_lookups;
+    if (context.TryGetCurrentSetting("sirius_test_invalidate_pin_witness", value))
+      contract_provenance.injections.invalidate_pin_witness = value.GetValue<bool>();
     contract_provenance.budget = op::scan::certification_budget(
       std::chrono::milliseconds{50}, 8u << 20, contract_provenance.injections.budget_declines);
   }

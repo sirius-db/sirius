@@ -1459,7 +1459,12 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->set_contract_payload(
     _info->contract_id,
     {{_info->contract_id, 0, std::move(input_identity), profile.profile, profile.validation}},
-    {{file_metadata, out->datasource, std::nullopt, _info->profiles}});
+    {{file_metadata,
+      out->datasource,
+      std::nullopt,
+      _info->profiles,
+      std::make_shared<parquet_input_approval const>(
+        parquet_input_approval{footer_len, std::move(retained)})}});
 
   return out;
 }

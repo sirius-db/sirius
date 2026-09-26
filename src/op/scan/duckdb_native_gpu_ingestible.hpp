@@ -146,6 +146,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// stats-backed only): the split stages no file reads and may carry a null
   /// datasource.
   bool host_backed_only = false;
+  bool is_insert_delta  = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {

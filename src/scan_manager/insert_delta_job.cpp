@@ -370,6 +370,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       d.max_string_length = s.max_string_length;
       d.bytes_size        = s.bytes_size;
       d.all_null          = s.all_null;
+      d.is_transient      = s.is_transient;
       d.segment_stats     = s.segment_stats;
       if (s.is_transient) {
         d.block_id     = -1;
@@ -439,6 +440,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
     auto info             = std::make_unique<op::scan::duckdb_native_scan_info>(
       std::move(row_groups), std::move(split_datasource), block_manager);
     info->host_backed_only = !any_file_read;
+    info->is_insert_delta  = true;
     if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
 
     std::vector<op::scan::split_materializer_certificate> certificates;

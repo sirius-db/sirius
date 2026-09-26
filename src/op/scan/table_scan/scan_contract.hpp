@@ -100,6 +100,11 @@ class physical_profile_table {
     profiles_.push_back(std::move(profile));
     return static_cast<profile_id>(profiles_.size());
   }
+  bool contains(profile_id id) const
+  {
+    std::lock_guard lock(mutex_);
+    return id > 0 && id <= profiles_.size();
+  }
   physical_profile get(profile_id id) const
   {
     std::lock_guard lock(mutex_);
@@ -411,11 +416,18 @@ struct split_materializer_certificate {
   validation_set validation;
   std::optional<key_held_witness> key_held;
 };
+// One immutable approval per file, shared by all emitted slices. Only the
+// retained row groups were checked; pruning must not authorize another group.
+struct parquet_input_approval {
+  std::size_t footer_bytes = 0;
+  std::vector<std::size_t> row_groups;
+};
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
   std::shared_ptr<io::sirius_datasource> datasource;
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
+  std::shared_ptr<parquet_input_approval const> parquet_approval;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {
@@ -446,5 +458,9 @@ scan_contract_id allocate_scan_contract(
   duckdb::vector<duckdb::LogicalType> output_types = {},
   duckdb::idx_t table_index                        = duckdb::DConstants::INVALID_INDEX);
 bound_table_scan const& contract_of(transparent::read_view_registry const&, scan_contract_id);
-void validate_split_for_gpu(scan_contract_id expected, scan_info const& split);
+void validate_split_for_gpu(scan_contract_id expected,
+                            later_check_set const& required,
+                            std::optional<key_held_witness> const& expected_key,
+                            scan_info const& split);
+void admit_resident_batch(scan_contract_id expected, pin_validation const&, uint64_t query_token);
 }  // namespace sirius::op::scan
