@@ -434,8 +434,9 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         {contract_id,
          static_cast<uint64_t>(row_group.row_group_index),
          request.entry_name + "|row_group=" + std::to_string(row_group.row_group_index),
-         "duckdb_native.insert_delta",
-         info->host_backed_only ? "host" : "file"});
+         0,
+         info->host_backed_only ? op::scan::check_bit(op::scan::later_check::host_staged)
+                                : op::scan::check_bit(op::scan::later_check::segments_per_range)});
       dependencies.push_back({nullptr, info->datasource, std::nullopt});
     }
     info->set_contract_payload(contract_id, std::move(certificates), std::move(dependencies));

@@ -209,8 +209,9 @@ void sirius_engine::execute()
 
   // This query's completion signal. Owned here, shared down to every task via its pipeline's
   // global state, so no cross-query subsystem holds a "current query" handler.
-  completion_handler_ = std::make_shared<pipeline::completion_handler>();
-  auto future         = completion_handler_->get_awaitable();
+  completion_handler_ =
+    std::make_shared<pipeline::completion_handler>(sirius_ctx->window_task_counter());
+  auto future = completion_handler_->get_awaitable();
 
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   query_ = sirius_ctx->create_query(std::move(new_scheduled),

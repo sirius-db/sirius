@@ -322,7 +322,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           logical_original_views_ ? &*logical_original_views_ : nullptr,
           physical_original_views_,
           *planner.read_views);
-        planner.read_views->publish_supported(
+        planner.read_views->publish_correspondence(
           sirius::op::scan::certificate_evidence_scope::binding_correspondence,
           comparison.correspondence,
           physical_original_views_);

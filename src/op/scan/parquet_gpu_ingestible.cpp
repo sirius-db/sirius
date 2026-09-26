@@ -1247,10 +1247,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       }
     }
   }
-  out->set_contract_payload(
-    _info->contract_id,
-    {{_info->contract_id, 0, std::move(input_identity), "parquet", "footer"}},
-    {{file_metadata, out->datasource, std::nullopt}});
+  out->set_contract_payload(_info->contract_id,
+                            {{_info->contract_id,
+                              0,
+                              std::move(input_identity),
+                              0,
+                              check_bit(later_check::footer_per_file)}},
+                            {{file_metadata, out->datasource, std::nullopt}});
 
   return out;
 }

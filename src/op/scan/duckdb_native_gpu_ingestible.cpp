@@ -212,6 +212,13 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
   _block_manager = sf_bm;
 
+  // Keep the constructor's admission gate even when a caller bypasses L0
+  // certification (for example the direct pin path).
+  if (sm.IsEncrypted()) {
+    throw std::runtime_error(
+      "duckdb-native scan rejected query: encrypted storage is not GPU-decodable");
+  }
+
   duckdb::vector<duckdb::idx_t> source_ids_fallback;
   if (bind.projection_ids.empty()) {
     source_ids_fallback.reserve(bind.column_ids.size());
@@ -386,8 +393,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                               _info->db_path +
                                 "|checkpoint=" + std::to_string(_checkpoint_iteration) +
                                 "|row_group=" + std::to_string(row_group.row_group_index),
-                              "duckdb_native",
-                              "segments"});
+                              0,
+                              check_bit(later_check::segments_per_range)});
       dependencies.push_back({nullptr, split->datasource, _checkpoint_iteration});
     }
     split->set_contract_payload(

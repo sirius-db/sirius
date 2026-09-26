@@ -361,6 +361,7 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
+          if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {

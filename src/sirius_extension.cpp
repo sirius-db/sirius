@@ -2904,6 +2904,48 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
   // option registration from growing scattered environment checks.
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_certification_delay_ms",
+                    "R2a test-only inject_certification_delay_ms",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_certification_bytes",
+                    "R2a test-only inject_certification_bytes",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_budget_declines",
+                    "R2a test-only budget_declines",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_scan_verdict",
+                    "R2a test-only inject_scan_verdict",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_iceberg_discovery",
+                    "R2a test-only inject_iceberg_discovery",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_after_certify_ms",
+                    "R2a test-only pause_after_certify_ms",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_lineage_unmodelled",
+                    "R2a test-only lineage_unmodelled",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_inject_pin_registry_change",
                     "simulate a pin or unpin landing between the finalize and execution windows",
                     LogicalType::BOOLEAN,

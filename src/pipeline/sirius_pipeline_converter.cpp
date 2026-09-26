@@ -520,6 +520,24 @@ char const* dump_evidence_depth(op::scan::evidence_depth depth)
   return "unknown";
 }
 
+std::string dump_later_checks(op::scan::later_check_set const& checks)
+{
+  static constexpr char const* names[] = {"footer_per_file",
+                                          "profile_per_file",
+                                          "schema_per_file",
+                                          "segments_per_range",
+                                          "matrix_per_range",
+                                          "host_staged",
+                                          "key_held"};
+  std::string result;
+  for (std::size_t index = 0; index < std::size(names); ++index) {
+    if (!checks.test(index)) continue;
+    if (!result.empty()) result += ",";
+    result += names[index];
+  }
+  return result.empty() ? "none" : result;
+}
+
 char const* dump_verdict(op::scan::eligibility_verdict verdict)
 {
   switch (verdict) {
@@ -577,6 +595,16 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " correspondence="
           << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
           << " verdict=" << dump_verdict(entry.eligibility.verdict)
+          << " reason=" << static_cast<unsigned>(entry.eligibility.reason)
+          << " later_checks=" << dump_later_checks(entry.eligibility.later_checks)
+          << " added_time_us=" << entry.eligibility.cost.added_time_us
+          << " added_bytes=" << entry.eligibility.cost.added_bytes
+          << " inherited_capture_bytes=" << entry.eligibility.cost.inherited_capture_bytes
+          << " borrowed_files=" << entry.eligibility.cost.borrowed_files
+          << " delete_preparation_time_us=" << entry.eligibility.cost.delete_preparation_time_us
+          << " storage_version="
+          << (entry.eligibility.storage_version ? std::to_string(*entry.eligibility.storage_version)
+                                                : "none")
           << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
           << " outputs=" << contract.output_types.size() << "\n";
     }
@@ -633,6 +661,16 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " correspondence="
         << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
         << " verdict=" << dump_verdict(entry.eligibility.verdict)
+        << " reason=" << static_cast<unsigned>(entry.eligibility.reason)
+        << " later_checks=" << dump_later_checks(entry.eligibility.later_checks)
+        << " added_time_us=" << entry.eligibility.cost.added_time_us
+        << " added_bytes=" << entry.eligibility.cost.added_bytes
+        << " inherited_capture_bytes=" << entry.eligibility.cost.inherited_capture_bytes
+        << " borrowed_files=" << entry.eligibility.cost.borrowed_files
+        << " delete_preparation_time_us=" << entry.eligibility.cost.delete_preparation_time_us
+        << " storage_version="
+        << (entry.eligibility.storage_version ? std::to_string(*entry.eligibility.storage_version)
+                                              : "none")
         << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
         << " outputs=" << contract.output_types.size()
         << " columns=" << contract.columns.column_ids.size()

@@ -17,8 +17,10 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <exception>
 #include <future>
+#include <memory>
 
 namespace sirius::pipeline {
 
@@ -31,7 +33,15 @@ namespace sirius::pipeline {
  */
 class completion_handler {
  public:
-  completion_handler()  = default;
+  completion_handler() = default;
+  explicit completion_handler(std::shared_ptr<std::atomic<uint64_t>> tasks)
+    : tasks_started_(std::move(tasks))
+  {
+  }
+  void record_task_started() noexcept
+  {
+    if (tasks_started_) tasks_started_->fetch_add(1, std::memory_order_relaxed);
+  }
   ~completion_handler() = default;
 
   // Non-copyable and non-movable
@@ -122,6 +132,7 @@ class completion_handler {
   [[nodiscard]] bool has_error() const noexcept { return _has_error.load(); }
 
  private:
+  std::shared_ptr<std::atomic<uint64_t>> tasks_started_;
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};
   std::atomic<bool> _has_error{false};

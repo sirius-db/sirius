@@ -6,6 +6,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_split_certificates.cpp
     test/cpp/transparent/test_plan_source_policy.cpp
     test/cpp/scan/test_scan_contracts.cpp
+    test/cpp/scan/test_scan_verdicts.cpp
+    test/cpp/integration/test_transparent_verdicts.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp

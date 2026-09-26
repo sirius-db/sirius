@@ -24,6 +24,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -42,6 +43,7 @@
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -336,6 +338,20 @@ class SiriusContext : public ClientContextState {
     uint64_t execution_rebuilds               = 0;
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
+    static constexpr std::size_t semantic_reason_count =
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::interface_unavailable) + 1;
+    std::array<uint64_t, semantic_reason_count> semantic_declines{};
+    std::array<uint64_t, 3> semantic_verdicts{};
+    uint64_t certification_added_time_us_sum = 0;
+    uint64_t certification_added_time_us_max = 0;
+    uint64_t certification_added_bytes       = 0;
+    uint64_t inherited_capture_bytes         = 0;
+    uint64_t certification_borrowed_files    = 0;
+    uint64_t delete_preparation_time_us      = 0;
+    std::array<uint64_t, 2> budget_exceeded{};
+    uint64_t setting_lookups_per_attempt = 0;
+    uint64_t window_tasks_started        = 0;
+    std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 
   SiriusContext();
@@ -723,6 +739,15 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
+  void record_scan_certification(sirius::op::scan::eligibility_certificate const& certificate);
+  void record_certification_budget(bool time, bool bytes, uint64_t lookups);
+  void record_scan_lowering(uint64_t contract);
+  void record_delete_preparation(uint64_t elapsed_us);
+  std::shared_ptr<std::atomic<uint64_t>> window_task_counter() const
+  {
+    return window_tasks_started_;
+  }
+  void record_semantic_decline(sirius::op::scan::verdict_reason reason) noexcept;
 
   /// Shared event source for planning, pinning, and execution observations.
   [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
@@ -859,12 +884,18 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::shared_ptr<std::atomic<uint64_t>> window_tasks_started_ =
+    std::make_shared<std::atomic<uint64_t>>(0);
+  mutable std::mutex certification_stats_mutex_;
+  transparent_execution_stats certification_stats_;
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
   std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
   std::atomic<uint64_t> lease_held_at_replay_count_{0};
+  std::array<std::atomic<uint64_t>, transparent_execution_stats::semantic_reason_count>
+    semantic_decline_counts_{};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
