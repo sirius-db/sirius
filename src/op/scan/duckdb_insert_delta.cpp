@@ -16,6 +16,8 @@
 
 #include "op/scan/duckdb_insert_delta.hpp"
 
+#include "helper/type_conversions.hpp"
+
 #include <cudf/utilities/bit.hpp>
 
 #include <duckdb/common/enums/scan_options.hpp>
@@ -126,6 +128,7 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
     out_seg.segment_start = lo - k;
     out_seg.segment_count = hi - lo;
     out_seg.compression   = compression;
+    out_seg.is_transient  = segment.segment_type == duckdb::ColumnSegmentType::TRANSIENT;
 
     if (all_null_validity) {
       // Nothing to stage or read; the marker alone drives the decode.
@@ -176,13 +179,21 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
                       std::to_string(rg_index) +
                       " straddles the delta boundary — positional drift");
       }
-      bool const supported = is_validity ? is_supported_validity_compression(compression)
-                                         : is_supported_data_compression(compression);
+      bool const supported =
+        is_validity ? is_supported_validity_compression(compression)
+                    : native_matrix_supports(sirius::to_duckdb(type).id(),
+                                             compression,
+                                             duckdb::CompressionType::COMPRESSION_CONSTANT);
       if (!supported ||
           (is_varchar && compression == duckdb::CompressionType::COMPRESSION_CONSTANT)) {
-        throw_capture("persistent delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) + ": unsupported compression " +
-                      duckdb::CompressionTypeToString(compression));
+        throw unsupported_physical_input(
+          0,
+          "row_group=" + std::to_string(rg_index),
+          is_validity ? verdict_reason::native_validity_codec
+                      : verdict_reason::native_segment_codec,
+          std::string(kTag) + " persistent delta segment on column " + std::to_string(column_id) +
+            " row group " + std::to_string(rg_index) + ": unsupported compression " +
+            duckdb::CompressionTypeToString(compression));
       }
       if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         // CONSTANT segments have no backing block (GetBlockSize() would
@@ -210,14 +221,22 @@ void walk_delta_tree(duckdb::ColumnSegmentTree& tree,
       // plan-time table-stat probe normally declines first; this catches
       // stats drift.
       if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
-        throw_capture("varchar delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
+        throw unsupported_physical_input(
+          0,
+          "row_group=" + std::to_string(rg_index),
+          verdict_reason::native_varchar_overflow,
+          std::string(kTag) + " varchar delta segment on column " + std::to_string(column_id) +
+            " row group " + std::to_string(rg_index) + ": Max String Length stat absent");
       }
       auto const max_len = duckdb::StringStats::MaxStringLength(segment.stats.statistics);
       if (max_len >= duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
-        throw_capture("varchar delta segment on column " + std::to_string(column_id) +
-                      " row group " + std::to_string(rg_index) +
-                      ": max string length reaches the overflow-block limit");
+        throw unsupported_physical_input(0,
+                                         "row_group=" + std::to_string(rg_index),
+                                         verdict_reason::native_varchar_overflow,
+                                         std::string(kTag) + " varchar delta segment on column " +
+                                           std::to_string(column_id) + " row group " +
+                                           std::to_string(rg_index) +
+                                           ": max string length reaches the overflow-block limit");
       }
       out_seg.max_string_length = static_cast<std::uint32_t>(max_len);
     }

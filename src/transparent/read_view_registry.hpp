@@ -91,6 +91,10 @@ struct read_view_registry_entry {
 // Dispatcher threads only read published entries; mutation must not overlap those reads.
 class read_view_registry {
  public:
+  op::scan::test_injections injections;
+  std::shared_ptr<op::scan::physical_profile_table> profiles =
+    std::make_shared<op::scan::physical_profile_table>();
+
   [[nodiscard]] read_view_registry_entry const& entry(op::scan::scan_contract_id id) const;
   [[nodiscard]] read_view_registry_entry const& entry_for_scan_node(uint64_t scan_node_id) const;
   [[nodiscard]] std::vector<read_view_registry_entry> const& entries() const noexcept

@@ -39,6 +39,8 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
+  op::scan::pin_validation validation;
+  op::scan::scan_contract_id contract_id = 0;
   /// One cached chunk or one insert-delta split, plus its (optional)
   /// per-query MVCC keep-mask. A batch carries either @ref data (resident
   /// cached chunk) or @ref scan_info (delta split, yielded after the

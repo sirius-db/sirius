@@ -107,7 +107,11 @@ duckdb::LogicalType map_int64(pq::SchemaElement const& el)
 {
   if (el.logical_type.has_value()) {
     switch (el.logical_type->type) {
-      case pq::LogicalType::TIMESTAMP: return duckdb::LogicalType::TIMESTAMP;
+      case pq::LogicalType::TIMESTAMP:
+        if (el.logical_type->timestamp_type &&
+            el.logical_type->timestamp_type->unit.type == pq::TimeUnit::NANOS)
+          return duckdb::LogicalType::TIMESTAMP_NS;
+        return duckdb::LogicalType::TIMESTAMP;
       case pq::LogicalType::TIME: return duckdb::LogicalType::TIME;
       case pq::LogicalType::INTEGER:
         if (el.logical_type->int_type.has_value()) {
@@ -151,8 +155,39 @@ duckdb::LogicalType map_byte_array(pq::SchemaElement const& el)
   return duckdb::LogicalType::BLOB;
 }
 
-duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el)
+duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el, bool decoded = false)
 {
+  if (decoded) {
+    if (el.logical_type && el.logical_type->type == pq::LogicalType::UNDEFINED)
+      return duckdb::LogicalType::SQLNULL;  // annotation unsupported by the pinned decoder
+    // Match the pinned cuDF decoder's temporal units. Duration columns have
+    // no DuckDB export mapping, even when their physical storage is INT64.
+    if (el.type == pq::Type::INT64 && el.arrow_type && !el.logical_type && !el.converted_type)
+      return duckdb::LogicalType::SQLNULL;
+    if (el.logical_type && el.logical_type->type == pq::LogicalType::TIME)
+      return duckdb::LogicalType::SQLNULL;
+    if (el.logical_type && el.logical_type->type == pq::LogicalType::TIMESTAMP &&
+        el.logical_type->timestamp_type) {
+      // cuDF drops the UTC annotation. Exporting that timezone-free column
+      // cannot implement DuckDB's TIMESTAMPTZ conversion, so do not qualify it.
+      if (el.logical_type->timestamp_type->isAdjustedToUTC) return duckdb::LogicalType::SQLNULL;
+      switch (el.logical_type->timestamp_type->unit.type) {
+        case pq::TimeUnit::MILLIS: return duckdb::LogicalType::TIMESTAMP_MS;
+        case pq::TimeUnit::MICROS: return duckdb::LogicalType::TIMESTAMP;
+        case pq::TimeUnit::NANOS: return duckdb::LogicalType::TIMESTAMP_NS;
+      }
+    }
+    if (!el.logical_type && el.converted_type) {
+      switch (*el.converted_type) {
+        case pq::ConvertedType::TIMESTAMP_MILLIS: return duckdb::LogicalType::TIMESTAMP_MS;
+        case pq::ConvertedType::TIMESTAMP_MICROS: return duckdb::LogicalType::TIMESTAMP;
+        case pq::ConvertedType::TIME_MILLIS:
+        case pq::ConvertedType::TIME_MICROS: return duckdb::LogicalType::SQLNULL;
+        default: break;
+      }
+    }
+    if (el.type == pq::Type::INT96) return duckdb::LogicalType::TIMESTAMP_NS;
+  }
   if (is_decimal(el)) { return map_decimal(el); }
   switch (el.type) {
     case pq::Type::BOOLEAN: return duckdb::LogicalType::BOOLEAN;
@@ -197,14 +232,14 @@ struct mapped_subtree {
 // Map the subtree rooted at `idx` (preorder) to a DuckDB LogicalType, advancing
 // past it so the caller resumes at the next sibling. Throws on a truncated or
 // malformed nested subtree.
-mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
+mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx, bool decoded)
 {
   if (idx >= meta.schema.size()) {
     throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
   }
   auto const& el = meta.schema[idx];
 
-  if (el.num_children == 0) { return {leaf_to_duckdb_type(el), idx + 1}; }
+  if (el.num_children == 0) { return {leaf_to_duckdb_type(el, decoded), idx + 1}; }
 
   if (is_map_annotated(el)) {
     // el -> key_value group (idx+1) -> key (idx+2), value (after key subtree)
@@ -213,8 +248,8 @@ mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
       throw std::runtime_error("[parquet_helpers] malformed parquet MAP schema for column '" +
                                el.name + "'");
     }
-    auto key   = map_subtree(meta, kv + 1);
-    auto value = map_subtree(meta, key.next);
+    auto key   = map_subtree(meta, kv + 1, decoded);
+    auto value = map_subtree(meta, key.next, decoded);
     return {duckdb::LogicalType::MAP(std::move(key.type), std::move(value.type)), value.next};
   }
 
@@ -225,7 +260,7 @@ mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
       throw std::runtime_error("[parquet_helpers] malformed parquet LIST schema for column '" +
                                el.name + "'");
     }
-    auto element = map_subtree(meta, mid + 1);
+    auto element = map_subtree(meta, mid + 1, decoded);
     return {duckdb::LogicalType::LIST(std::move(element.type)), element.next};
   }
 
@@ -237,7 +272,7 @@ mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
       throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
     }
     auto const child_name = meta.schema[cur].name;
-    auto child            = map_subtree(meta, cur);
+    auto child            = map_subtree(meta, cur, decoded);
     children.emplace_back(child_name, std::move(child.type));
     cur = child.next;
   }
@@ -246,7 +281,24 @@ mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
 
 }  // namespace
 
-schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta)
+duckdb::LogicalType leaf_schema_type(pq::SchemaElement const& element)
+{
+  // The Iceberg comparison uses DuckDB's parquet_schema type spelling,
+  // including UTC annotations that cuDF does not retain in its output type.
+  if (element.logical_type) {
+    auto const& logical = *element.logical_type;
+    if (logical.type == pq::LogicalType::TIMESTAMP && logical.timestamp_type &&
+        logical.timestamp_type->isAdjustedToUTC)
+      return duckdb::LogicalType::TIMESTAMP_TZ;
+    if (logical.type == pq::LogicalType::TIME && logical.time_type &&
+        logical.time_type->isAdjustedToUTC)
+      return duckdb::LogicalType::TIME_TZ;
+    if (logical.type == pq::LogicalType::UNKNOWN) return duckdb::LogicalType::SQLNULL;
+  }
+  return leaf_to_duckdb_type(element);
+}
+
+schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta, bool decoded)
 {
   if (meta.schema.empty()) { throw std::runtime_error("[parquet_helpers] empty parquet schema"); }
 
@@ -262,7 +314,7 @@ schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta)
       throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
     }
     out.names.push_back(meta.schema[idx].name);
-    auto mapped = map_subtree(meta, idx);
+    auto mapped = map_subtree(meta, idx, decoded);
     out.types.push_back(std::move(mapped.type));
     idx = mapped.next;
   }

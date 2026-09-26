@@ -22,10 +22,15 @@
 #include <duckdb/common/column_index.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -63,10 +68,49 @@ enum class later_check : uint8_t {
   host_staged,
   key_held
 };
-using later_check_set       = std::bitset<8>;
-using validation_set        = std::bitset<8>;
-using leaf_set              = std::vector<bool>;
-using profile_id            = uint32_t;
+using later_check_set = std::bitset<8>;
+using validation_set  = std::bitset<8>;
+using leaf_set        = std::vector<bool>;
+using profile_id      = uint32_t;
+struct physical_check_counters;
+struct physical_column_profile {
+  uint32_t type                  = 0;
+  uint64_t data_codecs           = 0;
+  uint64_t validity_or_encodings = 0;
+  bool type_mismatch             = false;
+  uint32_t logical_annotation    = 0;
+  uint32_t converted_annotation  = 0;
+  int32_t scale                  = 0;
+  int32_t precision              = 0;
+};
+struct physical_profile {
+  uint64_t storage_version = 0;
+  std::vector<physical_column_profile> columns;
+};
+// Owned by the query registry (or a direct pin's ingestible); workers append
+// under a lock. Certificates carry only fixed-size ids and shared dependencies.
+class physical_profile_table {
+ public:
+  std::shared_ptr<physical_check_counters> counters;
+  profile_id add(physical_profile profile)
+  {
+    std::lock_guard lock(mutex_);
+    if (profiles_.size() >= std::numeric_limits<profile_id>::max())
+      throw std::overflow_error("physical profile id space exhausted");
+    profiles_.push_back(std::move(profile));
+    return static_cast<profile_id>(profiles_.size());
+  }
+  physical_profile get(profile_id id) const
+  {
+    std::lock_guard lock(mutex_);
+    if (!id) throw std::out_of_range("unevaluated physical profile");
+    return profiles_.at(id - 1);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<physical_profile> profiles_;
+};
 using parquet_physical_type = cudf::io::parquet::Type;
 using parquet_logical_type  = cudf::io::parquet::LogicalType;
 
@@ -83,6 +127,9 @@ struct effective_reader_projection {
   std::vector<uint32_t> filter;
   std::vector<uint32_t> carrier;
   bool natural_read = false;
+  // Reader data-column order (D-space), including filter-only inputs.
+  std::vector<std::string> names;
+  std::vector<duckdb::LogicalType> bound_types;
 };
 
 enum class verdict_reason : uint16_t {
@@ -125,6 +172,48 @@ enum class verdict_reason : uint16_t {
   budget_bytes,
   evidence_missing,
   interface_unavailable
+};
+
+struct physical_check_counters {
+  // Installed before a test query, cleared only after its workers have joined.
+  // true = before footer processing, false = after successful cuDF decode.
+  std::function<void(std::string const&, bool)> parquet_phase_for_testing;
+  void parquet_phase(std::string const& file, bool footer) const
+  {
+    if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);
+  }
+
+  std::atomic<bool> track_units{false};  // latched when the test process creates its planner
+  mutable std::mutex units_mutex;
+  std::map<std::string, uint64_t> parquet_reader_calls;
+  std::map<std::string, uint64_t> native_decoder_calls;
+  void reader_call(std::string const& file)
+  {
+    if (!track_units) return;
+    std::lock_guard lock(units_mutex);
+    ++parquet_reader_calls[file];
+  }
+  void decoder_call(std::string const& group)
+  {
+    if (!track_units) return;
+    std::lock_guard lock(units_mutex);
+    ++native_decoder_calls[group];
+  }
+  std::atomic<uint64_t> checks{0};
+  std::array<std::atomic<uint64_t>,
+             static_cast<std::size_t>(verdict_reason::interface_unavailable) + 1>
+    rejections{};
+  std::atomic<uint64_t> type_mismatches{0};
+  std::atomic<uint64_t> type_refusals{0};
+  void record(verdict_reason reason, uint64_t mismatches = 0)
+  {
+    checks.fetch_add(1, std::memory_order_relaxed);
+    type_mismatches.fetch_add(mismatches, std::memory_order_relaxed);
+    if (reason != verdict_reason::none)
+      rejections[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (reason == verdict_reason::parquet_type_unqualified)
+      type_refusals.fetch_add(1, std::memory_order_relaxed);
+  }
 };
 
 struct certification_cost {
@@ -185,6 +274,15 @@ struct certification_result {
   certification_cost cost;
   std::optional<uint64_t> storage_version;
   leaf_set semantic_columns;
+};
+
+struct pin_validation {
+  struct check {
+    bool applies = false;
+    bool passed  = false;
+  };
+  check identity, layout, iteration, visibility, structure;
+  uint64_t query_token = 0;
 };
 
 struct key_held_witness {
@@ -289,6 +387,7 @@ struct predicate_contract {
   std::string pushdown_mode;
 };
 struct bound_table_scan {
+  std::shared_ptr<physical_profile_table> profiles;
   uint64_t scan_node_id     = 0;
   duckdb::idx_t table_index = duckdb::DConstants::INVALID_INDEX;
   std::shared_ptr<bound_read_view const> view;
@@ -310,6 +409,7 @@ struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;
   std::shared_ptr<io::sirius_datasource> datasource;
   std::optional<uint64_t> checkpoint_iteration;
+  std::shared_ptr<physical_profile_table> profiles;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {

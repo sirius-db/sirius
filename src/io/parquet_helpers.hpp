@@ -56,6 +56,9 @@ struct schema_info {
 ///
 /// @throws std::runtime_error on a malformed / truncated nested subtree or an
 ///         unsupported physical type.
-schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta);
+duckdb::LogicalType leaf_schema_type(cudf::io::parquet::SchemaElement const& element);
+
+/// With decoded=true, preserve cuDF temporal units and mark unexportable durations SQLNULL.
+schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta, bool decoded = false);
 
 }  // namespace sirius::io::parquet_helpers

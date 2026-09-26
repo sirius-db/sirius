@@ -16,6 +16,7 @@
 
 #include "op/scan/duckdb_native_metadata.hpp"
 
+#include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata_cache.hpp"
 #include "op/scan/metadata_walk_parallel.hpp"
@@ -202,7 +203,8 @@ struct array_column_access : duckdb::ArrayColumnData {
 std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
                                              duckdb::idx_t column_id,
                                              std::size_t rg_idx,
-                                             duckdb_column_metadata& col_md)
+                                             duckdb_column_metadata& col_md,
+                                             verdict_reason& reason_out)
 {
   // Walk a fixed-width data segment tree into out
   auto walk_data = [&](duckdb::ColumnSegmentTree& tree,
@@ -230,6 +232,7 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
       auto& segment          = node.GetNode();
       auto const compression = segment.GetCompressionFunction().type;
       if (!is_supported_validity_compression(compression)) {
+        reason_out = verdict_reason::native_validity_codec;
         return std::string(label) + " segment on column " + std::to_string(column_id) +
                " row group " + std::to_string(rg_idx) + ": unsupported compression " +
                duckdb::CompressionTypeToString(compression);
@@ -289,7 +292,8 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
                                                 bool is_varchar,
                                                 duckdb::idx_t column_id,
                                                 std::size_t rg_idx,
-                                                duckdb_column_metadata& col_md)
+                                                duckdb_column_metadata& col_md,
+                                                verdict_reason& reason_out)
 {
   auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
   if (!std_col) {
@@ -317,6 +321,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
       // Read the per-segment Max String Length stat TYPED (exact)
       // Absent stat -> refuse so consumers deref unchecked.
       if (!duckdb::StringStats::HasMaxStringLength(segment.stats.statistics)) {
+        reason_out = verdict_reason::native_varchar_overflow;
         return "varchar segment on column " + std::to_string(column_id) + " row group " +
                std::to_string(rg_idx) + ": Max String Length stat absent from segment stats";
       }
@@ -325,6 +330,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
       // decoder. Mirrors the refusal in prepare_duckdb_native_walk (see rationale there).
       if (*desc.max_string_length >=
           duckdb::StringUncompressed::GetStringBlockLimit(segment.GetBlockSize())) {
+        reason_out = verdict_reason::native_varchar_overflow;
         return "varchar segment on column " + std::to_string(column_id) + " row group " +
                std::to_string(rg_idx) +
                ": max string length reaches the overflow-block limit; overflow strings are not "
@@ -339,6 +345,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
     auto& segment          = node.GetNode();
     auto const compression = segment.GetCompressionFunction().type;
     if (!is_supported_validity_compression(compression)) {
+      reason_out = verdict_reason::native_validity_codec;
       return "validity segment on column " + std::to_string(column_id) + " row group " +
              std::to_string(rg_idx) + ": unsupported compression " +
              duckdb::CompressionTypeToString(compression);
@@ -785,6 +792,83 @@ std::optional<std::string> unsupported_projected_type_reason(
   return std::nullopt;
 }
 
+physical_profile native_row_group_profile(duckdb_row_group_metadata const& group,
+                                          std::span<sirius::logical_type const> types,
+                                          uint64_t storage_version)
+{
+  physical_profile profile;
+  profile.storage_version = storage_version;
+  auto mask               = [](auto const& segments) {
+    uint64_t bits = 0;
+    for (auto const& segment : segments) {
+      auto value = static_cast<unsigned>(segment.compression);
+      if (value >= 64) throw std::logic_error("native codec does not fit profile");
+      bits |= uint64_t{1} << value;
+    }
+    return bits;
+  };
+  for (std::size_t i = 0; i < group.columns.size(); ++i) {
+    auto const& column    = group.columns[i];
+    auto const& type      = types[i];
+    auto const& data_type = column.is_array ? type.array_child() : type;
+    profile.columns.push_back(
+      {static_cast<uint32_t>(sirius::to_duckdb(data_type).id()),
+       mask(column.is_array ? column.array_child_data_segments : column.data_segments),
+       mask(column.is_array ? column.array_child_validity_segments : column.validity_segments),
+       false});
+    if (column.is_array)
+      profile.columns.push_back({static_cast<uint32_t>(duckdb::LogicalTypeId::ARRAY),
+                                 0,
+                                 mask(column.data_segments),
+                                 false});
+  }
+  return profile;
+}
+
+bool native_matrix_supports(duckdb::LogicalTypeId type,
+                            duckdb::CompressionType data,
+                            duckdb::CompressionType validity) noexcept
+{
+  using C = duckdb::CompressionType;
+  using T = duckdb::LogicalTypeId;
+  if (!is_supported_validity_compression(validity)) return false;
+  if (type == T::VARCHAR) {
+    return data == C::COMPRESSION_UNCOMPRESSED || data == C::COMPRESSION_DICTIONARY ||
+           data == C::COMPRESSION_FSST || data == C::COMPRESSION_DICT_FSST;
+  }
+  // Mirrors duckdb_native_decoder and the fixed-width CUDA dispatchers. ARRAY
+  // callers validate the fixed-width child, never the container as a scalar.
+  switch (type) {
+    case T::BOOLEAN:
+    case T::TINYINT:
+    case T::UTINYINT:
+    case T::SMALLINT:
+    case T::USMALLINT:
+    case T::INTEGER:
+    case T::UINTEGER:
+    case T::BIGINT:
+    case T::UBIGINT:
+    case T::DECIMAL:
+    case T::DATE:
+    case T::TIMESTAMP_SEC:
+    case T::TIMESTAMP_MS:
+    case T::TIMESTAMP:
+    case T::TIMESTAMP_NS:
+    case T::FLOAT:
+    case T::DOUBLE: break;
+    default: return false;
+  }
+  switch (data) {
+    case C::COMPRESSION_UNCOMPRESSED:
+    case C::COMPRESSION_CONSTANT:
+    case C::COMPRESSION_RLE: return true;
+    case C::COMPRESSION_BITPACKING: return type != T::FLOAT && type != T::DOUBLE;
+    case C::COMPRESSION_ALP:
+    case C::COMPRESSION_ALPRD: return type == T::FLOAT || type == T::DOUBLE;
+    default: return false;
+  }
+}
+
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
   switch (c) {
@@ -1044,15 +1128,38 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
                         ? walk_array_column(row_group->GetRawColumnData(pc.storage_idx),
                                             pc.storage_idx.GetPrimaryIndex(),
                                             rg,
-                                            rg_md.columns[ci])
+                                            rg_md.columns[ci],
+                                            result.failure_reason)
                         : walk_standard_column(row_group->GetRawColumnData(pc.storage_idx),
                                                projected_types[ci].is_varchar(),
                                                pc.storage_idx.GetPrimaryIndex(),
                                                rg,
-                                               rg_md.columns[ci]);
+                                               rg_md.columns[ci],
+                                               result.failure_reason);
         if (reason) {
           refuse(std::move(*reason));
           return result;
+        }
+        auto& column       = rg_md.columns[ci];
+        auto const logical = sirius::to_duckdb(projected_types[ci]);
+        auto const type    = projected_types[ci].is_array()
+                               ? duckdb::ArrayType::GetChildType(logical).id()
+                               : logical.id();
+        auto& data = column.is_array ? column.array_child_data_segments : column.data_segments;
+        if (plan.synthetic_data_codec && !data.empty())
+          data.front().compression = *plan.synthetic_data_codec;
+        for (auto const& segment : data) {
+          if (!native_matrix_supports(
+                type, segment.compression, duckdb::CompressionType::COMPRESSION_CONSTANT)) {
+            throw unsupported_physical_input(
+              0,
+              "row_group=" + std::to_string(rg),
+              verdict_reason::native_segment_codec,
+              "data segment on column " + std::to_string(pc.storage_idx.GetPrimaryIndex()) +
+                " row group " + std::to_string(rg) + ": unsupported compression " +
+                std::to_string(static_cast<unsigned>(segment.compression)) + " for " +
+                logical.ToString());
+          }
         }
       }
     }

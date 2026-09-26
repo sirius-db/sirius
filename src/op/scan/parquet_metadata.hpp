@@ -17,6 +17,7 @@
 #pragma once
 
 #include "io/types.hpp"
+#include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
 
@@ -40,8 +41,11 @@ namespace sirius::op::scan {
 class parquet_metadata final : public sirius::io::io_object_metadata {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
-                   std::size_t footer_byte_len)
-    : _file_metadata(std::move(file_metadata)), _footer_byte_len(footer_byte_len)
+                   std::size_t footer_byte_len,
+                   parquet_encryption_evidence encryption = {})
+    : encryption_evidence(encryption),
+      _file_metadata(std::move(file_metadata)),
+      _footer_byte_len(footer_byte_len)
   {
   }
 
@@ -52,6 +56,8 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
   }
 
   [[nodiscard]] std::size_t footer_byte_len() const noexcept { return _footer_byte_len; }
+
+  parquet_encryption_evidence const encryption_evidence;
 
  private:
   std::shared_ptr<cudf::io::parquet::FileMetaData const> _file_metadata;

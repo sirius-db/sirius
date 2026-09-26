@@ -352,6 +352,11 @@ class SiriusContext : public ClientContextState {
     std::array<uint64_t, 2> budget_exceeded{};
     uint64_t setting_lookups_per_attempt = 0;
     uint64_t window_tasks_started        = 0;
+    std::map<std::string, uint64_t> parquet_reader_calls, native_decoder_calls;
+    uint64_t split_physical_checks = 0;
+    std::array<uint64_t, semantic_reason_count> split_physical_rejections{};
+    uint64_t parquet_type_mismatch_observed = 0;
+    uint64_t parquet_type_refusals          = 0;
     std::unordered_map<uint64_t, uint64_t> scan_lowerings;
   };
 
@@ -750,6 +755,10 @@ class SiriusContext : public ClientContextState {
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
   void record_scan_certification(sirius::op::scan::eligibility_certificate const& certificate);
   void record_certification_budget(bool time, bool bytes, uint64_t lookups);
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters() const
+  {
+    return physical_counters_;
+  }
   void record_scan_lowering(uint64_t contract);
   void record_delete_preparation(uint64_t elapsed_us);
   std::shared_ptr<std::atomic<uint64_t>> window_task_counter() const
@@ -895,6 +904,8 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
+    std::make_shared<sirius::op::scan::physical_check_counters>();
   std::shared_ptr<std::atomic<uint64_t>> window_tasks_started_ =
     std::make_shared<std::atomic<uint64_t>>(0);
   mutable std::mutex certification_stats_mutex_;
