@@ -211,3 +211,35 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
     run_ok("CHECKPOINT");
   }
 }
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Pinned query rejects stale resident evidence before publication",
+                 "[scan][native][matrix][certificate][consumption][integration]")
+{
+  run_ok("CREATE TABLE admission_pin AS SELECT i::INTEGER x FROM range(128) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("CALL pin_table(format='duckdb', name='admission_pin', tier='host')");
+  compare_gpu_vs_cpu("SELECT x FROM admission_pin");
+  run_ok("SET sirius_test_invalidate_pin_witness=true");
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  auto result = con->Query("SELECT sum(x) FROM admission_pin");
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->GetValue(0, 0).ToString() == "8128");
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+  CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  CHECK(after.certificate_mismatches == before.certificate_mismatches);
+  run_ok("SET enable_duckdb_fallback=false");
+  before = sirius::test::get_transparent_execution_stats(*con);
+  result = con->Query("SELECT sum(x) FROM admission_pin");
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("resident certificate incomplete: query token mismatch") !=
+        std::string::npos);
+  after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  run_ok("SET enable_duckdb_fallback=true");
+  run_ok("SET sirius_test_invalidate_pin_witness=false");
+  compare_gpu_vs_cpu("SELECT x FROM admission_pin");
+  run_ok("CALL unpin_table('admission_pin')");
+}

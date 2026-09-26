@@ -335,6 +335,7 @@ class SiriusContext : public ClientContextState {
     uint64_t classification_failures          = 0;
     uint64_t read_view_mismatches             = 0;
     uint64_t certificate_mismatches           = 0;
+    uint64_t certificate_incompletes          = 0;
     uint64_t execution_rebuilds               = 0;
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
@@ -737,6 +738,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
+  void record_transparent_certificate_incomplete() noexcept;
 
   /// \brief Record a CPU/candidate bound read-view comparison failure.
   void record_transparent_read_view_mismatch() noexcept;
@@ -906,6 +908,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_certificate_incomplete_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
   std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
   std::atomic<uint64_t> lease_held_at_replay_count_{0};

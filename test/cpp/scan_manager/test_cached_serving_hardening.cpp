@@ -38,6 +38,7 @@
 // through the same metadata, so several fixtures here carry no storage at all.
 
 #include "operator/operator_test_utils.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -414,6 +415,10 @@ sirius::scan_manager::mvcc_chunk_mask make_test_mask(std::size_t rows)
 /// order, then either ends the stream or throws — the provider behaviors the
 /// drain must handle.
 struct scripted_provider final : databatch_provider {
+  scripted_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   std::vector<sirius::scan_manager::mvcc_chunk_mask> masks;
   std::vector<bool> converting;
@@ -1877,4 +1882,60 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
     REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
   }
+}
+
+TEST_CASE("Resident refusal closes the connector and separates certificate counters",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 17;
+  provider.batches                = {make_test_batch(e, 4)};
+  split_connector connector;
+  std::stop_source stop;
+  duckdb::SiriusContext observer;
+  bool native_pin = false;
+  bool mismatch   = false;
+  SECTION("stale token") { provider.validation.query_token++; }
+  SECTION("identity absent") { provider.validation.identity.applies = false; }
+  SECTION("native checks absent") { native_pin = true; }
+  SECTION("different contract")
+  {
+    provider.contract_id++;
+    mismatch = true;
+  }
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, connector, stop.get_token(), false, 81, 17, &observer, false, native_pin);
+  CHECK(connector.peek_resident_batches().empty());
+  CHECK_FALSE(connector.is_closed());  // terminal exception remains schedulable
+  if (mismatch) {
+    REQUIRE_THROWS_WITH(connector.get_next_split(), "resident scan contract mismatch");
+  } else {
+    REQUIRE_THROWS_AS(connector.get_next_split(), certificate_incomplete);
+  }
+  auto stats = observer.get_transparent_execution_stats();
+  CHECK(stats.certificate_mismatches == (mismatch ? 1 : 0));
+  CHECK(stats.certificate_incompletes == (mismatch ? 0 : 1));
+}
+
+TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
+          "[cached_serving][scan_manager][certificate][consumption]")
+{
+  using namespace sirius::op::scan;
+  auto& e = env();
+  duckdb::SiriusContext observer;
+  sirius_gpu_scan_operator scan({}, 4, nullptr, &observer, nullptr, 81);
+  scan.set_query_validation(17, {});
+  scripted_provider provider;
+  provider.contract_id            = 81;
+  provider.validation.query_token = 18;
+  provider.batches                = {make_test_batch(e, 4)};
+  std::stop_source stop;
+  load_balancing_scan_batch_coalescer::drain_cached_provider(
+    provider, scan.get_split_connector(), stop.get_token(), false, 81, 18);
+  REQUIRE_THROWS_AS(scan.get_next_task_input_data(), certificate_incomplete);
+  CHECK(observer.get_transparent_execution_stats().certificate_incompletes == 1);
+  CHECK(observer.get_transparent_execution_stats().certificate_mismatches == 0);
 }

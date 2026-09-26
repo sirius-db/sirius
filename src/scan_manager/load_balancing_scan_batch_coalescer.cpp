@@ -18,9 +18,12 @@
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
+#include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <stop_token>
 #include <utility>
@@ -64,6 +67,7 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   // op's row filter (when present) runs against every drained split — record
   // that so each split's working-set estimate covers the filter-by-copy peak.
   state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
+  state.scan_op            = scan_op;
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -175,10 +179,22 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
+  auto* scan = state.scan_op;
+  if (!scan) {
+    state.connector->close(std::make_exception_ptr(
+      std::logic_error("cached scan slot is missing its scan operator")));
+    return;
+  }
   drain_cached_provider(*state.batch_provider,
                         *state.connector,
                         stop,
                         state.row_filter_pending,
+                        scan->contract_id(),
+                        scan->query_token(),
+                        scan->certificate_observer(),
+                        scan->read_views() && scan->read_views()->injections.invalidate_pin_witness,
+                        dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+                          &scan->get_ingestible().table_info()) != nullptr,
                         state.readahead,
                         state.op_id);
 }
@@ -187,7 +203,47 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
   databatch_provider& provider,
   split_connector& connector,
   std::stop_token const& stop,
+  bool row_filter_pending)
+{
+  drain_cached_provider(provider,
+                        connector,
+                        stop,
+                        row_filter_pending,
+                        op::scan::scan_contract_id{0},
+                        uint64_t{0});
+}
+
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
   bool row_filter_pending,
+  std::shared_ptr<readahead_scan_manager> readahead,
+  std::size_t operator_id)
+{
+  drain_cached_provider(provider,
+                        connector,
+                        stop,
+                        row_filter_pending,
+                        op::scan::scan_contract_id{0},
+                        uint64_t{0},
+                        nullptr,
+                        false,
+                        false,
+                        std::move(readahead),
+                        operator_id);
+}
+
+void load_balancing_scan_batch_coalescer::drain_cached_provider(
+  databatch_provider& provider,
+  split_connector& connector,
+  std::stop_token const& stop,
+  bool row_filter_pending,
+  op::scan::scan_contract_id expected,
+  uint64_t query_token,
+  duckdb::SiriusContext* observer,
+  bool invalidate_witness,
+  bool native_pin,
   std::shared_ptr<readahead_scan_manager> readahead,
   std::size_t operator_id)
 {
@@ -202,8 +258,32 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
       if (next.data) {
+        auto validation = provider.validation;
+        if (expected != 0) {
+          // Nothing has published this batch yet: even the memory prefetcher
+          // must only see batches that passed admission for this operator/query.
+          if (invalidate_witness) validation.query_token ^= 1;
+          try {
+            if (provider.contract_id != expected)
+              throw std::runtime_error("resident scan contract mismatch");
+            if (native_pin && (!validation.iteration.applies || !validation.visibility.applies))
+              throw op::scan::certificate_incomplete(
+                expected, {}, "resident native applicability missing");
+            op::scan::admit_resident_batch(expected, validation, query_token);
+          } catch (op::scan::certificate_incomplete const&) {
+            if (observer) observer->record_transparent_certificate_incomplete();
+            throw;
+          } catch (...) {
+            if (observer) observer->record_transparent_certificate_mismatch();
+            throw;
+          }
+        }
         auto split = std::make_unique<op::scan::scan_operator_input>(
           std::move(next.data), readahead, operator_id);
+        if (expected != 0) {
+          split->resident_contract_id = expected;
+          split->resident_validation  = validation;
+        }
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;

@@ -1911,11 +1911,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  con->Query("SET disabled_optimizers = 'extension'");
+  // This setting is DB-global: preserve Sirius's extension-load optimizer mask
+  // for later tests sharing this database, rather than RESET to DuckDB defaults.
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "extension");
   expect_iceberg_rows("SELECT * FROM " + pinned_scan(path) + " ORDER BY count;",
                       gpu_route::plan_fallback,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
@@ -1927,11 +1925,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   auto path  = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
   auto query = "SELECT * FROM " + pinned_scan(path) + " ORDER BY count";
-  struct optimizer_reset {
-    duckdb::Connection& connection;
-    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
-  } reset{*con};
-  REQUIRE_FALSE(con->Query("SET disabled_optimizers = 'extension'")->HasError());
+  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "extension");
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = false")->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
 

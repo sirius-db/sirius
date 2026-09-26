@@ -43,6 +43,10 @@ namespace {
 // Serves one batch, then holds the stream open until released, then ends it. push_split is
 // private, so the connector is fed through drain_cached_provider, as the sequencer feeds it.
 struct gated_provider final : databatch_provider {
+  gated_provider()
+  {
+    validation.identity = validation.layout = validation.structure = {true, true};
+  }
   std::shared_ptr<cucascade::data_batch> first;
   std::promise<void> release;
   std::shared_future<void> released = release.get_future().share();

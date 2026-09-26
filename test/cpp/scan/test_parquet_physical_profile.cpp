@@ -263,6 +263,7 @@ TEST_CASE("Iceberg per-file schema comparison preserves field ids and reasons",
   iceberg_table_schema table{{{"x", 1, "INTEGER"}}};
   auto check = [&] { return check_iceberg_file_schema(f.metadata, table, "fixture.parquet"); };
   REQUIRE(check().approved);
+  CHECK(check().validation == check_bit(later_check::schema_per_file));
   field.field_id.reset();
   CHECK(check().reason == verdict_reason::iceberg_schema_no_field_ids);
   field.field_id = 2;
