@@ -27,6 +27,8 @@
 #include <utils/parquet_fixture_utils.hpp>
 
 #include <fstream>
+#include <future>
+#include <latch>
 #include <set>
 #include <sstream>
 
@@ -228,6 +230,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  auto const cause = static_cast<size_t>(sirius::transparent::late_failure_cause::certificate);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause] + 1);
   CHECK(after.certificate_mismatches == before.certificate_mismatches);
   run_ok("SET enable_duckdb_fallback=false");
   before = sirius::test::get_transparent_execution_stats(*con);
@@ -238,8 +243,51 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause]);
   run_ok("SET enable_duckdb_fallback=true");
   run_ok("SET sirius_test_invalidate_pin_witness=false");
   compare_gpu_vs_cpu("SELECT x FROM admission_pin");
   run_ok("CALL unpin_table('admission_pin')");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Concurrent readers of one pin validate their own witnesses",
+                 "[scan][native][matrix][certificate][integration]")
+{
+  run_ok("CREATE TABLE shared_pin AS SELECT i::INTEGER x FROM range(8192) t(i)");
+  run_ok("CHECKPOINT");
+  run_ok("CALL pin_table(format='duckdb', name='shared_pin', tier='host')");
+  auto database = con->Query("SELECT current_database()");
+  REQUIRE_FALSE(database->HasError());
+  auto other =
+    std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+  auto use = other->Query("USE " + database->GetValue(0, 0).ToString());
+  REQUIRE_FALSE(use->HasError());
+  REQUIRE_FALSE(other->Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET sirius_test_invalidate_pin_witness=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET sirius_test_pause_after_certify_ms=100")->HasError());
+  REQUIRE_FALSE(other->Query("SET sirius_test_pause_after_certify_ms=100")->HasError());
+
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  std::latch start{2};
+  auto run = [&](duckdb::Connection& connection) {
+    start.arrive_and_wait();
+    return connection.Query("SELECT sum(x) FROM shared_pin");
+  };
+  auto rejected        = std::async(std::launch::async, [&] { return run(*con); });
+  auto admitted        = std::async(std::launch::async, [&] { return run(*other); });
+  auto rejected_result = rejected.get();
+  auto admitted_result = admitted.get();
+  REQUIRE_FALSE(rejected_result->HasError());
+  REQUIRE_FALSE(admitted_result->HasError());
+  CHECK(rejected_result->GetValue(0, 0).ToString() == "33550336");
+  CHECK(admitted_result->GetValue(0, 0).ToString() == "33550336");
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.successful_rebinds == before.successful_rebinds + 2);
+  CHECK(after.executions == before.executions + 2);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+  CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  run_ok("SET sirius_test_invalidate_pin_witness=false");
+  run_ok("CALL unpin_table('shared_pin')");
 }

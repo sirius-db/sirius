@@ -136,7 +136,7 @@ SF10 tests report a failed describe of the SF10 object as a skip unless
 STRICT is set. The three tests that PUT objects into managed MinIO skip when
 the endpoint is externally managed; device tests also report unavailable CUDA.
 The PUT cases cover ETag invalidation, kvikio stream ordering, and
-`transparent S3 glob rejects parquet files whose schemas differ instead of decoding them together`.
+`transparent S3 glob refuses semantic type drift before decoding`.
 
 `unittest.cpp` calls explicit container shutdown before exiting. The
 library's default Ryuk reaper is best effort; a killed process can leave

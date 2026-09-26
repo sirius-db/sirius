@@ -181,8 +181,8 @@ void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_proces
 {
   auto* scan = state.scan_op;
   if (!scan) {
-    state.connector->close(std::make_exception_ptr(
-      std::logic_error("cached scan slot is missing its scan operator")));
+    state.connector->close(
+      std::make_exception_ptr(std::logic_error("cached scan slot is missing its scan operator")));
     return;
   }
   drain_cached_provider(*state.batch_provider,
@@ -199,18 +199,13 @@ void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_proces
                         state.op_id);
 }
 
-void load_balancing_scan_batch_coalescer::drain_cached_provider(
-  databatch_provider& provider,
-  split_connector& connector,
-  std::stop_token const& stop,
-  bool row_filter_pending)
+void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
+                                                                split_connector& connector,
+                                                                std::stop_token const& stop,
+                                                                bool row_filter_pending)
 {
-  drain_cached_provider(provider,
-                        connector,
-                        stop,
-                        row_filter_pending,
-                        op::scan::scan_contract_id{0},
-                        uint64_t{0});
+  drain_cached_provider(
+    provider, connector, stop, row_filter_pending, op::scan::scan_contract_id{0}, uint64_t{0});
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(

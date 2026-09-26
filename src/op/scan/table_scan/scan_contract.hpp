@@ -176,10 +176,21 @@ enum class verdict_reason : uint16_t {
   budget_time,
   budget_bytes,
   evidence_missing,
-  interface_unavailable
+  interface_unavailable,
+  unknown_function,
+  bind_data_mismatch,
+  catalog_entry_missing,
+  no_trusted_reference,
+  callback_mismatch
+};
+
+struct scan_publication_observation {
+  std::map<std::string, uint64_t> readahead_registrations;
+  uint64_t prefetcher_conversions = 0;
 };
 
 struct physical_check_counters {
+  std::atomic<uint64_t> split_flushed_for_schema{0};
   std::atomic<uint64_t> iceberg_manifest_walks{0};
   std::atomic<uint64_t> iceberg_dv_manifest_reads{0};
   std::atomic<uint64_t> iceberg_delete_payload_loads{0};
@@ -188,16 +199,36 @@ struct physical_check_counters {
   // Installed before a test query, cleared only after its workers have joined.
   // true = before footer processing, false = after successful cuDF decode.
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
+  std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   std::function<void()> after_certify_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
     if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);
+  }
+  void parquet_metadata(std::string const& file, bool hit) const
+  {
+    if (track_units && parquet_metadata_for_testing) parquet_metadata_for_testing(file, hit);
   }
 
   std::atomic<bool> track_units{false};  // latched when the test process creates its planner
   mutable std::mutex units_mutex;
   std::map<std::string, uint64_t> parquet_reader_calls;
   std::map<std::string, uint64_t> native_decoder_calls;
+  // Test-only, keyed by query token so overlapping queries never share an
+  // observation. The entry survives scan-manager teardown for the test oracle.
+  std::map<uint64_t, scan_publication_observation> publications_by_query;
+  void readahead_registration(uint64_t query_token, std::string const& file)
+  {
+    if (!track_units) return;
+    std::lock_guard lock(units_mutex);
+    ++publications_by_query[query_token].readahead_registrations[file];
+  }
+  void prefetcher_conversions(uint64_t query_token, uint64_t count)
+  {
+    if (!track_units || count == 0) return;
+    std::lock_guard lock(units_mutex);
+    publications_by_query[query_token].prefetcher_conversions += count;
+  }
   void reader_call(std::string const& file)
   {
     if (!track_units) return;
@@ -211,8 +242,7 @@ struct physical_check_counters {
     ++native_decoder_calls[group];
   }
   std::atomic<uint64_t> checks{0};
-  std::array<std::atomic<uint64_t>,
-             static_cast<std::size_t>(verdict_reason::interface_unavailable) + 1>
+  std::array<std::atomic<uint64_t>, static_cast<std::size_t>(verdict_reason::callback_mismatch) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
@@ -379,12 +409,12 @@ struct test_injections {
   bool fail_on_host_staging_refusal  = false;
   uint64_t gpu_task_oom              = 0;
   uint64_t gpu_task_launch_error     = 0;
-  uint64_t gpu_task_retry_limit      = 0;
-  uint64_t gpu_task_retry_backoff_ms = 0;
-  bool override_read_only            = false;
-  bool transaction_mismatch          = false;
-  bool interrupt_before_replay       = false;
-  bool non_rollbackable_state        = false;
+  uint64_t gpu_task_retry_limit      = 100;
+  uint64_t gpu_task_retry_backoff_ms = 50;
+  std::optional<bool> override_read_only;
+  bool transaction_mismatch    = false;
+  bool interrupt_before_replay = false;
+  bool non_rollbackable_state  = false;
 };
 
 struct column_requirements {
@@ -458,6 +488,8 @@ scan_contract_id allocate_scan_contract(
   duckdb::vector<duckdb::LogicalType> output_types = {},
   duckdb::idx_t table_index                        = duckdb::DConstants::INVALID_INDEX);
 bound_table_scan const& contract_of(transparent::read_view_registry const&, scan_contract_id);
+// On-demand diagnostic of evidence already attached to a split. Never fetches metadata.
+std::string format_split_certificates_for_dump(scan_info const& split);
 void validate_split_for_gpu(scan_contract_id expected,
                             later_check_set const& required,
                             std::optional<key_held_witness> const& expected_key,

@@ -17,6 +17,7 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "utils/dynamic_filter_test_utils.hpp"
 #include "utils/gpu_execution_fixture.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -146,6 +147,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "R2a lineage follows reordered join outputs and pure-filter inputs",
                  "[scan][verdict][lineage][integration]")
 {
+  // This direct ExtractPlan test needs the optimizer mask Sirius normally publishes at load.
+  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
   run_ok("CREATE TABLE r2a_leaf(a INTEGER,b INTEGER,c INTEGER)");
   run_ok("INSERT INTO r2a_leaf VALUES (1,2,3),(2,1,4)");
   run_ok("CHECKPOINT");

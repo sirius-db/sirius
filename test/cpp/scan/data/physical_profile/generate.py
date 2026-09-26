@@ -6,7 +6,6 @@ an example for production key management. Regenerate on a cuDF/PyArrow bump.
 
 import argparse
 import base64
-import json
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,7 +15,16 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=Path, required=True)
 ROOT = parser.parse_args().output.resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
-MANIFEST = {"pyarrow": pa.__version__, "libcudf": "26.08.01", "files": []}
+assert pa.__version__ in {"25.0.0", "25.0.1"}
+expected_encodings = {
+    "PLAIN": ("RLE", "PLAIN"),
+    "DELTA_BINARY_PACKED": ("RLE", "DELTA_BINARY_PACKED"),
+    "BYTE_STREAM_SPLIT": ("RLE", "BYTE_STREAM_SPLIT"),
+    "DELTA_LENGTH_BYTE_ARRAY": ("RLE", "DELTA_LENGTH_BYTE_ARRAY"),
+    "DELTA_BYTE_ARRAY": ("RLE", "DELTA_BYTE_ARRAY"),
+    "DICTIONARY": ("PLAIN", "RLE", "RLE_DICTIONARY"),
+}
+physical_types = {"int": "INT32", "double": "DOUBLE", "string": "BYTE_ARRAY"}
 values = {
     "int": (
         pa.array([None if i % 7 == 0 else i for i in range(128)], pa.int32()),
@@ -49,22 +57,13 @@ for codec in ["NONE", "SNAPPY", "GZIP", "ZSTD", "LZ4", "BROTLI"]:
             chunks = [
                 metadata.row_group(i).column(0) for i in range(metadata.num_row_groups)
             ]
-            MANIFEST["files"].append(
-                {
-                    "file": name,
-                    "requested_codec": codec,
-                    "requested_encoding": encoding,
-                    "type": str(array.type),
-                    "actual": [
-                        {
-                            "codec": c.compression,
-                            "encodings": c.encodings,
-                            "physical_type": c.physical_type,
-                        }
-                        for c in chunks
-                    ],
-                }
-            )
+            assert len(chunks) == 2
+            for chunk in chunks:
+                assert chunk.compression == (
+                    "UNCOMPRESSED" if codec == "NONE" else codec
+                )
+                assert chunk.encodings == expected_encodings[encoding]
+                assert chunk.physical_type == physical_types[kind]
 
 
 test_keys = {}
@@ -104,14 +103,7 @@ for plaintext in [False, True]:
         ROOT / name, decryption_properties=factory.file_decryption_properties(kms)
     )
     assert actual.column(0).to_pylist() == [1, 2, 3]
-    MANIFEST["files"].append(
-        {
-            "file": name,
-            "encryption": "columns" if plaintext else "footer",
-            "magic": (ROOT / name).read_bytes()[-4:].decode(),
-            "readback": [1, 2, 3],
-        }
-    )
+    assert (ROOT / name).read_bytes()[-4:] == (b"PAR1" if plaintext else b"PARE")
 # Change only the footer encoding union; the data pages stay byte-identical.
 from footer_encoding import rewrite_encoding_lists
 import struct
@@ -126,23 +118,8 @@ for name, replacement in [("levels", bytes([0x25, 0, 8])), ("empty", bytes([0x05
     )
     metadata = pq.read_metadata(path)
     assert pq.read_table(path).equals(pq.read_table(ROOT / "int-SNAPPY-PLAIN.parquet"))
-    MANIFEST["files"].append(
-        {
-            "file": path.name,
-            "footer_variant": name,
-            "actual": [
-                {
-                    "codec": metadata.row_group(i).column(0).compression,
-                    "encodings": metadata.row_group(i).column(0).encodings,
-                }
-                for i in range(metadata.num_row_groups)
-            ],
-        }
-    )
-
-(ROOT / "manifest.json").write_text(json.dumps(MANIFEST, indent=2) + "\n")
-
-expected = json.loads((Path(__file__).resolve().parent / "manifest.json").read_text())
-assert (
-    json.loads(json.dumps(MANIFEST)) == expected
-), "actual codec/encoding manifest changed; review the pinned corpus"
+    assert metadata.num_row_groups == 2
+    for i in range(metadata.num_row_groups):
+        chunk = metadata.row_group(i).column(0)
+        assert chunk.compression == "SNAPPY"
+        assert chunk.encodings == (("PLAIN", "BIT_PACKED") if name == "levels" else ())

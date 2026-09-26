@@ -28,6 +28,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_snapshot_identity.hpp"
 #include "pin_table.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -99,6 +100,7 @@ class rest_ioctx;
 namespace sirius::op::scan {
 class sirius_gpu_scan_operator;
 class gpu_ingestible;
+struct physical_check_counters;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
@@ -504,7 +506,8 @@ class sirius_scan_manager {
    */
   sirius_scan_manager(const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
-                      std::shared_ptr<const sirius::memory::topology_index> topology_index);
+                      std::shared_ptr<const sirius::memory::topology_index> topology_index,
+                      std::shared_ptr<op::scan::physical_check_counters> physical_counters = {});
 
   ~sirius_scan_manager();
 
@@ -544,7 +547,18 @@ class sirius_scan_manager {
   ///        distributed round-robin across this subset instead of all GPUs.
   void prepare_for_query(const sirius::planner::query& query,
                          bool enable_pinned_zone_map_pruning,
-                         const std::vector<int>& allocated_gpu_ids);
+                         const std::vector<int>& allocated_gpu_ids,
+                         std::shared_ptr<pipeline::completion_handler> completion = nullptr);
+  void release_footer_hold_for_testing(uint64_t file_number)
+  {
+    if (auto completion = _execution_completion.load())
+      completion->release_footer_for_testing(file_number);
+  }
+  bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_publication_for_testing(timeout);
+  }
 
   /// \brief Drop everything held for @p query_id: stop and join its scan work, then destroy
   ///        its providers and coalescer. Other queries are untouched. No-op for an unknown id.
@@ -919,6 +933,9 @@ class sirius_scan_manager {
     //! call outside the state mutex — it can block for as long as an in-flight read.
     void drain() noexcept;
 
+    uint64_t query_token = 0;
+    std::shared_ptr<op::scan::physical_check_counters> physical_counters;
+
     //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.
     //! Construction rejects a null provider so the alternative always represents a runnable
     //! disk scan.
@@ -965,6 +982,9 @@ class sirius_scan_manager {
     //! Per-query readahead bookkeeping, seeded from this query's prefetching order and
     //! shared with every scan split this query emits.
     std::shared_ptr<readahead_scan_manager> readahead;
+
+    //! Completion state and late-failure injection belong to this query's scans.
+    std::shared_ptr<pipeline::completion_handler> completion;
 
     //! This query's sequencer for opportunistic fadvise calls; gets one pipeline slot per
     //! scan. Its slot map is keyed by operator id, which restarts at 0 per query.
@@ -1046,6 +1066,7 @@ class sirius_scan_manager {
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
+  std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
@@ -1125,6 +1146,7 @@ class sirius_scan_manager {
   void release_checkpoint_keys(sirius::query_id_t query_id);
   std::map<sirius::query_id_t, std::vector<checkpoint_lock_entry>> _checkpoint_locks;
   mutable std::mutex _checkpoint_locks_mutex;
+  std::atomic<std::shared_ptr<pipeline::completion_handler>> _execution_completion;
 
   io::io_context_registry _ioctx_registry;
 };

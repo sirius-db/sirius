@@ -525,8 +525,22 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
 
-  auto const* source = lookup_connector(op, context);
+  auto const lookup  = lookup_connector_classified(op, context);
+  auto const* source = lookup.entry;
   if (!source) {
+    if (read_views->record_declined_lookup(op, lookup.decline)) {
+      auto state = context.registered_state
+                     ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                     : nullptr;
+      if (state) {
+        sirius::op::scan::eligibility_certificate refusal;
+        auto const& record = read_views->declined_lookups().at(op.table_index);
+        refusal.verdict    = record.verdict;
+        refusal.reason     = record.reason;
+        state->record_scan_certification(refusal);
+        state->record_semantic_decline(refusal.reason);
+      }
+    }
     throw duckdb::NotImplementedException(
       "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "
       "data)",

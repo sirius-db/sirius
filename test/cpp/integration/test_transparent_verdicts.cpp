@@ -106,7 +106,7 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.semantic_verdicts[0] == before.semantic_verdicts[0] + 1);
   CHECK(after.semantic_verdicts[1] == before.semantic_verdicts[1] + 1);
   CHECK(after.window_tasks_started == before.window_tasks_started);
-  CHECK(after.setting_lookups_per_attempt == before.setting_lookups_per_attempt + 22);
+  CHECK(after.setting_lookups_per_attempt == before.setting_lookups_per_attempt + 32);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

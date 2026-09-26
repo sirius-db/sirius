@@ -1911,9 +1911,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][gpu_execution][iceberg][transparent][read_view]")
 {
   auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
-  // This setting is DB-global: preserve Sirius's extension-load optimizer mask
-  // for later tests sharing this database, rather than RESET to DuckDB defaults.
-  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "extension");
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{*con};
+  con->Query("SET disabled_optimizers = 'extension'");
   expect_iceberg_rows("SELECT * FROM " + pinned_scan(path) + " ORDER BY count;",
                       gpu_route::plan_fallback,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
@@ -1925,7 +1927,11 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 {
   auto path  = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
   auto query = "SELECT * FROM " + pinned_scan(path) + " ORDER BY count";
-  sirius::test::disabled_optimizers_guard optimizer_guard(*con, "extension");
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{*con};
+  REQUIRE_FALSE(con->Query("SET disabled_optimizers = 'extension'")->HasError());
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = false")->HasError());
   auto const before = sirius::test::get_transparent_execution_stats(*con);
 
@@ -2968,6 +2974,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
   CHECK(after.iceberg_inventory_bytes_peak > 0);
+  CHECK(after.budget_exceeded == before.budget_exceeded);
   auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_equality_deletes);
   CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
   auto inventory =
@@ -3198,6 +3205,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK_FALSE(result.inventory);
   CHECK(sirius::test::get_transparent_execution_stats(*con).iceberg_manifest_walks ==
         before.iceberg_manifest_walks);
+  CHECK_FALSE(provenance.budget.time_exceeded());
+  CHECK_FALSE(provenance.budget.bytes_exceeded());
 }
 
 namespace {
@@ -3303,7 +3312,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][iceberg][verdict]")
 {
   auto query = "SELECT id, value FROM " + pinned_scan(inventory_fixture("schema_later"));
-  REQUIRE_FALSE(con->Query("SET scan_task_batch_size=1")->HasError());
+  sirius::test::scoped_setting one_byte_scan_batch(*con, "scan_task_batch_size", 1);
   auto state    = sirius::test::get_registered_sirius_context(*con);
   auto counters = state->physical_counters();
   struct reset_hook {

@@ -74,6 +74,19 @@ struct connector {
                                             scan_contract_provenance&) = nullptr;
 };
 
+enum class lookup_decline : uint8_t {
+  none,
+  unknown_function,
+  bind_data_mismatch,
+  catalog_entry_missing,
+  no_trusted_reference,
+  callback_mismatch
+};
+struct lookup_outcome {
+  connector const* entry = nullptr;
+  lookup_decline decline = lookup_decline::none;
+};
+lookup_outcome lookup_connector_classified(duckdb::LogicalGet const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::LogicalGet const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::ClientContext&);
 connector const* lookup_connector(duckdb::TableFunction const&,

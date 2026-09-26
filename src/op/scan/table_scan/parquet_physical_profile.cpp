@@ -17,8 +17,11 @@
 #include "op/scan/table_scan/parquet_physical_profile.hpp"
 
 #include "io/parquet_helpers.hpp"
+#include "io/sirius_datasource.hpp"
+#include "op/scan/parquet_metadata.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
 
+#include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 
 #include <algorithm>
@@ -43,6 +46,7 @@ class crypto_reader {
       ((result_.footer_encrypted || result_.columns_encrypted) && bytes_.size() - offset_ == 28);
     return result_;
   }
+  std::vector<uint8_t> const& original_schema() const { return original_schema_; }
 
  private:
   uint8_t byte()
@@ -82,8 +86,12 @@ class crypto_reader {
       // FileMetaData.encryption_algorithm and ColumnChunk crypto/metadata fields.
       if ((context == 1 && field == 8) || (context == 3 && (field == 8 || field == 9)))
         result_.columns_encrypted = true;
-      unsigned child = context == 1 && field == 4 ? 2 : context == 2 && field == 1 ? 3 : 0;
+      unsigned child         = context == 1 && field == 4 ? 2 : context == 2 && field == 1 ? 3 : 0;
+      auto const value_start = offset_;
       skip(type, child, depth + 1, true);
+      if (context == 1 && field == 2) {
+        original_schema_.assign(bytes_.begin() + value_start, bytes_.begin() + offset_);
+      }
     }
   }
   void skip(unsigned type, unsigned context, unsigned depth, bool field)
@@ -128,6 +136,7 @@ class crypto_reader {
   std::span<uint8_t const> bytes_;
   std::size_t offset_ = 0;
   parquet_encryption_evidence result_;
+  std::vector<uint8_t> original_schema_;
 };
 }  // namespace
 parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> footer)
@@ -137,6 +146,39 @@ parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> 
   } catch (std::runtime_error const&) {
     return {};
   }
+}
+std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
+  io::sirius_datasource& source,
+  scan_contract_id contract,
+  std::string const& identity,
+  cudf::io::parquet_reader_options const& options,
+  bool* cache_hit)
+{
+  if (auto cached = std::dynamic_pointer_cast<parquet_metadata>(source.metadata())) {
+    if (cache_hit) *cache_hit = true;
+    return cached;
+  }
+  if (cache_hit) *cache_hit = false;
+  auto footer = fetch_plaintext_parquet_footer(source, contract, identity);
+  crypto_reader probe({footer->data(), footer->size()});
+  auto encryption = probe.read();
+  if (!encryption.complete || probe.original_schema().empty()) {
+    throw std::runtime_error("incomplete Parquet footer evidence: " + identity);
+  }
+  cudf::io::parquet::experimental::hybrid_scan_reader reader(
+    cudf::host_span<uint8_t const>(footer->data(), footer->size()), options);
+  auto parsed = std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+  std::string arrow_schema;
+  for (auto const& entry : parsed->key_value_metadata) {
+    if (entry.key == "ARROW:schema") {
+      arrow_schema = entry.value;
+      break;
+    }
+  }
+  auto result = std::make_shared<parquet_metadata>(
+    parsed, footer->size(), encryption, probe.original_schema(), std::move(arrow_schema));
+  std::ignore = source.store_metadata(result);
+  return result;
 }
 std::unique_ptr<cudf::io::datasource::buffer> fetch_plaintext_parquet_footer(
   cudf::io::datasource& source, scan_contract_id contract, std::string const& identity)

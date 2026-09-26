@@ -463,6 +463,17 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         .reservation_resource_id     = _reservation_tier_resource_id,
         .reservation_capacity_bytes  = _reservation_bytes,
       });
+      if (auto completion = get_completion_handler(); completion && completion->injections) {
+        auto const& inject = *completion->injections;
+        if (inject.gpu_task_oom &&
+            completion->injected_oom_attempts.fetch_add(1) < inject.gpu_task_oom)
+          throw rmm::out_of_memory("injected GPU task OOM");
+        if (inject.gpu_task_launch_error &&
+            completion->injected_launch_attempts.fetch_add(1) < inject.gpu_task_launch_error)
+          throw thrust::system_error(static_cast<int>(cudaErrorLaunchOutOfResources),
+                                     thrust::cuda_category(),
+                                     "injected GPU task launch failure");
+      }
       operator_input_output_data = run_one_operator(
         op, *operator_input_output_data, stream, pipeline, _task_id, operators.size(), _allocator);
     } catch (const rmm::out_of_memory& oom) {
@@ -588,7 +599,12 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
                                   sink_operators->get_operator_id());
     nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
+    auto completion       = get_completion_handler();
+    const bool observe_publication =
+      completion && completion->injections && completion->injections->hold_footer_index &&
+      (materialized ? *materialized : output_data).get_estimated_size_in_bytes() > 0;
     sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
+    if (observe_publication) completion->record_publication_for_testing();
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);

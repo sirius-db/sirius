@@ -1926,7 +1926,7 @@ TEST_CASE("Resident dequeue backstop rejects a stale query before processing",
   using namespace sirius::op::scan;
   auto& e = env();
   duckdb::SiriusContext observer;
-  sirius_gpu_scan_operator scan({}, 4, nullptr, &observer, nullptr, 81);
+  sirius_gpu_scan_operator scan({}, 4, nullptr, 81, &observer, nullptr);
   scan.set_query_validation(17, {});
   scripted_provider provider;
   provider.contract_id            = 81;

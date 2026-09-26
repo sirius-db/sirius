@@ -264,6 +264,8 @@ class parquet_file_scan_info : public scan_info {
 
   /// Parsed footer metadata for this file.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::vector<uint8_t> original_schema;
+  std::string arrow_schema;
   /// File path (also the datasource cache key).
   std::string file_path;
   /// Stable position in DuckDB's bound file list.

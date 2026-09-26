@@ -39,7 +39,7 @@ namespace pq = cudf::io::parquet;
 std::filesystem::path corpus()
 {
   if (auto path = std::getenv("SIRIUS_PARQUET_PROFILE_FIXTURES")) {
-    REQUIRE(std::filesystem::exists(std::filesystem::path(path) / "manifest.json"));
+    REQUIRE(std::filesystem::exists(std::filesystem::path(path) / "int-SNAPPY-PLAIN.parquet"));
     return path;
   }
   // CI regenerates from the checked-in recipe; local evidence can reuse an
@@ -388,6 +388,26 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.parquet_reader_calls == before.parquet_reader_calls);
   run_ok("SET sirius_test_lineage_unmodelled=false");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet D7 keeps mixed export-only schemas in separate splits",
+                 "[scan][parquet][profile][integration][d7]")
+{
+  sirius::test::scratch_dir directory("parquet_d7_mixed");
+  run_ok("SET gpu_execution=false");
+  run_ok("COPY (SELECT 10::INTEGER x) TO " + directory.file_literal("a.parquet") +
+         " (FORMAT PARQUET)");
+  run_ok("COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") +
+         " (FORMAT PARQUET)");
+  auto query = "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")";
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    compare_gpu_vs_cpu(query);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  }
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

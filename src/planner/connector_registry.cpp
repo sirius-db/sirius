@@ -21,8 +21,8 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
-#include "planner/connector_reference_cache.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_reference_cache.hpp"
 #include "sirius_registration.hpp"
 
 #include <dlfcn.h>
@@ -478,19 +478,22 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_iceberg_callbacks(db);
 }
 
-connector const* lookup_connector(duckdb::TableFunction const& function,
-                                  duckdb::FunctionData const* bind,
-                                  duckdb::ClientContext& context)
+lookup_outcome lookup_connector_classified(duckdb::TableFunction const& function,
+                                           duckdb::FunctionData const* bind,
+                                           duckdb::ClientContext& context)
 {
+  bool function_known = false;
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
-    if (entry.function_name != function.name || !entry.bind_data_matches(bind)) continue;
+    if (entry.function_name != function.name) continue;
+    function_known = true;
+    if (!entry.bind_data_matches(bind)) continue;
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
         context, DEFAULT_SCHEMA, entry.function_name, duckdb::OnEntryNotFound::RETURN_NULL);
-    if (!catalog_entry) return nullptr;
+    if (!catalog_entry) return {nullptr, lookup_decline::catalog_entry_missing};
     // A mutable catalog can confirm registration, but must never grant trust.
     auto const& references = cache.reference.get_or_resolve(
       [&] { return reference_functions(entry.function_name, context); });
@@ -513,18 +516,32 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
           requirement);
         cache.missing_reference_reported = true;
       }
-      return nullptr;
+      return {nullptr, lookup_decline::no_trusted_reference};
     }
     for (auto const& reference : references) {
       verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
-        if (callbacks.matches(registered)) return &entry;
+        if (callbacks.matches(registered)) return {&entry, lookup_decline::none};
       }
     }
-    return nullptr;
+    return {nullptr, lookup_decline::callback_mismatch};
   }
-  return nullptr;
+  return {nullptr,
+          function_known ? lookup_decline::bind_data_mismatch : lookup_decline::unknown_function};
+}
+
+lookup_outcome lookup_connector_classified(duckdb::LogicalGet const& get,
+                                           duckdb::ClientContext& context)
+{
+  return lookup_connector_classified(get.function, get.bind_data.get(), context);
+}
+
+connector const* lookup_connector(duckdb::TableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
+{
+  return lookup_connector_classified(function, bind, context).entry;
 }
 
 connector const* lookup_connector(duckdb::LogicalGet const& get, duckdb::ClientContext& context)

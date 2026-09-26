@@ -118,7 +118,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   plan_source_policy source_policy,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
-  std::uint64_t validated_plan_pin_epoch)
+  std::uint64_t validated_plan_pin_epoch,
+  std::optional<uint64_t> captured_transaction_id)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
@@ -129,6 +130,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
     source_policy_(std::move(source_policy)),
+    captured_transaction_id_(captured_transaction_id),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
     validated_plan_pin_epoch_(validated_plan_pin_epoch)
 {
@@ -178,6 +180,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    failure_cause failure;
+    late_failure_trace failure_trace;
+    bool non_rollbackable_state = false;
+    std::shared_ptr<op::scan::test_injections const> injections;
     auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
     // The execution window: begin mutations and slot acquire in one scope on
     // this thread; finished (mandatory cleanup and release) below, before the
@@ -364,6 +370,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       gpu_failed                = true;
       runtime_unavailable_error = true;
     } catch (std::exception& e) {
+      if (window) window->report_failure(std::current_exception());
       gpu_error  = duckdb::ErrorData(e);
       gpu_failed = true;
     }
@@ -378,12 +385,23 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // exception escaping the try above is handled by the window's destructor
     // backstop instead.
     if (window) {
+      injections = window->injections();
+      failure    = window->failure();
+      if (gpu_failed) failure_trace.cause = failure.cause;
+      non_rollbackable_state = window->non_rollbackable_state();
+      if (gpu_failed && state.sirius_context)
+        state.sirius_context->record_late_failure(failure.cause);
       window->finish();
       lease_release = window->lease_release();
       window.reset();
     }
 
     if (gpu_failed) {
+      failure_trace.cause = failure.cause;
+      if (lease_release.state ==
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered &&
+          state.sirius_context)
+        state.sirius_context->record_late_failure(failure.cause);
       const std::string gpu_msg = gpu_error.RawMessage();
       SIRIUS_LOG_ERROR("Transparent GPU execution error: {}", gpu_msg);
 
@@ -432,6 +450,24 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         throw duckdb::ExecutorException(
           "Sirius CPU replay refused because checkpoint-lease cleanup did not complete");
       }
+
+      D_ASSERT(!state.result && !state.current_chunk && !state.finished);
+      const bool read_only      = injections && injections->override_read_only
+                                    ? *injections->override_read_only
+                                    : cpu_fallback_prepared_->properties.IsReadOnly();
+      auto captured_transaction = captured_transaction_id_;
+      if (injections && injections->transaction_mismatch && captured_transaction)
+        *captured_transaction ^= 1;
+      if (injections && injections->interrupt_before_replay) context.client.interrupted = true;
+      auto admission = admit_cpu_replay(
+        context.client, read_only, captured_transaction, non_rollbackable_state, false);
+      failure_trace.replay     = admission.admitted;
+      failure_trace.refused_by = admission.refused_by;
+      if (!admission.admitted) {
+        if (state.sirius_context) state.sirius_context->record_late_refusal(*admission.refused_by);
+        throw duckdb::ExecutorException("Sirius CPU replay refused: " + gpu_msg);
+      }
+      if (state.sirius_context) state.sirius_context->record_late_replay(failure.cause, read_only);
 
       // Fall back: run the stored CPU plan on a private executor bound to the same
       // ClientContext (same transaction / MVCC snapshot).
