@@ -469,14 +469,36 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nul
   }
 }
 
-TEST_CASE("ast_from_duckdb - unsigned widening cannot use the signed HUGEINT carrier",
+TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range",
           "[ast_from_duckdb][unsigned_narrowing]")
 {
-  for (auto source : {LogicalTypeId::UBIGINT, LogicalTypeId::UHUGEINT}) {
-    for (bool try_cast : {false, true}) {
-      auto expr = BoundCastExpression::AddDefaultCastToType(
-        make_bound_ref(0, source), LogicalType::HUGEINT, try_cast);
-      REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+  // Counts are value bits: signed carriers reserve one bit for the sign, and
+  // Sirius represents HUGEINT/UHUGEINT using INT64/UINT64 rather than 128-bit storage.
+  using domain = std::pair<LogicalTypeId, int>;
+  for (auto [source, source_bits] : {domain{LogicalTypeId::UTINYINT, 8},
+                                     domain{LogicalTypeId::USMALLINT, 16},
+                                     domain{LogicalTypeId::UINTEGER, 32},
+                                     domain{LogicalTypeId::UBIGINT, 64},
+                                     domain{LogicalTypeId::UHUGEINT, 128}}) {
+    for (auto [target, target_bits] : {domain{LogicalTypeId::TINYINT, 7},
+                                       domain{LogicalTypeId::SMALLINT, 15},
+                                       domain{LogicalTypeId::INTEGER, 31},
+                                       domain{LogicalTypeId::BIGINT, 63},
+                                       domain{LogicalTypeId::HUGEINT, 63},
+                                       domain{LogicalTypeId::UTINYINT, 8},
+                                       domain{LogicalTypeId::USMALLINT, 16},
+                                       domain{LogicalTypeId::UINTEGER, 32},
+                                       domain{LogicalTypeId::UBIGINT, 64},
+                                       domain{LogicalTypeId::UHUGEINT, 64}}) {
+      for (bool try_cast : {false, true}) {
+        INFO("source=" << LogicalType(source).ToString()
+                       << " target=" << LogicalType(target).ToString() << " try_cast=" << try_cast);
+        auto expr = BoundCastExpression::AddDefaultCastToType(
+          make_bound_ref(0, source), LogicalType(target), try_cast);
+        auto translated = sirius::ast::from_duckdb(*expr);
+        // DuckDB elides same-type casts, leaving only the bound reference.
+        REQUIRE((translated != nullptr) == (source == target || source_bits <= target_bits));
+      }
     }
   }
 
