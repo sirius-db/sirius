@@ -153,6 +153,25 @@ DuckDB produces `upper(lower('İ')) == I`, in contrast cuDF produces
 See cuDF's [Unicode
 limitations](https://docs.rapids.ai/api/libcudf/stable/md_doxygen_unicode)
 for its supported code points and context-sensitive conversion limitations.
+### Temporal semantics
+
+`src/helper/timestamp_semantics.hpp` defines reusable GPU helpers in `sirius::temporal`.
+The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` and
+`-MAX` for infinity, while `MIN` remains finite. NULLs propagate. Frontends must
+normalize their temporal values to this representation before using these helpers;
+the helpers do not depend on DuckDB types or a frontend identity.
+
+`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
+columns to microseconds. It checks finite values before multiplying, preserves
+infinity, and truncates nanoseconds toward zero. Overflow raises
+`sirius::invalid_input_exception`; reading the overflow result synchronizes the
+supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+
+`finite_mask()` returns a nullable boolean column for DATE or any timestamp
+precision. Both checked conversion and millisecond/microsecond extraction use it,
+so sentinel handling has one implementation. The evaluator boundary regressions
+are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
+tagged `[timestamp_extraction]`.
 
 ### Logical AND/OR NULL semantics
 
