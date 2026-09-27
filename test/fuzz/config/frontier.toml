@@ -1,0 +1,53 @@
+# siriusfuzz "frontier" profile: also generates shapes Sirius declines today.
+# Plan-time fallbacks are counted (coverage report) and the CPU fallback path is
+# checked for correct results; only crashes, hangs, errors and mismatches are findings.
+
+profile = "frontier"
+
+[features]
+window_functions = true
+distinct = true
+grouping_sets = true
+full_join = true
+cross_join = true
+
+[features.set_ops]
+union_all = true
+union = true
+except = true
+intersect = true
+
+[features.joins]
+types = ["inner", "left", "right", "full", "semi", "anti"]
+inequality = true
+null_safe_keys = true
+max_tables = 4
+
+[features.subqueries]
+uncorrelated_scalar = true
+uncorrelated_exists = true
+
+[features.aggregates]
+functions = ["sum", "count", "count_star", "min", "max", "avg"]
+distinct = "on"
+
+[features.expressions]
+try = true
+
+[features.casts]
+temporal_numeric = true
+to_varchar = true
+targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)", "VARCHAR"]
+
+[features.limit]
+percent = false
+require_total_order = true
+
+[data.edge_values]
+probability = 0.03
+int_extremes = true
+negative_zero = true
+nan_inf = false
+
+[oracle]
+on_plan_fallback = "count"
