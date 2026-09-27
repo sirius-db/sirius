@@ -15,18 +15,16 @@ import time
 import shutil
 import tempfile
 import math
-from dataclasses import asdict
 
 from .artifacts import provenance, seal, verify, write_json
 from .isolation import supervise
 from . import __version__
 from .classify import Verdict
-from .config import FUZZ_DIR, REPO_ROOT, FuzzConfig, load_config, resolve_repo_path
+from .config import FUZZ_DIR, FuzzConfig, load_config, resolve_repo_path
 from .report import Report, default_known_issues_path, load_known_issues
 from .runner import Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
 
-DEFAULT_PROFILE = FUZZ_DIR / "config" / "strict.toml"
 SELFTEST_DEFAULT_OVERRIDES = (
     "data.rows=[8,16]",
     "features.joins.max_tables=2",

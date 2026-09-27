@@ -107,7 +107,7 @@ def _child(payload: dict[str, Any], work: str) -> None:
                 or str(statements[0].type).split(".")[-1] != "SELECT"
             ):
                 raise ValueError("replay requires exactly one SELECT or WITH query")
-            session.evidence = {}
+            session.begin_query(sql)
             record = ev.evaluate(None, sql, 0, "replay", 0)
             record.evidence = session.evidence
             record.context.update(

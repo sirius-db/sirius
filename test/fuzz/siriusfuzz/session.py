@@ -67,7 +67,6 @@ class Session:
         self.gpu_available = extension is not None
         self.current_alias: str | None = None
         self._setting_defaults: dict[str, Any] = {}
-        self._canary_ok: bool | None = None
         self.sqlsmith_loaded = False
         self.version_mismatch_bypassed = False
 
@@ -193,6 +192,26 @@ class Session:
         return [r[0] for r in rows]
 
     # -- queries --------------------------------------------------------------
+
+    def begin_query(self, sql: str) -> None:
+        """Replace the previous query's evidence before evaluating ``sql``.
+
+        The supervisor attributes a crash to the SQL in the active file, so it must
+        name this query even if the worker dies before the first run rewrites it.
+        """
+        self.evidence = {}
+        self.stage = "evaluation"
+        if self.evidence_path:
+            write_json(self.evidence_path.with_suffix(".observed.json"), self.evidence)
+            write_json(
+                self.evidence_path,
+                {
+                    "sql": sql,
+                    "stage": self.stage,
+                    "status": "pending",
+                    "started_at": time.time(),
+                },
+            )
 
     def mark_auxiliary(self, operation: str, input_sql: str) -> None:
         """Replace completed query evidence before non-query reducer work."""

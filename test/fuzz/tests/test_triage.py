@@ -24,7 +24,6 @@ from siriusfuzz.triage import (
     render,
     summarize,
     attempt,
-    digest,
     replay_command,
     suggested_group,
     ReductionBudgetReached,

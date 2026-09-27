@@ -28,6 +28,10 @@ class ClassifyTests(unittest.TestCase):
             "Sirius GPU execution failed: std::bad_alloc: out_of_memory: RMM failure"
         )
         self.assertEqual(v, Verdict.GPU_OOM)
+        v, _ = classify_gpu_error(
+            "Sirius GPU execution failed: CUDA error: cudaErrorMemoryAllocation"
+        )
+        self.assertEqual(v, Verdict.GPU_OOM)
 
     def test_normalize(self):
         a = normalize_reason(

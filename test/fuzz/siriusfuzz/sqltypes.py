@@ -11,8 +11,6 @@ exact width, and the comparator reads exact types back via DESCRIBE.
 
 from __future__ import annotations
 
-import datetime as _dt
-import decimal as _decimal
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -202,9 +200,3 @@ def render_insert_value(value: Any, typ: SqlType) -> str:
     if typ.kind == "varchar":
         return sql_string(str(value))
     raise ValueError(f"cannot render value of type {typ}")
-
-
-# Python-side value domains, used by the data generator and the comparator.
-PyDate = _dt.date
-PyDateTime = _dt.datetime
-PyDecimal = _decimal.Decimal
