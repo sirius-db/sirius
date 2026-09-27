@@ -38,13 +38,10 @@ max_depth = 2
 
 [features.cte]
 materialized = true
-recursive = false
 
 [features.aggregates]
 functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nondeterministic
 distinct = "grouped_only"  # ungrouped COUNT(DISTINCT) runtime-falls-back (#1218)
-filter = false
-order_by = false
 
 [features.scalar_functions]
 enabled = ["add", "sub", "mul", "div", "int_div", "mod",
@@ -78,7 +75,6 @@ nulls_first_last = true
 [features.limit]
 enabled = true
 offset = true
-percent = false
 require_total_order = true
 
 [features.complexity]

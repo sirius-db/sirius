@@ -6,6 +6,7 @@ from siriusfuzz.config import load_config
 from siriusfuzz.query_gen import QueryGenerator
 from siriusfuzz.reduce import candidates, reduce_query
 from siriusfuzz.schema_gen import DataGenerator
+from siriusfuzz.sqlast import Select, walk_with_parents
 
 try:
     import duckdb
@@ -47,7 +48,7 @@ class ReduceTests(unittest.TestCase):
         else:
             self.skipTest("no suitable query")
 
-        def still_fails(s):
+        def still_fails(s, _query):
             return self._valid(s) and "LIKE" in s
 
         r = reduce_query(q, sql, still_fails, max_steps=200)
@@ -58,9 +59,28 @@ class ReduceTests(unittest.TestCase):
     def test_original_returned_when_nothing_reproduces(self):
         q = self.qg.generate()
         sql = q.sql()
-        r = reduce_query(q, sql, lambda s: False, max_steps=20)
+        r = reduce_query(q, sql, lambda s, _query: False, max_steps=20)
         self.assertEqual(r.sql, sql)
         self.assertEqual(r.steps, 0)
+
+    def test_limit_never_loses_its_order_by(self):
+        def unordered_limit(query):
+            return any(
+                isinstance(node, Select)
+                and (node.limit is not None or node.offset is not None)
+                and not node.order_by
+                for _, _, _, node in walk_with_parents(query)
+            )
+
+        checked = 0
+        for _ in range(400):
+            q = self.qg.generate()
+            if getattr(q, "limit", None) is None or unordered_limit(q):
+                continue
+            checked += 1
+            for cand in candidates(q):
+                self.assertFalse(unordered_limit(cand), cand.sql())
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

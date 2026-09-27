@@ -90,10 +90,11 @@ _INTERNAL_MARKERS = (
     "invalid_argument",
     "logic_error",
 )
+# Lowercase: both marker lists are matched against the lowercased message.
 _OOM_MARKERS = (
     "out of memory",
     "out_of_memory",
-    "cudaErrorMemoryAllocation",
+    "cudaerrormemoryallocation",
     "memory allocation failed",
 )
 

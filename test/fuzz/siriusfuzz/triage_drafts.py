@@ -10,7 +10,6 @@ This module never runs queries, publishes issues, or writes human attestations.
 from __future__ import annotations
 
 import json
-import pathlib
 
 from .artifacts import fingerprint, verify, write_json
 from .triage import (
