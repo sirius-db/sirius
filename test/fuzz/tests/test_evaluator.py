@@ -6,7 +6,7 @@ import random
 import tempfile
 import time
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,8 +16,15 @@ from siriusfuzz.artifacts import verify
 from siriusfuzz.classify import Verdict, uses_plan_fallback
 from siriusfuzz.cli import build_parser, cmd_run
 from siriusfuzz.compare import ColumnInfo, ResultSet
-from siriusfuzz.config import load_config
-from siriusfuzz.report import KnownIssue, QueryRecord, Report, catch2_snippet, signature
+from siriusfuzz.config import FUZZ_DIR, load_config
+from siriusfuzz.report import (
+    KnownIssue,
+    QueryRecord,
+    Report,
+    catch2_snippet,
+    load_known_issues,
+    signature,
+)
 from siriusfuzz.runner import Evaluator, Orchestrator, OrchestratorOptions
 from siriusfuzz.session import RunResult, Session
 from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem, TableRef
@@ -123,8 +130,22 @@ def gpu_variant_wrong(sql, cols, rows, s):
 def gpu_count_distinct_error(sql, cols, rows, s):
     return RunResult(
         "error",
-        error="Sirius GPU execution failed: count(DISTINCT x) not supported ungrouped",
+        error="Sirius GPU execution failed: Distinct aggregates not supported in GPU path yet",
     )
+
+
+def gpu_reversed(sql, cols, rows, s):
+    return RunResult("ok", ResultSet(cols, list(reversed(rows))))
+
+
+ORDERED_QUERY = Select(
+    [
+        SelectItem(ColumnRef("t", name, typ), name)
+        for name, typ in (("c0", st.INTEGER), ("c1", st.DOUBLE))
+    ],
+    TableRef("t", "t"),
+    order_by=[OrderItem(Alias("c0")), OrderItem(Alias("c1"))],
+)
 
 
 def evaluate(behaviour, sql="SELECT 1 AS c0, 1.5 AS c1", **over):
@@ -534,6 +555,126 @@ class ReportTests(unittest.TestCase):
                     )
                     self.assertNotIn("compare_gpu_vs_cpu", snippet)
 
+    def test_reduction_compares_each_candidate_in_its_own_order_mode(self):
+        cfg = load_config(None, ["oracle.ambiguity_filter=false"])
+        ev = Evaluator(cfg, FakeSession(gpu_reversed), lambda m: None)
+        check = ev._make_still_fails(
+            QueryRecord(0, "d", 0, ORDERED_QUERY.sql(), "mismatch")
+        )
+        # Same rows, different order: a finding only for a totally ordered candidate.
+        self.assertTrue(check(ORDERED_QUERY.sql(), ORDERED_QUERY))
+        unordered = replace(ORDERED_QUERY, order_by=[])
+        self.assertFalse(check(unordered.sql(), unordered))
+        self.assertFalse(check(ORDERED_QUERY.sql(), None))
+
+    def test_reduction_rejects_candidates_that_depend_on_input_order(self):
+        class PermutationSensitive(FakeSession):
+            def run(self, sql, gpu, timeout):
+                res = super().run(sql, gpu, timeout)
+                if not gpu and self.current_alias.endswith("p"):
+                    res.result.rows = res.result.rows[:1]
+                return res
+
+        for ambiguity_filter, accepted in (("true", False), ("false", True)):
+            with self.subTest(ambiguity_filter=ambiguity_filter):
+                cfg = load_config(None, [f"oracle.ambiguity_filter={ambiguity_filter}"])
+                session = PermutationSensitive(gpu_wrong)
+                ev = Evaluator(cfg, session, lambda m: None)
+                ev.set_dataset(SimpleNamespace(seed=1), "main")
+                check = ev._make_still_fails(
+                    QueryRecord(0, "d", 0, "SELECT 1", "mismatch")
+                )
+                self.assertEqual(check("SELECT 0 LIMIT 1", None), accepted)
+                self.assertEqual(session.current_alias, "main")
+
+    def test_crash_before_first_run_is_attributed_to_the_new_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            active = root / "w0-s1.active.json"
+            # The previous query finished: its last run is in both evidence files.
+            session = Session(None, None, root, 0, evidence_path=active)
+            session.stage = "reduction"
+            session.evidence = {"cpu": {"sql": "SELECT previous"}}
+            active.write_text(
+                json.dumps({"sql": "SELECT previous", "phase": "cpu", "status": "ok"})
+            )
+            active.with_suffix(".observed.json").write_text(
+                json.dumps(session.evidence)
+            )
+            session.begin_query("SELECT current")
+            self.assertEqual(session.evidence, {})
+            self.assertEqual(session.stage, "evaluation")
+
+            # The worker dies before its first Session.run() rewrites the active file.
+            cfg = load_config(None)
+            report = Report(root / "run", cfg, [], 1)
+            runner = Orchestrator(cfg, report, 1, OrchestratorOptions(quiet=True))
+            runner.active_paths[0] = active
+            runner.inflight[0] = ("SELECT current", "w0-d0", time.time(), [])
+            process = SimpleNamespace(exitcode=-11)
+            with patch.object(runner, "_maybe_respawn"):
+                runner._worker_died(0, process, set())
+            record = json.loads(report.log_path.read_text().splitlines()[0])
+            self.assertEqual(record["verdict"], "crash")
+            self.assertEqual(record["sql"], "SELECT current")
+            self.assertEqual(record["evidence"], {})
+            self.assertFalse(record["reason"].startswith("CPU phase"))
+            report.finish()
+
+    def test_supervisor_reads_last_messages_of_an_exited_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(None)
+            report = Report(pathlib.Path(tmp), cfg, [], 1)
+            runner = Orchestrator(cfg, report, 1, OrchestratorOptions(quiet=True))
+            rec, _ = evaluate(gpu_ok)
+
+            def post(msg):
+                runner.queue.put({**msg, "worker": 0, "spawn": 1})
+
+            class ExitedAfterReporting:
+                exitcode = 0
+                reported = False
+
+                def is_alive(self):
+                    # The worker's last messages land after the supervisor's drain,
+                    # just before it observes the exit.
+                    if not self.reported:
+                        self.reported = True
+                        post({"type": "result", "record": asdict(rec)})
+                        post({"type": "idle"})
+                        post({"type": "done", "reason": "finished"})
+                    return False
+
+                def join(self, timeout=None):
+                    pass
+
+            def spawn(w):
+                runner.worker_spawns[w] = 1
+                runner.procs[w] = ExitedAfterReporting()
+                runner.last_seen[w] = time.time()
+                post({"type": "begin", "sql": rec.sql, "dataset": "w0-d0"})
+
+            with patch.object(runner, "_spawn", side_effect=spawn):
+                runner._run()
+            self.assertEqual(runner.total_results, 1)
+            self.assertEqual(report.status, "complete")
+            self.assertEqual(dict(report.counts), {"ok": 1})
+            report.finish()
+
+    def test_shipped_count_distinct_known_issue_is_specific(self):
+        known = load_known_issues(FUZZ_DIR / "known_issues.toml")
+        sql = "SELECT count(DISTINCT k) AS c0 FROM t"
+        rec, _ = evaluate(gpu_count_distinct_error, sql=sql)
+        self.assertTrue(any(k.matches(rec) for k in known))
+        other, _ = evaluate(
+            lambda *a: RunResult(
+                "error", error="Sirius GPU execution failed: unrelated join failure"
+            ),
+            sql=sql,
+        )
+        self.assertEqual(other.verdict, Verdict.GPU_ERROR.value)
+        self.assertFalse(any(k.matches(other) for k in known))
+
     def test_supervisor_does_not_turn_reducer_work_into_query_finding(self):
         for failure in ("crash", "hang"):
             for active_state in (
@@ -752,7 +893,7 @@ class ReportTests(unittest.TestCase):
             )
             known = [
                 KnownIssue(
-                    ".",
+                    "Distinct aggregates not supported in GPU path",
                     "sirius-db/sirius#1218",
                     verdicts=["gpu_error"],
                     sql_pattern="count\\(DISTINCT",

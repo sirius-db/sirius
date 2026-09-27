@@ -95,7 +95,6 @@ class ScopeTable:
 class Scope:
     tables: list[ScopeTable]
     outer: "Scope | None" = None
-    used_outer: bool = False
     aggregates: list[Expr] = field(default_factory=list)  # visible in HAVING
 
     def columns(self, kind: str | None = None) -> list[ColumnRef]:
@@ -577,7 +576,6 @@ class QueryGenerator:
                 raise GenerationFailed("no correlation pair")
             return None
         o, i = self.rng.choice(pairs)
-        scope.used_outer = True
         self._note("subquery:correlated")
         op = (
             "IS NOT DISTINCT FROM"
@@ -611,7 +609,6 @@ class QueryGenerator:
         p_col = 0.9 if prefer_column else 0.7
         if cols and rng.random() < p_col:
             if outer and rng.random() < 0.2:
-                scope.used_outer = True
                 return rng.choice(outer)
             return rng.choice(cols)
         if not cols and depth < self.f.complexity.max_expr_depth and rng.random() < 0.5:
@@ -893,9 +890,22 @@ class QueryGenerator:
             raise GenerationFailed("no columns for window")
         part = [rng.choice(cols)] if rng.random() < 0.7 else []
         order = [OrderItem(rng.choice(cols), desc=rng.random() < 0.5)]
+
+        def row_number() -> Window:
+            # row_number() numbers ORDER BY ties arbitrarily. Ordering by every column
+            # in scope leaves ties only between rows equal in all of them, which the
+            # output cannot tell apart. The aggregates below need no tiebreak: their
+            # default RANGE frame gives peers the same value.
+            order.extend(
+                OrderItem(c, desc=rng.random() < 0.5)
+                for c in cols
+                if c is not order[0].expr
+            )
+            return Window("row_number", None, part, order, kind="int")
+
         name = rng.choice(["row_number", "count", "sum", "min", "max"])
         if name == "row_number":
-            return Window(name, None, part, order, kind="int")
+            return row_number()
         nums = scope.columns("int") + scope.columns("float") + scope.columns("decimal")
         arg = (
             rng.choice(nums)
@@ -903,7 +913,7 @@ class QueryGenerator:
             else (rng.choice(cols) if name == "count" else None)
         )
         if arg is None:
-            return Window("row_number", None, part, order, kind="int")
+            return row_number()
         kind = "int" if name == "count" else arg.kind
         return Window(name, arg, part, order, kind=kind)
 

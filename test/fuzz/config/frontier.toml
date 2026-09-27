@@ -40,7 +40,6 @@ to_varchar = true
 targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)", "VARCHAR"]
 
 [features.limit]
-percent = false
 require_total_order = true
 
 [data.edge_values]

@@ -476,8 +476,6 @@ Query = Select | SetOp
 # Generic traversal
 # --------------------------------------------------------------------------
 
-ChildRef = tuple[Node, str, int | None]  # (parent, field name, list index or None)
-
 
 def iter_children(node: Node) -> Iterator[tuple[str, int | None, Node]]:
     """Yield (field, index, child) for every direct Node child, including tuple pairs in CASE."""

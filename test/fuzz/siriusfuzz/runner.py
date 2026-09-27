@@ -331,11 +331,22 @@ class Evaluator:
             return []
         return [r[0] for r in rows if r and r[0]]
 
-    def _make_still_fails(self, rec: QueryRecord) -> Callable[[str], bool] | None:
+    def _make_still_fails(self, rec: QueryRecord) -> Callable[..., bool] | None:
+        """Predicate ``(sql, query=None) -> bool`` for the reducer.
+
+        Mismatch checks compare each candidate in its own order mode and apply the
+        ambiguity filter, as evaluate() does; reduction can change both. Candidates
+        without an AST (string-level reduction) compare as multisets.
+        """
         verdict = Verdict(rec.verdict)
         variant = rec.variant or {}
         gpu = self.s.gpu_available
         fallback = uses_plan_fallback(rec.verdict, rec.context)
+
+        def ambiguous(sql: str, cpu: ResultSet, mode: str) -> bool:
+            return self.cfg.oracle.ambiguity_filter and self._is_ambiguous(
+                sql, cpu, mode
+            )
 
         def cpu_ok(sql: str) -> RunResult | None:
             res = self.s.run(sql, gpu=False, timeout=self.timeout)
@@ -362,7 +373,7 @@ class Evaluator:
 
         if verdict in (Verdict.MISMATCH, Verdict.FALLBACK_MISMATCH):
 
-            def check(sql: str) -> bool:
+            def check(sql: str, query: Query | None = None) -> bool:
                 cpu = cpu_ok(sql)
                 if cpu is None:
                     return False
@@ -376,24 +387,28 @@ class Evaluator:
                 )
                 if g.status != "ok" or g.result is None:
                     return False
+                mode = compare_mode(query)
                 g.result.columns = cpu.result.columns  # type: ignore[union-attr]
-                return not compare_results(cpu.result, g.result, False, self.tol).equal  # type: ignore[arg-type]
+                if compare_results(cpu.result, g.result, mode == "ordered", self.tol).equal:  # type: ignore[arg-type]
+                    return False
+                return not ambiguous(sql, cpu.result, mode)  # type: ignore[arg-type]
 
             return check
         if verdict == Verdict.VARIANT_MISMATCH and variant:
             name, value = next(iter(variant.items()))
 
-            def check_variant(sql: str) -> bool:
+            def check_variant(sql: str, query: Query | None = None) -> bool:
                 cpu = cpu_ok(sql)
                 if cpu is None:
                     return False
                 base = self.s.run(sql, gpu=gpu, timeout=self.timeout)
                 if base.status != "ok" or base.result is None:
                     return False
+                mode = compare_mode(query)
                 # A variant finding starts from a correct baseline. Reject edits
                 # that introduce a CPU/GPU mismatch before changing the setting.
                 base.result.columns = cpu.result.columns  # type: ignore[union-attr]
-                if not compare_results(cpu.result, base.result, False, self.tol).equal:  # type: ignore[arg-type]
+                if not compare_results(cpu.result, base.result, mode == "ordered", self.tol).equal:  # type: ignore[arg-type]
                     return False
                 try:
                     self.s.set(name, value)
@@ -403,9 +418,11 @@ class Evaluator:
                 if var.status != "ok" or var.result is None:
                     return False
                 var.result.columns = base.result.columns
-                return not compare_results(
-                    base.result, var.result, False, self.tol
-                ).equal
+                if compare_results(
+                    base.result, var.result, mode == "ordered", self.tol
+                ).equal:
+                    return False
+                return not ambiguous(sql, cpu.result, mode)  # type: ignore[arg-type]
 
             return check_variant
         if verdict in (
@@ -417,7 +434,7 @@ class Evaluator:
             original_reason = rec.reason.split(": ", 1)[-1] if variant else rec.reason
             want = normalize_reason(original_reason)
 
-            def check_error(sql: str) -> bool:
+            def check_error(sql: str, query: Query | None = None) -> bool:
                 if cpu_ok(sql) is None:
                     return False
                 rejection = plan_rejected(sql) if fallback else None
@@ -556,8 +573,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     }
                 )
                 try:
-                    session.evidence = {}
-                    session.stage = "evaluation"
+                    session.begin_query(sql)
                     rec = evaluator.evaluate(query, sql, w, stem, ds_seed)
                     rec.evidence = dict(session.evidence)
                     send({"type": "result", "record": asdict(rec)})
@@ -784,11 +800,9 @@ class Orchestrator:
                 msg = None
             if msg is not None:
                 self._handle(msg, finished)
-            drained = 0
             for _ in range(256):
                 try:
                     self._handle(self.queue.get_nowait(), finished)
-                    drained += 1
                 except queue_mod.Empty:
                     break
             now = time.time()
@@ -808,7 +822,11 @@ class Orchestrator:
                 if w in finished:
                     continue
                 if not p.is_alive():
-                    if drained < 256:
+                    # Its last result/done can land after the drain above. Nothing more
+                    # can arrive from a dead worker, so read everything before deciding
+                    # how it ended; after a respawn its messages would be discarded.
+                    self._drain(finished)
+                    if w not in finished:
                         self._worker_died(w, p, finished)
                     continue
                 sql_info = self.inflight.get(w)
@@ -881,6 +899,14 @@ class Orchestrator:
                 self.report.status = "incomplete"
                 self.report.stop_reason = msg.get("reason", "worker stopped")
                 self._say(f"[w{w}] stopped: {msg.get('reason')}")
+
+    def _drain(self, finished: set[int]) -> None:
+        while True:
+            try:
+                msg = self.queue.get_nowait()
+            except queue_mod.Empty:
+                return
+            self._handle(msg, finished)
 
     def _stderr_tail(self, w: int) -> str:
         path = self.stderr_paths.get(w)

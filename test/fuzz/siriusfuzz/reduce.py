@@ -10,6 +10,10 @@ subexpressions. Each candidate is re-checked with ``still_fails``; the first
 candidate that still reproduces becomes the new query. When the ``sqlsmith``
 extension is available, ``reduce_sql_statement`` runs as a second, string-level
 pass over the result.
+
+Edits never leave a LIMIT or OFFSET without the ORDER BY it had: that would make
+the candidate's rows depend on execution order, and a CPU/GPU difference in such
+a candidate is not a finding.
 """
 
 from __future__ import annotations
@@ -51,7 +55,8 @@ from .sqlast import (
     walk_with_parents,
 )
 
-StillFails = Callable[[str], bool]
+# ``still_fails(sql, query)``; ``query`` is None for string-level candidates.
+StillFails = Callable[[str, "Query | None"], bool]
 Edit = tuple  # ("drop_where",) / ("drop_item", i) / ...
 
 
@@ -74,7 +79,7 @@ def select_edits(sel: Select) -> list[Edit]:
     edits: list[Edit] = []
     if sel.limit is not None or sel.offset is not None:
         edits.append(("drop_limit",))
-    if sel.order_by:
+    if sel.order_by and sel.limit is None and sel.offset is None:
         edits.append(("drop_order",))
     if sel.where is not None:
         edits.append(("drop_where",))
@@ -303,7 +308,7 @@ def reduce_query(
     max_steps: int = 150,
     sqlsmith_candidates: Callable[[str], list[str]] | None = None,
 ) -> ReductionResult:
-    """Greedy reduction; ``still_fails(sql)`` must hold for the original query."""
+    """Greedy reduction; ``still_fails(sql, query)`` must hold for the original query."""
     result = ReductionResult(query=copy.deepcopy(query), sql=sql)
     budget = max_steps
     progress = True
@@ -317,7 +322,7 @@ def reduce_query(
                 continue
             budget -= 1
             result.tried += 1
-            if still_fails(cand_sql):
+            if still_fails(cand_sql, cand):
                 result.query = cand
                 result.sql = cand_sql
                 result.steps += 1
@@ -338,7 +343,7 @@ def reduce_query(
                     continue
                 budget -= 1
                 result.tried += 1
-                if still_fails(cand_sql):
+                if still_fails(cand_sql, None):
                     result.sql = cand_sql
                     result.query = None  # string-level result no longer maps to the AST
                     result.sqlsmith_steps += 1

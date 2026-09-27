@@ -1,4 +1,5 @@
 import pathlib
+import tempfile
 import tomllib
 import unittest
 
@@ -32,6 +33,19 @@ class ConfigTests(unittest.TestCase):
     def test_unknown_key_rejected(self):
         with self.assertRaises(ConfigError):
             load_config(None, ["features.no_such_thing=true"])
+
+    def test_retired_keys_accepted_only_as_false(self):
+        # Bundles saved before these options were removed list them as false.
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = pathlib.Path(tmp) / "config.toml"
+            saved.write_text(
+                "[features.cte]\nrecursive = false\n"
+                "[features.aggregates]\nfilter = false\norder_by = false\n"
+                "[features.limit]\npercent = false\n"
+            )
+            self.assertEqual(load_config(saved).to_dict(), load_config(None).to_dict())
+        with self.assertRaises(ConfigError):
+            load_config(None, ["features.cte.recursive=true"])
 
     def test_overrides_and_keywords(self):
         cfg = load_config(

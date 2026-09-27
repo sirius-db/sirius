@@ -4,8 +4,8 @@
 # query; optional `verdicts` restricts the verdict kinds.
 
 [[issue]]
-pattern = "."
+pattern = "Distinct aggregates not supported in GPU path"
 sql_pattern = "count\\(DISTINCT"
 issue = "sirius-db/sirius#1218"
-note = "ungrouped COUNT(DISTINCT) runtime-falls-back to CPU; tighten `pattern` once the error text is known"
+note = "ungrouped COUNT(DISTINCT) is not supported by the GPU runtime (thrown by sirius_physical_ungrouped_aggregate)"
 verdicts = ["gpu_error"]

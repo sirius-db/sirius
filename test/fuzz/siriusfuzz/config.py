@@ -61,7 +61,6 @@ class Subqueries:
 @dataclass
 class Cte:
     materialized: bool = True
-    recursive: bool = False
 
 
 @dataclass
@@ -70,8 +69,6 @@ class Aggregates:
         default_factory=lambda: ["sum", "count", "count_star", "min", "max", "avg"]
     )
     distinct: str = "grouped_only"  # off | grouped_only | on
-    filter: bool = False
-    order_by: bool = False
 
 
 @dataclass
@@ -141,7 +138,6 @@ class OrderBy:
 class Limit:
     enabled: bool = True
     offset: bool = True
-    percent: bool = False
     require_total_order: bool = True
 
 
@@ -346,12 +342,26 @@ def _strip_trailing_underscores(obj: Any) -> Any:
     return obj
 
 
+# Removed options the generator never implemented. Saved bundles still list them
+# as false; accept that so older findings replay, and reject anything else.
+_RETIRED_KEYS = {
+    "features.cte.recursive",
+    "features.aggregates.filter",
+    "features.aggregates.order_by",
+    "features.limit.percent",
+}
+
+
 def _build(cls: type, data: dict[str, Any], path: str) -> Any:
     fields = {f.name: f for f in dataclasses.fields(cls)}
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         name = _KEYWORD_FIELDS.get(key, key)
         if name not in fields:
+            if f"{path}{key}" in _RETIRED_KEYS:
+                if value is False:
+                    continue
+                raise ConfigError(f"{path}{key} was never implemented and is removed")
             raise ConfigError(f"unknown key {path}{key}")
         ftype = fields[name].type
         target = _resolve_type(ftype)
