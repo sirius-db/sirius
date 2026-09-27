@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "id": 0,
+  "fields": [
+    {
+      "id": 0,
+      "name": "id",
+      "type": "BIGINT NOT NULL"
+    },
+    {
+      "id": 1,
+      "name": "amount",
+      "type": "DECIMAL(12, 2)"
+    }
+  ],
+  "highestFieldId": 1,
+  "partitionKeys": [],
+  "primaryKeys": [
+    "id"
+  ],
+  "options": {
+    "file.format": "parquet",
+    "manifest.format": "avro",
+    "write-only": "true",
+    "snapshot.num-retained.min": "100",
+    "snapshot.num-retained.max": "100",
+    "bucket": "1",
+    "merge-engine": "deduplicate"
+  },
+  "comment": null,
+  "timeMillis": 1790478315098
+}

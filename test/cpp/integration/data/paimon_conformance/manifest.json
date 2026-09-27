@@ -1,0 +1,469 @@
+{
+  "files": {
+    "warehouse/reference.db/append_basic/bucket-0/data-0e37a213-7502-41ca-a735-1ce737074985-0.parquet": "ee4f02ba9bf40d33e7186f8eebdb69fc84ea61902438e2e261e050bacdb50a28",
+    "warehouse/reference.db/append_basic/bucket-0/data-d4e61164-1465-4a7e-9d93-a24709c43615-0.parquet": "7fd8dd1ef227b27205ed526abe4ca4a0e6316b0a079e88775f217d0d77cc0a23",
+    "warehouse/reference.db/append_basic/manifest/manifest-a1b91e17-ecd9-430e-83ea-7d63cefceed2-0": "347622c0a0ca94f2e51b0e792d2517a69bf2cefe465326b2c63ea48909ef95c9",
+    "warehouse/reference.db/append_basic/manifest/manifest-e52735ad-c894-4963-aa72-9431b6289634-0": "efb9e3ad01a23bdaa582051937f4f29dc782fcce10960dbd60d8b812715cdae3",
+    "warehouse/reference.db/append_basic/manifest/manifest-list-0f768c78-5db9-46fb-ae15-c5f903406bd7-0": "0d98dc14aa79b55a8332261f28905b3c5c2e0e92c75b95d827f417b6ba057e4c",
+    "warehouse/reference.db/append_basic/manifest/manifest-list-0f768c78-5db9-46fb-ae15-c5f903406bd7-1": "f91409a787d6d8a99cfb75385ba00a0c90772b9829ef37ca6604c2482641463a",
+    "warehouse/reference.db/append_basic/manifest/manifest-list-5a10e6e2-e185-4a19-81c4-a73cd717c9e9-0": "2358db1cc917c53fbd5e2ff32c7d43cfadc98d247fb80800123d0969ab00e2cb",
+    "warehouse/reference.db/append_basic/manifest/manifest-list-5a10e6e2-e185-4a19-81c4-a73cd717c9e9-1": "2ff87a93074e4134d3bdcca23b11ed271323969c825782724656d97b73a41624",
+    "warehouse/reference.db/append_basic/schema/schema-0": "c76056dd7773550495bb5d4d20497ea7e773358fce777d46921be32ac1238013",
+    "warehouse/reference.db/append_basic/snapshot/LATEST": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+    "warehouse/reference.db/append_basic/snapshot/snapshot-1": "377787fe023df9214492127e0ab348f2dc164b3f445038b68bbf86e89210e9f9",
+    "warehouse/reference.db/append_basic/snapshot/snapshot-2": "7c8008cc54384c2529376b7fc9bbe4f88cad3d38f0f3af137580e67cf054d286",
+    "warehouse/reference.db/empty_table/schema/schema-0": "c7392ba4c15bda42cae58871c6cc78b353c214d1a0ebc26748c17714f8dfaa1c",
+    "warehouse/reference.db/nullable_strings/bucket-0/data-dfecc34f-b6fc-47c2-985d-283a83b0478c-0.parquet": "9b5bc5ba780b9d8a272cb40904ad5585a0d445afcd778b340fc32bd8afae8d55",
+    "warehouse/reference.db/nullable_strings/manifest/manifest-43ed2926-f1a2-4b86-81c9-c504870a6dde-0": "5cc3682a73d3857fa31ce191a373447a3fba5829af51add5ea0f97a1f644d378",
+    "warehouse/reference.db/nullable_strings/manifest/manifest-list-6f5d667e-d090-47c6-ba83-8692321f399c-0": "8e9d55120fd721616836e75b5bcc9f0eee512ae1ffdb64c5f76ba3bd659cba1f",
+    "warehouse/reference.db/nullable_strings/manifest/manifest-list-6f5d667e-d090-47c6-ba83-8692321f399c-1": "9274ce2ed561a016e05efae4fbf07fe8d03779f32d591e96a921404f6580818b",
+    "warehouse/reference.db/nullable_strings/schema/schema-0": "c3b18823fdf3c77f61e5b4f1f70752991b25a6e2f008ba5f19bf856501eaf6dc",
+    "warehouse/reference.db/nullable_strings/snapshot/LATEST": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+    "warehouse/reference.db/nullable_strings/snapshot/snapshot-1": "b9e97cd36dc970db98d79c9cc739cfa173bc9f4336352d86ac2d921509749f3d",
+    "warehouse/reference.db/orders_pk/bucket-0/data-0a98ef44-3543-4298-b45c-7c767f0d2f58-0.parquet": "878c58c5aa60796aaea248e1cc29292e863c661f97bf934d8d5e797b002b5880",
+    "warehouse/reference.db/orders_pk/bucket-0/data-3922bf2b-fb46-4d2d-94b6-f58d2716290c-0.parquet": "d9c046ac1c21440bccaa3e2a65ed1e31e11ae90cb47ade03a520201d36e184a4",
+    "warehouse/reference.db/orders_pk/bucket-0/data-45c59efe-8cd7-4743-9020-d7230e558fc3-0.parquet": "7c5f293911dd02f328433d42411e9bf999cb68e2d0de399a74ad050710b01dc7",
+    "warehouse/reference.db/orders_pk/bucket-0/data-df5c4d57-30d9-4cbf-a50b-499a82c7b056-0.parquet": "296bebb5cff2d5d05d2e1c9b53c267a3ff25bc0cb30b7579a0979cc98d276d87",
+    "warehouse/reference.db/orders_pk/manifest/manifest-27acd6db-5d7f-46c1-a292-23b39d3c69d7-0": "a6df1994b96695af480ca0a94f66290f2c54fcf74b11c359276311c6e3d2f387",
+    "warehouse/reference.db/orders_pk/manifest/manifest-82681523-f591-4fdb-8764-cbe4b3fd738c-0": "babf65ffc6a0f2eb5c88a4901e43b9a3b6bd9b8489fbcabfac819ff577659fa7",
+    "warehouse/reference.db/orders_pk/manifest/manifest-87825618-2db9-445a-8ff7-3eb321b20e9d-0": "67c8ffc7cc8f6e298fec3ed7d9466f9595967ac1a9f4ac97384338d5e6693137",
+    "warehouse/reference.db/orders_pk/manifest/manifest-cd4a57a9-0fe0-47bd-b318-f4c2573ba73e-0": "422954861cc919450ed87589d8599db13848147fbb7233e10a2b0d19b9412ad1",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-27acd6db-5d7f-46c1-a292-23b39d3c69d7-0": "978b8eb30df1f0e2cbeffcea02e7847b822424a11112cb118f95e13d6105d988",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-27acd6db-5d7f-46c1-a292-23b39d3c69d7-1": "24d6037946412e3bd475af41450bfdf25930980f86f79c626d8435056477fed4",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-82681523-f591-4fdb-8764-cbe4b3fd738c-0": "e09c7de2567ee8e0ac74360f8134ec8bff143cccb34240fe78e919062d463ab4",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-82681523-f591-4fdb-8764-cbe4b3fd738c-1": "87487382d892b7920203356bd1e941dc2d351ba2ca1b87be3519d499d34bfc91",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-87825618-2db9-445a-8ff7-3eb321b20e9d-0": "cda2f6558c6b90bf5fac1698b1763ea8a9de9004809e37c5d5f2f23c335ebd6f",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-87825618-2db9-445a-8ff7-3eb321b20e9d-1": "d00c445c7dfcdb4e4741055920c4c884ebaf202d253973233d1e3387a860f7e1",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-cd4a57a9-0fe0-47bd-b318-f4c2573ba73e-0": "83d5019d81cc8415505726dd03447ffd2a08ad1b63030ab2ee4f4d785cb2cca8",
+    "warehouse/reference.db/orders_pk/manifest/manifest-list-cd4a57a9-0fe0-47bd-b318-f4c2573ba73e-1": "69f776d9a99bd63f5a0b601fd101c9efd0a234a380eb1d57c0e833800d269d27",
+    "warehouse/reference.db/orders_pk/schema/schema-0": "c257ac98a30000a5a483e336e97ffa0c644ef703352ac0d0092f97e2ea817584",
+    "warehouse/reference.db/orders_pk/snapshot/LATEST": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+    "warehouse/reference.db/orders_pk/snapshot/snapshot-1": "3aba26642e418bdc41854ab2d8ea81e6e7d4465c19bd84faaeccb4a828d82bfc",
+    "warehouse/reference.db/orders_pk/snapshot/snapshot-2": "f599e6771f087d5672e7121cd1b79cceed713cec23ed95ba855b07a45f2ccb07",
+    "warehouse/reference.db/orders_pk/snapshot/snapshot-3": "16b2ecbe42426926d13aae5fc627239c1dc8e6ac7f6ddb941bdee21c338eea43",
+    "warehouse/reference.db/orders_pk/snapshot/snapshot-4": "7566dce6d6ecb0a2d37bba065fd73f006730a5dbbcf4e0f30a04cd4df9b70644",
+    "warehouse/reference.db/partitioned_files/day=2026-09-26/bucket-0/data-ace701ec-fd15-4ef7-b74a-1f6f0b42e1fd-0.parquet": "bf179d3e390a14065e677cf0263917f870803a1ab08363a90becfe54b2591e70",
+    "warehouse/reference.db/partitioned_files/day=2026-09-27/bucket-0/data-97058333-a9d5-4817-ae5a-00b5ffa050b1-0.parquet": "bbe028103e8a376e331122f1a269d7ad80a37d86b80008437b7c0888e0199f91",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-184efbf7-d707-44f5-a23d-a3f73c8c277a-0": "1f8eb32c2f9628b16a84da7ed4239a4717ac3be4dd19465fa6ce10ecce485931",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-849383de-30bb-46c1-a443-13079eb7bd92-0": "0afc6e5fba1057e68a1dcfccf73f5f6b1fa0ed5786b159c9fadac27177d05bfa",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-list-07aa6b03-0a00-427b-aad3-023db95174f9-0": "b176ffde0a2122e373232d334162bbc929a7c861d44064ffb76541c82d7d117f",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-list-07aa6b03-0a00-427b-aad3-023db95174f9-1": "c1dc27c3079614a6bd22f21bb5bec264497fd6e31db5e1bf914b3220bcbfeabf",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-list-b8fbd0d9-32a9-4e67-83f2-934be3aed530-0": "4ef1fb6b403291e2a2aa5ded2f510ea75a3e8e517017acf5504806e430f421f2",
+    "warehouse/reference.db/partitioned_files/manifest/manifest-list-b8fbd0d9-32a9-4e67-83f2-934be3aed530-1": "02f6370151610b64c28d71a118ed37e74e79128befde4732bd5033af250f65e7",
+    "warehouse/reference.db/partitioned_files/schema/schema-0": "778d5916d88ae08dda217ebbb648357c9e15376c971637b12931e71483f24927",
+    "warehouse/reference.db/partitioned_files/snapshot/LATEST": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+    "warehouse/reference.db/partitioned_files/snapshot/snapshot-1": "ce5b44f9f3a795626cc6b53bc0a1910e4f703873ea2587d8b8af81b15de4b67b",
+    "warehouse/reference.db/partitioned_files/snapshot/snapshot-2": "2bfeab7e46ea6feed98811d07bf95104cfe473b0d378d87d7b9d0d12f55d6cc8",
+    "warehouse/reference.db/pk_filter_history/bucket-0/data-c6a2c1a4-12b5-4eda-a060-b00b734662d3-0.parquet": "5a8ba1b17abed9658b6a1e6fb6b7df7d8240681d9a5469e141c4e1435facd584",
+    "warehouse/reference.db/pk_filter_history/bucket-0/data-d25ac427-7e3f-487f-a2af-b81317d9f69f-0.parquet": "66908e9778f01ae76c91d6b8cd7be52c6c19d72ec64272965952b8d7a9de900c",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-127347fa-5e71-4975-959f-a8cb985aecc2-0": "514bdbee3f12ae761d247569c096473b41555ecff89ecadb7585482209069a62",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-d0fe0489-54db-447f-bc0b-eab0147f2b24-0": "6660725b9a4a4059bba5c10a2f8fdc552ca8c74341921e5821c0c8549a2a568c",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-list-401c201f-b72c-4737-881b-d6e20c4234d0-0": "f95c2a2fd8cfbfd99770e483dca095e1965b944c2fa87045d789f51ca457ae02",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-list-401c201f-b72c-4737-881b-d6e20c4234d0-1": "2a2caa5efa045904d1032dbd965cc73e55884ef9c9e816fb3b3f5298c18a96d4",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-list-e912cc1d-fded-4536-8029-6f157bd5968b-0": "1ad8a4bf57809ec4d520f9e27f1b30f6f81fb1860f200462ef4c2c2fbd523e61",
+    "warehouse/reference.db/pk_filter_history/manifest/manifest-list-e912cc1d-fded-4536-8029-6f157bd5968b-1": "46977dea518164b7faa87fdb7d32a7b718254bec142c80b9a5ddf750dc27ccac",
+    "warehouse/reference.db/pk_filter_history/schema/schema-0": "5973c692659a7879d5484b17dfedb3e4a2e449704ce515abb336457da5b07c93",
+    "warehouse/reference.db/pk_filter_history/snapshot/LATEST": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+    "warehouse/reference.db/pk_filter_history/snapshot/snapshot-1": "b3ff683d61e4a4c9fe0de38c7e49b82516e9b4d058d2ba5b9ea26e9fd65e618e",
+    "warehouse/reference.db/pk_filter_history/snapshot/snapshot-2": "0ecf87f480d72a16d44c1ca089bb2cbe7ecfc328882f4e695ef400c490136198"
+  },
+  "format_version": 1,
+  "generator": {
+    "delete_writer_sha256": "091a0ec7b9c7ec6c5aa6f123eff5b5f9744607b64949e2aa4769cb5d01c00697",
+    "native_commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
+    "pyarrow": "19.0.1",
+    "pypaimon": "2.0.0"
+  },
+  "independent_checks": [
+    {
+      "case": "append_a",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "10.00",
+          "id": 1
+        },
+        {
+          "amount": "10.00",
+          "id": 1
+        },
+        {
+          "amount": null,
+          "id": 2
+        }
+      ]
+    },
+    {
+      "case": "append_b",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "10.00",
+          "id": 1
+        },
+        {
+          "amount": "10.00",
+          "id": 1
+        },
+        {
+          "amount": null,
+          "id": 2
+        },
+        {
+          "amount": "5.00",
+          "id": 3
+        }
+      ]
+    },
+    {
+      "case": "pk_a",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "100.00",
+          "id": 101
+        },
+        {
+          "amount": "50.00",
+          "id": 102
+        }
+      ]
+    },
+    {
+      "case": "pk_b",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "120.00",
+          "id": 101
+        },
+        {
+          "amount": "50.00",
+          "id": 102
+        },
+        {
+          "amount": "80.00",
+          "id": 103
+        }
+      ]
+    },
+    {
+      "case": "pk_c",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "120.00",
+          "id": 101
+        },
+        {
+          "amount": "80.00",
+          "id": 103
+        }
+      ]
+    },
+    {
+      "case": "pk_d",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "120.00",
+          "id": 101
+        },
+        {
+          "amount": "70.00",
+          "id": 102
+        },
+        {
+          "amount": "80.00",
+          "id": 103
+        }
+      ]
+    },
+    {
+      "case": "strings_all",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "0.00",
+          "day": "2026-09-26",
+          "id": 1,
+          "label": null
+        },
+        {
+          "amount": "-1.25",
+          "day": "2026-09-26",
+          "id": 2,
+          "label": ""
+        },
+        {
+          "amount": null,
+          "day": "2026-09-27",
+          "id": 3,
+          "label": "Alice"
+        },
+        {
+          "amount": "2.50",
+          "day": "2026-09-27",
+          "id": 4,
+          "label": "\u8ba2\u5355"
+        }
+      ]
+    },
+    {
+      "case": "empty_rows",
+      "passed": true,
+      "rows": []
+    },
+    {
+      "case": "partitions_all",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "10.00",
+          "day": "2026-09-26",
+          "id": 1
+        },
+        {
+          "amount": "20.00",
+          "day": "2026-09-27",
+          "id": 2
+        },
+        {
+          "amount": "30.00",
+          "day": "2026-09-27",
+          "id": 3
+        }
+      ]
+    },
+    {
+      "case": "filter_history_a",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "200.00",
+          "id": 201
+        }
+      ]
+    },
+    {
+      "case": "filter_history_b",
+      "passed": true,
+      "rows": [
+        {
+          "amount": "50.00",
+          "id": 201
+        }
+      ]
+    }
+  ],
+  "tables": {
+    "append_basic": {
+      "live_files": [
+        "data-0e37a213-7502-41ca-a735-1ce737074985-0.parquet",
+        "data-d4e61164-1465-4a7e-9d93-a24709c43615-0.parquet"
+      ],
+      "live_partitions": [
+        "[]"
+      ],
+      "options": {
+        "bucket": "-1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/append_basic",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "snapshots": {
+        "A": 1,
+        "B": 2
+      },
+      "writer": "pypaimon"
+    },
+    "empty_table": {
+      "live_files": [],
+      "live_partitions": [],
+      "options": {
+        "bucket": "-1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/empty_table",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "snapshots": {},
+      "writer": "pypaimon"
+    },
+    "nullable_strings": {
+      "live_files": [
+        "data-dfecc34f-b6fc-47c2-985d-283a83b0478c-0.parquet"
+      ],
+      "live_partitions": [
+        "[]"
+      ],
+      "options": {
+        "bucket": "-1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/nullable_strings",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "label",
+          "VARCHAR"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ],
+      "snapshots": {
+        "A": 1
+      },
+      "writer": "pypaimon"
+    },
+    "orders_pk": {
+      "live_files": [
+        "data-0a98ef44-3543-4298-b45c-7c767f0d2f58-0.parquet",
+        "data-3922bf2b-fb46-4d2d-94b6-f58d2716290c-0.parquet",
+        "data-45c59efe-8cd7-4743-9020-d7230e558fc3-0.parquet",
+        "data-df5c4d57-30d9-4cbf-a50b-499a82c7b056-0.parquet"
+      ],
+      "live_partitions": [
+        "[]"
+      ],
+      "options": {
+        "bucket": "1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "merge-engine": "deduplicate",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/orders_pk",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "snapshots": {
+        "A": 1,
+        "B": 2,
+        "C": 3,
+        "D": 4
+      },
+      "writer": "paimon-cpp"
+    },
+    "partitioned_files": {
+      "live_files": [
+        "data-97058333-a9d5-4817-ae5a-00b5ffa050b1-0.parquet",
+        "data-ace701ec-fd15-4ef7-b74a-1f6f0b42e1fd-0.parquet"
+      ],
+      "live_partitions": [
+        "[datetime.date(2026, 9, 26)]",
+        "[datetime.date(2026, 9, 27)]"
+      ],
+      "options": {
+        "bucket": "-1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "partition.legacy-name": "false",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/partitioned_files",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ],
+      "snapshots": {
+        "A": 1,
+        "B": 2
+      },
+      "writer": "pypaimon"
+    },
+    "pk_filter_history": {
+      "live_files": [
+        "data-c6a2c1a4-12b5-4eda-a060-b00b734662d3-0.parquet",
+        "data-d25ac427-7e3f-487f-a2af-b81317d9f69f-0.parquet"
+      ],
+      "live_partitions": [
+        "[]"
+      ],
+      "options": {
+        "bucket": "1",
+        "file.format": "parquet",
+        "manifest.format": "avro",
+        "merge-engine": "deduplicate",
+        "snapshot.num-retained.max": "100",
+        "snapshot.num-retained.min": "100",
+        "write-only": "true"
+      },
+      "path": "warehouse/reference.db/pk_filter_history",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "snapshots": {
+        "A": 1,
+        "B": 2
+      },
+      "writer": "pypaimon"
+    }
+  }
+}

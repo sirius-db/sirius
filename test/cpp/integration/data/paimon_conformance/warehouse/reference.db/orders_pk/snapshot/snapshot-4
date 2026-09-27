@@ -1,0 +1,16 @@
+{
+    "version": 3,
+    "id": 4,
+    "schemaId": 0,
+    "baseManifestList": "manifest-list-27acd6db-5d7f-46c1-a292-23b39d3c69d7-0",
+    "baseManifestListSize": 1244,
+    "deltaManifestList": "manifest-list-27acd6db-5d7f-46c1-a292-23b39d3c69d7-1",
+    "deltaManifestListSize": 1184,
+    "commitUser": "sirius-reference-D",
+    "commitIdentifier": 9223372036854775807,
+    "commitKind": "APPEND",
+    "timeMillis": 1790478315083,
+    "totalRecordCount": 6,
+    "deltaRecordCount": 1,
+    "nextRowId": 0
+}
