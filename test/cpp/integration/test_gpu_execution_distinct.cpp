@@ -327,6 +327,18 @@ TEST_CASE_METHOD(DistinctFixture,
   }
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT over a materialized CTE",
+                 "[integration][gpu_execution][distinct]")
+{
+  // With equal widths Sirius omits the identity projection, so the CTE node is the DISTINCT's
+  // direct child. The narrower select keeps its projection.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT a FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+}
+
 //===----------------------------------------------------------------------===//
 // Volume: the paths a nine-row table cannot reach
 //===----------------------------------------------------------------------===//
