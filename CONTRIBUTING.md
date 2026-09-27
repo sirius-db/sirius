@@ -32,6 +32,13 @@ make test
 
 Test logs are written to `build/release/extension/sirius/test/cpp/log/`.
 
+### On-demand SQL fuzzing
+
+The [Sirius fuzzer guide](test/fuzz/README.md) covers GPU setup, bounded SQL campaigns,
+portable replay, triage and local issue drafts. Run it directly or use the
+[sirius-fuzz agent skill](.agents/skills/sirius-fuzz/SKILL.md) with an available development GPU.
+Harness unit tests use `pixi run -e duckdb-python fuzz-test` and do not require a GPU.
+
 ## Code style
 
 Sirius uses pre-commit hooks for formatting and linting. Install them once after cloning:

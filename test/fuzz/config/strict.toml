@@ -1,0 +1,137 @@
+# siriusfuzz "strict" profile: every enabled feature runs on the GPU today, so any
+# plan-time fallback is a finding (a generator bug or an undocumented gap).
+# Keys mirror siriusfuzz/config.py; unknown keys are rejected.
+
+profile = "strict"
+
+[features]
+window_functions = false
+distinct = false          # SELECT DISTINCT -> LogicalDistinct falls back today
+grouping_sets = false
+full_join = false
+cross_join = false
+types = ["BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT",
+         "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+         "FLOAT", "DOUBLE", "DECIMAL", "DATE",
+         "TIMESTAMP", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS", "VARCHAR"]
+
+[features.set_ops]
+union_all = true
+union = false
+except = false
+intersect = false
+
+[features.joins]
+types = ["inner", "left", "right", "semi", "anti"]
+inequality = true
+null_safe_keys = true     # IS NOT DISTINCT FROM keys
+max_tables = 4
+
+[features.subqueries]
+exists = true
+in = true
+scalar = true
+correlated = true
+uncorrelated_scalar = false   # plans as a cross product
+uncorrelated_exists = false
+max_depth = 2
+
+[features.cte]
+materialized = true
+recursive = false
+
+[features.aggregates]
+functions = ["sum", "count", "count_star", "min", "max", "avg"]   # first: nondeterministic
+distinct = "grouped_only"  # ungrouped COUNT(DISTINCT) runtime-falls-back (#1218)
+filter = false
+order_by = false
+
+[features.scalar_functions]
+enabled = ["add", "sub", "mul", "div", "int_div", "mod",
+           "substring", "like", "contains", "prefix", "suffix", "strlen", "length",
+           "regexp_replace", "concat", "concat_operator",
+           "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
+           "date_trunc"]
+[features.scalar_functions.weights]
+like = 2.0
+regexp_replace = 0.5
+
+[features.expressions]
+case = true
+coalesce = true
+in_list = true
+between = true
+is_null = true
+is_distinct_from = true
+try = false
+
+[features.casts]
+enabled = true
+temporal_numeric = false  # declined in translate_cast
+to_varchar = false        # number formatting differs between cuDF and DuckDB; enable to survey
+targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
+
+[features.order_by]
+enabled = true
+nulls_first_last = true
+
+[features.limit]
+enabled = true
+offset = true
+percent = false
+require_total_order = true
+
+[features.complexity]
+query = 0.2
+scalar = 0.2
+max_select_items = 5
+max_expr_depth = 4
+
+[nulls]
+column_null_ratio = 0.15
+all_null_column_probability = 0.05
+null_literals_in_queries = true
+null_literal_probability = 0.05
+
+[data]
+tables = [3, 6]
+rows = [50, 2000]
+common_value_ratio = 0.4
+numeric_range = "small"   # DuckDB raises on integer overflow; keep values small
+
+[data.strings]
+charset = "ascii"
+empty_string_ratio = 0.05
+max_len = 40
+
+[data.edge_values]
+probability = 0.02
+int_extremes = true
+negative_zero = false
+nan_inf = false
+date_extremes = false
+
+[oracle]
+float32_rel_tol = 1e-4
+float64_rel_tol = 1e-9
+abs_tol = 1e-12
+ambiguity_filter = true
+on_plan_fallback = "fail"
+known_issues = "known_issues.toml"
+query_timeout_seconds = 60
+reduce = true
+reduce_max_steps = 150
+reduce_sqlsmith = "auto"
+
+[variants]
+per_query = 2
+[variants.settings]
+expression_evaluator_strategy = ["materialize", "ast_interpret", "ast_jit"]
+hash_partition_bytes = [1048576, 8388608, 104857600]
+max_build_hash_table_bytes = [1048576, 90000000]
+max_sort_partition_bytes = [0, 1048576]
+
+[sirius]
+extension = "build/release/extension/sirius/sirius.duckdb_extension"
+configs = ["test/cpp/integration/integration.yaml"]
+dataset_queries = 200
