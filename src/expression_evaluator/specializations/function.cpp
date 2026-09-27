@@ -319,6 +319,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         scaled->view(), micros->view(), cudf::binary_operator::ADD, output_type, _stream, _mr);
     }
     // DuckDB returns NULL for infinite dates/timestamps as well as NULL input.
+    // Only +/-MAX are sentinels; MIN remains a finite date/timestamp.
     auto const days  = input.get_column_view().type().id() == cudf::type_id::TIMESTAMP_DAYS;
     auto const ticks = cudf::bit_cast(
       input.get_column_view(), cudf::data_type{days ? cudf::type_id::INT32 : cudf::type_id::INT64});
@@ -326,13 +327,17 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       days ? std::numeric_limits<int32_t>::max() : std::numeric_limits<int64_t>::max();
     cudf::numeric_scalar<int64_t> lower(-limit, true, _stream, _mr);
     cudf::numeric_scalar<int64_t> upper(limit, true, _stream, _mr);
-    auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
-    auto above =
-      cudf::binary_operation(ticks, lower, cudf::binary_operator::GREATER, bool_type, _stream, _mr);
-    auto below =
-      cudf::binary_operation(ticks, upper, cudf::binary_operator::LESS, bool_type, _stream, _mr);
-    auto finite = cudf::binary_operation(
-      above->view(), below->view(), cudf::binary_operator::LOGICAL_AND, bool_type, _stream, _mr);
+    auto const bool_type       = cudf::data_type{cudf::type_id::BOOL8};
+    auto not_negative_infinity = cudf::binary_operation(
+      ticks, lower, cudf::binary_operator::NOT_EQUAL, bool_type, _stream, _mr);
+    auto not_positive_infinity = cudf::binary_operation(
+      ticks, upper, cudf::binary_operator::NOT_EQUAL, bool_type, _stream, _mr);
+    auto finite = cudf::binary_operation(not_negative_infinity->view(),
+                                         not_positive_infinity->view(),
+                                         cudf::binary_operator::LOGICAL_AND,
+                                         bool_type,
+                                         _stream,
+                                         _mr);
     cudf::numeric_scalar<int64_t> null_result(0, false, _stream, _mr);
     result = cudf::copy_if_else(result->view(), null_result, finite->view(), _stream, _mr);
     return evaluate_result(std::move(result));

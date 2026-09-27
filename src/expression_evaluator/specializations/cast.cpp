@@ -23,10 +23,12 @@
 #include <sirius/exception.hpp>
 
 // cudf
+#include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/unary.hpp>
 
@@ -105,15 +107,6 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
     auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
     auto ticks           = cudf::bit_cast(child.get_column_view(), int_type);
     auto const nanos     = source_type == cudf::type_id::TIMESTAMP_NANOSECONDS;
-    cudf::numeric_scalar<int64_t> factor(
-      source_type == cudf::type_id::TIMESTAMP_SECONDS ? 1000000 : 1000, true, _stream, _mr);
-    auto micros =
-      cudf::binary_operation(ticks,
-                             factor,
-                             nanos ? cudf::binary_operator::DIV : cudf::binary_operator::MUL,
-                             int_type,
-                             _stream,
-                             _mr);
     cudf::numeric_scalar<int64_t> positive_infinity(
       std::numeric_limits<int64_t>::max(), true, _stream, _mr);
     cudf::numeric_scalar<int64_t> negative_infinity(
@@ -128,6 +121,41 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
                                            bool_type,
                                            _stream,
                                            _mr);
+    // Do not multiply infinity sentinels, even in rows overwritten below.
+    cudf::numeric_scalar<int64_t> zero(0, true, _stream, _mr);
+    auto finite_ticks   = cudf::copy_if_else(zero, ticks, infinite->view(), _stream, _mr);
+    int64_t const scale = source_type == cudf::type_id::TIMESTAMP_SECONDS ? 1000000 : 1000;
+    if (!nanos) {
+      // Integer division truncates toward zero, giving inclusive safe bounds.
+      cudf::numeric_scalar<int64_t> lower(
+        std::numeric_limits<int64_t>::min() / scale, true, _stream, _mr);
+      cudf::numeric_scalar<int64_t> upper(
+        std::numeric_limits<int64_t>::max() / scale, true, _stream, _mr);
+      auto below = cudf::binary_operation(
+        finite_ticks->view(), lower, cudf::binary_operator::LESS, bool_type, _stream, _mr);
+      auto above = cudf::binary_operation(
+        finite_ticks->view(), upper, cudf::binary_operator::GREATER, bool_type, _stream, _mr);
+      auto overflow = cudf::binary_operation(
+        below->view(), above->view(), cudf::binary_operator::LOGICAL_OR, bool_type, _stream, _mr);
+      auto any_overflow   = cudf::reduce(overflow->view(),
+                                       *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
+                                       bool_type,
+                                       _stream,
+                                       _mr);
+      auto const& invalid = static_cast<cudf::numeric_scalar<bool> const&>(*any_overflow);
+      if (invalid.is_valid(_stream) && invalid.value(_stream)) {
+        throw invalid_input_exception("Could not convert Timestamp({}) to Timestamp(US)",
+                                      source_type == cudf::type_id::TIMESTAMP_SECONDS ? "S" : "MS");
+      }
+    }
+    cudf::numeric_scalar<int64_t> factor(scale, true, _stream, _mr);
+    auto micros =
+      cudf::binary_operation(finite_ticks->view(),
+                             factor,
+                             nanos ? cudf::binary_operator::DIV : cudf::binary_operator::MUL,
+                             int_type,
+                             _stream,
+                             _mr);
     result_column = cudf::copy_if_else(cudf::bit_cast(ticks, return_type),
                                        cudf::bit_cast(micros->view(), return_type),
                                        infinite->view(),
