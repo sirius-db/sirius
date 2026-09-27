@@ -60,6 +60,7 @@
 #include <cstddef>
 #include <cstring>
 #include <future>
+#include <initializer_list>
 #include <latch>
 #include <limits>
 #include <memory>
@@ -302,15 +303,39 @@ TEST_CASE("merge_dynamic_filters_into_ast ignores out-of-range col_idx defensive
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// One INT32 column [0, 1, ..., size-1] wrapped in a single-column table.
-std::unique_ptr<cudf::table> make_sequence_table(int32_t size, ::cuda::stream_ref stream)
+/// Column of @p size values of type @p T: [start, start + step, start + 2 * step, ...].
+template <typename T>
+std::unique_ptr<cudf::column> make_sequence_column(cudf::size_type size,
+                                                   ::cuda::stream_ref stream,
+                                                   T start = 0,
+                                                   T step  = 1)
 {
-  auto col = cudf::sequence(size,
-                            cudf::numeric_scalar<int32_t>(0, true, stream),
-                            cudf::numeric_scalar<int32_t>(1, true, stream),
-                            stream);
+  return cudf::sequence(size,
+                        cudf::numeric_scalar<T>(start, true, stream),
+                        cudf::numeric_scalar<T>(step, true, stream),
+                        stream);
+}
+
+/// First value and increment of one column built by make_sequence_table().
+template <typename T>
+struct sequence_column_spec {
+  T start;
+  T step;
+};
+
+/// Table holding one make_sequence_column() of @p size rows per entry of @p columns; by default a
+/// single INT32 column [0, 1, ..., size-1].
+template <typename T = int32_t>
+std::unique_ptr<cudf::table> make_sequence_table(
+  cudf::size_type size,
+  ::cuda::stream_ref stream,
+  std::initializer_list<sequence_column_spec<T>> columns = {{0, 1}})
+{
   std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(col));
+  cols.reserve(columns.size());
+  for (auto const& [start, step] : columns) {
+    cols.push_back(make_sequence_column<T>(size, stream, start, step));
+  }
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
@@ -423,10 +448,7 @@ TEST_CASE("zone-map-only filter from a device reduce keeps a correct superset (n
   // Build keys spanning [100, 200] — the producer reduces these to min=100, max=200 and, with no
   // membership filter, publishes a zone-map alone. Probe [0..299]: only [100..200] can possibly
   // join, and crucially every value a build key could equal must survive (no false negative).
-  auto build = cudf::sequence(101,
-                              cudf::numeric_scalar<int32_t>(100, true, stream),
-                              cudf::numeric_scalar<int32_t>(1, true, stream),
-                              stream);
+  auto build = make_sequence_column<int32_t>(101, stream, 100);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(filters_producer.push_filter(0, make_zone_map_from_reduce(build->view(), stream)));
@@ -510,14 +532,10 @@ TEST_CASE("apply_dynamic_filters_to_view AND-conjoins multiple zone filters on a
 
 namespace {
 /// One INT64 sequence column [0, 1, ..., size-1] in a single-column table.
-std::unique_ptr<cudf::table> make_int64_sequence_table(int64_t size, ::cuda::stream_ref stream)
+std::unique_ptr<cudf::table> make_int64_sequence_table(cudf::size_type size,
+                                                       ::cuda::stream_ref stream)
 {
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(cudf::sequence(static_cast<cudf::size_type>(size),
-                                cudf::numeric_scalar<int64_t>(0, true, stream),
-                                cudf::numeric_scalar<int64_t>(1, true, stream),
-                                stream));
-  return std::make_unique<cudf::table>(std::move(cols));
+  return make_sequence_table<int64_t>(size, stream);
 }
 
 /// Single-column table from explicit host values — for keys/probes that aren't arithmetic
@@ -558,10 +576,7 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps exactly the rows whose key is a b
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
   // Build key set {0,1,2,3,4}; probe table [0..9]. Exact membership keeps the first five.
-  auto keys = cudf::sequence(5,
-                             cudf::numeric_scalar<int64_t>(0, true, stream),
-                             cudf::numeric_scalar<int64_t>(1, true, stream),
-                             stream);
+  auto keys = make_sequence_column<int64_t>(5, stream);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(
@@ -582,10 +597,7 @@ TEST_CASE("sirius_dynamic_in_list_filter INT64 path uses a persistent set and pr
           "[dynamic_filter][scan_merge]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto keys                 = cudf::sequence(5,
-                             cudf::numeric_scalar<int64_t>(0, true, stream),
-                             cudf::numeric_scalar<int64_t>(1, true, stream),
-                             stream);
+  auto keys                 = make_sequence_column<int64_t>(5, stream);
   auto filter               = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view(), stream, cudf::get_current_device_resource_ref());
   REQUIRE(filter->has_persistent_set());  // INT64, non-null keys → fast path
@@ -611,10 +623,7 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
 {
   auto const num_keys       = GENERATE(5, 1024);
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto keys                 = cudf::sequence(num_keys,
-                             cudf::numeric_scalar<int64_t>(0, true, stream),
-                             cudf::numeric_scalar<int64_t>(1, true, stream),
-                             stream);
+  auto keys                 = make_sequence_column<int64_t>(num_keys, stream);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(
@@ -643,10 +652,7 @@ TEST_CASE("sirius_dynamic_in_list_filter supports INT32 keys exactly",
   ::cuda::stream_ref stream = cudf::get_default_stream();
   // INT32 build key set {0,1,2,3,4}; INT32 probe [0..9]. Exact membership keeps exactly
   // {0,1,2,3,4}.
-  auto keys   = cudf::sequence(5,
-                             cudf::numeric_scalar<int32_t>(0, true, stream),
-                             cudf::numeric_scalar<int32_t>(1, true, stream),
-                             stream);
+  auto keys   = make_sequence_column<int32_t>(5, stream);
   auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view(), stream, cudf::get_current_device_resource_ref());
   REQUIRE(filter->has_persistent_set());  // INT32, non-null keys → persistent-set fast path
@@ -668,10 +674,7 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
 {
   auto const num_keys       = GENERATE(5, 1024);
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto keys                 = cudf::sequence(num_keys,
-                             cudf::numeric_scalar<int32_t>(0, true, stream),
-                             cudf::numeric_scalar<int32_t>(1, true, stream),
-                             stream);
+  auto keys                 = make_sequence_column<int32_t>(num_keys, stream);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(
@@ -711,10 +714,7 @@ TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key se
 
   // Reference filter over the same valid keys, built without nulls. Compaction is exact and the
   // hash policy deterministic, so the nullable build must produce a bit-identical filter.
-  auto clean_keys = cudf::sequence(5,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream);
+  auto clean_keys = make_sequence_column<int64_t>(5, stream);
 
   sirius_dynamic_filter_set nullable_channel;
   auto nullable_channel_producer = nullable_channel.register_producer({0});
@@ -807,10 +807,7 @@ TEST_CASE("sirius_dynamic_small_in_list_filter keeps exactly the rows whose key 
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
   // Small build key set {0,1,2,3,4}; probe [0..9]. The brute-force scan keeps the first five.
-  auto keys = cudf::sequence(5,
-                             cudf::numeric_scalar<int64_t>(0, true, stream),
-                             cudf::numeric_scalar<int64_t>(1, true, stream),
-                             stream);
+  auto keys = make_sequence_column<int64_t>(5, stream);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(
@@ -831,10 +828,7 @@ TEST_CASE("sirius_dynamic_small_in_list_filter supports INT32 keys exactly",
           "[dynamic_filter][scan_merge]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto keys                 = cudf::sequence(5,
-                             cudf::numeric_scalar<int32_t>(0, true, stream),
-                             cudf::numeric_scalar<int32_t>(1, true, stream),
-                             stream);
+  auto keys                 = make_sequence_column<int32_t>(5, stream);
   sirius_dynamic_filter_set filters;
   auto filters_producer = filters.register_producer({0});
   REQUIRE(
@@ -887,20 +881,12 @@ TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and su
   auto const mr             = cudf::get_current_device_resource_ref();
   using F                   = sirius::op::sirius_dynamic_small_in_list_filter;
 
-  auto one_i32       = cudf::sequence(1,
-                                cudf::numeric_scalar<int32_t>(0, true, stream),
-                                cudf::numeric_scalar<int32_t>(1, true, stream),
-                                stream);
-  auto max_i32       = cudf::sequence(static_cast<cudf::size_type>(F::k_max_keys),
-                                cudf::numeric_scalar<int32_t>(0, true, stream),
-                                cudf::numeric_scalar<int32_t>(1, true, stream),
-                                stream);
-  auto oversized_i32 = cudf::sequence(static_cast<cudf::size_type>(F::k_max_keys + 1),
-                                      cudf::numeric_scalar<int32_t>(0, true, stream),
-                                      cudf::numeric_scalar<int32_t>(1, true, stream),
-                                      stream);
-  auto empty_i32     = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
-  auto null_i32      = cudf::make_numeric_column(
+  auto one_i32 = make_sequence_column<int32_t>(1, stream);
+  auto max_i32 = make_sequence_column<int32_t>(static_cast<cudf::size_type>(F::k_max_keys), stream);
+  auto oversized_i32 =
+    make_sequence_column<int32_t>(static_cast<cudf::size_type>(F::k_max_keys + 1), stream);
+  auto empty_i32 = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+  auto null_i32  = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::ALL_NULL, stream);
   auto f64 =
     make_values_table<double>({0.0, 1.0, 2.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
@@ -930,25 +916,12 @@ TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and su
 //===----------------------------------------------------------------------===//
 
 namespace {
-/// IN-list filter keeping INT64 keys [0, count).
+/// IN-list filter keeping keys [0, count) of type @p T.
+template <typename T = int64_t>
 std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_in_list_prefix(
   int64_t count, ::cuda::stream_ref stream)
 {
-  auto keys = cudf::sequence(static_cast<cudf::size_type>(count),
-                             cudf::numeric_scalar<int64_t>(0, true, stream),
-                             cudf::numeric_scalar<int64_t>(1, true, stream),
-                             stream);
-  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
-    keys->view(), stream, cudf::get_current_device_resource_ref());
-}
-
-std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_int32_in_list_prefix(
-  int32_t count, ::cuda::stream_ref stream)
-{
-  auto keys = cudf::sequence(count,
-                             cudf::numeric_scalar<int32_t>(0, true, stream),
-                             cudf::numeric_scalar<int32_t>(1, true, stream),
-                             stream);
+  auto keys = make_sequence_column<T>(static_cast<cudf::size_type>(count), stream);
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view(), stream, cudf::get_current_device_resource_ref());
 }
@@ -983,12 +956,6 @@ std::vector<char> column_row_validity(cudf::column_view const& column, ::cuda::s
   return validity;
 }
 
-std::vector<cudf::size_type> list_offsets_to_host(cudf::lists_column_view const& lists,
-                                                  ::cuda::stream_ref stream)
-{
-  return to_host_int32(lists.offsets(), stream);
-}
-
 bool column_types_equal(cudf::column_view const& lhs, cudf::column_view const& rhs)
 {
   if (lhs.type() != rhs.type() || lhs.num_children() != rhs.num_children()) { return false; }
@@ -1021,8 +988,8 @@ bool columns_logically_equal(cudf::column_view const& lhs,
   if (lhs.type().id() == cudf::type_id::LIST) {
     auto const lhs_lists   = cudf::lists_column_view{lhs};
     auto const rhs_lists   = cudf::lists_column_view{rhs};
-    auto const lhs_offsets = list_offsets_to_host(lhs_lists, stream);
-    auto const rhs_offsets = list_offsets_to_host(rhs_lists, stream);
+    auto const lhs_offsets = to_host_int32(lhs_lists.offsets(), stream);
+    auto const rhs_offsets = to_host_int32(rhs_lists.offsets(), stream);
     for (std::size_t row = 0; row < validity.size(); ++row) {
       if (validity[row] == 0) { continue; }
       std::vector<cudf::size_type> const lhs_range{lhs_offsets[row], lhs_offsets[row + 1]};
@@ -1087,20 +1054,21 @@ bool forced_strategies_equal(cudf::table_view const& input,
 {
   using sirius::op::scan::detail::apply_dynamic_filters_to_view_for_testing;
   using sirius::op::scan::detail::compaction_strategy;
-  auto cascade = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::CASCADE, mode);
-  auto deferred = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::DEFERRED_KEYS, mode);
-  auto gather_once = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::GATHER_ONCE, mode);
-  stream.sync();
-  if (static_cast<bool>(cascade) != static_cast<bool>(deferred) ||
-      static_cast<bool>(cascade) != static_cast<bool>(gather_once)) {
-    return false;
+  auto const apply = [&](compaction_strategy strategy) {
+    auto out = apply_dynamic_filters_to_view_for_testing(input, snapshot, stream, strategy, mode);
+    stream.sync();
+    return out;
+  };
+  auto const cascade = apply(compaction_strategy::CASCADE);
+  for (auto const strategy :
+       {compaction_strategy::DEFERRED_KEYS, compaction_strategy::GATHER_ONCE}) {
+    auto const other = apply(strategy);
+    if (static_cast<bool>(cascade) != static_cast<bool>(other)) { return false; }
+    if (cascade && !tables_schema_and_elements_equal(cascade->view(), other->view(), stream)) {
+      return false;
+    }
   }
-  return !cascade ||
-         (tables_schema_and_elements_equal(cascade->view(), deferred->view(), stream) &&
-          tables_schema_and_elements_equal(cascade->view(), gather_once->view(), stream));
+  return true;
 }
 
 std::unique_ptr<cudf::column> make_nullable_list_payload(cudf::size_type rows,
@@ -1381,16 +1349,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
                                  sirius::op::scan::detail::compaction_strategy::DEFERRED_KEYS,
                                  sirius::op::scan::detail::compaction_strategy::GATHER_ONCE);
   rmm::cuda_stream stream;
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream.view()),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream.view()),
-                                   stream.view()));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(100, true, stream.view()),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream.view()),
-                                   stream.view()));
-  auto input    = std::make_unique<cudf::table>(std::move(columns));
+  auto input    = make_sequence_table<int64_t>(10, stream.view(), {{0, 1}, {100, 1}});
   int device_id = -1;
   REQUIRE(cudaGetDevice(&device_id) == cudaSuccess);
   blocked_filter_work work;
@@ -1847,41 +1806,41 @@ TEST_CASE("dynamic filter compaction policy selects the exact production strateg
   using sirius::op::scan::detail::choose_compaction_strategy;
   using sirius::op::scan::detail::compaction_strategy;
 
-  auto choose = [&](std::size_t rows,
-                    std::optional<std::size_t> bytes,
-                    std::size_t candidates,
-                    std::vector<std::optional<double>> const& estimates) {
-    return choose_compaction_strategy({rows, bytes, candidates, estimates});
+  auto choose = [](std::size_t rows,
+                   std::optional<std::size_t> bytes,
+                   std::vector<std::optional<double>> const& membership,
+                   bool has_ast_mask = false) {
+    return choose_compaction_strategy({rows, bytes, has_ast_mask, membership});
   };
 
   std::vector<std::optional<double>> const unknown{std::nullopt, std::nullopt};
-  CHECK(choose(100, 8000, 0, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 8000, 1, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(0, 8000, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, std::nullopt, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 0, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 99, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, std::numeric_limits<std::size_t>::max(), 2, unknown) ==
+  CHECK(choose(100, 8000, {}) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 8000, {std::nullopt}) == compaction_strategy::CASCADE);
+  CHECK(choose(0, 8000, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, std::nullopt, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 0, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 99, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, std::numeric_limits<std::size_t>::max(), unknown) ==
         compaction_strategy::CASCADE);
 
-  CHECK(choose(100, 6300, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 6399, 2, unknown) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 6400, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
-  CHECK(choose(100, 6499, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
-  CHECK(choose(100, 8000, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
-  CHECK(choose(100, 14400, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 6300, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 6399, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 6400, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 6499, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 8000, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 14400, unknown) == compaction_strategy::DEFERRED_KEYS);
 
   auto const above_wide_boundary = std::nextafter(0.35, 1.0);
   std::vector<std::optional<double>> const wide_boundary{0.35, 0.8};
   std::vector<std::optional<double>> const wide_weak{above_wide_boundary, 0.8};
-  CHECK(choose(100, 6400, 2, wide_boundary) == compaction_strategy::DEFERRED_KEYS);
-  CHECK(choose(100, 6400, 2, wide_weak) == compaction_strategy::GATHER_ONCE);
-  CHECK(choose(100, 8000, 3, {{0.5}, {0.8}, {0.9}}) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 6400, wide_boundary) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 6400, wide_weak) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 8000, {{0.5}, {0.8}, {0.9}}) == compaction_strategy::GATHER_ONCE);
 
   auto const below_narrow_boundary = std::nextafter(0.40, 0.0);
-  CHECK(choose(100, 3200, 2, {{0.40}, {0.8}}) == compaction_strategy::GATHER_ONCE);
-  CHECK(choose(100, 3200, 2, {{below_narrow_boundary}, {0.8}}) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 3200, 3, {{0.5}, {0.8}, {0.39}}) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 3200, {{0.40}, {0.8}}) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 3200, {{below_narrow_boundary}, {0.8}}) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 3200, {{0.5}, {0.8}, {0.39}}) == compaction_strategy::CASCADE);
 
   std::vector<std::optional<double>> const invalid_estimates{
     std::nullopt,
@@ -1891,13 +1850,12 @@ TEST_CASE("dynamic filter compaction policy selects the exact production strateg
     1.01};
   for (auto const invalid : invalid_estimates) {
     std::vector<std::optional<double>> const estimates{0.8, invalid};
-    CHECK(choose(100, 6400, 2, estimates) == compaction_strategy::DEFERRED_KEYS);
-    CHECK(choose(100, 6300, 2, estimates) == compaction_strategy::CASCADE);
+    CHECK(choose(100, 6400, estimates) == compaction_strategy::DEFERRED_KEYS);
+    CHECK(choose(100, 6300, estimates) == compaction_strategy::CASCADE);
   }
 
-  std::vector<std::optional<double>> const no_memberships;
-  CHECK(choose(100, 8000, 1, no_memberships) == compaction_strategy::CASCADE);
-  CHECK(choose(100, 8000, 2, {{0.5}}) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 8000, {}, /*has_ast_mask=*/true) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 8000, {{0.5}}, /*has_ast_mask=*/true) == compaction_strategy::GATHER_ONCE);
 }
 
 TEST_CASE("deferred keys support arbitrary repeated membership filters",
@@ -1926,22 +1884,15 @@ TEST_CASE("deferred keys support arbitrary repeated membership filters",
   REQUIRE(to_host_int64(out->view().column(0), stream) == std::vector<int64_t>{0, 1, 2});
 }
 
-TEST_CASE("deferred keys equal cascade for AST and INT32 membership",
+TEST_CASE("compaction strategies equal cascade for AST and INT32 membership",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  for (int32_t start : {0, 0, 100}) {
-    columns.push_back(cudf::sequence(10,
-                                     cudf::numeric_scalar<int32_t>(start, true, stream),
-                                     cudf::numeric_scalar<int32_t>(1, true, stream),
-                                     stream));
-  }
-  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto table                = make_sequence_table<int32_t>(10, stream, {{0, 1}, {0, 1}, {100, 1}});
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0, 1});
   REQUIRE(producer.push_filter(0, make_zone_map(2, 8)));
-  REQUIRE(producer.push_filter(1, make_int32_in_list_prefix(5, stream)));
+  REQUIRE(producer.push_filter(1, make_in_list_prefix<int32_t>(5, stream)));
 
   REQUIRE(forced_strategies_equal(
     table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS));
@@ -1960,19 +1911,13 @@ TEST_CASE("forced compaction strategies agree for an AST-only mask",
     table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS));
 }
 
-TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
+TEST_CASE("compaction strategies equal cascade for sliced nested nullable payloads",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
+  columns.push_back(make_sequence_column<int64_t>(10, stream));
+  columns.push_back(make_sequence_column<int64_t>(10, stream));
   columns.push_back(make_nullable_list_payload(10, stream));
   auto table        = std::make_unique<cudf::table>(std::move(columns));
   auto sliced_input = cudf::slice(table->view(), {1, 9}, stream).front();
@@ -1986,21 +1931,14 @@ TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
     sliced_input, filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
 }
 
-TEST_CASE("deferred keys equal cascade for all-true and empty results",
+TEST_CASE("compaction strategies equal cascade for all-true and empty results",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
 
   SECTION("all contributing masks retain every row")
   {
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    for (int64_t start : {0, 0, 100}) {
-      columns.push_back(cudf::sequence(10,
-                                       cudf::numeric_scalar<int64_t>(start, true, stream),
-                                       cudf::numeric_scalar<int64_t>(1, true, stream),
-                                       stream));
-    }
-    auto table = std::make_unique<cudf::table>(std::move(columns));
+    auto table = make_sequence_table<int64_t>(10, stream, {{0, 1}, {0, 1}, {100, 1}});
     sirius_dynamic_filter_set filters;
     auto producer = filters.register_producer({0, 1});
     REQUIRE(producer.push_filter(0, make_in_list_prefix(10, stream)));
@@ -2012,14 +1950,8 @@ TEST_CASE("deferred keys equal cascade for all-true and empty results",
   SECTION("contributing masks produce an empty table with the original schema")
   {
     std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(cudf::sequence(10,
-                                     cudf::numeric_scalar<int64_t>(0, true, stream),
-                                     cudf::numeric_scalar<int64_t>(1, true, stream),
-                                     stream));
-    columns.push_back(cudf::sequence(10,
-                                     cudf::numeric_scalar<int64_t>(9, true, stream),
-                                     cudf::numeric_scalar<int64_t>(-1, true, stream),
-                                     stream));
+    columns.push_back(make_sequence_column<int64_t>(10, stream));
+    columns.push_back(make_sequence_column<int64_t>(10, stream, 9, -1));
     columns.push_back(make_nullable_list_payload(10, stream));
     auto table = std::make_unique<cudf::table>(std::move(columns));
     sirius_dynamic_filter_set filters;
@@ -2031,18 +1963,12 @@ TEST_CASE("deferred keys equal cascade for all-true and empty results",
   }
 }
 
-TEST_CASE("deferred keys equal cascade for Bloom membership filters",
+TEST_CASE("compaction strategies equal cascade for Bloom membership filters",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto build_five           = cudf::sequence(5,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream);
-  auto build_three          = cudf::sequence(3,
-                                    cudf::numeric_scalar<int64_t>(0, true, stream),
-                                    cudf::numeric_scalar<int64_t>(1, true, stream),
-                                    stream);
+  auto build_five           = make_sequence_column<int64_t>(5, stream);
+  auto build_three          = make_sequence_column<int64_t>(3, stream);
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0});
   REQUIRE(
@@ -2104,16 +2030,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   // current, so the two width branches of the policy are exercised against the same filters.
   auto const input_bytes    = GENERATE(std::size_t{640}, std::size_t{1600});
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::sequence(20,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(20,
-                                   cudf::numeric_scalar<int64_t>(100, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  auto input = std::make_unique<cudf::table>(std::move(columns));
+  auto input                = make_sequence_table<int64_t>(20, stream, {{0, 1}, {100, 1}});
 
   // The marginal keeps these two filters train are 9/20 and 4/9. Both stay at or below the gate's
   // skippable cutoff, so neither filter is dropped before strategy selection, and both stay above
@@ -2126,15 +2043,20 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   REQUIRE(producer.push_filter(0, second));
   sirius::op::scan::dynamic_filter_gate gate;
 
-  auto trained = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    input_bytes);
-  stream.sync();
+  auto const apply = [&] {
+    auto out = sirius::op::scan::apply_dynamic_filters_gated_view(
+      input->view(),
+      filters.snapshot(),
+      gate,
+      stream,
+      dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+      -1,
+      input_bytes);
+    stream.sync();
+    return out;
+  };
+
+  auto trained = apply();
   REQUIRE(trained != nullptr);
   REQUIRE(to_host_int64(trained->view().column(0), stream) == std::vector<int64_t>{0, 1, 2, 3});
   auto const first_keep  = gate.filter_keep_ratio(first.get(), filters.filter_count());
@@ -2144,15 +2066,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*first_keep));
   REQUIRE_FALSE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*second_keep));
 
-  auto gathered_once = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    input_bytes);
-  stream.sync();
+  auto gathered_once = apply();
 
   REQUIRE(gathered_once != nullptr);
   REQUIRE(to_host_int64(gathered_once->view().column(0), stream) ==
@@ -2172,15 +2086,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   REQUIRE_FALSE(gate.filter_keep_ratio(first.get(), filters.filter_count()).has_value());
   REQUIRE_FALSE(gate.filter_keep_ratio(second.get(), filters.filter_count()).has_value());
 
-  auto retrained = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    input_bytes);
-  stream.sync();
+  auto retrained = apply();
 
   REQUIRE(retrained != nullptr);
   REQUIRE(to_host_int64(retrained->view().column(0), stream) == std::vector<int64_t>{0, 1, 2});
@@ -2192,24 +2098,7 @@ TEST_CASE("deferred keys preserve alignment across repeated and different column
           "[dynamic_filter][scan_merge][deferred_keys]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(9, true, stream),
-                                   cudf::numeric_scalar<int64_t>(-1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(100, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(200, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto table = make_sequence_table<int64_t>(10, stream, {{0, 1}, {9, -1}, {100, 1}, {200, 1}});
 
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0, 1});
@@ -2239,24 +2128,10 @@ TEST_CASE("deferred keys realign after nullable mask decline without training it
           "[dynamic_filter][scan_merge][deferred_keys]")
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  auto nullable_key         = cudf::sequence(10,
-                                     cudf::numeric_scalar<int64_t>(0, true, stream),
-                                     cudf::numeric_scalar<int64_t>(1, true, stream),
-                                     stream);
-  auto key_mask             = cudf::create_null_mask(10, cudf::mask_state::ALL_VALID, stream);
-  nullable_key->set_null_mask(std::move(key_mask), 1);
-  cudf::set_null_mask(nullable_key->mutable_view().null_mask(), 0, 1, false, stream);
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(std::move(nullable_key));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(10,
-                                   cudf::numeric_scalar<int64_t>(100, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  auto table = std::make_unique<cudf::table>(std::move(columns));
+  auto table                = make_sequence_table<int64_t>(10, stream, {{0, 1}, {0, 1}, {100, 1}});
+  auto& nullable_key        = table->get_column(0);
+  nullable_key.set_null_mask(cudf::create_null_mask(10, cudf::mask_state::ALL_VALID, stream), 1);
+  cudf::set_null_mask(nullable_key.mutable_view().null_mask(), 0, 1, false, stream);
 
   auto declining = std::make_shared<nullable_declining_filter>();
   auto selective = make_in_list_prefix(3, stream);
@@ -2293,16 +2168,7 @@ TEST_CASE("wide rows keep weak measured filters that narrow rows skip",
   auto const [input_bytes, wide] =
     GENERATE(std::pair{std::size_t{1600}, true}, std::pair{std::size_t{640}, false});
   ::cuda::stream_ref stream = cudf::get_default_stream();
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(cudf::sequence(20,
-                                   cudf::numeric_scalar<int64_t>(0, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  columns.push_back(cudf::sequence(20,
-                                   cudf::numeric_scalar<int64_t>(100, true, stream),
-                                   cudf::numeric_scalar<int64_t>(1, true, stream),
-                                   stream));
-  auto input = std::make_unique<cudf::table>(std::move(columns));
+  auto input                = make_sequence_table<int64_t>(20, stream, {{0, 1}, {100, 1}});
 
   // Marginal keeps of 11/20 and 6/11: both above the gate's 50% cutoff, both at or below 60%.
   auto first  = std::make_shared<counting_in_list_filter>(make_in_list_prefix(11, stream));
@@ -2313,15 +2179,20 @@ TEST_CASE("wide rows keep weak measured filters that narrow rows skip",
   REQUIRE(producer.push_filter(0, second));
   sirius::op::scan::dynamic_filter_gate gate;
 
-  auto trained = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    input_bytes);
-  stream.sync();
+  auto const apply = [&] {
+    auto out = sirius::op::scan::apply_dynamic_filters_gated_view(
+      input->view(),
+      filters.snapshot(),
+      gate,
+      stream,
+      dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+      -1,
+      input_bytes);
+    stream.sync();
+    return out;
+  };
+
+  auto trained = apply();
   REQUIRE(trained != nullptr);
   REQUIRE(trained->num_rows() == 6);
   auto const first_keep  = gate.filter_keep_ratio(first.get(), filters.filter_count());
@@ -2331,15 +2202,7 @@ TEST_CASE("wide rows keep weak measured filters that narrow rows skip",
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*first_keep));
   REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*second_keep));
 
-  auto again = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    input_bytes);
-  stream.sync();
+  auto again = apply();
 
   if (wide) {
     // Both weak filters stay, every marginal is known, so gather once probes the original rows.
@@ -2372,27 +2235,24 @@ TEST_CASE("wide rows skip measured filters that keep more than sixty percent",
   sirius::op::scan::dynamic_filter_gate gate;
   constexpr std::size_t wide_bytes = 1600;
 
-  auto trained = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    wide_bytes);
-  stream.sync();
+  auto const apply = [&] {
+    auto out = sirius::op::scan::apply_dynamic_filters_gated_view(
+      input->view(),
+      filters.snapshot(),
+      gate,
+      stream,
+      dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
+      -1,
+      wide_bytes);
+    stream.sync();
+    return out;
+  };
+
+  auto trained = apply();
   REQUIRE(trained != nullptr);
   REQUIRE(trained->num_rows() == prefix);
 
-  auto again = sirius::op::scan::apply_dynamic_filters_gated_view(
-    input->view(),
-    filters.snapshot(),
-    gate,
-    stream,
-    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
-    -1,
-    wide_bytes);
-  stream.sync();
+  auto again = apply();
 
   if (applied) {
     REQUIRE(again != nullptr);

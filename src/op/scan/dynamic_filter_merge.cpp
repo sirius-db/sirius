@@ -52,16 +52,16 @@ namespace {
  * @brief The strategy selection logic.
  *
  * If not every keep ratio is known, and
- *  - the row width is >= k_deferred_minimum_row_width, use deferred_keys strategy;
- *  - otherwise, use cascade strategy.
+ *  - the row width is >= k_deferred_minimum_row_width, use DEFERRED_KEYS strategy;
+ *  - otherwise, use CASCADE strategy.
  * If the row width is < k_deferred_minimum_row_width, and
  *  - every keep ratio >= k_gather_once_minimum_narrow_keep_ratio,
- *    use gather_once strategy;
- *  - otherwise, use cascade strategy.
+ *    use GATHER_ONCE strategy;
+ *  - otherwise, use CASCADE strategy.
  * If the row width is >= k_deferred_minimum_row_width, and
  *  - any keep ratio <= k_deferred_selective_keep_ratio,
- *    use deferred_keys strategy;
- *  - otherwise, use gather_once strategy.
+ *    use DEFERRED_KEYS strategy;
+ *  - otherwise, use GATHER_ONCE strategy.
  *
  * Measured filters keeping more than dynamic_filter_gate::filter_skippable() allows are skipped
  * before selection, except that rows at least k_deferred_minimum_row_width wide keep filters up to
@@ -84,11 +84,8 @@ struct membership_step {
   std::optional<double> expected_keep;  ///< The last observed keep ratio (empty if unknown).
 };
 
-struct filter_application_result {
-  std::unique_ptr<cudf::table> table;
-  std::size_t masks_applied = 0;
-};
-
+/// @brief Synchronizes the stream when leaving scope by exception, so the snapshot and inputs
+/// outlive any work already submitted against them.
 class exceptional_stream_retirement {
  public:
   explicit exceptional_stream_retirement(::cuda::stream_ref stream)
@@ -98,7 +95,7 @@ class exceptional_stream_retirement {
 
   ~exceptional_stream_retirement() noexcept
   {
-    if (_submitted && std::uncaught_exceptions() > _uncaught_on_entry) {
+    if (std::uncaught_exceptions() > _uncaught_on_entry) {
       (void)cudaStreamSynchronize(_stream.get());
     }
   }
@@ -106,30 +103,37 @@ class exceptional_stream_retirement {
   exceptional_stream_retirement(exceptional_stream_retirement const&)            = delete;
   exceptional_stream_retirement& operator=(exceptional_stream_retirement const&) = delete;
 
-  void mark_submitted() noexcept { _submitted = true; }
-
  private:
   ::cuda::stream_ref _stream;
   int _uncaught_on_entry;
-  bool _submitted = false;
 };
 
-/// @brief State for deferred_keys compaction strategy.
+/// @brief A key column compacted alongside the survivor row IDs.
+struct aligned_key_column {
+  std::size_t index;                     ///< The key column index of the batch.
+  std::unique_ptr<cudf::column> column;  ///< The compacted key (same length as the row IDs).
+};
+
+/// @brief State for DEFERRED_KEYS compaction strategy.
 struct deferred_selection_state {
-  std::unique_ptr<cudf::column> row_ids;  ///< The survivor row IDs.
-  std::unique_ptr<cudf::column>
-    aligned_key;                       ///< The last compacted key column (same length as row_ids).
-  std::unique_ptr<cudf::column> mask;  ///< The mask just computed for the next compaction.
-  std::optional<std::size_t> aligned_key_index;  ///< The index of the last compacted key column.
-  std::unique_ptr<cudf::table> transition;       ///< The transition table (key + row IDs).
-  std::unique_ptr<cudf::table> payload;  ///< The payload table (all columns except the key).
-  std::vector<std::unique_ptr<cudf::column>> output_columns;  ///< The output columns.
+  std::unique_ptr<cudf::column> row_ids;          ///< The survivor row IDs.
+  std::optional<aligned_key_column> aligned_key;  ///< The last compacted key column, if kept.
 };
 
 struct compaction_policy_decision {
   detail::compaction_strategy strategy;
   char const* reason;
 };
+
+[[nodiscard]] constexpr char const* to_string(detail::compaction_strategy strategy) noexcept
+{
+  switch (strategy) {
+    case detail::compaction_strategy::CASCADE: return "cascade";
+    case detail::compaction_strategy::DEFERRED_KEYS: return "deferred_keys";
+    case detail::compaction_strategy::GATHER_ONCE: return "gather_once";
+  }
+  return "unknown";
+}
 
 [[nodiscard]] bool is_known_keep_ratio(std::optional<double> estimate) noexcept
 {
@@ -161,7 +165,7 @@ struct compaction_policy_decision {
   detail::compaction_policy_input const& input) noexcept
 {
   using detail::compaction_strategy;
-  if (input.candidate_step_count < 2) {
+  if (input.membership.size() + static_cast<std::size_t>(input.has_ast_mask) < 2) {
     return {compaction_strategy::CASCADE, "fewer_than_two_candidates"};
   }
   auto const width = average_row_width(input.rows, input.input_bytes);
@@ -198,12 +202,10 @@ struct compaction_policy_decision {
 
 void validate_selection_state(deferred_selection_state const& state,
                               cudf::size_type original_rows,
-                              ::cuda::stream_ref stream,
-                              bool enabled)
+                              ::cuda::stream_ref stream)
 {
-  if (!enabled) { return; }
   if (!state.row_ids || state.row_ids->type().id() != cudf::type_id::INT32 ||
-      (state.aligned_key && state.aligned_key->size() != state.row_ids->size())) {
+      (state.aligned_key && state.aligned_key->column->size() != state.row_ids->size())) {
     throw std::logic_error("deferred dynamic-filter selection state is misaligned");
   }
 
@@ -238,42 +240,36 @@ void record_marginal_keep(dynamic_filter_gate* gate,
 
 //===----------CASCADE compaction strategy----------===//
 /// @brief Apply the CASCADE compaction strategy.
-filter_application_result apply_cascade(cudf::table_view const& input,
-                                        std::unique_ptr<cudf::column> ast_mask,
-                                        std::span<membership_step const> steps,
-                                        ::cuda::stream_ref stream,
-                                        rmm::device_async_resource_ref mr,
-                                        dynamic_filter_gate* gate,
-                                        std::size_t observed_generation,
-                                        int device_id)
+std::unique_ptr<cudf::table> apply_cascade(cudf::table_view const& input,
+                                           std::unique_ptr<cudf::column> ast_mask,
+                                           std::span<membership_step const> steps,
+                                           ::cuda::stream_ref stream,
+                                           rmm::device_async_resource_ref mr,
+                                           dynamic_filter_gate* gate,
+                                           std::size_t observed_generation,
+                                           int device_id)
 {
-  filter_application_result result;
   std::unique_ptr<cudf::table> table;
-  std::unique_ptr<cudf::column> mask;
-  exceptional_stream_retirement retirement{stream};
   cudf::table_view current = input;
 
-  auto compact = [&] {
+  auto compact = [&](std::unique_ptr<cudf::column> mask) {
     if (!mask) { return false; }
-    retirement.mark_submitted();
     table   = sirius::ApplyRetentionMask(current, mask->view(), stream, mr);
     current = table->view();
-    ++result.masks_applied;
     return true;
   };
 
-  mask = std::move(ast_mask);
-  (void)compact();
+  compact(std::move(ast_mask));
   for (auto const& step : steps) {
     if (current.num_rows() == 0) { break; }
     auto const rows_before = current.num_rows();
-    retirement.mark_submitted();
-    mask = step.mask_source->compute_mask(current.column(step.column_index), device_id, stream, mr);
-    if (!compact()) { continue; }
+    if (!compact(step.mask_source->compute_mask(
+          current.column(step.column_index), device_id, stream, mr))) {
+      continue;
+    }
     record_marginal_keep(gate, step, rows_before, current.num_rows(), observed_generation);
   }
-  result.table = std::move(table);
-  return result;
+  return table;
 }
 
 //===----------DEFERRED_KEYS compaction strategy----------===//
@@ -297,6 +293,17 @@ std::unique_ptr<cudf::column> gather_one(cudf::column_view const& source,
   return std::move(columns.front());
 }
 
+std::unique_ptr<cudf::column> compact_one(cudf::column_view const& source,
+                                          cudf::column_view const& mask,
+                                          ::cuda::stream_ref stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  auto columns =
+    sirius::ApplyRetentionMask(cudf::table_view({source}), mask, stream, mr)->release();
+  assert(columns.size() == 1);
+  return std::move(columns.front());
+}
+
 std::unique_ptr<cudf::table> materialize_deferred_result(cudf::table_view const& input,
                                                          deferred_selection_state& state,
                                                          ::cuda::stream_ref stream,
@@ -307,151 +314,129 @@ std::unique_ptr<cudf::table> materialize_deferred_result(cudf::table_view const&
       input, state.row_ids->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
   }
 
-  assert(state.aligned_key_index);
-  assert(*state.aligned_key_index < static_cast<std::size_t>(input.num_columns()));
+  auto const key_index = state.aligned_key->index;
+  assert(key_index < static_cast<std::size_t>(input.num_columns()));
   std::vector<cudf::size_type> payload_indices;
   payload_indices.reserve(static_cast<std::size_t>(input.num_columns()) - 1);
   for (cudf::size_type index = 0; index < input.num_columns(); ++index) {
-    if (static_cast<std::size_t>(index) != *state.aligned_key_index) {
-      payload_indices.push_back(index);
-    }
+    if (static_cast<std::size_t>(index) != key_index) { payload_indices.push_back(index); }
   }
 
-  state.output_columns.resize(static_cast<std::size_t>(input.num_columns()));
+  std::vector<std::unique_ptr<cudf::column>> output_columns(
+    static_cast<std::size_t>(input.num_columns()));
   if (!payload_indices.empty()) {
-    state.payload = cudf::gather(input.select(payload_indices),
-                                 state.row_ids->view(),
-                                 cudf::out_of_bounds_policy::DONT_CHECK,
-                                 stream,
-                                 mr);
-    auto columns  = state.payload->release();
+    auto columns = cudf::gather(input.select(payload_indices),
+                                state.row_ids->view(),
+                                cudf::out_of_bounds_policy::DONT_CHECK,
+                                stream,
+                                mr)
+                     ->release();
     assert(columns.size() == payload_indices.size());
     for (std::size_t index = 0; index < columns.size(); ++index) {
-      state.output_columns[static_cast<std::size_t>(payload_indices[index])] =
-        std::move(columns[index]);
+      output_columns[static_cast<std::size_t>(payload_indices[index])] = std::move(columns[index]);
     }
   }
-  state.output_columns[*state.aligned_key_index] = std::move(state.aligned_key);
-  return std::make_unique<cudf::table>(std::move(state.output_columns));
+  output_columns[key_index] = std::move(state.aligned_key->column);
+  return std::make_unique<cudf::table>(std::move(output_columns));
 }
 
 /// @brief Apply the DEFERRED_KEYS compaction strategy.
-filter_application_result apply_deferred_keys(cudf::table_view const& input,
-                                              std::unique_ptr<cudf::column> ast_mask,
-                                              std::span<membership_step const> steps,
-                                              ::cuda::stream_ref stream,
-                                              rmm::device_async_resource_ref mr,
-                                              dynamic_filter_gate* gate,
-                                              std::size_t observed_generation,
-                                              int device_id,
-                                              bool validate_indices)
+///
+/// A step's compacted key is kept only when the next step probes the same column or no step
+/// follows (materialization then reuses it); otherwise only the row IDs are compacted.
+std::unique_ptr<cudf::table> apply_deferred_keys(cudf::table_view const& input,
+                                                 std::unique_ptr<cudf::column> ast_mask,
+                                                 std::span<membership_step const> steps,
+                                                 ::cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr,
+                                                 dynamic_filter_gate* gate,
+                                                 std::size_t observed_generation,
+                                                 int device_id,
+                                                 bool validate_indices)
 {
-  filter_application_result result;
   deferred_selection_state state;
-  exceptional_stream_retirement retirement{stream};
-  retirement.mark_submitted();
+  auto validate = [&] {
+    if (validate_indices) { validate_selection_state(state, input.num_rows(), stream); }
+  };
+  auto applied  = false;
   state.row_ids = make_identity_row_ids(input.num_rows(), stream, mr);
-  validate_selection_state(state, input.num_rows(), stream, validate_indices);
+  validate();
 
   if (ast_mask) {
-    state.mask = std::move(ast_mask);
-    retirement.mark_submitted();
-    state.transition = sirius::ApplyRetentionMask(
-      cudf::table_view({state.row_ids->view()}), state.mask->view(), stream, mr);
-    auto columns = state.transition->release();
-    assert(columns.size() == 1);
-    state.row_ids = std::move(columns.front());
-    ++result.masks_applied;
-    validate_selection_state(state, input.num_rows(), stream, validate_indices);
+    state.row_ids = compact_one(state.row_ids->view(), ast_mask->view(), stream, mr);
+    applied       = true;
+    validate();
   }
 
-  for (auto const& step : steps) {
+  for (std::size_t step_index = 0; step_index < steps.size(); ++step_index) {
+    auto const& step = steps[step_index];
     if (state.row_ids->size() == 0) { break; }
     auto const key            = input.column(static_cast<cudf::size_type>(step.column_index));
     auto const identity_space = !state.aligned_key && state.row_ids->size() == input.num_rows();
-    if (state.aligned_key_index != step.column_index) {
-      if (!identity_space) {
-        retirement.mark_submitted();
-        state.aligned_key       = gather_one(key, state.row_ids->view(), stream, mr);
-        state.aligned_key_index = step.column_index;
-        validate_selection_state(state, input.num_rows(), stream, validate_indices);
-      } else {
-        state.aligned_key.reset();
-        state.aligned_key_index.reset();
-      }
+    if (!identity_space && (!state.aligned_key || state.aligned_key->index != step.column_index)) {
+      state.aligned_key =
+        aligned_key_column{step.column_index, gather_one(key, state.row_ids->view(), stream, mr)};
+      validate();
     }
 
     auto const rows_before = state.row_ids->size();
-    retirement.mark_submitted();
-    auto const probe = state.aligned_key ? state.aligned_key->view() : key;
-    state.mask       = step.mask_source->compute_mask(probe, device_id, stream, mr);
-    if (!state.mask) { continue; }
+    auto const probe       = state.aligned_key ? state.aligned_key->column->view() : key;
+    auto const mask        = step.mask_source->compute_mask(probe, device_id, stream, mr);
+    if (!mask) { continue; }
 
-    retirement.mark_submitted();
-    auto const compact_view =
-      state.aligned_key ? cudf::table_view({state.aligned_key->view(), state.row_ids->view()})
-                        : cudf::table_view({key, state.row_ids->view()});
-    state.transition = sirius::ApplyRetentionMask(compact_view, state.mask->view(), stream, mr);
-    auto columns     = state.transition->release();
-    assert(columns.size() == 2);
-    state.aligned_key       = std::move(columns[0]);
-    state.row_ids           = std::move(columns[1]);
-    state.aligned_key_index = step.column_index;
-    ++result.masks_applied;
-    validate_selection_state(state, input.num_rows(), stream, validate_indices);
+    auto const keep_key =
+      step_index + 1 == steps.size() || steps[step_index + 1].column_index == step.column_index;
+    if (keep_key) {
+      auto columns = sirius::ApplyRetentionMask(
+                       cudf::table_view({probe, state.row_ids->view()}), mask->view(), stream, mr)
+                       ->release();
+      assert(columns.size() == 2);
+      state.aligned_key = aligned_key_column{step.column_index, std::move(columns[0])};
+      state.row_ids     = std::move(columns[1]);
+    } else {
+      state.row_ids = compact_one(state.row_ids->view(), mask->view(), stream, mr);
+      state.aligned_key.reset();
+    }
+    applied = true;
+    validate();
     record_marginal_keep(gate, step, rows_before, state.row_ids->size(), observed_generation);
   }
 
-  if (result.masks_applied == 0) { return result; }
-  retirement.mark_submitted();
-  result.table = materialize_deferred_result(input, state, stream, mr);
-  return result;
+  if (!applied) { return nullptr; }
+  return materialize_deferred_result(input, state, stream, mr);
 }
 
 //===----------GATHER_ONCE compaction strategy----------===//
 /// @brief Apply the GATHER_ONCE compaction strategy.
-filter_application_result apply_gather_once(cudf::table_view const& input,
-                                            std::unique_ptr<cudf::column> ast_mask,
-                                            std::span<membership_step const> steps,
-                                            ::cuda::stream_ref stream,
-                                            rmm::device_async_resource_ref mr,
-                                            int device_id)
+std::unique_ptr<cudf::table> apply_gather_once(cudf::table_view const& input,
+                                               std::unique_ptr<cudf::column> ast_mask,
+                                               std::span<membership_step const> steps,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr,
+                                               int device_id)
 {
-  filter_application_result result;
   std::unique_ptr<cudf::column> accumulated_mask;
-  std::unique_ptr<cudf::column> next_mask;
-  exceptional_stream_retirement retirement{stream};
 
-  auto fold_mask = [&] {
-    if (!next_mask) { return; }
-    ++result.masks_applied;
-    if (!accumulated_mask) {
-      accumulated_mask = std::move(next_mask);
-      return;
-    }
-    retirement.mark_submitted();
-    accumulated_mask = cudf::binary_operation(accumulated_mask->view(),
-                                              next_mask->view(),
-                                              cudf::binary_operator::LOGICAL_AND,
-                                              cudf::data_type{cudf::type_id::BOOL8},
-                                              stream,
-                                              mr);
-    next_mask.reset();
+  auto fold_mask = [&](std::unique_ptr<cudf::column> mask) {
+    if (!mask) { return; }
+    accumulated_mask = accumulated_mask
+                         ? cudf::binary_operation(accumulated_mask->view(),
+                                                  mask->view(),
+                                                  cudf::binary_operator::LOGICAL_AND,
+                                                  cudf::data_type{cudf::type_id::BOOL8},
+                                                  stream,
+                                                  mr)
+                         : std::move(mask);
   };
 
-  next_mask = std::move(ast_mask);
-  fold_mask();
+  fold_mask(std::move(ast_mask));
   for (auto const& step : steps) {
-    retirement.mark_submitted();
-    next_mask = step.mask_source->compute_mask(
-      input.column(static_cast<cudf::size_type>(step.column_index)), device_id, stream, mr);
-    fold_mask();
+    fold_mask(step.mask_source->compute_mask(
+      input.column(static_cast<cudf::size_type>(step.column_index)), device_id, stream, mr));
   }
 
-  if (!accumulated_mask) { return result; }
-  retirement.mark_submitted();
-  result.table = sirius::ApplyRetentionMask(input, accumulated_mask->view(), stream, mr);
-  return result;
+  if (!accumulated_mask) { return nullptr; }
+  return sirius::ApplyRetentionMask(input, accumulated_mask->view(), stream, mr);
 }
 
 }  // namespace
@@ -499,8 +484,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   dynamic_filter_gate* gate,
   int device_id,
   std::optional<std::size_t> input_bytes,
-  std::optional<detail::compaction_strategy> strategy_override,
-  bool validate_indices)
+  std::optional<detail::compaction_strategy> strategy_override)
 {
   nvtx_scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
@@ -511,8 +495,8 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
 
   auto const include_ast_masks = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS;
 
-  std::unique_ptr<cudf::column> ast_mask;
   exceptional_stream_retirement retirement{stream};
+  std::unique_ptr<cudf::column> ast_mask;
   if (include_ast_masks) {
     cudf::ast::tree tree;
     cudf::ast::expression const* root = nullptr;
@@ -530,7 +514,6 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
     }
     if (root) {
       // Cross-column AST masks update only the scan-level gate.
-      retirement.mark_submitted();
       ast_mask = cudf::compute_column(input, *root, stream, mr);
     }
   }
@@ -559,13 +542,13 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   }
 
   detail::compaction_policy_input const policy_input{
-    .rows                 = static_cast<std::size_t>(input.num_rows()),
-    .input_bytes          = input_bytes,
-    .candidate_step_count = entries.size() + static_cast<std::size_t>(ast_mask != nullptr),
-    .membership           = std::span<std::optional<double> const>{estimates}};
+    .rows         = static_cast<std::size_t>(input.num_rows()),
+    .input_bytes  = input_bytes,
+    .has_ast_mask = ast_mask != nullptr,
+    .membership   = std::span<std::optional<double> const>{estimates}};
   auto const decision = evaluate_compaction_policy(policy_input);
   auto const strategy = strategy_override.value_or(decision.strategy);
-  filter_application_result result;
+  std::unique_ptr<cudf::table> result;
   switch (strategy) {
     case detail::compaction_strategy::CASCADE:
       result = apply_cascade(
@@ -580,21 +563,17 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
                                    gate,
                                    observed_filter_count,
                                    device_id,
-                                   validate_indices);
+                                   /*validate_indices=*/strategy_override.has_value());
       break;
     case detail::compaction_strategy::GATHER_ONCE:
       result = apply_gather_once(input, std::move(ast_mask), entries, stream, mr, device_id);
       break;
   }
 
-  if (!result.table) { return nullptr; }
-  auto const* strategy_name = strategy == detail::compaction_strategy::CASCADE ? "cascade"
-                              : strategy == detail::compaction_strategy::DEFERRED_KEYS
-                                ? "deferred_keys"
-                                : "gather_once";
-  auto const* mode_name     = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS
-                                ? "include_ast_row_masks"
-                                : "membership_masks_only";
+  if (!result) { return nullptr; }
+  auto const* mode_name = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS
+                            ? "include_ast_row_masks"
+                            : "membership_masks_only";
   std::optional<double> strongest_keep;
   for (auto const& estimate : estimates) {
     if (is_known_keep_ratio(estimate)) {
@@ -606,16 +585,16 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
     "candidates={} filters={} strongest_keep={} apply: {} -> {} rows.",
     device_id,
     mode_name,
-    strategy_name,
+    to_string(strategy),
     strategy_override ? "forced" : decision.reason,
     input_bytes.value_or(0),
     row_width.value_or(0),
-    policy_input.candidate_step_count,
+    estimates.size() + static_cast<std::size_t>(policy_input.has_ast_mask),
     entries.size(),
     strongest_keep.value_or(-1.0),
     input.num_rows(),
-    result.table->num_rows());
-  return std::move(result.table);
+    result->num_rows());
+  return result;
 }
 
 }  // namespace
@@ -630,7 +609,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   std::optional<std::size_t> input_bytes)
 {
   return apply_dynamic_filters_to_view_impl(
-    input, filters, stream, mode, gate, device_id, input_bytes, std::nullopt, false);
+    input, filters, stream, mode, gate, device_id, input_bytes, std::nullopt);
 }
 
 std::unique_ptr<cudf::table> detail::apply_dynamic_filters_to_view_for_testing(
@@ -643,7 +622,7 @@ std::unique_ptr<cudf::table> detail::apply_dynamic_filters_to_view_for_testing(
   int device_id)
 {
   return apply_dynamic_filters_to_view_impl(
-    input, filters, stream, mode, gate, device_id, std::nullopt, strategy, true);
+    input, filters, stream, mode, gate, device_id, std::nullopt, strategy);
 }
 
 std::optional<double> dynamic_filter_gate::filter_keep_ratio(

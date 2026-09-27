@@ -58,7 +58,7 @@ enum class compaction_strategy { CASCADE, DEFERRED_KEYS, GATHER_ONCE };
 struct compaction_policy_input {
   std::size_t rows;
   std::optional<std::size_t> input_bytes;
-  std::size_t candidate_step_count;
+  bool has_ast_mask;  ///< Whether an AST mask precedes the membership steps.
   std::span<std::optional<double> const> membership;
 };
 
