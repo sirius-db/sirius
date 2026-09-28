@@ -306,8 +306,7 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
   rmm::cuda_stream reader_stream;
   rmm::cuda_stream downgrade_stream;
 
-  auto batch =
-    wrap_batch(make_settled_column(kExpected, reader_stream), reader_stream);
+  auto batch = wrap_batch(make_settled_column(kExpected, reader_stream), reader_stream);
   REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
 
   delay_state gate;
