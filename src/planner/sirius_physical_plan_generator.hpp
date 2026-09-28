@@ -41,6 +41,7 @@ class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalDelimGet;
@@ -118,6 +119,7 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(

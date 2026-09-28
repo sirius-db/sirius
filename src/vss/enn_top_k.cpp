@@ -16,8 +16,8 @@
 
 #include "vss/enn_top_k.hpp"
 
-#include "vss/brute_force_search.hpp"
-#include "vss/cudf_raft_interop.hpp"
+#include "cuda/vss/brute_force_search.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 
 #include <cudf/column/column.hpp>
@@ -25,7 +25,6 @@
 #include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/merge.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 

@@ -18,8 +18,9 @@
 #include <catch.hpp>
 
 // sirius
-#include <vss/brute_force_search.hpp>
-#include <vss/cudf_raft_interop.hpp>
+#include <cuda/vss/cudf_raft_interop.hpp>
+
+#include <../../../src/cuda/vss/brute_force_search.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>

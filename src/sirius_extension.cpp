@@ -90,6 +90,7 @@ extern "C" int cudaProfilerStop();
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #endif
+#include "cuda/vss/ivf_flat_index.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
@@ -112,7 +113,6 @@ extern "C" int cudaProfilerStop();
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
-#include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
 

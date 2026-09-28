@@ -30,6 +30,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <../../../src/cuda/vss/ivf_flat_index.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -37,7 +38,6 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cuvs/distance/distance.hpp>
 #include <vss/cuvs_index_cache.hpp>
-#include <vss/ivf_flat_index.hpp>
 
 #include <cstdint>
 #include <string>
