@@ -469,6 +469,70 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nul
   }
 }
 
+TEST_CASE("ast_from_duckdb - unsigned casts require a carrier with enough range",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  // Counts are value bits: signed carriers reserve one bit for the sign, and
+  // Sirius represents HUGEINT/UHUGEINT using INT64/UINT64 rather than 128-bit storage.
+  using domain = std::pair<LogicalTypeId, int>;
+  for (auto [source, source_bits] : {domain{LogicalTypeId::UTINYINT, 8},
+                                     domain{LogicalTypeId::USMALLINT, 16},
+                                     domain{LogicalTypeId::UINTEGER, 32},
+                                     domain{LogicalTypeId::UBIGINT, 64},
+                                     domain{LogicalTypeId::UHUGEINT, 128}}) {
+    for (auto [target, target_bits] : {domain{LogicalTypeId::TINYINT, 7},
+                                       domain{LogicalTypeId::SMALLINT, 15},
+                                       domain{LogicalTypeId::INTEGER, 31},
+                                       domain{LogicalTypeId::BIGINT, 63},
+                                       domain{LogicalTypeId::HUGEINT, 63},
+                                       domain{LogicalTypeId::UTINYINT, 8},
+                                       domain{LogicalTypeId::USMALLINT, 16},
+                                       domain{LogicalTypeId::UINTEGER, 32},
+                                       domain{LogicalTypeId::UBIGINT, 64},
+                                       domain{LogicalTypeId::UHUGEINT, 64}}) {
+      for (bool try_cast : {false, true}) {
+        INFO("source=" << LogicalType(source).ToString()
+                       << " target=" << LogicalType(target).ToString() << " try_cast=" << try_cast);
+        auto expr = BoundCastExpression::AddDefaultCastToType(
+          make_bound_ref(0, source), LogicalType(target), try_cast);
+        auto translated = sirius::ast::from_duckdb(*expr);
+        // DuckDB elides same-type casts, leaving only the bound reference.
+        REQUIRE((translated != nullptr) == (source == target || source_bits <= target_bits));
+      }
+    }
+  }
+
+  // The nested cast must reject its parent comparison too, including a join predicate.
+  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UBIGINT),
+                                                        LogicalType::HUGEINT);
+  auto right = BoundCastExpression::AddDefaultCastToType(make_bound_ref(1, LogicalTypeId::BIGINT),
+                                                         LogicalType::HUGEINT);
+  BoundComparisonExpression predicate(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  REQUIRE(sirius::ast::from_duckdb(predicate) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - exact unsigned carriers and safe widenings remain supported",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  auto direct = make_bound_ref(0, LogicalTypeId::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*direct) != nullptr);
+  for (auto source : {LogicalTypeId::TINYINT,
+                      LogicalTypeId::SMALLINT,
+                      LogicalTypeId::INTEGER,
+                      LogicalTypeId::BIGINT,
+                      LogicalTypeId::UTINYINT,
+                      LogicalTypeId::USMALLINT,
+                      LogicalTypeId::UINTEGER}) {
+    auto expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, source), LogicalType::HUGEINT);
+    REQUIRE(sirius::ast::from_duckdb(*expr) != nullptr);
+  }
+  auto widen = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UINTEGER),
+                                                         LogicalType::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*widen) != nullptr);
+}
+
 // ============================================================================
 // BOUND_FUNCTION
 // ============================================================================
