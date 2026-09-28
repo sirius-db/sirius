@@ -19,20 +19,9 @@ Data reaches the GPU through the Sirius IO subsystem (`io::ioctx` / `io::sirius_
 
 ## Scan contracts
 
-Every GPU scan and streaming source carries a bound read view and a scan contract.
-The read view identifies the verified source, bound schema, options and input
-inventory. The contract adds the scan's output columns, predicates and
-materializer requirements.
+Before transparent GPU execution, Sirius checks that its scans read the same bound inputs as DuckDB's original plan. Each fresh split is checked against the scan consuming it. Native scans hold checkpoint protection until cleanup, and CPU fallback requires permitted sources and successful cleanup.
 
-Transparent execution compares the original DuckDB bindings with the GPU
-candidate before installing the plan, and repeats the check after an execution-time
-rebuild. Fresh splits carry certificates checked against their consuming scan.
-Native scans hold a shared checkpoint lease from execution preparation through
-scan cleanup. CPU replay also requires whole-plan source permission and successful
-lease release.
-
-See [Scan Contracts](scan-contracts-design.md) for source verification, binding
-comparison, split ownership, checkpoint lifetime, replay policy and diagnostics.
+See [Scan Contracts](scan-contracts-design.md) for the checks, fallback rules, and limitations.
 
 ## Scan Operator
 
@@ -110,7 +99,7 @@ There is no factory class. Each implementation provides a free `make_ingestible(
 
 ### DuckDB-native ingestible
 
-`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares its serial walk plan at execution start in `ensure_metadata_prepared()`, after the scan manager acquires the shared checkpoint key (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws through the runtime fallback policy before any per-segment IO). Its constructor does not walk row groups or acquire a key; see [Native checkpoint lease](scan-contracts-design.md#native-checkpoint-lease). It slices the table's row groups into fixed internal ranges of eight groups. `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
+`duckdb_native_gpu_ingestible` (`duckdb_native_gpu_ingestible.{hpp,cpp}`) prepares its serial walk plan during execution preparation under a shared checkpoint lease (`prepare_duckdb_native_walk`: partition statistics, projected-type viability gate, and filter-stat row-group pruning — a non-viable query throws through the runtime fallback policy before any per-segment IO). See [Native checkpoint lease](scan-contracts-design.md#native-checkpoint-lease) for its lifetime and effect on checkpoints. It slices the table's row groups into fixed internal ranges of eight groups. `next_split_provider` hands out one range per claim; each metadata task walks that range and emits a `duckdb_native_scan_info`. `materialize_metadata_to_table` decodes the range's storage segments into a `cudf::table` (always `UNFILTERED`); filter evaluation and projection to output arity happen in `post_filter_and_project`.
 
 ### Iceberg ingestible
 
@@ -411,7 +400,7 @@ Before decode, the scan walks DuckDB's storage metadata to learn, per row group,
 
 ### Phase 1 — `prepare_duckdb_native_walk()` (serial)
 
-Runs once on the query thread during execution preparation, under the scan manager's shared checkpoint key. It touches `ClientContext`/`LocalStorage`, which are not thread-safe:
+Runs once during execution preparation under a shared checkpoint lease. This work stays on the query thread because `ClientContext`/`LocalStorage` are not thread-safe:
 
 - Reads `PartitionStatistics` for every row group (the source of each row group's absolute first-row index and row count, used both for rowid synthesis and decoded-byte budgeting).
 - Gates the projected types: an exhaustive type switch refuses 128-bit and nested types up front — except fixed-size `ARRAY` with a supported fixed-width element, which is admitted and decodes as cuDF `LIST` — so an unsupported projection becomes a clean CPU fallback before any per-segment IO.
