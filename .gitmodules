@@ -3,8 +3,8 @@
 # match the new version.
 [submodule "duckdb"]
 	path = duckdb
-	url = https://github.com/sirius-db/duckdb
-	branch = v1.5.5-patches
+	url = https://github.com/duckdb/duckdb.git
+	branch = v1.5-variegata
 	ignore = dirty
 [submodule "substrait"]
 	path = substrait
