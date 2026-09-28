@@ -295,8 +295,8 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // hooks must not throw, so log a readable message and decline the plan.
   try {
     // Capture the optimizer-hook original before Copy() or Sirius lowering can
-    // transform the scans. Commit C consumes these table-indexed views as the
-    // authoritative logical-original side of its equivalence check.
+    // transform the scans. These table-indexed views remain the logical-original
+    // side of the candidate comparison.
     conn_state->set_captured_original_views(
       sirius::op::scan::capture_bound_read_views(*plan, context));
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));

@@ -1613,8 +1613,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     try {
       op->get_ingestible().ensure_metadata_prepared();
     } catch (...) {
-      // The c10 viability-error route must expose the same bounded held-key window as a
-      // successful prepare, so FORCE CHECKPOINT can be proven waiting before cleanup/replay.
+      // Pause with the checkpoint key held after metadata preparation fails, so tests can
+      // observe FORCE CHECKPOINT waiting before cleanup and replay.
       pause_native_with_key_for_testing();
       throw;
     }

@@ -240,8 +240,9 @@ TEST_CASE(kUnavailableChildCase, "[.][scan][native][checkpoint][integration]")
           *context, *fixture.con->context, "cleanup_failure");
         context->get_scan_manager().acquire_checkpoint_key(window.query_id(),
                                                            table.GetStorage().GetAttached());
-        CHECK_THROWS_WITH(window.finish(),
-                          Catch::Matchers::Contains("injected checkpoint cleanup failure"));
+        CHECK_THROWS_WITH(
+          window.finish(),
+          Catch::Matchers::ContainsSubstring("injected checkpoint cleanup failure"));
         CHECK(window.lease_release().state ==
               duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::cleanup_failed);
         CHECK(window.lease_release().keys_released == 0);
@@ -678,8 +679,8 @@ TEST_CASE("native-first planning cannot deadlock a cold Iceberg metadata connect
     return scalar_or_error(std::move(result));
   });
 
-  // lower_native_scan has reached the c7 pause. Planning owns no key, so FORCE CHECKPOINT must
-  // finish before A continues into Iceberg's cold internal metadata query.
+  // Native lowering is paused before the metadata walk. Planning holds no checkpoint key, so
+  // FORCE CHECKPOINT can finish before the query enters Iceberg's cold metadata lookup.
   REQUIRE(native_leaf.wait());
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   auto checkpoint = std::async(std::launch::async, [&] {

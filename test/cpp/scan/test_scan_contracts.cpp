@@ -21,6 +21,7 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
+#include "planner/connector_reference_cache.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
@@ -51,6 +52,7 @@
 #include <chrono>
 #include <csignal>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -292,7 +294,7 @@ TEST_CASE("Parquet identity includes bound explicit cardinality but not optimize
   CHECK(canonical_read_view_text(bound_100) == canonical_read_view_text(reestimated_100));
 
   // explicit_cardinality is different: DuckDB serializes it as a bound parquet
-  // option, so r18 requires it to remain in the identity.
+  // option, so it must remain part of the read identity.
   auto plan_200 =
     con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "', explicit_cardinality=200)");
   auto const bound_200 = capture_bound_read_view(first_get(*plan_200), *con.context);
@@ -500,9 +502,9 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   native_get.function.name = "r1_unknown_scan";
   REQUIRE_FALSE(sirius::planner::lookup_connector(native_get, *con.context));
   registry_test_generator generator(*con.context);
-  REQUIRE_THROWS_WITH(
-    generator.create_plan(native_get),
-    Catch::Matchers::Contains("Table function 'r1_unknown_scan' is not supported in Sirius"));
+  REQUIRE_THROWS_WITH(generator.create_plan(native_get),
+                      Catch::Matchers::ContainsSubstring(
+                        "Table function 'r1_unknown_scan' is not supported in Sirius"));
 
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
@@ -693,11 +695,76 @@ TEST_CASE("Dropping and recreating a native table changes read identity",
   CHECK_FALSE(before.identity->fingerprint == after.identity->fingerprint);
 }
 
+TEST_CASE("Scan reference resolution remembers unavailable definitions",
+          "[scan][contracts][reference_cache]")
+{
+  sirius::planner::detail::connector_reference_cache cache;
+  unsigned calls = 0;
+  auto resolve   = [&] {
+    ++calls;
+    // A missing host export yields no definition. A later candidate or catalog change
+    // must not cause another factory lookup or acquire trust through the empty cache.
+    if (calls == 1) return duckdb::vector<duckdb::TableFunction>{};
+    return duckdb::vector<duckdb::TableFunction>{duckdb::TableScanFunction::GetFunction()};
+  };
+  for (unsigned lookup = 0; lookup < 3; ++lookup) {
+    CHECK(cache.get_or_resolve(resolve).empty());
+  }
+  CHECK(calls == 1);
+}
+
+TEST_CASE("Extension bootstrap can publish after unavailable scan references",
+          "[scan][contracts][reference_cache]")
+{
+  sirius::planner::detail::connector_reference_cache cache;
+  unsigned calls   = 0;
+  auto unavailable = [&] {
+    ++calls;
+    return duckdb::vector<duckdb::TableFunction>{};
+  };
+  REQUIRE(cache.get_or_resolve(unavailable).empty());
+  cache.publish({});
+  REQUIRE(cache.get_or_resolve(unavailable).empty());
+  CHECK(calls == 1);
+
+  auto trusted = duckdb::TableScanFunction::GetFunction();
+  cache.publish({trusted});
+  auto const& references = cache.get_or_resolve(unavailable);
+  REQUIRE(references.size() == 1);
+  CHECK(references.front().function == trusted.function);
+  CHECK(cache.has_verified_functions());
+  CHECK(calls == 1);
+}
+
+TEST_CASE("Scan reference resolution publishes only complete results",
+          "[scan][contracts][reference_cache]")
+{
+  sirius::planner::detail::connector_reference_cache cache;
+  CHECK_THROWS_AS(cache.get_or_resolve([]() -> duckdb::vector<duckdb::TableFunction> {
+    throw std::runtime_error("factory unavailable");
+  }),
+                  std::runtime_error);
+  CHECK_FALSE(cache.has_verified_functions());
+
+  unsigned calls = 0;
+  auto trusted   = duckdb::TableScanFunction::GetFunction();
+  auto resolve   = [&] {
+    ++calls;
+    return duckdb::vector<duckdb::TableFunction>{trusted};
+  };
+  for (unsigned lookup = 0; lookup < 3; ++lookup) {
+    auto const& references = cache.get_or_resolve(resolve);
+    REQUIRE(references.size() == 1);
+    CHECK(references.front().function == trusted.function);
+  }
+  CHECK(calls == 1);
+}
+
 TEST_CASE("Scan registry rejects registered replacements before or after first lookup",
           "[scan][contracts][isolated_context]")
 {
-  auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" /
-                      "s3" / "sirius.yaml";
+  auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" /
+                      "data" / "configurator.yaml";
   REQUIRE(std::filesystem::is_regular_file(config));
   for (auto const* phase : {"cold",
                             "warm",
@@ -836,6 +903,18 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     loader.RegisterFunction(replacement);
   }
 
+  if (!iceberg_first) {
+    // Cache a real admission failure before Iceberg is loaded. The extension-load
+    // bootstrap must then replace that empty result in both static and loadable Sirius.
+    REQUIRE_FALSE(con.Query("SET gpu_execution=true")->HasError());
+    REQUIRE_FALSE(con.Query("SET enable_duckdb_fallback=false")->HasError());
+    auto rejected = con.Query("SELECT * FROM iceberg_scan(42)");
+    INFO((rejected->HasError() ? rejected->GetError() : "unexpected admission"));
+    REQUIRE(rejected->HasError());
+    CHECK(rejected->GetError().find("unverified callbacks") != std::string::npos);
+    REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  }
+
   // A missing trusted definition must stay unverified during lookup, even when the
   // library becomes locatable later; lookup may not retry cold initialization.
   auto info = duckdb::ExtensionManager::Get(*database.instance).GetExtensionInfo("iceberg");
@@ -970,7 +1049,8 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   auto& get = first_get(*plan);
   require_registered_callbacks(get.function, replacement);
   registry_test_generator generator(*con.context);
-  CHECK_THROWS_WITH(generator.create_plan(get), Catch::Matchers::Contains("unverified callbacks"));
+  CHECK_THROWS_WITH(generator.create_plan(get),
+                    Catch::Matchers::ContainsSubstring("unverified callbacks"));
   REQUIRE_FALSE(con.Query("COMMIT")->HasError());
   REQUIRE_FALSE(con.Query("SET gpu_execution=true")->HasError());
   REQUIRE_FALSE(con.Query("SET enable_duckdb_fallback=false")->HasError());
@@ -1048,7 +1128,7 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       CHECK_FALSE(sirius::planner::lookup_connector(get, *con.context));
       registry_test_generator generator(*con.context);
       CHECK_THROWS_WITH(generator.create_plan(get),
-                        Catch::Matchers::Contains("unverified callbacks"));
+                        Catch::Matchers::ContainsSubstring("unverified callbacks"));
     }
     CHECK(sirius::planner::lookup_connector(original, bind.get(), *con.context));
   }
@@ -1088,4 +1168,13 @@ TEST_CASE("Read-view evidence indexes preserve file order and duplicates", "[sca
   CHECK(positions.size() == paths.size());
   CHECK(paths == std::vector<std::string>{"c", "a", "b", "a"});
   CHECK(make_read_view_evidence_index({}).empty());
+}
+
+TEST_CASE("Sorted read-view files use an implicit evidence index", "[scan][contracts]")
+{
+  auto paths = GENERATE(std::vector<std::string>{},
+                        std::vector<std::string>{"a"},
+                        std::vector<std::string>{"a", "b", "c"},
+                        std::vector<std::string>{"a", "a", "b", "b"});
+  CHECK(make_read_view_evidence_index(paths).empty());
 }

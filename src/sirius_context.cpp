@@ -1763,7 +1763,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   } catch (SiriusRuntimeUnavailableException& e) {
     // Stable typed unavailable error: S3 keeps it as-is; LOCAL falls back to
     // the retained CPU plan when allowed.
-    if (source_policy.reads_sirius_owned_s3()) { throw; }
+    if (source_policy.reads_sirius_owned_s3() ||
+        sirius::references_sirius_owned_s3_parquet(current_query_sql)) {
+      throw;
+    }
     sirius::transparent::require_s3_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) { throw; }

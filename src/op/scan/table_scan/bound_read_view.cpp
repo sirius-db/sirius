@@ -551,11 +551,10 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 }
 }  // namespace
 
-// Keep this allocation boundary visible to T6's stack attribution. It contains only
-// R1 evidence correspondence storage, not baseline Parquet construction allocations.
-__attribute__((noinline)) std::vector<std::size_t> make_read_view_evidence_index(
-  std::span<std::string const> paths)
+// Map each file's input position to its position in the sorted evidence arrays.
+std::vector<std::size_t> make_read_view_evidence_index(std::span<std::string const> paths)
 {
+  if (std::is_sorted(paths.begin(), paths.end())) { return {}; }
   std::vector<std::size_t> result(paths.size());
   std::vector<std::size_t> order(paths.size());
   std::iota(order.begin(), order.end(), 0);
