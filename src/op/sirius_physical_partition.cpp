@@ -40,28 +40,12 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
-#include <memory>
 #include <mutex>
-#include <vector>
 
 namespace sirius {
 namespace op {
 
 namespace {
-
-/// The batches currently waiting in partition 0 of @p repo, in repository order. A batch removed
-/// between listing and lookup comes back null; callers decide whether that is skippable.
-std::vector<std::shared_ptr<cucascade::data_batch>> waiting_batches(
-  cucascade::shared_data_repository& repo)
-{
-  auto const batch_ids = repo.get_batch_ids(0);
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  batches.reserve(batch_ids.size());
-  for (auto batch_id : batch_ids) {
-    batches.push_back(repo.get_data_batch_by_id(batch_id, 0));
-  }
-  return batches;
-}
 
 std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
 {
@@ -405,8 +389,11 @@ uint64_t sirius_physical_partition::compute_total_bytes()
       "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
+  auto& repo           = ports.at("default")->repo;
+  auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
-  for (auto const& batch : waiting_batches(*ports.at("default")->repo)) {
+  for (auto batch_id : batch_ids) {
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
@@ -456,6 +443,7 @@ std::optional<observed_input_metadata> sirius_physical_partition::collect_input_
   // No repository means no batches to read; every metadata optional stays absent rather than
   // reporting "nothing observed" as "nothing there".
   if (repo == nullptr) { return meta; }
+  auto batch_ids = repo->get_batch_ids(0);
 
   std::uint64_t total_rows = 0;
   std::vector<observed_column_meta> columns;
@@ -463,7 +451,8 @@ std::optional<observed_input_metadata> sirius_physical_partition::collect_input_
   bool schema_latched                                = false;
   const cucascade::memory::memory_space* input_space = nullptr;
 
-  for (auto const& batch : waiting_batches(*repo)) {
+  for (auto batch_id : batch_ids) {
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
     // A batch that vanished mid-walk leaves the rows unknown.
     if (!batch) {
       schema_known = false;
