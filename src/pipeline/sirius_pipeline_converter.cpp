@@ -123,7 +123,8 @@ void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline
   for (const auto& pipeline : pipelines) {
     if (pipeline->get_source()->type != op::SiriusPhysicalOperatorType::HASH_JOIN &&
         pipeline->get_source()->type != op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN &&
-        pipeline->get_source()->type != op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) {
+        pipeline->get_source()->type != op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN &&
+        pipeline->get_source()->type != op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
       continue;
     }
     auto build_sink = pipeline->dependencies[0]->get_sink();
@@ -345,7 +346,8 @@ void sirius_pipeline_converter::finalize_pipeline_structure()
       bool const build_side_of_join =
         (locked_parent->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
          locked_parent->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
-         locked_parent->source->type == op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) &&
+         locked_parent->source->type == op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN ||
+         locked_parent->source->type == op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) &&
         pipeline->sink->type == op::SiriusPhysicalOperatorType::CONCAT &&
         pipeline->sink->Cast<op::sirius_physical_concat>().is_build_concat();
       if (build_side_of_join) {
@@ -386,7 +388,8 @@ void sirius_pipeline_converter::link_join_partition_siblings()
     // inner joins use their build side instead.
     if (pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
         pipeline->source->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
-        pipeline->source->type == op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) {
+        pipeline->source->type == op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN ||
+        pipeline->source->type == op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
       auto build_concat_pipeline    = pipeline->dependencies[0];
       auto build_partition_pipeline = build_concat_pipeline->dependencies[0];
       auto probe_concat_pipeline    = pipeline->dependencies[1];

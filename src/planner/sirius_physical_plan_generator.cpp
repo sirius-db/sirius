@@ -952,6 +952,7 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN:
+    case sirius::op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN:
       wrap_join(*slot, op_params, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:

@@ -202,6 +202,10 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! Per-row top-k vector join (a decorrelated LATERAL ORDER BY dist LIMIT k); nullptr if the
+  //! delim join is not that shape.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_vector_topk_join(
+    duckdb::LogicalComparisonJoin& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);

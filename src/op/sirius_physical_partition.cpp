@@ -155,8 +155,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       }
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
-             op->type == SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) {
-    // NLJ and vector-threshold join are the downstream sizing consumer too;
+             op->type == SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN ||
+             op->type == SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
+    // NLJ and the vector joins are the downstream sizing consumer too;
     // it always reports a single partition.
     _downstream_consumer_op = op;
     _partition_type         = PartitionType::NONE;

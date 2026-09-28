@@ -22,6 +22,8 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_vector_threshold_join.hpp"
+#include "op/sirius_physical_vector_topk_join.hpp"
+#include "op/sirius_physical_vector_topk_merge.hpp"
 
 #include <algorithm>
 #include <map>
@@ -311,6 +313,12 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
   } else if (op.type == op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) {
     lines.push_back("  type: " + duckdb::JoinTypeToString(
                                    op.Cast<op::sirius_physical_vector_threshold_join>().join_type));
+  } else if (op.type == op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
+    auto const& topk = op.Cast<op::sirius_physical_vector_topk_join>();
+    lines.push_back("  type: " + duckdb::JoinTypeToString(topk.join_type));
+    lines.push_back("  k: " + std::to_string(topk.k) + ", metric: " + topk.metric);
+  } else if (op.type == op::SiriusPhysicalOperatorType::VECTOR_TOPK_MERGE) {
+    lines.push_back("  k: " + std::to_string(op.Cast<op::sirius_physical_vector_topk_merge>().k));
   }
 
   // Scan function name annotation ("  scan: seq_scan")

@@ -20,6 +20,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_vector_threshold_join.hpp"
+#include "op/sirius_physical_vector_topk_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -66,6 +67,9 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
     // in one pass. INNER streams both sides (no fold).
     auto& threshold_join = downstream_join->Cast<sirius_physical_vector_threshold_join>();
     _concat_all          = (threshold_join.join_type == duckdb::JoinType::LEFT) ? is_build : false;
+  } else if (downstream_join->type == SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
+    // Pairs are independent and the merge stage combines them, so both sides stream (no fold).
+    _concat_all = false;
   } else if (downstream_join->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _concat_all = false;
   } else {
