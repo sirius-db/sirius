@@ -67,10 +67,13 @@ class fixed_size_host_memory_resource;
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace cucascade::memory {
@@ -871,13 +874,32 @@ class sirius_scan_manager {
     //! call outside the state mutex — it can block for as long as an in-flight read.
     void drain() noexcept;
 
-    //! One scan operator and the disk-reading provider built for it (null when the operator
-    //! matched a pinned entry and is served from the cache instead). A vector rather than a
-    //! map plus a parallel order vector: the only traversal is registration order, and one
-    //! container makes the "already registered" guard cover cache-matched operators too.
+    //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.
+    //! Construction rejects a null provider so the alternative always represents a runnable
+    //! disk scan.
+    struct disk_scan {
+      explicit disk_scan(std::unique_ptr<split_provider> provider) : provider(std::move(provider))
+      {
+        if (!this->provider) {
+          throw std::invalid_argument("[scan_entry::disk_scan] provider must be non-null");
+        }
+      }
+
+      std::unique_ptr<split_provider> provider;
+    };
+
+    //! A pinned-cache scan has no split_provider: its databatch_provider is owned by the
+    //! coalescer slot installed by use_cached_entries_for_pipeline().
+    struct cached_scan {};
+
+    using scan_source = std::variant<disk_scan, cached_scan>;
+
+    //! One registered scan operator and exactly one source kind. A vector rather than a map
+    //! plus a parallel order vector preserves registration order in one container and makes
+    //! the "already registered" guard cover both disk-backed and cached operators.
     struct scan_entry {
-      op::scan::sirius_gpu_scan_operator* op{nullptr};
-      std::unique_ptr<split_provider> provider;  ///< null for a cache-served operator
+      op::scan::sirius_gpu_scan_operator* op;
+      scan_source source;
     };
     std::vector<scan_entry> scans;
 

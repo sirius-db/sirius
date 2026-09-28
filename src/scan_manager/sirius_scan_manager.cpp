@@ -1579,7 +1579,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // take a copy of the entry's finished mask set.
     if (auto assignment = try_match_cached_entry(op, *state)) {
       cached_assignments.push_back(std::move(*assignment));
-      state->scans.push_back({op, nullptr});
+      state->scans.push_back({op, query_scan_manager_state::cached_scan{}});
       continue;
     }
     // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
@@ -1594,7 +1594,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         }
         return io_ctx;
       });
-    state->scans.push_back({op, std::move(provider)});
+    state->scans.push_back({op, query_scan_manager_state::disk_scan{std::move(provider)}});
   }
 
   if (state->scans.empty()) {
@@ -1896,11 +1896,10 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
   // so consumers dispatched first can occupy every slot while the producers
   // they await remain queued behind them.
   for (auto& scan : state.scans) {
-    // Null provider: the operator matched a pinned entry, and the coalescer already holds
-    // its cached databatch_provider (use_cached_entries_for_pipeline above).
-    if (!scan.provider) { continue; }
-    scan.provider->run(*state.dispatcher,
-                       state.metadata_processor->get_split_provider_bridge(scan.op));
+    auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source);
+    if (disk == nullptr) { continue; }
+    disk->provider->run(*state.dispatcher,
+                        state.metadata_processor->get_split_provider_bridge(scan.op));
   }
   state.metadata_processor->spawn_workers(*state.dispatcher);
   maybe_start_memory_prefetcher(state);
