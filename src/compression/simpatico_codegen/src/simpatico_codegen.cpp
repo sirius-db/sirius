@@ -362,23 +362,85 @@ std::unique_ptr<cudf::table> decompress_columns(compressed_table const& table,
 // Both waves submit typed session requests through the same plan interpreter.
 // probe_column describes row-route semantics, never asynchronous eligibility.
 
-// RAII CUDA events for the wave-1 -> combine cross-stream join.
+// The calling thread's free list of CUDA events for one device, kept for the thread's lifetime
+// like thread_device_stream_pool's streams (events are device-bound the same way). Creating and
+// destroying events per chunk is not free under concurrency: those calls take a driver lock that
+// another thread's synchronous pageable copy holds for the whole of its stream wait, so a pipeline
+// thread could stall for milliseconds on a plain cudaEventCreate. Recycling makes the phase's event
+// traffic record/wait only. Thread-exit destruction may run after context teardown, so the
+// destructor ignores cudaEventDestroy errors, as stream_pool::shutdown does.
+class event_pool {
+ public:
+  static event_pool& for_current_device()
+  {
+    thread_local std::map<int, event_pool> pools;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+      throw plan_error("filtered decode: cannot query the current device");
+    return pools[device];
+  }
+
+  event_pool()                             = default;
+  event_pool(event_pool const&)            = delete;
+  event_pool& operator=(event_pool const&) = delete;
+  ~event_pool()
+  {
+    for (auto ev : free_)
+      (void)cudaEventDestroy(ev);
+  }
+
+  cudaEvent_t acquire()
+  {
+    if (!free_.empty()) {
+      auto ev = free_.back();
+      free_.pop_back();
+      return ev;
+    }
+    // Reserve the return slot before creating the event so release() never allocates.
+    free_.reserve(owned_ + 1);
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
+      throw plan_error("filtered decode: cudaEventCreate failed");
+    ++owned_;
+    return ev;
+  }
+
+  // Safe as soon as every cudaStreamWaitEvent consuming the event has been ENQUEUED: a wait
+  // captures the recorded state at the call, so a later re-record cannot alter it. The phase
+  // enqueues all of its waits before it returns, and the next chunk on this thread starts only
+  // after that.
+  void release(cudaEvent_t ev) noexcept { free_.push_back(ev); }
+
+ private:
+  std::vector<cudaEvent_t> free_;
+  std::size_t owned_ = 0;
+};
+
+// The events one phase draws for its cross-stream joins, returned to the thread's pool when the
+// phase ends; on the failure path that is after the catch's synchronize_all, since the set is
+// declared before the try. The pool is resolved on first use so that constructing the set makes no
+// CUDA call.
 struct event_set {
+  event_pool* pool = nullptr;
   std::vector<cudaEvent_t> events;
+
+  event_set()                            = default;
+  event_set(event_set const&)            = delete;
+  event_set& operator=(event_set const&) = delete;
 
   cudaEvent_t make()
   {
-    // Register the handle first: growing host storage must not leak a created event.
+    if (!pool) pool = &event_pool::for_current_device();
+    // Register the slot first: growing host storage must not leak an acquired event.
     events.push_back(nullptr);
-    if (cudaEventCreateWithFlags(&events.back(), cudaEventDisableTiming) != cudaSuccess)
-      throw plan_error("filtered decode: cudaEventCreate failed");
+    events.back() = pool->acquire();
     return events.back();
   }
 
   ~event_set()
   {
     for (auto ev : events)
-      if (ev) cudaEventDestroy(ev);
+      if (ev) pool->release(ev);
   }
 };
 
