@@ -44,10 +44,8 @@ Running tests directly (non-obvious invocations):
 pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
 ```
 
-**Python API** (links against the repo's `duckdb/` submodule via `DUCKDB_SOURCE_PATH`):
-```bash
-pixi run -e duckdb-python build-duckdb-python
-```
+**Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
+Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-api).
 
 **Worktrees**: submodules are not auto-initialized — after creating one, run
 `git submodule update --init --recursive`.

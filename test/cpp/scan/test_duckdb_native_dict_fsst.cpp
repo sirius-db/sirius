@@ -42,7 +42,7 @@ void check_decode(segment const& seg,
   auto const count = seg.rows - skip;
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer bytes(seg.bytes.data(), seg.bytes.size(), stream.view());
+  rmm::device_buffer bytes(seg.bytes.data(), seg.bytes.size(), stream);
   uint32_t max_length = 0;
   bool has_nulls      = false;
   for (uint64_t row = seg.start + skip; row < seg.start + seg.rows; ++row) {
@@ -67,14 +67,14 @@ void check_decode(segment const& seg,
   std::vector<uint8_t> zeros;
   if (seg.all_null_validity) {
     zeros.assign((count + 7) / 8, 0);
-    validity = rmm::device_buffer(zeros.data(), zeros.size(), stream.view());
+    validity = rmm::device_buffer(zeros.data(), zeros.size(), stream);
     input.validity.push_back({duckdb::CompressionType::COMPRESSION_UNCOMPRESSED,
                               {{static_cast<uint8_t const*>(validity.data()),
                                 static_cast<uint32_t>(validity.size()),
                                 0,
                                 count}}});
   }
-  auto column = sirius::cuda::scan::gpu_decode_strings_column(input, stream.view(), mr);
+  auto column = sirius::cuda::scan::gpu_decode_strings_column(input, stream, mr);
   cudf::strings_column_view strings(column->view());
   auto offsets = sirius::test::decode::download<int32_t>(
     strings.offsets().data<int32_t>(), count + 1, stream.value());

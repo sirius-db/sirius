@@ -130,13 +130,6 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
 
-      - name: Init duckdb-python with version history
-        if: >-
-          matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
-          && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
-          && matrix.build.cudf-channel == 'stable'
-        run: git submodule update --init duckdb-python
-
       - name: Init vcpkg with full history for version overrides
         if: matrix.build.environment == 'vcpkg'
         run: |
@@ -188,14 +181,13 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Python bindings checks
+      - name: Python DuckDB version check
         if: >-
           matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
           && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
           && matrix.build.cudf-channel == 'stable'
         run: |
-          pixi run -e duckdb-python build-duckdb-python
-          pixi run -e duckdb-python python - <<'PY'
+          pixi run python - <<'PY'
           import json
           from pathlib import Path
 

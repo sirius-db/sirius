@@ -120,19 +120,6 @@ zip = "*"
 [feature.vcpkg.activation]
 scripts = ["scripts/vcpkg.sh"]
 
-[feature.duckdb-python]
-platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
-
-[feature.duckdb-python.dependencies]
-pip = "*"
-python = "3.*"
-pybind11 = "*"
-scikit-build-core = "*"
-setuptools-scm = "*"
-
-[feature.duckdb-python.tasks]
-build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb -DOVERRIDE_GIT_DESCRIBE=v1.5.5\" pip install --no-build-isolation ./duckdb-python"
-
 [feature.nightly-runner]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
@@ -146,7 +133,6 @@ nightly-run = "scripts/generate_nightly_env.sh && env -u PIXI_ENVIRONMENT_NAME p
 [environments]
 default = ["dev-libs", "cuda13"]
 cuda12 = ["dev-libs", "cuda12"]
-duckdb-python = ["duckdb-python"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }

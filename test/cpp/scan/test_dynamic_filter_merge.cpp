@@ -38,7 +38,6 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -1134,7 +1133,7 @@ TEST_CASE("decode probes retain exactly the captured snapshot after channel grow
   REQUIRE_FALSE(filter_lifetime.expired());
   auto mask = probes.probes[0][0].probe(
     input->view().column(0), stream, cudf::get_current_device_resource_ref());
-  stream.synchronize();
+  REQUIRE(cudaStreamSynchronize(cuda::stream_ref{stream}.get()) == cudaSuccess);
   REQUIRE(mask != nullptr);
   REQUIRE(mask->size() == input->num_rows());
   probes = {};
@@ -1145,7 +1144,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
           "[dynamic_filter][scan_merge][snapshot]")
 {
   rmm::cuda_stream stream;
-  auto input    = make_int64_sequence_table(10, stream.view());
+  auto input    = make_int64_sequence_table(10, stream);
   int device_id = -1;
   REQUIRE(cudaGetDevice(&device_id) == cudaSuccess);
   blocked_filter_work work;
@@ -1165,7 +1164,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
   std::jthread worker([&] {
     try {
       rmm::cuda_set_device_raii device{rmm::cuda_device_id{device_id}};
-      (void)sirius::op::scan::apply_dynamic_filters_to_view(input->view(), snapshot, stream.view());
+      (void)sirius::op::scan::apply_dynamic_filters_to_view(input->view(), snapshot, stream);
       returned.set_value();
     } catch (...) {
       returned.set_exception(std::current_exception());
@@ -1174,15 +1173,15 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
   struct release_join_guard {
     blocked_filter_work& work;
     std::jthread& worker;
-    rmm::cuda_stream_view stream;
+    cuda::stream_ref stream;
 
     ~release_join_guard()
     {
       work.unblock();
       if (worker.joinable()) { worker.join(); }
-      stream.synchronize_no_throw();
+      (void)cudaStreamSynchronize(stream.get());
     }
-  } cleanup{work, worker, stream.view()};
+  } cleanup{work, worker, stream};
 
   auto const callback_started =
     started.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
@@ -1190,7 +1189,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
     result.wait_for(std::chrono::milliseconds{100}) == std::future_status::ready;
   work.unblock();
   worker.join();
-  stream.synchronize();
+  REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
 
   REQUIRE(callback_started);
   REQUIRE_FALSE(returned_while_blocked);
