@@ -6,6 +6,7 @@
 #include "decode_session_test_access.hpp"
 #include "operators/constant_width_offsets.hpp"
 #include "test_utils.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
@@ -1845,6 +1846,75 @@ void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref u
          "nvCOMP decode with retained uploads mismatch");
 }
 
+// Host observations stage through the thread's pinned slab below its cap and copy straight into
+// the caller's storage above it; either way the bytes are exact and the frame's stream has
+// completed before the call returns.
+void test_host_observation_staging(rmm::device_async_resource_ref upstream)
+{
+  simpatico::stream_pool pool;
+  expect(pool.init(1), "observation pool init");
+  checked_resource resource(upstream);
+  auto const streams = stream_views(pool);
+  {
+    simpatico::decode_session session(streams, resource);
+    auto& frame                 = simpatico::decode_session_test_access::frame(session);
+    auto const uploads_before   = simpatico::decode_session_test_access::host_uploads(session);
+    constexpr std::size_t cap   = simpatico::pinned_staging_slab::cap_bytes;
+    constexpr std::size_t total = cap + 4096;
+    std::vector<std::uint8_t> source(total);
+    for (std::size_t i = 0; i < total; ++i)
+      source[i] = static_cast<std::uint8_t>((i * 7 + 3) & 0xff);
+    rmm::device_buffer device(total, frame.stream(), resource);
+    cuda_check(cudaMemcpyAsync(
+      device.data(), source.data(), total, cudaMemcpyHostToDevice, frame.stream().value()));
+    auto const* base = static_cast<std::uint8_t const*>(device.data());
+
+    // Sizes below the initial slab, across its growth, exactly at the cap, and above it.
+    for (std::size_t const bytes : {std::size_t{1},
+                                    std::size_t{16},
+                                    std::size_t{4096},
+                                    (std::size_t{64} << 10) + 1,
+                                    std::size_t{1} << 20,
+                                    cap,
+                                    cap + 1,
+                                    total}) {
+      std::size_t const offset = total - bytes;
+      std::vector<std::uint8_t> destination(bytes, 0xee);
+      frame.read_bytes(destination.data(), base + offset, bytes);
+      expect(std::equal(destination.begin(),
+                        destination.end(),
+                        source.begin() + static_cast<std::ptrdiff_t>(offset)),
+             "host observation bytes differ from the device source");
+    }
+    // A staged read still waits for the frame's stream tail before returning.
+    {
+      stream_gate gate(pool.streams[0]);
+      gate.release_after_delay.store(true);
+      std::uint8_t byte = 0;
+      frame.read_bytes(&byte, base + 5, 1);
+      expect(gate.released.load() && byte == source[5],
+             "host observation returned before its stream completed");
+      expect(!gate.timed_out.load(), "observation watchdog expired");
+    }
+    std::int64_t const scalar_value = -0x1122334455667788LL;
+    rmm::device_buffer scalar_storage(sizeof scalar_value, frame.stream(), resource);
+    cuda_check(cudaMemcpyAsync(scalar_storage.data(),
+                               &scalar_value,
+                               sizeof scalar_value,
+                               cudaMemcpyHostToDevice,
+                               frame.stream().value()));
+    expect(
+      frame.read_scalar(static_cast<std::int64_t const*>(scalar_storage.data())) == scalar_value,
+      "scalar observation mismatch");
+    expect(frame.read_scalar(base + total - 1) == source[total - 1],
+           "byte scalar observation mismatch");
+    expect(simpatico::decode_session_test_access::host_uploads(session) == uploads_before,
+           "host observations changed the frame's retained uploads");
+    expect(session.finish().empty(), "observation fixture published a result");
+  }
+  resource.check();
+}
+
 // Device temporaries are released during the append that allocates them, so the call-time ledger
 // holds only prior outputs plus the active request's working set. Library temporaries count too,
 // because the ledger is also the current device resource.
@@ -2461,6 +2531,7 @@ int main()
     test_request_copy_failure(upstream);
     test_host_upload_growth(upstream);
     test_host_uploads_survive_until_completion(upstream);
+    test_host_observation_staging(upstream);
     test_temporaries_released_at_submission(upstream);
     test_submission_never_waits_for_memory(upstream);
     test_failure_after_enqueue_unwinds_stream_ordered(upstream);

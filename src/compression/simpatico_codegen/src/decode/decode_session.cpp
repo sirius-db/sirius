@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "decode_session.hpp"
 
+#include "util/host_observation.hpp"
+
 #include <cudf/utilities/traits.hpp>
 
 #include <algorithm>
@@ -60,10 +62,7 @@ std::span<std::byte> decode_frame::host_bytes(std::size_t bytes)
 void decode_frame::read_bytes(void* destination, void const* source, std::size_t bytes)
 {
   try {
-    check_cuda(
-      cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDeviceToHost, stream_.value()));
-    // Host observation: the caller needs these bytes to establish a shape or branch.
-    stream_.synchronize();
+    read_device_bytes_completed(destination, source, bytes, stream_);
   } catch (...) {
     stream_.synchronize_no_throw();
     throw;

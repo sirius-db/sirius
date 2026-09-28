@@ -160,6 +160,7 @@ add_library(
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
+  src/util/host_observation.cpp
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp

@@ -139,7 +139,8 @@ class decode_frame final {
   /**
    * @brief Copy device bytes to host storage and wait for the frame's stream before returning.
    *
-   * On failure, waits for the stream before rethrowing, so @p destination may be local storage.
+   * The copy is staged through `read_device_bytes_completed` in `util/host_observation.hpp`. On
+   * failure, waits for the stream before rethrowing, so @p destination may be local storage.
    */
   void read_bytes(void* destination, void const* source, std::size_t bytes);
 
