@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
+#include "memory/reservable_bytes.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -37,15 +38,30 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
-#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
+#include <vector>
 
 namespace sirius {
 namespace op {
 
 namespace {
+
+/// The batches currently waiting in partition 0 of @p repo, in repository order. A batch removed
+/// between listing and lookup comes back null; callers decide whether that is skippable.
+std::vector<std::shared_ptr<cucascade::data_batch>> waiting_batches(
+  cucascade::shared_data_repository& repo)
+{
+  auto const batch_ids = repo.get_batch_ids(0);
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  batches.reserve(batch_ids.size());
+  for (auto batch_id : batch_ids) {
+    batches.push_back(repo.get_data_batch_by_id(batch_id, 0));
+  }
+  return batches;
+}
 
 std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
 {
@@ -205,15 +221,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 }
 
 bool sirius_physical_partition::is_build_partition() const { return _is_build; }
-
-bool sirius_physical_partition::is_memory_aware_bypass_enabled() const
-{
-  auto const* parent = get_parent_op();
-  auto pipeline      = get_pipeline();
-  return parent != nullptr && parent->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY &&
-         parent->owning_delim_join() == nullptr && pipeline != nullptr &&
-         pipeline->get_operator_params().enable_group_by_memory_aware_bypass;
-}
 
 MemoryBarrierType sirius_physical_partition::input_barrier_for(
   sirius_physical_operator const& producer) const
@@ -398,11 +405,8 @@ uint64_t sirius_physical_partition::compute_total_bytes()
       "sirius_physical_partition::compute_total_bytes() did not find default repo for id " +
       std::to_string(this->get_operator_id()));
   }
-  auto& repo           = ports.at("default")->repo;
-  auto batch_ids       = repo->get_batch_ids(0);
   uint64_t total_bytes = 0;
-  for (auto batch_id : batch_ids) {
-    auto batch = repo->get_data_batch_by_id(batch_id, 0);
+  for (auto const& batch : waiting_batches(*ports.at("default")->repo)) {
     if (batch) {
       auto ro = batch->to_read_only();
       if (ro.get_data()) { total_bytes += ro.get_data()->get_size_in_bytes(); }
@@ -433,38 +437,38 @@ std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
   return std::max(static_cast<uint64_t>(_size_estimate->bytes), compute_total_bytes());
 }
 
-std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypass_metadata()
+std::optional<observed_input_metadata> sirius_physical_partition::collect_input_metadata()
 {
-  if (!is_memory_aware_bypass_enabled()) { return std::nullopt; }
   if (ports.size() != 1) { return std::nullopt; }
 
-  group_by_bypass_metadata meta;
+  observed_input_metadata meta;
 
   auto* port = ports.begin()->second;
-  // "Complete" means every partial batch has physically arrived, which is what makes the row and
-  // type counts below a fact rather than a forecast. Point 3's `exact` flag is a weaker claim: it
-  // says the byte total is known, not that the batches are here.
+  // "Complete" means every batch has physically arrived, which is what makes the row and type
+  // counts below a fact rather than a forecast.
   meta.upstream_complete =
     port->src_pipeline != nullptr && port->src_pipeline->is_pipeline_finished();
   // A projection can fix the partition count before the producer finishes. It cannot establish
-  // complete residency or schema; let the consumer reject bypass without walking those batches.
+  // complete residency or schema, so report the input as incomplete without walking the batches.
   if (!meta.upstream_complete) { return meta; }
 
   auto* repo = port->repo;
-  // No repository means no batches to read; every metadata optional stays absent and the policy
-  // rejects the candidate rather than treating "nothing observed" as "nothing there".
+  // No repository means no batches to read; every metadata optional stays absent rather than
+  // reporting "nothing observed" as "nothing there".
   if (repo == nullptr) { return meta; }
-  auto batch_ids = repo->get_batch_ids(0);
 
   std::uint64_t total_rows = 0;
-  std::vector<bypass_column_meta> columns;
+  std::vector<observed_column_meta> columns;
   bool schema_known                                  = true;
   bool schema_latched                                = false;
   const cucascade::memory::memory_space* input_space = nullptr;
 
-  for (auto batch_id : batch_ids) {
-    auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (!batch) { return meta; }
+  for (auto const& batch : waiting_batches(*repo)) {
+    // A batch that vanished mid-walk leaves the rows unknown.
+    if (!batch) {
+      schema_known = false;
+      break;
+    }
     auto ro    = batch->to_read_only();
     auto* data = ro.get_data();
     if (data == nullptr) {
@@ -472,7 +476,10 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
       break;
     }
     if (auto* space = ro.get_memory_space(); space != nullptr) {
-      if (input_space != nullptr && input_space != space) { return meta; }
+      if (input_space != nullptr && input_space != space) {
+        schema_known = false;
+        break;
+      }
       input_space = space;
     } else {
       schema_known = false;
@@ -480,8 +487,7 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
     }
 
     // Anything that is not a plain GPU cuDF table — host/disk carriers, Simpatico-compressed
-    // payloads — has no table_view to read here, and its merge-time cost is not modelled. Reject
-    // rather than guess.
+    // payloads — has no table_view to read here. Report it as not resident rather than guess.
     auto const* gpu_table = dynamic_cast<const cucascade::gpu_table_representation*>(data);
     if (gpu_table == nullptr || data->get_current_tier() != cucascade::memory::Tier::GPU) {
       schema_known = false;
@@ -531,19 +537,8 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
   // The budget must come from the space the input actually lives in. Reading it from the batches
   // is what keeps this off physical GPU 0 on a multi-GPU box.
   if (meta.single_gpu_resident) {
-    auto const* space     = input_space;
-    meta.target_device_id = space->get_device_id();
-    // Use the reservation cap, not the larger allocation capacity. The charged counter
-    // includes both live allocations and outstanding reservations; subtract it only once.
-    // This is a snapshot for candidate selection, not a reservation guarantee.
-    if (auto const* adaptor = space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
-        adaptor != nullptr) {
-      auto const charged                = adaptor->get_total_allocated_bytes();
-      auto const limit                  = space->get_max_memory();
-      meta.admissible_additional_budget = limit > charged ? limit - charged : 0;
-    }
-    // Leaving the budget absent when the adaptor is not the GPU reservation adaptor is
-    // deliberate: the policy rejects on unknown metadata rather than guessing a budget.
+    meta.target_device_id             = input_space->get_device_id();
+    meta.admissible_additional_budget = memory::gpu_reservable_bytes(*input_space);
   }
   return meta;
 }
@@ -776,12 +771,11 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                 _is_build,
                                 /*build_foldable=*/false,
                                 /*combined_total_bytes=*/total_bytes};
-      if (is_memory_aware_bypass_enabled()) {
-        in.bypass_metadata_source = [this] { return collect_bypass_metadata(); };
-      }
-      auto const strategy = consumer->get_partition_strategy(in);
-      _num_partitions     = strategy.num_partitions;
-      _sizing_bytes       = in.total_bytes;
+      // Offered to every consumer; only one that calls it pays for the batch walk.
+      in.input_metadata_source = [this] { return collect_input_metadata(); };
+      auto const strategy      = consumer->get_partition_strategy(in);
+      _num_partitions          = strategy.num_partitions;
+      _sizing_bytes            = in.total_bytes;
       if (estimated.has_value()) {
         _sizing_basis = (_size_estimate && _size_estimate->exact) ? sizing_basis::upstream_complete
                                                                   : sizing_basis::projected;

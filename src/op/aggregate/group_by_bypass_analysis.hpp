@@ -20,7 +20,7 @@
 namespace sirius::op {
 
 class sirius_physical_grouped_aggregate_merge;
-struct group_by_bypass_metadata;
+struct observed_input_metadata;
 
 namespace group_by_bypass {
 
@@ -28,7 +28,7 @@ namespace group_by_bypass {
 /// Inspects aggregate states and downstream column layouts without collecting batches,
 /// changing the plan, reserving memory, or applying the decision.
 [[nodiscard]] candidate_input make_candidate(const sirius_physical_grouped_aggregate_merge& merge,
-                                             const group_by_bypass_metadata& meta,
+                                             const observed_input_metadata& meta,
                                              int natural,
                                              int num_admitted_gpus,
                                              double headroom_fraction);

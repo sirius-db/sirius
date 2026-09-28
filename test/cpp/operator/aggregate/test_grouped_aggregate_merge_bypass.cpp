@@ -28,7 +28,9 @@
 #include "expression/ast/constant.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
+#include "op/aggregate/group_by_bypass_analysis.hpp"
 #include "op/aggregate/group_by_bypass_policy.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_projection.hpp"
@@ -57,9 +59,9 @@ using namespace sirius::test::operator_utils;
 /// merge's default target, so every test starts from an AUTO > 1 the bypass policy could change.
 constexpr uint64_t kBigInputBytes = 8ULL * 1024 * 1024 * 1024;
 
-group_by_bypass_metadata ample_metadata(std::vector<bypass_column_meta> columns)
+observed_input_metadata ample_metadata(std::vector<observed_column_meta> columns)
 {
-  group_by_bypass_metadata meta;
+  observed_input_metadata meta;
   meta.upstream_complete            = true;
   meta.single_gpu_resident          = true;
   meta.columns                      = std::move(columns);
@@ -69,21 +71,31 @@ group_by_bypass_metadata ample_metadata(std::vector<bypass_column_meta> columns)
   return meta;
 }
 
-/// The PARTITION's lazy metadata source, backed by @p meta; empty (bypass disabled) when null.
-std::function<std::optional<group_by_bypass_metadata>()> metadata_source(
-  const group_by_bypass_metadata* meta)
+/// The PARTITION's lazy metadata source, backed by @p meta; empty (no source offered) when null.
+std::function<std::optional<observed_input_metadata>()> metadata_source(
+  const observed_input_metadata* meta)
 {
   if (meta == nullptr) { return {}; }
-  return [meta] { return std::optional<group_by_bypass_metadata>{*meta}; };
+  return [meta] { return std::optional<observed_input_metadata>{*meta}; };
 }
 
-partition_sizing_input sizing_input(const group_by_bypass_metadata* meta)
+partition_sizing_input sizing_input(const observed_input_metadata* meta)
 {
   return partition_sizing_input{kBigInputBytes,
                                 /*is_build_side=*/false,
                                 /*build_foldable=*/false,
                                 /*combined_total_bytes=*/kBigInputBytes,
                                 metadata_source(meta)};
+}
+
+/// Attach a query policy to @p op, as the pipeline builder does in production.
+void set_query_policy(sirius_physical_operator& op, bool enabled, double headroom = 0.25)
+{
+  auto params                                 = std::make_shared<sirius::operator_params>();
+  params->enable_group_by_memory_aware_bypass = enabled;
+  params->group_by_bypass_headroom_fraction   = headroom;
+  sirius::pipeline::pipeline_build_context ctx{nullptr, true, 1, std::move(params)};
+  op.set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
 }
 
 sirius::logical_type bigint() { return sirius::logical_type::make(sirius::type_id::BIGINT); }
@@ -110,6 +122,7 @@ struct merge_fixture {
     merge = duckdb::make_uniq<sirius_physical_grouped_aggregate_merge>(
       std::move(agg.output_types), std::move(agg.aggregates), std::move(agg.groups), 1'000'000);
     merge->operator_id = 7;
+    set_query_policy(*merge, /*enabled=*/true);
     if (attach_collector) {
       collector = duckdb::make_uniq<sirius_physical_operator>(
         SiriusPhysicalOperatorType::RESULT_COLLECTOR, duckdb::vector<sirius::logical_type>{}, 0);
@@ -176,8 +189,8 @@ TEST_CASE("merge bypass checks physical state types and aggregate operations",
           "[physical_grouped_aggregate_merge][group_by_bypass]")
 {
   std::vector<std::string> aggregations{"sum"};
-  std::vector<bypass_column_meta> columns{{static_cast<int>(cudf::type_id::INT64), 8, false},
-                                          {static_cast<int>(cudf::type_id::INT64), 8, false}};
+  std::vector<observed_column_meta> columns{{static_cast<int>(cudf::type_id::INT64), 8, false},
+                                            {static_cast<int>(cudf::type_id::INT64), 8, false}};
   SECTION("string grouping key")
   {
     columns[0] = {static_cast<int>(cudf::type_id::STRING), 0, false};
@@ -195,6 +208,20 @@ TEST_CASE("merge bypass checks physical state types and aggregate operations",
   auto meta = ample_metadata(columns);
   CHECK(f.merge->get_partition_strategy(sizing_input(&meta)).num_partitions > 1);
   CHECK(f.merge->no_history_peak_memory_estimate({8, kBigInputBytes}) == 2 * kBigInputBytes);
+}
+
+TEST_CASE("merge bypass reports an unreadable schema as unknown, not unsupported",
+          "[physical_grouped_aggregate_merge][group_by_bypass]")
+{
+  merge_fixture f{{"sum"}};
+  auto meta = ample_metadata({{static_cast<int>(cudf::type_id::INT64), 8, false},
+                              {static_cast<int>(cudf::type_id::INT64), 8, false}});
+  SECTION("schema unread") { meta.columns = std::nullopt; }
+  SECTION("schema does not match the merge's layout") { meta.columns->pop_back(); }
+  auto const candidate = group_by_bypass::make_candidate(*f.merge, meta, 8, 1, 0.25);
+  CHECK_FALSE(candidate.state.has_value());
+  CHECK(group_by_bypass::decide(candidate).reason ==
+        group_by_bypass::decision_reason::unknown_metadata);
 }
 
 TEST_CASE("merge bypass rejects downstream operations it cannot size",
@@ -357,16 +384,15 @@ TEST_CASE("merge bypass tracks filter output mappings through projection and lim
     return;
   }
   group_by_bypass::candidate_input expected;
-  expected.total_rows           = meta.total_rows;
-  expected.key_width_bytes      = 1;
-  expected.agg_width_bytes      = 8;
-  expected.key_columns          = 1;
-  expected.agg_columns          = 1;
-  expected.nullable_key_columns = 0;
-  expected.nullable_agg_columns = 0;
-  expected.downstream_row_bytes = filter_width + 16 * 8;
-  expected.downstream_columns   = filter_columns + 16;
-  auto const model              = group_by_bypass::model_additional_bytes(expected);
+  expected.state                  = group_by_bypass::state_shape{};
+  expected.state->total_rows      = *meta.total_rows;
+  expected.state->key_width_bytes = 1;
+  expected.state->agg_width_bytes = 8;
+  expected.state->key_columns     = 1;
+  expected.state->agg_columns     = 1;
+  expected.downstream_row_bytes   = filter_width + 16 * 8;
+  expected.downstream_columns     = filter_columns + 16;
+  auto const model                = group_by_bypass::model_additional_bytes(expected);
   REQUIRE(merge->get_partition_strategy(sizing_input(&meta)).num_partitions == 1);
   CHECK(merge->no_history_peak_memory_estimate({8, kBigInputBytes}) == model.additional_needed);
   // A budget just below the corrected requirement must preserve normal partitioning.
@@ -395,7 +421,7 @@ TEST_CASE("merge bypass skips metadata collection when a cheap gate already reje
   int calls       = 0;
   auto source     = [&] {
     ++calls;
-    return std::optional<group_by_bypass_metadata>{meta};
+    return std::optional<observed_input_metadata>{meta};
   };
   SECTION("automatic count is already one")
   {
@@ -407,7 +433,32 @@ TEST_CASE("merge bypass skips metadata collection when a cheap gate already reje
     CHECK(f.merge->get_partition_strategy({kBigInputBytes, false, false, kBigInputBytes, source})
             .num_partitions > 1);
   }
+  SECTION("the query policy leaves bypass off")
+  {
+    set_query_policy(*f.merge, /*enabled=*/false);
+    CHECK(f.merge->get_partition_strategy({kBigInputBytes, false, false, kBigInputBytes, source})
+            .num_partitions > 1);
+  }
+  SECTION("no query policy")
+  {
+    f.merge->set_pipeline(nullptr);
+    CHECK(f.merge->get_partition_strategy({kBigInputBytes, false, false, kBigInputBytes, source})
+            .num_partitions > 1);
+  }
   CHECK(calls == 0);
+}
+
+TEST_CASE("merge bypass declines a delim-join-owned merge",
+          "[physical_grouped_aggregate_merge][group_by_bypass]")
+{
+  merge_fixture f{{"sum"}};
+  auto const meta = ample_metadata({{static_cast<int>(cudf::type_id::INT64), 8, false},
+                                    {static_cast<int>(cudf::type_id::INT64), 8, false}});
+  REQUIRE(f.merge->get_partition_strategy(sizing_input(&meta)).num_partitions == 1);
+  sirius_physical_delim_join delim(
+    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN, {}, nullptr, {}, 0, {});
+  f.merge->set_owning_delim_join(&delim);
+  CHECK(f.merge->get_partition_strategy(sizing_input(&meta)).num_partitions > 1);
 }
 
 TEST_CASE("bypass uses the query policy snapshot for headroom",
@@ -421,10 +472,7 @@ TEST_CASE("bypass uses the query policy snapshot for headroom",
   meta.admissible_additional_budget = needed * 2;
 
   merge_fixture custom{{"sum"}};
-  auto params                               = std::make_shared<sirius::operator_params>();
-  params->group_by_bypass_headroom_fraction = 4.0;
-  sirius::pipeline::pipeline_build_context ctx{nullptr, true, 1, params};
-  custom.merge->set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
+  set_query_policy(*custom.merge, /*enabled=*/true, /*headroom=*/4.0);
   CHECK(custom.merge->get_partition_strategy(sizing_input(&meta)).num_partitions > 1);
 
   // Headroom changes eligibility, not the cold-start allocation estimate. Once the budget

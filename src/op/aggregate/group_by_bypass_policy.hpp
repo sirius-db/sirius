@@ -40,8 +40,9 @@ enum class decision_reason : std::uint8_t {
 
 [[nodiscard]] const char* reason_name(decision_reason reason) noexcept;
 
-/// The largest row count `cudf::size_type` can index. A concatenated table above this cannot be
-/// built at all, so the candidate is rejected rather than truncated.
+/// The largest row count `cudf::size_type` can index (checked against cuDF in the policy source).
+/// A concatenated table above this cannot be built at all, so the candidate is rejected rather
+/// than truncated.
 inline constexpr std::uint64_t CUDF_MAX_ROWS = 2147483647ULL;
 
 /// Per-term breakdown of the modelled *additional* bytes an unpartitioned merge would need.
@@ -58,6 +59,29 @@ struct memory_model {
   std::uint64_t headroom_bytes    = 0;  ///< Declared empirical margin on top
   std::uint64_t required_bytes    = 0;  ///< additional_needed + headroom_bytes
   bool overflowed                 = false;  ///< A term saturated; the candidate must be rejected
+};
+
+/// Physical shape of the concatenated partial input, split at the grouping-key boundary. It is
+/// known as a whole or not at all: every field comes from the same read of the batches.
+struct state_shape {
+  /// Total partial rows over all batches.
+  std::uint64_t total_rows = 0;
+
+  /// Summed fixed widths of the group key columns, in bytes.
+  std::uint64_t key_width_bytes = 0;
+
+  /// Summed fixed widths of the aggregate partial-state columns, in bytes.
+  std::uint64_t agg_width_bytes = 0;
+
+  /// Column counts behind the summed widths. cuDF allocates every column separately, so each one
+  /// is charged its own allocator padding.
+  std::size_t key_columns = 0;
+  std::size_t agg_columns = 0;
+
+  /// Columns that are nullable in at least one input batch, split by role. Each nullable column
+  /// costs a validity mask in every term that materializes that column.
+  std::size_t nullable_key_columns = 0;
+  std::size_t nullable_agg_columns = 0;
 };
 
 /// Everything the policy needs, as plain values. Deliberately free of engine, cuDF and cuCascade
@@ -78,7 +102,12 @@ struct candidate_input {
   /// All input batches are GPU-resident in one memory space, and that space is the merge target.
   bool single_gpu_resident = false;
 
-  /// Group keys and aggregate partial states are all inside the v1 fixed-width whitelist.
+  /// Absent when the partial input's schema or row count could not be read, or does not match the
+  /// merge's own column layout.
+  std::optional<state_shape> state;
+
+  /// Group keys and aggregate partial states are all inside the v1 fixed-width whitelist. Only
+  /// meaningful when @ref state is present.
   bool supported_state = false;
 
   /// The merge's downstream is a bounded result-collection path.
@@ -92,28 +121,9 @@ struct candidate_input {
   /// allocator padding.
   std::size_t downstream_columns = 0;
 
-  /// Total partial rows over all batches. Absent when the metadata could not be read.
-  std::optional<std::uint64_t> total_rows;
-
-  /// Summed fixed widths of the group key columns, in bytes.
-  std::optional<std::uint64_t> key_width_bytes;
-
-  /// Summed fixed widths of the aggregate partial-state columns, in bytes.
-  std::optional<std::uint64_t> agg_width_bytes;
-
-  /// Column counts behind the summed widths. cuDF allocates every column separately, so each one
-  /// is charged its own allocator padding.
-  std::optional<std::size_t> key_columns;
-  std::optional<std::size_t> agg_columns;
-
-  /// Columns that are nullable in at least one input batch, split by role. Each nullable column
-  /// costs a validity mask in every term that materializes that column.
-  std::optional<std::size_t> nullable_key_columns;
-  std::optional<std::size_t> nullable_agg_columns;
-
-  /// Bytes the target memory space can still hand out: capacity minus live allocations minus
-  /// outstanding reservations. This value is already net of both, so callers must not subtract
-  /// reserved bytes again. See docs/super-sirius/group-by-bypass.md.
+  /// Bytes a new reservation could still obtain on the target memory space (see
+  /// memory::gpu_reservable_bytes()). Already net of live allocations and outstanding
+  /// reservations, so callers must not subtract reserved bytes again.
   std::optional<std::uint64_t> admissible_additional_budget;
 
   /// Declared empirical margin, as a fraction of the modelled requirement.
@@ -129,8 +139,8 @@ struct decision {
   bool model_evaluated = false;
 };
 
-/// Model the additional bytes an unpartitioned merge of @p in would allocate.
-/// @pre The caller has already established that the metadata optionals are present.
+/// Model the additional bytes an unpartitioned merge of @p in would allocate. An absent
+/// @ref candidate_input::state models as zero rows; decide() never gets that far without one.
 [[nodiscard]] memory_model model_additional_bytes(const candidate_input& in) noexcept;
 
 /// Apply the decision order from docs/super-sirius/group-by-bypass.md. Pure: no locks, no

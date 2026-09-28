@@ -30,55 +30,51 @@
 namespace sirius {
 namespace op {
 
-/// One physical column of the partial aggregate input, as the PARTITION actually observed it on
-/// the device. Recorded per column rather than summarized because only the MERGE_GROUP_BY consumer
-/// knows which columns are grouping keys and which are aggregate partial states.
-struct bypass_column_meta {
+/// One physical column of a partition's input, as the PARTITION actually observed it on the
+/// device. Recorded per column rather than summarized because only the consumer knows what each
+/// column means (for a grouped aggregation: which are grouping keys and which partial states).
+struct observed_column_meta {
   /// `cudf::type_id` value, kept as an int so this header stays free of cuDF includes.
   int type_id = 0;
   /// Fixed element width in bytes; 0 means the type is not fixed-width (STRING/LIST/STRUCT/
-  /// DICTIONARY32), which the v1 whitelist rejects.
+  /// DICTIONARY32).
   uint32_t fixed_width_bytes = 0;
-  /// The column carries a validity mask in at least one input batch, so the merge will allocate
-  /// one for it. Charged explicitly in the memory model rather than being ignored.
+  /// The column carries a validity mask in at least one input batch, so concatenating the batches
+  /// allocates one for it.
   bool nullable = false;
 };
 
-/// Complete-input metadata for the group-by memory-aware bypass policy.
+/// A snapshot of what is waiting on a PARTITION's single input port, for consumers whose sizing
+/// decision depends on more than the byte total.
 ///
-/// Built by the PARTITION operator, which owns the input repository and its lock, and handed to
-/// the MERGE_GROUP_BY consumer through @ref partition_sizing_input. Populated **only** when the
-/// bypass setting is on: with the setting off the partition never walks its batches for this,
-/// so the default sizing path does no extra work.
+/// Built by the PARTITION operator, which owns the input repository and its lock, and offered to
+/// the consumer through @ref partition_sizing_input::input_metadata_source. Nothing is collected
+/// unless the consumer asks, so consumers that ignore it cost nothing.
 ///
 /// Every quantity that can be genuinely unknown is an optional. A missing value and a real zero
 /// are different answers — "this input has no nullable columns" must not be confused with "the
-/// column metadata could not be read" — and the policy rejects the candidate on the latter.
-struct group_by_bypass_metadata {
-  /// The partition's input pipeline has finished: every partial batch has actually arrived. This
-  /// is what makes the row/type metadata below trustworthy, and it is a stronger claim than
-  /// point 3's `data_size_estimate::exact`, which only says the byte total is known.
+/// column metadata could not be read".
+struct observed_input_metadata {
+  /// The partition's input pipeline has finished: every batch has actually arrived. This is what
+  /// makes the row/type metadata below a fact rather than a forecast, and it is a stronger claim
+  /// than `data_size_estimate::exact`, which only says the byte total is known.
   bool upstream_complete = false;
 
-  /// Every batch is GPU-resident in exactly one memory space.
+  /// Every batch is a plain cuDF table resident in exactly one GPU memory space.
   bool single_gpu_resident = false;
 
-  /// Per-column physical metadata, in table order (grouping keys first, then aggregate partial
-  /// states — the order `merge_grouped_aggregate` itself assumes). Absent when the schema could
-  /// not be read, or was inconsistent between batches.
-  std::optional<std::vector<bypass_column_meta>> columns;
+  /// Per-column physical metadata, in table order. Absent when the schema could not be read, or
+  /// was inconsistent between batches.
+  std::optional<std::vector<observed_column_meta>> columns;
 
-  /// Total partial rows over all batches; absent when the metadata could not be read.
+  /// Total rows over all batches; absent when the metadata could not be read.
   std::optional<uint64_t> total_rows;
 
-  /// Bytes the executor could still reserve on the target space: its reservation limit minus
-  /// everything already charged (live allocations *and* outstanding reservation arenas share one
-  /// counter, so nothing is subtracted twice). Absent when it could not be determined.
-  ///
-  /// Deliberately not `memory_space::get_available_memory()`, which measures headroom against the
-  /// larger allocation capacity and over-states what a reservation can obtain. See
-  /// docs/super-sirius/group-by-bypass.md.
+  /// Bytes a new reservation could still obtain on the space the input lives in, from
+  /// memory::gpu_reservable_bytes() (not `memory_space::get_available_memory()`, which over-states
+  /// it). Absent when it could not be determined.
   std::optional<uint64_t> admissible_additional_budget;
+
   /// Device the input actually lives on. -1 when unknown; never assumed to be 0.
   int target_device_id = -1;
 };
@@ -95,12 +91,13 @@ struct partition_sizing_input {
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
 
-  /// Collects group-by bypass metadata on demand; empty when bypass is disabled or not
-  /// applicable. Lazy so a consumer can skip the batch walk when a cheap gate already rejects the
-  /// bypass. Callable only during the get_partition_strategy call, which runs under the
-  /// partition's lock. Individual batches are read-locked only while being inspected; residency
-  /// and the budget can change after that snapshot.
-  std::function<std::optional<group_by_bypass_metadata>()> bypass_metadata_source;
+  /// Collects @ref observed_input_metadata on demand; empty when the partition has no single input
+  /// port to describe (sibling-partition joins). Lazy so a consumer that does not need it, or
+  /// whose cheap gates already decide, never walks the batches. Callable only during the
+  /// get_partition_strategy call, which runs under the partition's lock. Individual batches are
+  /// read-locked only while being inspected; residency and the budget can change after that
+  /// snapshot.
+  std::function<std::optional<observed_input_metadata>()> input_metadata_source;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

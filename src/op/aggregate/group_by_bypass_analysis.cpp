@@ -169,7 +169,7 @@ bool bypass_supported_aggregates(const sirius_physical_grouped_aggregate_merge& 
 }  // namespace
 
 candidate_input make_candidate(const sirius_physical_grouped_aggregate_merge& merge,
-                               const group_by_bypass_metadata& meta,
+                               const observed_input_metadata& meta,
                                int natural,
                                int num_admitted_gpus,
                                double headroom_fraction)
@@ -181,43 +181,37 @@ candidate_input make_candidate(const sirius_physical_grouped_aggregate_merge& me
   // A single admitted GPU must also mean the input really is on one device.
   candidate.single_gpu_resident          = meta.single_gpu_resident;
   candidate.headroom_fraction            = headroom_fraction;
-  candidate.total_rows                   = meta.total_rows;
   candidate.admissible_additional_budget = meta.admissible_additional_budget;
 
   // Split the observed physical columns at the grouping-key boundary — the same boundary
-  // merge_grouped_aggregate itself uses — and check each side against the whitelist.
+  // merge_grouped_aggregate itself uses — and check each side against the whitelist. A schema
+  // that could not be read, or that does not match this merge's own column layout, leaves
+  // `state` absent: unknown, not unsupported.
   auto const num_group_cols = merge.group_idx.size();
   std::vector<std::uint64_t> output_widths;
-  if (meta.columns.has_value() &&
+  if (meta.columns.has_value() && meta.total_rows.has_value() &&
       meta.columns->size() == num_group_cols + merge.cudf_aggregates.size()) {
-    auto const& cols        = *meta.columns;
-    bool types_ok           = bypass_supported_aggregates(merge);
-    std::uint64_t key_width = 0;
-    std::uint64_t agg_width = 0;
-    std::size_t null_keys   = 0;
-    std::size_t null_aggs   = 0;
+    auto const& cols = *meta.columns;
+    state_shape state;
+    state.total_rows  = *meta.total_rows;
+    state.key_columns = num_group_cols;
+    state.agg_columns = cols.size() - num_group_cols;
+    bool types_ok     = bypass_supported_aggregates(merge);
     for (std::size_t c = 0; c < cols.size(); ++c) {
       auto const& col = cols[c];
-      if (col.fixed_width_bytes == 0 || !bypass_supported_column_type(col.type_id)) {
-        types_ok = false;
-        break;
-      }
+      types_ok =
+        types_ok && col.fixed_width_bytes != 0 && bypass_supported_column_type(col.type_id);
       if (c < num_group_cols) {
-        key_width += col.fixed_width_bytes;
-        null_keys += col.nullable ? 1 : 0;
+        state.key_width_bytes += col.fixed_width_bytes;
+        state.nullable_key_columns += col.nullable ? 1 : 0;
       } else {
-        agg_width += col.fixed_width_bytes;
-        null_aggs += col.nullable ? 1 : 0;
+        state.agg_width_bytes += col.fixed_width_bytes;
+        state.nullable_agg_columns += col.nullable ? 1 : 0;
       }
     }
+    candidate.state           = state;
     candidate.supported_state = types_ok;
     if (types_ok) {
-      candidate.key_width_bytes      = key_width;
-      candidate.agg_width_bytes      = agg_width;
-      candidate.key_columns          = num_group_cols;
-      candidate.agg_columns          = cols.size() - num_group_cols;
-      candidate.nullable_key_columns = null_keys;
-      candidate.nullable_agg_columns = null_aggs;
       // The whitelisted states merge into columns of the same physical type, so the merge output
       // row has the partial input's widths.
       output_widths.reserve(cols.size());
@@ -225,16 +219,12 @@ candidate_input make_candidate(const sirius_physical_grouped_aggregate_merge& me
         output_widths.push_back(col.fixed_width_bytes);
       }
     }
-  } else {
-    // Either the schema could not be read, or it does not match this merge's own column layout.
-    // Both are "unknown", not "zero".
-    candidate.supported_state = false;
   }
 
-  auto const shape               = classify_bypass_downstream(merge, std::move(output_widths));
-  candidate.supported_downstream = shape.supported;
-  candidate.downstream_row_bytes = shape.row_bytes;
-  candidate.downstream_columns   = shape.columns;
+  auto const downstream          = classify_bypass_downstream(merge, std::move(output_widths));
+  candidate.supported_downstream = downstream.supported;
+  candidate.downstream_row_bytes = downstream.row_bytes;
+  candidate.downstream_columns   = downstream.columns;
 
   return candidate;
 }

@@ -158,20 +158,21 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   const partition_sizing_input& in, int natural)
 {
-  // With bypass disabled the PARTITION passes no metadata source, so there is nothing to do and
-  // the automatic count is returned without any extra work on this path.
-  if (!in.bypass_metadata_source) { return natural; }
+  // Off (the default) or without a query policy, the automatic count stands and the partition's
+  // batches are never walked.
+  auto const pipeline = get_pipeline();
+  if (pipeline == nullptr) { return natural; }
+  auto const& params = pipeline->get_operator_params();
+  if (!params.enable_group_by_memory_aware_bypass || !in.input_metadata_source) { return natural; }
   // Only an automatic count above 1 on a single admitted GPU can be overturned. Decide those
   // cases before walking the partition's batches for metadata; decide() would reject them anyway.
   if (natural <= 1 || _num_gpus > 1) { return natural; }
-  auto const collected = in.bypass_metadata_source();
+  auto const collected = in.input_metadata_source();
   if (!collected.has_value()) { return natural; }
   auto const& meta = *collected;
 
-  auto const pipeline = get_pipeline();
-  auto const headroom = pipeline ? pipeline->get_operator_params().group_by_bypass_headroom_fraction
-                                 : group_by_bypass::candidate_input{}.headroom_fraction;
-  auto const candidate = group_by_bypass::make_candidate(*this, meta, natural, _num_gpus, headroom);
+  auto const candidate = group_by_bypass::make_candidate(
+    *this, meta, natural, _num_gpus, params.group_by_bypass_headroom_fraction);
 
   auto const decision = group_by_bypass::decide(candidate);
   bool const selected = decision.reason == group_by_bypass::decision_reason::bypass_selected;

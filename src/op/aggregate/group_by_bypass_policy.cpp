@@ -18,54 +18,45 @@
 
 #include "memory/size_arithmetic.hpp"
 
+#include <cudf/null_mask.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/aligned.hpp>
+
 #include <cmath>
 #include <limits>
 
 namespace sirius::op::group_by_bypass {
 
+// The header keeps the policy's inputs free of cuDF types; this is where they are tied back.
+static_assert(CUDF_MAX_ROWS ==
+              static_cast<std::uint64_t>(std::numeric_limits<cudf::size_type>::max()));
+
 namespace {
+
+using sirius::memory::saturating_add;
+using sirius::memory::saturating_mul;
 
 constexpr std::uint64_t SATURATED = std::numeric_limits<std::size_t>::max();
 
-/// rmm::CUDA_ALLOCATION_ALIGNMENT. Hard-coded rather than included so this translation unit stays
-/// free of device headers and the policy remains host-testable; the value is asserted against
-/// rmm in the unit tests.
-constexpr std::uint64_t DEVICE_ALLOCATION_ALIGNMENT = 256;
+constexpr std::uint64_t DEVICE_ALLOCATION_ALIGNMENT = rmm::CUDA_ALLOCATION_ALIGNMENT;
 
-// The constants below mirror libcudf 26.08 internals (pixi.toml pins libcudf==26.08.01). Recheck
-// them against cudf/groupby and cudf/null_mask when bumping cuDF: nothing fails if they drift.
-
-/// cuDF pads validity bitmasks to this many bytes before allocating.
-constexpr std::uint64_t BITMASK_PAD_BYTES = 64;
-
-/// Slot width of the cuco set cuDF's hash groupby builds over the key rows: one `cudf::size_type`.
-constexpr std::uint64_t HASH_SLOT_BYTES = 4;
+/// Slot width of the cuco set cuDF's hash groupby builds over the key rows.
+constexpr std::uint64_t HASH_SLOT_BYTES = sizeof(cudf::size_type);
 
 /// cuDF's hash groupby targets a 0.5 load factor, so the set is sized at twice the row count.
+/// Mirrors libcudf 26.08 (pixi.toml pins libcudf==26.08.01); recheck cudf/groupby when bumping
+/// cuDF, since nothing fails if it drifts.
 constexpr std::uint64_t HASH_SLOTS_PER_ROW = 2;
 
-/// `cudf::size_type` gather map entry.
-constexpr std::uint64_t GATHER_ENTRY_BYTES = 4;
-
-[[nodiscard]] std::uint64_t saturating_add(std::uint64_t a, std::uint64_t b) noexcept
-{
-  return static_cast<std::uint64_t>(
-    sirius::memory::saturating_add(static_cast<std::size_t>(a), static_cast<std::size_t>(b)));
-}
-
-[[nodiscard]] std::uint64_t saturating_mul(std::uint64_t a, std::uint64_t b) noexcept
-{
-  return static_cast<std::uint64_t>(
-    sirius::memory::saturating_mul(static_cast<std::size_t>(a), static_cast<std::size_t>(b)));
-}
+/// Group gather map entry.
+constexpr std::uint64_t GATHER_ENTRY_BYTES = sizeof(cudf::size_type);
 
 /// Round @p value up to @p alignment, saturating instead of wrapping.
 [[nodiscard]] std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) noexcept
 {
-  if (value == 0) { return 0; }
-  std::uint64_t const bumped = saturating_add(value, alignment - 1);
-  if (bumped == SATURATED) { return SATURATED; }
-  return (bumped / alignment) * alignment;
+  if (value > SATURATED - (alignment - 1)) { return SATURATED; }
+  return rmm::align_up(value, alignment);
 }
 
 /// Device bytes a fixed-width column of @p rows × @p width occupies, including allocator padding.
@@ -86,13 +77,15 @@ constexpr std::uint64_t GATHER_ENTRY_BYTES = 4;
                         saturating_mul(count, DEVICE_ALLOCATION_ALIGNMENT - 1));
 }
 
-/// Device bytes one validity mask over @p rows occupies: cuDF pads the bitmask to 64 bytes, then
-/// the allocator pads that to its own alignment.
+/// Device bytes one validity mask over @p rows occupies: cuDF's padded bitmask size, then the
+/// allocator's alignment on top.
 [[nodiscard]] std::uint64_t mask_bytes(std::uint64_t rows) noexcept
 {
   if (rows == 0) { return 0; }
-  std::uint64_t const bits = align_up(saturating_add(rows, 7) / 8, BITMASK_PAD_BYTES);
-  return align_up(bits, DEVICE_ALLOCATION_ALIGNMENT);
+  // No cuDF column can be this long; decide() rejects it before the model is used.
+  if (rows > CUDF_MAX_ROWS) { return SATURATED; }
+  return align_up(cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows)),
+                  DEVICE_ALLOCATION_ALIGNMENT);
 }
 
 /// Total mask bytes for @p count columns over @p rows.
@@ -125,13 +118,14 @@ memory_model model_additional_bytes(const candidate_input& in) noexcept
 {
   memory_model m;
 
-  std::uint64_t const rows      = in.total_rows.value_or(0);
-  std::uint64_t const key_width = in.key_width_bytes.value_or(0);
-  std::uint64_t const agg_width = in.agg_width_bytes.value_or(0);
-  std::uint64_t const null_keys = in.nullable_key_columns.value_or(0);
-  std::uint64_t const null_aggs = in.nullable_agg_columns.value_or(0);
-  std::uint64_t const key_cols  = in.key_columns.value_or(0);
-  std::uint64_t const agg_cols  = in.agg_columns.value_or(0);
+  auto const state              = in.state.value_or(state_shape{});
+  std::uint64_t const rows      = state.total_rows;
+  std::uint64_t const key_width = state.key_width_bytes;
+  std::uint64_t const agg_width = state.agg_width_bytes;
+  std::uint64_t const null_keys = state.nullable_key_columns;
+  std::uint64_t const null_aggs = state.nullable_agg_columns;
+  std::uint64_t const key_cols  = state.key_columns;
+  std::uint64_t const agg_cols  = state.agg_columns;
 
   // cudf::concatenate materializes one buffer per column over every input row, plus a
   // concatenated validity mask for each column that is nullable in any input.
@@ -211,6 +205,12 @@ decision decide(const candidate_input& in) noexcept
     d.reason = decision_reason::unsupported_residency;
     return d;
   }
+  // Unknown is checked before unsupported: a schema that could not be read says nothing about
+  // whether its types are supported, and the log should say which it was.
+  if (!in.state.has_value() || !in.admissible_additional_budget.has_value()) {
+    d.reason = decision_reason::unknown_metadata;
+    return d;
+  }
   if (!in.supported_state) {
     d.reason = decision_reason::unsupported_state;
     return d;
@@ -219,15 +219,8 @@ decision decide(const candidate_input& in) noexcept
     d.reason = decision_reason::unsupported_downstream;
     return d;
   }
-  if (!in.total_rows.has_value() || !in.key_width_bytes.has_value() ||
-      !in.agg_width_bytes.has_value() || !in.key_columns.has_value() ||
-      !in.agg_columns.has_value() || !in.nullable_key_columns.has_value() ||
-      !in.nullable_agg_columns.has_value() || !in.admissible_additional_budget.has_value()) {
-    d.reason = decision_reason::unknown_metadata;
-    return d;
-  }
   // A concatenated table cannot be indexed past cudf::size_type's range.
-  if (*in.total_rows > CUDF_MAX_ROWS) {
+  if (in.state->total_rows > CUDF_MAX_ROWS) {
     d.reason = decision_reason::size_overflow;
     return d;
   }

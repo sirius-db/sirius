@@ -82,9 +82,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Whether this partition may use a projected input size.
   [[nodiscard]] bool is_size_estimation_enabled() const { return _enable_size_estimation; }
 
-  /// Read the query's immutable policy, restricted to non-delim aggregate-fanout partitions.
-  [[nodiscard]] bool is_memory_aware_bypass_enabled() const;
-
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
 
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
@@ -168,13 +165,13 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// @pre `lock` is held.
   std::optional<uint64_t> estimated_total_input_bytes();
 
-  /// Read the complete-input metadata the group-by bypass policy needs from the batches
-  /// waiting on this partition's input port. Returns nullopt when bypass is disabled.
+  /// Read the physical metadata of the batches waiting on this partition's single input port.
+  /// Returns nullopt when the partition has more than one port.
   ///
   /// Reads batch metadata only — no key scan, no host copy, no extra aggregation — under the
   /// repository's existing read-only handle, and never blocks on memory.
   /// @pre `lock` is held.
-  std::optional<group_by_bypass_metadata> collect_bypass_metadata();
+  std::optional<observed_input_metadata> collect_input_metadata();
 
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a

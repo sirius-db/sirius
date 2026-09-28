@@ -16,6 +16,11 @@
 
 #include "op/aggregate/group_by_bypass_policy.hpp"
 
+#include <cudf/null_mask.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/aligned.hpp>
+
 #include <catch.hpp>
 
 #include <limits>
@@ -35,13 +40,12 @@ candidate_input good_candidate()
   in.single_gpu_resident          = true;
   in.supported_state              = true;
   in.supported_downstream         = true;
-  in.total_rows                   = 1'000'000;
-  in.key_width_bytes              = 8;   // one INT64 key
-  in.agg_width_bytes              = 16;  // two INT64 partial states
-  in.key_columns                  = 1;
-  in.agg_columns                  = 2;
-  in.nullable_key_columns         = 0;
-  in.nullable_agg_columns         = 0;
+  in.state                        = state_shape{};
+  in.state->total_rows            = 1'000'000;
+  in.state->key_width_bytes       = 8;   // one INT64 key
+  in.state->agg_width_bytes       = 16;  // two INT64 partial states
+  in.state->key_columns           = 1;
+  in.state->agg_columns           = 2;
   in.admissible_additional_budget = 8ULL * 1024 * 1024 * 1024;
   in.headroom_fraction            = 0.25;
   return in;
@@ -101,22 +105,17 @@ TEST_CASE("group-by bypass preserves the automatic count when a gate rejects",
     in.supported_downstream = false;
     expect_auto_preserved(in, decision_reason::unsupported_downstream);
   }
-  SECTION("row count unknown")
+  SECTION("schema unknown")
   {
-    auto in       = good_candidate();
-    in.total_rows = std::nullopt;
+    auto in  = good_candidate();
+    in.state = std::nullopt;
     expect_auto_preserved(in, decision_reason::unknown_metadata);
   }
-  SECTION("column count unknown")
+  SECTION("an unknown schema is not reported as an unsupported one")
   {
-    auto in        = good_candidate();
-    in.agg_columns = std::nullopt;
-    expect_auto_preserved(in, decision_reason::unknown_metadata);
-  }
-  SECTION("nullability unknown is not the same as zero nullable columns")
-  {
-    auto in                 = good_candidate();
-    in.nullable_agg_columns = std::nullopt;
+    auto in            = good_candidate();
+    in.state           = std::nullopt;
+    in.supported_state = false;
     expect_auto_preserved(in, decision_reason::unknown_metadata);
   }
   SECTION("budget unknown")
@@ -151,9 +150,9 @@ TEST_CASE("group-by bypass rejects rather than wrapping on oversized inputs",
 {
   SECTION("above cuDF's concatenated row limit")
   {
-    auto in       = good_candidate();
-    in.total_rows = CUDF_MAX_ROWS + 1;
-    auto const d  = decide(in);
+    auto in              = good_candidate();
+    in.state->total_rows = CUDF_MAX_ROWS + 1;
+    auto const d         = decide(in);
     CHECK(d.reason == decision_reason::size_overflow);
     CHECK(d.num_partitions == in.auto_num_partitions);
   }
@@ -161,7 +160,7 @@ TEST_CASE("group-by bypass rejects rather than wrapping on oversized inputs",
   SECTION("exactly at the row limit is still evaluated, not rejected outright")
   {
     auto in                         = good_candidate();
-    in.total_rows                   = CUDF_MAX_ROWS;
+    in.state->total_rows            = CUDF_MAX_ROWS;
     in.admissible_additional_budget = std::numeric_limits<std::uint64_t>::max();
     auto const d                    = decide(in);
     // 2^31 rows of 24-byte partials is a real, representable requirement; the model must size it
@@ -174,8 +173,8 @@ TEST_CASE("group-by bypass rejects rather than wrapping on oversized inputs",
   SECTION("saturating width arithmetic rejects")
   {
     auto in                         = good_candidate();
-    in.total_rows                   = CUDF_MAX_ROWS;
-    in.agg_width_bytes              = std::numeric_limits<std::uint64_t>::max();
+    in.state->total_rows            = CUDF_MAX_ROWS;
+    in.state->agg_width_bytes       = std::numeric_limits<std::uint64_t>::max();
     in.admissible_additional_budget = std::numeric_limits<std::uint64_t>::max();
     auto const d                    = decide(in);
     CHECK(d.reason == decision_reason::size_overflow);
@@ -183,10 +182,29 @@ TEST_CASE("group-by bypass rejects rather than wrapping on oversized inputs",
   }
 }
 
+TEST_CASE("group-by bypass masks match cuDF's padded bitmask size", "[group_by_bypass][policy]")
+{
+  // One nullable key column over R rows adds exactly one concatenated mask and one dense output
+  // mask, each cuDF's padded bitmask size rounded to the allocator's alignment.
+  for (cudf::size_type const rows : {1, 511, 512, 513, 4096 * 8 + 1, 1'000'000}) {
+    INFO("rows = " << rows);
+    auto in                               = good_candidate();
+    in.state->total_rows                  = static_cast<std::uint64_t>(rows);
+    in.headroom_fraction                  = 0.0;
+    auto with_mask                        = in;
+    with_mask.state->nullable_key_columns = 1;
+    auto const mask =
+      rmm::align_up(cudf::bitmask_allocation_size_bytes(rows), rmm::CUDA_ALLOCATION_ALIGNMENT);
+    CHECK(model_additional_bytes(with_mask).concat_bytes -
+            model_additional_bytes(in).concat_bytes ==
+          mask);
+  }
+}
+
 TEST_CASE("group-by bypass model charges the terms it claims to", "[group_by_bypass][policy]")
 {
   auto in              = good_candidate();
-  in.total_rows        = 1024;
+  in.state->total_rows = 1024;
   in.headroom_fraction = 0.0;
   auto const base      = model_additional_bytes(in);
 
@@ -200,10 +218,10 @@ TEST_CASE("group-by bypass model charges the terms it claims to", "[group_by_byp
 
   SECTION("nullable columns are charged validity masks, not ignored")
   {
-    auto nulls                 = in;
-    nulls.nullable_key_columns = 1;
-    nulls.nullable_agg_columns = 2;
-    auto const with_masks      = model_additional_bytes(nulls);
+    auto nulls                        = in;
+    nulls.state->nullable_key_columns = 1;
+    nulls.state->nullable_agg_columns = 2;
+    auto const with_masks             = model_additional_bytes(nulls);
     CHECK(with_masks.concat_bytes > base.concat_bytes);
     CHECK(with_masks.sparse_agg_bytes > base.sparse_agg_bytes);
     CHECK(with_masks.additional_needed > base.additional_needed);
@@ -217,7 +235,7 @@ TEST_CASE("group-by bypass model charges the terms it claims to", "[group_by_byp
     projected.downstream_row_bytes = 80;
     projected.downstream_columns   = 10;
     auto const wide                = model_additional_bytes(projected);
-    CHECK(wide.downstream_bytes >= 80 * *in.total_rows);
+    CHECK(wide.downstream_bytes >= 80 * in.state->total_rows);
     CHECK(wide.downstream_bytes > base.output_bytes);
     CHECK(wide.additional_needed == base.additional_needed + wide.downstream_bytes);
   }
@@ -225,13 +243,13 @@ TEST_CASE("group-by bypass model charges the terms it claims to", "[group_by_byp
   SECTION("each column is charged its own allocation padding")
   {
     // The same 24 bytes per row split across more columns needs more padded allocations.
-    auto split         = in;
-    split.total_rows   = 1;
-    split.agg_columns  = 16;
-    auto packed        = split;
-    packed.agg_columns = 1;
-    auto const many    = model_additional_bytes(split);
-    auto const one     = model_additional_bytes(packed);
+    auto split                = in;
+    split.state->total_rows   = 1;
+    split.state->agg_columns  = 16;
+    auto packed               = split;
+    packed.state->agg_columns = 1;
+    auto const many           = model_additional_bytes(split);
+    auto const one            = model_additional_bytes(packed);
     // One row of 16 separately allocated aggregate columns occupies 16 aligned 256-byte blocks.
     CHECK(many.concat_bytes >= 256 + 16 * 256);
     CHECK(many.concat_bytes > one.concat_bytes);
@@ -251,7 +269,7 @@ TEST_CASE("group-by bypass model charges the terms it claims to", "[group_by_byp
 TEST_CASE("group-by bypass budget check is inclusive at the boundary", "[group_by_bypass][policy]")
 {
   auto in              = good_candidate();
-  in.total_rows        = 65'536;
+  in.state->total_rows = 65'536;
   in.headroom_fraction = 0.0;
   auto const model     = model_additional_bytes(in);
   REQUIRE(model.required_bytes > 1);
