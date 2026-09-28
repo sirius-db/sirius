@@ -241,10 +241,10 @@ struct pinned_entry {
   /// path appends columns and a positional attach would then describe the wrong
   /// ones.
   std::vector<bool> proven_unique_columns;
-  /// Generation-checked handle for late materialization: what a deferred
-  /// column holds instead of a pointer to this entry, so an unpin or a
-  /// replacing re-pin makes every outstanding origin fail closed rather than
-  /// dangle. Null unless the late-mat gate is on.
+  /// Generation-checked handle for late materialization. It points weakly back
+  /// to this exact entry, so an unpin/replacement hides it from new queries
+  /// without revoking a query that already co-owns it. Null unless the late-mat
+  /// gate is on.
   std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
@@ -1064,9 +1064,6 @@ class sirius_scan_manager {
   /// invalidate whatever handle it is replacing. Called after every insert;
   /// a no-op when the late-mat gate is off.
   void publish_late_mat_handle(const std::string& name);
-  /// Invalidate the handle of the entry at @p name, if any — every outstanding
-  /// origin against it then fails closed. Called before it is erased.
-  void retire_late_mat_handle(const std::string& name);
 
   //! One entry per in-flight query. Guarded by _query_states_mutex; the shared_ptr is
   //! resolved under the lock and used outside it, so an erase racing a reader cannot pull

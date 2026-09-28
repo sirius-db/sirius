@@ -2588,8 +2588,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       }
       return stored;
     }
-    // Row count or completeness contract differs → drop the stale entry and rebuild below.
-    retire_late_mat_handle(name);
+    // Row count or completeness contract differs → remove registry visibility and rebuild
+    // below. Queries already serving the old entry retain it (and its handle) by shared ownership.
     _pinned_entries.erase(existing_it);
   }
 
@@ -2614,11 +2614,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
     }
   }
 
-  // Assigning over an existing name destroys that entry in place, so its
-  // handle has to be invalidated FIRST — afterwards the entry is gone but the
-  // handle would still resolve, and its pointer would address the map node now
-  // holding different data.
-  retire_late_mat_handle(name);
+  // A new object gets a new handle. Any query still serving the old object keeps
+  // that exact object alive; its origins never resolve through this name.
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
   // The replace path stored every column.
@@ -2720,14 +2717,10 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.column_storage = std::move(column_storage);
   entry.zone_maps      = std::move(pin_zone_maps);
 
-  // Assigning over an existing name destroys that entry in place, so its handle has to be
-  // invalidated FIRST — afterwards the entry is gone but the handle would still resolve,
-  // and its pointer would address the map node now holding different data. Replace, never
-  // mutate: a query already serving the old entry holds its own shared_ptr and keeps
-  // reading it to completion. Only the map slot is swapped here, all under one lock so a
-  // concurrent find_pinned_entry_for_duckdb_table can never observe the handle mid-swap.
+  // Replace, never mutate: a query already serving the old entry holds its own shared_ptr and
+  // keeps both its data and exact-object late-mat handle valid to completion. Only the map slot
+  // is swapped here, all under one lock so a concurrent lookup sees either whole entry.
   std::lock_guard pin_lk{_pinned_entries_mutex};
-  retire_late_mat_handle(name);
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
 }
@@ -2781,10 +2774,9 @@ void sirius_scan_manager::insert_pinned_entry_device(
                    entry.device_chunks.size(),
                    new_num_rows);
 
-  // Assigning over an existing name destroys that entry in place, so its handle has to be
-  // invalidated FIRST. Replace, never mutate — see insert_pinned_entry_host.
+  // Replace, never mutate — see insert_pinned_entry_host. Existing query leases keep the old
+  // entry and its handle alive without redirecting either through this registry name.
   std::lock_guard pin_lk{_pinned_entries_mutex};
-  retire_late_mat_handle(name);
   _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
   publish_late_mat_handle(name);
 }
@@ -2842,10 +2834,10 @@ void sirius_scan_manager::attach_proven_unique_columns(
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
-  // Safe mid-query by construction: dropping the map slot only releases this map's reference.
-  // A query serving the entry holds its own, so its data outlives the unpin.
+  // Safe mid-query by construction: dropping the map slot only removes visibility to new
+  // queries and releases this map's reference. A query serving the exact entry holds its own
+  // shared_ptr, and the entry's weak late-mat handle continues to resolve through that owner.
   std::lock_guard pin_lk{_pinned_entries_mutex};
-  retire_late_mat_handle(name);
   _pinned_entries.erase(name);
   // Dropping the datasources releases their prefetching handles, which disposes
   // each request's consumer and hands the chunks back to the evictor. That is
@@ -2857,22 +2849,15 @@ void sirius_scan_manager::publish_late_mat_handle(const std::string& name)
   if (!late_mat::late_mat_enabled()) { return; }
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) { return; }
-  // Whatever handle this entry had described the pin it is replacing.
+  // Republishing on the same object is an in-place lifecycle change, so revoke
+  // its prior generation before installing the new handle.
   if (it->second->late_mat_handle) { it->second->late_mat_handle->invalidate(); }
   auto handle = std::make_shared<late_mat::pin_entry_handle>(
     name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
-  // The entry is held alive by the map's shared_ptr (and by every provider still serving
-  // it), so this pointer stays valid for as long as the handle itself is — and the handle
-  // is invalidated before the entry's last owner releases it.
-  handle->set_entry(it->second.get());
+  // The handle points weakly back at this exact object: entry -> handle -> weak entry avoids
+  // a cycle, while resolve() promotes it to an owning lease for each deferred gather.
+  handle->set_entry(it->second);
   it->second->late_mat_handle = std::move(handle);
-}
-
-void sirius_scan_manager::retire_late_mat_handle(const std::string& name)
-{
-  auto it = _pinned_entries.find(name);
-  if (it == _pinned_entries.end() || !it->second->late_mat_handle) { return; }
-  it->second->late_mat_handle->invalidate();
 }
 
 std::size_t sirius_scan_manager::pin_parquet_ranges(
