@@ -15,6 +15,7 @@ set(EXTENSION_SOURCES
     src/late_mat/multi_source_gather.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
+    src/helper/timestamp_semantics.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp

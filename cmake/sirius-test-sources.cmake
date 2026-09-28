@@ -87,6 +87,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_provider_isolation.cpp
+    test/cpp/integration/test_timestamp_extraction.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/late_mat/test_column_origin.cpp
     test/cpp/late_mat/test_prepared_selection.cpp
