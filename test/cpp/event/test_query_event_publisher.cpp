@@ -679,6 +679,7 @@ TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publi
   publish_one_of_each(*publisher);
 
   REQUIRE(wait_for(witness, 8));
+  REQUIRE(wait_for(subscriber, 1));
   CHECK(subscriber.unsubscribed_count() == 0);
   CHECK(subscriber.seen() == std::vector<std::string>{"task_queue_empty"});
   // The witness subscribed to all eight, so nothing it got was unsubscribed
