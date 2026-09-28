@@ -222,6 +222,7 @@ class sirius_physical_plan_generator {
 
  public:
   duckdb::ClientContext& context;
+
  public:
   //! Recursive post-pass that derives each operator's `_parent_op` from the final tree after
   //! rewrites finish. The engine calls it again after adding the RESULT_COLLECTOR wrapper to

@@ -2223,7 +2223,6 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
-
 static void ApplyExpressionEvaluatorStrategy(const std::string& value)
 {
   sirius::expression_evaluator_strategy parsed;
@@ -2259,7 +2258,6 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
-
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
                                     SetScope /*scope*/,
                                     Value& /*parameter*/)
@@ -2284,7 +2282,6 @@ static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
 {
   // DuckDB stores this setting in the client context.
 }
-
 
 static void SetFuseMergePipelines(ClientContext& /*context*/,
                                   SetScope /*scope*/,
@@ -2720,7 +2717,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
   auto const& operator_defaults    = defaults.get_operator_params();
   auto const& compression_defaults = defaults.get_compression_config();
 
-
   config.AddExtensionOption(
     "expression_evaluator_strategy",
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
@@ -2737,7 +2733,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::VARCHAR,
     Value(std::string(sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY))),
     SetExpressionExecutorStrategyDeprecated);
-
 
   add_sirius_option(
     config,
@@ -2860,7 +2855,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::BOOLEAN,
     Value::BOOLEAN(true),
     SetEnableLikeSwarFastpath);
-
 
   // Add in config option for sort partition size
   config.AddExtensionOption("max_sort_partition_bytes",
