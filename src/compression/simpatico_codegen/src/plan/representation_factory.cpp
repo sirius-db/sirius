@@ -13,6 +13,7 @@
 #include "../decode/decode_session.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -667,8 +668,11 @@ std::unique_ptr<compressed_representation> make_decode_payload(decode_channels c
   return rep;
 }
 
+// `key_width_hint` follows PlanNode::dictionary_key_width_hint; it is published on the frame-local
+// representation so that decode skips its own measurement when the width is known.
 std::unique_ptr<compressed_representation> make_decode_dictionary(decode_channels channels,
                                                                   bool has_mask,
+                                                                  std::int64_t key_width_hint,
                                                                   decode_frame& frame)
 {
   auto const offsets_type = channels[0]->type().id();
@@ -680,8 +684,15 @@ std::unique_ptr<compressed_representation> make_decode_dictionary(decode_channel
   if (offsets < 1 || channels[0]->null_count() != 0) {
     throw std::invalid_argument("dictionary: key offsets must be nonempty and null-free");
   }
-  auto const rows         = channels[2]->size();
-  auto const keys         = offsets - 1;
+  auto const rows = channels[2]->size();
+  auto const keys = offsets - 1;
+  // A positive hint fixes the chars extent exactly; anything else is corrupt metadata, not a shape
+  // to decline, because the gather addresses the chars with it.
+  if (key_width_hint < -1 ||
+      (key_width_hint > 0 && static_cast<std::int64_t>(channels[1]->size()) !=
+                               static_cast<std::int64_t>(keys) * key_width_hint)) {
+    throw std::invalid_argument("dictionary: key width hint does not describe the key channels");
+  }
   auto const indices_type = channels[2]->type().id();
   cudf::type_id signed_type;
   switch (indices_type) {
@@ -741,16 +752,16 @@ std::unique_ptr<compressed_representation> make_decode_dictionary(decode_channel
                                    std::move(parent_mask),
                                    null_count,
                                    std::move(dict_children)));
+  rep->constant_key_width = key_width_hint;
   return rep;
 }
 
-}  // namespace
-
-std::unique_ptr<compressed_representation> reconstruct_decode_representation(
+std::unique_ptr<compressed_representation> reconstruct_decode_representation_impl(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> channels,
   leaf_meta_v const& meta,
+  std::int64_t dictionary_key_width_hint,
   decode_frame& frame)
 {
   if (output_names.size() != channels.size() ||
@@ -767,7 +778,7 @@ std::unique_ptr<compressed_representation> reconstruct_decode_representation(
     } else {
       require_decode_channels(output_names, channels, {"keys_offsets", "keys_chars", "indices"});
     }
-    return make_decode_dictionary(std::move(channels), has_mask, frame);
+    return make_decode_dictionary(std::move(channels), has_mask, dictionary_key_width_hint, frame);
   }
   if (*id == OpId::Ans || *id == OpId::Snappy || *id == OpId::Lz4 || *id == OpId::Deflate ||
       *id == OpId::Bitcomp || *id == OpId::NvcompCascaded) {
@@ -891,6 +902,29 @@ std::unique_ptr<compressed_representation> reconstruct_decode_representation(
   }
   rep->channels_ = std::move(channels);
   return rep;
+}
+
+}  // namespace
+
+std::unique_ptr<compressed_representation> reconstruct_decode_representation(
+  std::string const& compressor_name,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> channels,
+  leaf_meta_v const& meta,
+  decode_frame& frame)
+{
+  return reconstruct_decode_representation_impl(
+    compressor_name, output_names, std::move(channels), meta, -1, frame);
+}
+
+std::unique_ptr<compressed_representation> reconstruct_decode_representation(
+  PlanNode const& node,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> channels,
+  decode_frame& frame)
+{
+  return reconstruct_decode_representation_impl(
+    node.op, output_names, std::move(channels), node.meta, node.dictionary_key_width_hint, frame);
 }
 
 std::unique_ptr<cudf::column> standalone_compressed_representation::decompress(

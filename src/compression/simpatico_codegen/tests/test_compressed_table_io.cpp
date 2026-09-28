@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -323,6 +324,64 @@ void test_dictionary()
 {
   auto t = make_string_table(4096, cudf::get_default_stream());
   io_roundtrip("dictionary", t->view(), "input -> dictionary\n");
+}
+
+// PlanNode::dictionary_key_width_hint is never serialized: both readers derive it from the stored
+// tree, so a read publishes the value the compress walk did (and -1 where neither can know).
+void test_dictionary_key_width_hint()
+{
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = rmm::mr::get_current_device_resource_ref();
+  std::vector<std::string> values(2048);
+  for (std::size_t i = 0; i < values.size(); ++i)
+    values[i] = std::array{"AB", "CD", "EF"}[(i * 5 + i / 7) % 3];
+  auto input = make_strings_column(values, {}, stream);
+  struct shape {
+    char const* plan;
+    std::int64_t expected;
+  };
+  shape const shapes[] = {
+    {"input -> dictionary\n", 2},
+    {"input -> dictionary -> keys_offsets, keys_chars, indices\n"
+     "dictionary.indices -> bitpack\n",
+     2},
+    {"input -> dictionary -> keys_offsets, keys_chars, indices\n"
+     "dictionary.keys_offsets -> bitpack\n"
+     "dictionary.indices -> bitpack\n",
+     -1},
+  };
+  auto hint_of = [](simpatico::compressed_table const& table) {
+    auto const& nodes = table.columns.front().plan_tree->nodes;
+    auto const node   = std::find_if(nodes.begin(), nodes.end(), [](simpatico::PlanNode const& n) {
+      return n.op == "dictionary";
+    });
+    expect(node != nodes.end(), "dictionary hint: plan has no dictionary node");
+    return node->dictionary_key_width_hint;
+  };
+  auto verify =
+    [&](char const* label, simpatico::compressed_table const& table, std::int64_t expected) {
+      expect(hint_of(table) == expected,
+             (std::string("dictionary hint: ") + label + " value").c_str());
+      auto out = simpatico::decompress(table, stream, mr);
+      expect(out != nullptr && out->num_columns() == 1 &&
+               columns_equal_any(input->view(), out->view().column(0), stream),
+             (std::string("dictionary hint: data mismatch after ") + label).c_str());
+    };
+  for (auto const& s : shapes) {
+    auto ct = simpatico::compress_with_plan(cudf::table_view{{input->view()}}, s.plan, stream, mr);
+    verify("encode", ct, s.expected);
+    TmpFile tmp;
+    std::string werr = simpatico::write_compressed_table(ct, tmp.path);
+    expect(werr.empty(), "dictionary hint: write error");
+    std::string rerr;
+    auto from_file = simpatico::read_compressed_table(tmp.path, stream, mr, &rerr);
+    expect(rerr.empty(), "dictionary hint: file read error");
+    verify("file read", from_file, s.expected);
+    std::string merr;
+    auto from_memory = memory_reread("dictionary_key_width_hint", ct, merr);
+    expect(merr.empty(), "dictionary hint: memory read error");
+    verify("memory read", from_memory, s.expected);
+  }
 }
 
 // 5. Multi-column: three columns with three different plans in one file.
@@ -694,6 +753,7 @@ int main()
     {"bitjoin_f32", test_bitjoin_f32},
     {"alp_rd_f64", test_alp_rd_f64},
     {"dictionary", test_dictionary},
+    {"dictionary_key_width_hint", test_dictionary_key_width_hint},
     {"multi_column", test_multi_column},
     {"selective_decompression", test_selective_decompression},
     {"memory_subset_read", test_memory_subset_read},

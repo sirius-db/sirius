@@ -86,12 +86,12 @@ Removing completion-only leaf waits does not remove dependencies needed to disco
 |---|---|
 | nvCOMP codecs | Header and compressed-size readbacks establish dimensions, pointers, and scratch sizing. Host upload arrays stay with the frame until the final drain; device metadata and scratch are released in stream order. |
 | ALP and ALP_RD | Shared ALP initialization must complete before publication; reconstructed ALP_RD bit-width metadata needs a host observation. |
-| Dictionary | An imported representation without prepared width metadata observes the reduction result during decode. Variable-width output sizing and selected-key inspection can also require observations. |
+| Dictionary | A published tree carries the key width on its plan node (`PlanNode::dictionary_key_width_hint`); only a reconstruction without a hint observes the reduction result during decode. Variable-width output sizing and selected-key inspection can also require observations. |
 | Selected strings | Decoded lengths are scanned, then the total character count is observed before allocating the exact output buffer. |
 | Scan selection | Survivor count is observed before exact-sized indices, policy decisions, and compacted output allocation; the count is staged through pinned memory like every other observation. |
 | Predicate needles | Not an observation decode asks for: constructing each cuDF string scalar synchronizes its stream while cuDF allocates the scalar's pinned validity buffer. The generic comparison and the dictionary lookup table each wait once per needle. |
 
-No path waits merely to release memory, and the dictionary gather specialization builds its offsets on the device, so it waits only for its key-offsets readback. The identity leaf copies its complete owned column, preserving the owning-copy path instead of converting it unnecessarily to a generic slice-aware view copy. Library-internal synchronization is not promised away.
+No path waits merely to release memory, and the dictionary gather specialization reads the key width from the plan node, builds its offsets on the device, and declines an unknown width, so it observes nothing. The identity leaf copies its complete owned column, preserving the owning-copy path instead of converting it unnecessarily to a generic slice-aware view copy. Library-internal synchronization is not promised away.
 
 ### Dictionary width publication
 
@@ -100,6 +100,8 @@ The dictionary factory prepares immutable fixed-key-width metadata before publis
 The factory allocates device scratch first, then an eight-byte result from cuDF's pinned, host-and-device-accessible resource. CUB writes directly into that result. The existing publication synchronization makes it readable on the CPU; no separate metadata D2H copy or new publication wait is needed. Scratch, pinned output, and key owners remain alive through failure drainage.
 
 Imported or reconstructed dictionaries may lack this metadata. Their decode path shares the reduction algorithm but allocates scratch and the result in local device storage on the request's stream, then reads the result through the frame's checked scalar observation, which waits for the stream before that storage is released. The storage policies differ because their ownership boundaries differ, not because they select different decoders.
+
+A published `PlanTree` also carries the width on its `dictionary` node as `PlanNode::dictionary_key_width_hint`. The compress walk copies the representation's prepared width when `keys_offsets` stays an identity output or the whole representation stays on the node; the reader derives the same value from the stored identity offsets (one staged readback per dictionary column) or from the self-stored representation, so both producers agree route for route. The hint is never serialized. `make_decode_dictionary` publishes it on the frame-local representation it builds, and the gather specialization consumes it in place of a readback.
 
 ## Representative flows
 
@@ -117,9 +119,10 @@ The session does not expose lane assignments or pending column views to implemen
 
 ## Regression coverage
 
-- [`test_async_decode.cpp`](../src/compression/simpatico_codegen/tests/test_async_decode.cpp): completed returns, concurrent submission, dictionary metadata, duplicate stream handles, release of temporaries during submission without waits (including the predicate, dictionary-gather, selected-string, full-width-then-gather, and mask routes), host-upload lifetime, pinned staging of host observations (`test_host_observation_staging`), abandonment, typed failures (including failure after enqueue), and error-priority drainage.
-- [`test_scan_filter_session.cpp`](../src/compression/simpatico_codegen/tests/test_scan_filter_session.cpp): phase integration, predicate dual delivery, membership acceptance/decline, and selected output.
+- [`test_async_decode.cpp`](../src/compression/simpatico_codegen/tests/test_async_decode.cpp): completed returns, concurrent submission, dictionary metadata, duplicate stream handles, release of temporaries during submission without waits (including the predicate, dictionary-gather, selected-string, full-width-then-gather, and mask routes), host-upload lifetime, pinned staging of host observations (`test_host_observation_staging`), dictionary key width hints on the plan node (`test_dictionary_key_width_hint`), abandonment, typed failures (including failure after enqueue), and error-priority drainage.
+- [`test_scan_filter_session.cpp`](../src/compression/simpatico_codegen/tests/test_scan_filter_session.cpp): phase integration, predicate dual delivery, membership acceptance/decline, selected output, and the dict_codes gather with a published key width against the general route (`dict_codes_gather`).
 - Borrowed stream views: [`test_async_decode.cpp`](../src/compression/simpatico_codegen/tests/test_async_decode.cpp) checks that a table decode waits on each distinct view at most once and covers work others queued there; [`test_scan_filter_session.cpp`](../src/compression/simpatico_codegen/tests/test_scan_filter_session.cpp) decodes with repeated views that include the output stream and checks every result against expected values: a range, keep-mask, and full-width request and a table decode through both the `stream_pool` and view overloads, then membership, BOOL8-only (empty second wave), and predicate table requests through the views.
+- [`test_compressed_table_io.cpp`](../src/compression/simpatico_codegen/tests/test_compressed_table_io.cpp): the file and in-memory readers republish the dictionary key width hint the compress walk did, including unknown for compressed `keys_offsets` (`test_dictionary_key_width_hint`).
 - [`test_masked_decode_variants.cpp`](../src/compression/simpatico_codegen/tests/test_masked_decode_variants.cpp): compacted kernel variants and selection boundaries.
 - [`test_decode_reservation.cpp`](../test/cpp/compression/test_decode_reservation.cpp): actual engine reservation behavior, a peak charge of earlier outputs plus one request's temporaries, and preserved OOM handling.
 

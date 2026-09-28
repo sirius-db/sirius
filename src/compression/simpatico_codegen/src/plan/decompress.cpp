@@ -117,10 +117,6 @@ class DecodeWalk {
              decode_selection const* sel);
   // Materialize `consumer` and return the decoded `value` it consumes, for a fused region to bind.
   cudf::column const* bind(NodeId consumer, ValueId value);
-  cudf::column const& terminal_channel(ValueId value, compressed_representation const& rep)
-  {
-    return *terminal_entry(value, rep);
-  }
   std::unique_ptr<cudf::column> run();
 
  private:
@@ -798,8 +794,7 @@ void DecodeWalk::materialize(NodeId nid)
       channels.push_back(std::move(terminal_entry(value, *channel->second)));
     }
   }
-  auto const rep =
-    reconstruct_decode_representation(node.op, names, std::move(channels), node.meta, frame);
+  auto const rep = reconstruct_decode_representation(node, names, std::move(channels), frame);
   store(key, decode_leaf(*rep, nid));
 }
 
@@ -948,13 +943,12 @@ struct str_split_shape {
 };
 std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree);
 
-// The specialized dictionary char-emit (launch_decode_fused_tree_dict_gather):
-// constant-width, null-free keys with identity-stored key channels; compressed
-// or variable-width keys take the general route. The caller owns key-width
-// measurement, keys_chars extraction, the analytic offsets (j * width), and
-// the strings assembly — the kernel itself emits only the compacted chars.
-// Returns nullptr only when this shape is unsupported. Execution failures throw;
-// nothing shared is mutated before a semantic decline.
+// The specialized dictionary char-emit (launch_decode_fused_tree_dict_gather): null-free keys whose
+// uniform width the plan node publishes and whose keys_chars is an identity-stored channel, bound
+// by view without a copy. An unknown or variable width and compressed keys take the general route,
+// which measures. The caller owns the analytic offsets (j * width) and the strings assembly; the
+// kernel itself emits only the compacted chars. Returns nullptr only when this shape is
+// unsupported. Execution failures throw; nothing shared is mutated before a semantic decline.
 std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
                                                         decode_selection const& sel,
                                                         DecodeWalk& walk,
@@ -962,33 +956,24 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
 {
   auto const dict_nid = root_value_producer(tree);
   if (dict_nid >= tree.nodes.size()) return nullptr;
-  auto const& node            = tree.nodes[dict_nid];
-  cudf::column const* offsets = nullptr;
-  cudf::column const* chars   = nullptr;
+  auto const& node = tree.nodes[dict_nid];
+  auto const width = node.dictionary_key_width_hint;
+  if (width <= 0) return nullptr;
+  cudf::column_view chars{};
   for (std::size_t i = 0; i < node.output_names.size(); ++i) {
-    auto const& name = node.output_names[i];
-    if (name != "keys_offsets" && name != "keys_chars") continue;
-    if (std::any_of(node.children.begin(), node.children.end(), [&](auto const& edge) {
-          return edge.channel == name;
+    if (node.output_names[i] != "keys_chars") continue;
+    if (std::any_of(node.children.begin(), node.children.end(), [](auto const& edge) {
+          return edge.channel == "keys_chars";
         }))
       return nullptr;
     auto it = node.channels.find(node.output_paths[i]);
     if (it == node.channels.end() || !it->second) return nullptr;
-    auto const& channel =
-      walk.terminal_channel(ValueId{dict_nid, static_cast<ChannelId>(i)}, *it->second);
-    (name == "keys_offsets" ? offsets : chars) = &channel;
+    auto const* identity =
+      dynamic_cast<identity_compressed_representation const*>(it->second.get());
+    if (!identity || identity->channels_.size() != 1 || !identity->channels_[0]) return nullptr;
+    chars = identity->channels_[0]->view();
   }
-  if (!offsets || !chars || offsets->type().id() != cudf::type_id::INT32 || offsets->size() < 2 ||
-      offsets->null_count() != 0 || chars->type().id() != cudf::type_id::UINT8 ||
-      chars->null_count() != 0)
-    return nullptr;
-  auto const count = static_cast<std::size_t>(offsets->size());
-  auto const host  = std::make_unique_for_overwrite<std::int32_t[]>(count);
-  frame.read_bytes(host.get(), offsets->view().head<void>(), count * sizeof(std::int32_t));
-  auto const width = host[1] - host[0];
-  if (width <= 0) return nullptr;
-  for (std::size_t i = 2; i < count; ++i)
-    if (host[i] - host[i - 1] != width) return nullptr;
+  if (chars.type().id() != cudf::type_id::UINT8 || chars.null_count() != 0) return nullptr;
   // The analytic offsets are INT32; a larger output takes the general route.
   if (sel.survivor_count * width > std::numeric_limits<cudf::size_type>::max()) return nullptr;
   auto codes_nid = static_cast<NodeId>(tree.nodes.size());
@@ -1003,10 +988,13 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   if (!region) throw std::runtime_error(error);
   auto const survivors = static_cast<cudf::size_type>(sel.survivor_count);
   std::vector<std::unique_ptr<cudf::column>> children;
+  auto const key_width = static_cast<std::int32_t>(width);
   // Built on the device: each cuDF scalar would wait for the stream and upload from the host.
-  children.push_back(make_constant_width_offsets(survivors, width, frame.stream(), frame.mr()));
+  children.push_back(make_constant_width_offsets(survivors, key_width, frame.stream(), frame.mr()));
   rmm::device_buffer out_chars(
-    static_cast<std::size_t>(survivors) * width, frame.stream(), frame.mr());
+    static_cast<std::size_t>(survivors) * static_cast<std::size_t>(key_width),
+    frame.stream(),
+    frame.mr());
   auto* const char_data = out_chars.data();
   auto output           = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
                                                survivors,
@@ -1021,8 +1009,8 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
                                          region->num_rows,
                                          *sel.mask,
                                          row_enumeration{},
-                                         chars->view().head<void>(),
-                                         width,
+                                         chars.data<std::uint8_t>(),
+                                         key_width,
                                          char_data,
                                          frame);
   }

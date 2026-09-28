@@ -11,9 +11,12 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <numeric>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -424,6 +427,65 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
   }
 }
 
+// The dict_codes route with a published key width gathers straight from the stored key chars;
+// with the hint cleared the same request takes the general route (compacted codes, then a
+// dictionary rebuilt with an unknown width it measures). Both must yield the filtered strings.
+void dict_codes_gather(simpatico::stream_pool& pool,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr)
+{
+  std::vector<std::string> const keys{"AB", "CD", "EF"};
+  std::vector<std::string> strings(row_count);
+  for (int i = 0; i < row_count; ++i)
+    strings[i] = keys[(i * 5 + i / 7) % keys.size()];
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_strings_column(strings, {}, stream));
+  columns.push_back(sequence(0, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed =
+    simpatico::compress_with_plan(input.view(),
+                                  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+                                  "dictionary.indices -> bitpack\n---\ninput -> bitpack\n",
+                                  stream,
+                                  mr);
+  auto& tree      = *compressed.columns[0].plan_tree;
+  auto dictionary = std::find_if(
+    tree.nodes.begin(), tree.nodes.end(), [](auto const& node) { return node.op == "dictionary"; });
+  expect(dictionary != tree.nodes.end() && dictionary->dictionary_key_width_hint == 2,
+         "dict_codes fixture did not publish its key width");
+
+  std::vector<std::string> const expected_strings(strings.begin(), strings.begin() + 20);
+  auto expected = make_strings_column(expected_strings, {}, stream);
+  std::array<std::size_t, 2> selected{0, 1};
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::dict_codes, sc::decode_route::bitpack_mask};
+  request.filters.push_back({1, {0, 19}});
+  sc::scan_filter_result result;
+  auto output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+  expect(result.applied && result.survivor_count == 20, "dict_codes range filter applied");
+  expect(output->view().column(0).type().id() == cudf::type_id::STRING &&
+           strings_equal(expected->view(), output->view().column(0), stream),
+         "dict_codes gather strings");
+
+  auto mask = result.view();
+  simpatico::decode_selection selection;
+  selection.mask           = &mask;
+  selection.survivor_count = mask.survivor_count;
+  selection.route          = sc::decode_route::dict_codes;
+  std::string error;
+  auto hinted = simpatico::decompress_column(tree, stream, mr, &error, nullptr, &selection);
+  expect(hinted != nullptr, error.c_str());
+  expect(strings_equal(expected->view(), hinted->view(), stream),
+         "direct dict_codes gather with the published width");
+  // Clearing the hint before the decode is a test-only way to force the general route.
+  dictionary->dictionary_key_width_hint = -1;
+  auto measured = simpatico::decompress_column(tree, stream, mr, &error, nullptr, &selection);
+  expect(measured != nullptr, error.c_str());
+  expect(strings_equal(hinted->view(), measured->view(), stream),
+         "dict_codes general route differs from the hinted gather");
+}
+
 }  // namespace
 
 int main()
@@ -450,6 +512,7 @@ int main()
     expect(pool.init(4), "stream pool initialization");
     numeric_sources(pool, stream.view(), resource);
     bool8_delivery(pool, stream.view(), resource);
+    dict_codes_gather(pool, stream.view(), resource);
     aliased_borrowed_lanes(pool, stream.view(), resource);
     check(pool.sync_all());
     stream.synchronize();

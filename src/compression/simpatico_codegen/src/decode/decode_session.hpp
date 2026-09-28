@@ -273,4 +273,18 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
   leaf_meta_v const& meta,
   decode_frame& frame);
 
+/**
+ * @brief Rebuild @p node's codec representation from channels decoded on the frame's stream,
+ * publishing `PlanNode::dictionary_key_width_hint` on a dictionary.
+ *
+ * Otherwise as the overload above, which leaves a dictionary's key width unknown.
+ *
+ * @throw std::invalid_argument also if the hint contradicts the key channels
+ */
+[[nodiscard]] std::unique_ptr<compressed_representation> reconstruct_decode_representation(
+  PlanNode const& node,
+  std::vector<std::string> const& output_names,
+  std::vector<std::unique_ptr<cudf::column>> channels,
+  decode_frame& frame);
+
 }  // namespace simpatico

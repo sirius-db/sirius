@@ -109,6 +109,17 @@ struct PlanNode {
   // information (e.g. uncompressed_size for ANS/Bitcomp) that cannot be
   // recovered from the stored channel buffers alone.
   leaf_meta_v meta{leaf_meta::none{}};
+
+  // Byte width of a `dictionary` node's keys: > 0 when every key has that uniform width, 0 when the
+  // keys are variable-width or empty, -1 when unknown. Written only before the tree is published
+  // and never serialized: the compress walk (plan/compress.cpp) copies the representation's
+  // prepared width, and the reader (api/compressed_table_io.cpp) derives the same value from the
+  // self-stored representation or the stored identity `keys_offsets` leaf, so both producers agree
+  // route for route and a `keys_offsets` output consumed by another node stays -1 on both. Consumed
+  // by make_decode_dictionary (plan/representation_factory.cpp), which publishes it on the
+  // frame-local representation and rejects a value that contradicts the key channels, and by the
+  // dict_codes gather specialization (plan/decompress.cpp), which declines a value <= 0.
+  std::int64_t dictionary_key_width_hint = -1;
 };
 
 struct PlanTree {

@@ -33,6 +33,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -1002,6 +1003,135 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
         "duplicate dictionary projection output mismatch");
     expect(original->constant_key_width == fixture.width,
            "duplicate projection changed shared dictionary width metadata");
+  }
+}
+
+constexpr std::string_view kDictionaryIdentityOffsetsPlan =
+  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+  "dictionary.indices -> bitpack\n";
+constexpr std::string_view kDictionaryBitpackedOffsetsPlan =
+  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+  "dictionary.keys_offsets -> bitpack\n"
+  "dictionary.indices -> bitpack\n";
+constexpr std::string_view kDictionarySelfPlan = "input -> dictionary\n";
+
+simpatico::PlanNode const& dictionary_node(simpatico::compressed_table const& table)
+{
+  auto const& nodes = table.columns.front().plan_tree->nodes;
+  auto const node   = std::find_if(
+    nodes.begin(), nodes.end(), [](simpatico::PlanNode const& n) { return n.op == "dictionary"; });
+  expect(node != nodes.end(), "dictionary plan has no dictionary node");
+  return *node;
+}
+
+// The compress walk publishes the key width on the plan node wherever the stored tree fixes it. The
+// hint reaches the frame-local representation at construction, so a hinted decode observes nothing
+// on the host, while a reconstruction without a hint still measures through the frame; a hint that
+// contradicts the key channels is rejected as corrupt metadata.
+void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
+{
+  struct fixture {
+    std::vector<std::string> keys;
+    std::int64_t width;
+  };
+  std::array<fixture, 3> const fixtures{{
+    {{"A", "N", "R"}, 1},
+    {{"aaaa", "bbbb"}, 4},
+    {{"a", "bbb", "cc"}, 0},
+  }};
+  struct shape {
+    std::string_view plan;
+    bool published;  ///< The stored tree fixes the width: self rep or identity keys_offsets.
+  };
+  std::array<shape, 3> const shapes{{
+    {kDictionaryIdentityOffsetsPlan, true},
+    {kDictionarySelfPlan, true},
+    {kDictionaryBitpackedOffsetsPlan, false},
+  }};
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  constexpr cudf::size_type rows = 1037;
+  auto const make_input          = [&](std::vector<std::string> const& keys) {
+    std::vector<std::string> values(rows);
+    for (std::size_t i = 0; i < values.size(); ++i)
+      values[i] = keys[(i * 7 + i / 3) % keys.size()];
+    return make_strings_column(values, {}, stream.view());
+  };
+  for (auto const& fixture : fixtures) {
+    auto input = make_input(fixture.keys);
+    for (auto const& shape : shapes) {
+      auto const expected = shape.published ? fixture.width : -1;
+      auto compressed     = simpatico::compress_with_plan(
+        cudf::table_view{{input->view()}}, shape.plan, stream.view(), mr);
+      expect(dictionary_node(compressed).dictionary_key_width_hint == expected,
+             "encode published an unexpected dictionary key width hint");
+      auto output = simpatico::decompress(compressed, stream.view(), mr);
+      expect(strings_equal_completed(input->view(), output->view().column(0), stream.view()),
+             "hinted dictionary roundtrip mismatch");
+    }
+  }
+
+  auto input   = make_input(fixtures.front().keys);
+  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+  auto const& original =
+    dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
+  std::vector<std::string> names;
+  for (auto const& channel : original.named_channels(stream.view()))
+    names.push_back(channel.name);
+  auto const copy_channels = [&] {
+    std::vector<std::unique_ptr<cudf::column>> channels;
+    for (auto const& channel : original.named_channels(stream.view()))
+      channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+    return channels;
+  };
+  stream.synchronize();
+  std::array const streams{stream.view()};
+  for (std::int64_t const hint : {std::int64_t{1}, std::int64_t{-1}}) {
+    simpatico::PlanNode node;
+    node.op                        = "dictionary";
+    node.dictionary_key_width_hint = hint;
+    simpatico::decode_session session(streams, mr);
+    auto& frame               = simpatico::decode_session_test_access::frame(session);
+    auto const uploads_before = simpatico::decode_session_test_access::host_uploads(session);
+    auto const rebuilt =
+      simpatico::reconstruct_decode_representation(node, names, copy_channels(), frame);
+    auto const& dictionary =
+      dynamic_cast<simpatico::dictionary_compressed_representation const&>(*rebuilt);
+    expect(dictionary.constant_key_width == hint,
+           "node hint did not reach the reconstructed dictionary");
+    std::unique_ptr<cudf::column> output;
+    {
+      // A published width leaves no host observation, so the decode returns while its lane is
+      // still gated; an unknown width measures and returns only once the gate has released.
+      stream_gate gate(stream.view());
+      if (hint < 0) gate.release_after_delay.store(true);
+      output = simpatico::decode_standalone(*rebuilt, frame);
+      expect(gate.released.load() == (hint < 0),
+             hint > 0 ? "known key width waited for its lane"
+                      : "unknown key width returned before its measurement completed");
+      expect(simpatico::decode_session_test_access::host_uploads(session) == uploads_before,
+             "dictionary decode changed the frame's retained uploads");
+      gate.release_after_delay.store(true);
+      expect(session.finish().empty(), "hint fixture published a session result");
+      expect(!gate.timed_out.load(), "dictionary hint watchdog expired");
+    }
+    expect(dictionary.constant_key_width == hint,
+           "decode changed the reconstructed dictionary width");
+    expect(strings_equal_completed(input->view(), output->view(), stream.view()),
+           "hinted reconstruction roundtrip mismatch");
+  }
+  // A hint that does not describe the stored key chars is corrupt metadata, not a decline.
+  for (std::int64_t const hint : {std::int64_t{3}, std::int64_t{-2}}) {
+    simpatico::PlanNode node;
+    node.op                        = "dictionary";
+    node.dictionary_key_width_hint = hint;
+    simpatico::decode_session session(streams, mr);
+    auto& frame = simpatico::decode_session_test_access::frame(session);
+    expect_failure(
+      [&] {
+        (void)simpatico::reconstruct_decode_representation(node, names, copy_channels(), frame);
+      },
+      "inconsistent dictionary key width hint was accepted");
+    expect(session.finish().empty(), "rejected hint fixture published a session result");
   }
 }
 
@@ -2522,6 +2652,7 @@ int main()
     test_dictionary_width_large_keys(upstream);
     test_dictionary_width_failures(upstream);
     test_dictionary_pinned_observation(upstream);
+    test_dictionary_key_width_hint(upstream);
     test_submission_and_kernel_lifetime(upstream);
     test_abandoned_session(upstream);
     test_session_state_contracts(upstream);
