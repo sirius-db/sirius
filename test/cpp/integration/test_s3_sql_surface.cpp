@@ -2712,7 +2712,7 @@ TEST_CASE("transparent S3 glob rejects a literal question mark in a Hive partiti
   auto const scan =
     s3_parquet_glob_scan(*env, "glob-enc/q/col=a?b/*.parquet", ", hive_partitioning=true");
   CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(*) FROM " + scan),
-                    Catch::Contains("literal '?'"));
+                    Catch::Matchers::ContainsSubstring("literal '?'"));
 }
 
 TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition separator",
@@ -2728,7 +2728,7 @@ TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition
   auto const scan =
     s3_parquet_glob_scan(*env, "glob-enc/guard-before/*/*.parquet", ", hive_partitioning=true");
   CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(n_nationkey) FROM " + scan),
-                    Catch::Contains("literal '?'"));
+                    Catch::Matchers::ContainsSubstring("literal '?'"));
 }
 
 TEST_CASE("transparent S3 glob permits a question mark in the terminal filename",

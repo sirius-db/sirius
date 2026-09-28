@@ -188,7 +188,7 @@ TEST_CASE("fan_out_and_join rethrows the first task error after the join",
   tasks.push_back([&ran] { ran.fetch_add(1); });
 
   REQUIRE_THROWS_WITH(fan_out_and_join(dispatcher, std::move(tasks), "error test"),
-                      Catch::Contains("mask task blew up"));
+                      Catch::Matchers::ContainsSubstring("mask task blew up"));
   REQUIRE(ran.load() == 2);  // the join waited for the healthy tasks too
 }
 

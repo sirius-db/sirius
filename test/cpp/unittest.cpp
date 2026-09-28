@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
-#define CATCH_CONFIG_NO_POSIX_SIGNALS
 #include "catch.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
@@ -50,18 +48,24 @@ using namespace duckdb;
  *   [integration]     → g_integration_env (GPU execution integration tests)
  *   anything else     → no env active     (isolated / standalone tests)
  */
-struct shared_env_listener : Catch::TestEventListenerBase {
-  using TestEventListenerBase::TestEventListenerBase;
+struct shared_env_listener : Catch::EventListenerBase {
+  using EventListenerBase::EventListenerBase;
 
   enum class env_need { NONE, SHARED, INTEGRATION };
 
   static env_need classify(Catch::TestCaseInfo const& info)
   {
     for (auto const& tag : info.tags) {
-      if (tag == "shared_context") return env_need::SHARED;
-      if (tag == "integration") return env_need::INTEGRATION;
+      if (tag.original == "shared_context") return env_need::SHARED;
+      if (tag.original == "integration") return env_need::INTEGRATION;
     }
     return env_need::NONE;
+  }
+
+  void testRunStarting(Catch::TestRunInfo const&) override
+  {
+    // Catch2 installs its fatal-signal handler when the run starts.
+    sirius::util::install_segfault_backtrace_handler();
   }
 
   void testCaseStarting(Catch::TestCaseInfo const& info) override

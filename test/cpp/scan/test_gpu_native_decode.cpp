@@ -248,7 +248,8 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on unsupported codec", "
   // role; both have since been implemented.)
   auto col = one_codec_column(I32, 1, CompressionType::COMPRESSION_DICTIONARY, {segment(d, 0, 1)});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("viability invariant violated"));
+  REQUIRE_THROWS_WITH(decode({col}),
+                      Catch::Matchers::ContainsSubstring("viability invariant violated"));
 }
 
 TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on non-fixed-width type", "[scan][decode]")
@@ -261,7 +262,7 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on non-fixed-width type"
   auto col =
     one_codec_column(STR, 1, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("non-fixed-width type"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Matchers::ContainsSubstring("non-fixed-width type"));
 }
 
 TEST_CASE_METHOD(decode_env,
@@ -283,7 +284,7 @@ TEST_CASE_METHOD(decode_env,
   col.validity.push_back({CompressionType::COMPRESSION_UNCOMPRESSED,
                           {segment(d_validity, /*row_offset=*/4, /*row_count=*/12)}});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("not byte-aligned"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Matchers::ContainsSubstring("not byte-aligned"));
 }
 
 TEST_CASE_METHOD(decode_env,
@@ -315,7 +316,8 @@ TEST_CASE_METHOD(decode_env,
   auto col =
     one_codec_column(I32, 16, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 16)});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("UNCOMPRESSED segment bytes_size"));
+  REQUIRE_THROWS_WITH(decode({col}),
+                      Catch::Matchers::ContainsSubstring("UNCOMPRESSED segment bytes_size"));
 }
 
 TEST_CASE_METHOD(decode_env,
@@ -336,7 +338,8 @@ TEST_CASE_METHOD(decode_env,
   col.validity.push_back({CompressionType::COMPRESSION_UNCOMPRESSED,
                           {segment(d_validity, /*row_offset=*/0, /*row_count=*/64)}});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("validity segment bytes_size"));
+  REQUIRE_THROWS_WITH(decode({col}),
+                      Catch::Matchers::ContainsSubstring("validity segment bytes_size"));
 }
 
 TEST_CASE_METHOD(decode_env,
@@ -350,7 +353,7 @@ TEST_CASE_METHOD(decode_env,
   auto col = one_codec_column(
     I32, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, /*row_offset=*/50, 100)});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("> total_rows"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Matchers::ContainsSubstring("> total_rows"));
 }
 
 TEST_CASE_METHOD(decode_env,
@@ -395,5 +398,5 @@ TEST_CASE_METHOD(decode_env,
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)}});
 
-  REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("cudf::size_type max"));
+  REQUIRE_THROWS_WITH(decode({col}), Catch::Matchers::ContainsSubstring("cudf::size_type max"));
 }

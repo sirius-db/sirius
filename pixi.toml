@@ -49,6 +49,7 @@ croaring = "*"
 rumdl = "==0.2.44"
 
 [feature.dev-libs.dependencies]
+catch2 = "3.*"
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"

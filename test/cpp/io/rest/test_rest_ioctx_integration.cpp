@@ -955,7 +955,8 @@ TEST_CASE("rest_ioctx accepts an empty final LIST page and rejects an empty cont
     auto ctx = make_direct_rest_ioctx(server.endpoint());
 
     CHECK_THROWS_WITH(ctx->list_objects("bucket", "empty/", /*page_size=*/1),
-                      Catch::Contains("without") && Catch::Contains("continuation token"));
+                      Catch::Matchers::ContainsSubstring("without") &&
+                        Catch::Matchers::ContainsSubstring("continuation token"));
     CHECK(server.list_count() == 1);
   }
 }
@@ -1162,7 +1163,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
     auto ctx = make_direct_rest_ioctx(server.endpoint());
 
     CHECK_THROWS_WITH(ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/2),
-                      Catch::Contains("narrow the glob prefix"));
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
 
     auto all = ctx->list_objects("bucket", "data/", /*page_size=*/1000, /*max_keys=*/3);
     CHECK(all.size() == 3);
@@ -1179,7 +1180,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         /*page_size=*/1,
                         [](sirius::io::s3::list_objects_v2_page const&) { return true; },
                         /*max_scanned=*/2),
-                      Catch::Contains("narrow the glob prefix"));
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
   }
 
   SECTION("primitive uses configured scanned cap unless an explicit override is passed")
@@ -1195,7 +1196,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         "data/",
                         /*page_size=*/1,
                         [](sirius::io::s3::list_objects_v2_page const&) { return true; }),
-                      Catch::Contains("narrow the glob prefix"));
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
 
     range_http_server override_server(deterministic_payload(16), {}, objects);
     auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
@@ -1224,7 +1225,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
     auto capped_ctx = make_direct_rest_ioctx(capped_server.endpoint(), cfg);
 
     CHECK_THROWS_WITH(capped_ctx->list_objects("bucket", "data/", /*page_size=*/1000),
-                      Catch::Contains("narrow the glob prefix"));
+                      Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
 
     range_http_server override_server(deterministic_payload(16), {}, objects);
     auto override_ctx = make_direct_rest_ioctx(override_server.endpoint(), cfg);
@@ -1774,7 +1775,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/missing.parquet",
                                              sirius::io::open_hint::parquet_footer_probe),
-                      Catch::Matchers::Contains("HTTP 404"));
+                      Catch::Matchers::ContainsSubstring("HTTP 404"));
   }
 
   SECTION("forbidden object fails the footer-probe open after HEAD fallback")
@@ -1789,7 +1790,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
 
     CHECK_THROWS_WITH(ioctx->open_datasource("s3://footer-bucket/forbidden.parquet",
                                              sirius::io::open_hint::parquet_footer_probe),
-                      Catch::Matchers::Contains("HTTP 403"));
+                      Catch::Matchers::ContainsSubstring("HTTP 403"));
   }
 }
 

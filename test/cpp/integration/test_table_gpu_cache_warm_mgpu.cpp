@@ -130,7 +130,7 @@ TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)
   if (device_count < 2) {
     WARN(
       "follow-up #17 repro requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 v2 WARN+return convention)");
+      "(per Catch2 WARN+return convention)");
     return;
   }
 

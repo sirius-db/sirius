@@ -341,7 +341,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("update chains"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("update chains"));
 
   run_ok("CHECKPOINT;");  // folds the chains into the base data
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
@@ -363,7 +363,7 @@ TEST_CASE_METHOD(PinMvccDeleteFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("uncheckpointed rows"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("uncheckpointed rows"));
 
   run_ok("CHECKPOINT;");  // flushes the append into the persistent image
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu');");
