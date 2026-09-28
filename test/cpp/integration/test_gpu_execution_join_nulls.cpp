@@ -121,3 +121,40 @@ TEST_CASE_METHOD(JoinNullFixture,
     "SELECT l.* FROM mixed_left l ANTI JOIN mixed_right r "
     "ON l.k = r.k AND l.v <> r.v");
 }
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution mixed SEMI and ANTI nullable residuals with cast hash keys",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  const std::string join_type = GENERATE("SEMI", "ANTI");
+  const bool right_family     = GENERATE(false, true);
+  const std::string residual  = GENERATE("<>", "IS NOT DISTINCT FROM");
+  run_ok("CREATE TABLE cast_big (id INTEGER, k BIGINT, v INTEGER);");
+  run_ok(
+    "INSERT INTO cast_big VALUES "
+    "(1, 1, NULL), (2, 1, 0), (3, 2, NULL), (4, NULL, 3), (5, 3, 8);");
+  run_ok("INSERT INTO cast_big SELECT 10 + i, 1, 0 FROM range(20) t(i);");
+  run_ok("CREATE TABLE cast_small (id INTEGER, k SMALLINT, v INTEGER);");
+  run_ok(
+    "INSERT INTO cast_small VALUES "
+    "(1, 1, NULL), (2, 1, 134), (3, 2, 7), (4, NULL, 3), (5, 4, 9);");
+  run_ok("CHECKPOINT;");
+
+  // The larger table stays on the physical left. Selecting the small table produces
+  // RIGHT_SEMI/RIGHT_ANTI; both orientations have NULLs in the residual's build column.
+  // INTEGER is unsupported by cuDF AST casts. Both key sides must be materialized,
+  // and SELECT l.* checks that their synthetic columns do not leak into the output.
+  const std::string lhs = right_family ? "cast_small" : "cast_big";
+  const std::string rhs = right_family ? "cast_big" : "cast_small";
+  const auto query      = "SELECT l.* FROM " + lhs + " l " + join_type + " JOIN " + rhs +
+                     " r ON CAST(l.k AS INTEGER) = CAST(r.k AS INTEGER) AND l.v " + residual +
+                     " r.v";
+  INFO(query);
+  run_ok("SET gpu_execution = false;");
+  auto plan = con->Query("EXPLAIN " + query);
+  REQUIRE(plan);
+  REQUIRE_FALSE(plan->HasError());
+  const auto expected_type = (right_family ? "RIGHT_" : "") + join_type;
+  REQUIRE(plan->ToString().find("Join Type: " + expected_type) != std::string::npos);
+  compare_gpu_vs_cpu(query);
+}

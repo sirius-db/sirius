@@ -314,8 +314,8 @@ static bool routes_null_safe_keys_to_predicate(const duckdb::LogicalComparisonJo
   return has_plain_equal && has_null_safe;
 }
 
-/// References and hash-key casts need no materialization. Routed predicate casts are trivial
-/// only when cuDF AST supports their target type.
+/// References and hash-only key casts need no materialization. Predicate casts are trivial
+/// only when cuDF AST supports their target type, including keys in a full-predicate fallback.
 static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_as_ast_predicate)
 {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) { return true; }
@@ -345,13 +345,25 @@ static void materialize_expression_join_keys(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& right)
 {
   const bool routes_null_safe = routes_null_safe_keys_to_predicate(op);
+  const bool is_semi_or_anti =
+    op.join_type == duckdb::JoinType::SEMI || op.join_type == duckdb::JoinType::ANTI ||
+    op.join_type == duckdb::JoinType::RIGHT_SEMI || op.join_type == duckdb::JoinType::RIGHT_ANTI;
+  const bool has_residual =
+    routes_null_safe ||
+    std::any_of(op.conditions.begin(), op.conditions.end(), [](auto const& cond) {
+      return cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+             cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+    });
+  // Nullable build-side residuals make mixed SEMI/ANTI joins use a conditional join over ALL
+  // conditions. Nullability is checked at execution, so prepare hash keys for that AST path now.
+  const bool may_use_full_predicate = is_semi_or_anti && has_residual;
 
   auto materialize_side = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator>& child,
                               duckdb::vector<duckdb::idx_t>& projection_map,
                               bool is_left) {
     const std::size_t old_width = child->types.size();
 
-    // Gather the complex, translatable sides on this child across all equality conditions.
+    // Gather the complex, translatable sides on this child across all conditions.
     std::vector<std::size_t> cond_indices;
     duckdb::vector<std::unique_ptr<sirius::ast::node>> key_exprs;
     duckdb::vector<sirius::logical_type> key_types;
@@ -360,10 +372,10 @@ static void materialize_expression_join_keys(
       const bool is_equality = cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
                                cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
       auto& side_expr = is_left ? cond.left : cond.right;
-      // Equality keys become hash-table columns; inequality sides (and routed null-safe keys)
-      // are evaluated inline by the cuDF AST predicate, which only takes what it can cast.
+      // Equality keys normally become hash-table columns; residuals and every condition in the
+      // SEMI/ANTI fallback are evaluated by the cuDF AST predicate, which only takes certain casts.
       const bool as_ast_predicate =
-        !is_equality ||
+        may_use_full_predicate || !is_equality ||
         (routes_null_safe && cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
       if (is_trivial_key_side(*side_expr, as_ast_predicate)) { continue; }
       auto node = sirius::ast::from_duckdb(*side_expr);
