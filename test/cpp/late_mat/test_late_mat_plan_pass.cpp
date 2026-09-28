@@ -920,6 +920,25 @@ TEST_CASE("a column only ever counted is marked as such", "[late_mat][lifetime]"
   REQUIRE_FALSE(summed[1].consumed_as_count_only);
 }
 
+TEST_CASE("a column a FIRST carries is read for its values", "[late_mat][lifetime]")
+{
+  // GROUP BY col0, first(col0), first(col1), count(col1): a carried column is
+  // gathered into the output, so neither a key nor a COUNT may let a rowid in.
+  wide_scan scan(2);
+  auto aggregate = make_aggregate(
+    2, /*groups=*/{0}, /*aggregate_inputs=*/{1}, cudf::aggregation::Kind::COUNT_VALID);
+  aggregate->aggregate_slots = {sirius::op::first_slot{.input_idx = 0, .carried_idx = 0},
+                                sirius::op::first_slot{.input_idx = 1, .carried_idx = 1},
+                                sirius::op::plain_slot{.partial_idx = 0}};
+  scan.link(aggregate.get());
+
+  auto const lives = analyze_column_lifetimes(scan);
+  REQUIRE(lives[0].first_reader == aggregate.get());
+  REQUIRE_FALSE(lives[0].group_ride.has_value());
+  REQUIRE(lives[1].first_reader == aggregate.get());
+  REQUIRE_FALSE(lives[1].consumed_as_count_only);
+}
+
 TEST_CASE("a join key records which condition compared it", "[late_mat][lifetime]")
 {
   // What a rider's functional-dependency proof reads: two scans meeting on the

@@ -536,6 +536,17 @@ TEST_CASE_METHOD(DistinctBulkFixture,
                              "SELECT k, first(payload) AS a, first(1000000 - payload) AS b, "
                              "count(*) AS c, sum(payload) AS s FROM dist_dup GROUP BY k",
                              {0, 3, 4});
+
+  // MERGE_SETS puts the merge groupby, and its ARGMIN, on cuDF's sort path.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM ("
+    "  SELECT k, first(payload) AS a, count(DISTINCT payload % 7) AS c"
+    "  FROM dist_dup GROUP BY k) "
+    "WHERE a % 10 <> k OR c <> 7");
+  compare_gpu_vs_cpu_on_keys(
+    *this,
+    "SELECT k, first(payload) AS a, count(DISTINCT payload % 7) AS c FROM dist_dup GROUP BY k",
+    {0, 2});
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
@@ -566,6 +577,10 @@ TEST_CASE_METHOD(DistinctFixture,
     "  SELECT ks, first(payload) AS a, min(payload) AS m, count(DISTINCT payload % 7) AS c"
     "  FROM dist_big GROUP BY ks) "
     "WHERE a % 10 <> m OR c <> 7");
+  compare_gpu_vs_cpu_on_keys(*this,
+                             "SELECT ks, first(payload) AS a, min(payload) AS m, "
+                             "count(DISTINCT payload % 7) AS c FROM dist_big GROUP BY ks",
+                             {0, 2, 3});
 }
 
 //===----------------------------------------------------------------------===//
