@@ -30,12 +30,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -43,6 +45,9 @@
 
 // Linker wrappers affect only explicit calls from this executable. Injection is scoped to the
 // submitting thread and one raw stream; event markers and independent gate controllers stay real.
+// A pending synchronize fault also makes the target stream report itself busy, so a caller that
+// waits only after a busy query still reaches the wait where the fault fires, whether or not the
+// stream has work (a gated stream reports busy anyway).
 namespace stream_fault {
 enum class operation { none, query, synchronize };
 struct calls {
@@ -71,9 +76,13 @@ void observe(operation op, cudaStream_t stream) noexcept
     }
   }
 }
+bool pending(operation expected, cudaStream_t stream) noexcept
+{
+  return next == expected && stream == target;
+}
 bool consume(operation expected, cudaStream_t stream) noexcept
 {
-  if (next != expected || stream != target) return false;
+  if (!pending(expected, stream)) return false;
   next = operation::none;
   return true;
 }
@@ -84,9 +93,9 @@ extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
 extern "C" cudaError_t __wrap_cudaStreamQuery(cudaStream_t stream)
 {
   stream_fault::observe(stream_fault::operation::query, stream);
-  return stream_fault::consume(stream_fault::operation::query, stream)
-           ? cudaErrorInvalidValue
-           : __real_cudaStreamQuery(stream);
+  if (stream_fault::consume(stream_fault::operation::query, stream)) return cudaErrorInvalidValue;
+  if (stream_fault::pending(stream_fault::operation::synchronize, stream)) return cudaErrorNotReady;
+  return __real_cudaStreamQuery(stream);
 }
 extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream)
 {
@@ -204,10 +213,10 @@ class checked_resource {
     std::map<void*, allocation> live;
     std::vector<cudaStream_t> attempts;
     std::optional<std::size_t> fail_at;
-    std::size_t failed_request_bytes           = 0;
-    event_markers* failure_markers             = nullptr;
-    std::atomic<bool>* release_required        = nullptr;
-    std::atomic<bool>* second_release_required = nullptr;
+    std::size_t failed_request_bytes                 = 0;
+    event_markers* failure_markers                   = nullptr;
+    std::atomic<bool> const* release_required        = nullptr;
+    std::atomic<bool> const* second_release_required = nullptr;
     // Set by the first deallocation, so a test can order a release before a stream gate opens.
     std::atomic<bool>* signal_on_deallocate = nullptr;
     std::size_t live_bytes                  = 0;
@@ -432,30 +441,8 @@ static_assert(cuda::mr::resource_with<pinned_scalar_resource,
                                       cuda::mr::host_accessible,
                                       cuda::mr::device_accessible>);
 
-class release_observation {
- public:
-  release_observation(checked_resource& resource,
-                      std::atomic<bool>& released,
-                      std::atomic<bool>* second_released = nullptr)
-    : resource_(resource)
-  {
-    resource_.observations->release_required        = &released;
-    resource_.observations->second_release_required = second_released;
-  }
-  ~release_observation()
-  {
-    resource_.observations->release_required        = nullptr;
-    resource_.observations->second_release_required = nullptr;
-  }
-  release_observation(release_observation const&)            = delete;
-  release_observation& operator=(release_observation const&) = delete;
-
- private:
-  checked_resource& resource_;
-};
-
-// The deadlock watchdog's budget. SIMPATICO_TEST_GATE_TIMEOUT_MS overrides the default so that a
-// run slowed by a sanitizer can be told apart from a real wait; the variable is read once.
+// The deadlock watchdog's budget. SIMPATICO_TEST_GATE_TIMEOUT_MS overrides the default for slow
+// machines; the variable is read once.
 std::chrono::milliseconds gate_timeout()
 {
   static std::chrono::milliseconds const timeout = [] {
@@ -473,15 +460,73 @@ std::chrono::milliseconds gate_timeout()
   return timeout;
 }
 
-// The callback only touches atomics. The controller releases on request or after a deadlock
-// watchdog, and reports a watchdog trip on stderr with the elapsed time so that a gate the watchdog
-// released is never mistaken for a real wait.
+// compute-sanitizer maps its collection libraries into the target process; their presence in
+// /proc/self/maps identifies a run under the tool.
+bool compute_sanitizer_mapped()
+{
+  std::ifstream maps("/proc/self/maps");
+  for (std::string line; std::getline(maps, line);) {
+    if (line.find("libsanitizer-collection.so") != std::string::npos ||
+        line.find("libsanitizer-public.so") != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
+// Whether this process arms its stream gates (see stream_gate). SIMPATICO_TEST_STREAM_GATES decides
+// when set: `on` and `off` force the mode, `auto` and an unset variable arm the gates unless
+// compute-sanitizer is mapped into the process, and any other value is an error. The variable is
+// read and /proc/self/maps scanned once; an inert decision prints one notice on stderr.
+bool stream_gates_armed()
+{
+  static bool const armed = [] {
+    if (char const* const value = std::getenv("SIMPATICO_TEST_STREAM_GATES")) {
+      std::string_view const text{value};
+      if (text == "on") return true;
+      if (text == "off") {
+        std::fputs(
+          "stream_gate: stream gates are inert (SIMPATICO_TEST_STREAM_GATES=off); no-wait "
+          "assertions are not verified in this run\n",
+          stderr);
+        return false;
+      }
+      if (text != "auto")
+        throw std::invalid_argument("SIMPATICO_TEST_STREAM_GATES must be on, off, or auto");
+    }
+    if (!compute_sanitizer_mapped()) return true;
+    std::fputs(
+      "stream_gate: compute-sanitizer detected; stream gates are inert because the tool blocks "
+      "kernel launches queued behind a blocked stream once a budget of pending launches is "
+      "exceeded, so no-wait assertions are not verified in this run (native runs verify them)\n",
+      stderr);
+    return false;
+  }();
+  return armed;
+}
+
+// Holds a stream so that work queued behind it stays pending: a host function on `stream` spins
+// until `released` is set, and a call that returns while the gate is held is known not to have
+// waited for that stream. The callback only touches atomics. A controller thread sets `released`
+// on request (`release_after_delay`, after 50 ms) or when the deadlock watchdog expires, in which
+// case it also sets `timed_out` and reports the trip on stderr with the elapsed time so that a
+// watchdog release is never mistaken for a real wait; gate_timeout() sets the budget.
+//
+// Under compute-sanitizer the gate is inert. The tool blocks the host inside cuLaunchKernel once
+// the launches pending behind a blocked stream exceed a history-dependent budget, so a held gate
+// would deadlock any test that keeps appending, and whether a call waited for its lane cannot be
+// observed at all. An inert gate queues nothing and never sets `released`, `entered`, or
+// `timed_out`; the expect_* members then assert nothing and wait_until_entered() returns at once,
+// so a test's gate-dependent checks are visibly skipped while its ordering, ledger, and result
+// checks keep running. stream_gates_armed() decides the mode once per process, with the
+// SIMPATICO_TEST_STREAM_GATES override. The destructor releases, joins the controller, and
+// synchronizes the stream in either mode.
 class stream_gate {
  public:
   explicit stream_gate(rmm::cuda_stream_view stream) : stream_(stream)
   {
-    controller_ = std::thread([this] {
-      auto const deadline = started_ + gate_timeout();
+    if (!armed_) return;
+    auto const deadline = started_ + gate_timeout();
+    controller_         = std::thread([this, deadline] {
       while (!released.load()) {
         if (release_after_delay.load()) {
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -516,11 +561,33 @@ class stream_gate {
   ~stream_gate()
   {
     released.store(true);
-    controller_.join();
+    if (controller_.joinable()) controller_.join();
     stream_.synchronize_no_throw();
   }
   stream_gate(stream_gate const&)            = delete;
   stream_gate& operator=(stream_gate const&) = delete;
+
+  [[nodiscard]] bool armed() const noexcept { return armed_; }
+
+  // Spins until the callback has started on the stream, which means all work queued before the
+  // gate has completed, or until the watchdog trips.
+  void wait_until_entered() const
+  {
+    if (!armed_) return;
+    while (!entered.load() && !timed_out.load())
+      std::this_thread::yield();
+  }
+
+  // The gate-dependent assertions. Each checks its condition only when the gate is armed and then
+  // appends status() to the failure text; an inert gate makes them no-ops.
+  void expect_if_armed(bool condition, char const* what) const
+  {
+    if (!armed_) return;
+    expect(condition, (std::string{what} + " (" + status() + ")").c_str());
+  }
+  void expect_not_released(char const* what) const { expect_if_armed(!released.load(), what); }
+  void expect_completed(char const* what) const { expect_if_armed(released.load(), what); }
+  void expect_not_timed_out(char const* what) const { expect_if_armed(!timed_out.load(), what); }
 
   // Watchdog state for a failure message: release and timed_out flags, the time since construction,
   // and the configured budget.
@@ -542,8 +609,35 @@ class stream_gate {
 
  private:
   rmm::cuda_stream_view stream_;
+  bool armed_                                    = stream_gates_armed();
   std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
   std::thread controller_;
+};
+
+// Flags a deallocation on `resource` that precedes the release of `gate` (and of `second`, when
+// given) as an early release. An inert gate holds nothing, so it imposes no ordering and is
+// skipped.
+class release_observation {
+ public:
+  release_observation(checked_resource& resource,
+                      stream_gate const& gate,
+                      stream_gate const* second = nullptr)
+    : resource_(resource)
+  {
+    resource_.observations->release_required = gate.armed() ? &gate.released : nullptr;
+    resource_.observations->second_release_required =
+      (second && second->armed()) ? &second->released : nullptr;
+  }
+  ~release_observation()
+  {
+    resource_.observations->release_required        = nullptr;
+    resource_.observations->second_release_required = nullptr;
+  }
+  release_observation(release_observation const&)            = delete;
+  release_observation& operator=(release_observation const&) = delete;
+
+ private:
+  checked_resource& resource_;
 };
 
 std::string repeated_plan(std::string const& plan, int columns)
@@ -769,11 +863,11 @@ void test_completed_public_return(rmm::device_async_resource_ref upstream)
     }
     // Identity has no post-join scratch frees, so readiness directly checks completed copies before
     // verification can hide a missing wait.
-    expect(gate.released.load(), "public decode returned before its gated stream completed");
+    gate.expect_completed("public decode returned before its gated stream completed");
     expect(markers.complete(), "public decode returned before all pool markers completed");
     for (auto stream : pool.streams)
       expect(cudaStreamQuery(stream) == cudaSuccess, "public decode returned with unfinished work");
-    expect(!gate.timed_out.load(), "public completion watchdog expired");
+    gate.expect_not_timed_out("public completion watchdog expired");
     if (table) {
       verify_projection(input->view(),
                         table->view(),
@@ -824,9 +918,9 @@ void test_borrowed_stream_views(rmm::device_async_resource_ref upstream)
         expect(observed.count(handle).queries <= 1 && observed.count(handle).synchronizations <= 1,
                "borrowed views were waited on beyond the final wait");
     }
-    expect(gate.released.load() && markers.complete(),
-           "the final wait skipped work queued on a borrowed stream");
-    expect(!gate.timed_out.load(), "borrowed-view watchdog expired");
+    gate.expect_completed("the final wait skipped work queued on a borrowed stream");
+    expect(markers.complete(), "the final wait skipped work queued on a borrowed stream");
+    gate.expect_not_timed_out("borrowed-view watchdog expired");
     verify_projection(input->view(), table->view(), selected);
   }
   for (auto handle : pool.streams)
@@ -873,7 +967,8 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
     gate.release_after_delay.store(true);
     auto output = representation->decompress(stream.view(), supplied);
     // Observe completed return before any verification readback can hide an unfinished copy.
-    expect(gate.released.load() && cudaStreamQuery(stream.value()) == cudaSuccess,
+    gate.expect_completed("owning identity copy returned before nested data completed");
+    expect(cudaStreamQuery(stream.value()) == cudaSuccess,
            "owning identity copy returned before nested data completed");
     auto verify = [&](auto&& self, cudf::column_view source, cudf::column_view copied) -> void {
       expect(source.type() == copied.type() && source.size() == copied.size() &&
@@ -902,7 +997,7 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
     output.reset();
     supplied.check();
     current.check();
-    expect(!gate.timed_out.load(), "owning identity copy watchdog expired");
+    gate.expect_not_timed_out("owning identity copy watchdog expired");
   }
 }
 
@@ -944,9 +1039,10 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       gate.release_after_delay.store(true);
       auto published = simpatico::dictionary_compressed_representation::from_encoded_column(
         std::move(copied), stream.view(), mr);
-      expect(gate.released.load() && published->constant_key_width == fixture.width,
-             "dictionary publication did not complete prior work and metadata");
-      expect(!gate.timed_out.load(), "dictionary publication watchdog expired");
+      gate.expect_completed("dictionary publication did not complete prior work");
+      expect(published->constant_key_width == fixture.width,
+             "dictionary publication did not complete its metadata");
+      gate.expect_not_timed_out("dictionary publication watchdog expired");
     }
 
     // The direct constructor also supports frame-local reconstruction with unknown metadata.
@@ -1143,14 +1239,15 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
       stream_gate gate(stream.view());
       if (hint < 0) gate.release_after_delay.store(true);
       output = simpatico::decode_standalone(*rebuilt, frame);
-      expect(gate.released.load() == (hint < 0),
-             hint > 0 ? "known key width waited for its lane"
-                      : "unknown key width returned before its measurement completed");
+      if (hint > 0)
+        gate.expect_not_released("known key width waited for its lane");
+      else
+        gate.expect_completed("unknown key width returned before its measurement completed");
       expect(simpatico::decode_session_test_access::host_uploads(session) == uploads_before,
              "dictionary decode changed the frame's retained uploads");
       gate.release_after_delay.store(true);
       expect(session.finish().empty(), "hint fixture published a session result");
-      expect(!gate.timed_out.load(), "dictionary hint watchdog expired");
+      gate.expect_not_timed_out("dictionary hint watchdog expired");
     }
     expect(dictionary.constant_key_width == hint,
            "decode changed the reconstructed dictionary width");
@@ -1290,11 +1387,11 @@ void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
     {
       stream_gate gate(stream.view());
       result = dictionary.decompress_predicate(predicate, frame);
-      expect(result != nullptr && !gate.released.load(),
-             "dictionary predicate waited for its lane");
+      expect(result != nullptr, "dictionary predicate declined the gated shape");
+      gate.expect_not_released("dictionary predicate waited for its lane");
       gate.release_after_delay.store(true);
       expect(session.finish().empty(), "gated predicate fixture published a session result");
-      expect(!gate.timed_out.load(), "dictionary predicate watchdog expired");
+      gate.expect_not_timed_out("dictionary predicate watchdog expired");
     }
     auto expected = reference(input->view(), needles);
     expect(bool8_equal_where_valid_completed(expected->view(), result->view()),
@@ -1528,12 +1625,12 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
     }
     expect(injected, "dictionary observation lost OOM subtype or requested bytes");
     // Check before any verification copy or test synchronization can hide a missing drain.
-    expect(gate.released.load() && markers.complete(),
-           "dictionary observation failure escaped with pending stream work");
+    gate.expect_completed("dictionary observation failure escaped with pending stream work");
+    expect(markers.complete(), "dictionary observation failure escaped with pending stream work");
     resource.check();
     expect(default_resource.observations->attempts.empty(),
            "failed dictionary observation bypassed supplied resource");
-    expect(!gate.timed_out.load(), "dictionary observation failure watchdog expired");
+    gate.expect_not_timed_out("dictionary observation failure watchdog expired");
   }
   // Unknown metadata uses the same reduction with local device result and scratch storage.
   resource.reset();
@@ -1553,11 +1650,13 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
                  error.requested_bytes >= sizeof(int64_t);
     }
     expect(injected, "unknown dictionary width lost its metadata allocation error");
-    expect(gate.released.load() && markers.complete(),
+    gate.expect_completed(
+      "unknown dictionary width failure escaped before prior stream work drained");
+    expect(markers.complete(),
            "unknown dictionary width failure escaped before prior stream work drained");
     expect(unknown.constant_key_width == -1, "failed dictionary fallback mutated metadata");
     resource.check();
-    expect(!gate.timed_out.load(), "unknown dictionary width failure watchdog expired");
+    gate.expect_not_timed_out("unknown dictionary width failure watchdog expired");
   }
   expect(default_resource.observations->attempts.empty(),
          "dictionary failure cleanup bypassed supplied resource");
@@ -1593,7 +1692,8 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
       pinned_resource_guard override(pinned);
       auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
         std::move(copied), stream, device);
-      expect(gate.released.load() && prepared->constant_key_width == widths[i],
+      gate.expect_completed("dictionary read an unfinished pinned scalar");
+      expect(prepared->constant_key_width == widths[i],
              "dictionary read an unfinished or recycled pinned scalar");
       auto const expected_allocations = i < 3 ? 1U : 0U;
       expect(pinned.observations->attempts - pinned_attempts == expected_allocations &&
@@ -1602,7 +1702,7 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
       expect(!pinned.observations->live && !pinned.observations->invalid_release,
              "dictionary returned pinned staging with invalid ownership");
       device.check();
-      expect(!gate.timed_out.load(), "dictionary pinned observation watchdog expired");
+      gate.expect_not_timed_out("dictionary pinned observation watchdog expired");
     }
   }
 
@@ -1628,12 +1728,12 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
     device.observations->fail_at.reset();
     expect(injected && pinned.observations->attempts == pinned_attempts,
            "dictionary allocated pinned output before device scratch or lost device OOM details");
-    expect(gate.released.load() && markers.complete(),
-           "dictionary device OOM escaped before prior stream work drained");
+    gate.expect_completed("dictionary device OOM escaped before prior stream work drained");
+    expect(markers.complete(), "dictionary device OOM escaped before prior stream work drained");
     expect(!pinned.observations->live && !pinned.observations->invalid_release,
            "dictionary device OOM changed pinned ownership");
     device.check();
-    expect(!gate.timed_out.load(), "dictionary device OOM watchdog expired");
+    gate.expect_not_timed_out("dictionary device OOM watchdog expired");
   }
   auto copied = std::make_unique<cudf::column>(original.dict_column->view(), first, upstream);
   auto const device_attempts     = device.observations->attempts.size();
@@ -1642,7 +1742,7 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
   event_markers markers(pool);
   stream_gate gate(first);
   markers.record();
-  release_observation device_release(device, gate.released);
+  release_observation device_release(device, gate);
   gate.release_after_delay.store(true);
   {
     pinned_resource_guard override(pinned);
@@ -1658,13 +1758,13 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
     expect(device.observations->attempts.size() == device_attempts + 1 &&
              pinned.observations->attempts == pinned_attempts + 1,
            "dictionary pinned OOM did not follow exactly one scratch allocation");
-    expect(gate.released.load() && markers.complete(),
-           "dictionary pinned OOM escaped before queued work drained");
+    gate.expect_completed("dictionary pinned OOM escaped before queued work drained");
+    expect(markers.complete(), "dictionary pinned OOM escaped before queued work drained");
     expect(!pinned.observations->live && !pinned.observations->invalid_release,
            "dictionary pinned OOM leaked staging");
     device.check();
   }
-  expect(!gate.timed_out.load(), "dictionary pinned OOM watchdog expired");
+  gate.expect_not_timed_out("dictionary pinned OOM watchdog expired");
   cuda_check(pool.sync_all());
 }
 
@@ -1699,17 +1799,16 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   event_markers markers(pool);
   // Gate destruction releases on exceptions before the session unwinds.
   stream_gate gate(pool.streams[0]);
-  while (!gate.entered.load() && !gate.timed_out.load())
-    std::this_thread::yield();
+  gate.wait_until_entered();
   std::array<std::size_t, 4> const requested{0, 1, 0, 1};
   for (auto index : requested) {
     session.append(value_request(compressed.columns[index]));
-    expect(!gate.released.load(), "column submission waited for the gated lane");
+    gate.expect_not_released("column submission waited for the gated lane");
   }
   markers.record();
   cache.clear();
   expect(!retained.expired(), "cache clear unloaded a pending kernel");
-  expect(!gate.released.load(), "cache clear waited for a pending kernel");
+  gate.expect_not_released("cache clear waited for a pending kernel");
   gate.released.store(true);
   auto outputs = session.finish();
   // These observations precede verification copies and any extra test synchronization.
@@ -1724,7 +1823,7 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   }
   outputs.clear();
   resource.check();
-  expect(!gate.timed_out.load(), "submission watchdog expired");
+  gate.expect_not_timed_out("submission watchdog expired");
 }
 
 void test_abandoned_session(rmm::device_async_resource_ref upstream)
@@ -1746,13 +1845,13 @@ void test_abandoned_session(rmm::device_async_resource_ref upstream)
   stream_gate gate(pool.streams[0]);
   session->append(value_request(compressed.columns[0]));
   markers.record();
-  release_observation release_guard(resource, gate.released);
+  release_observation release_guard(resource, gate);
   gate.release_after_delay.store(true);
   session.reset();
-  expect(gate.released.load(), "abandoned session returned while stream remained gated");
+  gate.expect_completed("abandoned session returned while stream remained gated");
   expect(markers.complete(), "abandoned session did not drain its stream");
   resource.check();
-  expect(!gate.timed_out.load(), "abandon watchdog expired");
+  gate.expect_not_timed_out("abandon watchdog expired");
 }
 
 void test_session_state_contracts(rmm::device_async_resource_ref upstream)
@@ -1804,7 +1903,7 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
     for (std::size_t i = 0; i < 2; ++i)
       session->append(value_request(compressed.columns[0]));
     markers.record();
-    release_observation observation(resource, first_gate.released, &second_gate.released);
+    release_observation observation(resource, first_gate, &second_gate);
     first_gate.release_after_delay.store(true);
     second_gate.release_after_delay.store(true);
     external_gate.release_after_delay.store(true);
@@ -1824,18 +1923,19 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
                "stream failure cleanup skipped a supplied physical stream");
     }
     expect(propagated, "stream completion failure lost the original CUDA error");
-    expect(first_gate.released.load() && second_gate.released.load() && markers.complete(),
-           "stream failure escaped before all supplied lanes completed");
-    expect(!resource.observations->early_release,
-           "stream failure released an output before all lanes completed");
+    first_gate.expect_completed("stream failure escaped before the first lane completed");
+    second_gate.expect_completed("stream failure escaped before the second lane completed");
+    expect(markers.complete(), "stream failure escaped before all supplied lanes completed");
+    first_gate.expect_if_armed(!resource.observations->early_release,
+                               "stream failure released an output before all lanes completed");
     expect_failure([&] { session->finish(); }, "failed session published partial output");
     expect_failure([&] { session->append(value_request(compressed.columns[0])); },
                    "stream failure left a reusable session");
     session.reset();
     resource.check();
-    expect(!first_gate.timed_out.load() && !second_gate.timed_out.load() &&
-             !external_gate.timed_out.load(),
-           "stream failure watchdog expired");
+    first_gate.expect_not_timed_out("stream failure watchdog expired");
+    second_gate.expect_not_timed_out("stream failure watchdog expired");
+    external_gate.expect_not_timed_out("stream failure watchdog expired");
     {
       auto recovered = simpatico::decompress(compressed, pool, resource);
       expect(columns_equal_completed(input->view().column(0), recovered->view().column(0)),
@@ -1926,7 +2026,7 @@ void test_duplicate_stream_handles(rmm::device_async_resource_ref upstream)
     stream_gate blocked_gate(blocked);
     for (std::size_t i = 0; i < 64; ++i)
       session.append(request);
-    expect(!blocked_gate.released.load(), "submission waited for a gated lane");
+    blocked_gate.expect_not_released("submission waited for a gated lane");
     // Each request's scratch is released during its append, on its allocation stream.
     expect(
       resource.observations->attempts.size() == 128 && resource.observations->live.size() == 64,
@@ -1955,13 +2055,14 @@ void test_duplicate_stream_handles(rmm::device_async_resource_ref upstream)
         expect(observed.count(handle).queries == 1 && observed.count(handle).synchronizations <= 1,
                "finish did not deduplicate supplied physical handles");
     }
-    expect(blocked_gate.released.load() && ready_tail.released.load() && markers.complete(),
-           "finish skipped an external tail on a completed stream");
+    blocked_gate.expect_completed("finish skipped the blocked lane");
+    ready_tail.expect_completed("finish skipped an external tail on a completed stream");
+    expect(markers.complete(), "finish skipped an external tail on a completed stream");
     expect_probe_outputs(output, std::vector<std::uint8_t>(64, 0x2a));
     output.clear();
     resource.check();
-    expect(!blocked_gate.timed_out.load() && !ready_tail.timed_out.load(),
-           "duplicate-handle watchdog expired");
+    blocked_gate.expect_not_timed_out("duplicate-handle watchdog expired");
+    ready_tail.expect_not_timed_out("duplicate-handle watchdog expired");
   }
 }
 
@@ -1979,19 +2080,19 @@ void test_external_phase_tail(rmm::device_async_resource_ref upstream)
   // The request's own work is complete before this external tail starts. Final completion must
   // observe the current supplied stream, not a host observation made during submission.
   stream_gate gate(pool.streams[0]);
-  while (!gate.entered.load() && !gate.timed_out.load())
-    std::this_thread::yield();
-  expect(!gate.timed_out.load(), "external tail gate did not start");
+  gate.wait_until_entered();
+  gate.expect_not_timed_out("external tail gate did not start");
   event_markers markers(pool);
   markers.record();
   gate.release_after_delay.store(true);
   auto output = session.finish();
-  expect(gate.released.load() && markers.complete(), "finish missed external phase work");
+  gate.expect_completed("finish missed external phase work");
+  expect(markers.complete(), "finish missed external phase work");
   expect(columns_equal_completed(input->view().column(0), output.front()->view()),
          "external-tail output mismatch");
   output.clear();
   resource.check();
-  expect(!gate.timed_out.load(), "external tail watchdog expired");
+  gate.expect_not_timed_out("external tail watchdog expired");
 }
 
 class request_copy_failure : public std::bad_alloc {
@@ -2036,7 +2137,7 @@ void test_request_copy_failure(rmm::device_async_resource_ref upstream)
   std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
   session->append(value_request(compressed.columns[0]));
   markers.record();
-  release_observation observation(resource, gate.released);
+  release_observation observation(resource, gate);
   *fail = true;
   gate.release_after_delay.store(true);
   bool propagated = false;
@@ -2048,12 +2149,12 @@ void test_request_copy_failure(rmm::device_async_resource_ref upstream)
     propagated = true;
   }
   expect(propagated, "request copy failure subtype was lost");
-  expect(gate.released.load() && markers.complete(),
-         "host bookkeeping failure escaped before prior work completed");
+  gate.expect_completed("host bookkeeping failure escaped before prior work completed");
+  expect(markers.complete(), "host bookkeeping failure escaped before prior work completed");
   expect_failure([&] { session->finish(); }, "request copy failure published partial results");
   session.reset();
   resource.check();
-  expect(!gate.timed_out.load(), "request copy failure watchdog expired");
+  gate.expect_not_timed_out("request copy failure watchdog expired");
 }
 
 void test_host_upload_growth(rmm::device_async_resource_ref upstream)
@@ -2135,7 +2236,8 @@ void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref u
       std::fill_n(churn.back().get(), words, ~std::uint64_t{0});
     }
     expect(session.finish().empty(), "raw upload fixture published an output");
-    expect(gate.released.load() && !gate.timed_out.load(), "upload gate did not release normally");
+    gate.expect_completed("upload gate did not release before the session drained");
+    gate.expect_not_timed_out("upload watchdog expired");
   }
   std::vector<std::uint64_t> host(words);
   cuda_check(cudaMemcpyAsync(
@@ -2211,9 +2313,9 @@ void test_host_observation_staging(rmm::device_async_resource_ref upstream)
       gate.release_after_delay.store(true);
       std::uint8_t byte = 0;
       frame.read_bytes(&byte, base + 5, 1);
-      expect(gate.released.load() && byte == source[5],
-             "host observation returned before its stream completed");
-      expect(!gate.timed_out.load(), "observation watchdog expired");
+      gate.expect_completed("host observation returned before its stream completed");
+      expect(byte == source[5], "gated host observation byte mismatch");
+      gate.expect_not_timed_out("observation watchdog expired");
     }
     std::int64_t const scalar_value = -0x1122334455667788LL;
     rmm::device_buffer scalar_storage(sizeof scalar_value, frame.stream(), resource);
@@ -2357,19 +2459,14 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
         expect(calls.queries == 0 && calls.synchronizations == 0,
                "an append without host readbacks queried or synchronized a stream");
     }
-    expect(!first_gate.released.load() && !second_gate.released.load(),
-           ("an append without host readbacks waited for its lane, or the gate watchdog timed_out "
-            "first (" +
-            first_gate.status() + "; " + second_gate.status() + ")")
-             .c_str());
+    first_gate.expect_not_released("an append without host readbacks waited for its lane");
+    second_gate.expect_not_released("an append without host readbacks waited for its lane");
     expect(!ledger.observations->wrong_stream, "a gated temporary was released on another stream");
     first_gate.release_after_delay.store(true);
     second_gate.release_after_delay.store(true);
     verify(gated_order, session.finish());
-    expect(!first_gate.timed_out.load() && !second_gate.timed_out.load(),
-           ("gated temporary watchdog timed_out (" + first_gate.status() + "; " +
-            second_gate.status() + ")")
-             .c_str());
+    first_gate.expect_not_timed_out("gated temporary watchdog expired");
+    second_gate.expect_not_timed_out("gated temporary watchdog expired");
   }
   ledger.check();
 }
@@ -2402,14 +2499,14 @@ void test_submission_never_waits_for_memory(rmm::device_async_resource_ref upstr
       expect(calls.queries == 0 && calls.synchronizations == 0,
              "submission queried or synchronized a stream to release memory");
   }
-  expect(!gate.released.load(), "submission waited for its gated lane");
+  gate.expect_not_released("submission waited for its gated lane");
   expect(resource.observations->live.size() == requests,
          "submission kept scratch beyond the appending call");
   expect(resource.observations->peak_live_bytes <= requests + scratch_bytes,
          "submission held more than one request's scratch at a time");
   gate.release_after_delay.store(true);
   expect_probe_outputs(session.finish(), expected);
-  expect(!gate.timed_out.load(), "gated scratch probe watchdog expired");
+  gate.expect_not_timed_out("gated scratch probe watchdog expired");
 }
 
 // A failure after work was queued releases the request's temporaries during unwinding, on their
@@ -2425,7 +2522,7 @@ void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resourc
   stream_gate gate(pool.streams[0]);
   event_markers markers(pool);
   markers.record();
-  release_observation observation(resource, gate.released);
+  release_observation observation(resource, gate);
   // The first release opens the gate after a delay, so every release precedes GPU completion.
   resource.observations->signal_on_deallocate = &gate.release_after_delay;
   bool propagated                             = false;
@@ -2436,10 +2533,12 @@ void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resourc
   }
   resource.observations->signal_on_deallocate = nullptr;
   expect(propagated, "failure after enqueue lost its exception subtype");
-  expect(gate.released.load() && markers.complete(),
-         "failure after enqueue escaped before its lane drained");
-  expect(resource.observations->early_release && resource.observations->live.empty(),
-         "failure after enqueue did not release temporaries before GPU completion");
+  gate.expect_completed("failure after enqueue escaped before its lane drained");
+  expect(markers.complete(), "failure after enqueue escaped before its lane drained");
+  gate.expect_if_armed(resource.observations->early_release,
+                       "failure after enqueue did not release temporaries before GPU completion");
+  expect(resource.observations->live.empty(),
+         "failure after enqueue kept device storage past the throwing append");
   expect(!resource.observations->wrong_stream && !resource.observations->wrong_thread,
          "failure after enqueue released a temporary on another stream or thread");
   expect_failure([&] { session->finish(); }, "failed session published a result");
@@ -2447,7 +2546,7 @@ void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resourc
                  "failed session accepted another request");
   session.reset();
   expect(resource.observations->live.empty(), "failed session leaked device storage");
-  expect(!gate.timed_out.load(), "failure-unwind watchdog expired");
+  gate.expect_not_timed_out("failure-unwind watchdog expired");
 }
 
 // A selection over `rows` rows, built on the host and uploaded, so no CNT wave runs.
