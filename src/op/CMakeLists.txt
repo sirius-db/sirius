@@ -25,6 +25,7 @@ target_sources(
           scan/sirius_gpu_scan_operator_data.cpp
           scan/gpu_ingestible.cpp
           scan/parquet_gpu_ingestible.cpp
+          scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
           scan/iceberg_metadata_reader.cpp
           scan/puffin_reader.cpp
