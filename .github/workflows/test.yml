@@ -168,11 +168,37 @@ jobs:
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
 
+      # One shard per GPU, round-robin over test names (the vendored Catch2 v2 has no
+      # --shard-count). Each shard sees all GPUs, rotated so its default device differs;
+      # 2-GPU tests still run. Commas, quotes and brackets are escaped for `-f`.
       - name: Run C++ unit tests
         run: |
-          set -o pipefail
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
+          bin=./build/release/extension/sirius/test/cpp/sirius_unittest
+          log_root=$PWD/build/release/extension/sirius/test/cpp/log
+          gpus=$(nvidia-smi -L | wc -l)
+          # List mode exits with the test count, so ignore the status and check the output.
+          "$bin" --list-test-names-only > /tmp/test-names.txt || true
+          test -s /tmp/test-names.txt
+          pids=()
+          for ((i = 0; i < gpus; i++)); do
+            awk -v n="$gpus" -v i="$i" 'NR % n == i' /tmp/test-names.txt \
+              | sed -e 's/[\\,"[]/\\&/g' > "/tmp/shard-$i.txt"
+            devices=$(for ((d = 0; d < gpus; d++)); do echo $(((d + i) % gpus)); done | paste -sd,)
+            mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
+            CUDA_VISIBLE_DEVICES=$devices SIRIUS_LOG_DIR="$log_root/shard-$i" TMPDIR="/tmp/shard-$i" \
+              timeout 45m "$bin" --abort -f "/tmp/shard-$i.txt" > "/tmp/unittest-$i.log" 2>&1 &
+            pids+=($!)
+          done
+          status=0
+          for i in "${!pids[@]}"; do
+            wait "${pids[$i]}" || status=1
+            echo "::group::Shard $i (CUDA_VISIBLE_DEVICES rotated by $i)"
+            cat "/tmp/unittest-$i.log"
+            echo "::endgroup::"
+          done
+          cat /tmp/unittest-*.log > /tmp/unittest.log
+          exit $status
 
       # The late-materialization gate is read from the environment once per process, so the
       # feature is entirely absent from the run above. Without this step the end-to-end case

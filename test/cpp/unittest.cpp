@@ -109,8 +109,9 @@ int main(int argc, char* argv[])
   sirius::util::install_segfault_backtrace_handler();
 
   // Initialize the logger
-  std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
-  Config::LOG_DIR     = log_dir;
+  // SIRIUS_LOG_DIR lets concurrent test processes (CI shards) log to separate dirs.
+  auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
+  Config::LOG_DIR         = log_dir_env ? log_dir_env : SIRIUS_UNITTEST_LOG_DIR;
   auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   auto flush =
     Config::LOG_FLUSH_SECONDS <= 0
