@@ -22,6 +22,9 @@ TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xla
 
 ![TPC-H hot-run query time and cost per run on AWS: Sirius versus DuckDB](super-sirius-perf.png)
 
+For the legacy Sirius implementation used for the ClickBench results, see the
+[`legacy-dev` archive (pinned at `f79a6f42`)](https://github.com/sirius-db/sirius/tree/f79a6f423fe69ef892ca0af03bef9c352d88cc79).
+
 ## Requirements
 - Linux on amd64/x86_64 or arm64/aarch64 with `glibc >= 2.28`.
 - NVIDIA Turing or newer, with compute capability 7.5+.
