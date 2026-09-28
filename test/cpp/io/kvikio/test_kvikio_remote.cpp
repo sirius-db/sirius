@@ -114,7 +114,7 @@ TEST_CASE("kvikio_context rejects s3 URIs when the object store is unconfigured"
   auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, io::object_store_config{});
 
   REQUIRE_THROWS_WITH(ctx->open_datasource("s3://bucket/key.parquet"),
-                      Catch::Contains("object store not configured"));
+                      Catch::Matchers::ContainsSubstring("object store not configured"));
 }
 
 TEST_CASE("kvikio_context rejects malformed s3 URIs before any network call", "[kvikio]")
