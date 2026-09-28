@@ -24,12 +24,10 @@
 
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
-#include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
-#include <cuda/std/bit>
 #include <cuda/std/cstddef>
-#include <cuda/std/limits>
 #include <cuda/stream>
+#include <cuda/utility>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
@@ -63,61 +61,11 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
-/**
- * @brief cuco-compatible Bloom policy using Lemire fast-range
- *
- * Arrow's policy caps filter size, while cuco's default uses costly 64-bit modulo. Construction
- * and lookup share this mapping, preserving the no-false-negative contract.
- */
-template <class KeyT>
-class sirius_bloom_policy {
- public:
-  using hasher             = cuco::xxhash_64<KeyT>;
-  using word_type          = std::uint32_t;
-  using hash_argument_type = typename hasher::argument_type;
-  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
-
-  static constexpr std::uint32_t words_per_block = 8;
-
- private:
-  static constexpr std::uint32_t word_bits       = cuda::std::numeric_limits<word_type>::digits;
-  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
-  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
-
-  static_assert(words_per_block * bit_index_width <=
-                  cuda::std::numeric_limits<hash_result_type>::digits,
-                "hash is too narrow to supply one fingerprint bit per word");
-
- public:
-  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
-  {
-    return hash_(key);
-  }
-
-  template <class Extent>
-  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
-                                                        Extent num_blocks) const
-  {
-    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
-                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
-    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
-  }
-
-  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
-                                                            std::uint32_t word_index) const
-  {
-    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
-  }
-
- private:
-  hasher hash_{};
-};
-
 template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
                                         cuda::thread_scope_device,
-                                        sirius_bloom_policy<KeyT>,
+                                        cuco::default_filter_policy<KeyT>,
                                         bloom_alloc>;
 
 template <class Filter>
@@ -140,7 +88,7 @@ void copy_filter_storage(Filter const& source,
                          cucascade::memory::memory_space const& source_space,
                          Filter& destination,
                          rmm::cuda_device_id destination_device,
-                         rmm::cuda_stream_view stream,
+                         ::cuda::stream_ref stream,
                          cucascade::memory::memory_space const& host_staging_space,
                          std::size_t& bytes)
 {
@@ -245,7 +193,7 @@ std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) n
 }
 
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   if (!supports(keys.type())) {
@@ -260,7 +208,7 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     build_keys = compacted->view().column(0);
   }
   auto const n = build_keys.size();
-  cuda::stream_ref const s{stream.value()};
+  cuda::stream_ref const s{stream.get()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
   if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
@@ -305,7 +253,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   auto const& source_space = source_target->get_gpu_space();
 
   // Keep copies and streams alive until all peer transfers are queued and synchronized.
-  std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
+  std::vector<std::pair<std::unique_ptr<bloom_replica>, ::cuda::stream_ref>> pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -332,9 +280,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
             target, detail::tracked_replica_allocation_bytes(bytes), stream);
           if (!reservation) { return std::unique_ptr<bloom_replica>{}; }
 
-          auto destination_bloom = make_bloom<filter_type>(source_bloom->block_extent(),
-                                                           reservation->allocator(),
-                                                           cuda::stream_ref{stream.value()});
+          auto destination_bloom = make_bloom<filter_type>(
+            source_bloom->block_extent(), reservation->allocator(), cuda::stream_ref{stream.get()});
           auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
           auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
           copy_filter_storage(*source_bloom,
@@ -376,7 +323,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      stream.sync();
       _impl->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
@@ -402,7 +349,7 @@ std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,
   int device_id,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   auto const* replica =
@@ -427,7 +374,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   auto const n = keys.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cuda::stream_ref const s{stream.value()};
+  cuda::stream_ref const s{stream.get()};
   auto* const outp = out->mutable_view().data<bool>();
 
   std::visit(

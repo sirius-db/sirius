@@ -219,8 +219,8 @@ q10; no other query moves outside noise.
 
 | Piece | File |
 |---|---|
-| What a deferral is (the pair, the substituted schemas) | `src/include/late_mat/defer_directive.hpp` |
-| Whether a bundle is worth deferring, and the floors | `src/include/late_mat/defer_policy.hpp` |
+| What a deferral is (the pair, the substituted schemas) | `src/late_mat/defer_directive.hpp` |
+| Whether a bundle is worth deferring, and the floors | `src/late_mat/defer_policy.hpp` |
 | How long each scanned column's values are needed | `src/planner/late_mat_plan_pass.cpp` |
 | Admission (uniqueness proof, pipelines, riders) | `src/scan_manager/sirius_scan_manager.cpp` |
 | Pin-time distinctness proof | `src/late_mat/pin_uniqueness.cpp` |

@@ -19,6 +19,7 @@
 #include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -29,10 +30,10 @@
 
 namespace sirius::io {
 
-sirius_ioctx::sirius_ioctx()  = default;
-sirius_ioctx::~sirius_ioctx() = default;
+ioctx::ioctx()  = default;
+ioctx::~ioctx() = default;
 
-void sirius_ioctx::initialize_cache(
+void ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   io::cache::config const& cache_config,
   std::shared_ptr<const sirius::memory::topology_index> topology_index) noexcept
@@ -40,13 +41,12 @@ void sirius_ioctx::initialize_cache(
   // One-shot.  Repeated calls are silent no-ops so callers can be
   // robust to multiple wiring sites.
   if (_cache) {
-    SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but prefetching_cache already present");
+    SIRIUS_LOG_WARN("ioctx::initialize_cache() called but prefetching_cache already present");
     return;
   }
   if (!can_use_prefetching_cache()) {
     SIRIUS_LOG_WARN(
-      "sirius_ioctx::initialize_cache() called but backend does not support vector host read");
+      "ioctx::initialize_cache() called but backend does not support vector host read");
     return;
   }
   try {
@@ -61,38 +61,45 @@ void sirius_ioctx::initialize_cache(
   }
 }
 
-void sirius_ioctx::shutdown_cache() noexcept { _cache.reset(); }
+void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 {
   // Create the backend-appropriate io_object (local fds / object-store HEAD /
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
   // construction is uniform across backends, so it lives here rather than in a
   // per-backend hook.
-  return std::make_unique<sirius_datasource>(shared_from_this(), create_io_object(std::move(path)));
+  //
+  // `file://` is stripped HERE, at the single funnel above the create_io_object
+  // virtual, rather than at each call site: sirius_scan_manager normalizes on the
+  // paths it owns, but callers that hold an ioctx and open directly
+  // (parquet_gpu_ingestible::build_file_scan_info, iceberg_metadata_reader's
+  // delete-file reads, duckdb_native_gpu_ingestible) bypassed it entirely. An
+  // un-stripped URI reaches the local reactor's "unsupported path" throw, which
+  // becomes a RUNTIME fallback rather than a clean plan-time decline.
+  return std::make_unique<sirius_datasource>(shared_from_this(),
+                                             create_io_object(strip_file_scheme(path)));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path, open_hint hint)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), hint));
+                                             create_io_object(strip_file_scheme(path), hint));
 }
 
-std::unique_ptr<sirius_datasource> sirius_ioctx::open_datasource(std::string path,
-                                                                 std::uint64_t known_size)
+std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
+                                                          std::uint64_t known_size)
 {
   return std::make_unique<sirius_datasource>(shared_from_this(),
-                                             create_io_object(std::move(path), known_size));
+                                             create_io_object(strip_file_scheme(path), known_size));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
-                                                                 open_hint /*hint*/)
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path, open_hint /*hint*/)
 {
   return create_io_object(std::move(path));
 }
 
-std::shared_ptr<sirius_io_object> sirius_ioctx::create_io_object(std::string path,
-                                                                 std::uint64_t /*known_size*/)
+std::shared_ptr<io_object> ioctx::create_io_object(std::string path, std::uint64_t /*known_size*/)
 {
   return create_io_object(std::move(path));
 }

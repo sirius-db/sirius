@@ -286,7 +286,7 @@ int main(int argc, char** argv)
     auto sources = cudf::io::make_datasources(cudf::io::source_info{path_list});
     ms           = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
   } else {
     // Size the buffer pool to fit the working set, plus headroom.
@@ -324,7 +324,7 @@ int main(int argc, char** argv)
 
     ms = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
 
     // std::cout << "cache summary : " << io_ctx->cache()->summary() <<

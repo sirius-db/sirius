@@ -56,7 +56,7 @@ constexpr char const* kTable = "lineitem";
 /// entry can be told apart from the one that replaced it.
 sirius::device_pin_chunk make_chunk(cucascade::memory::memory_space& space,
                                     cudf::size_type rows,
-                                    rmm::cuda_stream_view stream)
+                                    ::cuda::stream_ref stream)
 {
   sirius::device_pin_chunk chunk;
   chunk.memory_space = &space;
@@ -81,7 +81,7 @@ sirius::scan_manager::cache_entry_info make_cache_info()
 void pin_once(sirius_scan_manager& manager,
               cucascade::memory::memory_space& space,
               cudf::size_type rows,
-              rmm::cuda_stream_view stream)
+              ::cuda::stream_ref stream)
 {
   std::vector<sirius::device_pin_chunk> chunks;
   chunks.push_back(make_chunk(space, rows, stream));
@@ -128,7 +128,7 @@ TEST_CASE("an origin does not survive the pin it names being replaced", "[late_m
   // The gate decides whether handles are published at all.
   if (!sirius::late_mat::late_mat_enabled()) { return; }
 
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
   sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};
@@ -154,7 +154,7 @@ TEST_CASE("an origin does not survive an unpin", "[late_mat][pin_lifecycle]")
 {
   if (!sirius::late_mat::late_mat_enabled()) { return; }
 
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
   sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};
@@ -174,7 +174,7 @@ TEST_CASE("pin, unpin, re-pin leaves the first origin unable to resolve",
 
   // The harness's actual rhythm: each query pins what it needs and unpins
   // after, so the same names cycle for the length of a run.
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   manager_fixture fixture;
   auto* space = fixture.memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
   sirius_scan_manager manager{scan_manager_config{}, *fixture.memory, fixture.topology};

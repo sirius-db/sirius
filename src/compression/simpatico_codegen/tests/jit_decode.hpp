@@ -67,8 +67,7 @@ inline std::vector<Element> jit_decode_tree(const jit::FusedTree& tree,
   }
 
   jit::CompileOptions opts;
-  opts.arch_cc        = arch_cc;
-  opts.default_device = true;
+  opts.arch_cc = arch_cc;
 
   std::shared_ptr<const jit::CompiledKernel> kernel;
   try {

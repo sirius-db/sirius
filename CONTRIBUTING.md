@@ -53,6 +53,141 @@ Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `co
 
 The `duckdb/`, `duckdb-python/`, and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
 
+## Migrating your local clone from `dev` to `main`
+
+Sirius's default branch was renamed from `dev` to `main`
+([#1859](https://github.com/sirius-db/sirius/issues/1859)) — if your local clone or `gh-stack`
+predates that change, follow the steps below before continuing to develop. The old `main` is
+preserved as `legacy-main`, and a snapshot of `dev`'s tip at migration time is preserved as
+`legacy-dev`; both are read-only archives. GitHub automatically re-targeted open PRs and branch
+protection at the time of the rename.
+
+### Migration commands
+
+:warning: Run each command on its own — don't chain them.
+
+The commands you need depend on what your `origin` remote actually points to, not on how you
+originally cloned. Check first:
+
+```bash
+git remote -v
+```
+
+If you already have a local branch named `main` (common in this repo), check it for unpushed
+work before continuing — the steps below reuse the name `main` and expect it to be free.
+
+```bash
+git branch --list main
+```
+
+If it exists and has nothing you need, remove it:
+
+```bash
+git branch -D main
+```
+
+Skipping this step is what causes the `git branch -m dev main` command below to fail with
+`fatal: a branch named 'main' already exists`.
+
+#### `origin` is your personal fork
+
+This is the common case for Self-contained PR contributors, whether you cloned with
+`gh repo clone <your-fork>` (which sets this remote layout up for you automatically) or with
+plain `git clone` against your fork's URL.
+
+Add `upstream` if you don't already have it — skip this if `gh repo clone` already set it up:
+
+```bash
+git remote add upstream git@github.com:sirius-db/sirius.git
+```
+
+```bash
+git fetch upstream
+```
+
+```bash
+git branch -m dev main
+```
+
+```bash
+git branch -u upstream/main main
+```
+
+```bash
+git remote set-head upstream -a
+```
+
+Push your local `main` to your fork so `origin/main` matches too:
+
+```bash
+git push origin main
+```
+
+**Your fork's own `dev` branch will not be renamed automatically** — GitHub's rename only applies
+to `sirius-db/sirius` itself, not to forks, so a stale `dev` will keep sitting on your fork
+indefinitely (and reappear if you or anyone else clones it again). Once you've confirmed `main`
+is pushed above, and after ensuring all open work has been migrated to `main`, change your fork's
+default branch first: on GitHub, go to your fork's **Settings → Branches** and switch the
+**Default branch** to `main`. GitHub refuses to delete whichever branch is currently the repo's
+default, so skipping this step will fail:
+
+```bash
+git push origin --delete dev
+```
+
+Skipping the default-branch change above is what causes this to fail with
+`error: refusing to delete the current branch: refs/heads/dev`.
+
+#### `origin` is `sirius-db/sirius` directly
+
+This is the [Stacked PRs](#stacked-prs) maintainer convention — your `origin` was deliberately
+pointed at the main repo instead of your fork, per that section's setup instructions.
+
+```bash
+git fetch origin
+```
+
+```bash
+git branch -m dev main
+```
+
+```bash
+git branch -u origin/main main
+```
+
+```bash
+git remote set-head origin -a
+```
+
+If you also have a fork remote from before switching to the Stacked PRs convention, it has the
+same stale-`dev` problem described above — push `main` and delete `dev` on it if you still use it.
+
+If you have a stack (`gh stack view` shows branches) that predates the rename, its trunk branch
+name is pinned locally in `.git/gh-stack` at the time the stack was created — it still
+references `dev` by name and won't automatically pick up the rename on its own. Re-sync it
+against the new trunk:
+
+```bash
+gh stack sync
+```
+
+Then confirm it picked up the new trunk correctly:
+
+```bash
+gh stack view
+```
+
+If `gh stack view` still shows `dev` as the trunk or reports errors resolving branches, do not
+continue adding to the stack — ask in `#sirius` before proceeding, since `.git/gh-stack`'s
+pinned trunk reference may need manual correction.
+
+#### Something else
+
+If `git remote -v` doesn't match either case above — a renamed remote, multiple forks, or a
+non-standard setup — the general pattern is the same regardless: rename your local `dev` to
+`main`, point its tracking at whichever remote actually has `main`, then run
+`git remote set-head <remote> -a`. Ask in `#sirius` if you're not sure which remote that is.
+
 ## Troubleshooting CI failures
 
 When the C++ unit test job fails or times out, the workflow automatically uploads log artifacts to GitHub Actions. Download them from the **Summary** tab of the failed run.
@@ -168,11 +303,11 @@ gh stack sync                                           # rebase and sync the st
 Move between layers without typing branch names:
 
 ```bash
-gh stack top       # check out the top branch (furthest from dev)
-gh stack bottom    # check out the bottom branch (closest to dev)
-gh stack up        # check out one branch up (further from dev)
-gh stack down      # check out one branch down (closer to dev)
-gh stack trunk     # check out dev
+gh stack top       # check out the top branch (furthest from main)
+gh stack bottom    # check out the bottom branch (closest to main)
+gh stack up        # check out one branch up (further from main)
+gh stack down      # check out one branch down (closer to main)
+gh stack trunk     # check out main
 gh stack switch    # interactively pick a branch in the stack
 ```
 
@@ -198,7 +333,7 @@ code or to manage the stack during the "bottom-up" merge process.
 
 **Managing conflicts**
 
-During active development of the stack, always use `gh stack rebase` to manage conflicts with `dev`
+During active development of the stack, always use `gh stack rebase` to manage conflicts with `main`
 or between your stacked layers. If you have submitted your stack, run `gh stack submit` to push
 these changes to the repo and open PRs.
 
@@ -209,10 +344,10 @@ the stack layers as they are merged.
 **Rebase stack notifications**
 
 GitHub's support for stacked PRs includes a "Rebase stack" option in the Web UI when the target base
-(usually `dev`) has moved forward; it is not recommended to use this method.
+(usually `main`) has moved forward; it is not recommended to use this method.
 
 **NOTE:** CI and the merge queue both test the combined merge commit of the PR and the latest
-`dev` before merging. Rebasing is not necessary unless there is a conflict. If you have a conflict,
+`main` before merging. Rebasing is not necessary unless there is a conflict. If you have a conflict,
 follow the instructions in **Managing conflicts**.
 
 **Unstacking PRs**
@@ -220,7 +355,7 @@ follow the instructions in **Managing conflicts**.
 Sometimes it may be necessary to unstack PRs. This can be done in the CLI with
 `gh stack unstack` or in the Web UI clicking on the stack icon and selecting the stack icon with
 an "x" labeled "Unstack pull requests." Both methods remove the stack and convert the PRs to
-self-contained PRs targeting `dev`.
+self-contained PRs targeting `main`.
 
 #### Merging a stack
 
@@ -246,12 +381,12 @@ not just the stack's author. Steps 5-6 need a local checkout with the stack trac
 3. ***Web UI*** - Click **"Enqueue pull request"** on that PR's own page to
    merge just that one PR. Do not click "Enqueue stack" (this is only on the top-most layer of
    the stack) and don't use `gh stack merge`.
-4. ***Web UI*** - Wait for it to clear the merge queue and merge to `dev`. GitHub automatically
-   retargets the next layer's base to `dev` once the branch it was targeting is deleted; no
+4. ***Web UI*** - Wait for it to clear the merge queue and merge to `main`. GitHub automatically
+   retargets the next layer's base to `main` once the branch it was targeting is deleted; no
    manual action is needed for the retargeting.
 5. ***GH CLI*** - If the next layer's PR now shows "This branch has conflicts that must be
    resolved" / "Unable to merge", run `gh stack sync --prune` to rebase the remaining branches
-   onto the updated `dev` and clean up local branches for the merged PR. Always resolve stack
+   onto the updated `main` and clean up local branches for the merged PR. Always resolve stack
    conflicts via the CLI.
 6. ***GH CLI*** - Confirm it worked via `gh stack view`: the merged layer should show a `✓` under
    a `╌╌╌ merged ╌╌╌` marker, and the remaining branches shouldn't show a `⚠` warning icon. If

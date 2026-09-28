@@ -18,6 +18,7 @@
 
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -30,7 +31,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/chunk_row_set.hpp>
@@ -48,7 +48,7 @@ namespace {
 
 std::unique_ptr<cudf::column> gather_one(cudf::column_view const& source,
                                          cudf::column_view const& map,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   // DONT_CHECK: ids are pin-order positions the caller is responsible for, the
@@ -87,7 +87,7 @@ bool can_gather_raw(pinned_column_view const& column)
 /// The raw path: gather by global id, no canonical form, no restoring pass.
 std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
                                               prepared_selection const& selection,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   auto const& ids = selection.ids();
@@ -134,12 +134,12 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
                   host_bases.data(),
                   host_bases.size() * sizeof(void const*),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   cudaMemcpyAsync(starts.data(),
                   host_starts.data(),
                   host_starts.size() * sizeof(std::int64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   rmm::device_buffer masks;
   if (any_nullable) {
@@ -148,7 +148,7 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
                     host_masks.data(),
                     host_masks.size() * sizeof(cudf::bitmask_type const*),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   }
 
   multi_source_gather_fixed(
@@ -195,7 +195,7 @@ std::unique_ptr<cudf::column> require_non_null(std::unique_ptr<cudf::column> col
 /// the worst case is the decode that would have happened anyway.
 std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
                                                      batch_selection const& selection,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr)
 {
   auto const& table = source.compressed->table();
@@ -262,7 +262,7 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
 /// identity, and building one to apply it is more work than the copy.
 std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
                                                 batch_selection const& selection,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr)
 {
   if (source.is_compressed()) { return materialize_compressed(source, selection, stream, mr); }
@@ -279,10 +279,10 @@ std::unique_ptr<cudf::column> materialize_batch(batch_source const& source,
 
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
-                                          rmm::cuda_stream_view stream,
+                                          ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::late_mat::materialize"};
+  nvtx_scoped_range nvtx_range{"sirius::late_mat::materialize"};
   auto const& layout = selection.layout();
   if (column.batches.size() != layout.num_batches()) {
     throw std::runtime_error(

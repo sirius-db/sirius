@@ -15,9 +15,6 @@
  */
 
 // sirius
-
-#include <nvtx3/nvtx3.hpp>
-
 #include <config.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -27,6 +24,7 @@
 #include <pipeline/sirius_meta_pipeline.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_interface.hpp>
+#include <telemetry/nvtx.hpp>
 
 // cucascade
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -65,11 +63,11 @@ sirius_physical_result_collector::sirius_physical_result_collector(
 }
 
 std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_result_collector::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches());
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -120,9 +118,9 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
 }
 
 void sirius_physical_materialized_collector::sink(const operator_data& input_data,
-                                                  rmm::cuda_stream_view stream)
+                                                  ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_materialized_collector::sink"};
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = pipelineable_input.get_data_batches();
 

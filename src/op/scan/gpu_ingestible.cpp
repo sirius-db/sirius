@@ -29,7 +29,7 @@ namespace sirius::op::scan {
 
 filtered_table gpu_ingestible::materialize_table(
   const op::scan::scan_operator_input& split,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
@@ -52,7 +52,7 @@ filtered_table gpu_ingestible::materialize_table(
       }
       auto masked = apply_host_keep_bitmask(
         view, mask.view(), mask.row_count, stream, mem_space->get_default_allocator());
-      stream.synchronize();
+      stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = materialized.state};
     }
     return materialized;
@@ -101,7 +101,7 @@ filtered_table gpu_ingestible::materialize_table(
       // returns. Await the mask work before dropping them, the same
       // discipline the duckdb-native decoder uses for its staging buffers
       // (submit_and_await).
-      stream.synchronize();
+      stream.sync();
       return {.table = owning_table_view{std::move(masked)}, .state = filter_state::UNFILTERED};
     }
     return {.table               = owning_table_view{std::move(rbatch), view},

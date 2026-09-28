@@ -354,7 +354,7 @@ std::unique_ptr<cudf::column> create_numeric_column_with_random_data(
   size_t num_rows,
   const cudf::data_type& dtype,
   const std::optional<std::pair<int, int>>& range,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto& gen = global_rng();
@@ -375,7 +375,7 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   size_t num_rows,
   const std::vector<cudf::data_type>& column_types,
   const std::vector<std::optional<std::pair<int, int>>>& ranges,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   bool use_int64_string_offsets)
 {

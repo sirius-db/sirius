@@ -17,8 +17,7 @@
 #include "op/scan/duckdb_native_metadata.hpp"
 
 #include "log/logging.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
@@ -475,6 +474,25 @@ void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 
 }  // namespace
 
+std::optional<std::string> unsupported_projected_type_reason(
+  const std::vector<projected_column>& projected_cols,
+  const std::vector<sirius::logical_type>& projected_types)
+{
+  if (projected_cols.empty()) { return "no projected columns"; }
+  if (projected_cols.size() != projected_types.size()) {
+    return "projected_cols and projected_types size mismatch";
+  }
+  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
+    if (projected_cols[ci].is_rowid) { continue; }
+    std::string reason;
+    if (!is_supported_logical_type(projected_types[ci], reason)) {
+      return "column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
+             reason;
+    }
+  }
+  return std::nullopt;
+}
+
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
   switch (c) {
@@ -515,7 +533,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   const duckdb::TableFilterSet* table_filters,
   const duckdb::vector<duckdb::ColumnIndex>* column_ids)
 {
-  nvtx3::scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
+  nvtx_scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
 
   duckdb_native_walk_plan plan;
   plan.viable          = false;
@@ -532,24 +550,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
                      plan.viability_failure_reason);
   };
 
-  if (projected_cols.empty()) {
-    refuse("no projected columns");
+  if (auto reason = unsupported_projected_type_reason(projected_cols, projected_types)) {
+    refuse(std::move(*reason));
     return plan;
-  }
-  if (projected_cols.size() != projected_types.size()) {
-    refuse("projected_cols and projected_types size mismatch");
-    return plan;
-  }
-
-  // Type gate
-  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
-    if (projected_cols[ci].is_rowid) { continue; }
-    std::string reason;
-    if (!is_supported_logical_type(projected_types[ci], reason)) {
-      refuse("column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
-             reason);
-      return plan;
-    }
   }
 
   // GetPartitionStats touches LocalStorage/ClientContext. Runs before the
@@ -557,7 +560,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   duckdb::vector<duckdb::PartitionStatistics> partition_stats;
   {
     /// @note Synchronous pread()s happen here when cold.
-    nvtx3::scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
+    nvtx_scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
     partition_stats = storage.GetPartitionStats(context);
   }
 
@@ -570,11 +573,13 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   plan.partition_row_groups.assign(plan.n_row_groups, nullptr);
   plan.row_group_pruned_by_stats.assign(plan.n_row_groups, false);
   plan.pruned_decoded_bytes_by_row_group.assign(plan.n_row_groups, 0);
-  // PartitionStatistics is expected to carry one entry per row group; a larger
-  // count means the DuckDB layout assumption below (index i == row group i) has
-  // drifted and trailing entries would be silently dropped.
-  assert(partition_stats.size() <= plan.n_row_groups &&
-         "partition_stats count exceeds row group count — DuckDB layout drift");
+  // Transaction-local partitions can appear in GetPartitionStats without a
+  // corresponding persisted row group. Their index cannot be mapped safely to
+  // this scan's block-backed row groups, so defer to DuckDB.
+  if (partition_stats.size() > plan.n_row_groups) {
+    refuse("partition stats include transaction-local partitions");
+    return plan;
+  }
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
     auto const& ps = partition_stats[i];
     if (!ps.row_start.IsValid()) {
@@ -584,11 +589,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
     }
     // PartitionStatistics order matches `RowGroupCollection::SegmentNodes()`
     // iteration order at v1.5.2.
-    if (i < plan.n_row_groups) {
-      plan.row_group_start[i]      = ps.row_start.GetIndex();
-      plan.row_count[i]            = ps.count;
-      plan.partition_row_groups[i] = ps.partition_row_group;
-    }
+    plan.row_group_start[i]      = ps.row_start.GetIndex();
+    plan.row_count[i]            = ps.count;
+    plan.partition_row_groups[i] = ps.partition_row_group;
   }
 
   mark_row_groups_pruned_by_filter_stats(plan);
@@ -702,7 +705,7 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   // Walk segment metadata for surviving row groups only — reading the typed
   // segment trees directly
   {
-    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    nvtx_scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
     auto& row_groups = *plan.storage->GetRowGroupCollection();
     for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
       auto const local_rgi = local_index_by_rg[rg - rg_begin];

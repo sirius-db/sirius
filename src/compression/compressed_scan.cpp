@@ -29,13 +29,13 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius {
 
@@ -341,8 +341,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
                                                       std::span<const std::size_t> selected,
                                                       pushdown_request const& request,
                                                       decode_visibility_mask const& keep_mask,
-                                                      std::span<const rmm::cuda_stream_view> lanes,
-                                                      rmm::cuda_stream_view stream,
+                                                      std::span<const ::cuda::stream_ref> lanes,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr,
                                                       pushdown_outcome& outcome)
 {
@@ -598,7 +598,7 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    decompression_pushdown_scan const* scan,
                                    decode_visibility_mask const& keep_mask,
                                    cucascade::memory::memory_space const& space,
-                                   rmm::cuda_stream_view stream,
+                                   ::cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr)
 {
   decompress_result out;
@@ -621,22 +621,24 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   // The lanes come from the stream pool of `space`, which cuCascade shares round-robin with every
   // other `memory_space::acquire_stream()` caller, for example cuCascade's own host-to-GPU and
   // GPU-to-GPU converters, the memory prefetcher, pin materialization, dynamic-filter and hash-join
-  // publication, and concurrent decodes. They are borrowed views, neither exclusive nor necessarily
-  // distinct, owned by the pool for the memory space's lifetime. Sharing couples latency in both
-  // directions: every wait the decode makes on a lane, including the session's final wait and the
-  // scan-filter joins, also waits for work others queued on it, and work others queue later runs
-  // behind the decode's. The coupling also chains through event waits: the scan-filter joins make
-  // shared lanes wait on each other, and hash-join publication makes a pool stream wait on its
-  // build writer's event, so a wait can cover work on streams outside the pool. It cannot deadlock,
-  // because every stream wait references an event that is already recorded and no pool user queues
-  // host-gated work, as Simpatico's borrowed-stream overloads require. Decoded columns can record a
-  // lane as their deallocation stream, so the converters rebind them to the task stream. With the
-  // non-default `per_stream_reservation: true`, allocations are charged by stream: a lane that is
-  // also a memory prefetcher worker's stream charges the decode's allocations to that worker's
-  // reservation, so compressed scans are not accounted correctly in that mode.
-  std::array<rmm::cuda_stream_view, kDecodeStreams> lanes;
-  for (auto& lane : lanes) {
-    lane = space.acquire_stream();
+  // publication, and concurrent decodes. They are borrowed references, neither exclusive nor
+  // necessarily distinct, owned by the pool for the memory space's lifetime. Sharing couples
+  // latency in both directions: every wait the decode makes on a lane, including the session's
+  // final wait and the scan-filter joins, also waits for work others queued on it, and work others
+  // queue later runs behind the decode's. The coupling also chains through event waits: the
+  // scan-filter joins make shared lanes wait on each other, and hash-join publication makes a pool
+  // stream wait on its build writer's event, so a wait can cover work on streams outside the pool.
+  // It cannot deadlock, because every stream wait references an event that is already recorded and
+  // no pool user queues host-gated work, as Simpatico's borrowed-stream overloads require. Decoded
+  // columns can record a lane as their deallocation stream, so the converters rebind them to the
+  // task stream. With the non-default `per_stream_reservation: true`, allocations are charged by
+  // stream: a lane that is also a memory prefetcher worker's stream charges the decode's
+  // allocations to that worker's reservation, so compressed scans are not accounted correctly in
+  // that mode.
+  std::vector<::cuda::stream_ref> lanes;
+  lanes.reserve(kDecodeStreams);
+  for (std::size_t i = 0; i < kDecodeStreams; ++i) {
+    lanes.push_back(space.acquire_stream());
   }
   if (!request.empty() && !request.row_selection_disabled) {
     out.table =

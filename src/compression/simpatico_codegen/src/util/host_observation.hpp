@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 
@@ -65,6 +65,6 @@ pinned_staging_slab& thread_pinned_staging();
 void read_device_bytes_completed(void* destination,
                                  void const* source,
                                  std::size_t bytes,
-                                 rmm::cuda_stream_view stream);
+                                 ::cuda::stream_ref stream);
 
 }  // namespace simpatico

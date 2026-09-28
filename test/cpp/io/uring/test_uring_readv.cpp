@@ -18,7 +18,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <exec/semi_future.hpp>
 #include <io/types.hpp>
@@ -420,9 +420,15 @@ TEST_CASE("prep_host_to_device fuses contiguous bounce buffers into one readv wi
   // Three contiguous 4 KiB cached chunks covering the whole [0, 12 KiB) request.
   std::vector<io_object_segment> segs{
     {0, 4096, fake_ptr(0x10000)}, {4096, 4096, fake_ptr(0x20000)}, {8192, 4096, fake_ptr(0x30000)}};
-  auto* dst = fake_ptr(0x40000000);
-  auto req  = uring_reactor::prep_host_to_device_rx_request(
-    cfg, *tf.obj, segs, dst, /*offset=*/0, /*size=*/3 * 4096, rmm::cuda_stream_view{}, 0);
+  auto* dst   = fake_ptr(0x40000000);
+  auto req    = uring_reactor::prep_host_to_device_rx_request(cfg,
+                                                           *tf.obj,
+                                                           segs,
+                                                           dst,
+                                                           /*offset=*/0,
+                                                           /*size=*/3 * 4096,
+                                                           ::cuda::stream_ref{cudaStream_t{}},
+                                                           0);
   auto fut    = req->get_future();
   auto chunks = req->get_all_chunks();
 
@@ -460,9 +466,15 @@ TEST_CASE("prep_host_to_device clips the batched copy to the request window", "[
   // head of chunk 2 — the copies clip to the request, not the chunk bounds.
   std::vector<io_object_segment> segs{
     {0, 4096, fake_ptr(0x10000)}, {4096, 4096, fake_ptr(0x20000)}, {8192, 4096, fake_ptr(0x30000)}};
-  auto* dst = fake_ptr(0x40000000);
-  auto req  = uring_reactor::prep_host_to_device_rx_request(
-    cfg, *tf.obj, segs, dst, /*offset=*/1024, /*size=*/10240, rmm::cuda_stream_view{}, 0);
+  auto* dst   = fake_ptr(0x40000000);
+  auto req    = uring_reactor::prep_host_to_device_rx_request(cfg,
+                                                           *tf.obj,
+                                                           segs,
+                                                           dst,
+                                                           /*offset=*/1024,
+                                                           /*size=*/10240,
+                                                           ::cuda::stream_ref{cudaStream_t{}},
+                                                           0);
   auto chunks = req->get_all_chunks();
 
   REQUIRE(chunks.size() == 1);
@@ -497,9 +509,15 @@ TEST_CASE("prep_host_to_device caps each readv group at max_n_chunks", "[uring_r
                                       {8192, 4096, fake_ptr(0x30000)},
                                       {12288, 4096, fake_ptr(0x40000)},
                                       {16384, 4096, fake_ptr(0x50000)}};
-  auto* dst = fake_ptr(0x40000000);
-  auto req  = uring_reactor::prep_host_to_device_rx_request(
-    cfg, *tf.obj, segs, dst, /*offset=*/0, /*size=*/5 * 4096, rmm::cuda_stream_view{}, 0);
+  auto* dst   = fake_ptr(0x40000000);
+  auto req    = uring_reactor::prep_host_to_device_rx_request(cfg,
+                                                           *tf.obj,
+                                                           segs,
+                                                           dst,
+                                                           /*offset=*/0,
+                                                           /*size=*/5 * 4096,
+                                                           ::cuda::stream_ref{cudaStream_t{}},
+                                                           0);
   auto chunks = req->get_all_chunks();
 
   // 5 contiguous segments, cap 2 => groups of 2, 2, 1.

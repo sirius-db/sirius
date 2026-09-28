@@ -8,6 +8,7 @@
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 #include "util/host_observation.hpp"
 
 #include <cudf/column/column.hpp>
@@ -19,7 +20,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <array>
@@ -226,7 +226,7 @@ static bool read_meta(Reader& r, leaf_meta_v& out)
 // same reconstruction serves both the file reader (contiguous host payload) and
 // the in-memory reader (a caller-owned, possibly multi-block pinned payload).
 using leaf_buffer_fill =
-  std::function<void(std::size_t i, void* dst_device, std::size_t size, rmm::cuda_stream_view)>;
+  std::function<void(std::size_t i, void* dst_device, std::size_t size, ::cuda::stream_ref)>;
 
 // Bytes make_col allocates from leaf_mr for one enumerated buffer: the leaf column
 // is sized to the DECODED element count (num_rows) times the element width — NOT the
@@ -244,7 +244,7 @@ static std::uint64_t leaf_alloc_bytes(std::uint8_t type_tag, std::uint64_t num_r
 static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   leaf_desc const& ld,
   leaf_buffer_fill const& fill,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   rmm::device_async_resource_ref leaf_mr,
   std::string* err)
@@ -425,7 +425,7 @@ struct ColRecord {
 // concatenated file layout). Returns false and sets *err on any structural error.
 static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::parse_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::parse_header"};
   auto bad = [&](std::string const& m) {
     if (err) *err = m;
     return false;
@@ -526,7 +526,7 @@ static std::int64_t constant_key_width_from_offsets(std::span<std::int32_t const
 // are read back on `stream`, the stream the leaf fetches were enqueued on (one staged read per such
 // column, host memory only). INT64 offsets and a consumed `keys_offsets` stay unknown. Returns an
 // error message, or empty on success.
-static std::string derive_dictionary_key_width_hints(PlanTree& tree, rmm::cuda_stream_view stream)
+static std::string derive_dictionary_key_width_hints(PlanTree& tree, ::cuda::stream_ref stream)
 {
   for (auto& node : tree.nodes) {
     if (op_id_from_name(node.op) != OpId::Dictionary) continue;
@@ -576,12 +576,12 @@ static std::string derive_dictionary_key_width_hints(PlanTree& tree, rmm::cuda_s
 // `recs` is consumed (plan trees are moved into the result).
 static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
                                                  payload_fetch_fn const& fetch,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr,
                                                  rmm::device_async_resource_ref leaf_mr,
                                                  std::string* err)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::fetch_payload"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::fetch_payload"};
   auto fail = [&](std::string const& m) -> compressed_table {
     if (err) *err = m;
     return {};
@@ -614,7 +614,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
       if (ld.node_index >= nodes.size())
         return fail("leaf node_index out of range in col " + std::to_string(ci));
 
-      auto fill = [&](std::size_t bi, void* dst, std::size_t sz, rmm::cuda_stream_view s) {
+      auto fill = [&](std::size_t bi, void* dst, std::size_t sz, ::cuda::stream_ref s) {
         fetch(boffs[bi], sz, dst, s);
       };
 
@@ -655,9 +655,9 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 
 std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
-                                   rmm::cuda_stream_view stream)
+                                   ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
   // Build the header + payload buffer list once (shared with the in-memory
   // writer), then gather the payload into one contiguous blob for the file.
   std::vector<std::uint8_t> hdr;
@@ -673,10 +673,10 @@ std::string write_compressed_table(compressed_table const& table,
                       b.device_ptr,
                       static_cast<std::size_t>(b.size_bytes),
                       cudaMemcpyDeviceToHost,
-                      stream.value());
+                      stream.get());
     }
   }
-  stream.synchronize();  // D→H copies must complete before the file write
+  stream.sync();  // D→H copies must complete before the file write
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
@@ -688,11 +688,11 @@ std::string write_compressed_table(compressed_table const& table,
 }
 
 compressed_table read_compressed_table(std::string const& path,
-                                       rmm::cuda_stream_view stream,
+                                       ::cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr,
                                        std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[file]"};
   auto fail = [&](std::string const& msg) -> compressed_table {
     if (error_out) *error_out = msg;
     return {};
@@ -731,10 +731,9 @@ compressed_table read_compressed_table(std::string const& path,
     }
   }
 
-  payload_fetch_fn fetch =
-    [&](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyHostToDevice, s.value());
-    };
+  payload_fetch_fn fetch = [&](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
+    cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyHostToDevice, s.get());
+  };
 
   return reconstruct_from_records(col_records, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
 }
@@ -748,7 +747,7 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
                          std::int32_t slot,
                          OpId kind,
                          compressed_representation const* rep,
-                         rmm::cuda_stream_view stream)
+                         ::cuda::stream_ref stream)
 {
   leaf_desc d;
   d.node_index = node_index;
@@ -782,7 +781,7 @@ leaf_desc make_leaf_desc(std::uint32_t node_index,
 // rep->kind() is used for all rep types including codegen_fused_representation,
 // which maps its fused op tag to a leaf kind (delta->Delta, rle->Rle,
 // bitpack->Bitpack, for->For, zigzag->Zigzag, RawFused->Identity).
-std::vector<std::vector<leaf_desc>> compressed_table::describe(rmm::cuda_stream_view stream) const
+std::vector<std::vector<leaf_desc>> compressed_table::describe(::cuda::stream_ref stream) const
 {
   std::vector<std::vector<leaf_desc>> result;
   result.reserve(columns.size());
@@ -817,9 +816,9 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::vector<std::uint8_t>& out_header,
                                           std::vector<payload_buffer_ref>& out_buffers,
                                           std::uint64_t& out_payload_bytes,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
 
   out_header.clear();
@@ -900,12 +899,12 @@ std::string build_compressed_table_header(compressed_table const& table,
 compressed_table read_compressed_table_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   std::optional<rmm::device_async_resource_ref> leaf_mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
@@ -918,11 +917,11 @@ compressed_table read_compressed_table_subset_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
   std::span<const std::size_t> selected_columns,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};

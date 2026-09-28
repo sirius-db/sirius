@@ -99,7 +99,8 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
 }
 
 TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: sparse strategy under a tiny histogram budget",
+                 "gpu_execution dense count-join: a tiny histogram budget declines the fusion "
+                 "at plan time",
                  "[integration][gpu_execution][dense_count_join]")
 {
   sirius::test::scoped_sirius_setting budget{*con, "dense_count_join_max_bytes", std::uint64_t{8}};
@@ -107,6 +108,27 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
     "SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
   compare_gpu_vs_cpu(
     "SELECT c_id, count(*) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
+}
+
+TEST_CASE_METHOD(DenseCountJoinFixture,
+                 "gpu_execution dense count-join: sparse key domain takes the operator's runtime "
+                 "sparse strategy",
+                 "[integration][gpu_execution][dense_count_join]")
+{
+  run_ok("CREATE TABLE wide_cust (c_id INTEGER);");
+  run_ok("INSERT INTO wide_cust VALUES (1), (2000000), (4000000), (6000000), (NULL);");
+  run_ok("CREATE TABLE wide_ord (o_id BIGINT, o_cust INTEGER, o_val INTEGER);");
+  run_ok(
+    "INSERT INTO wide_ord VALUES (200, 2000000, 10), (201, 2000000, NULL), (202, 6000000, 11), "
+    "(203, 42, 12), (204, NULL, 13);");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu(
+    "SELECT c_id, count(o_id) AS c_count FROM wide_cust LEFT JOIN wide_ord ON c_id = o_cust "
+    "GROUP BY c_id");
+  compare_gpu_vs_cpu(
+    "SELECT c_id, count(*) AS c_count FROM wide_cust LEFT JOIN wide_ord ON c_id = o_cust GROUP "
+    "BY c_id");
 }
 
 TEST_CASE_METHOD(DenseCountJoinFixture,
@@ -265,8 +287,4 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
     "SELECT c_id, count(o_val) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
   compare_fused_and_unfused(
     "SELECT c_id, count(*) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
-
-  sirius::test::scoped_sirius_setting budget{*con, "dense_count_join_max_bytes", std::uint64_t{8}};
-  compare_gpu_vs_cpu(
-    "SELECT c_id, count(o_val) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
 }

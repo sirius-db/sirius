@@ -8,7 +8,10 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  73cdf0e16e701063528c71ac48f0d3d9072dce11d1ab2ac768173c676cb8d704fcb2d3eb5b0ae8892b3b657eefc8bc03e3d83fb204befaa81cb9538328410cf1
+  20ab7b08c47f27ccc1d43f880c350d9f20e48b2c7bb9e0b1c6c9bf2995fa49ec7b542eaaded32b32aa53bb7294f680761ef515ba4fc9e89fa6b1384eb6b4f930
+  # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
+  PATCHES
+  fix-pq-kernel-optional.patch
   HEAD_REF
   main)
 
@@ -18,9 +21,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
+  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
   HEAD_REF
   main)
 
@@ -44,9 +47,9 @@ vcpkg_from_github(
   REPO
   rapidsai/raft
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  b5c25d369f7e69941118b342ac581d0908a0f0c7763f4e42c6bc7af0afee4ab85306dfed057b28b115096bdf2799d8da5ce7eb3d2eb796468b210ea5f7724d41
+  cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
   HEAD_REF
   main)
 
@@ -72,9 +75,9 @@ vcpkg_from_github(
   REPO
   NVIDIA/cuCollections
   REF
-  f517bbb1277753b1852dfd388993383e401eaa38
+  0883368d39296f3bef3a058033141bcc642c5c54
   SHA512
-  53f6185db57eba7391fd9b93b342d9da3c4cdf906dc47fad02cc1eb34867bb11ce798f0e94fee71a3cfb6423e6cad907ebe21e46997b4f4ef2b6e1e3b0a45d82
+  be8040f9ad46a2f8cc9d9c53a2bdbd0c9ff1e83c3f93788ae5508bc9f4610028e2d326e6b357a41a65a93064960db8d18963a540f25609fe2f254eb231484aee
   HEAD_REF
   dev)
 
@@ -106,12 +109,26 @@ vcpkg_cmake_configure(
   -DCUVS_NVTX=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
+  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
+  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
+)
 
 vcpkg_cmake_install()
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME cuvs CONFIG_PATH lib/cmake/cuvs)
+
+# Static cuVS exports shared JIT dependencies; use the overlay redistributables.
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-cuvs_static-static-targets.cmake"
+  "CUDA::nvJitLink" "nvjitlink::nvjitlink_static")
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-cuvs_static-static-targets.cmake"
+  "CUDA::nvrtc" "nvrtc::nvrtc_static")
+file(READ "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake" CUVS_CONFIG)
+file(
+  WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(nvjitlink CONFIG)\nfind_dependency(nvrtc CONFIG)\n${CUVS_CONFIG}"
+)
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")

@@ -154,36 +154,9 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
   }
 }
 
-void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
+void task_scheduler::start_query(const planner::query& query)
 {
-  // No leftover-task drain here: each query drops its own queued work at cleanup
-  // (drain_query_tasks from SiriusContext::run_mandatory_cleanup). Draining every executor at
-  // query START would discard any other in-flight query's tasks along with the stale ones.
-
-  std::lock_guard lock(_query_mutex);
-  _query = std::move(query);
-
-  _completion_handler = std::make_shared<completion_handler>();
-
-  // Executors keep raw references owned by the scheduler.
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_completion_handler(_completion_handler.get());
-  }
-
-  // Terminal pipelines keep weak references so replacing the handler retires the previous query.
-  if (_query) {
-    for (auto& pipeline : _query->get_pipelines()) {
-      if (pipeline && pipeline->is_query_terminal()) {
-        pipeline->set_completion_handler(_completion_handler);
-      }
-    }
-  }
-}
-
-std::future<void> task_scheduler::start_query()
-{
-  std::scoped_lock lock(_query_mutex);
-  const auto& scans = _query->get_scan_operators();
+  const auto& scans = query.get_scan_operators();
 
   // A query with no schedulable scan can never complete. Plan generation should have
   // rejected it, so fail loudly instead of dereferencing an empty vector.
@@ -191,30 +164,25 @@ std::future<void> task_scheduler::start_query()
     throw std::runtime_error("task_scheduler: query has no schedulable scan sources");
   }
 
+  // The caller already holds the future from its own completion handler.
   _task_creator->schedule(scans.front());
-
-  return _completion_handler->get_awaitable();
 }
 
-void task_scheduler::terminate_query(std::exception_ptr error)
+void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& handler,
+                                     std::exception_ptr error)
 {
   // Report-only: this can be reached from a GPU executor's own worker thread (via
   // notify_downstream_pipelines() in ~gpu_pipeline_task) or from the task_creator's own worker
-  // thread. stop() below joins each gpu_pipeline_executor's manager thread and then blocks in
-  // that executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of
-  // that pool's workers, its slot cannot free until this call returns, so wait_all() would never
+  // thread. stop() joins each gpu_pipeline_executor's manager thread and then blocks in that
+  // executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of that
+  // pool's workers, its slot cannot free until this call returns, so wait_all() would never
   // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
   // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
   // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
-  std::shared_ptr<completion_handler> completion;
-  {
-    std::scoped_lock lock(_query_mutex);
-    completion = _completion_handler;
-  }
-  if (completion) { completion->report_error(std::move(error)); }
+  if (handler) { handler->report_error(std::move(error)); }
 }
 
-void task_scheduler::drain_after_error()
+void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
   // Teardown ordering is load-bearing. The scan/gpu executor drains below run
@@ -248,9 +216,7 @@ void task_scheduler::drain_after_error()
   // Now that no executor can generate further task_creation_requests, discard the ones this
   // query accumulated — they hold raw operator pointers into a plan that QueryEnd is about to
   // destroy. Scoped to this query: any other in-flight query keeps its pending requests.
-  if (auto query_id = current_query_id(); query_id && _task_creator) {
-    _task_creator->drain_pending_tasks(*query_id);
-  }
+  if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
 
   // Belt-and-suspenders: the executor restarts above emit device_ready signals,
   // and the management loop may have dispatched a leftover task into an executor
@@ -262,7 +228,7 @@ void task_scheduler::drain_after_error()
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
 
-void task_scheduler::wait_for_completion()
+void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
 {
   // Once the query has signaled completion, NOTHING should still be queued. Rather
   // than drain (which would hide the bug), validate that every queue is empty and
@@ -292,13 +258,13 @@ void task_scheduler::wait_for_completion()
     }
   } catch (...) {
     if (_task_creator) {
-      if (auto query_id = current_query_id()) { _task_creator->drain_pending_tasks(*query_id); }
+      _task_creator->drain_pending_tasks(query_id);
       _task_creator->start_thread_pool();
     }
     throw;
   }
   if (_task_creator) {
-    if (auto query_id = current_query_id()) { _task_creator->drain_pending_tasks(*query_id); }
+    _task_creator->drain_pending_tasks(query_id);
     _task_creator->start_thread_pool();
   }
 }
@@ -312,13 +278,6 @@ void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_query_tasks(query_id);
   }
-}
-
-std::optional<sirius::query_id_t> task_scheduler::current_query_id() const
-{
-  std::lock_guard lock(_query_mutex);
-  if (!_query) { return std::nullopt; }
-  return _query->query_id();
 }
 
 void task_scheduler::management_eventloop()
@@ -353,9 +312,10 @@ void task_scheduler::management_eventloop()
     // Work: let the creator pre-create for a waiting device (lookahead
     // strategy only), then sleep until something is pushed.
     if (_task_queue.empty()) {
-      if (auto query_id = current_query_id();
-          query_id && _task_creator && !_ready_devices.empty()) {
-        _task_creator->schedule_lookahead(*query_id, *_ready_devices.begin());
+      // No query id: the task_creator picks the oldest live query itself, since this loop has
+      // none to inherit.
+      if (_task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(*_ready_devices.begin());
       }
       if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
@@ -380,7 +340,8 @@ void task_scheduler::management_eventloop()
       // (lowest value) task preferring exactly this device.
       task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // Pick a task with no preference; any ready device may claim it.
+        // Pick a task with no preference (any device will do). Which GPU gets it is decided by
+        // whichever executor signalled ready first, not by any counter.
         task =
           _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }

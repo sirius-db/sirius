@@ -114,7 +114,7 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                void* out,
                                std::uint32_t const* const* masks_dev,
                                std::uint32_t* out_mask,
-                               rmm::cuda_stream_view stream)
+                               ::cuda::stream_ref stream)
 {
   if (count == 0) { return; }
   if (bases_dev == nullptr || row_start_dev == nullptr || ids == nullptr || out == nullptr ||
@@ -134,57 +134,57 @@ void multi_source_gather_fixed(void const* const* bases_dev,
   switch (elem_size) {
     case 1:
       gather_fixed_kernel<std::uint8_t>
-        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
-                                              row_start_dev,
-                                              num_batches,
-                                              ids,
-                                              count,
-                                              static_cast<std::uint8_t*>(out),
-                                              masks,
-                                              out_bits);
+        <<<grid, kBlock, 0, stream.get()>>>(bases_dev,
+                                            row_start_dev,
+                                            num_batches,
+                                            ids,
+                                            count,
+                                            static_cast<std::uint8_t*>(out),
+                                            masks,
+                                            out_bits);
       break;
     case 2:
       gather_fixed_kernel<std::uint16_t>
-        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
-                                              row_start_dev,
-                                              num_batches,
-                                              ids,
-                                              count,
-                                              static_cast<std::uint16_t*>(out),
-                                              masks,
-                                              out_bits);
+        <<<grid, kBlock, 0, stream.get()>>>(bases_dev,
+                                            row_start_dev,
+                                            num_batches,
+                                            ids,
+                                            count,
+                                            static_cast<std::uint16_t*>(out),
+                                            masks,
+                                            out_bits);
       break;
     case 4:
       gather_fixed_kernel<std::uint32_t>
-        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
-                                              row_start_dev,
-                                              num_batches,
-                                              ids,
-                                              count,
-                                              static_cast<std::uint32_t*>(out),
-                                              masks,
-                                              out_bits);
+        <<<grid, kBlock, 0, stream.get()>>>(bases_dev,
+                                            row_start_dev,
+                                            num_batches,
+                                            ids,
+                                            count,
+                                            static_cast<std::uint32_t*>(out),
+                                            masks,
+                                            out_bits);
       break;
     case 8:
       gather_fixed_kernel<std::uint64_t>
-        <<<grid, kBlock, 0, stream.value()>>>(bases_dev,
-                                              row_start_dev,
-                                              num_batches,
-                                              ids,
-                                              count,
-                                              static_cast<std::uint64_t*>(out),
-                                              masks,
-                                              out_bits);
+        <<<grid, kBlock, 0, stream.get()>>>(bases_dev,
+                                            row_start_dev,
+                                            num_batches,
+                                            ids,
+                                            count,
+                                            static_cast<std::uint64_t*>(out),
+                                            masks,
+                                            out_bits);
       break;
     case 16:
-      gather_fixed_kernel<uint4><<<grid, kBlock, 0, stream.value()>>>(bases_dev,
-                                                                      row_start_dev,
-                                                                      num_batches,
-                                                                      ids,
-                                                                      count,
-                                                                      static_cast<uint4*>(out),
-                                                                      masks,
-                                                                      out_bits);
+      gather_fixed_kernel<uint4><<<grid, kBlock, 0, stream.get()>>>(bases_dev,
+                                                                    row_start_dev,
+                                                                    num_batches,
+                                                                    ids,
+                                                                    count,
+                                                                    static_cast<uint4*>(out),
+                                                                    masks,
+                                                                    out_bits);
       break;
     default:
       throw std::runtime_error("multi_source_gather: element width " + std::to_string(elem_size) +

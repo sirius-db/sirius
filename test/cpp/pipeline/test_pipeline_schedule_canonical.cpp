@@ -59,8 +59,7 @@ std::string operator_chain(const sirius_pipeline& pipeline)
 }
 
 //! Every pipeline must appear after all of its `dependencies` (producers).
-void require_strictly_topological(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& scheduled)
+void require_strictly_topological(const std::vector<std::shared_ptr<sirius_pipeline>>& scheduled)
 {
   std::unordered_map<const sirius_pipeline*, size_t> position;
   for (size_t i = 0; i < scheduled.size(); i++) {
@@ -91,12 +90,12 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
     // pipeline_id equals the vector position; `dependencies` sorted by it (printer order).
     for (size_t i = 0; i < scheduled.size(); i++) {
       REQUIRE(scheduled[i]->get_pipeline_id() == i);
-      REQUIRE(std::is_sorted(scheduled[i]->dependencies.begin(),
-                             scheduled[i]->dependencies.end(),
-                             [](const duckdb::shared_ptr<sirius_pipeline>& a,
-                                const duckdb::shared_ptr<sirius_pipeline>& b) {
-                               return a->get_pipeline_id() < b->get_pipeline_id();
-                             }));
+      REQUIRE(std::is_sorted(
+        scheduled[i]->dependencies.begin(),
+        scheduled[i]->dependencies.end(),
+        [](const std::shared_ptr<sirius_pipeline>& a, const std::shared_ptr<sirius_pipeline>& b) {
+          return a->get_pipeline_id() < b->get_pipeline_id();
+        }));
     }
 
     // Join dependencies are build-side-first: dependencies[0] is the build CONCAT

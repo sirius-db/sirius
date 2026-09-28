@@ -267,7 +267,7 @@ std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
     cudaMemsetAsync(out_col->mutable_view().head<void>(),
                     0,
                     static_cast<size_t>(n) * static_cast<size_t>(cudf::size_of(out_type)),
-                    stream.value()),
+                    stream.get()),
     "bitextract decompress clear");
 
   // Compute total output width in bits
@@ -284,7 +284,7 @@ std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
                          /*src_lo=*/0,
                          /*dst_lo=*/lo_bit,
                          field_spec.bits,
-                         stream.value());
+                         stream.get());
     offset_from_msb += field_spec.bits;
   }
   throw_if_cuda_error(cudaGetLastError(), "bitextract decompress launch");
@@ -294,7 +294,7 @@ std::unique_ptr<cudf::column> bitextract_compressed_representation::decompress(
 // ── bitextract_compressor::compress ──────────────────────────────────────────
 
 std::unique_ptr<compressed_representation> bitextract_compressor::compress(
-  cudf::column_view column, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view column, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   if (spec.fields.empty()) { throw std::invalid_argument("bitextract compress: empty spec"); }
 
@@ -330,13 +330,13 @@ std::unique_ptr<compressed_representation> bitextract_compressor::compress(
                                                    stream,
                                                    mr);
 
-    launch_bitextract_field(column, field_col->mutable_view(), lo_bit, field.bits, stream.value());
+    launch_bitextract_field(column, field_col->mutable_view(), lo_bit, field.bits, stream.get());
 
     field_cols.push_back(std::move(field_col));
     offset_from_msb += field.bits;
   }
 
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   throw_if_cuda_error(cudaGetLastError(), "bitextract compress sync");
 
   // Build the spec result to store in the representation.

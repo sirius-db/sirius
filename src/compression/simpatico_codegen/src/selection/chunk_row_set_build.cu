@@ -122,7 +122,7 @@ __global__ void scatter_blocks_kernel(std::int32_t const* __restrict__ row_ids,
 chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
                                         std::int64_t num_ids,
                                         std::int64_t num_rows,
-                                        rmm::cuda_stream_view stream,
+                                        ::cuda::stream_ref stream,
                                         rmm::device_async_resource_ref mr)
 {
   if (num_rows <= 0) {
@@ -155,9 +155,9 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
   auto* boundary = static_cast<std::uint32_t*>(boundary_buf.data());
   auto* rank     = static_cast<std::uint32_t*>(rank_buf.data());
   auto* bad      = static_cast<std::uint32_t*>(bad_buf.data());
-  throw_on_cuda(cudaMemsetAsync(bad, 0, sizeof(std::uint32_t), stream.value()), "bad flag clear");
+  throw_on_cuda(cudaMemsetAsync(bad, 0, sizeof(std::uint32_t), stream.get()), "bad flag clear");
 
-  row_ids_scan_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.value()>>>(
+  row_ids_scan_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.get()>>>(
     row_ids,
     num_ids,
     num_rows,
@@ -168,27 +168,25 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
 
   std::size_t tmp_bytes = 0;
   throw_on_cuda(cub::DeviceScan::InclusiveSum(
-                  nullptr, tmp_bytes, boundary, rank, static_cast<int>(num_ids), stream.value()),
+                  nullptr, tmp_bytes, boundary, rank, static_cast<int>(num_ids), stream.get()),
                 "boundary scan probe");
   rmm::device_buffer tmp(tmp_bytes, stream, mr);
   throw_on_cuda(cub::DeviceScan::InclusiveSum(
-                  tmp.data(), tmp_bytes, boundary, rank, static_cast<int>(num_ids), stream.value()),
+                  tmp.data(), tmp_bytes, boundary, rank, static_cast<int>(num_ids), stream.get()),
                 "boundary scan");
 
   // The one host sync: T is the grid, and a grid is a host-side value. The
   // validity flag rides along on the same sync rather than costing a second.
   std::uint32_t touched = 0;
   std::uint32_t invalid = 0;
-  throw_on_cuda(cudaMemcpyAsync(&touched,
-                                rank + (num_ids - 1),
-                                sizeof(std::uint32_t),
-                                cudaMemcpyDeviceToHost,
-                                stream.value()),
-                "num_touched D2H");
   throw_on_cuda(
-    cudaMemcpyAsync(&invalid, bad, sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.value()),
+    cudaMemcpyAsync(
+      &touched, rank + (num_ids - 1), sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
+    "num_touched D2H");
+  throw_on_cuda(
+    cudaMemcpyAsync(&invalid, bad, sizeof(std::uint32_t), cudaMemcpyDeviceToHost, stream.get()),
     "validity D2H");
-  throw_on_cuda(cudaStreamSynchronize(stream.value()), "num_touched sync");
+  throw_on_cuda(cudaStreamSynchronize(stream.get()), "num_touched sync");
 
   if (invalid != 0u) {
     throw std::runtime_error(
@@ -201,7 +199,7 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
   out.block_offsets =
     rmm::device_buffer((static_cast<std::size_t>(touched) + 1) * sizeof(std::uint32_t), stream, mr);
 
-  scatter_blocks_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.value()>>>(
+  scatter_blocks_kernel<<<grid_for(num_ids, kBlock), kBlock, 0, stream.get()>>>(
     row_ids,
     num_ids,
     boundary,

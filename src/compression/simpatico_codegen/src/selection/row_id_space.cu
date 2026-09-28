@@ -145,13 +145,13 @@ __global__ void to_local_kernel(std::uint64_t const* __restrict__ ids,
 
 sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                          std::int64_t count,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   sorted_unique_ids out;
   out.original_count = count;
   out.count_dev      = rmm::device_buffer(sizeof(std::int32_t), stream, mr);
-  throw_on_cuda(cudaMemsetAsync(out.count_dev.data(), 0, sizeof(std::int32_t), stream.value()),
+  throw_on_cuda(cudaMemsetAsync(out.count_dev.data(), 0, sizeof(std::int32_t), stream.get()),
                 "count clear");
   if (count == 0) { return out; }
   if (count < 0 || ids == nullptr) {
@@ -173,7 +173,7 @@ sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
   rmm::device_buffer flag(static_cast<std::size_t>(count) * sizeof(std::uint32_t), stream, mr);
   rmm::device_buffer rank(static_cast<std::size_t>(count) * sizeof(std::uint32_t), stream, mr);
 
-  iota_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.value()>>>(
+  iota_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.get()>>>(
     static_cast<std::int32_t*>(pos.data()), count);
   throw_on_cuda(cudaPeekAtLastError(), "iota launch");
 
@@ -187,7 +187,7 @@ sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                                 static_cast<int>(count),
                                                 0,
                                                 64,
-                                                stream.value()),
+                                                stream.get()),
                 "sort probe");
   rmm::device_buffer tmp(tmp_bytes, stream, mr);
   throw_on_cuda(cub::DeviceRadixSort::SortPairs(tmp.data(),
@@ -199,10 +199,10 @@ sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                                 static_cast<int>(count),
                                                 0,
                                                 64,
-                                                stream.value()),
+                                                stream.get()),
                 "sort");
 
-  first_occurrence_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.value()>>>(
+  first_occurrence_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.get()>>>(
     static_cast<std::uint64_t const*>(sorted_ids.data()),
     count,
     static_cast<std::uint32_t*>(flag.data()));
@@ -214,7 +214,7 @@ sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                               static_cast<std::uint32_t const*>(flag.data()),
                                               static_cast<std::uint32_t*>(rank.data()),
                                               static_cast<int>(count),
-                                              stream.value()),
+                                              stream.get()),
                 "unique scan probe");
   rmm::device_buffer scan_tmp(scan_bytes, stream, mr);
   throw_on_cuda(cub::DeviceScan::InclusiveSum(scan_tmp.data(),
@@ -222,10 +222,10 @@ sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                               static_cast<std::uint32_t const*>(flag.data()),
                                               static_cast<std::uint32_t*>(rank.data()),
                                               static_cast<int>(count),
-                                              stream.value()),
+                                              stream.get()),
                 "unique scan");
 
-  compact_and_restore_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.value()>>>(
+  compact_and_restore_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.get()>>>(
     static_cast<std::uint64_t const*>(sorted_ids.data()),
     static_cast<std::int32_t const*>(sorted_pos.data()),
     static_cast<std::uint32_t const*>(rank.data()),
@@ -246,7 +246,7 @@ std::vector<std::int64_t> split_sorted_ids_by_batch(
   std::int32_t const* count_dev,
   std::vector<std::int64_t> const& batch_row_start,
   std::int64_t* count_out,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (batch_row_start.size() < 2) {
@@ -263,14 +263,12 @@ std::vector<std::int64_t> split_sorted_ids_by_batch(
   auto const bounds_bytes = static_cast<std::size_t>(num_bounds) * sizeof(std::int64_t);
   rmm::device_buffer starts_dev(bounds_bytes, stream, mr);
   rmm::device_buffer batch_dev(bounds_bytes, stream, mr);
-  throw_on_cuda(cudaMemcpyAsync(batch_dev.data(),
-                                batch_row_start.data(),
-                                bounds_bytes,
-                                cudaMemcpyHostToDevice,
-                                stream.value()),
-                "batch starts H2D");
+  throw_on_cuda(
+    cudaMemcpyAsync(
+      batch_dev.data(), batch_row_start.data(), bounds_bytes, cudaMemcpyHostToDevice, stream.get()),
+    "batch starts H2D");
 
-  lower_bound_kernel<<<grid_for(num_bounds, kBlock), kBlock, 0, stream.value()>>>(
+  lower_bound_kernel<<<grid_for(num_bounds, kBlock), kBlock, 0, stream.get()>>>(
     sorted_ids,
     count_dev,
     max_count,
@@ -283,15 +281,15 @@ std::vector<std::int64_t> split_sorted_ids_by_batch(
   std::int32_t unique_count = 0;
   throw_on_cuda(
     cudaMemcpyAsync(
-      starts.data(), starts_dev.data(), bounds_bytes, cudaMemcpyDeviceToHost, stream.value()),
+      starts.data(), starts_dev.data(), bounds_bytes, cudaMemcpyDeviceToHost, stream.get()),
     "batch bounds D2H");
   if (count_dev != nullptr) {
     throw_on_cuda(
       cudaMemcpyAsync(
-        &unique_count, count_dev, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream.value()),
+        &unique_count, count_dev, sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream.get()),
       "unique count D2H");
   }
-  throw_on_cuda(cudaStreamSynchronize(stream.value()), "batch bounds sync");
+  throw_on_cuda(cudaStreamSynchronize(stream.get()), "batch bounds sync");
 
   if (count_out != nullptr) {
     *count_out = count_dev != nullptr ? static_cast<std::int64_t>(unique_count) : max_count;
@@ -303,13 +301,13 @@ void global_slice_to_local(std::uint64_t const* ids,
                            std::int64_t count,
                            std::int64_t batch_row_start,
                            std::int32_t* out_local,
-                           rmm::cuda_stream_view stream)
+                           ::cuda::stream_ref stream)
 {
   if (count == 0) { return; }
   if (count < 0 || ids == nullptr || out_local == nullptr) {
     throw std::runtime_error("row_id_space: local conversion over unbound buffers");
   }
-  to_local_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.value()>>>(
+  to_local_kernel<<<grid_for(count, kBlock), kBlock, 0, stream.get()>>>(
     ids, count, batch_row_start, out_local);
   throw_on_cuda(cudaPeekAtLastError(), "to_local launch");
 }

@@ -32,7 +32,7 @@ namespace op {
 
 std::shared_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   const std::vector<cucascade::read_only_data_batch>& input,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -58,7 +58,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   const std::vector<cucascade::read_only_data_batch>& input,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -157,7 +157,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   const std::vector<cucascade::read_only_data_batch>& input,
   int num_group_cols,
   const std::vector<cudf::aggregation::Kind>& aggregates,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -303,7 +303,7 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   const std::vector<int>& order_key_idx,
   const std::vector<cudf::order>& column_order,
   const std::vector<cudf::null_order>& null_precedence,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {

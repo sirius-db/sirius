@@ -244,7 +244,7 @@ routing_observations collect_routing_observations(
 
 sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager)
 {
-  return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+  return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::ioctx> {
     auto ds = manager.create_datasource(path);
     if (!ds) {
       throw std::runtime_error("test datasource resolver: no backend supports path: " +
@@ -259,11 +259,10 @@ sirius::planner::query make_empty_query()
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = sirius::make_query_id(1);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
-  return sirius::planner::query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo);
+  return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                                tctx->context(),
+                                query_id,
+                                tinfo);
 }
 
 struct range_fault_policy {
@@ -537,7 +536,7 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
   auto const uri          = std::string{"s3://routing-bucket/data.parquet"};
   std::atomic<std::size_t> ready{0};
   std::atomic<bool> go{false};
-  std::vector<std::shared_ptr<sirius::io::sirius_ioctx>> ioctxs(kThreads);
+  std::vector<std::shared_ptr<sirius::io::ioctx>> ioctxs(kThreads);
   std::vector<std::exception_ptr> errors(kThreads);
   std::vector<std::thread> threads;
   threads.reserve(kThreads);

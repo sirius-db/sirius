@@ -4,8 +4,9 @@
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
@@ -31,7 +32,7 @@ namespace simpatico {
 [[nodiscard]] std::unique_ptr<cudf::column> make_constant_width_offsets(
   cudf::size_type rows,
   std::int32_t width,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 }  // namespace simpatico

@@ -31,6 +31,7 @@
 
 #include <catch.hpp>
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 #include <cstddef>
 #include <string>
@@ -145,6 +146,18 @@ TEST_CASE("cache_entry_info: parquet different file set misses", "[scan][can_ser
   parquet_ingestible_table_info two_files;
   fill(two_files, {"a.parquet", "b.parquet"}, {0});
   REQUIRE(pinned.can_serve_with_columns(two_files).empty());
+}
+
+TEST_CASE("cache_entry_info: parquet virtual columns always bypass a matching pin",
+          "[scan][can_serve][virtual_columns]")
+{
+  auto const filename = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+  auto pinned         = parquet_cache({"a.parquet"}, {0, filename});
+  parquet_ingestible_table_info scan;
+  fill(scan, {"a.parquet"}, {0, filename});
+
+  REQUIRE(scan.has_requested_user_virtual_columns());
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
 }
 
 TEST_CASE("cache_entry_info: duckdb same-table subset request hits with a gather projection",

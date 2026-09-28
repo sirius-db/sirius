@@ -39,14 +39,14 @@ pinned_staging_slab& thread_pinned_staging()
 void read_device_bytes_completed(void* destination,
                                  void const* source,
                                  std::size_t bytes,
-                                 rmm::cuda_stream_view stream)
+                                 ::cuda::stream_ref stream)
 {
   void* const staging = thread_pinned_staging().reserve(bytes);
   throw_if_cuda_error(
     cudaMemcpyAsync(
-      staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.value()),
+      staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.get()),
     "host observation: device-to-host copy");
-  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "host observation: stream wait");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "host observation: stream wait");
   if (staging) std::memcpy(destination, staging, bytes);
 }
 

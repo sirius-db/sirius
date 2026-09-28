@@ -9,26 +9,42 @@ nvcomp-Cascaded, bitcomp, ANS, bitextract/bitjoin — specified via a human-read
 ## Requirements
 
 - NVIDIA GPU (Turing or newer)
-- [pixi](https://prefix.dev/) (or conda)
+- [pixi](https://prefix.dev/)
 - CUDA 12.9 or CUDA 13.x
 
 ## Quick start
 
+Simpatico is built and tested as part of Sirius. From the Sirius repository root:
+
 ```bash
-# From the simpatico_codegen/ directory:
-pixi install          # install all C++ deps (libcudf, nvcomp, CUDA toolkit, cmake)
-pixi run build        # cmake configure + build
-pixi run test         # ctest
-pixi run simpatico -- --help   # show CLI help
+git submodule update --init --recursive
+pixi run make
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[compression]"
 ```
 
-## Building manually (inside pixi shell)
+On CUDA 12 systems, add `-e cuda12` to each `pixi run` command and use `pixi shell -e cuda12` instead of `pixi shell`.
+
+## Standalone CLI and tests
+
+The standalone build produces the `simpatico` CLI and the dedicated Simpatico CTest suite.
+It uses the Sirius repository's default CUDA 13 Pixi environment.
 
 ```bash
+# From the Sirius repository root:
+cd src/compression/simpatico_codegen
+pixi run cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+pixi run cmake --build build --parallel
+pixi run ctest --test-dir build --output-on-failure
+pixi run ./build/simpatico --help
+```
+
+To invoke `simpatico` directly for an interactive session, activate the environment once:
+
+```bash
+# From the Sirius repository root:
 pixi shell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-cd build && ctest --output-on-failure
+cd src/compression/simpatico_codegen
+./build/simpatico --help
 ```
 
 ## CLI: `simpatico`
@@ -39,8 +55,9 @@ simpatico <mode> [options]
 Modes:
   benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)
   explore     BFS cascade search for the best plan for a single column
-  compress    Compress input to a .hpln file
-  decompress  Decompress a .hpln file to Parquet
+  compress    Compress input to a .hpln file (--verify round-trips it)
+  decompress  Decompress a .hpln file to Parquet (--verify checks vs source)
+  plan        Print each column's compression plan (DSL) from a .hpln file
 ```
 
 Run `simpatico <mode> --help` for per-mode options.
@@ -49,13 +66,14 @@ Run `simpatico <mode> --help` for per-mode options.
 
 ```bash
 # Find the best plan for column 0 of a Parquet file
-simpatico explore --input data.parquet --col 0
+pixi run ./build/simpatico explore --input data.parquet --col 0
 
-# All columns of a TPC-H .tbl file (pipe-separated, no header)
-simpatico explore --input lineitem.tbl --beam-width 200 --max-depth 8
+# All columns of a Parquet file
+pixi run ./build/simpatico explore --input data.parquet \
+    --beam-width 200 --max-depth 8 > data.plan
 
 # Binary i64 column
-simpatico explore --input prices.bin --dtype i64
+pixi run ./build/simpatico explore --input prices.bin --dtype i64
 ```
 
 Output is a plan DSL block per column, separated by `---`.
@@ -63,27 +81,35 @@ Output is a plan DSL block per column, separated by `---`.
 ### Compress
 
 ```bash
-simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln
 # --verify decompresses in-memory and checks the round-trip matches the input
-simpatico compress --input data.parquet --plan plans/example_plans.txt --out data.hpln --verify
+pixi run ./build/simpatico compress \
+    --input data.parquet --plan data.plan --out data.hpln --verify
 ```
 
 ### Decompress
 
 ```bash
-simpatico decompress --input data.hpln --out data_out.parquet
-# --verify checks the decompressed output byte-for-byte against a source file
-simpatico decompress --input data.hpln --verify data.parquet
+pixi run ./build/simpatico decompress --input data.hpln --out data_out.parquet
+
+# --verify checks the decompressed table against a source file
+pixi run ./build/simpatico decompress --input data.hpln --verify data.parquet
+```
+
+### Plan
+
+```bash
+# Print the plans reconstructed from the serialized file
+pixi run ./build/simpatico plan --input data.hpln
 ```
 
 ### Benchmark
 
 ```bash
-simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+pixi run ./build/simpatico benchmark --input data.parquet --plan data.plan \
     --warmup 5 --iters 20
 
 # Full-table parallel mode (8 threads)
-simpatico benchmark --input data.parquet --plan plans/intraday_balanced.txt \
+pixi run ./build/simpatico benchmark --input data.parquet --plan data.plan \
     --mode full-table --threads 8 --csv-out results.csv
 ```
 
@@ -215,6 +241,6 @@ the on-disk cache is disabled automatically (the in-memory cache still applies).
 ## Running tests
 
 ```bash
-pixi run test          # full ctest
-cd build && ctest -R roundtrip   # run a specific test by name regex
+pixi run ctest --test-dir build --output-on-failure
+pixi run ctest --test-dir build -R roundtrip --output-on-failure
 ```

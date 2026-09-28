@@ -74,9 +74,8 @@ constexpr std::string_view kHashJoinBuildPort = "build";
 /// @param probe_as_pipeline When true (build_probe strategy), an edge feeding the probe side of a
 ///        HASH_JOIN consumer is recorded as a PIPELINE barrier regardless of the port's real
 ///        barrier, so the probe pipeline extends through the join.
-pipeline_dag build_dag(
-  const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  bool probe_as_pipeline)
+pipeline_dag build_dag(const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+                       bool probe_as_pipeline)
 {
   pipeline_dag dag;
   for (const auto& producer_sp : pipelines) {
@@ -146,7 +145,7 @@ std::shared_ptr<const query_index> query_index::build_index(const query& q,
 }
 
 std::shared_ptr<const query_index> query_index::build_index(
-  const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+  const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
   build_index_options options)
 {
   // barrier_order and build_probe both honor barriers when cutting; only pipeline_order ignores

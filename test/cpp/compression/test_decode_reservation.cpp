@@ -27,7 +27,7 @@ namespace {
 struct attached_decode_reservation {
   cucascade::memory::reservation_aware_resource_adaptor& allocator;
   simpatico::stream_pool& streams;
-  rmm::cuda_stream_view attachment_stream;
+  ::cuda::stream_ref attachment_stream;
 
   ~attached_decode_reservation()
   {
@@ -82,7 +82,7 @@ TEST_CASE("Simpatico decode preserves reservation OOM and releases partial outpu
   REQUIRE(allocator != nullptr);
   simpatico::stream_pool streams;
   REQUIRE(streams.init(3));
-  auto const attachment_stream = rmm::cuda_stream_view{streams.streams.front()};
+  auto const attachment_stream = ::cuda::stream_ref{streams.streams.front()};
   auto reservation             = space.make_reservation(column_bytes);
   REQUIRE(reservation != nullptr);
   REQUIRE(
@@ -187,7 +187,7 @@ TEST_CASE("Simpatico decode charges one request's temporaries beyond earlier out
   REQUIRE(allocator != nullptr);
   simpatico::stream_pool streams;
   REQUIRE(streams.init(columns));
-  auto const attachment_stream = rmm::cuda_stream_view{streams.streams.front()};
+  auto const attachment_stream = ::cuda::stream_ref{streams.streams.front()};
   auto reservation             = space.make_reservation(column_bytes);
   REQUIRE(reservation != nullptr);
   REQUIRE(

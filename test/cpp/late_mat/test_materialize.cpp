@@ -32,10 +32,10 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -64,7 +64,7 @@ struct fake_pin {
   std::vector<std::unique_ptr<cudf::column>> batches;
   pinned_column_view view;
 
-  fake_pin(std::vector<std::int64_t> const& batch_rows, rmm::cuda_stream_view stream)
+  fake_pin(std::vector<std::int64_t> const& batch_rows, ::cuda::stream_ref stream)
   {
     std::int64_t next = 0;
     for (auto const rows : batch_rows) {
@@ -80,10 +80,10 @@ struct fake_pin {
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
       batches.push_back(std::move(col));
     }
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
 
     view.dtype = cudf::data_type{cudf::type_id::INT32};
     for (std::size_t b = 0; b < batches.size(); ++b) {
@@ -102,7 +102,7 @@ struct fake_string_pin {
   std::vector<std::unique_ptr<cudf::column>> batches;
   pinned_column_view view;
 
-  fake_string_pin(std::vector<std::int64_t> const& batch_rows, rmm::cuda_stream_view stream)
+  fake_string_pin(std::vector<std::int64_t> const& batch_rows, ::cuda::stream_ref stream)
   {
     auto const mr     = rmm::mr::get_current_device_resource_ref();
     std::int64_t next = 0;
@@ -124,11 +124,11 @@ struct fake_string_pin {
                       offsets.data(),
                       offsets.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
       rmm::device_buffer chars_buf(chars.size(), stream, mr);
       cudaMemcpyAsync(
-        chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value());
-      cudaStreamSynchronize(stream.value());
+        chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get());
+      cudaStreamSynchronize(stream.get());
 
       batches.push_back(cudf::make_strings_column(static_cast<cudf::size_type>(rows),
                                                   std::move(offsets_col),
@@ -158,7 +158,7 @@ std::vector<std::string> read_back_strings(cudf::column_view const& col)
   std::string chars(static_cast<std::size_t>(offsets.back() - offsets.front()), '\0');
   if (!chars.empty()) {
     cudaMemcpy(chars.data(),
-               scv.chars_begin(rmm::cuda_stream_default) + offsets.front(),
+               scv.chars_begin(::cuda::stream_ref{cudaStream_t{}}) + offsets.front(),
                chars.size(),
                cudaMemcpyDeviceToHost);
   }
@@ -183,7 +183,7 @@ std::vector<std::int32_t> read_back(cudf::column_view const& col)
   return host;
 }
 
-rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_stream_view stream)
+rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, ::cuda::stream_ref stream)
 {
   rmm::device_buffer buf(
     host.size() * sizeof(std::uint64_t), stream, rmm::mr::get_current_device_resource_ref());
@@ -192,8 +192,8 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_
                     host.data(),
                     host.size() * sizeof(std::uint64_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   return buf;
 }
@@ -202,7 +202,7 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_
 
 TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{3 * kChunk, 2 * kChunk, 4 * kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -218,7 +218,7 @@ TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat]
                                                 static_cast<std::int64_t>(ids.size()),
                                                 true});
   auto const column = materialize(pin.view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   std::vector<std::int32_t> expect;
   for (auto id : ids) {
@@ -232,7 +232,7 @@ TEST_CASE("a sorted selection materializes its rows in table order", "[late_mat]
 TEST_CASE("an unordered selection with repeats comes back in the caller's order",
           "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{4 * kChunk, 5 * kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -248,7 +248,7 @@ TEST_CASE("an unordered selection with repeats comes back in the caller's order"
                                                 false});
 
   auto const column = materialize(pin.view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   // One row per id the CALLER passed, each holding that id — repeats and all.
   std::vector<std::int32_t> expect;
@@ -267,7 +267,7 @@ TEST_CASE("an unordered selection with repeats comes back in the caller's order"
 TEST_CASE("a multi-batch string column takes the canonical path and still answers in order",
           "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{1024, 512, 700};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -283,7 +283,7 @@ TEST_CASE("a multi-batch string column takes the canonical path and still answer
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const column = materialize(pin.view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(prepared.has_canonical());  // variable width, so no raw path
   std::vector<std::string> expect;
@@ -295,7 +295,7 @@ TEST_CASE("a multi-batch string column takes the canonical path and still answer
 
 TEST_CASE("a dense batch is copied whole and still lands in order", "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{2 * kChunk, 2 * kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -316,7 +316,7 @@ TEST_CASE("a dense batch is copied whole and still lands in order", "[late_mat][
                                                 true});
 
   auto const column = materialize(pin.view, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   std::vector<std::int32_t> expect;
   for (auto id : ids) {
@@ -328,7 +328,7 @@ TEST_CASE("a dense batch is copied whole and still lands in order", "[late_mat][
 TEST_CASE("an empty selection materializes an empty column of the right type",
           "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{kChunk, kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);
@@ -343,7 +343,7 @@ TEST_CASE("an empty selection materializes an empty column of the right type",
 TEST_CASE("a column whose batches disagree with the prepared layout is refused",
           "[late_mat][materialize]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   std::vector<std::int64_t> const batch_rows{kChunk, kChunk};
   auto const layout = pinned_table_layout::from_batch_rows(batch_rows);

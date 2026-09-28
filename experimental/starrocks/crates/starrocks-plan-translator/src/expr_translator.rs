@@ -496,10 +496,7 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
         None
     };
     let mut ifs = Vec::new();
-    loop {
-        let Some(condition) = children.next() else {
-            break;
-        };
+    while let Some(condition) = children.next() {
         let then = children
             .next()
             .ok_or_else(|| TranslateError::malformed("CASE_EXPR when without then"))?;

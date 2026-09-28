@@ -40,7 +40,7 @@ std::unique_ptr<cudf::column> restore_type(std::unique_ptr<cudf::column> column,
 //===----------------------------------------------------------------------===//
 // decode_frame
 //===----------------------------------------------------------------------===//
-decode_frame::decode_frame(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) noexcept
+decode_frame::decode_frame(::cuda::stream_ref stream, rmm::device_async_resource_ref mr) noexcept
   : stream_(stream), mr_(mr)
 {
 }
@@ -64,7 +64,7 @@ void decode_frame::read_bytes(void* destination, void const* source, std::size_t
   try {
     read_device_bytes_completed(destination, source, bytes, stream_);
   } catch (...) {
-    stream_.synchronize_no_throw();
+    (void)cudaStreamSynchronize(stream_.get());
     throw;
   }
 }
@@ -85,7 +85,7 @@ struct decode_session::impl {
     decode_frame frame;
     std::variant<std::monostate, column_decode_request, mask_decode_request> request;
     template <typename Request>
-    submitted_request(rmm::cuda_stream_view stream,
+    submitted_request(::cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr,
                       Request const& value)
       : frame(stream, mr), request(std::in_place_type<Request>, value)
@@ -95,7 +95,7 @@ struct decode_session::impl {
   static_assert(!std::is_copy_constructible_v<submitted_request> &&
                 !std::is_move_constructible_v<submitted_request>);
 
-  std::vector<rmm::cuda_stream_view> streams;
+  std::vector<::cuda::stream_ref> streams;
   rmm::device_async_resource_ref mr;
   std::thread::id thread = std::this_thread::get_id();
   // List nodes keep each frame at a stable address while its decoder or a test refers to it.
@@ -106,7 +106,7 @@ struct decode_session::impl {
   bool submitted        = false;
   bool drained          = false;
 
-  impl(std::span<rmm::cuda_stream_view const> supplied, rmm::device_async_resource_ref resource)
+  impl(std::span<const ::cuda::stream_ref> supplied, rmm::device_async_resource_ref resource)
     : streams(supplied.begin(), supplied.end()), mr(resource)
   {
     if (streams.empty()) throw std::invalid_argument("decode_session requires a stream");
@@ -122,7 +122,7 @@ struct decode_session::impl {
   [[nodiscard]] bool first_stream_handle(std::size_t lane) const noexcept
   {
     for (std::size_t earlier = 0; earlier < lane; ++earlier)
-      if (streams[earlier].value() == streams[lane].value()) return false;
+      if (streams[earlier].get() == streams[lane].get()) return false;
     return true;
   }
 
@@ -146,10 +146,10 @@ struct decode_session::impl {
     for (std::size_t lane = 0; lane < streams.size(); ++lane) {
       if (!first_stream_handle(lane)) continue;
       auto const stream = streams[lane];
-      auto status       = cudaStreamQuery(stream.value());
+      auto status       = cudaStreamQuery(stream.get());
       if (status != cudaSuccess) {
         if (status != cudaErrorNotReady && first == cudaSuccess) first = status;
-        status = cudaStreamSynchronize(stream.value());
+        status = cudaStreamSynchronize(stream.get());
         if (status != cudaSuccess && first == cudaSuccess) first = status;
       }
     }
@@ -170,7 +170,7 @@ struct decode_session::impl {
 //===----------------------------------------------------------------------===//
 // decode_session
 //===----------------------------------------------------------------------===//
-decode_session::decode_session(std::span<rmm::cuda_stream_view const> streams,
+decode_session::decode_session(std::span<const ::cuda::stream_ref> streams,
                                rmm::device_async_resource_ref mr)
   : state_(std::make_unique<impl>(streams, mr))
 {

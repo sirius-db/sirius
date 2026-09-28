@@ -4,7 +4,7 @@ This document covers the task creation subsystem: how the system decides when an
 
 ## Overview
 
-**File:** `src/include/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
+**File:** `src/creator/task_creator.hpp`, `src/creator/task_creator.cpp`
 
 The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
 
@@ -43,7 +43,7 @@ All map access is protected by `_global_state_mutex`.
 
 ## `TaskCreationHint` Enum
 
-**File:** `src/include/op/sirius_physical_operator.hpp`
+**File:** `src/op/sirius_physical_operator.hpp`
 
 ```cpp
 enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
@@ -217,7 +217,7 @@ The `mark_task_created()` call before data popping prevents a race condition whe
 
 ### Look-ahead task creation
 
-**Files:** `src/include/creator/config.hpp`, `src/creator/task_creator.cpp`
+**Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
 
 The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds a `_lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the queue from `_index_of_next_lookahead`, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
 
@@ -269,10 +269,10 @@ Called during `drain_after_error()` to cleanly shut down:
 
 | File | Purpose |
 |------|---------|
-| `src/include/creator/task_creator.hpp` | Task creator interface |
-| `src/include/creator/config.hpp` | `task_creator_config`, `request_type` (`active` / `lookahead`) |
+| `src/creator/task_creator.hpp` | Task creator interface |
+| `src/creator/config.hpp` | `task_creator_config`, `request_type` (`active` / `lookahead`) |
 | `src/creator/task_creator.cpp` | Manager loop, hint chain, look-ahead queue, task dispatch |
-| `src/include/op/sirius_physical_operator.hpp` | Base `get_next_task_hint()`, `get_next_task_input_data()` |
+| `src/op/sirius_physical_operator.hpp` | Base `get_next_task_hint()`, `get_next_task_input_data()` |
 | `src/op/sirius_physical_operator.cpp` | Base implementations |
 | `src/op/sirius_physical_hash_join.cpp` | BUILD_PROBE hint/data overrides |
 | `src/op/sirius_physical_partition.cpp` | Sibling sync, adaptive count |

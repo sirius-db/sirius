@@ -168,14 +168,14 @@ class mock_gpu_pipeline : public sirius::pipeline::sirius_pipeline {
  */
 struct source_pipeline_fixture {
   duckdb::unique_ptr<sirius_physical_operator> upstream_producer;
-  duckdb::shared_ptr<mock_gpu_pipeline> pipeline;
+  std::shared_ptr<mock_gpu_pipeline> pipeline;
 };
 
 source_pipeline_fixture create_unfinished_source_pipeline()
 {
   source_pipeline_fixture fixture;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  fixture.pipeline          = duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+  fixture.pipeline          = std::make_shared<mock_gpu_pipeline>(build_ctx);
   fixture.upstream_producer = duckdb::make_uniq<sirius_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
@@ -191,7 +191,7 @@ source_pipeline_fixture create_unfinished_source_pipeline()
  */
 void attach_concat_port(sirius_physical_concat& concat_op,
                         cucascade::shared_data_repository& repo,
-                        duckdb::shared_ptr<mock_gpu_pipeline> src_pipeline = nullptr)
+                        std::shared_ptr<mock_gpu_pipeline> src_pipeline = nullptr)
 {
   auto port           = std::make_unique<sirius_physical_operator::port>();
   port->type          = MemoryBarrierType::FULL;
@@ -1250,7 +1250,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       // Create a dedicated CUDA stream for this thread
       cudaStream_t raw_stream;
       cudaStreamCreate(&raw_stream);
-      rmm::cuda_stream_view stream(raw_stream);
+      ::cuda::stream_ref stream(raw_stream);
 
       auto outputs =
         concat_op.execute(partitioned_operator_data(thread_inputs[thread_id], 0), default_stream());

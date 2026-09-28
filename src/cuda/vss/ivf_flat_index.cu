@@ -71,7 +71,7 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_batches(
   std::uint32_t n_lists,
   cuvs::distance::DistanceType metric,
   rmm::device_async_resource_ref index_mr,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (batches.empty()) {
     throw std::invalid_argument("build_ivf_flat_index_from_batches: no batches to index");
@@ -162,7 +162,7 @@ ann_result search_ivf_flat_index(any_cuvs_index const& index,
                                  std::int64_t dim,
                                  std::int64_t k,
                                  std::uint32_t n_probes,
-                                 rmm::cuda_stream_view stream,
+                                 ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr)
 {
   auto const* holder = dynamic_cast<cuvs_index_holder<ivf_flat_index_t> const*>(&index);

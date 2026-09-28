@@ -49,7 +49,7 @@ There is no bounded channel and no channel-level backpressure; see
 
 ## `exec::batch_stream`
 
-**Files:** `src/include/exec/batch_stream.hpp`, `src/exec/batch_stream.cpp`
+**Files:** `src/exec/batch_stream.hpp`, `src/exec/batch_stream.cpp`
 
 One direction of batch flow: N declared senders push into one repository; consumers pull, poll,
 or block.
@@ -158,7 +158,7 @@ Reading S1–S5 against the diagram:
 
 ## `STREAMING_SOURCE` — the input boundary
 
-**Files:** `src/include/op/sirius_physical_streaming_source.hpp`,
+**Files:** `src/op/sirius_physical_streaming_source.hpp`,
 `src/op/sirius_physical_streaming_source.cpp`
 
 Wraps one `batch_stream` constructed with the fragment's expected sender set. Remote producers
@@ -226,7 +226,7 @@ pipeline finish and schedules its consumers.
 
 ## `STREAMING_SINK` — the output boundary
 
-**Files:** `src/include/op/sirius_physical_streaming_sink.hpp`,
+**Files:** `src/op/sirius_physical_streaming_sink.hpp`,
 `src/op/sirius_physical_streaming_sink.cpp`
 
 A pipeline-terminal operator. `sink()` pushes each output batch into an output `batch_stream`;
@@ -300,7 +300,7 @@ Construction invariants:
 
 ## `exec::stream_session` — the id-addressed router
 
-**Files:** `src/include/exec/stream_session.hpp`, `src/exec/stream_session.cpp`
+**Files:** `src/exec/stream_session.hpp`, `src/exec/stream_session.cpp`
 
 ```
 push(stream_id, batch)              // → source.push

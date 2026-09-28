@@ -25,9 +25,9 @@
 
 #include "codegen/selection/chunk_row_set.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -108,14 +108,14 @@ void check_against_reference(char const* what,
                              std::vector<std::int32_t> const& ids,
                              std::int64_t num_rows)
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   device_ids d_ids(ids);
   REQUIRE_MSG(ids.empty() || d_ids.ptr != nullptr, "[%s] could not upload the ids", what);
 
   chunk_row_set_owner built =
     build_chunk_row_set(d_ids.ptr, static_cast<std::int64_t>(ids.size()), num_rows, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   host_csr const ref = reference(ids, num_rows);
   auto const view    = built.view();
@@ -220,7 +220,7 @@ void test_tiny_geometry()
 /// set that reads the wrong rows.
 void expect_rejected(char const* what, std::vector<std::int32_t> const& ids, std::int64_t num_rows)
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   device_ids d_ids(ids);
   bool threw = false;

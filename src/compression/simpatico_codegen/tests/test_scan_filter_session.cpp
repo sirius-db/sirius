@@ -46,7 +46,7 @@ class resource_guard {
 };
 
 std::unique_ptr<cudf::column> sequence(int base,
-                                       rmm::cuda_stream_view stream,
+                                       ::cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   std::vector<std::int32_t> values(row_count);
@@ -57,13 +57,13 @@ std::unique_ptr<cudf::column> sequence(int base,
                         values.data(),
                         values.size() * sizeof(values[0]),
                         cudaMemcpyHostToDevice,
-                        stream.value()));
-  stream.synchronize();
+                        stream.get()));
+  stream.sync();
   return column;
 }
 
 template <typename T>
-std::vector<T> read(cudf::column_view column, rmm::cuda_stream_view stream)
+std::vector<T> read(cudf::column_view column, ::cuda::stream_ref stream)
 {
   std::vector<T> values(column.size());
   // No producer wait/event here: completed public results must be readable on
@@ -72,14 +72,14 @@ std::vector<T> read(cudf::column_view column, rmm::cuda_stream_view stream)
                         column.head<T>(),
                         values.size() * sizeof(T),
                         cudaMemcpyDeviceToHost,
-                        stream.value()));
-  stream.synchronize();
+                        stream.get()));
+  stream.sync();
   return values;
 }
 
 void verify_values(cudf::table_view output,
                    std::vector<std::int32_t> const& rows,
-                   rmm::cuda_stream_view stream)
+                   ::cuda::stream_ref stream)
 {
   expect(output.num_columns() == 2 && output.num_rows() == static_cast<int>(rows.size()),
          "numeric filtered output shape");
@@ -95,7 +95,7 @@ struct probe_failure : std::runtime_error {
 };
 
 void numeric_sources(simpatico::stream_pool& pool,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -144,19 +144,17 @@ void numeric_sources(simpatico::stream_pool& pool,
   output.reset();
 
   auto limit = std::make_shared<cudf::numeric_scalar<std::int32_t>>(20, true, stream, mr);
-  stream.synchronize();
+  stream.sync();
   std::weak_ptr<cudf::numeric_scalar<std::int32_t>> snapshot = limit;
   request.filters.clear();
   request.routes     = {sc::decode_route::full, sc::decode_route::full};
   std::size_t probes = 0;
   request.membership_filters.push_back(
     {0,
-     [limit, &probes, &pool](cudf::column_view keys,
-                             rmm::cuda_stream_view lane,
-                             rmm::device_async_resource_ref resource) {
-       expect(
-         std::find(pool.streams.begin(), pool.streams.end(), lane.value()) != pool.streams.end(),
-         "probe uses a supplied lane");
+     [limit, &probes, &pool](
+       cudf::column_view keys, ::cuda::stream_ref lane, rmm::device_async_resource_ref resource) {
+       expect(std::find(pool.streams.begin(), pool.streams.end(), lane.get()) != pool.streams.end(),
+              "probe uses a supplied lane");
        ++probes;
        return cudf::binary_operation(keys,
                                      *limit,
@@ -168,7 +166,7 @@ void numeric_sources(simpatico::stream_pool& pool,
   limit.reset();
   expect(!snapshot.expired(), "membership closure pins immutable snapshot");
   request.membership_filters.push_back(
-    {1, [](cudf::column_view, rmm::cuda_stream_view, rmm::device_async_resource_ref) {
+    {1, [](cudf::column_view, ::cuda::stream_ref, rmm::device_async_resource_ref) {
        return std::unique_ptr<cudf::column>{};
      }});
   std::vector<std::uint32_t> keep((row_count + 31) / 32, 0);
@@ -201,7 +199,7 @@ void numeric_sources(simpatico::stream_pool& pool,
 
   request.membership_filters.front().probe =
     [](cudf::column_view,
-       rmm::cuda_stream_view,
+       ::cuda::stream_ref,
        rmm::device_async_resource_ref) -> std::unique_ptr<cudf::column> { throw probe_failure{}; };
   bool propagated = false;
   try {
@@ -213,15 +211,14 @@ void numeric_sources(simpatico::stream_pool& pool,
   expect(propagated && result.status == sc::scan_filter_status::failed,
          "probe execution failure is not converted to plain decode");
 
-  request.membership_filters.front().probe = [](cudf::column_view keys,
-                                                rmm::cuda_stream_view lane,
-                                                rmm::device_async_resource_ref resource) {
-    return cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                     keys.size(),
-                                     cudf::mask_state::UNALLOCATED,
-                                     lane,
-                                     resource);
-  };
+  request.membership_filters.front().probe =
+    [](cudf::column_view keys, ::cuda::stream_ref lane, rmm::device_async_resource_ref resource) {
+      return cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       keys.size(),
+                                       cudf::mask_state::UNALLOCATED,
+                                       lane,
+                                       resource);
+    };
   bool malformed = false;
   try {
     (void)simpatico::decompress_scan_filter(
@@ -235,7 +232,7 @@ void numeric_sources(simpatico::stream_pool& pool,
 }
 
 void bool8_delivery(simpatico::stream_pool& pool,
-                    rmm::cuda_stream_view stream,
+                    ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr)
 {
   std::vector<std::string> strings(row_count, "other");
@@ -318,7 +315,7 @@ void bool8_delivery(simpatico::stream_pool& pool,
 // do. The phase joins, the index waits, and the cleanup waits must stay correct; results must match
 // the stream_pool overloads; and the call must leave every lane usable.
 void aliased_borrowed_lanes(simpatico::stream_pool& pool,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -330,7 +327,7 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
   // Non-blocking, as production lanes are: no implicit ordering with the legacy default stream.
   rmm::cuda_stream lane{rmm::cuda_stream::flags::non_blocking};
   rmm::cuda_stream out{rmm::cuda_stream::flags::non_blocking};
-  std::array const lanes{lane.view(), out.view(), lane.view(), out.view()};
+  std::array<::cuda::stream_ref, 4> const lanes{lane, out, lane, out};
   std::array<std::size_t, 2> selected{0, 1};
 
   // Two sources on different lanes, a full-width column, and a keep mask exercise every join.
@@ -359,11 +356,11 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
   request.keep_mask_words = nullptr;
   request.keep_mask_rows  = 0;
   cudf::numeric_scalar<std::int32_t> const lower(10005, true, stream, mr);
-  stream.synchronize();
+  stream.sync();
   request.membership_filters.push_back(
     {1,
      [&lanes, &lower](cudf::column_view keys,
-                      rmm::cuda_stream_view assigned,
+                      ::cuda::stream_ref assigned,
                       rmm::device_async_resource_ref resource) {
        expect(std::find(lanes.begin(), lanes.end(), assigned) != lanes.end(),
               "probe uses a borrowed lane");
@@ -420,10 +417,10 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
 
   // The borrowed lanes still accept work after the calls.
   rmm::device_buffer probe(sizeof(std::uint32_t), stream, mr);
-  stream.synchronize();
+  stream.sync();
   for (auto const borrowed : lanes) {
-    check(cudaMemsetAsync(probe.data(), 0, probe.size(), borrowed.value()));
-    check(cudaStreamSynchronize(borrowed.value()));
+    check(cudaMemsetAsync(probe.data(), 0, probe.size(), borrowed.get()));
+    check(cudaStreamSynchronize(borrowed.get()));
   }
 }
 
@@ -431,7 +428,7 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
 // with the hint cleared the same request takes the general route (compacted codes, then a
 // dictionary rebuilt with an unknown width it measures). Both must yield the filtered strings.
 void dict_codes_gather(simpatico::stream_pool& pool,
-                       rmm::cuda_stream_view stream,
+                       ::cuda::stream_ref stream,
                        rmm::device_async_resource_ref mr)
 {
   std::vector<std::string> const keys{"AB", "CD", "EF"};

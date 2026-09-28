@@ -37,9 +37,9 @@
 #include "test_utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <array>
@@ -69,7 +69,7 @@ int g_failures = 0;
 // These tests deliberately exercise raw launchers with externally owned buffers. The session owns
 // their frame and drains both normal and exceptional paths before any test owner can unwind.
 template <auto Launch, typename... Args>
-bool completed_decode(rmm::cuda_stream_view stream, Args&&... args)
+bool completed_decode(::cuda::stream_ref stream, Args&&... args)
 {
   std::array const streams{stream};
   simpatico::decode_session session{streams, rmm::mr::get_current_device_resource_ref()};
@@ -80,7 +80,7 @@ bool completed_decode(rmm::cuda_stream_view stream, Args&&... args)
 }
 
 template <auto Launch, typename... Args>
-bool rejects_decode_input(rmm::cuda_stream_view stream, Args&&... args)
+bool rejects_decode_input(::cuda::stream_ref stream, Args&&... args)
 {
   try {
     completed_decode<Launch>(stream, std::forward<Args>(args)...);
@@ -235,7 +235,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 {
   const std::int64_t n  = 5 * kChunk + 700;  // partial tail chunk
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   const std::vector<Element> data = gen_data<Element>(n, base, range);
 
@@ -531,7 +531,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
 {
   const std::int64_t n  = 5 * kChunk + 700;
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   // Orderkey-like: monotone with small steps (delta diffs bitpack tightly).
   std::vector<Element> data(static_cast<std::size_t>(n));
@@ -659,7 +659,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   const std::int64_t n        = 3 * kChunk + 511;
   const std::int64_t nc       = codegen::num_chunks_for(n);
   const std::int32_t num_keys = 3;
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   std::vector<std::int32_t> codes(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
@@ -746,7 +746,7 @@ bool run_str_split_masked(bool deep, int arch)
   const std::int64_t n     = 4 * kChunk + 300;            // string rows
   const std::int64_t n_off = n + 1;                       // offsets elements
   const std::int64_t nc    = codegen::num_chunks_for(n);  // row chunks
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
   const char* tag = deep ? "str-deep" : "str-shallow";
 
   // Host strings: offsets cumulative; chars pseudo-random bytes.
@@ -1029,9 +1029,9 @@ bool render_checks()
 bool selection_validation_checks()
 {
   rmm::cuda_stream owned_stream(rmm::cuda_stream::flags::non_blocking);
-  auto const stream = owned_stream.view();
-  auto const mr     = rmm::mr::get_current_device_resource_ref();
-  auto input        = make_int32_table(1, 35, 91);
+  ::cuda::stream_ref const stream = owned_stream;
+  auto const mr                   = rmm::mr::get_current_device_resource_ref();
+  auto input                      = make_int32_table(1, 35, 91);
   // The fixture's default-stream upload must finish before the nonblocking decode stream reads it.
   cudf::get_default_stream().synchronize();
   auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
@@ -1043,11 +1043,11 @@ bool selection_validation_checks()
   rmm::device_buffer device_words(words.data(), words.size() * sizeof(words[0]), stream, mr);
   rmm::device_buffer device_counts(counts.data(), sizeof(counts), stream, mr);
   rmm::device_buffer device_indices(indices.data(), sizeof(indices), stream, mr);
-  stream.synchronize();
+  stream.sync();
   selection_mask mask{static_cast<std::uint32_t*>(device_words.data()),
                       input->num_rows(),
                       2,
-                       static_cast<std::uint32_t*>(device_counts.data())};
+                      static_cast<std::uint32_t*>(device_counts.data())};
   simpatico::decode_selection selection;
   selection.mask               = &mask;
   selection.survivor_count     = 2;
@@ -1131,18 +1131,18 @@ bool selection_validation_checks()
               "str_split mask domain mismatch accepted");
 
   auto refuses_without_work = [&](auto&& operation) {
-    if (cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeGlobal) != cudaSuccess)
+    if (cudaStreamBeginCapture(stream.get(), cudaStreamCaptureModeGlobal) != cudaSuccess)
       throw std::runtime_error("preflight capture failed to start");
     cudaGraph_t graph = nullptr;
     bool refused      = false;
     try {
       refused = operation();
     } catch (...) {
-      (void)cudaStreamEndCapture(stream.value(), &graph);
+      (void)cudaStreamEndCapture(stream.get(), &graph);
       if (graph) (void)cudaGraphDestroy(graph);
       throw;
     }
-    if (cudaStreamEndCapture(stream.value(), &graph) != cudaSuccess)
+    if (cudaStreamEndCapture(stream.get(), &graph) != cudaSuccess)
       throw std::runtime_error("preflight submitted non-capturable work");
     std::size_t nodes         = 0;
     auto const node_status    = cudaGraphGetNodes(graph, nullptr, &nodes);
@@ -1156,7 +1156,7 @@ bool selection_validation_checks()
   bool const selected_equal =
     selected_strings && strings_equal(selected_strings->view(), expected_strings->view(), stream);
   // Complete test readbacks before an assertion can release nonblocking-stream owners.
-  rmm::cuda_stream_default.synchronize();
+  ::cuda::stream_ref{cudaStream_t{}}.sync();
   REQUIRE_MSG(selected_equal, "raw str_split chars lost selected decode support");
   auto& split_plan       = *split.columns[0].plan_tree;
   auto& split_node       = split_plan.nodes[1];
@@ -1184,7 +1184,7 @@ bool selection_validation_checks()
   auto full_strings = simpatico::decompress_column_full(split, 0, stream, mr);
   bool const full_equal =
     full_strings && strings_equal(full_strings->view(), strings->view().column(0), stream);
-  rmm::cuda_stream_default.synchronize();
+  ::cuda::stream_ref{cudaStream_t{}}.sync();
   REQUIRE_MSG(full_equal, "compressed str_split chars full decode mismatch");
 
   auto missing_root = simpatico::plan_tree_from_dsl("input -> bitpack\n");

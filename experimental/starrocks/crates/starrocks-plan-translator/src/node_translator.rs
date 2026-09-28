@@ -11,8 +11,8 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
     AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
-    Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, fetch_rel, function_argument,
-    join_rel, rel, rel_common, sort_field,
+    Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, function_argument, join_rel,
+    rel, rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -180,9 +180,6 @@ fn translate_plan_node(
 ///
 /// `TPlanNode::limit` applies to any node type; a skip offset only appears on sort and exchange
 /// payloads.
-// The deprecated plain offset/count oneof variants share wire tags with their expression
-// counterparts and are the fields DuckDB's Substrait consumer reads.
-#[allow(deprecated)]
 fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
     let offset = node
         .sort_node
@@ -197,17 +194,12 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         row_tuples,
         output_width,
     } = input;
-    // For an offset-only fetch, emit an explicit unlimited count: the consumer reads the plain
-    // count field without checking the oneof, and an unset count would decode as `LIMIT 0`.
-    let count = if node.limit >= 0 { node.limit } else { -1 };
-    let count_mode = Some(fetch_rel::CountMode::Count(count));
-    let offset_mode = (offset != 0).then_some(fetch_rel::OffsetMode::Offset(offset));
     TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Fetch(Box::new(FetchRel {
                 input: Some(Box::new(rel)),
-                offset_mode,
-                count_mode,
+                offset_expr: (offset != 0).then(|| Box::new(i64_literal(offset))),
+                count_expr: (node.limit >= 0).then(|| Box::new(i64_literal(node.limit))),
                 ..Default::default()
             }))),
         },
@@ -473,7 +465,6 @@ fn translate_aggregation(
     } else {
         #[allow(deprecated)]
         let grouping = aggregate_rel::Grouping {
-            grouping_expressions: Vec::new(),
             expression_references: (0..grouping_expressions.len() as u32).collect(),
         };
         vec![grouping]
@@ -1208,6 +1199,20 @@ fn i32_literal(value: i32) -> Expression {
         rex_type: Some(substrait::proto::expression::RexType::Literal(
             substrait::proto::expression::Literal {
                 literal_type: Some(substrait::proto::expression::literal::LiteralType::I32(
+                    value,
+                )),
+                ..Default::default()
+            },
+        )),
+    }
+}
+
+/// Builds an i64 literal for a Substrait fetch expression.
+fn i64_literal(value: i64) -> Expression {
+    Expression {
+        rex_type: Some(substrait::proto::expression::RexType::Literal(
+            substrait::proto::expression::Literal {
+                literal_type: Some(substrait::proto::expression::literal::LiteralType::I64(
                     value,
                 )),
                 ..Default::default()

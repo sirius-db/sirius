@@ -4,7 +4,7 @@ This document covers all Super Sirius physical operators, organized by category.
 
 ## Base Class
 
-**File:** `src/include/op/sirius_physical_operator.hpp`
+**File:** `src/op/sirius_physical_operator.hpp`
 
 `sirius_physical_operator` is the base class for every operator.
 
@@ -39,12 +39,12 @@ See [Task Creator](task-creator.md) for per-operator overrides.
 These operators produce data for pipelines. See [Scan](scan.md) for in-depth coverage.
 
 ### `sirius_physical_table_scan` — `TABLE_SCAN`
-**File:** `src/include/op/sirius_physical_table_scan.hpp`
+**File:** `src/op/sirius_physical_table_scan.hpp`
 
 Base scan operator wrapping a DuckDB table function. Stores column IDs, projection IDs, and optional table filters for predicate pushdown. It exists only as the plan-time carrier: during plan generation it is rewritten into a `GPU_SCAN` source (see below).
 
 ### `sirius_gpu_scan_operator` — `GPU_SCAN`
-**File:** `src/include/op/scan/sirius_gpu_scan_operator.hpp`
+**File:** `src/op/scan/sirius_gpu_scan_operator.hpp`
 
 Unified GPU scan source operator for reading table data from storage. It carries no format-specific code: it pulls pre-built splits off a `split_connector` and delegates per-split materialization to an installed `gpu_ingestible`, one implementation per source format (`parquet_gpu_ingestible` for Parquet, `duckdb_native_gpu_ingestible` for DuckDB-native `.duckdb` tables); pinned-cache hits are served by the scan manager's `cached_databatch_provider`.
 
@@ -53,7 +53,7 @@ The pipeline converter rewrites a DuckDB parquet or DuckDB-native table scan int
 See [Scan](scan.md) for the full scan subsystem (scan manager, `gpu_ingestible`, pinned-table caching, and the IO layer).
 
 ### `sirius_physical_streaming_source` — `STREAMING_SOURCE`
-**File:** `src/include/op/sirius_physical_streaming_source.hpp`
+**File:** `src/op/sirius_physical_streaming_source.hpp`
 
 Source operator that marks the bottom boundary of an intermediate pipeline fragment. Producers
 call `push(batch)` / `close_input(sender_id)`; the operator publishes each queued
@@ -123,7 +123,7 @@ relieves memory pressure. Sirius has no upward "stop producing" signal today (hi
 queue.
 
 ### `sirius_physical_streaming_sink` — `STREAMING_SINK`
-**File:** `src/include/op/sirius_physical_streaming_sink.hpp`
+**File:** `src/op/sirius_physical_streaming_sink.hpp`
 
 Terminal operator of a streaming fragment: every batch the pipeline produces is pushed into one
 `exec::batch_stream` and exposed to an external consumer via `pull()` / `wait()` / `drained()`.
@@ -171,12 +171,12 @@ Key design facts:
   original + N−1 clones simultaneously.
 
 ### `sirius_physical_dummy_scan` — `DUMMY_SCAN`
-**File:** `src/include/op/sirius_physical_dummy_scan.hpp`
+**File:** `src/op/sirius_physical_dummy_scan.hpp`
 
 Generates a single empty row for constant queries (e.g., `SELECT 1+2`).
 
 ### `sirius_physical_column_data_scan` — `COLUMN_DATA_SCAN` / `CTE_SCAN` / `DELIM_SCAN`
-**File:** `src/include/op/sirius_physical_column_data_scan.hpp`
+**File:** `src/op/sirius_physical_column_data_scan.hpp`
 
 Scans a pre-materialized `ColumnDataCollection`. Used for CTE results, correlated subquery intermediates, and expression-generated data.
 
@@ -185,7 +185,7 @@ Scans a pre-materialized `ColumnDataCollection`. Used for CTE results, correlate
 These operators process data in a single pass without buffering.
 
 ### `sirius_physical_filter` — `FILTER`
-**File:** `src/include/op/sirius_physical_filter.hpp`
+**File:** `src/op/sirius_physical_filter.hpp`
 
 Applies a predicate expression to filter rows.
 
@@ -193,7 +193,7 @@ Applies a predicate expression to filter rows.
 - **Key members:** `expression` (filter predicate)
 
 ### `sirius_physical_projection` — `PROJECTION`
-**File:** `src/include/op/sirius_physical_projection.hpp`
+**File:** `src/op/sirius_physical_projection.hpp`
 
 Evaluates a list of expressions to produce output columns.
 
@@ -206,7 +206,7 @@ Evaluates a list of expressions to produce output columns.
 - **Key members:** `select_list` (output expressions)
 
 ### `sirius_physical_streaming_limit` — `STREAMING_LIMIT`
-**File:** `src/include/op/sirius_physical_limit.hpp`
+**File:** `src/op/sirius_physical_limit.hpp`
 
 Implements LIMIT/OFFSET using atomic counters for parallel execution.
 
@@ -218,7 +218,7 @@ Implements LIMIT/OFFSET using atomic counters for parallel execution.
 These operators buffer input before producing output. They are both sinks and sources.
 
 ### `sirius_physical_hash_join` — `HASH_JOIN`
-**File:** `src/include/op/sirius_physical_hash_join.hpp`, `src/op/sirius_physical_hash_join.cpp`
+**File:** `src/op/sirius_physical_hash_join.hpp`, `src/op/sirius_physical_hash_join.cpp`
 
 Three execution modes:
 
@@ -303,14 +303,46 @@ Key members:
 Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, `cudf::left_join()`, `cudf::full_outer_join()`, `cudf::filtered_join`, and `cudf::mark_join`.
 
 ### `sirius_physical_nested_loop_join` — `NESTED_LOOP_JOIN`
-**File:** `src/include/op/sirius_physical_nested_loop_join.hpp`
+**File:** `src/op/sirius_physical_nested_loop_join.hpp`
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
+### `sirius_physical_union` — `UNION`
+**File:** `src/include/op/sirius_physical_union.hpp`
+
+`UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
+identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
+over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
+(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+
+- **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
+  `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the
+  repository manager keys by `(operator_id, port_id)`, so a shared name would orphan an arm's
+  repository and finish the pipeline while that arm still had rows.
+- **`PASSTHROUGH_SINK -> UNION` is `PARTIAL`**, not the base's `FULL` default, which
+  would hold every arm's output in repositories until all arms finished.
+- **Overrides both task-driver methods.** UNION nominates and drains arms sequentially in child
+  order. Only the active arm can be nominated by UNION or popped; a finished empty arm is skipped,
+  and UNION issues one normal draining nomination per live arm. An arm that already has data when
+  it becomes active was started by `start_query`'s seed or, under lookahead, by a one-task
+  request; UNION latches it as nominated and, only under lookahead, enqueues a full request for
+  it. Popping the final queued batch from a finished non-final arm advances the cursor and
+  schedules UNION once so the next arm is activated even when no producer completion can provide
+  another wakeup. One arm per task also keeps each batch on the GPU that produced it.
+- **Arm pipelines are created in reverse child order.** The converter schedules child
+  meta-pipelines last-created-first, so reversing makes arm 0 pipeline #0: the scan `start_query`
+  seeds and the top execution priority. Drain order therefore matches execution order.
+- **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
+  operator, so this answer decides the whole plan's.
+- **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
+  the operator, so the `"union_{i}"` names are resolved to `port*` once on first use.
+- **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
+  arms presenting different physical carriers for the same logical column.
+
 ### `sirius_physical_order` — `ORDER_BY`
-**File:** `src/include/op/sirius_physical_order.hpp`
+**File:** `src/op/sirius_physical_order.hpp`
 
 Local sort of each data batch.
 
@@ -318,14 +350,14 @@ Local sort of each data batch.
 - **Key members:** `orders` (sort keys with ASC/DESC and null ordering), `projections` (output columns), `is_index_sort`
 
 ### `sirius_physical_top_n` — `TOP_N`
-**File:** `src/include/op/sirius_physical_top_n.hpp`
+**File:** `src/op/sirius_physical_top_n.hpp`
 
 Combined ORDER + LIMIT: selects and sorts the top N rows.
 
 - **GPU execution:** Two-step process: `cudf::top_k_order()` selects top-N row indices, then `cudf::sort_by_key()` sorts the gathered rows to ensure deterministic output ordering- **Key members:** `orders`, `limit`, `offset`, `dynamic_filter`
 
 ### `sirius_physical_ungrouped_aggregate` — `UNGROUPED_AGGREGATE`
-**File:** `src/include/op/sirius_physical_ungrouped_aggregate.hpp`
+**File:** `src/op/sirius_physical_ungrouped_aggregate.hpp`
 
 Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
@@ -336,7 +368,7 @@ Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 - **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.
 
 ### `sirius_physical_grouped_aggregate` — `HASH_GROUP_BY`
-**File:** `src/include/op/sirius_physical_grouped_aggregate.hpp`
+**File:** `src/op/sirius_physical_grouped_aggregate.hpp`
 
 Hash-based GROUP BY.
 
@@ -347,7 +379,7 @@ Hash-based GROUP BY.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
 
 ### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
-**File:** `src/include/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
+**File:** `src/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
 
 Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join, replacing the
 partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
@@ -371,25 +403,42 @@ sizing partitions have run.
 These operators are injected during pipeline splitting. They don't map to DuckDB logical operators.
 
 ### `sirius_physical_partition` — `PARTITION`
-**File:** `src/include/op/sirius_physical_partition.hpp`
+**File:** `src/op/sirius_physical_partition.hpp`
 
 Repartitions data into N buckets based on partition keys. Partition keys are always plain column indices — a hash-join equality key that is a complex expression has already been materialized into a real column by a planner-inserted projection (`materialize_expression_join_keys()`), because PARTITION hashes by column index and cannot evaluate expressions.
 
 - **Modes:** `HASH` (most common), `RANGE`, `EVENLY`, `CUSTOM`, `NONE`
-- **Adaptive count:** `determine_num_partitions()` computes N from actual input data size and `hash_partition_bytes` config
+- **Adaptive count:** the downstream consumer's `get_partition_strategy()` computes N from input size and `hash_partition_bytes`. N is fixed on the first task because it determines each row's hash bucket.
 - **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
-- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
+- **Projected sizing (aggregate fanout):** when runtime estimation is enabled, the group-by partition uses a projected total and a `PARTIAL` ingress. It waits if no estimate is available. See [data management](data-management.md#runtime-data-size-estimation).
+- **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`, `_size_estimate`
 
 ### `sirius_physical_concat` — `CONCAT`
-**File:** `src/include/op/sirius_physical_concat.hpp`
+**File:** `src/op/sirius_physical_concat.hpp`
 
 Reassembles partitioned data back into a linear stream. Behavior depends on join type:
 
 - `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
 - `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
 
+### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
+**File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
+
+Terminates one arm of a `UNION`, forwarding every batch unchanged into the downstream `UNION`'s
+`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a bag union needs
+neither half of.
+
+- **Emits `pipelineable_operator_data`, not `partitioned_operator_data`.** With no `partition_idx`
+  the task creator selects a device by data locality instead of `partition_idx % num_gpus`, so each
+  batch is consumed on the GPU its scan produced it on.
+- **Owns its port name.** `sirius_physical_union::input_port_for` returns a `string_view` into
+  `_union_port_label`, which the wiring descriptor and `next_port_info` retain for the life of the
+  query.
+- Inherits the base task-driver methods: it is single-input, so `UNION`'s fan-in hazards cannot
+  arise.
+
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
-**File:** `src/include/op/sirius_physical_sort_sample.hpp`
+**File:** `src/op/sirius_physical_sort_sample.hpp`
 
 Samples input batches to compute P-1 partition boundary rows for range partitioning. Sampling is byte-based: it accumulates batches until `sort_sample_bytes` worth of input is available, rather than a fixed batch count.
 
@@ -400,12 +449,12 @@ Boundary computation follows an explicit `BoundaryState` lifecycle: `NOT_DONE �
 - Once `DONE`, the operator falls back to default scheduling and passes through remaining batches unchanged.
 
 ### `sirius_physical_sort_partition` — `SORT_PARTITION`
-**File:** `src/include/op/sirius_physical_sort_partition.hpp`
+**File:** `src/op/sirius_physical_sort_partition.hpp`
 
 Range-partitions data according to boundaries computed by SORT_SAMPLE. Links to the sample operator via `_sample_op`.
 
 ### `sirius_physical_merge_sort` — `MERGE_SORT`
-**File:** `src/include/op/sirius_physical_merge_sort.hpp`
+**File:** `src/op/sirius_physical_merge_sort.hpp`
 
 Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way merge via cuDF).
 
@@ -413,24 +462,24 @@ Merges pre-sorted partitions using `gpu_merge_impl::merge_order_by()` (multi-way
 - Tracks `_current_partition_index` atomically under mutex
 
 ### `sirius_physical_grouped_aggregate_merge` — `MERGE_GROUP_BY`
-**File:** `src/include/op/sirius_physical_grouped_aggregate_merge.hpp`
+**File:** `src/op/sirius_physical_grouped_aggregate_merge.hpp`
 
 Merges grouped aggregate results from multiple partitions. Drains one partition per task, similar to MERGE_SORT.
 
 ### `sirius_physical_ungrouped_aggregate_merge` — `MERGE_AGGREGATE`
-**File:** `src/include/op/sirius_physical_ungrouped_aggregate_merge.hpp`
+**File:** `src/op/sirius_physical_ungrouped_aggregate_merge.hpp`
 
 Merges ungrouped aggregate results from multiple partitions.
 
 ### `sirius_physical_top_n_merge` — `MERGE_TOP_N`
-**File:** `src/include/op/sirius_physical_top_n_merge.hpp`
+**File:** `src/op/sirius_physical_top_n_merge.hpp`
 
 Merges local top-N results from multiple partitions.
 
 ## CTE / Delim Join Operators
 
 ### `sirius_physical_cte` — `CTE`
-**File:** `src/include/op/sirius_physical_cte.hpp`
+**File:** `src/op/sirius_physical_cte.hpp`
 
 Materializes Common Table Expression results into a `ColumnDataCollection` for later scanning by CTE_SCAN operators.
 
@@ -438,7 +487,7 @@ Materializes Common Table Expression results into a `ColumnDataCollection` for l
 
 ### `sirius_physical_left_delim_join` — `LEFT_DELIM_JOIN`
 ### `sirius_physical_right_delim_join` — `RIGHT_DELIM_JOIN`
-**File:** `src/include/op/sirius_physical_delim_join.hpp`
+**File:** `src/op/sirius_physical_delim_join.hpp`
 
 Handle correlated subqueries via duplicate elimination. Wrap an inner join (hash or nested loop) and embed a `sirius_physical_grouped_aggregate` for DISTINCT on duplicate-eliminated columns.
 
@@ -447,19 +496,19 @@ Handle correlated subqueries via duplicate elimination. Wrap an inner join (hash
 - `delim_scans` — downstream scan operators that receive the deduplicated data
 
 ### `sirius_physical_partition_consumer_operator`
-**File:** `src/include/op/sirius_physical_partition_consumer_operator.hpp`
+**File:** `src/op/sirius_physical_partition_consumer_operator.hpp`
 
 Base interface for operators that consume partitioned data. Provides `push_data_batch_partitioned(port_id, batch, partition_idx)`.
 
 ## Result Operators
 
 ### `sirius_physical_result_collector` / `sirius_physical_materialized_collector` — `RESULT_COLLECTOR`
-**File:** `src/include/op/sirius_physical_result_collector.hpp`
+**File:** `src/op/sirius_physical_result_collector.hpp`
 
 Final sink that materializes query results into a `ColumnDataCollection`. The GPU executor checks for this operator type to determine query completion.
 
 ### `sirius_physical_empty_result` — `EMPTY_RESULT`
-**File:** `src/include/op/sirius_physical_empty_result.hpp`
+**File:** `src/op/sirius_physical_empty_result.hpp`
 
 Returns an empty result set for queries with contradicted filters.
 
@@ -490,8 +539,10 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
+| UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
 | PARTITION | Pipeline | Hash/range partitioning |
 | CONCAT | Pipeline | Partition reassembly |
+| PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |

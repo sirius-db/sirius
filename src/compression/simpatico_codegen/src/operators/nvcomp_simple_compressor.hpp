@@ -21,8 +21,9 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -38,7 +39,7 @@ namespace detail {
 inline std::pair<std::unique_ptr<rmm::device_buffer>, std::size_t> nvcomp_compress_impl(
   batched_codec_ops const& ops,
   cudf::column_view const& col,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (!cudf::is_fixed_width(col.type())) {

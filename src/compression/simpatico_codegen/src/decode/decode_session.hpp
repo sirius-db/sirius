@@ -4,6 +4,8 @@
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 
+#include <cuda/stream>
+
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -114,7 +116,7 @@ class decode_frame final {
   decode_frame(decode_frame const&)            = delete;
   decode_frame& operator=(decode_frame const&) = delete;
 
-  [[nodiscard]] rmm::cuda_stream_view stream() const noexcept { return stream_; }
+  [[nodiscard]] ::cuda::stream_ref stream() const noexcept { return stream_; }
   [[nodiscard]] rmm::device_async_resource_ref mr() const noexcept { return mr_; }
 
   /**
@@ -164,9 +166,9 @@ class decode_frame final {
 
  private:
   friend class decode_session;
-  decode_frame(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) noexcept;
+  decode_frame(::cuda::stream_ref stream, rmm::device_async_resource_ref mr) noexcept;
   std::span<std::byte> host_bytes(std::size_t bytes);
-  rmm::cuda_stream_view stream_;
+  ::cuda::stream_ref stream_;
   rmm::device_async_resource_ref mr_;
   std::vector<std::unique_ptr<std::byte[]>> uploads_;
   // Dropping the final module handle can synchronize the CUDA context.
@@ -199,7 +201,7 @@ class decode_session final {
    * deallocation contract of `device_async_resource_ref` (a synchronous resource may block on
    * release)
    */
-  decode_session(std::span<rmm::cuda_stream_view const> streams, rmm::device_async_resource_ref mr);
+  decode_session(std::span<const ::cuda::stream_ref> streams, rmm::device_async_resource_ref mr);
   /**
    * @brief Attempt to complete pending work before releasing results and host state; log cleanup
    * errors without throwing.

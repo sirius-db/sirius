@@ -75,7 +75,7 @@ bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
 template <typename T>
 std::pair<T, T> numeric_bounds(cudf::scalar const& minimum,
                                cudf::scalar const& maximum,
-                               rmm::cuda_stream_view stream)
+                               ::cuda::stream_ref stream)
 {
   return {static_cast<cudf::numeric_scalar<T> const&>(minimum).value(stream),
           static_cast<cudf::numeric_scalar<T> const&>(maximum).value(stream)};
@@ -84,7 +84,7 @@ std::pair<T, T> numeric_bounds(cudf::scalar const& minimum,
 template <typename Decimal>
 std::pair<__int128_t, __int128_t> decimal_bounds(cudf::scalar const& minimum,
                                                  cudf::scalar const& maximum,
-                                                 rmm::cuda_stream_view stream)
+                                                 ::cuda::stream_ref stream)
 {
   using scalar_type = cudf::fixed_point_scalar<Decimal>;
   return {static_cast<__int128_t>(static_cast<scalar_type const&>(minimum).value(stream)),
@@ -94,7 +94,7 @@ std::pair<__int128_t, __int128_t> decimal_bounds(cudf::scalar const& minimum,
 std::optional<numeric_range> range_from_scalars(cudf::scalar const& minimum,
                                                 cudf::scalar const& maximum,
                                                 uint8_t decimal_scale,
-                                                rmm::cuda_stream_view stream)
+                                                ::cuda::stream_ref stream)
 {
   switch (minimum.type().id()) {
     case cudf::type_id::INT8: {
@@ -166,7 +166,7 @@ cudf::column_view narrowing_rep_view(cudf::column_view const& column)
 
 std::unique_ptr<cudf::column> cast_through_rep(cudf::column_view const& column,
                                                cudf::data_type target,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   // Given caller-established carrier provenance, tunnel only when exactly one side is a
@@ -330,7 +330,7 @@ std::optional<cudf::data_type> choose_narrow_physical_type(const logical_type& t
 
 std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const& column,
                                                          logical_type const& logical,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   if (!is_narrowable_numeric_type(logical) || column.size() == 0 ||
@@ -344,7 +344,7 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
 }
 
 std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const& column,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   if (!is_supported_numeric_carrier(column.type()) || column.size() == 0 ||

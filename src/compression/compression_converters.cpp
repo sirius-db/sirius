@@ -19,6 +19,7 @@
 #include "compressed_representation.hpp"
 #include "compressed_scan.hpp"
 #include "device_compressed_blob.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
@@ -27,7 +28,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -56,7 +56,7 @@ namespace {
 // pipeline stream `s` orders the rest of the work downstream; re-pointing frees here keeps them
 // ordered with that work instead of with whatever runs next on a shared stream.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
-                                                   rmm::cuda_stream_view s)
+                                                   ::cuda::stream_ref s)
 {
   if (!col) { return col; }
   const auto type = col->type();
@@ -98,7 +98,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   decompression_pushdown_scan const* scan,
   decode_visibility_mask const& keep_mask,
   const cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   // Reconstruct only the requested columns. read_compressed_table_subset_from_memory
   // fetches just those columns' payload buffers, so serving a projection of a wide
@@ -124,7 +124,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // Decode across 4 streams of the target space's pool, submitted from the calling thread — no
   // worker threads are spawned. The H2D fetch above ran on `stream`; sync it first so decode-stream
   // reads are ordered after all fetched bytes are resident.
-  stream.synchronize();
+  stream.sync();
   auto const mr = rmm::mr::get_current_device_resource_ref();
   // `subset` already holds only the projected columns, so the scan's request —
   // which is indexed by projected position — lines up with 0..num_columns.
@@ -163,10 +163,10 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
 std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
+  nvtx_scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
   auto& rep         = source.cast<compressed_host_representation>();
   auto const& space = gpu_decode_space(target_memory_space, "host-to-GPU decompression");
 
@@ -174,7 +174,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   // device memory (block-aware, since the payload is a multi-block allocation).
   auto const& payload = rep.payload();
   simpatico::payload_fetch_fn fetch =
-    [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+    [&payload](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
       copy_pinned_blocks_to_device(payload, off, dst, sz, s);
     };
 
@@ -193,10 +193,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
+  nvtx_scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
   auto& rep         = source.cast<compressed_device_representation>();
   auto const& space = gpu_decode_space(
     target_memory_space != nullptr ? target_memory_space : &source.get_memory_space(),

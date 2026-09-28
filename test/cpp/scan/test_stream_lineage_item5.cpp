@@ -27,9 +27,9 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -93,7 +93,7 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                                                     std::int64_t seed,
                                                     bool with_nulls,
                                                     cucascade::memory::memory_space& space,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   auto mr = space.get_default_allocator();
 
@@ -106,7 +106,7 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                   host_vals.data(),
                   num_rows * sizeof(std::int64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   rmm::device_buffer mask{};
   cudf::size_type null_count = 0;
@@ -122,9 +122,9 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                     words.data(),
                     num_words * sizeof(std::uint32_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   }
-  stream.synchronize();
+  stream.sync();
   return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
                                         static_cast<cudf::size_type>(num_rows),
                                         std::move(data),
@@ -134,7 +134,7 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
 
 std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows,
                                                             cucascade::memory::memory_space& space,
-                                                            rmm::cuda_stream_view stream)
+                                                            ::cuda::stream_ref stream)
 {
   auto mr = space.get_default_allocator();
 
@@ -153,7 +153,7 @@ std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows
                   offsets.data(),
                   offsets.size() * sizeof(std::int32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
                                                     static_cast<cudf::size_type>(num_rows + 1),
                                                     std::move(offsets_buf),
@@ -162,8 +162,8 @@ std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows
 
   rmm::device_buffer chars_buf{chars.size(), stream, mr};
   cudaMemcpyAsync(
-    chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value());
-  stream.synchronize();
+    chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get());
+  stream.sync();
 
   return cudf::make_strings_column(static_cast<cudf::size_type>(num_rows),
                                    std::move(offsets_col),
@@ -179,7 +179,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(stream_lineage_fixture& f
                                                        std::int64_t seed,
                                                        bool with_nulls,
                                                        bool with_strings,
-                                                       rmm::cuda_stream_view stream)
+                                                       ::cuda::stream_ref stream)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(make_patterned_column(num_rows, seed, with_nulls, *f.gpu0, stream));
@@ -193,13 +193,13 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(stream_lineage_fixture& f
     mut.convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), f.host0, stream);
   }
-  stream.synchronize();
+  stream.sync();
   return batch;
 }
 
 void upload_to_gpu(stream_lineage_fixture& f,
                    const std::shared_ptr<cucascade::data_batch>& batch,
-                   rmm::cuda_stream_view stream)
+                   ::cuda::stream_ref stream)
 {
   auto mut = batch->to_mutable();
   mut.convert_to<cucascade::gpu_table_representation>(
@@ -209,29 +209,29 @@ void upload_to_gpu(stream_lineage_fixture& f,
 /// Mirrors the production steal path (sirius_gpu_scan_operator_data.cpp).
 std::unique_ptr<cudf::table> steal_table(const std::shared_ptr<cucascade::data_batch>& batch,
                                          cucascade::memory::memory_space& space,
-                                         rmm::cuda_stream_view stream)
+                                         ::cuda::stream_ref stream)
 {
   auto mut      = batch->to_mutable();
   auto* gpu_rep = dynamic_cast<cucascade::gpu_table_representation*>(mut.get_data());
   REQUIRE(gpu_rep != nullptr);
   auto stolen = gpu_rep->release_table(stream);
   mut.set_data(std::make_unique<cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+    std::make_unique<cudf::table>(), space, ::cuda::stream_ref{cudaStream_t{}}));
   return stolen;
 }
 
 /// Enough traffic that work enqueued after it is still pending when the host regains control.
-void enqueue_blockers(void* scratch, std::size_t scratch_bytes, rmm::cuda_stream_view stream)
+void enqueue_blockers(void* scratch, std::size_t scratch_bytes, ::cuda::stream_ref stream)
 {
   for (int i = 0; i < 32; ++i) {
-    cudaMemsetAsync(scratch, 0, scratch_bytes, stream.value());
+    cudaMemsetAsync(scratch, 0, scratch_bytes, stream.get());
   }
 }
 
 /// Conversion-pool churn: each conversion allocates from the async pool,
 /// recycling any block whose free has already retired.
 void hammer_conversions(stream_lineage_fixture& f,
-                        rmm::cuda_stream_view stream,
+                        ::cuda::stream_ref stream,
                         int count,
                         std::size_t rows)
 {
@@ -265,12 +265,12 @@ TEST_CASE("stolen table tolerates mid-flight column destruction under conversion
     std::int64_t const seed = 1000000LL * (iter + 1);
     rmm::cuda_stream task_stream;
 
-    auto batch = make_host_batch(f, kRows, seed, false, false, task_stream.view());
-    upload_to_gpu(f, batch, task_stream.view());
-    auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
+    auto batch = make_host_batch(f, kRows, seed, false, false, task_stream);
+    upload_to_gpu(f, batch, task_stream);
+    auto stolen = steal_table(batch, *f.gpu0, task_stream);
     REQUIRE(stolen != nullptr);
 
-    enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
+    enqueue_blockers(scratch, kScratchMiB << 20, task_stream);
     void const* src = stolen->view().column(0).head();
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
 
@@ -281,7 +281,7 @@ TEST_CASE("stolen table tolerates mid-flight column destruction under conversion
       cols[0].reset();
     }
 
-    hammer_conversions(f, hammer_stream.view(), 3, kRows / 4);
+    hammer_conversions(f, hammer_stream, 3, kRows / 4);
 
     cudaMemcpyAsync(
       host_result.data(), result_dev, kBytes, cudaMemcpyDeviceToHost, task_stream.value());
@@ -314,23 +314,23 @@ TEST_CASE("rebinding a stolen column back to an idle foreign stream reproduces p
   rmm::cuda_stream task_stream;
   rmm::cuda_stream foreign_stream;
 
-  auto batch = make_host_batch(f, kRows, seed, false, false, task_stream.view());
-  upload_to_gpu(f, batch, task_stream.view());
-  auto stolen = steal_table(batch, *f.gpu0, task_stream.view());
+  auto batch = make_host_batch(f, kRows, seed, false, false, task_stream);
+  upload_to_gpu(f, batch, task_stream);
+  auto stolen = steal_table(batch, *f.gpu0, task_stream);
 
   // Recreate the pre-fix binding: buffers bound back to an idle foreign stream.
   auto cols = stolen->release();
-  cols[0]   = cudf::rebind_stream(std::move(*cols[0]), foreign_stream.view());
+  cols[0]   = cudf::rebind_stream(std::move(*cols[0]), foreign_stream);
 
   void const* src = cols[0]->view().head();
-  enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
+  enqueue_blockers(scratch, kScratchMiB << 20, task_stream);
   cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
 
   cols[0].reset();
 
   // A same-stream allocation of the same size recycles the freed block; poison
   // it while the read above is still stuck behind the blocker.
-  rmm::device_buffer reuse{kBytes, foreign_stream.view(), f.gpu0->get_default_allocator()};
+  rmm::device_buffer reuse{kBytes, foreign_stream, f.gpu0->get_default_allocator()};
   bool const block_reused = reuse.data() == src;
   if (block_reused) {
     cudaMemsetAsync(reuse.data(), 0xFF, kBytes, foreign_stream.value());
@@ -377,17 +377,17 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   rmm::cuda_stream reader_stream;
   rmm::cuda_stream reclaim_stream;
 
-  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream.view());
-  upload_to_gpu(f, batch, setup_stream.view());
+  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream);
+  upload_to_gpu(f, batch, setup_stream);
   setup_stream.synchronize();
 
   {
     auto ro         = batch->to_read_only();
     auto view       = sirius::get_cudf_table_view(ro);
     void const* src = view.column(0).head();
-    enqueue_blockers(scratch, kScratchMiB << 20, reader_stream.view());
+    enqueue_blockers(scratch, kScratchMiB << 20, reader_stream);
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, reader_stream.value());
-    ro.record_reader_event(reader_stream.view());
+    ro.record_reader_event(reader_stream);
   }  // read lock dropped with the read still in flight
 
   // Anti-vacuity: the lock is already gone, so only a pending reader event can
@@ -398,13 +398,13 @@ TEST_CASE("reader events order a convert reclaim's mutable acquisition after in-
   {
     auto mut = batch->to_mutable();
     CHECK(cudaStreamQuery(reader_stream.value()) == cudaSuccess);
-    mut.rebind_stream(reclaim_stream.view());
+    mut.rebind_stream(reclaim_stream);
     mut.convert_to<cucascade::host_data_representation>(
-      sirius::converter_registry::get(), f.host0, reclaim_stream.view());
+      sirius::converter_registry::get(), f.host0, reclaim_stream);
   }
   REQUIRE(batch->try_to_mutable().has_value());
 
-  hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
+  hammer_conversions(f, reclaim_stream, 3, kRows / 4);
 
   std::vector<std::int64_t> host_result(kRows);
   cudaMemcpyAsync(
@@ -440,8 +440,8 @@ TEST_CASE("filtered serving records reader events through owning_table_view befo
   rmm::cuda_stream task_stream;
   rmm::cuda_stream reclaim_stream;
 
-  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream.view());
-  upload_to_gpu(f, batch, setup_stream.view());
+  auto batch = make_host_batch(f, kRows, seed, false, false, setup_stream);
+  upload_to_gpu(f, batch, setup_stream);
   setup_stream.synchronize();
 
   {
@@ -449,10 +449,10 @@ TEST_CASE("filtered serving records reader events through owning_table_view befo
     auto view   = sirius::get_cudf_table_view(rbatch);
     sirius::op::scan::owning_table_view served{std::move(rbatch), view};
 
-    enqueue_blockers(scratch, kScratchMiB << 20, task_stream.view());
+    enqueue_blockers(scratch, kScratchMiB << 20, task_stream);
     void const* src = served.view().column(0).head();
     cudaMemcpyAsync(result_dev, src, kBytes, cudaMemcpyDeviceToDevice, task_stream.value());
-    served.record_reader_event(task_stream.view());
+    served.record_reader_event(task_stream);
 
     served.drop();
   }
@@ -464,13 +464,13 @@ TEST_CASE("filtered serving records reader events through owning_table_view befo
   {
     auto mut = batch->to_mutable();
     CHECK(cudaStreamQuery(task_stream.value()) == cudaSuccess);
-    mut.rebind_stream(reclaim_stream.view());
+    mut.rebind_stream(reclaim_stream);
     mut.convert_to<cucascade::host_data_representation>(
-      sirius::converter_registry::get(), f.host0, reclaim_stream.view());
+      sirius::converter_registry::get(), f.host0, reclaim_stream);
   }
   REQUIRE(batch->try_to_mutable().has_value());
 
-  hammer_conversions(f, reclaim_stream.view(), 3, kRows / 4);
+  hammer_conversions(f, reclaim_stream, 3, kRows / 4);
 
   std::vector<std::int64_t> host_result(kRows);
   cudaMemcpyAsync(

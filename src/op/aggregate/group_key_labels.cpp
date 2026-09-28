@@ -34,7 +34,7 @@
 namespace sirius::op::detail {
 
 group_key_labels make_group_key_labels(cudf::table_view const& keys,
-                                       rmm::cuda_stream_view stream,
+                                       ::cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(keys.num_columns() > 0, "Group key table must have at least one column");

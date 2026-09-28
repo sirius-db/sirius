@@ -6,6 +6,7 @@
 #include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "codegen/util/nvtx.hpp"
 #include "constant_width_offsets.hpp"
 
 #include <cudf/column/column.hpp>
@@ -32,7 +33,6 @@
 #include <cub/device/device_reduce.cuh>
 #include <cuda/functional>
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/tabulate.h>
@@ -104,7 +104,7 @@ template <typename Allocate>
     { allocate(bytes) } -> std::same_as<key_width_storage>;
   }
 int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
-                                    rmm::cuda_stream_view stream,
+                                    ::cuda::stream_ref stream,
                                     Allocate allocate)
 {
   matching_key_width const matching_width{
@@ -119,7 +119,7 @@ int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
                                          cuda::minimum<int64_t>{},
                                          matching_width,
                                          std::numeric_limits<int64_t>::max(),
-                                         stream.value()),
+                                         stream.get()),
       "dictionary key width reduction");
   };
   std::size_t scratch_bytes = 0;
@@ -146,9 +146,9 @@ int64_t measure_constant_key_width(cudf::strings_column_view const& keys, decode
   return frame.read_scalar(width);
 }
 
-void drain_dictionary_observation(rmm::cuda_stream_view stream) noexcept
+void drain_dictionary_observation(::cuda::stream_ref stream) noexcept
 {
-  auto const status = cudaStreamSynchronize(stream.value());
+  auto const status = cudaStreamSynchronize(stream.get());
   if (status != cudaSuccess) {
     std::fprintf(stderr, "simpatico dictionary cleanup failed: %s\n", cudaGetErrorString(status));
   }
@@ -268,7 +268,7 @@ uploaded_needles upload_needles(std::vector<std::string> const& needles, decode_
   rmm::device_buffer storage(total_bytes, frame.stream(), frame.mr());
   throw_if_cuda_error(
     cudaMemcpyAsync(
-      storage.data(), host.data(), total_bytes, cudaMemcpyHostToDevice, frame.stream().value()),
+      storage.data(), host.data(), total_bytes, cudaMemcpyHostToDevice, frame.stream().get()),
     "dictionary predicate: upload values");
   needle_view const view{static_cast<std::int32_t const*>(storage.data()),
                          static_cast<char const*>(storage.data()) + offsets_bytes,
@@ -374,7 +374,7 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
 }
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
-  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view const& col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   if (col.type().id() != cudf::type_id::STRING) {
     throw std::runtime_error("dictionary_compressor: column must be STRING, got '" +
@@ -411,7 +411,7 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
 
 std::unique_ptr<cudf::column> make_constant_width_offsets(cudf::size_type rows,
                                                           std::int32_t width,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr)
 {
   if (rows < 0 || width < 0) {
@@ -434,7 +434,7 @@ std::unique_ptr<cudf::column> make_constant_width_offsets(cudf::size_type rows,
 
 std::unique_ptr<dictionary_compressed_representation>
 dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::column> dict_col,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr)
 {
   std::unique_ptr<dictionary_compressed_representation> result;
@@ -456,7 +456,7 @@ dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::
           });
       }
     }
-    stream.synchronize();
+    stream.sync();
     if (width_result) {
       result->constant_key_width = *static_cast<int64_t const*>(width_result->data());
     }
@@ -473,7 +473,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
-  nvtx3::scoped_range r{"dictionary_decompress"};
+  nvtx_scoped_range r{"dictionary_decompress"};
   // Decode from the stored dictionary column.
   if (dict_column == nullptr) { throw std::invalid_argument("dictionary decode: missing column"); }
   if (dict_column->size() == 0) {
@@ -504,7 +504,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
 {
   auto const stream = frame.stream();
   auto const mr     = frame.mr();
-  nvtx3::scoped_range r{"dictionary_decompress_predicate"};
+  nvtx_scoped_range r{"dictionary_decompress_predicate"};
   if (dict_column == nullptr) {
     throw std::invalid_argument("dictionary predicate: missing column");
   }
@@ -569,7 +569,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
                                         dict_column->view().null_mask(),
                                         cudf::bitmask_allocation_size_bytes(n_rows),
                                         cudaMemcpyDeviceToDevice,
-                                        stream.value()),
+                                        stream.get()),
                         "dictionary predicate: copy null mask");
   }
 
@@ -590,7 +590,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
 
 std::unique_ptr<compressed_representation> dictionary_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   return dictionary_compress_impl(column_to_compress, stream, mr);

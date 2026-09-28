@@ -74,7 +74,7 @@ std::unique_ptr<cudf::column> lz4_compressed_representation::decompress(decode_f
 }
 
 std::unique_ptr<compressed_representation> lz4_compressor::compress(
-  cudf::column_view col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   auto const dt = col.type();
   auto const n  = col.size();

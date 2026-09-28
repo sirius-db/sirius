@@ -53,7 +53,7 @@ std::unique_ptr<cudf::table> make_empty_vss_output(
 
 void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
                              const std::vector<sirius::logical_type>& native_types,
-                             rmm::cuda_stream_view stream,
+                             ::cuda::stream_ref stream,
                              rmm::device_async_resource_ref mr)
 {
   auto const n = std::min(cols.size(), native_types.size());
@@ -75,7 +75,7 @@ std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   cucascade::gpu_table_representation gpu_repr(std::move(table), c.space, c.stream);
   auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, &c.host_space, c.stream);
-  c.stream.synchronize();
+  c.stream.sync();
   return host_repr;
 }
 
@@ -94,7 +94,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // The GPU->host converter's cudaMemcpyBatchAsync rejects the default stream.
   // Synchronized before we return, so the owned stream is safe to destroy on exit.
   rmm::cuda_stream stream_owner;
-  auto stream = stream_owner.view();
+  ::cuda::stream_ref stream = stream_owner;
 
   // The table must be GPU-pinned: the search reads its vectors and gathers the
   // output columns straight from GPU-resident chunks (same order the index built in).
@@ -137,8 +137,8 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // Upload the (constant) query vector once; both search impls read it on the device.
   rmm::device_buffer query_buf(req.query.size() * sizeof(float), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.value()));
-  stream.synchronize();
+    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
 
   vector_search_context c{ctx,
                           req,

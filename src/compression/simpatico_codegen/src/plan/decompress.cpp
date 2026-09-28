@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/util/nvtx.hpp"
 #include "decode/decode_session.hpp"
 #include "operators/constant_width_offsets.hpp"
 
@@ -21,7 +22,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <array>
@@ -139,7 +139,7 @@ class DecodeWalk {
 
   PlanTree const& tree;
   decode_frame& frame;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream;
   rmm::device_async_resource_ref mr;
   std::string* error_out;
   decode_predicate const* pred = nullptr;
@@ -187,7 +187,7 @@ std::size_t elem_size_for_slot(std::string const& slot, std::size_t element_size
 
 // name → view map of a rep's channels, for repeated per-slot lookups.
 std::unordered_map<std::string, cudf::column_view> channels_by_name(
-  compressed_representation const& rep, rmm::cuda_stream_view stream)
+  compressed_representation const& rep, ::cuda::stream_ref stream)
 {
   std::unordered_map<std::string, cudf::column_view> by_name;
   for (auto const& o : rep.named_channels(stream))
@@ -220,7 +220,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
                                   std::string const& parent_channel,
                                   PlanTree const& tree,
                                   std::size_t element_size,
-                                  rmm::cuda_stream_view stream,
+                                  ::cuda::stream_ref stream,
                                   rmm::device_async_resource_ref mr,
                                   codegen::jit::LabeledBuffers& labeled,
                                   decode_materialize_fn const& materialize,
@@ -326,7 +326,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
                             NodeId plan_node,
                             PlanTree const& tree,
                             std::size_t element_size,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr,
                             codegen::jit::LabeledBuffers& labeled,
                             decode_materialize_fn const& materialize,
@@ -413,7 +413,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
 bool bind_fused_subtree(BuiltFusedTree const& built,
                         PlanTree const& tree,
                         std::size_t element_size,
-                        rmm::cuda_stream_view stream,
+                        ::cuda::stream_ref stream,
                         rmm::device_async_resource_ref mr,
                         codegen::jit::LabeledBuffers& labeled,
                         decode_materialize_fn const& materialize,
@@ -481,7 +481,7 @@ struct bound_fused_region {
 std::optional<bound_fused_region> bind_fused_region(PlanTree const& tree,
                                                     NodeId root_nid,
                                                     decode_materialize_fn const& materialize,
-                                                    rmm::cuda_stream_view stream,
+                                                    ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref const& mr,
                                                     std::string* error_out)
 {
@@ -726,7 +726,7 @@ void DecodeWalk::decode_bitjoin(NodeId nid)
       cudaMemsetAsync(output->mutable_view().head<void>(),
                       0,
                       static_cast<std::size_t>(packed_view.size()) * cudf::size_of(output->type()),
-                      stream.value());
+                      stream.get());
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     for (auto const& ref : refs) {
       launch_bitjoin_field(output->mutable_view(),
@@ -734,7 +734,7 @@ void DecodeWalk::decode_bitjoin(NodeId nid)
                            static_cast<int>(ref.dst_lo),
                            static_cast<int>(ref.src_lo),
                            ref.width,
-                           stream.value());
+                           stream.get());
     }
     store(key, std::move(output));
   }
@@ -1076,7 +1076,7 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
   auto status = cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
                                 0,
                                 sizeof(std::int32_t),
-                                frame.stream().value());
+                                frame.stream().get());
   if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
   if (survivors > 0) {
     launch_decode_fused_tree_str_split_meta(*region->built.tree,
@@ -1229,13 +1229,13 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
 }
 
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out,
                                                 decode_predicate const* pred,
                                                 decode_selection const* sel)
 {
-  nvtx3::scoped_range range{"simpatico::decompress_column"};
+  nvtx_scoped_range range{"simpatico::decompress_column"};
   column_decode_request request{std::cref(tree)};
   // Translate only documented host validation failures; submitted execution failures propagate.
   try {
@@ -1465,7 +1465,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
     auto const bytes = static_cast<std::size_t>(
                          sirius::codegen::selection_mask::AllocWordsFor(destination.num_rows)) *
                        sizeof(std::uint32_t);
-    auto status = cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().value());
+    auto status = cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().get());
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     return mask_source_status::DECLINED;
   }
@@ -1481,7 +1481,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
 bool decompress_column_selection_mask(PlanTree const& tree,
                                       sirius::codegen::range_predicate pred,
                                       std::uint32_t* mask_words,
-                                      rmm::cuda_stream_view stream,
+                                      ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out)
 {
@@ -1509,7 +1509,7 @@ bool decompress_column_selection_mask(PlanTree const& tree,
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
@@ -1598,9 +1598,9 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
                                 mr);
         gathered_columns = gathered->release();
         // Complete this cross-column gather phase before replacing its source owners.
-        stream.synchronize();
+        stream.sync();
       } catch (...) {
-        stream.synchronize_no_throw();
+        (void)cudaStreamSynchronize(stream.get());
         throw;
       }
       for (std::size_t k = 0; k < full_positions.size(); ++k) {

@@ -203,7 +203,7 @@ void with_conversion_result(
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =
-      duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+      std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
     root_pipeline->build(*sirius_plan);
     root_pipeline->ready();
 

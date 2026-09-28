@@ -350,7 +350,7 @@ void accumulate_impl(cudf::column_view const& keys,
                      dense_count_layout const& layout,
                      bool bounds_check,
                      CountT* bins,
-                     rmm::cuda_stream_view stream)
+                     ::cuda::stream_ref stream)
 {
   if (count_argument && count_argument->size() != keys.size()) {
     throw sirius::internal_exception(
@@ -386,16 +386,16 @@ void accumulate_impl(cudf::column_view const& keys,
       auto const grid =
         resident_grid_for(n, accumulate_privatized_kernel<KeyT, CountT>, smem_bytes);
       accumulate_privatized_kernel<KeyT, CountT>
-        <<<grid, k_block_size, smem_bytes, stream.value()>>>(keys.template data<KeyT>(),
-                                                             key_mask,
-                                                             keys.offset(),
-                                                             val_mask,
-                                                             val_mask_offset,
-                                                             n,
-                                                             min_key,
-                                                             static_cast<int32_t>(slots),
-                                                             bounds_check,
-                                                             bins);
+        <<<grid, k_block_size, smem_bytes, stream.get()>>>(keys.template data<KeyT>(),
+                                                           key_mask,
+                                                           keys.offset(),
+                                                           val_mask,
+                                                           val_mask_offset,
+                                                           n,
+                                                           min_key,
+                                                           static_cast<int32_t>(slots),
+                                                           bounds_check,
+                                                           bins);
       return;
     }
     // Only a contended histogram is atomic-latency bound. One row per slot is a pure scatter, and
@@ -404,16 +404,16 @@ void accumulate_impl(cudf::column_view const& keys,
     auto const grid =
       contended ? full_grid_for(n) : resident_grid_for(n, accumulate_kernel<KeyT, CountT>);
     accumulate_kernel<KeyT, CountT>
-      <<<grid, k_block_size, 0, stream.value()>>>(keys.template data<KeyT>(),
-                                                  key_mask,
-                                                  keys.offset(),
-                                                  val_mask,
-                                                  val_mask_offset,
-                                                  n,
-                                                  min_key,
-                                                  slots,
-                                                  bounds_check,
-                                                  bins);
+      <<<grid, k_block_size, 0, stream.get()>>>(keys.template data<KeyT>(),
+                                                key_mask,
+                                                keys.offset(),
+                                                val_mask,
+                                                val_mask_offset,
+                                                n,
+                                                min_key,
+                                                slots,
+                                                bounds_check,
+                                                bins);
   };
   dispatch_key_type(keys.type().id(), "key column", launch);
   // Deliberately not CUDF_CHECK_CUDA: that macro synchronizes the stream in non-NDEBUG builds, and
@@ -426,7 +426,7 @@ void write_null_group_row(cudf::column& key_col,
                           cudf::size_type row_idx,
                           dense_count_semantics semantics,
                           int64_t null_group_rows,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr)
 {
   auto key_view        = key_col.mutable_view();
@@ -438,7 +438,7 @@ void write_null_group_row(cudf::column& key_col,
                                   static_cast<std::size_t>(key_view.offset() + row_idx) * key_bytes,
                                 0,
                                 key_bytes,
-                                stream.value()));
+                                stream.get()));
   cudf::numeric_scalar<int64_t> const fill_value{
     semantics.null_group_value(null_group_rows), true, stream, mr};
   cudf::fill_in_place(value_view, row_idx, row_idx + 1, fill_value, stream);
@@ -462,7 +462,7 @@ template <group_row_writer Fn>
                                                               int64_t num_groups,
                                                               dense_count_semantics semantics,
                                                               int64_t null_group_rows,
-                                                              rmm::cuda_stream_view stream,
+                                                              ::cuda::stream_ref stream,
                                                               rmm::device_async_resource_ref mr,
                                                               Fn&& fill_groups)
 {
@@ -503,7 +503,7 @@ std::unique_ptr<cudf::table> emit_impl(CountT const* presence,
                                        dense_count_semantics semantics,
                                        int64_t null_group_rows,
                                        dense_count_bounds bounds,
-                                       rmm::cuda_stream_view stream,
+                                       ::cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
   auto const slots = static_cast<int64_t>(layout.slots());
@@ -532,16 +532,16 @@ std::unique_ptr<cudf::table> emit_impl(CountT const* presence,
     auto launch = [&](auto key_tag) {
       using KeyT      = decltype(key_tag);
       auto const grid = resident_grid_for(group_rows, emit_kernel<KeyT, CountT>);
-      emit_kernel<KeyT, CountT><<<grid, k_block_size, 0, stream.value()>>>(
-        selected ? selected->data() : nullptr,
-        group_rows,
-        presence,
-        counts,
-        layout.min_key(),
-        semantics.unmatched_fill,
-        key_view.template data<KeyT>(),
-        value_view.template data<int64_t>(),
-        overflow_flag ? overflow_flag->data() : nullptr);
+      emit_kernel<KeyT, CountT>
+        <<<grid, k_block_size, 0, stream.get()>>>(selected ? selected->data() : nullptr,
+                                                  group_rows,
+                                                  presence,
+                                                  counts,
+                                                  layout.min_key(),
+                                                  semantics.unmatched_fill,
+                                                  key_view.template data<KeyT>(),
+                                                  value_view.template data<int64_t>(),
+                                                  overflow_flag ? overflow_flag->data() : nullptr);
     };
     dispatch_key_type(key_type.id(), "output key", launch);
     CUDF_CUDA_TRY(cudaGetLastError());
@@ -581,7 +581,7 @@ std::optional<dense_count_layout> dense_count_layout::plan(int64_t min_key,
 
 std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
   std::vector<cudf::column_view> const& keys,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   using scalar_pair = std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>;
@@ -613,17 +613,17 @@ std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
 
 template <typename CountT>
 auto dense_count_state::make_bins(std::size_t slots,
-                                  rmm::cuda_stream_view stream,
+                                  ::cuda::stream_ref stream,
                                   rmm::device_async_resource_ref mr) -> histograms<CountT>
 {
   // plan() proved 2 * slots * sizeof(CountT) fits size_t.
   histograms<CountT> result{rmm::device_uvector<CountT>(2 * slots, stream, mr)};
-  CUDF_CUDA_TRY(cudaMemsetAsync(result.bins.data(), 0, 2 * slots * sizeof(CountT), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(result.bins.data(), 0, 2 * slots * sizeof(CountT), stream.get()));
   return result;
 }
 
 dense_count_state::dense_count_state(dense_count_layout const& layout,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr)
   : _layout(layout),
     _bins(layout.slot_bytes() == sizeof(uint64_t)
@@ -633,7 +633,7 @@ dense_count_state::dense_count_state(dense_count_layout const& layout,
 }
 
 void dense_count_state::accumulate_preserved(cudf::column_view const& keys,
-                                             rmm::cuda_stream_view stream)
+                                             ::cuda::stream_ref stream)
 {
   std::visit(
     [&](auto& bins) {
@@ -645,7 +645,7 @@ void dense_count_state::accumulate_preserved(cudf::column_view const& keys,
 
 void dense_count_state::accumulate_counted(cudf::column_view const& keys,
                                            std::optional<cudf::column_view> const& count_argument,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   std::visit(
     [&](auto& bins) {
@@ -658,7 +658,7 @@ std::unique_ptr<cudf::table> dense_count_state::emit(cudf::data_type key_type,
                                                      dense_count_semantics semantics,
                                                      int64_t null_group_rows,
                                                      dense_count_bounds bounds,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr) const
 {
   return std::visit(
@@ -678,7 +678,7 @@ std::unique_ptr<cudf::table> dense_count_state::emit(cudf::data_type key_type,
 
 void throw_if_count_product_overflows(cudf::column_view const& lhs,
                                       cudf::column_view const& rhs,
-                                      rmm::cuda_stream_view stream,
+                                      ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr)
 {
   if (lhs.type().id() != cudf::type_id::INT64 || rhs.type().id() != cudf::type_id::INT64) {
@@ -699,7 +699,7 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
   validate_product_kernel<<<resident_grid_for(lhs.size(), validate_product_kernel),
                             k_block_size,
                             0,
-                            stream.value()>>>(
+                            stream.get()>>>(
     lhs.data<int64_t>(), rhs.data<int64_t>(), static_cast<int64_t>(lhs.size()), status.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
@@ -713,7 +713,7 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
 std::unique_ptr<cudf::table> make_null_group_table(cudf::data_type key_type,
                                                    dense_count_semantics semantics,
                                                    int64_t null_group_rows,
-                                                   rmm::cuda_stream_view stream,
+                                                   ::cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref mr)
 {
   return build_output_table(
