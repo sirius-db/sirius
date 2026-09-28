@@ -1,5 +1,14 @@
-build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
-build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+add_library(sirius_objects OBJECT ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                                CXX_VISIBILITY_PRESET hidden)
+add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
+
+add_library(sirius_shared SHARED src/sirius_library_anchor.cpp
+                                 $<TARGET_OBJECTS:sirius_objects>)
+build_static_extension(sirius src/sirius_extension_entry.cpp
+                       $<TARGET_OBJECTS:sirius_objects>)
+build_loadable_extension(sirius CPP src/sirius_extension_entry.cpp
+                         $<TARGET_OBJECTS:sirius_objects>)
 
 # The standalone FFI constructs an embedded DuckDB, which needs the no-op static
 # extension loader retained regardless of archive ordering.
@@ -18,15 +27,22 @@ set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
                                      -Wrange-loop-analysis -Wnull-dereference)
 
-foreach(_target sirius_extension sirius_loadable_extension)
+foreach(_target sirius_objects sirius_core sirius_extension
+                sirius_loadable_extension sirius_shared)
+  set(_link_scope "")
+  if(_target STREQUAL "sirius_shared")
+    set(_link_scope PRIVATE)
+  endif()
   set_target_properties(
     ${_target}
     PROPERTIES CXX_STANDARD 20
                CXX_STANDARD_REQUIRED ON
                CUDA_STANDARD 20
                CUDA_STANDARD_REQUIRED ON
-               CUDA_SEPARABLE_COMPILATION ON
-               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+               CUDA_SEPARABLE_COMPILATION ON)
+  if(NOT _target STREQUAL "sirius_objects")
+    set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
   # consumers (tests/benchmarks) with --expt-extended-lambda.
@@ -83,6 +99,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_link_libraries(
     ${_target}
+    ${_link_scope}
     cudf::cudf
     cuvs::cuvs
     raft::raft
@@ -98,7 +115,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     parquet_extension
     simpatico)
   if(BUILD_WITH_CTRACK)
-    target_link_libraries(${_target} ctrack::ctrack)
+    target_link_libraries(${_target} ${_link_scope} ctrack::ctrack)
   endif()
 
   # Corrosion exposes telemetry_bridge as an INTERFACE target whose concrete
@@ -109,28 +126,36 @@ foreach(_target sirius_extension sirius_loadable_extension)
     TARGET ${_target} PROPERTY "LINK_LIBRARY_OVERRIDE_telemetry_bridge-static"
                                WHOLE_ARCHIVE)
 
+  target_link_libraries(
+    ${_target}
+    ${_link_scope}
+    PkgConfig::NUMA
+    PkgConfig::LIBURING
+    ${SIRIUS_CURL_TARGET}
+    OpenSSL::Crypto
+    absl::any_invocable)
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
-# Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable)
-
-# `sirius_extension` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
+# `sirius_core` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
 # perform a final link. Carry the concrete Rust archive as a transitive
 # WHOLE_ARCHIVE item instead; DuckDB and every other final consumer then retain
 # the static NVTX pointer shim as well.
-target_link_libraries(sirius_extension
-                      "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
+foreach(_target sirius_core sirius_extension)
+  target_link_libraries(${_target}
+                        "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
+endforeach()
 
 # A statically embedded Sirius cannot give NVTX a DSO path. Its private dlopen
 # interposer maps one sentinel path to the running executable instead. Carry
 # both symbols into the final executable's dynamic symbol table so dependency
 # images such as libcudf can resolve the Quent initializer from that handle.
-target_link_options(
-  sirius_extension INTERFACE
-  "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2"
-  "LINKER:--export-dynamic-symbol=dlopen")
+foreach(_target sirius_core sirius_extension)
+  target_link_options(
+    ${_target} INTERFACE
+    "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2"
+    "LINKER:--export-dynamic-symbol=dlopen")
+endforeach()
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       ${SIRIUS_CURL_TARGET} OpenSSL::Crypto)
@@ -143,7 +168,6 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 target_link_options(sirius_loadable_extension PRIVATE
                     "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
 
-add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
 add_library(sirius::sirius ALIAS sirius_shared)
 set_target_properties(
   sirius_shared
@@ -162,7 +186,7 @@ target_include_directories(
 target_compile_features(sirius_shared PUBLIC cxx_std_20)
 target_link_libraries(
   sirius_shared
-  PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
+  PRIVATE duckdb_static
           "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
 set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
 
