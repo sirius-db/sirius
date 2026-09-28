@@ -16,9 +16,9 @@
 // via the alp_traits<T> accessor. Both instantiations share the same code
 // path, so kernel improvements apply to both precisions automatically.
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 #include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>

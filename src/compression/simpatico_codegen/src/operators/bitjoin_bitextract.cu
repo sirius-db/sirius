@@ -10,9 +10,9 @@
  * FLOAT32/FLOAT64 inputs are reinterpreted as UINT32/UINT64 bit patterns.
  */
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>

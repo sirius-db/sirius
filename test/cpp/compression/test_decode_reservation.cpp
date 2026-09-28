@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#include "api/simpatico_codegen.hpp"
-
 #include <cudf/column/column_factories.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
+#include <api/simpatico_codegen.hpp>
 #include <catch.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>

@@ -2,8 +2,8 @@
 // Implementation of the low-level (batched) nvcomp codec driver. See the header
 // for the frame format and rationale.
 
-#include "../decode/decode_session.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 #include "nvcomp_batched_codec.hpp"
 
 #include <cuda_runtime.h>

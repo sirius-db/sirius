@@ -12,8 +12,8 @@
 
 #pragma once
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
 #include "nvcomp_batched_codec.hpp"
 
 #include <cudf/column/column_factories.hpp>

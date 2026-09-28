@@ -10,11 +10,11 @@
 // ``bitextract_<spec>`` prefix) to the matching subclass factory. Every place
 // that has raw stored channels and needs a typed rep funnels through here.
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>

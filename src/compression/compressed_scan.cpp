@@ -29,6 +29,7 @@
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <numeric>
 #include <span>
@@ -635,11 +636,10 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   // stream: a lane that is also a memory prefetcher worker's stream charges the decode's
   // allocations to that worker's reservation, so compressed scans are not accounted correctly in
   // that mode.
-  std::vector<::cuda::stream_ref> lanes;
-  lanes.reserve(kDecodeStreams);
-  for (std::size_t i = 0; i < kDecodeStreams; ++i) {
-    lanes.push_back(space.acquire_stream());
-  }
+  // cuda::stream_ref has no default constructor, so the lanes are built in place.
+  auto const lanes = [&]<std::size_t... I>(std::index_sequence<I...>) {
+    return std::array<::cuda::stream_ref, kDecodeStreams>{((void)I, space.acquire_stream())...};
+  }(std::make_index_sequence<kDecodeStreams>{});
   if (!request.empty() && !request.row_selection_disabled) {
     out.table =
       decompress_with_pushdown(chunk, selected, request, keep_mask, lanes, stream, mr, out.outcome);

@@ -3,11 +3,11 @@
  * Stores the encoded dictionary column to avoid copying keys chars from cuDF (invalid pointers).
  */
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "constant_width_offsets.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>

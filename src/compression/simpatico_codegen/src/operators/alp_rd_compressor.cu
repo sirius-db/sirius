@@ -26,9 +26,9 @@
 // 16 bits (right_bw ∈ [48..63]), which keeps the dict column UINT16 across
 // types. This matches the upstream cwida convention.
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 #include "operators/alp_common.cuh"
 
 #include <cudf/column/column.hpp>

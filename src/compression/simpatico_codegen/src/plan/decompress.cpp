@@ -1485,6 +1485,8 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out)
 {
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_column_selection_mask"};
+
   compressed_representation const* rep = nullptr;
   try {
     validate_plan(tree);

@@ -3,10 +3,10 @@
 // str_split: decompose STRING into {offsets, chars, null_mask}; reassemble via
 // make_strings_column on decode. Structural operator.
 
-#include "../decode/decode_session.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/representation.hpp"
 #include "codegen/util/cuda_check.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
