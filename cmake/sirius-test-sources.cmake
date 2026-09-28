@@ -145,6 +145,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp
     test/cpp/operator/test_physical_mark_join.cpp
+    test/cpp/operator/test_physical_mixed_filter_join.cpp
     test/cpp/operator/test_physical_merge_sort.cpp
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp

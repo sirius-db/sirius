@@ -269,7 +269,7 @@ TEST_CASE_METHOD(join_expression_key_fixture,
 }
 
 TEST_CASE_METHOD(join_expression_key_fixture,
-                 "join expression key - mixed SEMI and ANTI fallback materializes hash-key casts",
+                 "join expression key - mixed SEMI and ANTI keep casts in hash keys",
                  "[join_expression_key][isolated_context]")
 {
   const bool anti             = GENERATE(false, true);
@@ -292,8 +292,14 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
                                           : (anti ? JoinType::ANTI : JoinType::SEMI);
   REQUIRE(hj->join_type == expected_type);
-  require_all_equality_sides_are_references(*hj);
-  CHECK(has_projection_child(*hj));
+  CHECK_FALSE(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 2);
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison == sirius::comparison_type::equal) {
+      CHECK_FALSE(is_bound_ref(*condition.left));
+      CHECK_FALSE(is_bound_ref(*condition.right));
+    }
+  }
   CHECK(hj->types.size() == 2);
   const auto& output = right_family ? hj->rhs_output_columns : hj->lhs_output_columns;
   CHECK(output.col_idxs.size() == 2);

@@ -142,8 +142,8 @@ TEST_CASE_METHOD(JoinNullFixture,
 
   // The larger table stays on the physical left. Selecting the small table produces
   // RIGHT_SEMI/RIGHT_ANTI; both orientations have NULLs in the residual's build column.
-  // INTEGER is unsupported by cuDF AST casts. Both key sides must be materialized,
-  // and SELECT l.* checks that their synthetic columns do not leak into the output.
+  // INTEGER is unsupported by cuDF AST casts. The keys must stay on the hash path,
+  // and SELECT l.* checks that build validity columns do not leak into the output.
   const std::string lhs = right_family ? "cast_small" : "cast_big";
   const std::string rhs = right_family ? "cast_big" : "cast_small";
   const auto query      = "SELECT l.* FROM " + lhs + " l " + join_type + " JOIN " + rhs +
@@ -157,4 +157,26 @@ TEST_CASE_METHOD(JoinNullFixture,
   const auto expected_type = (right_family ? "RIGHT_" : "") + join_type;
   REQUIRE(plan->ToString().find("Join Type: " + expected_type) != std::string::npos);
   compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution selective mixed SEMI and ANTI joins with one NULL residual",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  const std::string join_type = GENERATE("SEMI", "ANTI");
+  const bool right_family     = GENERATE(false, true);
+  // Only one build residual is NULL in either orientation. The equality keys narrow five
+  // billion possible row pairs to 50,000 candidates; a conditional full-predicate join loses
+  // that selectivity. Keep this a result regression rather than a hardware-dependent timer.
+  run_ok(
+    "CREATE TABLE selective_big AS SELECT i::INTEGER AS k, "
+    "CASE WHEN i = 0 THEN NULL ELSE 1 END AS v FROM range(100000) t(i);");
+  run_ok(
+    "CREATE TABLE selective_small AS SELECT i::INTEGER AS k, "
+    "CASE WHEN i = 0 THEN NULL ELSE 0 END AS v FROM range(50000) t(i);");
+  run_ok("CHECKPOINT;");
+  const std::string lhs = right_family ? "selective_small" : "selective_big";
+  const std::string rhs = right_family ? "selective_big" : "selective_small";
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + lhs + " l " + join_type + " JOIN " + rhs +
+                     " r ON l.k = r.k AND l.v <> r.v");
 }
