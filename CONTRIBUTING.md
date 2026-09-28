@@ -51,7 +51,7 @@ Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `co
 
 ## Submodules
 
-The `duckdb/`, `duckdb-python/`, and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
+The `duckdb/` and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
 
 ## Migrating your local clone from `dev` to `main`
 
