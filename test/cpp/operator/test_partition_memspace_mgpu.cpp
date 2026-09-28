@@ -134,7 +134,7 @@ mgpu_env_params tight_params(int num_gpus)
 // the wrong GPU SIGABRT'd in cuco (so a regression aborts the unittest binary).
 //===----------------------------------------------------------------------===//
 TEST_CASE("partition memory-space is enforced across OOM reschedule on multi-GPU",
-          "[mgpu][operator-mgpu][partition][memspace][hash_join][gpu_execution]")
+          "[mgpu][operator-mgpu][partition][memspace][hash_join][gpu_execution][multi_gpu]")
 {
   if (!sirius::test::mgpu::require_two_gpus()) return;
 

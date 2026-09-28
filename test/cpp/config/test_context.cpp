@@ -19,6 +19,7 @@
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -1895,7 +1896,7 @@ TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusio
 // multi-GPU correctness when multiple executors target different devices.
 // ============================================================================
 
-TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
+TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1916,7 +1917,8 @@ TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
   }
 }
 
-TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_foundation]")
+TEST_CASE("reservation_manager_configurator builds N GPU spaces",
+          "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1942,7 +1944,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   REQUIRE(host_count >= 1);
 }
 
-TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation]")
+TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -2024,14 +2026,9 @@ TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (M
   sirius::converter_registry::shutdown();
 }
 
-TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
+TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   sirius::converter_registry::reset_for_testing();
 
@@ -2073,14 +2070,9 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
 // .planning/phases/07-*/07-RESEARCH.md — Ada Lovelace + Sapphire Rapids).
 // WARN+return on single-GPU hosts (Catch2 v2 skip idiom).
 TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-06)",
-          "[multi_gpu_foundation][mgpu_04_round_trip]")
+          "[multi_gpu_foundation][mgpu_04_round_trip][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs for MGPU-04 round-trip");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   sirius::converter_registry::reset_for_testing();
 

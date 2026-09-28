@@ -116,4 +116,12 @@ extern shared_test_env* g_integration_env_2gpu;
  */
 shared_test_env* acquire_integration_env_for(int num_gpus);
 
+/**
+ * @brief Returns whether at least @p n GPUs are visible, WARNing when not so the caller can skip.
+ *
+ * Tests that need more than one GPU must be tagged [multi_gpu]: CI runs the rest in per-GPU
+ * shards with SIRIUS_TEST_SINGLE_GPU set, under which a shortfall FAILs instead of skipping.
+ */
+bool has_gpus(int n);
+
 }  // namespace sirius::test

@@ -136,7 +136,7 @@ void attach_integration_duckdb(duckdb::Connection& con)
 }  // namespace
 
 TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
-          "[integration][mgpu-audit][gpu_execution][TPC-H][Q1]")
+          "[integration][mgpu-audit][gpu_execution][TPC-H][Q1][multi_gpu]")
 {
   // The native duckdb scan is the default and does not emit the per-GPU scan
   // markers this audit greps for; skip.
@@ -145,14 +145,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
     "on this path — skipping");
   return;
 
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN(
-      "[mgpu-audit] AUDIT-01/02/03 requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 v2 WARN+return convention)");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   auto* env = sirius::test::acquire_integration_env_for(2);
   REQUIRE(env != nullptr);

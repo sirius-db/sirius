@@ -16,7 +16,11 @@
 
 #include "sirius_test_env.hpp"
 
+#include "catch.hpp"
+
 #include <cuda_runtime.h>
+
+#include <cstdlib>
 
 namespace sirius::test {
 
@@ -109,13 +113,20 @@ void shared_test_env::resume()
 shared_test_env* acquire_integration_env_for(int num_gpus)
 {
   if (num_gpus == 1) { return g_integration_env; }
-  if (num_gpus == 2) {
-    int count = 0;
-    cudaGetDeviceCount(&count);
-    if (count < 2) { return nullptr; }
-    return g_integration_env_2gpu;
-  }
+  if (num_gpus == 2) { return has_gpus(2) ? g_integration_env_2gpu : nullptr; }
   return nullptr;
+}
+
+bool has_gpus(int n)
+{
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess) { count = 0; }
+  if (count >= n) { return true; }
+  if (std::getenv("SIRIUS_TEST_SINGLE_GPU") != nullptr) {
+    FAIL("test needs " << n << " GPUs but runs in a single-GPU shard; tag it [multi_gpu]");
+  }
+  WARN("test needs " << n << " GPUs, " << count << " visible; skipping");
+  return false;
 }
 
 }  // namespace sirius::test

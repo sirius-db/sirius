@@ -22,6 +22,7 @@
 #include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -57,27 +58,9 @@ constexpr int kBuildDevice = 0;
 constexpr int kProbeDevice = 1;
 constexpr std::array<int, 2> kReplicaDevices{kBuildDevice, kProbeDevice};
 
-bool require_two_gpus()
-{
-  int count      = 0;
-  auto const err = cudaGetDeviceCount(&count);
-  if (err != cudaSuccess || count < 2) {
-    WARN("dynamic-filter replica test requires at least two visible GPUs; skipping");
-    return false;
-  }
-  return true;
-}
+bool require_two_gpus() { return sirius::test::has_gpus(2); }
 
-bool require_three_gpus()
-{
-  int count      = 0;
-  auto const err = cudaGetDeviceCount(&count);
-  if (err != cudaSuccess || count < 3) {
-    WARN("dynamic-filter overlap test requires at least three visible GPUs; skipping");
-    return false;
-  }
-  return true;
-}
+bool require_three_gpus() { return sirius::test::has_gpus(3); }
 
 template <typename T>
 std::unique_ptr<cudf::column> make_values(std::vector<T> const& values,
@@ -158,7 +141,7 @@ std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
 }  // namespace
 
 TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
-          "[dynamic_filter][mgpu][replica][in_list]")
+          "[dynamic_filter][mgpu][replica][in_list][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
@@ -222,7 +205,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 }
 
 TEST_CASE("dynamic-filter replicas require destination reservation admission",
-          "[dynamic_filter][mgpu][replica][reservation]")
+          "[dynamic_filter][mgpu][replica][reservation][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
@@ -286,7 +269,7 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
 }
 
 TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
-          "[dynamic_filter][mgpu][replica][peer_overlap]")
+          "[dynamic_filter][mgpu][replica][peer_overlap][multi_gpu]")
 {
   if (!require_three_gpus()) { return; }
 
@@ -333,7 +316,7 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
 }
 
 TEST_CASE("dynamic-filter replica transfer borrows fixed blocks from a Sirius HOST space",
-          "[dynamic_filter][mgpu][replica][transfer]")
+          "[dynamic_filter][mgpu][replica][transfer][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
@@ -405,7 +388,7 @@ TEST_CASE("dynamic-filter replica transfer borrows fixed blocks from a Sirius HO
 }
 
 TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
-          "[dynamic_filter][mgpu][replica][bloom]")
+          "[dynamic_filter][mgpu][replica][bloom][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
@@ -455,7 +438,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
 }
 
 TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1",
-          "[dynamic_filter][mgpu][replica][zone_map]")
+          "[dynamic_filter][mgpu][replica][zone_map][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
@@ -506,7 +489,7 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
 }
 
 TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1",
-          "[dynamic_filter][mgpu][replica][small_in_list]")
+          "[dynamic_filter][mgpu][replica][small_in_list][multi_gpu]")
 {
   if (!require_two_gpus()) { return; }
 
