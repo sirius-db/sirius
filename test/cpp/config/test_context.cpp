@@ -287,7 +287,19 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 0);
+    REQUIRE(setting_count(con, "hash_partition_bytes") == 0);
+    REQUIRE(setting_count(con, "max_broadcast_join_size") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET max_build_hash_table_bytes = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET hash_partition_bytes = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET max_broadcast_join_size = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET enable_pinned_zone_map_pruning = false");
@@ -337,6 +349,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 0);
+    REQUIRE(setting_count(con, "hash_partition_bytes") == 0);
+    REQUIRE(setting_count(con, "max_broadcast_join_size") == 0);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -354,7 +369,28 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    REQUIRE(setting_count(con, "max_build_hash_table_bytes") == 1);
+    REQUIRE(setting_count(con, "hash_partition_bytes") == 1);
+    REQUIRE(setting_count(con, "max_broadcast_join_size") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET max_build_hash_table_bytes = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET max_build_hash_table_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET hash_partition_bytes = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET hash_partition_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET max_broadcast_join_size = 1048576");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET max_broadcast_join_size");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET enable_pinned_zone_map_pruning = false");
