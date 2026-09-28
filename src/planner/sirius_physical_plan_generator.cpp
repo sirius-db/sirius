@@ -451,7 +451,7 @@ void wrap_table_scan_source(
     leaf         = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
                               scan,
                               op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
+                              sirius::op::scan::dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
                               sirius_ctx.get());
     replace_slot = true;
   } else if (fn == "iceberg_scan") {
@@ -464,7 +464,7 @@ void wrap_table_scan_source(
     leaf = make_gpu_scan_leaf(build_iceberg_table_info(scan, op_params, context),
                               scan,
                               op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
+                              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
                               sirius_ctx.get());
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
@@ -473,7 +473,7 @@ void wrap_table_scan_source(
     leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
                               scan,
                               op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
+                              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
                               sirius_ctx.get());
     replace_slot = true;
   } else {
