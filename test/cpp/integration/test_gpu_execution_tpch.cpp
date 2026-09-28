@@ -4122,42 +4122,42 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 1",
-                 "[integration][gpu_execution][TPC-H][Q1]")
+                 "[integration][gpu_execution][TPC-H][Q1][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 1 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q1]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q1][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ1, sirius::test::kTpchQueries[0].float_tolerance);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 2",
-                 "[integration][gpu_execution][TPC-H][Q2]")
+                 "[integration][gpu_execution][TPC-H][Q2][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ2);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 2 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q2]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q2][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ2);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 3",
-                 "[integration][gpu_execution][TPC-H][Q3]")
+                 "[integration][gpu_execution][TPC-H][Q3][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ3);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 3 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q3]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q3][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ3);
 }
@@ -4170,7 +4170,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // a fresh bind_env.
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 4",
-                 "[integration][gpu_execution][TPC-H][Q4]")
+                 "[integration][gpu_execution][TPC-H][Q4][multi_gpu]")
 {
   auto const num_gpus = GENERATE(1, 2);
   CAPTURE(num_gpus);
@@ -4187,7 +4187,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 4 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q4]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q4][multi_gpu]")
 {
   auto const num_gpus = GENERATE(1, 2);
   CAPTURE(num_gpus);
@@ -4204,224 +4204,224 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 5",
-                 "[integration][gpu_execution][TPC-H][Q5]")
+                 "[integration][gpu_execution][TPC-H][Q5][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ5);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 5 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q5]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q5][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ5);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 6",
-                 "[integration][gpu_execution][TPC-H][Q6]")
+                 "[integration][gpu_execution][TPC-H][Q6][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ6);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 6 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q6]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q6][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ6);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 7",
-                 "[integration][gpu_execution][TPC-H][Q7]")
+                 "[integration][gpu_execution][TPC-H][Q7][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ7);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 7 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q7]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q7][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ7);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 8",
-                 "[integration][gpu_execution][TPC-H][Q8]")
+                 "[integration][gpu_execution][TPC-H][Q8][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ8);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 8 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q8]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q8][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ8);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 9",
-                 "[integration][gpu_execution][TPC-H][Q9]")
+                 "[integration][gpu_execution][TPC-H][Q9][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ9);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 9 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q9]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q9][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ9);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 10",
-                 "[integration][gpu_execution][TPC-H][Q10]")
+                 "[integration][gpu_execution][TPC-H][Q10][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ10);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 10 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q10]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q10][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ10);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 11",
-                 "[integration][gpu_execution][TPC-H][Q11]")
+                 "[integration][gpu_execution][TPC-H][Q11][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ11);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 11 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q11]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q11][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ11);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 12",
-                 "[integration][gpu_execution][TPC-H][Q12]")
+                 "[integration][gpu_execution][TPC-H][Q12][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ12);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 12 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q12]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q12][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ12);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 13",
-                 "[integration][gpu_execution][TPC-H][Q13]")
+                 "[integration][gpu_execution][TPC-H][Q13][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ13);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 13 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q13]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q13][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ13);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 14",
-                 "[integration][gpu_execution][TPC-H][Q14]")
+                 "[integration][gpu_execution][TPC-H][Q14][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ14);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 14 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q14]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q14][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ14);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 15",
-                 "[integration][gpu_execution][TPC-H][Q15]")
+                 "[integration][gpu_execution][TPC-H][Q15][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ15);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 15 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q15]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q15][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ15);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 16",
-                 "[integration][gpu_execution][TPC-H][Q16]")
+                 "[integration][gpu_execution][TPC-H][Q16][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ16);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 16 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q16]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q16][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ16);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 17",
-                 "[integration][gpu_execution][TPC-H][Q17]")
+                 "[integration][gpu_execution][TPC-H][Q17][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ17);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 17 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q17]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q17][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ17);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 18",
-                 "[integration][gpu_execution][TPC-H][Q18]")
+                 "[integration][gpu_execution][TPC-H][Q18][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ18);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 18 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q18]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q18][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ18);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 19",
-                 "[integration][gpu_execution][TPC-H][Q19]")
+                 "[integration][gpu_execution][TPC-H][Q19][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ19);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 19 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q19]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q19][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ19);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 20",
-                 "[integration][gpu_execution][TPC-H][Q20]")
+                 "[integration][gpu_execution][TPC-H][Q20][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ20);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 20 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q20]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q20][multi_gpu]")
 {
   sirius::test::scoped_recording_log_sink logs{"warn"};
   RUN_TPCH_MGPU(sirius::test::kTpchQ20);
@@ -4433,28 +4433,28 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 21",
-                 "[integration][gpu_execution][TPC-H][Q21]")
+                 "[integration][gpu_execution][TPC-H][Q21][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ21);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 21 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q21]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q21][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ21);
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 22",
-                 "[integration][gpu_execution][TPC-H][Q22]")
+                 "[integration][gpu_execution][TPC-H][Q22][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ22);
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 22 parquet",
-                 "[integration][gpu_execution][parquet][TPC-H][Q22]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q22][multi_gpu]")
 {
   RUN_TPCH_MGPU(sirius::test::kTpchQ22);
 }
@@ -4471,18 +4471,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q1_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q1]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q1][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q1 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q1_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, "
@@ -4502,18 +4497,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q6_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q6]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q6][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q6 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q6_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select sum(l_extendedprice * l_discount) as revenue "
@@ -4529,18 +4519,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q12_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q12]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q12][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q12 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q12_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select l_shipmode, "
@@ -4572,18 +4557,13 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 // NESTED_LOOP_JOIN downstream of the CTE.
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - tpch_q11_sf10_2gpu",
-                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q11]")
+                 "[integration][tpch_sf10][mgpu-audit][gpu_execution][TPC-H][Q11][multi_gpu]")
 {
   if (sf10_path().empty()) {
     WARN("SIRIUS_TEST_SF10_PATH unset; skipping SF10 Q11 variant (TEST-04 gate)");
     return;
   }
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("tpch_q11_sf10_2gpu requires >=2 GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!compare_gpu_vs_cpu_sf10_for(
         /*num_gpus=*/2,
         "select ps_partkey, "
