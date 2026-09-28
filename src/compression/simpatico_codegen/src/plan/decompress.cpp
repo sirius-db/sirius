@@ -944,11 +944,13 @@ struct str_split_shape {
 std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree);
 
 // The specialized dictionary char-emit (launch_decode_fused_tree_dict_gather): null-free keys whose
-// uniform width the plan node publishes and whose keys_chars is an identity-stored channel, bound
-// by view without a copy. An unknown or variable width and compressed keys take the general route,
-// which measures. The caller owns the analytic offsets (j * width) and the strings assembly; the
-// kernel itself emits only the compacted chars. Returns nullptr only when this shape is
-// unsupported. Execution failures throw; nothing shared is mutated before a semantic decline.
+// uniform width the plan node publishes, whose keys_chars is an identity-stored channel bound by
+// view without a copy, and whose identity-stored keys_offsets count confirms the chars extent that
+// width implies. An unknown or variable width, compressed key channels, and a width that
+// contradicts the extent take the general route, which measures or rejects. The caller owns the
+// analytic offsets (j * width) and the strings assembly; the kernel itself emits only the compacted
+// chars. Returns nullptr only when this shape is unsupported. Execution failures throw; nothing
+// shared is mutated before a semantic decline.
 std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
                                                         decode_selection const& sel,
                                                         DecodeWalk& walk,
@@ -959,21 +961,31 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   auto const& node = tree.nodes[dict_nid];
   auto const width = node.dictionary_key_width_hint;
   if (width <= 0) return nullptr;
-  cudf::column_view chars{};
-  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
-    if (node.output_names[i] != "keys_chars") continue;
-    if (std::any_of(node.children.begin(), node.children.end(), [](auto const& edge) {
-          return edge.channel == "keys_chars";
-        }))
-      return nullptr;
-    auto it = node.channels.find(node.output_paths[i]);
-    if (it == node.channels.end() || !it->second) return nullptr;
-    auto const* identity =
-      dynamic_cast<identity_compressed_representation const*>(it->second.get());
-    if (!identity || identity->channels_.size() != 1 || !identity->channels_[0]) return nullptr;
-    chars = identity->channels_[0]->view();
-  }
+  auto const terminal_identity_channel = [&node](char const* name) -> cudf::column const* {
+    for (std::size_t i = 0; i < node.output_names.size() && i < node.output_paths.size(); ++i) {
+      if (node.output_names[i] != name) continue;
+      if (std::any_of(node.children.begin(), node.children.end(), [name](auto const& edge) {
+            return edge.channel == name;
+          }))
+        return nullptr;
+      auto const it = node.channels.find(node.output_paths[i]);
+      if (it == node.channels.end() || !it->second) return nullptr;
+      auto const* identity =
+        dynamic_cast<identity_compressed_representation const*>(it->second.get());
+      if (!identity || identity->channels_.size() != 1) return nullptr;
+      return identity->channels_[0].get();
+    }
+    return nullptr;
+  };
+  auto const* const chars_column   = terminal_identity_channel("keys_chars");
+  auto const* const offsets_column = terminal_identity_channel("keys_offsets");
+  if (!chars_column || !offsets_column) return nullptr;
+  auto const chars = chars_column->view();
   if (chars.type().id() != cudf::type_id::UINT8 || chars.null_count() != 0) return nullptr;
+  // The gather addresses the chars with the width, so the extent it implies is checked against host
+  // metadata first, the property make_decode_dictionary enforces on the general route.
+  auto const keys = static_cast<std::int64_t>(offsets_column->size()) - 1;
+  if (keys < 0 || static_cast<std::int64_t>(chars.size()) != keys * width) return nullptr;
   // The analytic offsets are INT32; a larger output takes the general route.
   if (sel.survivor_count * width > std::numeric_limits<cudf::size_type>::max()) return nullptr;
   auto codes_nid = static_cast<NodeId>(tree.nodes.size());

@@ -255,15 +255,16 @@ uploaded_needles upload_needles(std::vector<std::string> const& needles, decode_
   auto const offsets_bytes = (count + 1) * sizeof(std::int32_t);
   auto const total_bytes   = offsets_bytes + total_chars;
   auto const host          = frame.host_array<char>(total_bytes);
-  auto* const host_offsets = reinterpret_cast<std::int32_t*>(host.data());
   auto* const host_chars   = host.data() + offsets_bytes;
-  std::int32_t cursor      = 0;
+  std::vector<std::int32_t> offsets(count + 1);
+  std::int32_t cursor = 0;
   for (std::size_t j = 0; j < count; ++j) {
-    host_offsets[j] = cursor;
+    offsets[j] = cursor;
     if (!needles[j].empty()) std::memcpy(host_chars + cursor, needles[j].data(), needles[j].size());
     cursor += static_cast<std::int32_t>(needles[j].size());
   }
-  host_offsets[count] = cursor;
+  offsets[count] = cursor;
+  std::memcpy(host.data(), offsets.data(), offsets_bytes);
   rmm::device_buffer storage(total_bytes, frame.stream(), frame.mr());
   throw_if_cuda_error(
     cudaMemcpyAsync(

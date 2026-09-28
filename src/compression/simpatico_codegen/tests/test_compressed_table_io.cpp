@@ -21,7 +21,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -327,27 +326,52 @@ void test_dictionary()
 }
 
 // PlanNode::dictionary_key_width_hint is never serialized: both readers derive it from the stored
-// tree, so a read publishes the value the compress walk did (and -1 where neither can know).
+// tree, so a read publishes the value the compress walk did, -1 where neither can know (a consumed
+// keys_offsets), and -1 where only the reader declines to look (a key set above its readback bound,
+// kMaxHintOffsets in api/compressed_table_io.cpp).
 void test_dictionary_key_width_hint()
 {
   rmm::cuda_stream_view stream = cudf::get_default_stream();
   auto mr                      = rmm::mr::get_current_device_resource_ref();
-  std::vector<std::string> values(2048);
-  for (std::size_t i = 0; i < values.size(); ++i)
-    values[i] = std::array{"AB", "CD", "EF"}[(i * 5 + i / 7) % 3];
-  auto input = make_strings_column(values, {}, stream);
-  struct shape {
-    char const* plan;
-    std::int64_t expected;
+  auto const make_input        = [&](std::vector<std::string> const& keys) {
+    std::vector<std::string> values(2048);
+    for (std::size_t i = 0; i < values.size(); ++i)
+      values[i] = keys[(i * 5 + i / 7) % keys.size()];
+    return make_strings_column(values, {}, stream);
   };
+  // 65536 distinct six-byte keys, one per row, give 65537 offsets: one past the reader's bound.
+  std::vector<std::string> many_keys(65536);
+  for (std::size_t i = 0; i < many_keys.size(); ++i) {
+    auto const digits = std::to_string(i);
+    many_keys[i]      = "K" + std::string(5 - digits.size(), '0') + digits;
+  }
+  constexpr char const* identity_offsets_plan =
+    "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+    "dictionary.indices -> bitpack\n";
+  struct shape {
+    char const* label;
+    std::unique_ptr<cudf::column> input;
+    char const* plan;
+    std::int64_t encode_expected;
+    std::int64_t read_expected;
+  };
+  std::vector<std::string> const uniform{"AB", "CD", "EF"};
+  std::vector<std::string> const variable{"A", "BB", "CCC"};
   shape const shapes[] = {
-    {"input -> dictionary\n", 2},
-    {"input -> dictionary -> keys_offsets, keys_chars, indices\n"
-     "dictionary.indices -> bitpack\n",
-     2},
-    {"input -> dictionary -> keys_offsets, keys_chars, indices\n"
+    {"self", make_input(uniform), "input -> dictionary\n", 2, 2},
+    {"identity offsets", make_input(uniform), identity_offsets_plan, 2, 2},
+    {"bitpacked offsets",
+     make_input(uniform),
+     "input -> dictionary -> keys_offsets, keys_chars, indices\n"
      "dictionary.keys_offsets -> bitpack\n"
      "dictionary.indices -> bitpack\n",
+     -1,
+     -1},
+    {"variable width", make_input(variable), identity_offsets_plan, 0, 0},
+    {"key set above the readback bound",
+     make_strings_column(many_keys, {}, stream),
+     identity_offsets_plan,
+     6,
      -1},
   };
   auto hint_of = [](simpatico::compressed_table const& table) {
@@ -358,29 +382,32 @@ void test_dictionary_key_width_hint()
     expect(node != nodes.end(), "dictionary hint: plan has no dictionary node");
     return node->dictionary_key_width_hint;
   };
-  auto verify =
-    [&](char const* label, simpatico::compressed_table const& table, std::int64_t expected) {
-      expect(hint_of(table) == expected,
-             (std::string("dictionary hint: ") + label + " value").c_str());
-      auto out = simpatico::decompress(table, stream, mr);
-      expect(out != nullptr && out->num_columns() == 1 &&
-               columns_equal_any(input->view(), out->view().column(0), stream),
-             (std::string("dictionary hint: data mismatch after ") + label).c_str());
-    };
+  auto verify = [&](shape const& s,
+                    char const* producer,
+                    simpatico::compressed_table const& table,
+                    std::int64_t expected) {
+    auto const context = std::string("dictionary hint: ") + s.label + ", " + producer;
+    expect(hint_of(table) == expected, (context + ": value").c_str());
+    auto out = simpatico::decompress(table, stream, mr);
+    expect(out != nullptr && out->num_columns() == 1 &&
+             columns_equal_any(s.input->view(), out->view().column(0), stream),
+           (context + ": data mismatch").c_str());
+  };
   for (auto const& s : shapes) {
-    auto ct = simpatico::compress_with_plan(cudf::table_view{{input->view()}}, s.plan, stream, mr);
-    verify("encode", ct, s.expected);
+    auto ct =
+      simpatico::compress_with_plan(cudf::table_view{{s.input->view()}}, s.plan, stream, mr);
+    verify(s, "encode", ct, s.encode_expected);
     TmpFile tmp;
     std::string werr = simpatico::write_compressed_table(ct, tmp.path);
     expect(werr.empty(), "dictionary hint: write error");
     std::string rerr;
     auto from_file = simpatico::read_compressed_table(tmp.path, stream, mr, &rerr);
     expect(rerr.empty(), "dictionary hint: file read error");
-    verify("file read", from_file, s.expected);
+    verify(s, "file read", from_file, s.read_expected);
     std::string merr;
     auto from_memory = memory_reread("dictionary_key_width_hint", ct, merr);
     expect(merr.empty(), "dictionary hint: memory read error");
-    verify("memory read", from_memory, s.expected);
+    verify(s, "memory read", from_memory, s.read_expected);
   }
 }
 

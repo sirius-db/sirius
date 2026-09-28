@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -453,14 +454,34 @@ class release_observation {
   checked_resource& resource_;
 };
 
+// The deadlock watchdog's budget. SIMPATICO_TEST_GATE_TIMEOUT_MS overrides the default so that a
+// run slowed by a sanitizer can be told apart from a real wait; the variable is read once.
+std::chrono::milliseconds gate_timeout()
+{
+  static std::chrono::milliseconds const timeout = [] {
+    std::chrono::milliseconds const fallback{10'000};
+    char const* const value = std::getenv("SIMPATICO_TEST_GATE_TIMEOUT_MS");
+    if (!value) return fallback;
+    std::string_view const text{value};
+    long long milliseconds  = 0;
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), milliseconds);
+    if (error != std::errc{} || end != text.data() + text.size() || milliseconds <= 0)
+      throw std::invalid_argument(
+        "SIMPATICO_TEST_GATE_TIMEOUT_MS must be a positive number of milliseconds");
+    return std::chrono::milliseconds{milliseconds};
+  }();
+  return timeout;
+}
+
 // The callback only touches atomics. The controller releases on request or after a deadlock
-// watchdog.
+// watchdog, and reports a watchdog trip on stderr with the elapsed time so that a gate the watchdog
+// released is never mistaken for a real wait.
 class stream_gate {
  public:
   explicit stream_gate(rmm::cuda_stream_view stream) : stream_(stream)
   {
     controller_ = std::thread([this] {
-      auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      auto const deadline = started_ + gate_timeout();
       while (!released.load()) {
         if (release_after_delay.load()) {
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -470,6 +491,7 @@ class stream_gate {
         if (std::chrono::steady_clock::now() >= deadline) {
           timed_out.store(true);
           released.store(true);
+          std::fprintf(stderr, "stream_gate: watchdog timed_out (%s)\n", status().c_str());
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -500,6 +522,19 @@ class stream_gate {
   stream_gate(stream_gate const&)            = delete;
   stream_gate& operator=(stream_gate const&) = delete;
 
+  // Watchdog state for a failure message: release and timed_out flags, the time since construction,
+  // and the configured budget.
+  std::string status() const
+  {
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started_)
+                           .count();
+    return "released=" + std::to_string(released.load()) +
+           " timed_out=" + std::to_string(timed_out.load()) +
+           " elapsed_ms=" + std::to_string(elapsed) +
+           " timeout_ms=" + std::to_string(gate_timeout().count());
+  }
+
   std::atomic<bool> released{false};
   std::atomic<bool> entered{false};
   std::atomic<bool> timed_out{false};
@@ -507,6 +542,7 @@ class stream_gate {
 
  private:
   rmm::cuda_stream_view stream_;
+  std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
   std::thread controller_;
 };
 
@@ -2322,13 +2358,18 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
                "an append without host readbacks queried or synchronized a stream");
     }
     expect(!first_gate.released.load() && !second_gate.released.load(),
-           "an append without host readbacks waited for its lane");
+           ("an append without host readbacks waited for its lane, or the gate watchdog timed_out "
+            "first (" +
+            first_gate.status() + "; " + second_gate.status() + ")")
+             .c_str());
     expect(!ledger.observations->wrong_stream, "a gated temporary was released on another stream");
     first_gate.release_after_delay.store(true);
     second_gate.release_after_delay.store(true);
     verify(gated_order, session.finish());
     expect(!first_gate.timed_out.load() && !second_gate.timed_out.load(),
-           "gated temporary watchdog expired");
+           ("gated temporary watchdog timed_out (" + first_gate.status() + "; " +
+            second_gate.status() + ")")
+             .c_str());
   }
   ledger.check();
 }

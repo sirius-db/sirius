@@ -263,7 +263,7 @@ int64_t run_selection_cnt(selection_mask& mask,
   // The one host sync of the selection wave: survivor_count gates wave-2 allocations (compacted
   // TierA columns, the TierB gather map). Staged through the thread's pinned slab, see
   // read_device_bytes_completed.
-  std::uint32_t total;
+  std::uint32_t total = 0;
   simpatico::read_device_bytes_completed(&total, mask.chunk_offsets + nc, sizeof total, stream);
 
   mask.survivor_count = static_cast<int64_t>(total);

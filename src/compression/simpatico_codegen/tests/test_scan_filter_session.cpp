@@ -484,6 +484,17 @@ void dict_codes_gather(simpatico::stream_pool& pool,
   expect(measured != nullptr, error.c_str());
   expect(strings_equal(hinted->view(), measured->view(), stream),
          "dict_codes general route differs from the hinted gather");
+  // A positive hint that does not describe the stored key chars is corrupt metadata: the gather
+  // specialization declines instead of addressing the chars with it, and the general route then
+  // rejects the hint.
+  dictionary->dictionary_key_width_hint = 3;
+  bool rejected                         = false;
+  try {
+    (void)simpatico::decompress_column(tree, stream, mr, &error, nullptr, &selection);
+  } catch (std::invalid_argument const&) {
+    rejected = true;
+  }
+  expect(rejected, "dict_codes gather accepted a key width hint that contradicts the key chars");
 }
 
 }  // namespace

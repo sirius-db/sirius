@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "util/host_observation.hpp"
 
+#include "codegen/util/cuda_check.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstring>
-#include <stdexcept>
 
 namespace simpatico {
-namespace {
-
-void check_cuda(cudaError_t status)
-{
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-
-}  // namespace
 
 pinned_staging_slab::~pinned_staging_slab()
 {
@@ -29,7 +22,8 @@ void* pinned_staging_slab::reserve(std::size_t bytes)
   // Allocate before releasing so a failed growth leaves the current slab usable.
   auto const grown = std::min(cap_bytes, std::max({bytes, 2 * capacity_, initial_bytes}));
   void* fresh      = nullptr;
-  check_cuda(cudaHostAlloc(&fresh, grown, cudaHostAllocPortable));
+  throw_if_cuda_error(cudaHostAlloc(&fresh, grown, cudaHostAllocPortable),
+                      "host observation: pinned staging allocation");
   if (data_) (void)cudaFreeHost(data_);
   data_     = fresh;
   capacity_ = grown;
@@ -48,9 +42,11 @@ void read_device_bytes_completed(void* destination,
                                  rmm::cuda_stream_view stream)
 {
   void* const staging = thread_pinned_staging().reserve(bytes);
-  check_cuda(cudaMemcpyAsync(
-    staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.value()));
-  check_cuda(cudaStreamSynchronize(stream.value()));
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.value()),
+    "host observation: device-to-host copy");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "host observation: stream wait");
   if (staging) std::memcpy(destination, staging, bytes);
 }
 

@@ -383,6 +383,8 @@ class event_pool {
   event_pool()                             = default;
   event_pool(event_pool const&)            = delete;
   event_pool& operator=(event_pool const&) = delete;
+  event_pool(event_pool&&)                 = delete;
+  event_pool& operator=(event_pool&&)      = delete;
   ~event_pool()
   {
     for (auto ev : free_)
@@ -419,29 +421,32 @@ class event_pool {
 // The events one phase draws for its cross-stream joins, returned to the thread's pool when the
 // phase ends; on the failure path that is after the catch's synchronize_all, since the set is
 // declared before the try. The pool is resolved on first use so that constructing the set makes no
-// CUDA call.
-struct event_set {
-  event_pool* pool = nullptr;
-  std::vector<cudaEvent_t> events;
-
+// CUDA call, and make() is the only writer, so a non-null event always has a pool to return to.
+class event_set {
+ public:
   event_set()                            = default;
   event_set(event_set const&)            = delete;
   event_set& operator=(event_set const&) = delete;
+  event_set(event_set&&)                 = delete;
+  event_set& operator=(event_set&&)      = delete;
+  ~event_set()
+  {
+    for (auto ev : events_)
+      if (ev) pool_->release(ev);
+  }
 
   cudaEvent_t make()
   {
-    if (!pool) pool = &event_pool::for_current_device();
+    if (!pool_) pool_ = &event_pool::for_current_device();
     // Register the slot first: growing host storage must not leak an acquired event.
-    events.push_back(nullptr);
-    events.back() = pool->acquire();
-    return events.back();
+    events_.push_back(nullptr);
+    events_.back() = pool_->acquire();
+    return events_.back();
   }
 
-  ~event_set()
-  {
-    for (auto ev : events)
-      if (ev) pool->release(ev);
-  }
+ private:
+  event_pool* pool_ = nullptr;
+  std::vector<cudaEvent_t> events_;
 };
 
 // A semantic precondition or completed selectivity decision may decline this
