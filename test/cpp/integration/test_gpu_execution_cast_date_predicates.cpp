@@ -339,6 +339,8 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
     {
       // DuckDB #25139 calls Timestamp::GetTime on infinite constants while
       // rewriting DATE/TIMESTAMP comparisons, before either execution path runs.
+      // TODO: Remove both expression_rewriter guards once our DuckDB pin includes
+      // the v1.5 backport of https://github.com/duckdb/duckdb/pull/26225.
       sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
       compare_all(kInfinityConstants, "p_t_inf");
     }
