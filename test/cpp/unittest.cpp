@@ -23,6 +23,7 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -101,6 +102,21 @@ struct shared_env_listener : Catch::EventListenerBase {
 };
 
 CATCH_REGISTER_LISTENER(shared_env_listener)
+
+/**
+ * @brief Ends DuckDB Catch's "[n/N] test" progress line when stdout is not a terminal. Catch
+ * leaves it open until the next test starts, so line-streamed CI logs would hide the running test.
+ */
+struct progress_line_listener : Catch::TestEventListenerBase {
+  using TestEventListenerBase::TestEventListenerBase;
+
+  void testCaseStarting(Catch::TestCaseInfo const&) override
+  {
+    if (isatty(STDOUT_FILENO) == 0) { std::cout << std::endl; }
+  }
+};
+
+CATCH_REGISTER_LISTENER(progress_line_listener)
 
 int main(int argc, char* argv[])
 {
