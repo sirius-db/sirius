@@ -34,6 +34,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/pinned_entry_census.hpp>
@@ -335,7 +336,12 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
   {
     pin_compressed_parquet("t_inf");
     compare_all(kFiniteConstantsOnInfinityRows, "p_t_inf");
-    compare_all(kInfinityConstants, "p_t_inf");
+    {
+      // DuckDB #25139 calls Timestamp::GetTime on infinite constants while
+      // rewriting DATE/TIMESTAMP comparisons, before either execution path runs.
+      sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
+      compare_all(kInfinityConstants, "p_t_inf");
+    }
     unpin_parquet("t_inf");
   }
 }
@@ -354,7 +360,10 @@ TEST_CASE_METHOD(CastDatePredicateFixture,
                                 {{"1"}});
   expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d >  TIMESTAMP '2000-06-01'",
                                 {{"2"}});
-  expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'",
-                                {{"1"}, {"2"}});
+  {
+    sirius::test::disabled_optimizers_guard guard(*con, "expression_rewriter");
+    expect_cpu_raises_gpu_answers("SELECT id FROM p_t_far WHERE d <  TIMESTAMP 'infinity'",
+                                  {{"1"}, {"2"}});
+  }
   unpin_parquet("t_far");
 }
