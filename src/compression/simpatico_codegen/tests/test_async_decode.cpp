@@ -11,6 +11,8 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -1132,6 +1134,157 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
       },
       "inconsistent dictionary key width hint was accepted");
     expect(session.finish().empty(), "rejected hint fixture published a session result");
+  }
+}
+
+// BOOL8 equality on valid rows plus identical validity; bytes under nulls are unspecified. Like the
+// other *_completed helpers, the default-stream readbacks are completed before the caller's
+// nonblocking-stream deallocations.
+bool bool8_equal_where_valid_completed(cudf::column_view expected, cudf::column_view actual)
+{
+  bool equal = expected.type().id() == cudf::type_id::BOOL8 && actual.type() == expected.type() &&
+               expected.size() == actual.size() && validity_equal(expected, actual);
+  if (equal) {
+    auto const n = static_cast<std::size_t>(expected.size());
+    std::vector<std::uint8_t> a(n), b(n);
+    cuda_check(cudaMemcpy(a.data(), expected.head<std::uint8_t>(), n, cudaMemcpyDeviceToHost));
+    cuda_check(cudaMemcpy(b.data(), actual.head<std::uint8_t>(), n, cudaMemcpyDeviceToHost));
+    auto const valid = host_validity_bits(expected);
+    for (std::size_t i = 0; i < n && equal; ++i)
+      equal = !valid[i] || (a[i] != 0) == (b[i] != 0);
+  }
+  rmm::cuda_stream_default.synchronize();
+  return equal;
+}
+
+// The dictionary predicate answers equals_any from a lookup table over the keys that is built
+// without a cuDF scalar: the needles upload from frame-owned host storage and nothing on the path
+// waits for the stream. Its semantics are cuDF's EQUAL folded with LOGICAL_OR over the decoded
+// strings.
+void test_dictionary_predicate_lookup(rmm::device_async_resource_ref mr)
+{
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{stream.view()};
+  std::vector<std::string> const key_pool{
+    "DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN", ""};
+  constexpr cudf::size_type rows = 1037;
+
+  auto const evaluate = [&](simpatico::dictionary_compressed_representation const& dictionary,
+                            std::vector<std::string> const& needles) {
+    simpatico::decode_session session(streams, mr);
+    auto& frame = simpatico::decode_session_test_access::frame(session);
+    simpatico::decode_predicate predicate;
+    predicate.equals_any = needles;
+    auto result          = dictionary.decompress_predicate(predicate, frame);
+    stream.synchronize();
+    expect(session.finish().empty(), "predicate fixture published a session result");
+    return result;
+  };
+  auto const reference = [&](cudf::column_view strings, std::vector<std::string> const& needles) {
+    auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
+    std::unique_ptr<cudf::column> mask;
+    for (auto const& needle : needles) {
+      cudf::string_scalar const value(needle, true, stream.view(), mr);
+      auto hit = cudf::binary_operation(
+        strings, value, cudf::binary_operator::EQUAL, bool_type, stream.view(), mr);
+      mask = mask ? cudf::binary_operation(mask->view(),
+                                           hit->view(),
+                                           cudf::binary_operator::LOGICAL_OR,
+                                           bool_type,
+                                           stream.view(),
+                                           mr)
+                  : std::move(hit);
+    }
+    stream.synchronize();
+    return mask;
+  };
+  auto const make_input = [&](std::size_t key_count, bool nullable) {
+    std::vector<std::string> values(rows);
+    std::vector<bool> valid;
+    if (nullable) valid.assign(rows, true);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      values[i] = key_pool[(i * 7 + i / 3) % key_count];
+      if (nullable && i % 11 == 0) valid[i] = false;
+    }
+    return make_strings_column(values, valid, stream.view());
+  };
+
+  for (std::size_t key_count : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{5}}) {
+    for (bool nullable : {false, true}) {
+      auto input   = make_input(key_count, nullable);
+      auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+      auto const& dictionary =
+        dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
+      auto const& first = key_pool.front();
+      auto const& last  = key_pool[key_count - 1];
+      std::vector<std::vector<std::string>> const needle_sets{
+        {first},
+        {first, last},
+        {"absent"},
+        {""},
+        {first + " AND MORE BYTES THAN ANY KEY"},
+        {first.substr(0, first.size() - 1)},
+        {"absent", last, first},
+      };
+      for (auto const& needles : needle_sets) {
+        auto result = evaluate(dictionary, needles);
+        expect(result != nullptr, "dictionary predicate declined a supported shape");
+        expect(result->type().id() == cudf::type_id::BOOL8 && result->size() == rows,
+               "dictionary predicate result shape");
+        auto expected = reference(input->view(), needles);
+        expect(bool8_equal_where_valid_completed(expected->view(), result->view()),
+               "dictionary predicate lookup differs from the cuDF reference");
+      }
+    }
+  }
+
+  // Without a cuDF scalar the lookup table needs no host wait, so the predicate returns while the
+  // frame's stream is still gated.
+  {
+    auto input   = make_input(4, false);
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto const& dictionary =
+      dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
+    std::vector<std::string> const needles{key_pool[1], key_pool[3]};
+    simpatico::decode_session session(streams, mr);
+    auto& frame = simpatico::decode_session_test_access::frame(session);
+    simpatico::decode_predicate predicate;
+    predicate.equals_any = needles;
+    std::unique_ptr<cudf::column> result;
+    {
+      stream_gate gate(stream.view());
+      result = dictionary.decompress_predicate(predicate, frame);
+      expect(result != nullptr && !gate.released.load(),
+             "dictionary predicate waited for its lane");
+      gate.release_after_delay.store(true);
+      expect(session.finish().empty(), "gated predicate fixture published a session result");
+      expect(!gate.timed_out.load(), "dictionary predicate watchdog expired");
+    }
+    auto expected = reference(input->view(), needles);
+    expect(bool8_equal_where_valid_completed(expected->view(), result->view()),
+           "gated dictionary predicate lookup differs from the cuDF reference");
+  }
+
+  // Zero keys: an all-null column has no key set, so every comparison is null.
+  {
+    auto input = make_strings_column(
+      std::vector<std::string>(rows, "x"), std::vector<bool>(rows, false), stream.view());
+    auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+    auto const& dictionary =
+      dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
+    auto result = evaluate(dictionary, {"x"});
+    expect(result != nullptr && result->size() == rows && result->null_count() == rows,
+           "all-null dictionary predicate is not all null");
+  }
+  // Indices narrower than INT32 are left to the generic path.
+  {
+    auto input  = make_strings_column({"a", "b", "a"}, {}, stream.view());
+    auto narrow = cudf::dictionary::encode(
+      input->view(), cudf::data_type{cudf::type_id::INT16}, stream.view(), mr);
+    stream.synchronize();
+    simpatico::dictionary_compressed_representation const dictionary(std::move(narrow));
+    expect(evaluate(dictionary, {"a"}) == nullptr,
+           "narrow-index dictionary predicate was not declined");
   }
 }
 
@@ -2653,6 +2806,7 @@ int main()
     test_dictionary_width_failures(upstream);
     test_dictionary_pinned_observation(upstream);
     test_dictionary_key_width_hint(upstream);
+    test_dictionary_predicate_lookup(upstream);
     test_submission_and_kernel_lifetime(upstream);
     test_abandoned_session(upstream);
     test_session_state_contracts(upstream);

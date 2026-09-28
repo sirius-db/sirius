@@ -8,7 +8,6 @@
 #include "codegen/util/cuda_check.hpp"
 #include "constant_width_offsets.hpp"
 
-#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
@@ -19,13 +18,13 @@
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -42,11 +41,14 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace simpatico {
 
@@ -190,6 +192,87 @@ void padded_gather_chunks(
                            out[base + i] = b[i];
                        }
                      });
+}
+
+// Device view of an equals_any predicate's needles packed for one upload: `offsets` holds
+// count + 1 byte offsets into `chars`, the needles' bytes back to back.
+struct needle_view {
+  std::int32_t const* offsets;
+  char const* chars;
+  std::int32_t count;
+};
+
+// The upload's device storage together with its view; the storage is released in stream order once
+// the owner goes out of scope, so it must outlive the enqueue of every kernel that reads the view.
+struct uploaded_needles {
+  rmm::device_buffer storage;
+  needle_view view;
+};
+
+// Per-key membership test: `lut[k]` is true iff key `k` equals some needle byte for byte, the same
+// comparison as cuDF's STRING EQUAL. Keys are read through an offsetalator so INT32 and INT64 key
+// offsets share one instantiation; the offsets are absolute into `key_chars`.
+struct key_matches_any_needle {
+  cudf::detail::input_offsetalator key_offsets;
+  char const* key_chars;
+  needle_view needles;
+
+  __device__ bool operator()(cudf::size_type k) const
+  {
+    auto const key_begin = key_offsets[k];
+    auto const key_size  = key_offsets[k + 1] - key_begin;
+    for (std::int32_t j = 0; j < needles.count; ++j) {
+      auto const needle_begin = needles.offsets[j];
+      if (needles.offsets[j + 1] - needle_begin != key_size) continue;
+      bool equal = true;
+      for (int64_t b = 0; b < key_size && equal; ++b) {
+        equal = key_chars[key_begin + b] == needles.chars[needle_begin + b];
+      }
+      if (equal) return true;
+    }
+    return false;
+  }
+};
+
+// Stage the needles in frame-owned host storage, which lives until the session drains, and upload
+// them once. A pageable host-to-device copy is staged by the runtime without waiting for the
+// stream, so this is the whole cost of the predicate's host side.
+uploaded_needles upload_needles(std::vector<std::string> const& needles, decode_frame& frame)
+{
+  auto const count = needles.size();
+  if (count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+    throw std::length_error("dictionary predicate: too many values");
+  }
+  std::size_t total_chars = 0;
+  for (auto const& needle : needles) {
+    if (needle.size() >
+        static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) - total_chars) {
+      throw std::length_error("dictionary predicate: values exceed the packed size limit");
+    }
+    total_chars += needle.size();
+  }
+  // Offsets first so they stay naturally aligned at the start of both blocks; the chars follow.
+  auto const offsets_bytes = (count + 1) * sizeof(std::int32_t);
+  auto const total_bytes   = offsets_bytes + total_chars;
+  auto const host          = frame.host_array<char>(total_bytes);
+  auto* const host_offsets = reinterpret_cast<std::int32_t*>(host.data());
+  auto* const host_chars   = host.data() + offsets_bytes;
+  std::int32_t cursor      = 0;
+  for (std::size_t j = 0; j < count; ++j) {
+    host_offsets[j] = cursor;
+    if (!needles[j].empty()) std::memcpy(host_chars + cursor, needles[j].data(), needles[j].size());
+    cursor += static_cast<std::int32_t>(needles[j].size());
+  }
+  host_offsets[count] = cursor;
+  rmm::device_buffer storage(total_bytes, frame.stream(), frame.mr());
+  throw_if_cuda_error(
+    cudaMemcpyAsync(
+      storage.data(), host.data(), total_bytes, cudaMemcpyHostToDevice, frame.stream().value()),
+    "dictionary predicate: upload values");
+  needle_view const view{static_cast<std::int32_t const*>(storage.data()),
+                         static_cast<char const*>(storage.data()) + offsets_bytes,
+                         static_cast<std::int32_t>(count)};
+  return {std::move(storage), view};
 }
 
 // Constant-width null-free decode: analytic offsets + flat byte gather (skips cudf's
@@ -453,27 +536,22 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   // the shape to the generic path instead of carrying a tri-state accumulate.
   if (keys.null_count() > 0) { return nullptr; }
 
-  // One bool per distinct value: keys ∈ equals_any. The key set is the column's
-  // whole distinct-value population (four entries for l_shipinstruct), so these
-  // kernels are noise next to the row-length pass below — which is the entire
-  // point: this is the work that replaces the decode gather.
-  std::unique_ptr<cudf::column> lut;
-  for (auto const& value : pred.equals_any) {
-    // Each needle waits for the stream while cuDF allocates its pinned validity buffer. Its bytes
-    // upload from `value`, which the caller keeps until session completion.
-    cudf::string_scalar const needle(value, true, stream, mr);
-    auto hit =
-      cudf::binary_operation(keys, needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
-    if (!lut) {
-      lut = std::move(hit);
-    } else {
-      lut = cudf::binary_operation(
-        lut->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr);
-    }
-  }
-  if (!lut || lut->size() != n_keys) {
-    throw std::logic_error("dictionary predicate: invalid lookup table");
-  }
+  // One bool per distinct value: key in equals_any. The key set is the column's whole
+  // distinct-value population (four entries for l_shipinstruct), so this pass is noise next to the
+  // row-length pass below, which is the entire point: this is the work that replaces the decode
+  // gather. No cuDF scalar is constructed, so nothing here waits for the stream or borrows from the
+  // process-global pinned pool; the needles and the table live until the row pass has been queued.
+  auto const needles = upload_needles(pred.equals_any, frame);
+  auto lut =
+    cudf::make_fixed_width_column(bool_t, n_keys, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudf::strings_column_view const key_strings(keys);
+  thrust::tabulate(rmm::exec_policy_nosync(stream, mr),
+                   lut->mutable_view().begin<bool>(),
+                   lut->mutable_view().end<bool>(),
+                   key_matches_any_needle{cudf::detail::offsetalator_factory::make_input_iterator(
+                                            key_strings.offsets(), key_strings.offset()),
+                                          key_strings.chars_begin(stream),
+                                          needles.view});
 
   // Only the *row* validity needs carrying: the keys are non-null (checked
   // above), so a matching code is unambiguously true.
