@@ -69,6 +69,7 @@ class scoped_temp_file {
   std::filesystem::path _path;
 };
 
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
 std::string env_or(char const* name, std::string fallback = {})
 {
   auto const* value = std::getenv(name);
@@ -94,6 +95,7 @@ io::object_store_config minio_store()
   os.tls_verify = false;
   return os;
 }
+#endif
 
 io::object_store_config configured_store()
 {
@@ -156,6 +158,7 @@ TEST_CASE("kvikio_context clamps local reads past the end of the object", "[kvik
   REQUIRE(ds->host_read(contents.size() + 100, buffer.size(), buffer.data()) == 0);
 }
 
+#ifdef SIRIUS_HAVE_TESTCONTAINERS
 TEST_CASE("kvikio_context orders remote device reads behind the destination stream",
           "[s3][integration][kvikio]")
 {
@@ -237,3 +240,4 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
   REQUIRE(got == payload);
 }
+#endif
