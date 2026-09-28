@@ -32,9 +32,6 @@ class numeric_scalar : public scalar {
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_comparison.cpp` — Constructing comparison constants
-- `src/operator/gpu_physical_table_scan.cpp` — `cudf::numeric_scalar<bool>(false)` for null replacement
-- `src/gpu_columns.cpp` — Extracting scalar results
 
 ### `cudf::string_scalar`
 
@@ -47,7 +44,6 @@ class string_scalar : public scalar {
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_function.cpp` — String literal constants for LIKE patterns
 
 ### `cudf::fixed_point_scalar<T>`
 
@@ -70,7 +66,6 @@ class fixed_point_scalar : public scalar {
 **Header**: `cudf/scalar/scalar.hpp`
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_comparison.cpp` — Timestamp comparison constants
 
 ### Scalar Factory Functions
 

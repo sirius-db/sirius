@@ -27,7 +27,6 @@ std::size_t align_up(std::size_t value, std::size_t alignment) noexcept;
 **Description**: Rounds `value` up to the nearest multiple of `alignment`.
 
 **Our usage**:
-- `src/gpu_buffer_manager.cpp:28` — Aligns buffer sizes for GPU memory allocations
 
 ### Other functions
 

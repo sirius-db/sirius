@@ -120,7 +120,6 @@ public:
 ```
 
 **Our usage**:
-- `src/plan/gpu_plan_aggregate.cpp` — Bind sorted aggregates when translating aggregate plans
 
 ### ScalarFunction
 

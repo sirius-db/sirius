@@ -2,7 +2,7 @@
 
 Super Sirius is the task-based GPU execution engine in Sirius. It uses `namespace sirius` and a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
 
-With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required. Legacy `sirius.cfg` is still recognized for compatibility.
+With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required.
 
 ```sql
 -- Just load the extension. If ~/.sirius/sirius.yaml exists, GPU is automatic.

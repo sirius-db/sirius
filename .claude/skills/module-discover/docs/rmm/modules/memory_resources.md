@@ -33,7 +33,6 @@ public:
 
 **Our usage**:
 - `src/include/memory/sirius_memory_reservation_manager.hpp:20` — Type used for memory resource pointers
-- `src/gpu_buffer_manager.cpp` — Pool MR's upstream; `mr->deallocate(rmm::cuda_stream_view{}, ptr, size)`
 
 ### `rmm::mr::cuda_memory_resource`
 
@@ -49,7 +48,6 @@ public:
 **Description**: Simplest MR — wraps `cudaMalloc`/`cudaFree`. Stream argument is ignored (allocation is synchronous).
 
 **Our usage**:
-- `src/gpu_buffer_manager.cpp:171` — `cuda_mr = new rmm::mr::cuda_memory_resource()`
 - `test/cpp/data/test_host_parquet_representation.cpp:78` — Creates cuda MR in test setup
 
 ### `rmm::mr::pool_memory_resource<Upstream>`
@@ -75,7 +73,6 @@ public:
 **Description**: Coalescing best-fit suballocator. Allocates a large pool from upstream and sub-allocates from it. Thread-safe. Grows geometrically up to `maximum_pool_size`. On destruction, returns all memory to upstream.
 
 **Our usage**:
-- `src/gpu_buffer_manager.cpp:172` — `mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_gpu)` — Fixed-size pool for GPU processing memory
 
 ## APIs Available but Not Used
 

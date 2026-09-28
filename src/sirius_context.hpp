@@ -877,7 +877,7 @@ bool compressed_materialization_enabled(ClientContext& context);
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
 /// piped/redirected output is not corrupted. Shared by the transparent runtime
-/// fallback and the legacy gpu_execution() CALL path so the message stays in sync.
+/// fallback and the explicit gpu_execution() CALL path so the message stays in sync.
 void print_cpu_fallback_banner();
 
 }  // namespace duckdb

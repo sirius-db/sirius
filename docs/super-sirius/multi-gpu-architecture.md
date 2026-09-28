@@ -239,7 +239,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `chunk_memory_spaces[i]` parallel to `data_batches_by_column[col][i]` | `src/scan_manager/sirius_scan_manager.hpp` | Pin-table merge must preserve owning-space per chunk (Phase 22 Pitfall 3) |
 | All tasks of a partition pinned to one admitted GPU via `partition_idx % _active_gpu_ids.size()`; pin preserved across OOM reschedule | `src/creator/task_creator.cpp`, `src/pipeline/gpu_pipeline_executor.cpp` | A cuco hash table is valid only on the GPU it was built on; cross-device access trips `cudaErrorInvalidValue`. Indexing the admitted executor set avoids phantom pins when `num_gpus` < physical GPU count, and keeps a query off devices it was not admitted onto |
 | Locality-derived device preferences (operator hint, GPU-resident bytes, NUMA `gpus_of()`, cached-chunk home) clamped into `_active_gpu_ids` | `src/creator/task_creator.cpp` | These are computed from where data lives, not from the admitted set, so any of them can name an excluded device — and the scheduler treats a preference as binding |
-| HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
+| HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
 | Multi-GPU parquet reads resolve to `sirius_datasource`, not kvikio | `sirius_config::enforce_sirius_datasource_for_multi_gpu()` forces `use_sirius_datasource=true` when >1 GPU is configured | Any file-path datasource via cudf silently uses kvikio, which binds to a single CUDA context |
 
 ## Hardware Caveats

@@ -32,7 +32,6 @@ public:
 
 **Our usage**:
 - `src/sirius_extension.cpp` — Parse the SQL string passed to `gpu_execution()`
-- `test/cpp/pipeline/test_modified_pipeline.cpp` — Parse test queries
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Parse TPC-DS queries
 
 ### CreateTableFunctionInfo

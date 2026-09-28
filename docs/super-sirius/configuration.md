@@ -774,8 +774,7 @@ Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
+| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
