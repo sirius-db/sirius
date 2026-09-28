@@ -181,22 +181,25 @@ jobs:
           # List mode exits with the test count, so ignore the status and check the output.
           "$bin" --list-test-names-only "~[.]~[multi_gpu]" > /tmp/test-names.txt || true
           test -s /tmp/test-names.txt
-          pids=()
           for ((i = 0; i < gpus; i++)); do
             awk -v n="$gpus" -v i="$i" 'NR % n == i' /tmp/test-names.txt \
               | sed -e 's/[\\,"[]/\\&/g' > "/tmp/shard-$i.txt"
             mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
-            CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
-              TMPDIR="/tmp/shard-$i" \
-              timeout 45m "$bin" --abort -f "/tmp/shard-$i.txt" > "/tmp/unittest-$i.log" 2>&1 &
-            pids+=($!)
+            # Stream each shard live with a prefix; keep its full log for the failure summary.
+            {
+              status=0
+              CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
+                TMPDIR="/tmp/shard-$i" \
+                timeout 45m "$bin" --abort -f "/tmp/shard-$i.txt" 2>&1 || status=$?
+              echo "$status" > "/tmp/shard-$i.status"
+            } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
           done
+          wait
           status=0
-          for i in "${!pids[@]}"; do
-            wait "${pids[$i]}" || status=1
-            echo "::group::Shard $i (GPU $i)"
-            cat "/tmp/unittest-$i.log"
-            echo "::endgroup::"
+          for ((i = 0; i < gpus; i++)); do
+            summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
+            echo "Shard $i (exit $(cat "/tmp/shard-$i.status")): $summary"
+            [ "$(cat "/tmp/shard-$i.status")" = 0 ] || status=1
           done
           cat /tmp/unittest-*.log > /tmp/unittest.log
           exit $status
