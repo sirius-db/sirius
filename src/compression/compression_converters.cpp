@@ -121,9 +121,9 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
 
-  // Decode across 4 streams of the target space's pool, submitted from the calling thread — no
-  // worker threads are spawned. The H2D fetch above ran on `stream`; sync it first so decode-stream
-  // reads are ordered after all fetched bytes are resident.
+  // Decode across 4 pool streams, submitted from the calling thread — no worker
+  // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
+  // pool-stream reads are ordered after all fetched bytes are resident.
   stream.sync();
   auto const mr = rmm::mr::get_current_device_resource_ref();
   // `subset` already holds only the projected columns, so the scan's request —

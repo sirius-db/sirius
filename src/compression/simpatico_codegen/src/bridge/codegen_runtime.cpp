@@ -20,8 +20,9 @@
 //      once the launch is queued; the frame keeps loaded kernels until its
 //      session proves completion.
 //
-// Fused leaf kinds are bitpack/delta/rle/for/zigzag and synthesized raw passthrough.
-// The plan walker dispatches other codecs through their standalone leaves.
+// Restrictions: int32/int64 dtypes; fused leaf kinds bitpack/delta/rle/for/
+// zigzag (+ the synthesized raw passthrough).
+// Other kinds fall through (caller routes to the legacy operator path).
 // Every stored bitpack rep is dense (compact_bitpack_packed runs before
 // publish), so decode always uses the Compact gather over bp_offsets.
 // Decode failures propagate to the owning session without changing exception types.
@@ -56,7 +57,10 @@
 #include <utility>
 #include <vector>
 
-// Plan and representation types used to assemble compressed encode leaves.
+// Heavyweight C++ types pulled in only by the encode bridge (rep
+// construction, plan-DSL walk, rmm device buffers).  Keeping these
+// includes here avoids re-parsing them for the decode-only TUs that
+// already compile fine without them.
 #include "codegen/bridge/fused_tree_build.hpp"
 #include "codegen/codegen_bridge.hpp"
 #include "codegen/plan/plan_dsl.hpp"

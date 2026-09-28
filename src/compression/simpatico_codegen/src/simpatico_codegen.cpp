@@ -637,10 +637,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       rmm::device_buffer(static_cast<std::size_t>(nc + 1) * sizeof(std::uint32_t), s0, mr);
     auto* combined = static_cast<std::uint32_t*>(result.mask_words.data());
 
-    // ── Wave 1: mask sources round-robin on the supplied streams. Source 0 writes straight into
-    // the combined buffer on stream 0 (its allocation stream); sources 1..k-1 into per-filter
-    // buffers allocated on the stream that writes them. Range conjuncts run the range ballot;
-    // equality conjuncts run the shipped BOOL8 pushdown then the packed-mask adapter.
+    // ── Wave 1: mask sources round-robin on the pool streams. Source 0 writes
+    // straight into the combined buffer on stream 0 (its allocation stream);
+    // sources 1..k-1 into per-filter buffers allocated on the stream that
+    // writes them. Range conjuncts run the range ballot; equality conjuncts run
+    // the shipped BOOL8 pushdown then the packed-mask adapter.
     per_filter.reserve(k_total > 1 ? k_total - 1 : 0);
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask

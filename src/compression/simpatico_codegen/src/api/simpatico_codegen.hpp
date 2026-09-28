@@ -1,15 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * @file
- * @brief Completed compression/decompression APIs for owning Simpatico tables.
- *
- * Decompression returns only after the output is ready for use on other streams. Inputs must
- * already be readable on the supplied stream(s) and remain alive until return. The supplied
- * resource and streams must outlive allocations that retain them for deallocation. All codecs and
- * predicate/row-selection routes use `decode_session` on the calling CPU thread. Submission may
- * wait for required host observations; the session completes submitted work before publishing
- * results.
- */
 #pragma once
 
 #include "codegen/plan/plan_interpreter.hpp"
@@ -102,7 +91,7 @@ compressed_table compress_with_plan(
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
-/// Compress all columns using @p column_threads streams from the calling CPU thread.
+/// Compress all columns in parallel using @p column_threads worker threads.
 ///
 /// `max(1, column_threads)` streams are leased from a process-lifetime internal
 /// cache (never destroyed), so the returned table's buffers are safe to free on
@@ -110,7 +99,7 @@ compressed_table compress_with_plan(
 ///
 /// @param table          Source table.
 /// @param plan_dsl       Multi-column plan DSL string.
-/// @param column_threads Number of CUDA streams.
+/// @param column_threads Number of parallel CUDA streams / worker threads.
 /// @param mr             Device memory resource; nullptr selects the RMM default.
 /// @param column_names   Optional per-column names.
 /// @throws std::runtime_error  plan/table column count mismatch or GPU error.
@@ -121,7 +110,7 @@ compressed_table compress_with_plan(
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
-/// Compress all columns using a caller-owned stream pool from the calling CPU thread.
+/// Compress all columns in parallel using a caller-owned stream pool.
 ///
 /// The pool must remain valid for the duration of the call. Reusing the same
 /// pool across multiple calls is safe and avoids repeated stream allocation.
@@ -153,10 +142,10 @@ std::unique_ptr<cudf::table> decompress(
   ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress all columns using @p column_threads streams from the calling CPU thread.
+/// Decompress all columns in parallel using @p column_threads worker threads.
 ///
 /// @param table          Compressed table.
-/// @param column_threads Number of CUDA streams.
+/// @param column_threads Number of parallel CUDA streams / worker threads.
 /// @param mr             Device memory resource; nullptr selects the RMM default.
 /// @throws std::runtime_error on GPU error.
 std::unique_ptr<cudf::table> decompress(
@@ -164,7 +153,7 @@ std::unique_ptr<cudf::table> decompress(
   int column_threads,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress all columns using a caller-owned stream pool from the calling CPU thread.
+/// Decompress all columns in parallel using a caller-owned stream pool.
 ///
 /// @param table  Compressed table.
 /// @param pool   Caller-supplied stream pool.
@@ -189,14 +178,14 @@ std::unique_ptr<cudf::table> decompress(
   ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress a column subset using @p column_threads streams from the calling CPU thread.
+/// Decompress a column subset in parallel using @p column_threads worker threads.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
   int column_threads,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress a column subset using a caller-owned stream pool from the calling CPU thread.
+/// Decompress a column subset in parallel using a caller-owned stream pool.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,

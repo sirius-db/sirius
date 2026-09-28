@@ -134,7 +134,17 @@ class DecodeWalk {
   void decode_bitjoin(NodeId nid);
   std::unique_ptr<cudf::column> materialize_fused_node(NodeId nid,
                                                        decode_selection const* node_sel);
+
+  /// True when @p nid produces the column's final value and a predicate is
+  /// pending — the one place a rep may answer the predicate instead of decoding.
   [[nodiscard]] bool predicate_applies_to(NodeId nid) const;
+
+  /// True when @p nid is THE node whose fused decode consumes the pending
+  /// selection: the (0,0)-producing bitpack region, or — for the
+  /// dictionary-gather mode — the bitpack region producing the dictionary's `indices`
+  /// value. Inner fused subtrees (entropy tails, dictionary keys_offsets, ...)
+  /// hold metadata that is NOT row-aligned with the column and must decode
+  /// full; the precomputed @c sel_target pins the exact consumer.
   [[nodiscard]] bool selection_applies_to(NodeId nid) const;
 
   PlanTree const& tree;
@@ -142,9 +152,13 @@ class DecodeWalk {
   ::cuda::stream_ref stream;
   rmm::device_async_resource_ref mr;
   std::string* error_out;
+  /// Borrowed; null when the caller wants the column itself.
   decode_predicate const* pred = nullptr;
-  decode_selection const* sel  = nullptr;
+  /// Borrowed decode-time row selection; null on the default path.
+  decode_selection const* sel = nullptr;
+  /// The one NodeId selection_applies_to accepts; tree.nodes.size() = none.
   NodeId sel_target;
+  /// Set once a rep has answered `pred`, so run() knows not to compare again.
   bool predicate_resolved = false;
   // A present entry holding no column was consumed; requesting it again is an error.
   std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> memo;
@@ -707,6 +721,9 @@ void DecodeWalk::decode_bitjoin(NodeId nid)
   struct field_ref {
     std::uint32_t width, src_lo, dst_lo;
   };
+
+  // Group the fields by the source value each targets (a source may collect
+  // several bit ranges), keyed structurally by ValueId.
   std::unordered_map<std::uint64_t, std::vector<field_ref>> by_src;
   for (std::size_t i = 0; i < node.input_sources.size(); ++i) {
     by_src[value_id_key(node.input_sources[i])].push_back(

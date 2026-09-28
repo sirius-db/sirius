@@ -112,7 +112,6 @@ std::optional<PlanTree> plan_tree_from_steps(std::vector<plan_step> const& steps
     }
   }
 
-  // Cannot throw here: every edge built above names one of its producer's output_names.
   compute_input_sources(tree);
 
   if (error_out) error_out->clear();

@@ -286,9 +286,9 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
-  /// Evaluate @p pred against the dictionary *keys* and map the result over the indices, producing
-  /// a BOOL8 column of @c num_rows without ever gathering the key chars into a decoded STRING
-  /// column.
+  /// Evaluate @p pred against the dictionary *keys* and map the result over the
+  /// indices, returning a BOOL8 column of @c num_rows without ever gathering the
+  /// key chars into a decoded STRING column.
   ///
   /// The keys column is the distinct-value set (four entries for `l_shipinstruct`), so the
   /// comparison is effectively free; the only full-length pass is a 1-byte-per-row lookup over the
