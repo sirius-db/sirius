@@ -1134,7 +1134,7 @@ TEST_CASE("decode probes retain exactly the captured snapshot after channel grow
   REQUIRE_FALSE(filter_lifetime.expired());
   auto mask = probes.probes[0][0].probe(
     input->view().column(0), stream, cudf::get_current_device_resource_ref());
-  stream.synchronize();
+  REQUIRE(cudaStreamSynchronize(rmm::cuda_stream_view{stream}.value()) == cudaSuccess);
   REQUIRE(mask != nullptr);
   REQUIRE(mask->size() == input->num_rows());
   probes = {};
