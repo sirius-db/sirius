@@ -121,7 +121,9 @@ class duckdb_native_metadata_cache {
     std::unordered_map<duckdb::idx_t, std::shared_ptr<const column_stats_snapshot>> column_stats;
     /// Non-null on a product hit for the key passed to acquire().
     std::shared_ptr<const walk_plan_product> product;
-    /// Snapshot generation of `core`; pass back to store_product.
+    /// Snapshot generation of `core`; pass back to store_product. Drawn from a
+    /// cache-wide monotonic clock, so a generation is never reused, even after
+    /// the entry is evicted and recreated.
     std::uint64_t generation = 0;
   };
 
@@ -174,7 +176,8 @@ class duckdb_native_metadata_cache {
 
   std::mutex _mutex;
   std::unordered_map<duckdb::DataTable const*, cache_entry> _entries;
-  std::uint64_t _use_clock = 0;
+  std::uint64_t _use_clock        = 0;
+  std::uint64_t _generation_clock = 0;
 
   std::atomic<bool> _disabled_for_testing{false};
   std::atomic<std::uint64_t> _hits{0};

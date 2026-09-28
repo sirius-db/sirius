@@ -272,7 +272,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     entry.core = std::shared_ptr<const table_walk_snapshot>(std::move(live));
     entry.columns.clear();
     entry.products.clear();  // products describe the previous geometry
-    ++entry.generation;
+    entry.generation = ++_generation_clock;
     ++_rebuilds;
     SIRIUS_LOG_DEBUG("[duckdb_native_metadata_cache] snapshot rebuilt: {} row group(s), {} row(s)",
                      entry.core->n_row_groups,

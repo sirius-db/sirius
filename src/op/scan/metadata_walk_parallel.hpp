@@ -66,7 +66,9 @@ inline void parallel_over_row_groups(std::size_t n,
 
   auto const chunk = (n + workers - 1) / workers;
   std::vector<std::exception_ptr> errors(workers);
-  std::vector<std::thread> threads;
+  // jthread joins on destruction, so a failed thread creation cannot leave
+  // already-started workers joinable (which would std::terminate).
+  std::vector<std::jthread> threads;
   threads.reserve(workers - 1);
   auto run_range = [&](std::size_t w) noexcept {
     auto const begin = w * chunk;

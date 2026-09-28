@@ -412,6 +412,86 @@ TEST_CASE("walk product cache drops products when the snapshot rebuilds",
   require_same_walk(after, again);
 }
 
+TEST_CASE("walk product store is dropped when the entry was evicted and recreated in between",
+          "[scan][duckdb_native_metadata_cache]")
+{
+  // Regression: generations used to restart at 1 per entry, so an entry
+  // evicted and recreated between acquire() and store_product() could hand
+  // back the same generation for a different geometry, and a stale product
+  // would be installed against the new snapshot.
+  auto& cache = duckdb_native_metadata_cache::instance();
+  cache.clear();
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t3c_prod_evict(a INTEGER)");
+  exec_ok(con, "INSERT INTO t3c_prod_evict SELECT range FROM range(0, 300000)");
+  exec_ok(con, "CHECKPOINT");
+  exec_ok(con, "BEGIN TRANSACTION");
+  auto& storage = get_storage_in_txn(con, "t3c_prod_evict");
+
+  auto make_key = [] {
+    walk_product_key key;
+    key.projection_signature = "0:INTEGER;";
+    key.prunable_filters.emplace_back(
+      0,
+      duckdb::make_uniq<duckdb::ConstantFilter>(
+        duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(250000)));
+    return key;
+  };
+  auto make_view = [](const walk_product_key& key,
+                      std::vector<std::pair<duckdb::idx_t, const duckdb::TableFilter*>>& borrowed) {
+    borrowed.clear();
+    for (auto const& [col, filter] : key.prunable_filters) {
+      borrowed.emplace_back(col, filter.get());
+    }
+    walk_product_key_view view;
+    view.projection_signature = &key.projection_signature;
+    view.prunable_filters     = &borrowed;
+    return view;
+  };
+
+  std::vector<duckdb::idx_t> const stats_columns = {0};
+  auto const key                                 = make_key();
+  std::vector<std::pair<duckdb::idx_t, const duckdb::TableFilter*>> borrowed;
+  auto const view = make_view(key, borrowed);
+
+  auto first = cache.acquire(storage, *con.context, stats_columns, &view);
+  REQUIRE(first.has_value());
+  REQUIRE(first->product == nullptr);
+  auto const stale_generation = first->generation;
+
+  // Erase the entry (as LRU eviction would) and change the table's geometry
+  // before the product is stored.
+  cache.clear();
+  exec_ok(con, "COMMIT");
+  exec_ok(con, "INSERT INTO t3c_prod_evict SELECT range FROM range(300000, 400000)");
+  exec_ok(con, "BEGIN TRANSACTION");
+
+  auto recreated = cache.acquire(storage, *con.context, stats_columns, &view);
+  REQUIRE(recreated.has_value());
+  REQUIRE(recreated->core->n_row_groups > first->core->n_row_groups);
+  REQUIRE(recreated->generation != stale_generation);
+
+  // A product assembled from the stale snapshot must not be installed.
+  auto stale_product    = std::make_shared<walk_plan_product>();
+  stale_product->viable = true;
+  stale_product->row_group_pruned_by_stats.assign(first->core->n_row_groups, true);
+  cache.store_product(storage, stale_generation, make_key(), stale_product);
+
+  auto lookup = cache.acquire(storage, *con.context, stats_columns, &view);
+  REQUIRE(lookup.has_value());
+  REQUIRE(lookup->product == nullptr);
+  REQUIRE(cache.product_hits() == 0);
+
+  // The current generation still stores normally.
+  auto fresh_product    = std::make_shared<walk_plan_product>();
+  fresh_product->viable = true;
+  fresh_product->row_group_pruned_by_stats.assign(recreated->core->n_row_groups, false);
+  cache.store_product(storage, recreated->generation, make_key(), fresh_product);
+  auto served = cache.acquire(storage, *con.context, stats_columns, &view);
+  REQUIRE(served.has_value());
+  REQUIRE(served->product == fresh_product);
+}
+
 //===--------------------------------------------------------------------===//
 // Invalidation
 //===--------------------------------------------------------------------===//
