@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    task_creator:
+      num_threads: 1

@@ -20,12 +20,13 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -36,8 +37,8 @@ namespace op {
 // callers in Super Sirius and have been removed.
 
 // Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
-static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_functions(
-  const duckdb::vector<duckdb::vector<std::size_t>>& src)
+[[maybe_unused]] static duckdb::vector<duckdb::unsafe_vector<std::size_t>>
+convert_grouping_functions(const duckdb::vector<duckdb::vector<std::size_t>>& src)
 {
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> result;
   result.reserve(src.size());
@@ -51,8 +52,21 @@ static duckdb::vector<duckdb::unsafe_vector<std::size_t>> convert_grouping_funct
   return result;
 }
 
+void sirius_physical_grouped_aggregate_merge::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  // The child sink still creates the upstream pipeline boundary.
+  if (fuse_into_parent()) {
+    D_ASSERT(children.size() == 1);
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    children[0]->build_pipelines(current, meta_pipeline);
+    return;
+  }
+  sirius_physical_operator::build_pipelines(current, meta_pipeline);
+}
+
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  sirius_physical_grouped_aggregate* grouped_aggregate)
+  sirius_physical_grouped_aggregate* grouped_aggregate, uint64_t hash_partition_bytes)
   : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,
                                             grouped_aggregate->group_idx,
                                             grouped_aggregate->cudf_aggregates,
@@ -63,7 +77,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->has_count_distinct,
                                             grouped_aggregate->estimated_cardinality)
 {
-  child_op = grouped_aggregate;
+  child_op              = grouped_aggregate;
+  _hash_partition_bytes = hash_partition_bytes;
 }
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
@@ -135,6 +150,25 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
+partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
+  const partition_sizing_input& in)
+{
+  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  // Pre-size this merge's single input repository so every partition slot exists before batches
+  // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
+  // repository's set_num_partitions contract.
+  if (natural > 1) {
+    std::lock_guard<std::mutex> lg(lock);
+    if (!ports.empty()) {
+      auto& repo = ports.begin()->second->repo;
+      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      }
+    }
+  }
+  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+}
+
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
 {
   // we need to lock, then pull all the batches from one partition and return them, and increment
@@ -165,9 +199,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
@@ -177,19 +211,24 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
-    merged = input_batches[0].clone(sirius::get_next_batch_id(), stream);
+    const auto clone_batch_id = sirius::get_next_batch_id();
+    merged                    = input_batches[0].clone(
+      clone_batch_id,
+      stream,
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),
                                                      cudf_aggregates,
                                                      stream,
-                                                     *input_batches[0].get_memory_space());
+                                                     *input_batches[0].get_memory_space(),
+                                                     batch_telemetry());
   }
 
   // If no post-processing needed, return merged result directly
@@ -260,8 +299,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
     }
   }
 
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
-  auto result       = sirius::make_data_batch(std::move(output_table), *space, stream);
+  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
+  auto result = sirius::make_data_batch(std::move(output_table), *space, stream, batch_telemetry());
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }

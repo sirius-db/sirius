@@ -15,12 +15,17 @@
  */
 
 #include "catch.hpp"
+#include "sirius_config.hpp"
 #include "yaml_reader.hpp"
 
 #include <yaml-cpp/yaml.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <variant>
@@ -157,6 +162,60 @@ bi: "1.5Gi")");
     REQUIRE(bi == static_cast<std::uint64_t>(1.5 * 1024 * 1024 * 1024));
   }
 
+  SECTION("required byte values reject negative integers without mutation")
+  {
+    auto node          = YAML::Load("size: -1");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("required byte values reject negative suffixed strings without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "-1GiB")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative integers without mutation")
+  {
+    auto node                         = YAML::Load("size: -1");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("optional byte values reject negative suffixed strings without mutation")
+  {
+    auto node                         = YAML::Load(R"(size: "-1GiB")");
+    std::optional<std::uint64_t> size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value must be non-negative"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("zero byte values remain valid")
+  {
+    auto node                                  = YAML::Load("size: 0");
+    std::uint64_t size                         = 4096;
+    std::optional<std::uint64_t> optional_size = 4096;
+    yaml::reader r(node);
+    r.required("size", yaml::bytes(size));
+    REQUIRE(size == 0);
+
+    yaml::reader optional_reader(node);
+    optional_reader.optional("size", yaml::bytes(optional_size));
+    REQUIRE(optional_size == 0);
+  }
+
   SECTION("string suffix on plain integer field is rejected")
   {
     auto node = YAML::Load(R"(count: "4Ki")");
@@ -171,6 +230,118 @@ bi: "1.5Gi")");
     std::uint64_t size = 0;
     yaml::reader r(node);
     REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
+  }
+}
+
+TEST_CASE("parse_duration time suffix parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("all supported units")
+  {
+    REQUIRE(yaml::parse_duration("500ns") == 500ns);
+    REQUIRE(yaml::parse_duration("500us") == 500us);
+    REQUIRE(yaml::parse_duration("10ms") == 10ms);
+    REQUIRE(yaml::parse_duration("2s") == 2s);
+    REQUIRE(yaml::parse_duration("3min") == 3min);
+    REQUIRE(yaml::parse_duration("1h") == 1h);
+  }
+
+  SECTION("long-form and alias suffixes")
+  {
+    REQUIRE(yaml::parse_duration("500nsec") == 500ns);
+    REQUIRE(yaml::parse_duration("500usec") == 500us);
+    REQUIRE(yaml::parse_duration("10msec") == 10ms);
+    REQUIRE(yaml::parse_duration("2sec") == 2s);
+    REQUIRE(yaml::parse_duration("2seconds") == 2s);
+    REQUIRE(yaml::parse_duration("3m") == 3min);
+    REQUIRE(yaml::parse_duration("3minutes") == 3min);
+    REQUIRE(yaml::parse_duration("1hr") == 1h);
+    REQUIRE(yaml::parse_duration("1hours") == 1h);
+  }
+
+  SECTION("case-insensitive suffixes")
+  {
+    REQUIRE(yaml::parse_duration("10MS") == 10ms);
+    REQUIRE(yaml::parse_duration("2S") == 2s);
+    REQUIRE(yaml::parse_duration("1H") == 1h);
+  }
+
+  SECTION("whitespace between number and unit") { REQUIRE(yaml::parse_duration("10 ms") == 10ms); }
+
+  SECTION("fractional values round down to nanoseconds")
+  {
+    REQUIRE(yaml::parse_duration("1.5s") == 1500ms);
+    REQUIRE(yaml::parse_duration("2.5ms") == 2500us);
+  }
+
+  SECTION("bare numbers are rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration("10"), std::runtime_error);
+  }
+
+  SECTION("empty value is rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration(""), std::runtime_error);
+  }
+
+  SECTION("unknown suffix is rejected")
+  {
+    REQUIRE_THROWS_AS(yaml::parse_duration("10years"), std::runtime_error);
+  }
+}
+
+TEST_CASE("yaml reader duration parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("reads a suffixed string into a milliseconds field")
+  {
+    auto node = YAML::Load(R"(period: "250ms")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 250ms);
+  }
+
+  SECTION("converts units to the target duration type")
+  {
+    auto node = YAML::Load(R"(period: "2s")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 2000ms);
+  }
+
+  SECTION("finer-grained input truncates to target resolution")
+  {
+    auto node = YAML::Load(R"(period: "1500us")");
+    std::chrono::milliseconds period{0};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 1ms);  // 1500us -> 1ms after duration_cast truncation
+  }
+
+  SECTION("missing optional field leaves default untouched")
+  {
+    auto node = YAML::Load(R"(other: 5)");
+    std::chrono::milliseconds period{10};
+    yaml::reader r(node);
+    r.optional("period", period);
+    REQUIRE(period == 10ms);
+  }
+
+  SECTION("bare number is interpreted in the field's native unit")
+  {
+    auto node = YAML::Load(R"(period: 10)");
+    std::chrono::milliseconds ms_period{0};
+    std::chrono::seconds s_period{0};
+    yaml::reader r(node);
+    r.optional("period", ms_period);
+    REQUIRE(ms_period == 10ms);
+    yaml::reader r2(node);
+    r2.optional("period", s_period);
+    REQUIRE(s_period == 10s);
   }
 }
 
@@ -427,6 +598,44 @@ TEST_CASE("yaml reader optional_node", "[config_opt][optional_node]")
   REQUIRE_FALSE(missing.has_value());
 }
 
+TEST_CASE("yaml reader has_value distinguishes null from scalar values", "[config_opt][has_value]")
+{
+  struct test_case {
+    const char* yaml;
+    bool expected;
+  };
+
+  const test_case cases[] = {
+    {"{}", false},
+    {"usage_limit_bytes: null", false},
+    {"usage_limit_fraction: null", false},
+    {"usage_limit_bytes: null\nusage_limit_fraction: null", false},
+    {"usage_limit_bytes: 0", true},
+    {"usage_limit_fraction: 0.5", true},
+    {"usage_limit_bytes: 0\nusage_limit_fraction: null", true},
+    {"usage_limit_bytes: null\nusage_limit_fraction: 0.5", true},
+  };
+
+  for (auto const& test : cases) {
+    INFO("yaml=" << test.yaml);
+    auto node = YAML::Load(test.yaml);
+    yaml::reader r(node);
+    auto const has_explicit_gpu_limit =
+      r.has_value("usage_limit_bytes") || r.has_value("usage_limit_fraction");
+    REQUIRE(has_explicit_gpu_limit == test.expected);
+  }
+}
+
+TEST_CASE("yaml reader has distinguishes missing, null, and scalar keys", "[config_opt][has]")
+{
+  auto node = YAML::Load("null_key: null\nscalar_key: 0");
+  yaml::reader r(node);
+
+  CHECK_FALSE(r.has("missing_key"));
+  CHECK(r.has("null_key"));
+  CHECK(r.has("scalar_key"));
+}
+
 // ================ error context ================= //
 
 TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
@@ -442,4 +651,49 @@ TEST_CASE("yaml reader error messages include context", "[config_opt][errors]")
     std::string msg = e.what();
     REQUIRE(msg.find("test.section.value") != std::string::npos);
   }
+}
+
+TEST_CASE("the domain-coverage threshold is validated where it enters the engine",
+          "[config_opt][conditional][dynamic_filter]")
+{
+  // YAML and SQL configuration share this ingress validator.
+  config::valid_domain_coverage_threshold const accepts;
+
+  REQUIRE(accepts(0.9));
+  REQUIRE(accepts(1.5));  // values above 1.0 disable the gate
+
+  REQUIRE_FALSE(accepts(0.0));  // would suppress every filter
+  REQUIRE_FALSE(accepts(-0.5));
+  REQUIRE_FALSE(accepts(std::numeric_limits<double>::quiet_NaN()));
+  REQUIRE_FALSE(accepts(std::numeric_limits<double>::infinity()));
+
+  // On rejection the YAML surface throws and leaves the default untouched.
+  auto node    = YAML::Load("dynamic_filter_domain_coverage_threshold: 0");
+  double value = 0.9;
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("dynamic_filter_domain_coverage_threshold", value, accepts),
+                    std::runtime_error);
+  REQUIRE(value == 0.9);
+}
+
+TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML section",
+          "[config_opt][dynamic_filter]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_dynamic_filter.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter: false\n";
+  }
+
+  // Parsing false is the non-vacuous direction because the default is true.
+  CHECK(operator_params{}.enable_dynamic_filter);
+
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
 }

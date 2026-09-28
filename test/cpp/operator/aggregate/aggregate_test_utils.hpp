@@ -86,7 +86,7 @@ AggregateExpressionResult create_aggregate_expressions(
   AggregateExpressionResult result;
 
   // Create output types: first the group by column types, then the aggregate result types
-  for (std::size_t group_idx : group_indexes) {
+  for ([[maybe_unused]] std::size_t group_idx : group_indexes) {
     result.output_types.push_back(sirius::from_duckdb(Traits::logical_type()));
   }
   for (std::size_t i = 0; i < aggregations.size(); ++i) {
@@ -171,7 +171,7 @@ template <typename Traits>
 std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>>
 make_test_data_for_grouped_aggregate(std::size_t num_groups,
                                      std::size_t num_group_key_columns,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr)
 {
   std::vector<int32_t> group_sizes(num_groups);
@@ -288,7 +288,7 @@ template <typename Traits>
 std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>>
 make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
                                               std::size_t num_group_key_columns,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   std::vector<int32_t> group_sizes(num_groups);

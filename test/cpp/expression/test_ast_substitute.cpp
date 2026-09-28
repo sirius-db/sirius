@@ -16,6 +16,7 @@
 
 #include "ast_test_builders.hpp"
 #include "catch.hpp"
+#include "expression/ast/cast.hpp"
 #include "expression/ast/function_call.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
@@ -27,6 +28,9 @@
 #include <utility>
 #include <vector>
 
+using sirius::ast::cast;
+using sirius::ast::cast_kind;
+using sirius::ast::clone;
 using sirius::ast::function_call;
 using sirius::ast::node;
 using sirius::ast::reference;
@@ -66,4 +70,36 @@ TEST_CASE("ast_substitute - substitutes references inside a function call", "[as
   REQUIRE(fc.arguments().size() == 2);
   REQUIRE(fc.arguments()[0]->get<reference>().column_index == 4);
   REQUIRE(fc.arguments()[1]->get<reference>().column_index == 4);
+}
+
+TEST_CASE("ast_substitute - clone and substitution preserve cast kind and try_cast",
+          "[ast_substitute]")
+{
+  // rebuild() must carry a cast's provenance tag and TRY semantics through both transforms: a
+  // carrier_restore flattened back to the default-constructed semantic kind would turn a
+  // planner-emitted representation restore into a value-converting SQL cast (and vice versa), and
+  // a dropped try_cast would turn null-on-failure into throw-on-failure.
+  auto const check = [](cast_kind kind, bool try_cast) {
+    node const original{
+      cast{make_ref(0), sirius::logical_type::make(sirius::type_id::DATE), try_cast, kind}};
+
+    auto cloned = clone(original);
+    REQUIRE(cloned->holds<cast>());
+    REQUIRE(cloned->get<cast>().kind == kind);
+    REQUIRE(cloned->get<cast>().try_cast == try_cast);
+    REQUIRE(cloned->get<cast>().target_type.id() == sirius::type_id::DATE);
+    REQUIRE(cloned->get<cast>().child->get<reference>().column_index == 0);
+
+    std::vector<std::unique_ptr<node>> inner_select_list;
+    inner_select_list.push_back(make_ref(3));
+    auto substituted = substitute_references(original, inner_select_list);
+    REQUIRE(substituted->holds<cast>());
+    REQUIRE(substituted->get<cast>().kind == kind);
+    REQUIRE(substituted->get<cast>().try_cast == try_cast);
+    REQUIRE(substituted->get<cast>().target_type.id() == sirius::type_id::DATE);
+    REQUIRE(substituted->get<cast>().child->get<reference>().column_index == 3);
+  };
+
+  check(cast_kind::carrier_restore, /*try_cast=*/false);
+  check(cast_kind::semantic, /*try_cast=*/true);
 }

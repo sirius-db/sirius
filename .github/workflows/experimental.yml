@@ -37,15 +37,15 @@ jobs:
       run:
         working-directory: experimental/starrocks
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
 
       - name: Init starrocks submodules
         working-directory: ${{ github.workspace }}
-        run: git submodule update --init --depth=1 experimental/starrocks/starrocks experimental/starrocks/brpc
+        run: git submodule update --init --depth=1 --jobs 2 experimental/starrocks/starrocks experimental/starrocks/brpc
 
-      - uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
           pixi-version: v0.71.1
@@ -69,7 +69,7 @@ jobs:
 
   experimental:
     name: experimental
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     needs: [starrocks]
     if: always()
     steps:

@@ -29,7 +29,7 @@ Build Sirius using pixi and run the tests the user selects.
 3. Run the selected tests using pixi:
    - **All C++ unit tests**: `pixi run make test`
    - **Specific C++ unit test**: `pixi run bash -c "build/release/extension/sirius/test/cpp/sirius_unittest '<name-or-tag>'"`
-   - **Auto-detect**: Check `git diff dev --name-only` to identify changed files, then run the most relevant tests. Explain the reasoning to the user before running.
+   - **Auto-detect**: Check `git diff main --name-only` to identify changed files, then run the most relevant tests. Explain the reasoning to the user before running.
 
 4. If tests fail:
    - Show the failure output clearly.

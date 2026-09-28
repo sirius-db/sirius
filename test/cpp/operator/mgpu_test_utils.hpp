@@ -117,12 +117,11 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: "
     << params.scan_task_batch_size
     << "\n"
-       "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: "
     << params.hash_partition_bytes
@@ -184,10 +183,9 @@ class scoped_mgpu_env {
    * @brief Test-only accessor for the underlying task_scheduler.
    *
    * Returns a non-owning reference to the task_scheduler instance owned
-   * by the SiriusContext that this fixture wraps. Intended for tests
-   * that need to call test-only mutators (e.g.,
-   * `set_no_pref_rr_counter_for_testing`) between query setup and
-   * execution. Lifetime: the returned reference is valid for the
+   * by the SiriusContext that this fixture wraps. Intended for tests that
+   * need to reach the scheduler between query setup and execution.
+   * Lifetime: the returned reference is valid for the
    * lifetime of the scoped_mgpu_env instance (the SiriusContext is
    * shared across every connection opened against this env via the
    * extension callback's `OnConnectionOpened`).
@@ -346,10 +344,11 @@ class scoped_log_dir {
 };
 
 /**
- * @brief Run @p inner_query through gpu_execution on @p con. Returns
- * whether both GPU and CPU reference execution produced identical row
- * sets (string-compare after ORDER BY). Disables fallback so GPU errors
- * are not silently hidden.
+ * @brief Compare @p inner_query through `gpu_execution` with a reference execution.
+ *
+ * The reference may be transparently intercepted by Sirius unless
+ * @p force_cpu_reference is true. Disables fallback so GPU errors are not
+ * silently hidden.
  *
  * The comparison mirrors the one in test_gpu_execution_tpch.cpp's
  * compare_gpu_vs_cpu but stripped down to what the operator MGPU tests

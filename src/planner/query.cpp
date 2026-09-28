@@ -16,16 +16,17 @@
 
 #include "planner/query.hpp"
 
-#include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
 #include "telemetry/telemetry_context.hpp"
+
+#include <cstdlib>
 
 namespace sirius::planner {
 
-query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+query::query(std::vector<std::shared_ptr<pipeline::sirius_pipeline>> pipelines,
              const quent::Context& context,
+             sirius::query_id_t query_id,
              telemetry::query_telemetry_info telemetry_info)
-  : _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
+  : _query_id(query_id), _plan_id(uuid::now_v7()), _pipelines(std::move(pipelines))
 {
   build_indices();
   telemetry::emit_plan_telemetry(context, _pipelines, _plan_id, telemetry_info);
@@ -34,6 +35,9 @@ query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipel
 void query::build_indices()
 {
   for (const auto& pipeline : _pipelines) {
+    // Stamp the query id so the task queues can derive their per-query index key from a
+    // pipeline without recovering it from the (31-bit-masked) scheduling priority.
+    pipeline->set_query_id(_query_id);
     for (auto& op : pipeline->get_operators()) {
       op.get().set_pipeline(pipeline);
     }
@@ -43,9 +47,15 @@ void query::build_indices()
       // Add to operator-to-pipeline map
       _operator_to_pipeline[source.get()] = pipeline;
 
-      // If it's a scan-like source, add to scan operators vector
+      // If it's a scan-like source, add to scan operators vector. GPU_VALUES
+      // must be included: task_scheduler::start_query() schedules the first
+      // scan operator, which is the only kickoff a VALUES-only plan gets.
+      // STREAMING_SOURCE is also included: a receiver fragment has no table to scan.
+      // It may return WAITING on that first hint (no batch has arrived yet); the
+      // on_data hook wired in set_pipeline() re-schedules it when the first push lands.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::CPU_SOURCE) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
+          source->type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
         _scan_operators.push_back(source.get());
       }
     }
@@ -60,19 +70,19 @@ void query::build_indices()
   }
 }
 
-const duckdb::vector<op::sirius_physical_operator*>& query::get_scan_operators() const
+std::span<op::sirius_physical_operator* const> query::get_scan_operators() const
 {
-  return _scan_operators;
+  return {_scan_operators.data(), _scan_operators.size()};
 }
 
-duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
+std::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
 {
   auto it = _operator_to_pipeline.find(op);
   if (it != _operator_to_pipeline.end()) { return it->second; }
   return nullptr;
 }
 
-const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
+const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
 {
   return _pipelines;
 }

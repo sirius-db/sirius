@@ -8,13 +8,13 @@ You don't have to run them in order — pick what answers the user's question fi
 
 **Question answered:** Which operators or pipelines dominate query time?
 
-**Inputs:** `_pipeline_aggregates.csv` (filtered to the target `query_begin_ts`), `pipeline_plan.json`.
+**Inputs:** `_operator_aggregates.csv` and `_pipeline_aggregates.csv` (both filtered to the target `query_begin_ts`), `pipeline_plan.json`.
 
 **Method:**
 
-1. Sum `sum_execution_time_ms` across all pipelines of the query — that's your denominator (call it `total_exec_ms`).
-2. For each pipeline row, compute `% = sum_execution_time_ms / total_exec_ms * 100`.
-3. Cross-reference `pipeline_id` to `pipeline_plan.json -> operator_index` (or look up the pipeline in `pipelines[].operators`) to name the operators.
+1. For pipeline-level attribution, sum `sum_execution_time_ms` across all pipeline rows of the query — that's your denominator (call it `total_exec_ms`), then compute each pipeline's `% = sum_execution_time_ms / total_exec_ms * 100`.
+2. For operator-level attribution (usually the more actionable view), use `_operator_aggregates.csv`: each row already carries `operator_type`, `operator_id`, and `sum_execution_time_ms` per operator — rank them directly, no plan join needed. Rows are ordered by run order within each pipeline.
+3. If you need to name operators from a pipeline row, cross-reference `pipeline_id` to `pipeline_plan.json -> operator_index` (or `pipelines[].operators`).
 4. Also surface `max_execution_time_ms` — a single slow task can be more diagnostic than the sum (e.g. one straggler task vs many balanced tasks).
 
 **Interpreting the result:**

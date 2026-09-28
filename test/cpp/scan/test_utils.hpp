@@ -76,9 +76,9 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   builder.set_number_of_gpus(n_gpus)
     .set_gpu_usage_limit(gpu_capacity / n_gpus)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity / n_gpus)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity / n_gpus)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -190,7 +190,7 @@ inline void validate_scanned_batches(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
   size_t expected_rows,
   cucascade::memory::memory_reservation_manager& mem_mgr,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto* gpu_space = get_space(mem_mgr, cucascade::memory::Tier::GPU);
   REQUIRE(gpu_space != nullptr);
@@ -279,7 +279,7 @@ inline void validate_projected_id_price_batches(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
   size_t expected_rows,
   cucascade::memory::memory_reservation_manager& mem_mgr,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto* gpu_space = get_space(mem_mgr, cucascade::memory::Tier::GPU);
   REQUIRE(gpu_space != nullptr);

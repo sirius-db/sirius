@@ -4,15 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 S3_TEST_BIN="${S3_TEST_BIN:-${PROJECT_ROOT}/build/release/extension/sirius/test/cpp/sirius_unittest}"
-DOC_OUTPUT="/Users/tengyu/code/doc/s3support/pr6-b1-bench-results.md"
-
-if [[ -z "${SIRIUS_BENCH_OUTPUT_PATH:-}" ]]; then
-  if [[ -d "$(dirname "${DOC_OUTPUT}")" ]]; then
-    export SIRIUS_BENCH_OUTPUT_PATH="${DOC_OUTPUT}"
-  else
-    export SIRIUS_BENCH_OUTPUT_PATH="${SCRIPT_DIR}/pr6-b1-bench-results.md"
-  fi
-fi
+: "${SIRIUS_BENCH_OUTPUT_PATH:=${SCRIPT_DIR}/pr6-b1-bench-results.md}"
+export SIRIUS_BENCH_OUTPUT_PATH
 
 if [[ ! -x "${S3_TEST_BIN}" ]]; then
   echo "run_b1_bench: ${S3_TEST_BIN} not found; run make release first" >&2

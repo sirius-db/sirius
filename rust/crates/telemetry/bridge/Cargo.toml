@@ -10,9 +10,10 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1"
 instrumentation-model = { path = "../model" }
+nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1", features = ["static-injection"] }
 
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-# Tracks a pinned commit from quent's main branch.
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "1e82188c7af631bb334cca6b0c31bbc3a4faef7e" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }

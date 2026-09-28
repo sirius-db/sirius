@@ -22,9 +22,13 @@
 #include <catch.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/table_filter.hpp>
-#include <op/sirius_physical_parquet_scan.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <op/scan/scan_utils.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 
 using namespace duckdb;
@@ -35,6 +39,26 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+duckdb::unique_ptr<duckdb::Expression> make_untranslatable_filter_expression()
+{
+  auto expression = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    duckdb::LogicalType::BOOLEAN,
+    duckdb::ScalarFunction("sirius_unmapped_filter",
+                           {duckdb::LogicalType::BIGINT},
+                           duckdb::LogicalType::BOOLEAN,
+                           nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expression->children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::BIGINT, 0));
+  return expression;
+}
+
+duckdb::unique_ptr<duckdb::TableFilter> make_untranslatable_filter()
+{
+  return duckdb::make_uniq<duckdb::ExpressionFilter>(make_untranslatable_filter_expression());
+}
 }  // namespace
 
 TEMPLATE_TEST_CASE(
@@ -396,179 +420,97 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
   REQUIRE(view.num_rows() == 0);
 }
 
-TEST_CASE("parquet_scan with translatable filter sets table_scan passthrough",
-          "[physical_table_scan][passthrough]")
+TEST_CASE("table-filter conversion distinguishes discharged filters from failed translations",
+          "[physical_table_scan][table_filter]")
+{
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  duckdb::vector<duckdb::LogicalType> duckdb_types{duckdb::LogicalType::BIGINT,
+                                                   duckdb::LogicalType::BIGINT};
+  auto const returned_types = sirius::from_duckdb_vec(duckdb_types);
+  auto const batch_map      = sirius::op::build_batch_column_map({}, column_ids.size());
+
+  SECTION("partition-only filter is discharged")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
+    CHECK(sirius::op::convert_table_filters_to_expression(
+            filters, column_ids, returned_types, batch_map, {0}) == nullptr);
+  }
+
+  SECTION("plain data filter produces a translatable expression")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(1));
+    auto expression = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map);
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) != nullptr);
+  }
+
+  SECTION("unsupported data filter remains distinguishable from an empty conversion")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = make_untranslatable_filter();
+    auto expression    = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map);
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) == nullptr);
+  }
+
+  SECTION("partition and data filters retain the data predicate")
+  {
+    duckdb::TableFilterSet filters;
+    filters.filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_EQUAL, duckdb::Value::BIGINT(1));
+    filters.filters[1] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
+    auto expression = sirius::op::convert_table_filters_to_expression(
+      filters, column_ids, returned_types, batch_map, {0});
+    REQUIRE(expression);
+    CHECK(sirius::ast::from_duckdb(*expression) != nullptr);
+  }
+}
+
+TEST_CASE("sirius_physical_table_scan fails closed for an untranslatable pushed-down filter",
+          "[physical_table_scan][table_filter]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
-  // Build a two-column batch: col0 (INT64 filter), col1 (INT32 data)
-  std::vector<int64_t> filter_vals{1, 2, 3, 5, 7};
-  std::vector<int32_t> data_vals{10, 20, 30, 50, 70};
-
+  std::vector<int64_t> filter_values{1, 2, 3};
+  std::vector<int32_t> data_values{10, 20, 30};
   auto input_batch = make_two_column_batch<int64_t, int32_t>(
-    *space, filter_vals, data_vals, cudf::type_id::INT32, std::nullopt);
+    *space, filter_values, data_values, cudf::type_id::INT32, std::nullopt);
 
-  // Filter: col0 > 3 (translatable to cuDF AST)
-  auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(3));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(constant_filter));
-
-  duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
-  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
-
-  duckdb::vector<duckdb::LogicalType> returned_types = types;
-
-  duckdb::vector<duckdb::ColumnIndex> column_ids;
-  column_ids.push_back(duckdb::ColumnIndex(0));
-  column_ids.push_back(duckdb::ColumnIndex(1));
-
+  auto table_filters        = duckdb::make_uniq<duckdb::TableFilterSet>();
+  table_filters->filters[0] = make_untranslatable_filter();
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT,
+                                            duckdb::LogicalType::INTEGER};
+  duckdb::vector<duckdb::ColumnIndex> column_ids{duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
   duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
   duckdb::vector<std::string> names{"filter_col", "data_col"};
   duckdb::vector<duckdb::Value> parameters;
   duckdb::virtual_column_map_t virtual_columns;
-
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
 
   sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
                                         std::move(table_function),
                                         nullptr,
-                                        sirius::from_duckdb_vec(returned_types),
+                                        sirius::from_duckdb_vec(types),
                                         std::move(column_ids),
                                         std::move(projection_ids),
                                         std::move(names),
                                         std::move(table_filters),
-                                        filter_vals.size(),
+                                        filter_values.size(),
                                         duckdb::ExtraOperatorInfo(),
                                         std::move(parameters),
                                         std::move(virtual_columns));
-
-  // Construct parquet_scan from table_scan — triggers filter translation
-  sirius_physical_parquet_scan parquet_scan(&table_scan);
-
-  // INT64 > 3 should translate successfully
-  REQUIRE(table_scan.passthrough == true);
-  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
-  REQUIRE(table_scan.filter_expr != nullptr);
-
-  // In passthrough mode, execute() returns input data unchanged
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  auto out_view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
-  auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
-  auto host_data   = copy_column_to_host<int32_t>(out_view.column(1));
-
-  // All rows pass through — no filtering applied
-  REQUIRE(host_filter == filter_vals);
-  REQUIRE(host_data == data_vals);
-}
-
-TEST_CASE("parquet_scan with decimal filter sets table_scan passthrough",
-          "[physical_table_scan][passthrough]")
-{
-  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  REQUIRE(space);
-
-  // Build a two-column batch: col0 (DECIMAL64 filter), col1 (INT32 data)
-  auto mr     = sirius::test::operator_utils::get_resource_ref(*space);
-  auto stream = sirius::test::operator_utils::default_stream();
-
-  // Decimal values scaled by -2: stored 100,200,300,500,700 → represent 1.00,2.00,3.00,5.00,7.00
-  std::vector<int64_t> dec_raw{100, 200, 300, 500, 700};
-  std::vector<int32_t> data_vals{10, 20, 30, 50, 70};
-  constexpr int32_t decimal_scale = -2;
-
-  auto col0 =
-    cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, decimal_scale},
-                                  static_cast<cudf::size_type>(dec_raw.size()),
-                                  cudf::mask_state::UNALLOCATED,
-                                  stream,
-                                  mr);
-  cudaMemcpy(col0->mutable_view().data<int64_t>(),
-             dec_raw.data(),
-             sizeof(int64_t) * dec_raw.size(),
-             cudaMemcpyHostToDevice);
-
-  auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                        static_cast<cudf::size_type>(data_vals.size()),
-                                        cudf::mask_state::UNALLOCATED,
-                                        stream,
-                                        mr);
-  cudaMemcpy(col1->mutable_view().data<int32_t>(),
-             data_vals.data(),
-             sizeof(int32_t) * data_vals.size(),
-             cudaMemcpyHostToDevice);
-
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(std::move(col0));
-  cols.push_back(std::move(col1));
-  auto table    = std::make_unique<cudf::table>(std::move(cols));
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::move(table), *space, cudf::get_default_stream());
-  auto input_batch = cucascade::data_batch::make(0, std::move(gpu_repr));
-
-  // Filter: col0 > 3.00 (decimal column-vs-literal comparisons translate to cuDF AST)
-  auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
-  auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::DECIMAL(300, 10, 2));
-  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(constant_filter));
-
-  duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::DECIMAL(10, 2));
-  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
-
-  duckdb::vector<duckdb::LogicalType> returned_types = types;
-
-  duckdb::vector<duckdb::ColumnIndex> column_ids;
-  column_ids.push_back(duckdb::ColumnIndex(0));
-  column_ids.push_back(duckdb::ColumnIndex(1));
-
-  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
-  duckdb::vector<std::string> names{"dec_col", "data_col"};
-  duckdb::vector<duckdb::Value> parameters;
-  duckdb::virtual_column_map_t virtual_columns;
-
-  duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
-
-  sirius_physical_table_scan table_scan(sirius::from_duckdb_vec(types),
-                                        std::move(table_function),
-                                        nullptr,
-                                        sirius::from_duckdb_vec(returned_types),
-                                        std::move(column_ids),
-                                        std::move(projection_ids),
-                                        std::move(names),
-                                        std::move(table_filters),
-                                        dec_raw.size(),
-                                        duckdb::ExtraOperatorInfo(),
-                                        std::move(parameters),
-                                        std::move(virtual_columns));
-
-  // Construct parquet_scan from table_scan — triggers filter translation
-  sirius_physical_parquet_scan parquet_scan(&table_scan);
-
-  // DECIMAL64 > 3.00 should translate successfully
-  REQUIRE(table_scan.passthrough == true);
-  REQUIRE(!parquet_scan.translated_filter_by_device.empty());
-  REQUIRE(table_scan.filter_expr != nullptr);
-
-  // In passthrough mode, execute() returns input data unchanged
-  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
-
-  auto out_view = sirius::get_cudf_table_view(
-    *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0]);
-  auto host_dec  = copy_column_to_host<int64_t>(out_view.column(0));
-  auto host_data = copy_column_to_host<int32_t>(out_view.column(1));
-
-  // All rows pass through — no filtering applied
-  REQUIRE(host_dec == dec_raw);
-  REQUIRE(host_data == data_vals);
+  CHECK_THROWS_WITH(
+    table_scan.execute(pipelineable_operator_data(inputs), cudf::get_default_stream()),
+    Catch::Contains("cannot evaluate pushed-down predicate"));
 }

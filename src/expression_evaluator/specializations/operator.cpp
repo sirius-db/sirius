@@ -57,7 +57,7 @@ template <typename T>
 std::unique_ptr<cudf::column> execute_numeric_in_ast(const ::sirius::ast::in_list& alt,
                                                      const cudf::column_view& input_view,
                                                      rmm::device_async_resource_ref mr,
-                                                     rmm::cuda_stream_view stream)
+                                                     ::cuda::stream_ref stream)
 {
   std::vector<T> children_vals;
   children_vals.reserve(alt.values.size());
@@ -69,7 +69,7 @@ std::unique_ptr<cudf::column> execute_numeric_in_ast(const ::sirius::ast::in_lis
                                 children_vals.data(),
                                 children_vals.size() * sizeof(T),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -84,7 +84,7 @@ template <typename DecimalT>
 std::unique_ptr<cudf::column> execute_decimal_in_ast(const ::sirius::ast::in_list& alt,
                                                      const cudf::column_view& input_view,
                                                      rmm::device_async_resource_ref mr,
-                                                     rmm::cuda_stream_view stream)
+                                                     ::cuda::stream_ref stream)
 {
   using Rep = typename DecimalT::rep;
   std::vector<Rep> children_vals;
@@ -106,7 +106,7 @@ std::unique_ptr<cudf::column> execute_decimal_in_ast(const ::sirius::ast::in_lis
                                 children_vals.data(),
                                 children_vals.size() * sizeof(Rep),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   // input_view.type() carries the scale, so the haystack column matches the needle's type.
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
@@ -122,7 +122,7 @@ template <typename CudfTimestampT>
 std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_list& alt,
                                                        const cudf::column_view& input_view,
                                                        rmm::device_async_resource_ref mr,
-                                                       rmm::cuda_stream_view stream)
+                                                       ::cuda::stream_ref stream)
 {
   using Rep = typename CudfTimestampT::rep;
   std::vector<Rep> children_vals;
@@ -148,7 +148,7 @@ std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_l
                                 children_vals.data(),
                                 children_vals.size() * sizeof(Rep),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -164,7 +164,7 @@ std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_l
 std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& alt,
                                                   const cudf::column_view& input_view,
                                                   rmm::device_async_resource_ref mr,
-                                                  rmm::cuda_stream_view stream)
+                                                  ::cuda::stream_ref stream)
 {
   std::vector<uint8_t> children_vals;
   children_vals.reserve(alt.values.size());
@@ -176,7 +176,7 @@ std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& 
                                 children_vals.data(),
                                 children_vals.size() * sizeof(uint8_t),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -189,7 +189,7 @@ std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& 
 std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list& alt,
                                                     const cudf::column_view& input_view,
                                                     rmm::device_async_resource_ref mr,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   auto const num_strings = static_cast<cudf::size_type>(alt.values.size());
   auto const num_offsets = num_strings + 1;
@@ -211,12 +211,12 @@ std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list
                                 chars.data(),
                                 chars.size() * sizeof(char),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
                                 offsets.data(),
                                 offsets.size() * sizeof(cudf::size_type),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
 
   auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                                     num_offsets,
@@ -258,8 +258,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
       (mode == evaluation_mode::AST || ast_op_count >= _min_ast_size)) {
     auto child        = evaluate(*alt.child, evaluation_mode::AST);
     auto build_output = [&](expr_ref const& produced) -> evaluate_result {
-      return evaluate_result(
-        ast_result(produced, child.get_temp_scalar_indices(), child.get_temp_column_indices()));
+      return evaluate_result(compose(produced, {&child}));
     };
 
     evaluate_result output = [&]() -> evaluate_result {
@@ -295,7 +294,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::unary_op const& alt,
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(output.get_expr());
-    release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+    release_temporaries({&output});
     return evaluate_result(std::move(result_column));
   }
 
@@ -351,10 +350,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
     auto comparator          = evaluate(*alt.values[0], evaluation_mode::AST);
     expr_ref comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
       cudf::ast::ast_operator::EQUAL, test.get_expr(), comparator.get_expr());
-    auto output = evaluate_result(
-      ast_result(comparison_expr,
-                 {test.get_temp_scalar_indices(), comparator.get_temp_scalar_indices()},
-                 {test.get_temp_column_indices(), comparator.get_temp_column_indices()}));
+    auto output = evaluate_result(compose(comparison_expr, {&test, &comparator}));
 
     for (std::size_t value_idx = 1; value_idx < alt.values.size(); ++value_idx) {
       auto next_comparator          = evaluate(*alt.values[value_idx], evaluation_mode::AST);
@@ -362,23 +358,19 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
         cudf::ast::ast_operator::EQUAL, test.get_expr(), next_comparator.get_expr());
       comparison_expr = _ast_tree.emplace<cudf::ast::operation>(
         cudf::ast::ast_operator::LOGICAL_OR, comparison_expr, next_comparison_expr);
-      output = evaluate_result(
-        ast_result(comparison_expr,
-                   {output.get_temp_scalar_indices(), next_comparator.get_temp_scalar_indices()},
-                   {output.get_temp_column_indices(), next_comparator.get_temp_column_indices()}));
+      output = evaluate_result(compose(comparison_expr, {&output, &next_comparator}));
     }
 
     if (!alt.negated) {
       // produce IN result (positive)
       if (mode == evaluation_mode::AST) { return output; }
       auto result_column = evaluate_ast(output.get_expr());
-      release_temporaries(output.get_temp_scalar_indices(), output.get_temp_column_indices());
+      release_temporaries({&output});
       return evaluate_result(std::move(result_column));
     }
     auto const& not_expr =
       _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::NOT, comparison_expr);
-    auto not_output = evaluate_result(
-      ast_result(not_expr, output.get_temp_scalar_indices(), output.get_temp_column_indices()));
+    auto not_output = evaluate_result(compose(not_expr, {&output}));
 
     if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
@@ -387,7 +379,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::in_list const& alt,
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(not_output.get_expr());
-    release_temporaries(not_output.get_temp_scalar_indices(), not_output.get_temp_column_indices());
+    release_temporaries({&not_output});
     return evaluate_result(std::move(result_column));
   }
 

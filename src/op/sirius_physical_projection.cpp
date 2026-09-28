@@ -22,11 +22,11 @@
 #include "expression_evaluator/expression_evaluator.hpp"
 #include "log/logging.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -68,9 +68,9 @@ sirius_physical_projection::sirius_physical_projection(
 }
 
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view stream)
+                                                                   ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_projection::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_projection::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
   // Mutable local: we move each read-only lock out of this vector into an output batch's owner.
   auto input_batches = input.get_read_only_batches();
@@ -101,7 +101,13 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
   // Construct the evaluator once (reused across batches; evaluate() resets its state each call).
   std::optional<sirius::expression_evaluator> evaluator;
   if (!all_passthrough) {
-    evaluator.emplace(evaluated_exprs, cudf::get_current_device_resource_ref(), stream);
+    evaluator.emplace(evaluated_exprs,
+                      cudf::get_current_device_resource_ref(),
+                      stream,
+                      strategy_from_config(),
+                      expression_evaluator::default_min_ast_size,
+                      like_swar_fastpath_enabled(),
+                      like_cache());
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
@@ -114,7 +120,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     // ---- Path 1: every output column is an evaluated expression ----
     if (all_evaluated) {
       auto projected_table = evaluator->evaluate(input_view);
-      output_batches.push_back(sirius::make_data_batch(std::move(projected_table), mem, stream));
+      output_batches.push_back(
+        sirius::make_data_batch(std::move(projected_table), mem, stream, batch_telemetry()));
       continue;
     }
 
@@ -134,7 +141,7 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       // Owner = the input read-only lock: keeps the source columns alive AND pinned read-only for
       // the output batch's lifetime, so the view can never be freed/downgraded out from under us.
       output_batches.push_back(sirius::make_data_batch_from_view(
-        out_view, std::move(input_ro), referenced_bytes, mem, stream));
+        out_view, std::move(input_ro), referenced_bytes, mem, stream, batch_telemetry()));
       continue;
     }
 
@@ -174,8 +181,8 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
       cucascade::read_only_data_batch input_lock;
     };
     projection_owner owner{std::move(evaluated), std::move(input_ro)};
-    output_batches.push_back(
-      sirius::make_data_batch_from_view(out_view, std::move(owner), referenced_bytes, mem, stream));
+    output_batches.push_back(sirius::make_data_batch_from_view(
+      out_view, std::move(owner), referenced_bytes, mem, stream, batch_telemetry()));
   }
   return std::make_unique<pipelineable_operator_data>(output_batches);
 }

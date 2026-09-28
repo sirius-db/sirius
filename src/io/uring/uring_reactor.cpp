@@ -18,6 +18,7 @@
 
 #include "cucascade/cuda/event.hpp"
 #include "driver_types.h"
+#include "exec/thread_util.hpp"
 #include "io/details/slot_pool.hpp"
 #include "io/types.hpp"
 #include "io/uring/types.hpp"
@@ -44,6 +45,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace sirius::io::uring {
@@ -55,7 +57,7 @@ static constexpr size_t NUM_CHUNKS = 64;  // max concurrent device reads, i.e. r
 namespace {
 
 /// True iff @p v is a multiple of IO_BLOCK_SIZE (O_DIRECT page size).
-[[nodiscard]] constexpr bool is_block_aligned(size_t v) noexcept
+[[maybe_unused]] [[nodiscard]] constexpr bool is_block_aligned(size_t v) noexcept
 {
   return (v & (static_cast<size_t>(IO_BLOCK_SIZE) - 1)) == 0;
 }
@@ -67,7 +69,8 @@ namespace {
 /// by a silent fallback.
 [[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
 {
-  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS;
+  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS ||
+         errc == ENOMEM;
 }
 
 struct io_slot {
@@ -230,7 +233,7 @@ struct io_slot {
                                                           size_t req_offset,
                                                           size_t req_size,
                                                           uint8_t* dst,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           int device_id,
                                                           size_t file_size,
                                                           std::shared_ptr<request_manager> manager)
@@ -281,7 +284,7 @@ struct io_slot {
   size_t req_offset,
   size_t req_size,
   uint8_t* dst,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   int device_id,
   size_t file_size,
   std::shared_ptr<request_manager> manager)
@@ -399,11 +402,11 @@ unique_ring_ptr make_ring(unsigned depth)
   p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
   int rc = io_uring_queue_init_params(depth, r.get(), &p);
   if (rc == 0) {
-    spdlog::trace("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
-                  depth);
+    SIRIUS_LOG_TRACE("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN, entries={}",
+                     depth);
     return unique_ring_ptr{r.release()};
   }
-  spdlog::trace(
+  SIRIUS_LOG_TRACE(
     "uring_device_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
     "({}), falling back to plain flags",
     strerror(-rc));
@@ -411,7 +414,7 @@ unique_ring_ptr make_ring(unsigned depth)
   auto r2 = std::make_unique<io_uring>();
   int rc2 = io_uring_queue_init(depth, r2.get(), 0);
   if (rc2 < 0) throw std::runtime_error("uring_reactor: ring init: " + std::string(strerror(-rc2)));
-  spdlog::trace("uring_reactor: ring using plain flags, entries={}", depth);
+  SIRIUS_LOG_TRACE("uring_reactor: ring using plain flags, entries={}", depth);
   return unique_ring_ptr{r2.release()};
 }
 
@@ -427,8 +430,9 @@ struct unique_ring {
   [[nodiscard]] bool register_buffers(std::span<iovec> iovecs)
   {
     if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), iovecs.size()); rc < 0) {
-      spdlog::warn("uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
-                   strerror(-rc));
+      SIRIUS_LOG_WARN(
+        "uring_reactor: io_uring_register_buffers failed ({}); fixed buffers disabled",
+        strerror(-rc));
       return false;
     }
     return true;
@@ -507,7 +511,7 @@ void uring_reactor::start()
                          _stop_source.get_token());
   if (!_tname.empty()) {
     std::string full_name = _tname + "_worker";
-    pthread_setname_np(_worker.native_handle(), full_name.c_str());
+    std::ignore           = sirius::exec::thread_util::set_thread_name(_worker, full_name);
   }
 }
 
@@ -579,7 +583,7 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
                                                        uint8_t* dst,
                                                        size_t offset,
                                                        size_t size,
-                                                       rmm::cuda_stream_view stream,
+                                                       ::cuda::stream_ref stream,
                                                        int device_id)
 {
   if (size == 0) { return rx_request::create({}); }
@@ -620,7 +624,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   uint8_t* dst,
   size_t offset,
   size_t size,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   int device_id)
 {
   // Device read staged through caller-supplied pinned host buffers.  The
@@ -851,7 +855,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   static constexpr std::chrono::milliseconds SHUTDOWN_POLL_MS{100};
 
   std::stop_callback cb(stop_token, [this] {
-    spdlog::trace("uring_reactor worker_loop: stop requested");
+    SIRIUS_LOG_TRACE("uring_reactor worker_loop: stop requested");
     _requests.enqueue(nullptr);  // unblock the worker if it's waiting on an empty queue
   });
 
@@ -899,7 +903,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
   int inflight = 0;
 
   auto poll_copy_completions = [&]() {
-    using query_status = cucascade::cuda::cuda_event::query_status;
+    using query_status = cucascade::cuda::event::query_result;
     copying_slots.erase(std::remove_if(copying_slots.begin(),
                                        copying_slots.end(),
                                        [&](slot_token const& token) {
@@ -979,7 +983,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         // resubmit — register_bound_buffer re-preps it as a plain read.  No
         // bytes landed, so the resubmit reads the whole range from scratch.
         if (s.used_fixed_buffer && is_fixed_buffer_error(errc)) {
-          spdlog::warn(
+          SIRIUS_LOG_WARN(
             "uring_reactor: fixed-buffer read failed on slot {} ({}); "
             "falling back to plain read",
             si,
@@ -1040,7 +1044,8 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
     while (inflight > 0) {
       auto s = ring.wait_for(SHUTDOWN_POLL_MS);
       if (s) {
-        spdlog::error("uring_reactor: io_uring_wait_cqe failed during shutdown: {}", strerror(s));
+        SIRIUS_LOG_ERROR("uring_reactor: io_uring_wait_cqe failed during shutdown: {}",
+                         strerror(s));
         break;
       }
       reap_cqes();
@@ -1082,7 +1087,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         if (inflight > 0) {
           auto s = ring.wait_for(SHUTDOWN_POLL_MS);
           if (s) {
-            spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
+            SIRIUS_LOG_ERROR("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(s));
             break;
           }
           reap_cqes();
@@ -1093,7 +1098,7 @@ void uring_reactor::worker_loop(const std::stop_token& stop_token)
         poll_copy_completions();
       }
     } catch (const std::exception& e) {
-      spdlog::error("uring_reactor: exception: {}", e.what());
+      SIRIUS_LOG_ERROR("uring_reactor: exception: {}", e.what());
     }
   }
 }

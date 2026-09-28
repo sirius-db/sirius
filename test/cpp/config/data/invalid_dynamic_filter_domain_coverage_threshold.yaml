@@ -1,0 +1,5 @@
+sirius:
+  topology:
+    num_gpus: 1
+  operator_params:
+    dynamic_filter_domain_coverage_threshold: 0

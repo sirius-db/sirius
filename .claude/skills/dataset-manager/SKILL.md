@@ -4,7 +4,7 @@ description: >
   Use this skill to generate benchmark datasets (TPC-H, TPC-DS, etc.). Trigger when the user
   needs test data at a specific scale factor for benchmarking or testing. Supports parquet and
   duckdb output formats.
-argument-hint: "[benchmark] [scale_factor] [--format duckdb|parquet] [--output <path>]"
+argument-hint: "[benchmark] [scale_factor] [--format duckdb|parquet] [--cluster] [--output <path>]"
 ---
 
 # Dataset Generator
@@ -17,6 +17,7 @@ Parse `$ARGUMENTS` for:
 - **Benchmark**: name from the registry below (first positional arg)
 - **Scale factor**: integer (second positional arg)
 - **Format**: `--format duckdb|parquet` (optional — each benchmark has a default)
+- **Cluster** (TPC-H duckdb only): `--cluster` / `--cluster-keys <spec>` (optional — physically sorts tables so row-group pruning works; errors with `--format parquet`)
 - **Output path**: `--output <path>` (optional — scripts have sensible defaults)
 
 If any required parameter (benchmark, scale factor) is missing, ask the user.
@@ -33,17 +34,23 @@ Each entry follows the same structure: script location, command template, suppor
 |-------|-------|
 | Script | `test/tpch_performance/generate_tpch_data.sh` |
 | Default format | `parquet` |
-| Formats | `parquet` (tpchgen-rs), `duckdb` (DuckDB `dbgen()`) |
+| Formats | `parquet` (tpchgen-rs), `duckdb` (tpchgen-rs `.tbl` staged via `COPY`; classic dbgen fallback) |
 | Default output (parquet) | `test_datasets/tpch_parquet_sf<SF>` |
 | Default output (duckdb) | `test_datasets/tpch_sf<SF>.duckdb` |
-| Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `build/release/duckdb` |
+| Default output (duckdb + `--cluster`) | `test_datasets/tpch_sf<SF>_sorted.duckdb` |
+| Prerequisites | Parquet: pixi env (rust, python, pyarrow). DuckDB: `build/release/duckdb` + pixi env rust for tpchgen-rs (falls back to building the bundled classic dbgen) |
 
 ```bash
-cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--output <path>]
+cd test/tpch_performance && pixi run bash generate_tpch_data.sh <SF> --format <FORMAT> [--cluster] [--cluster-keys <spec>] [--output <path>]
 ```
 
 Notes:
 - If the parquet output directory already exists, the script skips generation
+- The duckdb format deliberately does **not** use DuckDB's built-in `tpch` extension `dbgen()`: its synthetic comment pool differs from the classic tools, so q13/q16 (which filter on `o_comment`/`s_comment`) would return non-reference results. Instead it stages reference `.tbl` output (tpchgen-rs, byte-identical to classic dbgen and ~14x faster; dbgen built from the bundled zip as fallback) and `COPY`s it in **one table at a time, largest first**, deleting each `.tbl` after load — peak disk is the largest table plus the database, which is what makes SF1000 reachable.
+- The script runs its DuckDB loads with `SIRIUS_DISABLE=1` internally, so generation does not initialize the GPU or depend on a Sirius config.
+- `--cluster` (duckdb only) physically sorts tables at load so each row group's per-column min/max becomes selective — this is what makes Sirius's native-scan row-group pruning skip work on date-filtered queries. It writes a distinct `tpch_sf<SF>_sorted.duckdb` so it can coexist with the unsorted dataset.
+- Default cluster keys: `lineitem:l_shipdate,orders:o_orderdate`. Override with `--cluster-keys "table:col,table:col,..."` (implies `--cluster`).
+- `--cluster` errors if combined with `--format parquet` (tpchgen-rs writes decimals as FIXED_LEN_BYTE_ARRAY, which disables Sirius row-group pruning for the whole file).
 
 ### TPC-DS
 
@@ -69,7 +76,7 @@ For any benchmark that requires the DuckDB binary, check before running:
 ```bash
 test -x build/release/duckdb
 ```
-If missing, tell the user to build first: `CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) make`
+If missing, tell the user to build first: `pixi run make`
 
 ## Report Results
 

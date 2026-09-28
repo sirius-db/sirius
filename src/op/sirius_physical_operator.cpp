@@ -16,11 +16,15 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include "config.hpp"
+#include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/batch_telemetry.hpp"
+#include "telemetry/data_batch_probe.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/error.hpp>
@@ -37,62 +41,66 @@ namespace op {
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
 {
-  if (!_data_batches) {
-    if (!_read_only_data_batches) {
-      throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
-    }
-    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-    batches.reserve(_read_only_data_batches->size());
-    for (const auto& ro : *_read_only_data_batches) {
-      auto copy = ro;
-      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
-    }
-    _data_batches = std::move(batches);
-  }
-  return *_data_batches;
+  return _data_batches;
 }
 
-std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches(
-  bool leave_locked) const
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches()
+  const
 {
-  if (!_read_only_data_batches) {
-    if (!_data_batches) {
-      throw std::runtime_error("pipelineable_operator_data:get_read_only_batches no data batches");
-    }
-    std::vector<::cucascade::read_only_data_batch> ro_batches;
-    ro_batches.reserve(_data_batches->size());
-    for (const auto& batch : *_data_batches) {
-      if (batch) {
-        ro_batches.push_back(batch->to_read_only());
-      } else {
-        SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
-      }
-    }
-    if (leave_locked) {
-      _read_only_data_batches = std::move(ro_batches);
+  if (_read_only_data_batches.has_value()) { return *_read_only_data_batches; }
+
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(_data_batches.size());
+  for (const auto& batch : _data_batches) {
+    if (batch) {
+      ro_batches.push_back(batch->to_read_only());
     } else {
-      return std::move(ro_batches);
+      SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
     }
   }
-  return *_read_only_data_batches;
+  return ro_batches;
 }
 
 void pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
   remove_read_only_lock();
-  auto data_batches = get_data_batches();
-  std::vector<::cucascade::read_only_data_batch> ro_batches;
-  ro_batches.reserve(data_batches.size());
 
-  for (const auto& batch : data_batches) {
-    if (!batch) {
+  std::vector<cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(_data_batches.size());
+
+  for (std::shared_ptr<cucascade::data_batch>& batch : _data_batches) {
+    if (not batch) {
       throw sirius::internal_exception(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
-    std::optional<::cucascade::read_only_data_batch> ro_batch;
     try {
-      ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+      if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
+            pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
+        pipeline::lock_and_prepare_batch_result result = *maybe_result;
+
+        std::visit(cucascade::utils::overloaded{
+                     [&ro_batches](pipeline::lock_to_existing_batch& result) {
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                     [&batch, &ro_batches](pipeline::lock_to_new_batch& result) {
+                       // result has returned a read_only accessor to a clone (for the case of
+                       // cross-GPU input/target_mem_space), so the ro_lock accessor here references
+                       // a different batch than `batch` from `_data_batches`. Update the vector so
+                       // _data_batches now holds the new updated batch, upholding the invariant
+                       // that _data_batches[i] is the batch underlying accessor
+                       // _read_only_data_batches[i].
+                       batch = std::move(result.new_batch);
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                   },
+                   result);
+      } else {
+        throw sirius::internal_exception(
+          "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+          batch->get_batch_id(),
+          static_cast<int>(batch->get_state()));
+      }
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
@@ -108,15 +116,7 @@ void pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!ro_batch) {
-      throw sirius::internal_exception(
-        "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()));
-    }
-    ro_batches.emplace_back(std::move(*ro_batch));
   }
-
   _read_only_data_batches = std::move(ro_batches);
 }
 
@@ -138,6 +138,18 @@ sirius_physical_operator::get_children() const
   }
   return result;
 }
+std::string_view sirius_physical_operator::input_port_for(
+  sirius_physical_operator const& /*producer*/) const
+{
+  return "default";
+}
+
+MemoryBarrierType sirius_physical_operator::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::ORDER_BY ? MemoryBarrierType::PIPELINE
+                                                               : MemoryBarrierType::FULL;
+}
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
@@ -147,20 +159,20 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
 {
   auto& state = meta_pipeline.get_state();
   if (is_sink()) {
-    // operator is a sink, build a pipeline
-    D_ASSERT(children.size() == 1);
+    // Sink: build a pipeline. Leaf-sinks (scans) terminate their own one-operator pipeline.
+    D_ASSERT(children.size() <= 1);
 
-    // single operator: the operator becomes the data source of the current pipeline
-    state.set_pipeline_source(current, *this);
+    // create_child_meta_pipeline pre-populates [*this] in the child_meta; source/sink
+    // derive from operators[] in `is_ready`, so no set_pipeline_source here.
 
-    // we create a new pipeline starting from the child
+    // we create a new pipeline starting from the child (or just [*this] for leaf-sinks)
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
-    child_meta_pipeline.build(*children[0]);
+    if (!children.empty()) { child_meta_pipeline.build(*children[0]); }
   } else {
     // operator is not a sink! recurse in children
     if (children.empty()) {
-      // source
-      state.set_pipeline_source(current, *this);
+      // source-leaf. Append: source-leaves land at operators[0] post-reverse.
+      state.add_pipeline_operator(current, *this);
     } else {
       if (children.size() != 1) {
         throw internal_exception("Operator not supported in build_pipelines");
@@ -221,21 +233,31 @@ void sirius_physical_operator::add_port(std::string_view port_id, std::unique_pt
   ports[std::string(port_id)] = raw;
 }
 
-sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_view port_id)
+sirius_physical_operator::port* sirius_physical_operator::try_get_port(std::string_view port_id)
 {
   auto it = ports.find(std::string(port_id));
-  if (it == ports.end()) {
-    std::string ports_string = "";
-    for (auto& [port_name, port_ptr] : ports) {
-      ports_string += port_name + ", ";
-    }
-    throw internal_exception("Port " + std::string(port_id) + " not found in operator " +
-                             get_name() + " existing ports are: " + ports_string);
-  }
-  return it->second;
+  return it == ports.end() ? nullptr : it->second;
 }
 
-void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+const sirius_physical_operator::port* sirius_physical_operator::try_get_port(
+  std::string_view port_id) const
+{
+  auto it = ports.find(std::string(port_id));
+  return it == ports.end() ? nullptr : it->second;
+}
+
+sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_view port_id)
+{
+  if (auto* found = try_get_port(port_id); found != nullptr) { return found; }
+  std::string ports_string = "";
+  for (auto& [port_name, port_ptr] : ports) {
+    ports_string += port_name + ", ";
+  }
+  throw internal_exception("Port " + std::string(port_id) + " not found in operator " + get_name() +
+                           " existing ports are: " + ports_string);
+}
+
+void sirius_physical_operator::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
@@ -246,7 +268,7 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
 }
 
 std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_data& input_data,
-                                                                 rmm::cuda_stream_view stream)
+                                                                 ::cuda::stream_ref stream)
 {
   // not doing anything for now
   return std::make_unique<pipelineable_operator_data>(
@@ -257,7 +279,12 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
-  if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
+  if (p && p->repo) {
+    // Emit before the batch becomes poppable so `queued` precedes `packaged`.
+    telemetry::batch_telemetry_registry::instance().on_published(
+      batch, p->repo, telemetry::batch_origin::operator_output);
+    p->repo->add_data_batch(std::move(batch));
+  }
 }
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
@@ -341,7 +368,11 @@ bool sirius_physical_operator::all_ports_empty()
 bool sirius_physical_operator::is_source_pipeline_finished()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
+    // A port with no src_pipeline cannot gate on an upstream pipeline — treat
+    // it as non-blocking, mirroring get_next_task_hint()'s null guards. The
+    // zero-task finish guard now calls this on source operators too
+    //.
+    if (port_ptr->src_pipeline && !port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
   }
   return true;
 }
@@ -354,16 +385,31 @@ bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipe
   return false;
 }
 
-duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
-  const noexcept
+std::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline() const noexcept
 {
   return _pipeline;
 }
 
-void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+void sirius_physical_operator::set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);
+}
+
+bool sirius_physical_operator::like_swar_fastpath_enabled() const noexcept
+{
+  return _pipeline != nullptr && _pipeline->get_operator_params().like_swar_fastpath;
+}
+
+std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_cache() const noexcept
+{
+  return _pipeline != nullptr ? _pipeline->get_like_multiliteral_cache() : nullptr;
+}
+
+telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
+{
+  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 
 // implement get_all_ports

@@ -21,8 +21,8 @@
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <fcntl.h>
 #include <glob.h>
-#include <spdlog/common.h>
-#include <spdlog/spdlog.h>
+#include <log/logging.hpp>
+#include <log/spdlog_owning_sink.hpp>
 #include <unistd.h>
 
 #include <algorithm>
@@ -134,7 +134,11 @@ int main(int argc, char** argv)
     return 1;
   }
 
-  spdlog::set_level(spdlog::level::info);  // show per-read trace
+  // Per-read trace goes to log/sirius.log (no backend is installed until the
+  // logger is initialized; without this every log statement is dropped).
+  auto log_sink = sirius::log::make_spdlog_owning_sink({"log", std::nullopt});
+  log_sink->set_level(sirius::log::level::info);
+  sirius::log::set_sink(std::move(log_sink));
 
   std::cout << "Source : " << argv[2] << "\n"
             << "Files  : " << paths.size() << "\n";
@@ -282,25 +286,25 @@ int main(int argc, char** argv)
     auto sources = cudf::io::make_datasources(cudf::io::source_info{path_list});
     ms           = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
   } else {
     // Size the buffer pool to fit the working set, plus headroom.
     constexpr uint32_t POOL_MAX_SLABS       = 20;
     constexpr size_t INFLIGHT_BUDGET_CHUNKS = 2048;
+    constexpr size_t CHUNKS_PER_SLAB =
+      cucascade::memory::fixed_size_host_memory_resource::default_pool_size;
     constexpr size_t POOL_CAPACITY =
-      static_cast<size_t>(POOL_MAX_SLABS) *
-      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB) * (1 << 20);
+      static_cast<size_t>(POOL_MAX_SLABS) * CHUNKS_PER_SLAB * (1 << 20);
 
     cucascade::memory::numa_region_pinned_host_memory_resource upstream(0, /*make_portable=*/true);
-    cucascade::memory::fixed_size_host_memory_resource host_mr(
-      0,                                                                     // device_id
-      upstream,                                                              // upstream allocator
-      POOL_CAPACITY,                                                         // mem_limit
-      POOL_CAPACITY,                                                         // capacity
-      1 << 20,                                                               // block_size = 1 MiB
-      static_cast<size_t>(sirius::io::cache::buffer_pool::CHUNKS_PER_SLAB),  // pool_size
-      1);                                                                    // initial_pools
+    cucascade::memory::fixed_size_host_memory_resource host_mr(0,              // device_id
+                                                               upstream,       // upstream allocator
+                                                               POOL_CAPACITY,  // mem_limit
+                                                               POOL_CAPACITY,  // capacity
+                                                               1 << 20,        // block_size = 1 MiB
+                                                               CHUNKS_PER_SLAB,  // pool_size
+                                                               1);               // initial_pools
 
     auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
       sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
@@ -320,7 +324,7 @@ int main(int argc, char** argv)
 
     ms = time_ms([&] {
       auto tbl =
-        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream.view());
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), read_opts, stream);
     });
 
     // std::cout << "cache summary : " << io_ctx->cache()->summary() <<

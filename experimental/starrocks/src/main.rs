@@ -1,11 +1,16 @@
-use std::{num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use clap::Parser;
+#[cfg(feature = "sirius-engine")]
+use sirius_starrocks_cn::SiriusEngine;
+#[cfg(not(feature = "sirius-engine"))]
+use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, HeartbeatServer, SharedHeartbeatState,
-    register_node, report_to_frontend_once, start_backend_server, start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
+    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
+    start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -59,13 +64,19 @@ impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
     #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
-        // Bring the Sirius engine up before serving any RPC so a bad config or a GPU bring-up
-        // failure exits before FE can route work here (fail-fast). The handle is held for the
-        // process lifetime and torn down (RAII) only after the servers stop, below.
+        // Build the fragment executor before serving any RPC. Compiled with the engine, this brings
+        // up the GPU engine on its dedicated thread (fail-fast: a bad config or GPU failure exits
+        // before FE can route work here); otherwise it is a stub. The handle is held for the
+        // process lifetime and torn down after the servers stop, below.
         #[cfg(feature = "sirius-engine")]
-        let sirius_context = bring_up_engine(&self.engine)?;
+        let executor: Arc<dyn FragmentExecutor> = Arc::new(
+            SiriusEngine::start(self.engine.sirius_config.clone()).map_err(|err| anyhow!(err))?,
+        );
         #[cfg(not(feature = "sirius-engine"))]
-        warn_engine_disabled(&self.engine);
+        let executor: Arc<dyn FragmentExecutor> = {
+            warn_engine_disabled(&self.engine);
+            Arc::new(StubExecutor)
+        };
 
         let state = SharedHeartbeatState::new();
 
@@ -79,7 +90,7 @@ impl Args {
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node)?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone())?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -104,27 +115,13 @@ impl Args {
         .await;
 
         // The servers have stopped by the time `wait_until_shutdown` returns, so no in-flight RPC
-        // can touch the engine. Tear it down explicitly here for an ordered, logged teardown.
+        // can touch the engine. Drop the executor last for an ordered teardown — the engine closes
+        // its thread and tears down the context (joined) here.
         #[cfg(feature = "sirius-engine")]
-        {
-            info!("tearing down Sirius engine context");
-            drop(sirius_context);
-        }
+        info!("tearing down Sirius engine");
+        drop(executor);
         result
     }
-}
-
-/// Brings up the embedded Sirius engine context from `--sirius-config` (or built-in defaults when
-/// unset). Returns an error on a bad config file or GPU bring-up failure so startup can fail fast.
-#[cfg(feature = "sirius-engine")]
-fn bring_up_engine(engine: &EngineConfig) -> Result<sirius::SiriusContext> {
-    let context = match &engine.sirius_config {
-        Some(path) => sirius::SiriusContext::from_config_file(path),
-        None => sirius::SiriusContext::new(),
-    }
-    .map_err(|err| anyhow!("failed to bring up Sirius engine: {err}"))?;
-    info!(config = ?engine.sirius_config, "Sirius engine context created");
-    Ok(context)
 }
 
 /// Warns when an engine config is supplied but the engine was compiled out, so the flag is
@@ -264,8 +261,12 @@ struct BrpcRuntime {
 }
 
 impl BrpcRuntime {
-    /// Binds the BRPC listener and starts serving it on a dedicated runtime.
-    fn start(compute_node: &ComputeNodeConfig) -> Result<Self> {
+    /// Binds the BRPC listener and starts serving it on a dedicated runtime, dispatching fragments
+    /// to `executor`.
+    fn start(
+        compute_node: &ComputeNodeConfig,
+        executor: Arc<dyn FragmentExecutor>,
+    ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
@@ -275,7 +276,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::new()
+                BrpcServer::with_executor(executor)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

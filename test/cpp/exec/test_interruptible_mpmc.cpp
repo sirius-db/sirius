@@ -286,6 +286,66 @@ TEST_CASE("interruptible_mpmc reset after interrupt re-enables queue", "[interru
   REQUIRE(*result == 42);
 }
 
+TEST_CASE("interruptible_mpmc reactivate discards every sentinel when work remains",
+          "[interruptible_mpmc]")
+{
+  interruptible_mpmc<std::unique_ptr<int>> queue;
+
+  // Push from a separate (joined) thread so the items land in their own
+  // moodycamel producer sub-queue: try_dequeue does not honor FIFO across
+  // sub-queues, so a real item can come out ahead of the earlier-enqueued
+  // sentinels, which is exactly the case reactivate() must survive.
+  constexpr int num_items = 5;
+  std::thread producer([&queue] {
+    for (int i = 0; i < num_items; ++i) {
+      REQUIRE(queue.push(std::make_unique<int>(i)));
+    }
+  });
+  producer.join();
+
+  queue.interrupt();
+  queue.reactivate();
+  REQUIRE(queue.is_open());
+
+  // Every real item survives, every sentinel is gone.
+  int popped = 0;
+  while (auto item = queue.try_pop()) {
+    ++popped;
+  }
+  REQUIRE(popped == num_items);
+  REQUIRE(queue.is_empty());
+
+  // A consumer blocking on the reactivated queue must see new work, not a
+  // stale interrupt.
+  REQUIRE(queue.push(std::make_unique<int>(99)));
+  auto item = queue.pop();
+  REQUIRE(item != nullptr);
+  REQUIRE(*item == 99);
+}
+
+TEST_CASE("interruptible_mpmc try_pop skips sentinels to reach queued work", "[interruptible_mpmc]")
+{
+  interruptible_mpmc<std::unique_ptr<int>> queue;
+
+  // Items in a foreign producer sub-queue, sentinels in this thread's.
+  std::thread producer([&queue] {
+    REQUIRE(queue.push(std::make_unique<int>(1)));
+    REQUIRE(queue.push(std::make_unique<int>(2)));
+  });
+  producer.join();
+
+  queue.interrupt();
+
+  // Both real items must be reachable through the sentinels — drain/cancel
+  // loops rely on try_pop never truncating at a sentinel.
+  auto first = queue.try_pop();
+  REQUIRE(first != nullptr);
+  auto second = queue.try_pop();
+  REQUIRE(second != nullptr);
+  REQUIRE(*first + *second == 3);
+  REQUIRE(queue.try_pop() == nullptr);
+}
+
 // =============================================================================
 // Multi-threaded tests
 // =============================================================================

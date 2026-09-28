@@ -425,6 +425,50 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST honors try_cast = true", "[ast_from_duck
   REQUIRE(c.try_cast == true);
 }
 
+TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nullptr",
+          "[ast_from_duckdb][narrow_domain]")
+{
+  // DuckDB binds these pairs to the null-cast (NULL for TRY_CAST, ConversionException for CAST),
+  // which the GPU cannot honor -- and translating them would hand the expression evaluator a
+  // cast whose shape matches a compressed-materialization carrier restore. Declining here is the
+  // planners' CPU-fallback signal.
+  SECTION("DATE -> SMALLINT")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::DATE), LogicalType{LogicalTypeId::SMALLINT});
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("DATE -> SMALLINT with try_cast")
+  {
+    auto cast_expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, duckdb::LogicalTypeId::DATE),
+                                                LogicalType{LogicalTypeId::SMALLINT},
+                                                /*try_cast=*/true);
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("SMALLINT -> DATE")
+  {
+    auto cast_expr = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::SMALLINT), LogicalType{LogicalTypeId::DATE});
+    REQUIRE(sirius::ast::from_duckdb(*cast_expr) == nullptr);
+  }
+
+  SECTION("legal pairs still translate")
+  {
+    // Numeric widening and same-family temporal conversions are real cuDF casts and must keep
+    // translating -- the gate rejects only the mixed temporal/numeric pairs.
+    auto widen = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0),
+                                                           LogicalType{LogicalTypeId::BIGINT});
+    REQUIRE(sirius::ast::from_duckdb(*widen) != nullptr);
+
+    auto to_timestamp = BoundCastExpression::AddDefaultCastToType(
+      make_bound_ref(0, duckdb::LogicalTypeId::DATE), LogicalType{LogicalTypeId::TIMESTAMP});
+    REQUIRE(sirius::ast::from_duckdb(*to_timestamp) != nullptr);
+  }
+}
+
 // ============================================================================
 // BOUND_FUNCTION
 // ============================================================================

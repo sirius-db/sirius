@@ -53,6 +53,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -213,8 +214,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_tab
   return info;
 }
 
-std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
-  std::string uri)
+[[maybe_unused]] std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info>
+make_nation_table_info(std::string uri)
 {
   std::vector<std::string> uris;
   uris.push_back(std::move(uri));
@@ -243,7 +244,7 @@ routing_observations collect_routing_observations(
 
 sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager)
 {
-  return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+  return [&manager](std::string_view path) -> std::shared_ptr<sirius::io::ioctx> {
     auto ds = manager.create_datasource(path);
     if (!ds) {
       throw std::runtime_error("test datasource resolver: no backend supports path: " +
@@ -255,12 +256,13 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
 
 sirius::planner::query make_empty_query()
 {
-  auto tctx = sirius::test::make_test_telemetry_context();
-  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id()};
-  return sirius::planner::query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    tinfo);
+  auto tctx           = sirius::test::make_test_telemetry_context();
+  const auto query_id = sirius::make_query_id(1);
+  sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
+  return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                                tctx->context(),
+                                query_id,
+                                tinfo);
 }
 
 struct range_fault_policy {
@@ -522,6 +524,72 @@ TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
   CHECK(datasource->io_ctx()->type() == io_context_type::restful);
 }
 
+TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
+          "[s3][routing][scan_manager]")
+{
+  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_s3_scan_config(server.endpoint(), true), *fixture.memory, fixture.topology};
+
+  auto constexpr kThreads = std::size_t{16};
+  auto const uri          = std::string{"s3://routing-bucket/data.parquet"};
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::shared_ptr<sirius::io::ioctx>> ioctxs(kThreads);
+  std::vector<std::exception_ptr> errors(kThreads);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (std::size_t i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i] {
+      try {
+        ready.fetch_add(1, std::memory_order_acq_rel);
+        while (!go.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+
+        auto datasource = manager.create_datasource(uri);
+        if (datasource == nullptr) {
+          throw std::runtime_error("create_datasource returned nullptr");
+        }
+        if (datasource->io_ctx() == nullptr) {
+          throw std::runtime_error("datasource has no ioctx");
+        }
+        ioctxs[i] = datasource->io_ctx();
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != kThreads) {
+    std::this_thread::yield();
+  }
+  go.store(true, std::memory_order_release);
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+
+  REQUIRE(ioctxs[0] != nullptr);
+  auto* const expected = ioctxs[0].get();
+  REQUIRE(ioctxs[0]->type() == io_context_type::restful);
+  for (auto const& ioctx : ioctxs) {
+    REQUIRE(ioctx != nullptr);
+    CHECK(ioctx->type() == io_context_type::restful);
+    CHECK(ioctx.get() == expected);
+  }
+
+  auto datasource = manager.create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx().get() == expected);
+}
+
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
           "[s3][routing][scan_manager]")
 {
@@ -579,11 +647,11 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   auto q = make_empty_query();
   // The query intentionally has no scan operators: routed caches must still
   // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q);
+  manager.prepare_for_query(q, true, {});
   REQUIRE(routed_cache->query_epoch() == 1);
   REQUIRE(default_cache->query_epoch() == 1);
 
-  manager.prepare_for_query(q);
+  manager.prepare_for_query(q, true, {});
   REQUIRE(routed_cache->query_epoch() == 2);
   REQUIRE(default_cache->query_epoch() == 2);
 }
@@ -603,7 +671,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   REQUIRE(datasource->io_ctx()->cache() == nullptr);
 
   auto q = make_empty_query();
-  REQUIRE_NOTHROW(manager.prepare_for_query(q));
+  REQUIRE_NOTHROW(manager.prepare_for_query(q, true, {}));
 }
 
 TEST_CASE("rest perf instrumentation flag gates micro counters", "[s3][rest][perf]")

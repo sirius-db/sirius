@@ -1,0 +1,61 @@
+name: Feature request
+description: Submit an idea for Sirius
+labels: ["enhancement"]
+title: "feat: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for submitting feature requests to the Sirius Team.
+        Please ensure your responses are clear and concise to support the team's triage.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Describe the problem to solve or your goal to achieve
+      placeholder: "A problem prevents me from...  OR  I wish I could use Sirius to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you would like
+      placeholder: "I would like to see..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternative
+    attributes:
+      label: Describe alternatives you have considered
+      placeholder: "A CPU fallback... or Using existing DuckDB functionality..."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Sirius component
+      description: Select the component most relevant to your request. If it spans multiple, note the others in additional context.
+      options:
+        - CI & Build
+        - Executors
+        - Integrations
+        - Memory & Compression
+        - Operators & Expressions
+        - Planner
+        - Scan & I/O
+        - Telemetry & Observability
+        - Testing & Benchmarks
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      placeholder: "Links, benchmarks, related issues"
+    validations:
+      required: false

@@ -1,0 +1,3 @@
+sirius:
+  compression:
+    max_compressed_fraction: -0.1

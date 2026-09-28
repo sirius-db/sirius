@@ -47,8 +47,9 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <algorithm>
@@ -266,7 +267,7 @@ std::vector<cudf::size_type> build_null_indices(size_t num_rows,
 
 void apply_null_mask(cudf::column& column,
                      std::vector<cudf::size_type> const& null_rows,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (null_rows.empty() || column.size() == 0) { return; }
@@ -329,7 +330,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 cucascade::host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<cucascade::data_batch> const& batch,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto& manager = sirius_ctx->get_memory_manager();
 
@@ -647,7 +648,8 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   auto string_nulls = build_null_indices(num_rows, {1, 9, 64, 128, 256});
   apply_null_mask(table->get_column(1), int64_nulls, stream, mr);
   apply_null_mask(table->get_column(2), string_nulls, stream, mr);
-  auto batch = sirius::make_data_batch(std::move(table), *gpu_space, stream);
+  auto batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 
   expected_table_data expected;
   std::vector<uint8_t> expected_int64_mask;

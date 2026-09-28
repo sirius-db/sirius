@@ -24,6 +24,8 @@
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_hash_join.hpp>
+#include <op/sirius_physical_partition.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 
 #include <atomic>
 #include <mutex>
@@ -57,6 +59,16 @@ struct hash_join_test_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
+//! Depth-first, root-first numbering of a bare operator tree, standing in for
+//! pipeline::assign_operator_ids in fixtures that never build pipelines.
+void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
+{
+  op.operator_id = next_id++;
+  for (auto& child : op.children) {
+    if (child) { number_operator_tree(*child, next_id); }
+  }
+}
+
 /**
  * @brief Create a minimal sirius_physical_hash_join for testing concat.
  *
@@ -64,8 +76,10 @@ struct hash_join_test_fixture {
  * @param output_types The logical types for the join output columns
  * @return hash_join_test_fixture owning both the logical and physical join
  */
-hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
-                                             duckdb::vector<duckdb::LogicalType> output_types)
+hash_join_test_fixture create_test_hash_join(
+  duckdb::JoinType join_type,
+  duckdb::vector<duckdb::LogicalType> output_types,
+  uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES)
 {
   hash_join_test_fixture fixture;
 
@@ -102,7 +116,15 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     duckdb::vector<duckdb::idx_t>{},  // right_projection_map (empty = all)
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),  // delim_types
     1000,                                                            // estimated_cardinality
-    nullptr);                                                        // pushdown_info
+    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    sirius::op::dynamic_filter_publish_plan{},  // dynamic_filter_plan
+    hash_partition_bytes);
+
+  // These fixtures build a bare operator tree with no pipelines, so the converter's
+  // assign_operator_ids never runs over it. Number it here — operator code reads
+  // get_operator_id(), which rejects the unassigned sentinel.
+  size_t next_id = 0;
+  number_operator_tree(*fixture.hash_join, next_id);
 
   return fixture;
 }
@@ -114,6 +136,79 @@ memory_space* get_shared_mem_space()
 {
   static auto manager = sirius::test::operator_utils::initialize_memory_manager();
   return manager->get_memory_space(Tier::GPU, 0);
+}
+
+//===----------------------------------------------------------------------===//
+// Source-pipeline fixture for get_next_task_hint / get_next_task_input_data
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief A sirius_pipeline whose finished state the test controls, standing in for the source
+ * pipeline feeding the concat operator's input port.
+ */
+class mock_gpu_pipeline : public sirius::pipeline::sirius_pipeline {
+ public:
+  explicit mock_gpu_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+
+  void set_finished(bool finished) { _finished = finished; }
+
+  bool is_pipeline_finished() const override { return _finished; }
+
+ private:
+  bool _finished = false;
+};
+
+/**
+ * @brief Bundles a controllable source pipeline with the upstream producer operator that
+ * get_next_task_hint reports in WAITING_FOR_INPUT_DATA hints. The producer must outlive the
+ * pipeline, which stores it by reference.
+ */
+struct source_pipeline_fixture {
+  duckdb::unique_ptr<sirius_physical_operator> upstream_producer;
+  std::shared_ptr<mock_gpu_pipeline> pipeline;
+};
+
+source_pipeline_fixture create_unfinished_source_pipeline()
+{
+  source_pipeline_fixture fixture;
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  fixture.pipeline          = std::make_shared<mock_gpu_pipeline>(build_ctx);
+  fixture.upstream_producer = duckdb::make_uniq<sirius_physical_operator>(
+    SiriusPhysicalOperatorType::PROJECTION,
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000);
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.add_pipeline_operator(*fixture.pipeline, *fixture.upstream_producer);
+  return fixture;
+}
+
+/**
+ * @brief Attach a single input port backed by @p repo to @p concat_op, optionally wired to a
+ * source pipeline.
+ */
+void attach_concat_port(sirius_physical_concat& concat_op,
+                        cucascade::shared_data_repository& repo,
+                        std::shared_ptr<mock_gpu_pipeline> src_pipeline = nullptr)
+{
+  auto port           = std::make_unique<sirius_physical_operator::port>();
+  port->type          = MemoryBarrierType::FULL;
+  port->repo          = &repo;
+  port->src_pipeline  = std::move(src_pipeline);
+  port->dest_pipeline = nullptr;
+  concat_op.add_port("input", std::move(port));
+}
+
+/**
+ * @brief Create an int32 batch of @p num_rows rows (4 bytes per row).
+ */
+std::shared_ptr<data_batch> make_int32_batch(memory_space& space, std::size_t num_rows)
+{
+  std::vector<int32_t> values(num_rows);
+  std::iota(values.begin(), values.end(), 0);
+  return make_numeric_batch<int32_t>(space, values, cudf::type_id::INT32);
 }
 
 }  // namespace
@@ -524,6 +619,322 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
 }
 
 //===----------------------------------------------------------------------===//
+// Unfinished-source-pipeline gating tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("sirius_physical_concat defers under-threshold groups while the source pipeline runs",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;  // 1 KB
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Two 400-byte batches accumulate below the threshold: no group forms yet.
+  auto batch_a    = make_int32_batch(*space, 100);
+  auto batch_b    = make_int32_batch(*space, 100);
+  const auto id_a = batch_a->get_batch_id();
+  const auto id_b = batch_b->get_batch_id();
+  repo->add_data_batch(std::move(batch_a), 0);
+  repo->add_data_batch(std::move(batch_b), 0);
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0).size() == 2);
+
+  auto waiting_hint = concat_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(waiting_hint->producer == source.upstream_producer.get());
+
+  // A third 400-byte batch crosses the threshold: the first two form a complete group and the
+  // overflowing batch stays behind to seed the next group.
+  auto batch_c    = make_int32_batch(*space, 100);
+  const auto id_c = batch_c->get_batch_id();
+  repo->add_data_batch(std::move(batch_c), 0);
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+  REQUIRE(ready_hint->producer == &concat_op);
+
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*group).get_data_batches();
+  REQUIRE(group_batches.size() == 2);
+  REQUIRE(group_batches[0]->get_batch_id() == id_a);
+  REQUIRE(group_batches[1]->get_batch_id() == id_b);
+
+  // The leftover batch is under the threshold, so it keeps accumulating.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{id_c});
+
+  // Pipeline finish flushes the under-threshold tail.
+  source.pipeline->set_finished(true);
+  auto flush_hint = concat_op.get_next_task_hint();
+  REQUIRE(flush_hint.has_value());
+  REQUIRE(flush_hint->hint == TaskCreationHint::READY);
+
+  auto tail = concat_op.get_next_task_input_data();
+  REQUIRE(tail != nullptr);
+  const auto& tail_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*tail).get_data_batches();
+  REQUIRE(tail_batches.size() == 1);
+  REQUIRE(tail_batches[0]->get_batch_id() == id_c);
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE_FALSE(concat_op.get_next_task_hint().has_value());
+}
+
+TEST_CASE("sirius_physical_concat holds a lone oversized batch until more data or pipeline finish",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;  // 1 KB
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // A single 1200-byte batch exceeds the threshold on its own, but more data may still arrive
+  // behind it, so nothing is released yet.
+  auto oversized          = make_int32_batch(*space, 300);
+  const auto oversized_id = oversized->get_batch_id();
+  repo->add_data_batch(std::move(oversized), 0);
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{oversized_id});
+
+  auto waiting_hint = concat_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(waiting_hint->producer == source.upstream_producer.get());
+
+  // A second batch behind it releases the oversized batch as a single-batch group.
+  auto small          = make_int32_batch(*space, 100);
+  const auto small_id = small->get_batch_id();
+  repo->add_data_batch(std::move(small), 0);
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*group).get_data_batches();
+  REQUIRE(group_batches.size() == 1);
+  REQUIRE(group_batches[0]->get_batch_id() == oversized_id);
+
+  // The remaining under-threshold batch keeps accumulating until the source is done.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{small_id});
+
+  source.pipeline->set_finished(true);
+  auto tail = concat_op.get_next_task_input_data();
+  REQUIRE(tail != nullptr);
+  const auto& tail_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*tail).get_data_batches();
+  REQUIRE(tail_batches.size() == 1);
+  REQUIRE(tail_batches[0]->get_batch_id() == small_id);
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_concat with concat_all defers all batches until pipeline finish",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;  // 1 KB
+
+  // LEFT join + is_build=true -> _concat_all = true
+  auto fixture = create_test_hash_join(duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    true,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Mix under- and over-threshold batches: the threshold plays no role with concat_all.
+  std::vector<uint64_t> expected_ids;
+  for (std::size_t num_rows : {100UL, 300UL, 100UL}) {
+    auto batch = make_int32_batch(*space, num_rows);
+    expected_ids.push_back(batch->get_batch_id());
+    repo->add_data_batch(std::move(batch), 0);
+  }
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == expected_ids);
+
+  auto waiting_hint = concat_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(waiting_hint->producer == source.upstream_producer.get());
+
+  // Pipeline finish releases the whole partition as one group.
+  source.pipeline->set_finished(true);
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+
+  auto all = concat_op.get_next_task_input_data();
+  REQUIRE(all != nullptr);
+  const auto& all_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*all).get_data_batches();
+  REQUIRE(all_batches.size() == expected_ids.size());
+  for (std::size_t i = 0; i < expected_ids.size(); ++i) {
+    REQUIRE(all_batches[i]->get_batch_id() == expected_ids[i]);
+  }
+
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_concat pulls from a later partition when earlier ones are not ready",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  constexpr uint64_t threshold = 1024;  // 1 KB
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+
+  // Partition 0 holds a lone under-threshold batch: no group is ready there.
+  auto p0_batch    = make_int32_batch(*space, 100);
+  const auto p0_id = p0_batch->get_batch_id();
+  repo->add_data_batch(std::move(p0_batch), 0);
+
+  // Partition 1 holds three 400-byte batches: the third crosses the threshold, so the first two
+  // form a ready group.
+  std::vector<uint64_t> p1_ids;
+  for (int i = 0; i < 3; ++i) {
+    auto batch = make_int32_batch(*space, 100);
+    p1_ids.push_back(batch->get_batch_id());
+    repo->add_data_batch(std::move(batch), 1);
+  }
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+  REQUIRE(ready_hint->producer == &concat_op);
+
+  // The pull must skip the not-ready partition 0 and release partition 1's group.
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_data = dynamic_cast<const partitioned_operator_data&>(*group);
+  REQUIRE(group_data.get_partition_idx() == std::optional<std::size_t>{1});
+  const auto& group_batches = group_data.get_data_batches();
+  REQUIRE(group_batches.size() == 2);
+  REQUIRE(group_batches[0]->get_batch_id() == p1_ids[0]);
+  REQUIRE(group_batches[1]->get_batch_id() == p1_ids[1]);
+
+  // Both partitions now hold under-threshold tails: nothing further until the source finishes.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{p0_id});
+  REQUIRE(repo->get_batch_ids(1) == std::vector<uint64_t>{p1_ids[2]});
+
+  // Pipeline finish flushes the tails in partition order.
+  source.pipeline->set_finished(true);
+  auto tail0 = concat_op.get_next_task_input_data();
+  REQUIRE(tail0 != nullptr);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail0).get_partition_idx() ==
+          std::optional<std::size_t>{0});
+  auto tail1 = concat_op.get_next_task_input_data();
+  REQUIRE(tail1 != nullptr);
+  REQUIRE(dynamic_cast<const partitioned_operator_data&>(*tail1).get_partition_idx() ==
+          std::optional<std::size_t>{1});
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+}
+
+TEST_CASE("sirius_physical_concat keeps a batch exactly at the threshold in its group",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  // Size the threshold to exactly match one batch: the strict '>' comparison keeps that batch in
+  // the accumulating group instead of overflowing on its own.
+  auto exact_batch         = make_int32_batch(*space, 256);
+  const auto exact_id      = exact_batch->get_batch_id();
+  const uint64_t threshold = exact_batch->to_read_only().get_data()->get_size_in_bytes();
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    1000,
+    fixture.hash_join.get(),
+    false,
+    threshold);
+
+  auto repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto source = create_unfinished_source_pipeline();
+  attach_concat_port(concat_op, *repo, source.pipeline);
+  repo->add_data_batch(std::move(exact_batch), 0);
+
+  // Exactly at the threshold is not over it: the batch keeps accumulating.
+  REQUIRE(concat_op.get_next_task_input_data() == nullptr);
+  auto waiting_hint = concat_op.get_next_task_hint();
+  REQUIRE(waiting_hint.has_value());
+  REQUIRE(waiting_hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+
+  // The next batch overflows the group, releasing the exact-threshold batch alone.
+  auto follower          = make_int32_batch(*space, 100);
+  const auto follower_id = follower->get_batch_id();
+  repo->add_data_batch(std::move(follower), 0);
+
+  auto ready_hint = concat_op.get_next_task_hint();
+  REQUIRE(ready_hint.has_value());
+  REQUIRE(ready_hint->hint == TaskCreationHint::READY);
+
+  auto group = concat_op.get_next_task_input_data();
+  REQUIRE(group != nullptr);
+  const auto& group_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*group).get_data_batches();
+  REQUIRE(group_batches.size() == 1);
+  REQUIRE(group_batches[0]->get_batch_id() == exact_id);
+  REQUIRE(repo->get_batch_ids(0) == std::vector<uint64_t>{follower_id});
+}
+
+//===----------------------------------------------------------------------===//
 // 3. Constructor tests
 //===----------------------------------------------------------------------===//
 
@@ -614,6 +1025,101 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
         false),
       std::runtime_error);
   }
+}
+
+TEST_CASE("sirius_physical_hash_join identifies right-family joins", "[physical_concat]")
+{
+  for (auto join_type :
+       {duckdb::JoinType::RIGHT, duckdb::JoinType::RIGHT_ANTI, duckdb::JoinType::RIGHT_SEMI}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type, {duckdb::LogicalType::INTEGER});
+    REQUIRE(fixture.hash_join->is_right_family());
+  }
+
+  for (auto join_type : {duckdb::JoinType::INNER,
+                         duckdb::JoinType::LEFT,
+                         duckdb::JoinType::SEMI,
+                         duckdb::JoinType::ANTI,
+                         duckdb::JoinType::MARK,
+                         duckdb::JoinType::OUTER}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type, {duckdb::LogicalType::INTEGER});
+    REQUIRE_FALSE(fixture.hash_join->is_right_family());
+  }
+}
+
+TEST_CASE("right-family sibling partitions round up from the probe input", "[physical_partition]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  auto build_batch =
+    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(4, 1), cudf::type_id::INT32);
+  auto probe_batch =
+    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(9, 1), cudf::type_id::INT32);
+  auto const build_bytes = build_batch->to_read_only().get_data()->get_size_in_bytes();
+  auto const probe_bytes = probe_batch->to_read_only().get_data()->get_size_in_bytes();
+  REQUIRE(probe_bytes > build_bytes);
+  auto const partition_size = probe_bytes - 1;
+
+  // The join owns hash_partition_bytes (the natural-count divisor) now, so it must be constructed
+  // with partition_size for the probe side to size to two partitions.
+  auto fixture =
+    create_test_hash_join(duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER}, partition_size);
+  auto make_types = [] {
+    return sirius::from_duckdb_vec(
+      duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  };
+  sirius_physical_partition build_partition(make_types(), 4, fixture.hash_join.get(), true);
+  sirius_physical_partition probe_partition(make_types(), 9, fixture.hash_join.get(), false);
+  // These partitions hang off the join by pointer, not as children, so create_test_hash_join's
+  // numbering does not reach them. Number them past the join tree's ids.
+  size_t partition_next_id = 100;
+  number_operator_tree(build_partition, partition_next_id);
+  number_operator_tree(probe_partition, partition_next_id);
+  build_partition.set_sibling_partition_op(&probe_partition);
+  probe_partition.set_sibling_partition_op(&build_partition);
+  build_partition.set_drives_partition_count(false);
+  probe_partition.set_drives_partition_count(true);
+
+  auto build_repo = std::make_unique<cucascade::shared_data_repository>();
+  auto probe_repo = std::make_unique<cucascade::shared_data_repository>();
+  build_repo->add_data_batch(std::move(build_batch), 0);
+  probe_repo->add_data_batch(std::move(probe_batch), 0);
+
+  // The join's per-partition input repos that the sizing decision pre-sizes inside
+  // sirius_physical_hash_join::get_partition_strategy (created during pipeline construction in
+  // production): the build side targets the join's "build" port, the probe side its "default" port.
+  auto join_build_repo   = std::make_unique<cucascade::shared_data_repository>();
+  auto join_default_repo = std::make_unique<cucascade::shared_data_repository>();
+
+  auto attach_port = [](sirius_physical_operator& op,
+                        std::string_view port_id,
+                        cucascade::shared_data_repository& repo) {
+    auto port           = std::make_unique<sirius_physical_operator::port>();
+    port->type          = MemoryBarrierType::FULL;
+    port->repo          = &repo;
+    port->src_pipeline  = nullptr;
+    port->dest_pipeline = nullptr;
+    op.add_port(port_id, std::move(port));
+  };
+  attach_port(build_partition, "default", *build_repo);
+  attach_port(probe_partition, "default", *probe_repo);
+  attach_port(*fixture.hash_join, "build", *join_build_repo);
+  attach_port(*fixture.hash_join, "default", *join_default_repo);
+
+  // Enter through the non-driving build side first. It must still size both siblings from probe.
+  auto build_input = build_partition.get_next_task_input_data();
+  REQUIRE(build_input != nullptr);
+  auto build_output = build_partition.execute(*build_input, default_stream());
+  REQUIRE(
+    dynamic_cast<const pipelineable_operator_data&>(*build_output).get_data_batches().size() == 2);
+
+  auto probe_input = probe_partition.get_next_task_input_data();
+  REQUIRE(probe_input != nullptr);
+  auto probe_output = probe_partition.execute(*probe_input, default_stream());
+  REQUIRE(
+    dynamic_cast<const pipelineable_operator_data&>(*probe_output).get_data_batches().size() == 2);
 }
 
 //===----------------------------------------------------------------------===//
@@ -744,7 +1250,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       // Create a dedicated CUDA stream for this thread
       cudaStream_t raw_stream;
       cudaStreamCreate(&raw_stream);
-      rmm::cuda_stream_view stream(raw_stream);
+      ::cuda::stream_ref stream(raw_stream);
 
       auto outputs =
         concat_op.execute(partitioned_operator_data(thread_inputs[thread_id], 0), default_stream());

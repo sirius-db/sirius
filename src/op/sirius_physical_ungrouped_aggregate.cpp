@@ -27,6 +27,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -39,8 +40,6 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -85,7 +84,7 @@ ScalarType& scalar_cast(cudf::scalar& s)
 template <typename T>
 std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type type,
                                                              T value,
-                                                             rmm::cuda_stream_view stream)
+                                                             ::cuda::stream_ref stream)
 {
   auto out = cudf::make_numeric_scalar(type, stream);
   scalar_cast<cudf::numeric_scalar<T>>(*out).set_value(value, stream);
@@ -192,14 +191,23 @@ aggregate_layout build_aggregate_layout(
         layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
         layout.merge_nth_index.push_back(std::nullopt);
         break;
-      case sirius::aggregate_id::avg:
+      case sirius::aggregate_id::avg: {
         if (children.empty()) {
           throw not_implemented_exception("avg() without arguments not supported");
         }
         spec.kind          = aggregate_kind::AVG;
         spec.input_idx     = child_ref_index();
         spec.local_sum_idx = local_idx++;
-        layout.local_types.push_back(agg_return_type);
+        // AVG's local carrier is the input type, not AVG's final return type. Execution widens
+        // signed 8/16/32-bit inputs to INT64 before reducing so partial sums merge without a
+        // cross-type reduction; keep the declared local schema on the same rule.
+        auto local_sum_type = sirius::to_duckdb(children[0]->return_type());
+        if (local_sum_type.id() == duckdb::LogicalTypeId::TINYINT ||
+            local_sum_type.id() == duckdb::LogicalTypeId::SMALLINT ||
+            local_sum_type.id() == duckdb::LogicalTypeId::INTEGER) {
+          local_sum_type = duckdb::LogicalType::BIGINT;
+        }
+        layout.local_types.push_back(std::move(local_sum_type));
         layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         layout.merge_nth_index.push_back(std::nullopt);
         spec.local_count_idx = local_idx++;
@@ -208,6 +216,7 @@ aggregate_layout build_aggregate_layout(
         layout.merge_nth_index.push_back(std::nullopt);
         layout.has_avg = true;
         break;
+      }
       case sirius::aggregate_id::first:
         spec.kind          = aggregate_kind::FIRST;
         spec.input_idx     = child_ref_index();
@@ -231,7 +240,7 @@ aggregate_layout build_aggregate_layout(
 std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
                                               const cudf::column_view& count_view,
                                               const duckdb::LogicalType& return_type,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref memory_resource)
 {
   // The merged sum/count columns are already single-row, so divide them on-device
@@ -264,10 +273,30 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 
 }  // namespace
 
-std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_local_output_types()
+  const
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
+  aggregate_layout layout;
+  try {
+    layout = build_aggregate_layout(aggregates);
+  } catch (const not_implemented_exception&) {
+    // Keep unsupported aggregates on their established runtime-fallback path. Their local output
+    // is never consumed, so retaining the declared schema here avoids turning a runtime fallback
+    // into an earlier planning refusal merely to describe an output that will not be produced.
+    return types;
+  }
+  duckdb::vector<sirius::logical_type> local_types;
+  local_types.reserve(layout.local_types.size());
+  for (auto const& type : layout.local_types) {
+    local_types.push_back(sirius::from_duckdb(type));
+  }
+  return local_types;
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
@@ -308,7 +337,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto col = view.column(static_cast<cudf::size_type>(spec.input_idx));
           std::unique_ptr<cudf::scalar> first_scalar;
           if (col.size() == 0) {
-            first_scalar = cudf::make_fixed_width_scalar(
+            // FIRST over an empty input is NULL. make_fixed_width_scalar throws on
+            // non-fixed-width types (e.g. STRING), so build a typed, invalid scalar
+            // that works for any column type.
+            first_scalar = cudf::make_default_constructed_scalar(
               col.type(), stream, cudf::get_current_device_resource_ref());
             first_scalar->set_valid_async(false, stream);
           } else {
@@ -367,8 +399,19 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
-            auto count_scalar = make_numeric_scalar_with_value<int64_t>(
-              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+            // AVG denominator is the count of non-null values (SUM skips NULLs).
+            // No NULLs -> row count suffices, so avoid the extra COUNT reduction.
+            std::unique_ptr<cudf::scalar> count_scalar;
+            if (!col.nullable() || col.null_count() == 0) {
+              count_scalar =
+                make_numeric_scalar_with_value<int64_t>(cudf::data_type{cudf::type_id::INT64},
+                                                        static_cast<int64_t>(view.num_rows()),
+                                                        stream);
+            } else {
+              auto count_agg = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+              count_scalar   = cudf::reduce(
+                col, *count_agg, cudf::data_type{cudf::type_id::INT64}, std::nullopt, stream);
+            }
             cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
           }
           break;
@@ -376,7 +419,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       }
     }
 
-    auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
+    auto out_table = std::make_unique<cudf::table>(std::move(cols));
     // STREAM-LINEAGE: cudf::table ctor + cudf::make_column_from_scalar wrote
     // on `stream`; the constructor records the writer event for downstream
     // cross-device readers.
@@ -384,7 +427,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
       std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
     std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
     auto const batch_id                                          = ::sirius::get_next_batch_id();
-    outputs.push_back(cucascade::data_batch::make(batch_id, std::move(output_data)));
+    outputs.push_back(cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
   }
 
   return std::make_unique<pipelineable_operator_data>(outputs);
@@ -430,9 +476,9 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 }
 
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
   auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
@@ -454,10 +500,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
-    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
+    merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space);
+      input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
   }
 
   if (!layout.has_avg) {
@@ -493,7 +539,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space, stream);
   std::unique_ptr<cucascade::idata_representation> output_data = std::move(out_repr);
   auto const batch_id                                          = ::sirius::get_next_batch_id();
-  auto output_batch = cucascade::data_batch::make(batch_id, std::move(output_data));
+  auto output_batch                                            = cucascade::data_batch::make(
+    batch_id,
+    std::move(output_data),
+    telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
 
   return std::make_unique<pipelineable_operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});

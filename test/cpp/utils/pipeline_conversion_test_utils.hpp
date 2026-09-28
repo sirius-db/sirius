@@ -1,0 +1,126 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "exec/streaming_fragment.hpp"
+#include "op/sirius_physical_streaming_sink.hpp"
+#include "query_id.hpp"
+
+#include <cucascade/data/data_repository.hpp>
+#include <duckdb/main/connection.hpp>
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
+namespace sirius::pipeline {
+struct pipeline_conversion_result;
+}  // namespace sirius::pipeline
+
+namespace sirius {
+class sirius_engine;
+}
+
+namespace sirius::test {
+
+//! Registers a data repository manager for a synthetic query and drops it on scope exit,
+//! standing in for a real `SiriusContext::StandaloneQueryScope`.
+//!
+//! Tests that build a `sirius_engine` directly never open an execution window, so nothing
+//! would otherwise create the manager the engine requires, nor clean it up afterwards.
+//! Leaving repositories behind also breaks the *next* real GPU query in the process, since
+//! operator ids restart at 0 for every plan and would collide on `{operator_id, port_id}`.
+//!
+//! Construct it before the engine and keep it alive for at least as long: pass `query_id()`
+//! to the `sirius_engine` constructor. No-op when Sirius is not registered on the connection.
+class scoped_test_query {
+ public:
+  explicit scoped_test_query(duckdb::ClientContext& context);
+  ~scoped_test_query();
+
+  scoped_test_query(const scoped_test_query&)            = delete;
+  scoped_test_query& operator=(const scoped_test_query&) = delete;
+
+  [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
+
+ private:
+  [[nodiscard]] bool usable() const noexcept;
+
+  duckdb::shared_ptr<duckdb::SiriusContext> ctx_;
+  sirius::query_id_t query_id_;
+};
+
+//! Drive the full sirius planner + meta_pipeline + converter flow on `query` (with the
+//! production optimizer disables) and return `dump_pipeline_conversion_result(...)`; stops
+//! after `converter.convert()` — no GPU execution. Returns a string rather than the raw
+//! result because the result references the function-local plan tree. Throws on
+//! parse / bind / optimize errors.
+std::string convert_query_to_dump(duckdb::Connection& con, const std::string& query);
+
+//! Like `convert_query_to_dump`, but returns the raw scheduled order
+//! (`dump_pipeline_schedule_raw`); comparing two calls is the schedule-determinism check.
+std::string convert_query_to_raw_schedule(duckdb::Connection& con, const std::string& query);
+
+//! Like `convert_query_to_dump`, but hands the raw `pipeline_conversion_result` to `consume`
+//! while the plan tree and meta-pipelines are still alive; the result must not escape
+//! `consume`. Lets tests inspect the real schedule order, which the dump sorts away.
+void with_conversion_result(
+  duckdb::Connection& con,
+  const std::string& query,
+  const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
+
+//! Initialize an engine for `query` and invoke `consume` while its plan is alive.
+//!
+//! By default mints its own synthetic query id via `scoped_test_query` (for callers that build
+//! a `sirius_engine` without opening a real execution window). A caller that already opened a
+//! `SiriusContext::StandaloneQueryScope` on `con` and intends to call `engine.execute()` MUST
+//! pass that window's `query_id()` here instead: `execute()` routes through
+//! `task_creator::prepare_for_query`, which requires `set_client_context` to have already run
+//! for the exact query id the engine carries — the window's `begin_execution_window` is what
+//! calls it, keyed on the window's id, not on a separately synthesized one.
+void with_initialized_engine(duckdb::Connection& con,
+                             const std::string& query,
+                             const std::function<void(sirius_engine&)>& consume,
+                             std::optional<sirius::query_id_t> query_id = std::nullopt);
+
+//! SQL → bound LogicalOperator (tests stand in for Substrait). Caller must have a transaction.
+exec::logical_plan_source sql_plan_source(const std::string& query);
+
+//! Like with_initialized_engine, but roots the plan in a STREAMING_SINK over output_repos.
+//! Caller owns the plan tree; engine borrows via initialize_internal.
+void with_initialized_streaming_fragment(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<std::shared_ptr<cucascade::shared_data_repository>> output_repos,
+  std::optional<op::partition_spec> spec,
+  const std::function<void(sirius_engine&, op::sirius_physical_streaming_sink&)>& consume);
+
+//! Path to the canonical TPC-H queries (`test/tpch_performance/tpch_queries/orig/`).
+std::filesystem::path tpch_queries_dir();
+
+//! Read canonical TPC-H query `q` (1..22); throws if the file cannot be opened.
+std::string read_tpch_query_file(int q);
+
+}  // namespace sirius::test

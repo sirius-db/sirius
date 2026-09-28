@@ -65,7 +65,7 @@ double bench_seconds(rmm::cuda_stream& stream,
                      int warmup = 3)
 {
   for (int i = 0; i < warmup; ++i)
-    (void)gpu_decode_table(cols, stream.view(), mr);
+    (void)gpu_decode_table(cols, stream, mr);
   cudaStreamSynchronize(stream.value());
 
   cudaEvent_t s, e;
@@ -73,7 +73,7 @@ double bench_seconds(rmm::cuda_stream& stream,
   cudaEventCreate(&e);
   cudaEventRecord(s, stream.value());
   for (int i = 0; i < iters; ++i)
-    (void)gpu_decode_table(cols, stream.view(), mr);
+    (void)gpu_decode_table(cols, stream, mr);
   cudaEventRecord(e, stream.value());
   cudaEventSynchronize(e);
   float ms = 0.0f;
@@ -93,7 +93,7 @@ TEST_CASE("bench UNCOMPRESSED int64 single 32MiB", "[!benchmark][scan][decode]")
   rmm::mr::cuda_async_memory_resource mr;
   constexpr size_t ROWS = 4 << 20;
   std::vector<int64_t> values(ROWS, 0);
-  auto d   = upload(values, stream.view());
+  auto d   = upload(values, stream);
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
                               ROWS,
                               CompressionType::COMPRESSION_UNCOMPRESSED,
@@ -120,7 +120,7 @@ TEST_CASE("bench UNCOMPRESSED int64 multi 16x2MiB", "[!benchmark][scan][decode]"
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.push_back(upload(values, stream.view()));
+    bufs.push_back(upload(values, stream));
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -151,7 +151,7 @@ TEST_CASE("bench UNCOMPRESSED int64 multi 1024x32KiB", "[!benchmark][scan][decod
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.push_back(upload(values, stream.view()));
+    bufs.push_back(upload(values, stream));
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -181,8 +181,8 @@ TEST_CASE("bench raw cudaMemcpyAsync 1024x32KiB (reference, no dispatcher)",
   std::vector<rmm::device_buffer> srcs;
   srcs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i)
-    srcs.push_back(upload(values, stream.view()));
-  rmm::device_buffer dst(N_SEGS * SEG_BYTES, stream.view());
+    srcs.push_back(upload(values, stream));
+  rmm::device_buffer dst(N_SEGS * SEG_BYTES, stream);
   cudaStreamSynchronize(stream.value());
 
   // Warmup + timed loop.
@@ -228,7 +228,7 @@ TEST_CASE("bench CONSTANT int64 32MiB", "[!benchmark][scan][decode]")
   rmm::mr::cuda_async_memory_resource mr;
   constexpr size_t ROWS  = 4 << 20;
   std::vector<int64_t> v = {12345};
-  auto d                 = upload(v, stream.view());
+  auto d                 = upload(v, stream);
   auto col               = one_codec_column(cudf::data_type{cudf::type_id::INT64},
                               ROWS,
                               CompressionType::COMPRESSION_CONSTANT,
@@ -264,7 +264,7 @@ TEST_CASE("bench RLE int64 long_runs (16 entries/seg) 128Mi rows", "[!benchmark]
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -298,7 +298,7 @@ TEST_CASE("bench RLE int64 medium_runs (1024 entries/seg) 128Mi rows", "[!benchm
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -335,7 +335,7 @@ TEST_CASE("bench RLE int64 pareto_runs (skewed distribution) 128Mi rows",
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
     auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/i + 1, /*x_min=*/400.0);
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -369,7 +369,7 @@ TEST_CASE("bench RLE int32 short_runs (4096 entries/seg) 65M rows", "[!benchmark
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
@@ -416,7 +416,7 @@ TEST_CASE("bench BITPACKING int64 FOR width=8 128M rows", "[!benchmark][scan][de
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -447,7 +447,7 @@ TEST_CASE("bench BITPACKING int32 FOR width=12 128M rows", "[!benchmark][scan][d
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
@@ -478,7 +478,7 @@ TEST_CASE("bench BITPACKING int64 CONSTANT 128M rows", "[!benchmark][scan][decod
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT64},
@@ -518,7 +518,7 @@ TEST_CASE("bench BITPACKING int32 FOR width=16 128M rows", "[!benchmark][scan][d
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
@@ -552,7 +552,7 @@ TEST_CASE("bench BITPACKING int32 FOR width=5 128M rows", "[!benchmark][scan][de
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
@@ -587,7 +587,7 @@ TEST_CASE("bench BITPACKING int32 DELTA_FOR width=8 128M rows", "[!benchmark][sc
   bufs.reserve(N_SEGS);
   segs.reserve(N_SEGS);
   for (uint32_t i = 0; i < N_SEGS; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back(segment(bufs.back(), i * SEG_ROWS, SEG_ROWS));
   }
   auto col = one_codec_column(cudf::data_type{cudf::type_id::INT32},
@@ -621,7 +621,7 @@ TEST_CASE("bench ALP double bw=11 32K vectors (32M rows)", "[!benchmark][scan][d
   constexpr uint32_t ROWS   = N_VECS * 1024u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/11);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
                                            ROWS,
@@ -643,7 +643,7 @@ TEST_CASE("bench ALP float bw=20 32K vectors (32M rows)", "[!benchmark][scan][de
   constexpr uint32_t ROWS   = N_VECS * 1024u;
 
   auto seg_bytes = synth_alp_segment<float>(N_VECS, /*bit_width=*/20);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT32},
                                            ROWS,
@@ -667,7 +667,7 @@ TEST_CASE("bench ALPRD double right_bw=48 left_bw=3 32K vectors (32M rows)",
 
   std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD, 0xDEAD, 0xBEEF, 0xCAFE, 0xF00D};
   auto seg_bytes = synth_alprd_segment<double>(N_VECS, /*right_bw=*/48, /*left_bw=*/3, dict);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
                                            ROWS,
@@ -693,7 +693,7 @@ TEST_CASE("bench ALP double bw=8 32K vectors (32M rows)", "[!benchmark][scan][de
   constexpr uint32_t ROWS   = N_VECS * 1024u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/8);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
                                            ROWS,
@@ -715,7 +715,7 @@ TEST_CASE("bench ALP double bw=16 32K vectors (32M rows)", "[!benchmark][scan][d
   constexpr uint32_t ROWS   = N_VECS * 1024u;
 
   auto seg_bytes = synth_alp_segment<double>(N_VECS, /*bit_width=*/16);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
                                            ROWS,
@@ -737,7 +737,7 @@ TEST_CASE("bench ALP float bw=32 32K vectors (32M rows)", "[!benchmark][scan][de
   constexpr uint32_t ROWS   = N_VECS * 1024u;
 
   auto seg_bytes = synth_alp_segment<float>(N_VECS, /*bit_width=*/32);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT32},
                                            ROWS,
@@ -761,7 +761,7 @@ TEST_CASE("bench ALPRD double right_bw=56 left_bw=2 32K vectors (32M rows)",
 
   std::vector<uint16_t> dict = {0xAAAA, 0x5555, 0x1234, 0xABCD};
   auto seg_bytes = synth_alprd_segment<double>(N_VECS, /*right_bw=*/56, /*left_bw=*/2, dict);
-  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream.view());
+  auto d_seg     = sirius::test::decode::upload(seg_bytes, stream);
   auto col =
     sirius::test::decode::one_codec_column(cudf::data_type{cudf::type_id::FLOAT64},
                                            ROWS,
@@ -791,7 +791,7 @@ double bench_strings_seconds(rmm::cuda_stream& stream,
                              int warmup = 3)
 {
   for (int i = 0; i < warmup; ++i)
-    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream, mr);
   cudaStreamSynchronize(stream.value());
 
   cudaEvent_t s, e;
@@ -799,7 +799,7 @@ double bench_strings_seconds(rmm::cuda_stream& stream,
   cudaEventCreate(&e);
   cudaEventRecord(s, stream.value());
   for (int i = 0; i < iters; ++i)
-    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream, mr);
   cudaEventRecord(e, stream.value());
   cudaEventSynchronize(e);
   float ms = 0.0f;
@@ -845,7 +845,7 @@ TEST_CASE("bench DICTIONARY 1M rows / 1024 dict / 16-byte avg",
     sel[i] = 1u + (i % (DICT_COUNT - 1u));
   auto bytes = sirius::test::decode::strings::make_dict_segment(dict, sel);
 
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                                                   static_cast<uint32_t>(d_seg.size()),
                                                   0,
@@ -891,7 +891,7 @@ TEST_CASE("bench DICTIONARY low-cardinality / 2 entries × 2000B",
     sel[i] = 1u + (i % (DICT_COUNT - 1u));
   auto bytes = sirius::test::decode::strings::make_dict_segment(dict, sel);
 
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                                                   static_cast<uint32_t>(d_seg.size()),
                                                   0,
@@ -942,7 +942,7 @@ TEST_CASE("bench FSST 1M rows / TPC-H-like comments", "[!benchmark][scan][decode
     bytes = sirius::test::decode::strings::make_fsst_segment(synth);
   }
 
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                                                   static_cast<uint32_t>(d_seg.size()),
                                                   0,
@@ -990,7 +990,7 @@ TEST_CASE("bench FSST 1M rows / long comments", "[!benchmark][scan][decode][stri
     bytes = sirius::test::decode::strings::make_fsst_segment(synth);
   }
 
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                                                   static_cast<uint32_t>(d_seg.size()),
                                                   0,
@@ -1092,7 +1092,7 @@ TEST_CASE("bench FSST realistic multi-segment / TPC-H-like comments",
     seg_offsets[k] = alloc_bytes;
     alloc_bytes += (seg_blobs[k].first.size() + SEG_ALIGN - 1) & ~(SEG_ALIGN - 1);
   }
-  rmm::device_buffer d_all(alloc_bytes, stream.view());
+  rmm::device_buffer d_all(alloc_bytes, stream);
   std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
   segs.reserve(seg_blobs.size());
   uint32_t row_cursor = 0;
@@ -1177,7 +1177,7 @@ TEST_CASE("bench FSST realistic multi-segment / long comments",
     seg_offsets[k] = alloc_bytes;
     alloc_bytes += (seg_blobs[k].first.size() + SEG_ALIGN - 1) & ~(SEG_ALIGN - 1);
   }
-  rmm::device_buffer d_all(alloc_bytes, stream.view());
+  rmm::device_buffer d_all(alloc_bytes, stream);
   std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
   segs.reserve(seg_blobs.size());
   uint32_t row_cursor = 0;
@@ -1260,7 +1260,7 @@ TEST_CASE("bench DICT_FSST mode 1 1M rows / TPC-H-like dict", "[!benchmark][scan
     bytes = sirius::test::decode::strings::make_dict_fsst_segment(dict, sel, /*mode=*/1);
   }
 
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   sirius::cuda::scan::gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                                                   static_cast<uint32_t>(d_seg.size()),
                                                   0,
@@ -1327,7 +1327,7 @@ TEST_CASE("bench DICT_FSST realistic multi-segment mode 1", "[!benchmark][scan][
     seg_offsets[k] = alloc_bytes;
     alloc_bytes += (seg_blobs[k].first.size() + SEG_ALIGN - 1) & ~(SEG_ALIGN - 1);
   }
-  rmm::device_buffer d_all(alloc_bytes, stream.view());
+  rmm::device_buffer d_all(alloc_bytes, stream);
   std::vector<sirius::cuda::scan::gpu_string_segment_desc> segs;
   segs.reserve(seg_blobs.size());
   uint32_t row_cursor = 0;

@@ -119,7 +119,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::case_expr const& alt
         "[expression_evaluator:case]: Expected an owned column after executing CASE "
         "expression.");
     }
-    return materialize_as_ast_column(std::move(current_result.release_column()));
+    return materialize_as_ast_column(current_result.release_column());
   }
   return current_result;
 }

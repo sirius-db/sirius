@@ -16,10 +16,13 @@
 
 #include "io/uri_parser.hpp"
 
+#include <duckdb/common/path.hpp>
+
 #include <cctype>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace sirius::io {
 
@@ -27,6 +30,7 @@ namespace {
 
 constexpr std::string_view kSchemeDelim = "://";
 constexpr std::string_view kFileScheme  = "file";
+constexpr std::string_view kS3Scheme    = "s3";
 
 [[noreturn]] void fail(std::string_view reason, std::string_view uri)
 {
@@ -125,6 +129,27 @@ parsed_uri parse(std::string_view uri)
 {
   if (uri.empty()) fail("empty URI", uri);
 
+  // S3 object keys are literal: '%', '?', '#' are ordinary key bytes. Handle s3
+  // before the fragment strip / query split / percent-decode below (which would
+  // mutate the key) and return the raw key. Non-s3 schemes fall through unchanged.
+  if (auto delim = uri.find(kSchemeDelim);
+      delim != std::string_view::npos && delim > 0 && to_lower(uri.substr(0, delim)) == kS3Scheme) {
+    auto rest    = uri.substr(delim + kSchemeDelim.size());
+    auto slash   = rest.find('/');
+    auto host_sv = (slash == std::string_view::npos) ? rest : rest.substr(0, slash);
+    auto key_sv  = (slash == std::string_view::npos) ? std::string_view{} : rest.substr(slash);
+    if (host_sv.empty()) fail("empty host", uri);
+    // Strip exactly one bucket/key separator slash (S3 REST semantics, matching
+    // the general object-store branch); any further leading slashes are key bytes.
+    if (!key_sv.empty() && key_sv.front() == '/') key_sv.remove_prefix(1);
+    if (key_sv.empty()) fail("empty object key", uri);
+    parsed_uri s3;
+    s3.scheme = std::string{kS3Scheme};
+    s3.host   = std::string{host_sv};
+    s3.path   = std::string{key_sv};  // RAW literal key: no percent-decode.
+    return s3;
+  }
+
   // Strip fragment early: fragments have no semantics for object-store URIs.
   // Why: users may paste browser URLs; silent drop avoids noisy errors.
   if (auto hash = uri.find('#'); hash != std::string_view::npos) {
@@ -205,6 +230,57 @@ parsed_uri parse(std::string_view uri)
 
   if (!query_part.empty()) out.query = parse_query(query_part, uri);
   return out;
+}
+
+std::string strip_file_scheme(std::string_view path)
+{
+  // Deliberately NOT implemented via parse(): this runs on every datasource open,
+  // must not throw on inputs parse() rejects (relative paths, empty keys), and
+  // must return the ORIGINAL bytes for everything it does not strip — no
+  // normalization of any other scheme.
+  //
+  // Do NOT reduce the `file:` handling to a `file://` prefix test: that strips one of the three
+  // forms the URI scheme admits and leaves `file:/abs` unopenable by any local datasource.
+  constexpr std::string_view kFileSchemePrefix = "file:";
+  if (path.size() <= kFileSchemePrefix.size()) { return std::string{path}; }
+  for (std::size_t i = 0; i < kFileSchemePrefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(path[i])) !=
+        static_cast<unsigned char>(kFileSchemePrefix[i])) {
+      return std::string{path};
+    }
+  }
+
+  // duckdb::Path dispatches on a case-SENSITIVE "file:/", but the scheme is case-insensitive per
+  // RFC 3986 and manifests spell it FILE:// and File://. A missed match pairs a delete file with
+  // no data file, which silently returns deleted rows. Scheme bytes only.
+  std::string normalized{kFileSchemePrefix};
+  normalized.append(path.substr(kFileSchemePrefix.size()));
+
+  // The non-standard "double-slash path" form, which duckdb::Path rejects. This repo's fixtures
+  // use it for repo-RELATIVE paths, which committed metadata cannot spell as absolute URIs, so it
+  // keeps the plain strip.
+  constexpr std::string_view kDoubleSlash = "file://";
+  auto const bare_prefix_strip            = [&]() -> std::string {
+    return path.size() > kDoubleSlash.size() ? std::string{path.substr(kDoubleSlash.size())}
+                                                        : std::string{path};
+  };
+
+  std::string local;
+  try {
+    auto const parsed = duckdb::Path::FromString(normalized);
+    if (!parsed.IsLocal()) { return bare_prefix_strip(); }
+    local = parsed.GetAnchor() + parsed.GetPath() + parsed.GetTrailingSeparator();
+  } catch (...) {
+    // Must not throw: this is on every datasource open.
+    return bare_prefix_strip();
+  }
+
+  // Only what was stripped is a URI, so only there is `%20` a space.
+  try {
+    return percent_decode(local, path);
+  } catch (...) {
+    return local;
+  }
 }
 
 }  // namespace sirius::io

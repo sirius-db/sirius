@@ -3,10 +3,12 @@
 //! This crate converts a StarRocks `TExecPlanFragmentParams` (the Thrift plan a
 //! StarRocks frontend ships to a backend) into a `substrait` `Plan`. It is meant
 //! as a foundation more operators are built on, so it favours explicit, checked
-//! invariants over breadth: v1 supports scan, filter, and projection, and
-//! everything outside that surface returns a structured [`TranslateError`] that
+//! invariants over breadth: it translates one fragment at a time, and everything
+//! outside the supported surface returns a structured [`TranslateError`] that
 //! names the offending node/type — so the next contributor knows exactly what to
-//! implement next.
+//! implement next. In particular `EXCHANGE_NODE` is rejected: a fragment is
+//! translated in isolation, and multi-fragment plans (every exchange is a
+//! fragment boundary) are a later milestone.
 //!
 //! # Wire format: flat preorder
 //!
@@ -21,29 +23,53 @@
 //! instead of silently producing a truncated tree. **Any new node translator
 //! must preserve this invariant.**
 //!
-//! # Supported surface (v1)
+//! # Supported surface
 //!
-//! | Plan node        | Substrait relation     |
-//! |------------------|------------------------|
-//! | `FILE_SCAN_NODE` | `ReadRel` (named table) |
-//! | `HDFS_SCAN_NODE` | `ReadRel` (named table) |
-//! | `SELECT_NODE`    | `FilterRel`            |
-//! | `PROJECT_NODE`   | `ProjectRel`           |
+//! | Plan node            | Substrait relation |
+//! |----------------------|--------------------|
+//! | `FILE_SCAN_NODE`     | `ReadRel` (local files) |
+//! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
+//! | `SELECT_NODE`        | `FilterRel`        |
+//! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
+//! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
+//! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
 //!
-//! | Expression node | Substrait expression |
-//! |-----------------|----------------------|
-//! | `SLOT_REF`      | field reference (resolved by `DescriptorTable::slot_global_index`) |
-//! | `*_LITERAL`     | width-matched typed literal |
-//! | `BINARY_PRED`   | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
-//! | `COMPOUND_PRED` | boolean function (`and`, `or`, `not`) |
-//! | `CAST_EXPR`     | cast (throwing failure behavior) |
-//! | `IS_NULL_PRED`  | `is_null` / `is_not_null` |
+//! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
+//! `FilterRel` over the node's output on every supported node.
+//!
+//! Any node's non-negative `limit` (plus a sort offset) becomes a `FetchRel` on top of its
+//! relation.
+//!
+//! | Expression node   | Substrait expression |
+//! |-------------------|----------------------|
+//! | `SLOT_REF`        | field reference (resolved by `DescriptorTable::slot_global_index`) |
+//! | `*_LITERAL`       | width-matched typed literal (incl. `DATE_LITERAL` as epoch days) |
+//! | `BINARY_PRED`     | comparison function (`equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`) |
+//! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
+//! | `CAST_EXPR`       | cast (throwing failure behavior) |
+//! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
+//! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
+//! | `CASE_EXPR`       | if-then chain (no leading case operand) |
+//! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
+//!
+//! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
+//! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
+//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
 //! decimal precision &gt; 38 (both exceed the i128 decimal encoding), and
 //! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
 //! support lands.
+//!
+//! Decimal arithmetic is **not exact**. `ARITHMETIC_EXPR` over decimal operands, and decimal
+//! `sum`/`avg`, are evaluated in FP64 because the GPU expression and aggregate paths cannot
+//! consume decimal arithmetic; decimal slots of precision &gt; 18 likewise map to FP64. Results
+//! are not cast back, so a column the frontend declared DECIMAL can arrive as a double and
+//! differ from StarRocks in its final digits.
 //!
 //! # Adding a node
 //!
@@ -75,16 +101,26 @@ pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+mod scan_paths;
 pub(crate) mod type_mapper;
 
 use descriptor_table::{DescriptorTable, SlotInfo};
 use error::Result;
 pub use error::TranslateError;
+use scan_paths::ScanFilePaths;
 
 /// Substrait comparison function extension URN used for scalar predicates.
 pub const URN_COMPARISON: &str = "extension:io.substrait:functions_comparison";
 /// Substrait boolean function extension URN used for compound predicates.
 pub const URN_BOOLEAN: &str = "extension:io.substrait:functions_boolean";
+/// Substrait arithmetic function extension URN.
+pub const URN_ARITHMETIC: &str = "extension:io.substrait:functions_arithmetic";
+/// Substrait string function extension URN.
+pub const URN_STRING: &str = "extension:io.substrait:functions_string";
+/// Substrait datetime function extension URN.
+pub const URN_DATETIME: &str = "extension:io.substrait:functions_datetime";
+/// Substrait aggregate function extension URN.
+pub const URN_AGGREGATE: &str = "extension:io.substrait:functions_aggregate_generic";
 
 /// Result of translating one StarRocks plan fragment.
 pub struct TranslatedPlan {
@@ -95,11 +131,6 @@ pub struct TranslatedPlan {
 }
 
 impl TranslatedPlan {
-    /// Returns a human-readable Substrait text formatter for logging and debugging.
-    pub fn explain(&self) -> PlanExplain<'_> {
-        PlanExplain { plan: &self.plan }
-    }
-
     /// Encodes the Substrait plan to protobuf bytes on demand.
     pub fn to_substrait_bytes(&self) -> Vec<u8> {
         self.plan.encode_to_vec()
@@ -107,37 +138,12 @@ impl TranslatedPlan {
 }
 
 impl fmt::Debug for TranslatedPlan {
-    /// Renders the translated plan using `substrait-explain` instead of protobuf debug output.
+    /// Renders the translated plan using its protobuf debug representation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TranslatedPlan")
             .field("output_names", &self.output_names)
-            .field("plan", &self.explain())
+            .field("plan", &self.plan)
             .finish()
-    }
-}
-
-/// Display/debug adapter for a Substrait plan in explain-text form.
-pub struct PlanExplain<'a> {
-    /// Plan to render with `substrait-explain`.
-    plan: &'a Plan,
-}
-
-impl fmt::Display for PlanExplain<'_> {
-    /// Formats the plan text and appends formatter warnings when present.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (text, warnings) = substrait_explain::format(self.plan);
-        f.write_str(&text)?;
-        if !warnings.is_empty() {
-            write!(f, "\nformat warnings: {warnings:?}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for PlanExplain<'_> {
-    /// Delegates debug output to the same readable text as display output.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
     }
 }
 
@@ -185,8 +191,10 @@ impl PlanTranslator {
             })?;
 
         let desc = DescriptorTable::try_from(desc_tbl)?;
+        let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
         let mut registry = ExtensionRegistry::new();
-        let mut translated = node_translator::translate_plan(plan, &desc, &mut registry)?;
+        let mut translated =
+            node_translator::translate_plan(plan, &desc, &scan_paths, &mut registry)?;
 
         let output_names = if let Some(output_exprs) = fragment
             .output_exprs

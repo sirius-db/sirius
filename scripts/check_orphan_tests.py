@@ -6,7 +6,7 @@
 """Pre-commit guard against orphaned test files.
 
 A ``test_*.cpp`` that exists under ``test/cpp`` but is not listed in
-CMakeLists.txt's TEST_SOURCES never compiles, so its coverage silently
+the CMake source inventories never compiles, so its coverage silently
 vanishes. This check fails when such a file exists, unless it carries an
 explicit, reasoned entry in ``test/cpp/orphan_test_allowlist.txt``.
 
@@ -21,10 +21,13 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 TEST_DIR = REPO_ROOT / "test" / "cpp"
-CMAKELISTS = REPO_ROOT / "CMakeLists.txt"
+CMAKE_INPUTS = [
+    REPO_ROOT / "CMakeLists.txt",
+    *sorted((REPO_ROOT / "cmake").glob("sirius-*.cmake")),
+]
 ALLOWLIST = TEST_DIR / "orphan_test_allowlist.txt"
 
-# Matches any test/cpp/.../test_*.cpp reference in CMakeLists.txt, including
+# Matches any test/cpp/.../test_*.cpp reference in the CMake source inventories, including
 # entries inside option-gated blocks (a gated test is not an orphan when its
 # option is off).
 CMAKE_TEST_REF = re.compile(r"test/cpp/[A-Za-z0-9_/]*test_[A-Za-z0-9_]+\.cpp")
@@ -45,7 +48,11 @@ def main() -> int:
     tree_tests = {
         p.relative_to(REPO_ROOT).as_posix() for p in TEST_DIR.rglob("test_*.cpp")
     }
-    cmake_tests = set(CMAKE_TEST_REF.findall(CMAKELISTS.read_text()))
+    cmake_tests = {
+        test
+        for path in CMAKE_INPUTS
+        for test in CMAKE_TEST_REF.findall(path.read_text())
+    }
     allowlist = read_allowlist()
 
     orphans = sorted(tree_tests - cmake_tests - allowlist)
@@ -59,7 +66,7 @@ def main() -> int:
         for path in orphans:
             print(f"  {path}")
         print(
-            "Add them to TEST_SOURCES in CMakeLists.txt (or, with a reason, to "
+            "Add them to the CMake test source inventory (or, with a reason, to "
             "test/cpp/orphan_test_allowlist.txt)."
         )
     if stale_allowlist:

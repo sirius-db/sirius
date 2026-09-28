@@ -1,0 +1,3 @@
+# Personal project settings are machine-local and may contain permissions or
+# other overrides that should not be shared with the team.
+/settings.local.json

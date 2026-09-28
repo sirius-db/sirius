@@ -76,7 +76,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = type;
@@ -88,7 +88,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
                                         0,
                                         row_count}}});
 
-  auto t = gpu_decode_table({col}, stream.view(), mr);
+  auto t = gpu_decode_table({col}, stream, mr);
   REQUIRE(t->num_rows() == static_cast<cudf::size_type>(row_count));
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
@@ -300,8 +300,8 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-segment column", "[scan][decode][
 
   auto bytes_a = make_constant_block<int32_t>(7);
   auto bytes_b = make_for_block<int32_t>(/*frame=*/100, /*width=*/4, std::vector<int32_t>(50, 3));
-  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream.view());
-  rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream);
+  rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = I32;
@@ -313,7 +313,7 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-segment column", "[scan][decode][
       gpu_segment_desc{
         static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto t   = gpu_decode_table({col}, stream, mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
   for (uint32_t i = 0; i < 50; ++i)
     REQUIRE(out[i] == 7);
@@ -336,12 +336,12 @@ TEST_CASE("gpu_decode_table BITPACKING - CONSTANT/CONSTANT_DELTA at unaligned ds
   // Segment A: 50 int32 rows = 200 bytes, not a multiple of 16. Segment B's
   // destination then starts at byte offset 200 — unaligned for vec_t stores.
   auto bytes_a = make_for_block<int32_t>(/*frame=*/0, /*width=*/4, std::vector<int32_t>(50, 1));
-  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream.view());
+  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream);
 
   SECTION("CONSTANT at unaligned row offset")
   {
     auto bytes_b = make_constant_block<int32_t>(77);
-    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream);
     gpu_column_decode_input col;
     col.out_type   = I32;
     col.total_rows = 100;
@@ -351,7 +351,7 @@ TEST_CASE("gpu_decode_table BITPACKING - CONSTANT/CONSTANT_DELTA at unaligned ds
           static_cast<uint8_t const*>(d_a.data()), static_cast<uint32_t>(d_a.size()), 0, 50},
         gpu_segment_desc{
           static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
-    auto t   = gpu_decode_table({col}, stream.view(), mr);
+    auto t   = gpu_decode_table({col}, stream, mr);
     auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
     for (uint32_t i = 0; i < 50; ++i)
       REQUIRE(out[i] == 1);
@@ -362,7 +362,7 @@ TEST_CASE("gpu_decode_table BITPACKING - CONSTANT/CONSTANT_DELTA at unaligned ds
   SECTION("CONSTANT_DELTA at unaligned row offset")
   {
     auto bytes_b = make_constant_delta_block<int32_t>(/*frame=*/1000, /*delta=*/3);
-    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+    rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream);
     gpu_column_decode_input col;
     col.out_type   = I32;
     col.total_rows = 100;
@@ -372,7 +372,7 @@ TEST_CASE("gpu_decode_table BITPACKING - CONSTANT/CONSTANT_DELTA at unaligned ds
           static_cast<uint8_t const*>(d_a.data()), static_cast<uint32_t>(d_a.size()), 0, 50},
         gpu_segment_desc{
           static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
-    auto t   = gpu_decode_table({col}, stream.view(), mr);
+    auto t   = gpu_decode_table({col}, stream, mr);
     auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
     for (uint32_t i = 0; i < 50; ++i)
       REQUIRE(out[i] == 1);
@@ -412,7 +412,7 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = I32;
@@ -423,7 +423,7 @@ TEST_CASE("gpu_decode_table BITPACKING - multi-group segment", "[scan][decode][b
                                         0,
                                         total_rows}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto t   = gpu_decode_table({col}, stream, mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), total_rows, stream.value());
   for (uint32_t i = 0; i < group_rows; ++i)
     REQUIRE(out[i] == 7);
@@ -670,9 +670,9 @@ inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
                                                        uint32_t total_rows)
 {
   std::vector<uint8_t> canary(size_t{total_rows} * sizeof(int32_t), 0xCC);
-  rmm::device_buffer d_out(canary.data(), canary.size(), stream.view());
+  rmm::device_buffer d_out(canary.data(), canary.size(), stream);
   decode_bitpacking_data(
-    run, static_cast<uint8_t*>(d_out.data()), I32, sizeof(int32_t), stream.view(), mr);
+    run, static_cast<uint8_t*>(d_out.data()), I32, sizeof(int32_t), stream, mr);
   return download<int32_t>(d_out.data(), total_rows, stream.value());
 }
 }  // namespace
@@ -688,7 +688,7 @@ TEST_CASE("gpu_decode_table BITPACKING - INVALID mode zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 32;
   gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
@@ -712,7 +712,7 @@ TEST_CASE("gpu_decode_table BITPACKING - corrupt metadata_end zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 16;
   gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
@@ -736,7 +736,7 @@ TEST_CASE("gpu_decode_table BITPACKING - width > sizeof(T)*8 zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 8;
   gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
@@ -759,7 +759,7 @@ TEST_CASE("gpu_decode_table BITPACKING - packed stream past metadata_end zero-fi
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 2048;
   gpu_codec_run run{CompressionType::COMPRESSION_BITPACKING,
@@ -781,7 +781,7 @@ TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   auto bytes = make_constant_block<int32_t>(0);
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   auto const DEC128 = cudf::data_type{cudf::type_id::DECIMAL128, /*scale=*/-2};
   gpu_column_decode_input col;
@@ -791,6 +791,6 @@ TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
     {CompressionType::COMPRESSION_BITPACKING,
      {gpu_segment_desc{
        static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), mr),
+  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream, mr),
                       Catch::Contains("viability invariant violated"));
 }

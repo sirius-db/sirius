@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -54,6 +55,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
 {
   D_ASSERT(op.children.size() == 1);
+  // Reject nested filter predicates before planning the child.
+  for (auto const& predicate : op.expressions) {
+    reject_nested_column_operation(*predicate, "a filter predicate");
+  }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = create_plan(*op.children[0]);
 
   // A filter that carries a projection map drops/reorders columns on its way out. When there is a
@@ -87,11 +92,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
       }
     }
 
-    auto filter =
-      duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(filter_types),
-                                                            sirius::ast::from_duckdb(*combined),
-                                                            op.estimated_cardinality,
-                                                            std::move(output_indices));
+    auto predicate = sirius::ast::from_duckdb(*combined);
+    if (predicate == nullptr) {
+      throw duckdb::NotImplementedException("Unsupported filter predicate (falling back to CPU): " +
+                                            combined->ToString());
+    }
+    auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(filter_types),
+                                                                        std::move(predicate),
+                                                                        op.estimated_cardinality,
+                                                                        std::move(output_indices));
     filter->children.push_back(std::move(plan));
     plan = std::move(filter);
   } else if (op.HasProjectionMap()) {

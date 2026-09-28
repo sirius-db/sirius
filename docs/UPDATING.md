@@ -9,3 +9,5 @@ as follows:
 - Bump versions in `.github/workflows`
   - `duckdb_version` input in `distribution.yml` should be set to latest tagged release
   - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes
+- Set `OVERRIDE_GIT_DESCRIBE` in `cmake/CMakePresets.json` to the current DuckDB version `vX.Y.Z`
+  - This should match the tag at the base of the branch for the submodule

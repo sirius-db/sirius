@@ -28,17 +28,20 @@ namespace sirius::planner {
 
 namespace {
 
-// Translate a vector of DuckDB expressions into Sirius AST nodes at the planner
-// boundary. The source vector is drained; size and order are preserved, with a
-// null slot wherever from_duckdb declines an unsupported shape (a fallback
-// signal) — matching the prior bulk-translation null-skip semantics.
+// Translate at the planner boundary and reject unsupported expressions before
+// they enter a physical projection. The source vector is consumed in order.
 duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
 {
   duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
   out.reserve(exprs.size());
   for (auto& e : exprs) {
-    out.push_back(e ? sirius::ast::from_duckdb(*e) : nullptr);
+    auto translated = e ? sirius::ast::from_duckdb(*e) : nullptr;
+    if (e && translated == nullptr) {
+      throw duckdb::NotImplementedException(
+        "Unsupported expression in projection (falling back to CPU): " + e->ToString());
+    }
+    out.push_back(std::move(translated));
   }
   return out;
 }

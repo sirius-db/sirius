@@ -15,7 +15,7 @@
  */
 
 // Unit tests for cache_entry_info::can_serve_with_columns — the pinned-cache match
-// used by sirius_scan_manager::try_assign_cached_entries. A pinned entry can serve
+// used by sirius_scan_manager::try_match_cached_entry. A pinned entry can serve
 // an incoming scan iff it has the same identity (parquet file set OR duckdb
 // catalog.schema.table) AND reads a superset of the requested columns; the result
 // is the gather projection (positions into the pinned entry's column layout) that
@@ -31,6 +31,7 @@
 
 #include <catch.hpp>
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 #include <cstddef>
 #include <string>
@@ -147,6 +148,18 @@ TEST_CASE("cache_entry_info: parquet different file set misses", "[scan][can_ser
   REQUIRE(pinned.can_serve_with_columns(two_files).empty());
 }
 
+TEST_CASE("cache_entry_info: parquet virtual columns always bypass a matching pin",
+          "[scan][can_serve][virtual_columns]")
+{
+  auto const filename = duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME;
+  auto pinned         = parquet_cache({"a.parquet"}, {0, filename});
+  parquet_ingestible_table_info scan;
+  fill(scan, {"a.parquet"}, {0, filename});
+
+  REQUIRE(scan.has_requested_user_virtual_columns());
+  REQUIRE(pinned.can_serve_with_columns(scan).empty());
+}
+
 TEST_CASE("cache_entry_info: duckdb same-table subset request hits with a gather projection",
           "[scan][can_serve]")
 {
@@ -199,4 +212,98 @@ TEST_CASE("cache_entry_info: a different ingestible format never matches", "[sca
   parquet_ingestible_table_info parquet_scan_info;
   fill(parquet_scan_info, {"a.parquet"}, {0});
   REQUIRE(duckdb_pin.can_serve_with_columns(parquet_scan_info).empty());
+}
+
+TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher",
+          "[scan][can_serve]")
+{
+  auto cache = duckdb_cache("db", "main", "lineitem", {0, 1});
+  REQUIRE(cache.matches_duckdb_table("db", "main", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db2", "main", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "other", "lineitem"));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "orders"));
+
+  auto parquet = parquet_cache({"a.parquet"}, {0});
+  REQUIRE_FALSE(parquet.matches_duckdb_table("", "", ""));  // parquet identity never matches
+}
+
+TEST_CASE("cache_entry_info: matches_parquet_files is the shared parquet identity matcher",
+          "[scan][can_serve]")
+{
+  auto cache = parquet_cache({"a.parquet", "b.parquet"}, {0});
+
+  // Same set hits regardless of order.
+  std::vector<std::string> const in_order{"a.parquet", "b.parquet"};
+  std::vector<std::string> const reordered{"b.parquet", "a.parquet"};
+  REQUIRE(cache.matches_parquet_files(in_order));
+  REQUIRE(cache.matches_parquet_files(reordered));
+
+  // Size mismatch misses.
+  std::vector<std::string> const fewer{"a.parquet"};
+  REQUIRE_FALSE(cache.matches_parquet_files(fewer));
+
+  // Different file misses.
+  std::vector<std::string> const different{"a.parquet", "c.parquet"};
+  REQUIRE_FALSE(cache.matches_parquet_files(different));
+
+  // A duckdb-identity entry (empty resolved_file_paths) never matches.
+  auto duckdb_entry = duckdb_cache("db", "main", "t", {0});
+  REQUIRE_FALSE(duckdb_entry.matches_parquet_files(fewer));
+
+  // Empty input misses.
+  REQUIRE_FALSE(cache.matches_parquet_files(std::vector<std::string>{}));
+}
+
+TEST_CASE("cache_entry_info: matches_parquet_files canonicalizes the probe's spellings",
+          "[scan][can_serve]")
+{
+  // Stored identities are canonical (cache_entry_info::from canonicalizes at
+  // construction); probes arrive as bound and are canonicalized inside the
+  // matcher, so a plan-time gate probe and a serve-time cache-hit probe with
+  // non-canonical spellings of the same files both hit. The prefix is chosen to
+  // not exist so canonicalization is purely lexical (no symlink resolution).
+  std::string const base = "/sirius-canon-test-nonexistent";
+  auto cache             = parquet_cache({base + "/a.parquet", base + "/sub/b.parquet"}, {0});
+
+  std::vector<std::string> const dot_segment{base + "/./a.parquet", base + "/sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(dot_segment));
+
+  std::vector<std::string> const parent_segment{base + "/a.parquet",
+                                                base + "/other/../sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(parent_segment));
+
+  std::vector<std::string> const file_uri{"file://" + base + "/a.parquet", base + "/sub/b.parquet"};
+  REQUIRE(cache.matches_parquet_files(file_uri));
+
+  // Canonicalization never conflates genuinely different paths.
+  std::vector<std::string> const different{base + "/a.parquet", base + "/sub/../b.parquet"};
+  REQUIRE_FALSE(cache.matches_parquet_files(different));
+}
+
+TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", "[scan][can_serve]")
+{
+  auto cache = duckdb_cache("db", "main", "t", {0, 1, 2});
+
+  SECTION("plain subset gathers in the requested order")
+  {
+    auto projection = cache.column_projection_for(make_ids({2, 0}));
+    REQUIRE(projection == std::vector<std::size_t>{2, 0});
+  }
+
+  SECTION("rowid request misses")
+  {
+    duckdb::vector<duckdb::ColumnIndex> ids;
+    ids.emplace_back(duckdb::ColumnIndex(0));
+    ids.emplace_back(duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID));
+    REQUIRE(cache.column_projection_for(ids).empty());
+  }
+
+  SECTION("field-identifier request misses instead of throwing")
+  {
+    duckdb::vector<duckdb::ColumnIndex> ids;
+    ids.emplace_back(duckdb::ColumnIndex(std::string("nested_field")));
+    REQUIRE(cache.column_projection_for(ids).empty());
+  }
+
+  SECTION("missing column misses") { REQUIRE(cache.column_projection_for(make_ids({5})).empty()); }
 }

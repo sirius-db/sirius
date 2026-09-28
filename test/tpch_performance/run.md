@@ -105,7 +105,7 @@ sirius:
 
 `run_tpch_parquet_and_generate_telemetry.sh` runs TPC-H queries in Sirius,
 labels each `(query, iteration)` pair with `sirius_set_query_label`, and writes
-Quent ndjson files to `sirius.telemetry.output_directory`.
+Quent postcard files to `sirius.telemetry.output_directory`.
 
 ```bash
 pixi run -- ./test/tpch_performance/run_tpch_parquet_and_generate_telemetry.sh \
@@ -209,7 +209,6 @@ sirius:
       num_threads: 6
   operator_params:
     scan_task_batch_size: 5368709120       # 5 GB
-    default_scan_task_varchar_size: 256
     max_sort_partition_bytes: 0            # 0 = auto (33% GPU memory)
     hash_partition_bytes: 5368709120       # 5 GB
     concat_batch_bytes: 5368709120         # 5 GB

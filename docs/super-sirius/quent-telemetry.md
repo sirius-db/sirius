@@ -7,14 +7,14 @@ a modular instrumentation based telemetry toolkit to better understand runtime
 behaviours of complex applications. When a query runs, Sirius emits structured
 traces describing the engine, the plan (operators, ports, edges), executor
 /task-manager threads, task queues, and per-query activity. These traces are written
-as newline-delimited JSON (ndjson) files that Quent's analyzer server then ingests
+as newline-delimited JSON (ndjson) files by default that Quent's analyzer server then ingests
 and renders as an interactive timeline in your browser.
 
 ## 1. Enable the exporter
 
 Telemetry is controlled entirely by the Sirius YAML config (see the
 [Configuration reference](configuration.md#telemetry) for where config files are resolved). Enable
-the Quent ndjson exporter and choose an output directory:
+the Quent exporter and choose an output directory:
 
 ```yaml
 sirius:
@@ -26,13 +26,21 @@ sirius:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enable_quent` | bool | `true` | Emit Quent telemetry using the ndjson exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
-| `output_directory` | string | `telemetry_data` | Directory for the Quent ndjson files. |
-| `engine_name` | string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `enable_quent` | bool | `true` | Emit Quent telemetry using the configured exporter. When `false`, telemetry uses the no-op exporter and nothing is written. |
+| `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
+| `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
+| `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
+
+Quent captures NVTX emitted by dependency images such as libcudf in both deployment modes. A
+loadable Sirius is its own injection DSO. A DuckDB executable with Sirius linked into it exports the
+same initializer and handles NVTX's private injection token inside the executable, so it does not
+ship a sidecar DSO.
 
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with
-`enable_quent: true` then writes ndjson files into `output_directory`.
+`enable_quent: true` then writes ndjson files into `output_directory` by default. Set
+`exporter: postcard` for compact benchmark or CI telemetry.
 
 ## 2. Label your queries (optional)
 
@@ -57,7 +65,7 @@ with `sirius_set_query_label`. Unlabeled queries are reported as `unnamed_query`
 
 ## 3. Generate telemetry
 
-Run any query with the exporter enabled and ndjson files appear under `output_directory`.
+Run any query with the exporter enabled and telemetry files appear under `output_directory`.
 
 ### TPC-H helper
 
@@ -107,6 +115,16 @@ timeline.
 
 **Default view** — the query plan on the left and the per-resource execution timeline
 (executor threads, task-manager loops, task queues) on the right.
+
+Resources are grouped into a collapsible tree by GPU device: each `gpu-N` group (declared once per
+GPU at engine startup) contains per-thread-type buckets (`executor_thread`,
+`task_manager_loop_thread`) plus that executor's task queue, and a `shared` group under the engine
+holds threads with no single GPU (e.g. the task-scheduler thread). The tree shape is entirely
+data-driven via each resource's `parent_group_id`; to inspect it offline run:
+
+```bash
+pixi run bash -c "cd rust && cargo run -p sirius-telemetry-analyzer --example print_resource_tree -- <output_dir>/<session_uuid>"
+```
 
 ![Quent standard view](quent-screenshots/standard.png)
 

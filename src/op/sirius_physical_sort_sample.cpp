@@ -24,9 +24,9 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
-#include <nvtx3/nvtx3.hpp>
-
+#include <algorithm>
 #include <functional>
 
 namespace sirius {
@@ -159,16 +159,16 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
 }
 
 std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
-                                                                    rmm::cuda_stream_view stream)
+                                                                    ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // do boundary computation
@@ -187,7 +187,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
   if (valid_batches.empty() || !space) {
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory), leave the state
@@ -223,46 +223,68 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
     if (valid_batches.size() == 1) {
       merged_sample_view = get_cudf_table_view(valid_batches[0]);
     } else {
-      merged_sample_batch = gpu_merge_impl::merge_order_by(
-        valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
-      merged_sample_view = get_cudf_table_view(merged_sample_batch->to_read_only());
+      merged_sample_batch = gpu_merge_impl::merge_order_by(valid_batches,
+                                                           order_key_idx,
+                                                           column_order,
+                                                           null_precedence,
+                                                           stream,
+                                                           *space,
+                                                           batch_telemetry());
+      merged_sample_view  = get_cudf_table_view(merged_sample_batch->to_read_only());
     }
 
     // 4. Compute number of partitions
+    bool complete_input = false;
+    auto port_ids       = get_port_ids();
+    if (!port_ids.empty()) {
+      auto* port = get_port(port_ids[0]);
+      // Check completion before repository emptiness: once completion is visible,
+      // the upstream pipeline cannot publish another batch.
+      complete_input = port && port->src_pipeline && port->src_pipeline->is_pipeline_finished() &&
+                       port->repo && port->repo->all_empty();
+    }
+
     size_t total_rows      = static_cast<size_t>(merged_sample_view.num_rows());
     size_t avg_batch_bytes = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
     size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
     size_t num_parts          = 1;
-    if (estimated_cardinality == 0 || avg_rows_per_batch == 0) {
+    bool const can_size = complete_input || (estimated_cardinality > 0 && avg_rows_per_batch > 0);
+    if (!can_size) {
       SIRIUS_LOG_WARN(
         "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
         "defaulting to 1 partition",
         estimated_cardinality,
         avg_rows_per_batch);
     } else {
-      size_t total_batch_count =
-        (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
-      size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
-      size_t available_memory      = space->get_available_memory(stream);
-      size_t max_partition_bytes   = _max_partition_bytes_override > 0
-                                       ? _max_partition_bytes_override
-                                       : static_cast<size_t>(static_cast<double>(available_memory) *
+      size_t total_batch_count = valid_batches.size();
+      size_t bytes_for_sizing  = total_sample_bytes;
+      if (!complete_input) {
+        total_batch_count = (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
+        bytes_for_sizing  = avg_batch_bytes * total_batch_count;
+      }
+      size_t available_memory    = space->get_available_memory(stream);
+      size_t max_partition_bytes = _max_partition_bytes_override > 0
+                                     ? _max_partition_bytes_override
+                                     : static_cast<size_t>(static_cast<double>(available_memory) *
                                                            _max_partition_memory_fraction);
 
-      if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
-        num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+      if (max_partition_bytes > 0 && bytes_for_sizing > max_partition_bytes) {
+        num_parts = (bytes_for_sizing + max_partition_bytes - 1) / max_partition_bytes;
       }
+      num_parts = std::min(num_parts, std::max<size_t>(1, total_rows));
 
       SIRIUS_LOG_DEBUG(
-        "Sort sample: estimated_cardinality={}, total_rows={}, avg_rows_per_batch={}, "
+        "Sort sample: complete_input={}, estimated_cardinality={}, total_rows={}, "
+        "avg_rows_per_batch={}, "
         "avg_batch_bytes={}, total_batch_count={}, "
-        "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        "bytes_for_sizing={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+        complete_input,
         estimated_cardinality,
         total_rows,
         avg_rows_per_batch,
         avg_batch_bytes,
         total_batch_count,
-        estimated_total_bytes,
+        bytes_for_sizing,
         available_memory,
         max_partition_bytes,
         num_parts);
@@ -294,7 +316,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     boundary_indices_host.data(),
                                     num_boundaries * sizeof(int32_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
 
       // Extract only the sort key columns from merged sample for the boundaries
       std::vector<cudf::column_view> sort_key_cols;
@@ -329,7 +351,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
 
 }  // namespace op

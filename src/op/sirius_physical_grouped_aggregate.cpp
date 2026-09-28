@@ -16,11 +16,11 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
+#include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -71,10 +71,28 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
-std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+duckdb::vector<sirius::logical_type>
+sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
+  auto const aggregate_offset = group_idx.size();
+  if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
+    throw std::runtime_error(
+      "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
+  }
+
+  auto local_types = types;
+  for (size_t slot_idx = 0; slot_idx < aggregate_slots.size(); ++slot_idx) {
+    if (aggregate_slots[slot_idx].is_count_distinct) {
+      local_types[aggregate_offset + slot_idx] = sirius::logical_type::make(sirius::type_id::LIST);
+    }
+  }
+  return local_types;
+}
+
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
+  const operator_data& input_data, ::cuda::stream_ref stream)
+{
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
@@ -87,7 +105,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
-                                                              *space);
+                                                              *space,
+                                                              batch_telemetry());
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

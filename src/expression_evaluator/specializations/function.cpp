@@ -15,11 +15,13 @@
  */
 
 // sirius
+#include <config.hpp>
 #include <expression/ast/node.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
@@ -45,12 +47,27 @@
 
 // standard library
 #include <algorithm>
+#include <optional>
 #include <regex>
 #include <string>
 #include <variant>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
+
+like_multiliteral_cache::entry_ptr const& expression_evaluator::get_or_classify_like(
+  std::string_view pattern)
+{
+  if (auto const found = _like_classifications.find(pattern);
+      found != _like_classifications.end()) {
+    return found->second;
+  }
+
+  auto classification = _like_cache->get_or_classify(pattern);
+  ++_like_shared_cache_lookup_count;
+  return _like_classifications.emplace(std::string(pattern), std::move(classification))
+    .first->second;
+}
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const& alt,
                                                evaluation_mode mode)
@@ -96,16 +113,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     if (mode == evaluation_mode::AST) {
       //===----------1: AST Mode----------===//
-      return evaluate_result(
-        ast_result(func_expr,
-                   {left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                   {left.get_temp_column_indices(), right.get_temp_column_indices()}));
+      return evaluate_result(compose(func_expr, {&left, &right}));
     }
 
     //===----------2: MATERIALIZE Mode, evaluate node with AST----------===//
     auto result_column = evaluate_ast(func_expr);
-    release_temporaries({left.get_temp_scalar_indices(), right.get_temp_scalar_indices()},
-                        {left.get_temp_column_indices(), right.get_temp_column_indices()});
+    release_temporaries({&left, &right});
     return evaluate_result(std::move(result_column));
   }
 
@@ -117,7 +130,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         "[expression_evaluator:function]: Expected an owned column after executing function "
         "expression.");
     }
-    return materialize_as_ast_column(std::move(result.release_column()));
+    return materialize_as_ast_column(result.release_column());
   }
   auto const output_type = sirius::get_cudf_type(alt.return_type());
 
@@ -171,33 +184,48 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
-    auto result_column =
-      cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
-                                   cudf::numeric_scalar(start_val, true, _stream, _mr),
-                                   cudf::numeric_scalar(stop_val, true, _stream, _mr),
-                                   cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
-                                   _stream,
-                                   _mr);
+    auto const input_strings = cudf::strings_column_view(input.get_column_view());
+    auto result_column       = cudf::strings::slice_strings(input_strings,
+                                                      std::optional<cudf::size_type>{start_val},
+                                                      std::optional<cudf::size_type>{stop_val},
+                                                      std::optional<cudf::size_type>{1},
+                                                      _stream,
+                                                      _mr);
     return evaluate_result(std::move(result_column));
   }
 
   //----------String Matching Functions----------//
-  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string> {
+  auto setup_string_matching = [&]() -> std::pair<evaluate_result, std::string_view> {
     D_ASSERT(args.size() == 2);
     D_ASSERT(args[1]->holds<sirius::ast::constant>());
 
-    auto input     = evaluate(*args[0], evaluation_mode::MATERIALIZE);
-    auto match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
-    return {evaluate_result(std::move(input)), std::move(match_str)};
+    auto input            = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const& match_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
+    return {evaluate_result(std::move(input)), std::string_view(match_str)};
   };
   if (resolved_id == function_id::like || resolved_id == function_id::not_like) {
     auto [input, match_str] = setup_string_matching();
+    auto const invert       = resolved_id == function_id::not_like;
+
+    // `%lit1%lit2%...%litN%` patterns take a SWAR digram fast path (NOT fused in);
+    // everything else — and any ineligible column layout — takes cudf::strings::like.
+    if (_like_swar_fastpath && !input.is_scalar()) {
+      auto const& parsed = get_or_classify_like(match_str);
+      if (*parsed) {
+        if (auto result_column = like_multiliteral(
+              cudf::strings_column_view(input.get_column_view()), **parsed, invert, _stream, _mr)) {
+          return evaluate_result(std::move(result_column));
+        }
+      }
+    }
+
+    // cuDF fallback
     auto result_column = cudf::strings::like(cudf::strings_column_view(input.get_column_view()),
                                              std::string_view(match_str),
                                              std::string_view(),
                                              _stream,
                                              _mr);
-    if (resolved_id == function_id::not_like) {
+    if (invert) {
       result_column =
         cudf::unary_operation(result_column->view(), cudf::unary_operator::NOT, _stream, _mr);
     }
@@ -300,7 +328,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------String Concatenation----------//
-  if (resolved_id == function_id::concat) {
+  if (resolved_id == function_id::concat || resolved_id == function_id::concat_operator) {
     // Evaluate every argument to a materialized column or scalar.
     std::vector<evaluate_result> arg_results;
     arg_results.reserve(args.size());
@@ -324,15 +352,18 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       }
     }
 
-    // SQL concat: any NULL input produces NULL output.  cuDF achieves this with
-    // an invalid (null) narep scalar.
+    // DuckDB's concat() ignores NULL arguments (concat(NULL, 'x') = 'x'), whereas
+    // the || operator propagates NULL ('a' || NULL = NULL). The narep scalar
+    // selects the behaviour: a valid empty string replaces NULLs with "" (ignore),
+    // an invalid narep short-circuits the whole row to NULL (propagate).
+    bool const propagate_nulls = (resolved_id == function_id::concat_operator);
+    cudf::string_scalar narep("", /*is_valid=*/!propagate_nulls, _stream, _mr);
     cudf::table_view concat_table(col_views);
     auto result_column = cudf::strings::concatenate(
       concat_table,
-      cudf::string_scalar("", true, _stream, _mr),   // empty separator between parts
-      cudf::string_scalar("", false, _stream, _mr),  // null narep → null propagation
-      cudf::strings::separator_on_nulls::YES,        // no-op: invalid narep short-circuits before
-                                                     // separator logic runs
+      cudf::string_scalar("", true, _stream, _mr),  // empty separator between parts
+      narep,
+      cudf::strings::separator_on_nulls::NO,
       _stream,
       _mr);
     return evaluate_result(std::move(result_column));
@@ -364,16 +395,15 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const& pattern_str = std::get<std::string>(args[1]->get<sirius::ast::constant>().payload);
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
-    auto regex_prog         = cudf::strings::regex_program::create(std::string_view(pattern_str));
-
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
           return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
-            input.get_column_view());
+            input.get_column_view(), _stream, _mr);
         }
       }
+      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
       return cudf::strings::replace_with_backrefs(
         cudf::strings_column_view(input.get_column_view()),
         *regex_prog,
@@ -381,6 +411,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
         _stream,
         _mr);
     } else {
+      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),

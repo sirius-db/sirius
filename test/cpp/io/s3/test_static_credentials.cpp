@@ -15,7 +15,7 @@
  */
 
 #include "catch.hpp"
-#include "io/s3/static_credentials.hpp"
+#include "io/rest/s3/static_credentials.hpp"
 
 #include <chrono>
 

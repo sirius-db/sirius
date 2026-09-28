@@ -74,9 +74,9 @@ make_test_memory_manager_with_disk()
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio)
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio)
     .set_disk_mounting_point(0, disk_capacity, tmp_dir.string());
 
   auto space_configs = builder.build();
@@ -100,7 +100,8 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
   std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 100000)};
 
   auto table = sirius::create_cudf_table_with_random_data(num_rows, col_types, ranges, stream, mr);
-  return sirius::make_data_batch(std::move(table), gpu_space, stream);
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
 }
 
 }  // namespace

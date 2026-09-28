@@ -19,7 +19,7 @@ If no marker exists, ask the user which commit to start from, or default to the 
 
 ### Step 2: Identify Changed PRs
 Run `git log --oneline --merges LAST_COMMIT..HEAD` to find merge commits.
-Run `gh pr list --state merged --limit 100 --base dev` to list merged PRs.
+Run `gh pr list --state merged --limit 100 --base main` to list merged PRs.
 Cross-reference to find PRs merged since the last update.
 
 ### Step 3: Inspect Each PR

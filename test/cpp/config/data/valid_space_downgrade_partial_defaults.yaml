@@ -1,0 +1,10 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        downgrade_trigger_fraction: null
+        downgrade_stop_fraction: 0.7
+    host:
+      - numa_id: 0
+        downgrade_trigger_fraction: 0.7
+        downgrade_stop_fraction: null

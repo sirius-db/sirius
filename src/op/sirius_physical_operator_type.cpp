@@ -105,16 +105,19 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS: return "UPDATE_EXTENSIONS";
     case SiriusPhysicalOperatorType::PARTITION: return "PARTITION";
     case SiriusPhysicalOperatorType::CONCAT: return "CONCAT";
+    case SiriusPhysicalOperatorType::PASSTHROUGH_SINK: return "PASSTHROUGH_SINK";
     case SiriusPhysicalOperatorType::MERGE_SORT: return "MERGE_SORT";
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: return "MERGE_GROUP_BY";
     case SiriusPhysicalOperatorType::MERGE_TOP_N: return "MERGE_TOP_N";
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE: return "MERGE_AGGREGATE";
     case SiriusPhysicalOperatorType::SORT_PARTITION: return "SORT_PARTITION";
     case SiriusPhysicalOperatorType::SORT_SAMPLE: return "SORT_SAMPLE";
-    case SiriusPhysicalOperatorType::DUCKDB_SCAN: return "DUCKDB_SCAN";
-    case SiriusPhysicalOperatorType::ICEBERG_SCAN: return "ICEBERG_SCAN";
-    case SiriusPhysicalOperatorType::CPU_SOURCE: return "CPU_SOURCE";
+    case SiriusPhysicalOperatorType::GPU_VALUES: return "GPU_VALUES";
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
+    case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";
+    case SiriusPhysicalOperatorType::STREAMING_SINK: return "STREAMING_SINK";
+    case SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: return "DENSE_COUNT_JOIN";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";

@@ -43,9 +43,10 @@ bool env_set(char const* name)
 
 }  // namespace sirius::test
 
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <curl/curl.h>
+#include <duckdb.hpp>
 
 extern "C" {
 #include <testcontainers-c/container.h>
@@ -54,16 +55,20 @@ extern "C" {
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sirius::test {
@@ -213,6 +218,101 @@ fs::path generate_fixtures(fs::path const& out_dir)
     {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
+}
+
+void create_special_key_fixtures(fs::path const& fixture_dir)
+{
+  auto const nation = fixture_dir / "parquet" / "nation.parquet";
+  auto const region = fixture_dir / "parquet" / "region.parquet";
+  if (!fs::is_regular_file(nation) || !fs::is_regular_file(region)) {
+    throw std::runtime_error("special-key glob fixtures require nation.parquet and region.parquet");
+  }
+
+  auto const root = fixture_dir / "glob-enc";
+  fs::remove_all(root);
+  std::array<std::pair<fs::path, fs::path>, 12> const fixtures{{
+    {nation, root / "a%2Fb.parquet"},
+    {region, root / "a" / "b.parquet"},
+    {nation, root / "x#1.parquet"},
+    {nation, root / "y?v.parquet"},
+    {nation, root / "100%.parquet"},
+    {nation, root / "t" / "col=a%20b" / "p0.parquet"},
+    {nation, root / "q" / "col=a%3Fb" / "p0.parquet"},
+    {nation, root / "q" / "col=a?b" / "p0.parquet"},
+    {nation, root / "f%20g.parquet"},
+    {region, root / "f g.parquet"},
+    {nation, root / "guard-before" / "co?l=value" / "p0.parquet"},
+    {nation, root / "guard-filename" / "report=foo?bar.parquet"},
+  }};
+  for (auto const& [source, destination] : fixtures) {
+    fs::create_directories(destination.parent_path());
+    fs::copy_file(source, destination, fs::copy_options::overwrite_existing);
+  }
+}
+
+void create_edge_types_fixture(fs::path const& fixture_dir)
+{
+  auto const output = fixture_dir / "parquet" / "edge_types.parquet";
+  auto temporary    = output;
+  temporary += ".tmp";
+
+  fs::create_directories(output.parent_path());
+  std::error_code ec;
+  fs::remove(temporary, ec);
+  if (ec) { throw std::runtime_error("cannot remove stale edge-types fixture: " + ec.message()); }
+
+  auto sql_quote = [](std::string_view value) {
+    std::string quoted{"'"};
+    for (auto const c : value) {
+      if (c == '\'') quoted.push_back('\'');
+      quoted.push_back(c);
+    }
+    quoted.push_back('\'');
+    return quoted;
+  };
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto result = con.Query(
+    "COPY ("
+    "SELECT CAST(id AS INTEGER) AS id, CAST(n AS INTEGER) AS n, "
+    "CAST(d AS DECIMAL(18,4)) AS d, CAST(ts AS TIMESTAMP) AS ts "
+    "FROM (VALUES "
+    "(1, CAST(NULL AS INTEGER), '0.0000', '1970-01-01 00:00:00'), "
+    "(2, 0, '-0.0001', '1970-01-01 00:00:00.000001'), "
+    "(3, -1, '0.0001', '1985-07-13 12:34:56.123456'), "
+    "(4, CAST(NULL AS INTEGER), '99999999999999.9999', '1999-12-31 23:59:59.999999'), "
+    "(5, 1, '-99999999999999.9999', '2000-02-29 12:00:00'), "
+    "(6, 2147483647, '12345678901234.5678', '2001-09-09 01:46:40'), "
+    "(7, CAST(NULL AS INTEGER), '-12345678901234.5678', '2010-01-01 00:00:00'), "
+    "(8, -2147483648, '42.4242', '2016-02-29 08:15:30'), "
+    "(9, 42, '-42.4242', '2020-02-29 23:59:59'), "
+    "(10, CAST(NULL AS INTEGER), '1.0000', '2024-07-24 03:01:01'), "
+    "(11, -42, '-1.0000', '2038-01-19 03:14:07'), "
+    "(12, 7, '9876543210.4321', '2050-06-30 10:20:30.4005'), "
+    "(13, CAST(NULL AS INTEGER), '-9876543210.4321', '2099-12-31 23:59:59.999999'), "
+    "(14, 8, '3141592653.5897', '2100-03-01 00:00:00'), "
+    "(15, 9, '-2718281828.4590', '1969-12-31 23:59:59.999999'), "
+    "(16, CAST(NULL AS INTEGER), '10000000000000.0000', '1900-01-01 00:00:00'), "
+    "(17, 10, '-10000000000000.0000', '2199-12-31 23:59:59'), "
+    "(18, 11, '0.0100', '2200-01-01 00:00:00'), "
+    "(19, CAST(NULL AS INTEGER), '-0.0100', '2262-04-11 23:47:16'), "
+    "(20, 12, '77777777777777.7777', '2200-12-31 23:59:59.123456')"
+    ") AS edge(id, n, d, ts)"
+    ") TO " +
+    sql_quote(temporary.string()) + " (FORMAT PARQUET)");
+  if (!result || result->HasError()) {
+    auto const error = result ? result->GetError() : std::string{"no query result"};
+    fs::remove(temporary, ec);
+    throw std::runtime_error("failed to generate edge-types parquet fixture: " + error);
+  }
+
+  fs::rename(temporary, output, ec);
+  if (ec) {
+    auto const error = ec.message();
+    fs::remove(temporary, ec);
+    throw std::runtime_error("failed to finalize edge-types parquet fixture: " + error);
+  }
 }
 
 // ---- host-side SigV4 + libcurl upload --------------------------------------
@@ -426,6 +526,119 @@ void maybe_upload_large_fixture(minio_instance const& http,
   }
 }
 
+void maybe_upload_tpch_sf1_fixture(minio_instance const& http,
+                                   minio_instance const& tls,
+                                   std::optional<fs::path> const& ca,
+                                   fs::path const& work)
+{
+  if (!env_truthy("SIRIUS_TEST_S3_TPCH") && !env_truthy("SIRIUS_BENCH_S3_TPCH")) return;
+
+  constexpr std::array<std::string_view, 8> tables = {
+    "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+  fs::path fixture_dir = work / "tpch_sf1";
+
+  auto fixture_complete = [&] {
+    std::error_code ec;
+    for (auto const table : tables) {
+      auto const parquet = fixture_dir / (std::string{table} + ".parquet");
+      if (!fs::exists(parquet, ec) || fs::file_size(parquet, ec) == 0 || ec) return false;
+    }
+    return true;
+  };
+
+  if (!fixture_complete()) {
+    fs::path duckdb_bin =
+      env_or("SIRIUS_TEST_DUCKDB",
+             (fs::path{SIRIUS_PROJECT_ROOT} / "build" / "release" / "duckdb").string());
+    fs::path db          = work / "tpch_sf1.duckdb";
+    fs::path fixture_tmp = work / "tpch_sf1.tmp";
+    std::error_code ec;
+    fs::remove(db, ec);
+    fs::remove_all(fixture_tmp, ec);
+    fs::create_directories(fixture_tmp);
+
+    std::string sql = "INSTALL tpch; LOAD tpch; CALL dbgen(sf=1); ";
+    for (auto const table : tables) {
+      auto const parquet = fixture_tmp / (std::string{table} + ".parquet");
+      sql += "COPY (SELECT * FROM " + std::string{table} + ") TO '" + parquet.string() +
+             "' (FORMAT PARQUET); ";
+    }
+
+    int rc = run_process({duckdb_bin.string(), db.string(), "-c", sql});
+    fs::remove(db, ec);
+    if (rc != 0) {
+      fs::remove_all(fixture_tmp, ec);
+      throw std::runtime_error("failed to generate SF1 TPC-H parquet fixtures via DuckDB CLI (" +
+                               duckdb_bin.string() + ")");
+    }
+
+    fs::remove_all(fixture_dir, ec);
+    fs::rename(fixture_tmp, fixture_dir, ec);
+    if (ec) throw std::runtime_error("failed to finalize SF1 TPC-H fixture cache: " + ec.message());
+    if (!fixture_complete()) {
+      throw std::runtime_error("SF1 TPC-H fixture generation left an incomplete cache");
+    }
+  } else {
+    std::cout << "[s3] reusing cached SF1 TPC-H fixtures at " << fixture_dir << std::endl;
+  }
+
+  std::uintmax_t total_bytes = 0;
+  for (auto const table : tables) {
+    auto const parquet = fixture_dir / (std::string{table} + ".parquet");
+    auto const key     = "tpch/sf1/" + std::string{table} + ".parquet";
+    auto const bytes   = static_cast<std::int64_t>(fs::file_size(parquet));
+    total_bytes += static_cast<std::uintmax_t>(bytes);
+
+    auto upload = [&](minio_instance const& instance,
+                      std::string const& scheme,
+                      std::optional<fs::path> const& ca_bundle) {
+      std::FILE* file = std::fopen(parquet.c_str(), "rb");
+      if (file == nullptr) {
+        throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
+      }
+      auto const code =
+        s3_put(instance, scheme, uri_path_for(kBucket, key), file, bytes, ca_bundle);
+      std::fclose(file);
+      if (!(code == 200 || code == 204)) {
+        throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
+                                 std::to_string(code) + ") at " + instance.endpoint);
+      }
+    };
+
+    upload(http, "http", std::nullopt);
+    upload(tls, "https", ca);
+  }
+
+  setenv("SIRIUS_TEST_S3_TPCH_LOCAL_DIR", fixture_dir.c_str(), /*overwrite=*/1);
+  std::cout << "[s3] uploaded 8 SF1 TPC-H parquet fixtures (" << total_bytes << " bytes) to "
+            << http.endpoint << " and " << tls.endpoint << std::endl;
+}
+
+void maybe_upload_glob_scale_fixture(minio_instance const& http, fs::path const& fixture_dir)
+{
+  if (!env_truthy("SIRIUS_TEST_S3_GLOB_SCALE")) return;
+
+  constexpr std::size_t object_count = 1001;
+  auto const parquet                 = fixture_dir / "parquet" / "nation.parquet";
+  auto const parquet_size            = static_cast<std::int64_t>(fs::file_size(parquet));
+
+  for (std::size_t index = 0; index < object_count; ++index) {
+    auto const key = "glob-scale/part_" + std::to_string(index) + ".parquet";
+    std::FILE* f   = std::fopen(parquet.c_str(), "rb");
+    if (f == nullptr) throw std::runtime_error("cannot open glob-scale parquet fixture");
+    auto const code =
+      s3_put(http, "http", uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
+    std::fclose(f);
+    if (!(code == 200 || code == 204)) {
+      throw std::runtime_error("glob-scale upload failed for '" + key + "' (HTTP " +
+                               std::to_string(code) + ")");
+    }
+  }
+
+  std::cout << "[s3] uploaded " << object_count << " parquet objects under " << http.endpoint << "/"
+            << kBucket << "/glob-scale/" << std::endl;
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 void setenv_kv(char const* k, std::string const& v) { ::setenv(k, v.c_str(), /*overwrite=*/1); }
@@ -441,6 +654,8 @@ bool bring_up()
 
   fs::path ca_bundle = generate_self_signed_cert(certs_dir);
   generate_fixtures(fixture_dir);
+  create_special_key_fixtures(fixture_dir);
+  create_edge_types_fixture(fixture_dir);
 
   // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
   int http_req = make_minio_request();
@@ -470,6 +685,8 @@ bool bring_up()
   upload_fixtures(http, "http", fixture_dir, std::nullopt);
   upload_fixtures(tls, "https", fixture_dir, ca);
   maybe_upload_large_fixture(http, tls, ca, work);
+  maybe_upload_tpch_sf1_fixture(http, tls, ca, work);
+  maybe_upload_glob_scale_fixture(http, fixture_dir);
 
   // Publish the env contract the [s3] tests consume (mirrors the old env.sh).
   setenv_kv("SIRIUS_TEST_S3_ENDPOINT", http.endpoint);
@@ -526,6 +743,46 @@ bool ensure_s3_container_env()
     g_state = 2;  // best-effort: skip
     return false;
   }
+}
+
+bool put_s3_container_object(std::string_view key, std::span<std::uint8_t const> bytes)
+{
+  if (g_state != 1) { return false; }
+
+  auto endpoint         = env_or("SIRIUS_TEST_S3_ENDPOINT");
+  auto const scheme_end = endpoint.find("://");
+  if (scheme_end == std::string::npos) {
+    throw std::runtime_error("managed MinIO endpoint has no URI scheme");
+  }
+  auto const scheme = endpoint.substr(0, scheme_end);
+  auto authority    = endpoint.substr(scheme_end + 3);
+  if (scheme != "http" || authority.empty() || authority.find('/') != std::string::npos) {
+    throw std::runtime_error("managed MinIO object PUT requires the HTTP endpoint");
+  }
+
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> body(std::tmpfile(), &std::fclose);
+  if (!body) { throw std::runtime_error("cannot create temporary S3 upload body"); }
+  auto const written = std::fwrite(bytes.data(), 1, bytes.size(), body.get());
+  if (written != bytes.size()) {
+    throw std::runtime_error("cannot write temporary S3 upload body");
+  }
+  std::rewind(body.get());
+
+  minio_instance instance;
+  instance.endpoint  = std::move(endpoint);
+  instance.authority = std::move(authority);
+  auto const bucket  = env_or("SIRIUS_TEST_S3_BUCKET", kBucket);
+  auto const code    = s3_put(instance,
+                           scheme,
+                           uri_path_for(bucket, std::string{key}),
+                           body.get(),
+                           static_cast<std::int64_t>(bytes.size()),
+                           std::nullopt);
+  if (!(code == 200 || code == 204)) {
+    throw std::runtime_error("managed MinIO object PUT failed for '" + std::string{key} +
+                             "' (HTTP " + std::to_string(code) + ")");
+  }
+  return true;
 }
 
 void shutdown_s3_container_env()
