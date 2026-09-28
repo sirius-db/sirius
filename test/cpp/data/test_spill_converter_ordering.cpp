@@ -234,9 +234,9 @@ std::size_t count_not_expected(std::vector<std::int32_t> const& values)
 void warm_conversion_path()
 {
   rmm::cuda_stream stream;
-  auto batch = wrap_batch(make_settled_column(kExpected, stream.view()), stream.view());
+  auto batch = wrap_batch(make_settled_column(kExpected, stream), stream);
   sirius::convertible_data_batch wrapper(batch);
-  REQUIRE(wrapper.convert({env().host_space}, stream.view(), *env().mgr, true).has_value());
+  REQUIRE(wrapper.convert({env().host_space}, stream, *env().mgr, true).has_value());
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
 }
 
@@ -250,12 +250,12 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
   rmm::cuda_stream producer_stream;
   rmm::cuda_stream downgrade_stream;
 
-  auto col = make_settled_column(kStale, producer_stream.view());
+  auto col = make_settled_column(kStale, producer_stream);
 
   delay_state gate;
   std::vector<std::int32_t> final_bytes(kRows, kExpected);
   registered_host_memory final_bytes_registration(
-    final_bytes.data(), kRows * sizeof(std::int32_t), producer_stream.view(), gate);
+    final_bytes.data(), kRows * sizeof(std::int32_t), producer_stream, gate);
   REQUIRE(cudaLaunchHostFunc(producer_stream.value(), block_until_released, &gate) == cudaSuccess);
   REQUIRE(cudaMemcpyAsync(col->mutable_view().head<void>(),
                           final_bytes.data(),
@@ -263,7 +263,7 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
                           cudaMemcpyHostToDevice,
                           producer_stream.value()) == cudaSuccess);
 
-  auto batch = wrap_batch(std::move(col), producer_stream.view());
+  auto batch = wrap_batch(std::move(col), producer_stream);
   REQUIRE(wait_for_flag(gate.entered));
 
   sirius::convertible_data_batch wrapper(batch);
@@ -274,7 +274,7 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
   gated_thread downgrader(gate, [&] {
     worker_started.store(true, std::memory_order_release);
     try {
-      result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
+      result = wrapper.convert({env().host_space}, downgrade_stream, *env().mgr, true);
     } catch (...) {
       worker_error = std::current_exception();
     }
@@ -291,7 +291,7 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
   REQUIRE(cudaStreamSynchronize(downgrade_stream.value()) == cudaSuccess);
   REQUIRE(final_bytes_registration.unregister() == cudaSuccess);
 
-  auto const out = read_back(*batch, downgrade_stream.view());
+  auto const out = read_back(*batch, downgrade_stream);
   REQUIRE(out.size() == kRows);
   auto const torn = count_not_expected(out);
   INFO("host image carries " << torn << " stale (torn) values of " << kRows);
@@ -307,13 +307,13 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
   rmm::cuda_stream downgrade_stream;
 
   auto batch =
-    wrap_batch(make_settled_column(kExpected, reader_stream.view()), reader_stream.view());
+    wrap_batch(make_settled_column(kExpected, reader_stream), reader_stream);
   REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
 
   delay_state gate;
   std::vector<std::int32_t> reader_out(kRows, 0);
   registered_host_memory reader_out_registration(
-    reader_out.data(), kRows * sizeof(std::int32_t), reader_stream.view(), gate);
+    reader_out.data(), kRows * sizeof(std::int32_t), reader_stream, gate);
   {
     auto ro   = batch->to_read_only();
     auto view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
@@ -330,7 +330,7 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
 
   sirius::convertible_data_batch wrapper(batch);
   REQUIRE_FALSE(
-    wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, false).has_value());
+    wrapper.convert({env().host_space}, downgrade_stream, *env().mgr, false).has_value());
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
   std::atomic<bool> converted{false};
@@ -339,9 +339,9 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
   gated_thread downgrader(gate, [&] {
     worker_started.store(true, std::memory_order_release);
     try {
-      auto result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
+      auto result = wrapper.convert({env().host_space}, downgrade_stream, *env().mgr, true);
       if (!result.has_value()) { throw std::runtime_error("blocking downgrade did not convert"); }
-      rmm::device_buffer poison(kRows * sizeof(std::int32_t), downgrade_stream.view());
+      rmm::device_buffer poison(kRows * sizeof(std::int32_t), downgrade_stream);
       throw_if_cuda_error(
         cudaMemsetAsync(
           poison.data(), 0xEE, kRows * sizeof(std::int32_t), downgrade_stream.value()),
@@ -365,7 +365,7 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
   INFO("straggler reader observed " << scribbled << " scribbled values of " << kRows);
   REQUIRE(scribbled == 0);
 
-  auto const out = read_back(*batch, downgrade_stream.view());
+  auto const out = read_back(*batch, downgrade_stream);
   REQUIRE(out.size() == kRows);
   auto const torn = count_not_expected(out);
   INFO("host image carries " << torn << " torn values of " << kRows);
