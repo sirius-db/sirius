@@ -35,6 +35,9 @@ std::unique_ptr<cudf::column> restore_type(std::unique_ptr<cudf::column> column,
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// decode_frame
+//===----------------------------------------------------------------------===//
 decode_frame::decode_frame(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) noexcept
   : stream_(stream), mr_(mr)
 {
@@ -67,11 +70,14 @@ void decode_frame::read_bytes(void* destination, void const* source, std::size_t
   }
 }
 
-//===----------decode_session::impl----------===//
+//===----------------------------------------------------------------------===//
+// decode_session::impl
+//===----------------------------------------------------------------------===//
 struct decode_session::impl {
+  /// OPEN -> FINISHED or FAILED; no further append() or finish() calls allowed
   enum class phase { OPEN, FAILED, FINISHED };
   struct result_slot {
-    std::unique_ptr<cudf::column> column;
+    std::unique_ptr<cudf::column> column;  ///< The output column for this request
     std::optional<cudf::data_type> stored_type;
   };
   // The request copy keeps predicate strings, descriptors, and probe captures alive for queued
@@ -162,7 +168,9 @@ struct decode_session::impl {
   }
 };
 
-//===----------decode_session----------===//
+//===----------------------------------------------------------------------===//
+// decode_session
+//===----------------------------------------------------------------------===//
 decode_session::decode_session(std::span<rmm::cuda_stream_view const> streams,
                                rmm::device_async_resource_ref mr)
   : state_(std::make_unique<impl>(streams, mr))

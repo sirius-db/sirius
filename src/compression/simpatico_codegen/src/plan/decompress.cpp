@@ -632,8 +632,9 @@ std::unique_ptr<cudf::column> DecodeWalk::consume(ValueId value)
 {
   auto const key   = value_id_key(value);
   auto const found = memo.find(key);
-  if (found == memo.end() || !found->second)
+  if (found == memo.end() || !found->second) {
     throw std::runtime_error("decode: unresolved or consumed memo value " + value_label(value));
+  }
   auto count_it = remaining_consumers.find(key);
   if (count_it == remaining_consumers.end() || count_it->second == 0) {
     throw std::runtime_error("decode: memo value has no remaining consumer " + value_label(value));
