@@ -281,6 +281,14 @@ class parquet_batch_coalescer : public batch_coalescer {
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     if (file == nullptr) { return emitted; }
 
+    // Reject invalid ownership or coverage before recording a fallback or flushing pending work.
+    if (file->contract_id() != _contract_id) {
+      throw std::invalid_argument("parquet file contract does not match coalescer contract");
+    }
+    if (file->certificates().size() != 1 || file->dependencies().size() != 1) {
+      throw std::invalid_argument("parquet file requires one certificate and dependency");
+    }
+
     // Remember the first fully-pruned file. If the WHOLE source coalesces to
     // nothing, flush() emits one empty split built from it — zero splits mean
     // zero tasks, and the pipeline-completion accounting only fires from task
@@ -332,12 +340,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_comp,
                            std::move(slice_ds),
                            file->file_index);
-      if (!file->certificates().empty()) {
-        auto certificate     = file->certificates().front();
-        certificate.split_id = _next_split_id++;
-        _certificates.push_back(std::move(certificate));
-        _dependencies.push_back(file->dependencies().front());
-      }
+      auto certificate     = file->certificates().front();
+      certificate.split_id = _next_split_id++;
+      _certificates.push_back(std::move(certificate));
+      _dependencies.push_back(file->dependencies().front());
       _produced_any      = true;
       _acc_working_bytes = memory::saturating_add(_acc_working_bytes, cur_working);
       _acc_run_count     = memory::saturating_add(_acc_run_count, run_count);
@@ -741,8 +747,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     _sirius_dynamic_filters->ignore_columns(partition_cols);
   }
 
-  _file_paths             = bind.resolved_file_paths;
-  _evidence_index_by_file = make_read_view_evidence_index(_file_paths);
+  _file_paths = bind.resolved_file_paths;
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -775,13 +780,11 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
-  auto const& file_path     = _file_paths[idx];
-  auto const evidence_index = _evidence_index_by_file[idx];
+  auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, idx, evidence_index, io_ctx = std::move(io_ctx)]()
-           -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, idx, evidence_index, io_ctx);
+  return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, idx, io_ctx);
   };
 }
 
@@ -789,10 +792,7 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path,
-  std::size_t file_index,
-  std::size_t evidence_index,
-  std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -1222,6 +1222,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   if (_info->read_views && _info->contract_id != 0) {
     auto const& entry = _info->read_views->entry(_info->contract_id);
     if (auto const& evidence = entry.physical_evidence) {
+      std::call_once(_evidence_index_once, [this] {
+        _evidence_index_by_file = make_read_view_evidence_index(_file_paths);
+      });
+      auto const evidence_index =
+        _evidence_index_by_file.empty() ? file_index : _evidence_index_by_file[file_index];
       if (evidence_index >= evidence->size.size() ||
           evidence_index >= evidence->last_modified.size() ||
           evidence_index >= evidence->size_present.size() ||

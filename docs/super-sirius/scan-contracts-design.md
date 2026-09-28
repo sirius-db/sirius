@@ -63,14 +63,17 @@ Parquet definitions. Sirius refuses GPU lowering for affected scans and logs a
 warning once per source for the lifetime of the loaded Sirius module. Local
 queries may use the original CPU plan when fallback and source policy permit it;
 disabling fallback reports the GPU planning error. Catalog contents never
-substitute for missing trusted factories.
+substitute for missing trusted factories. Successful and unavailable factory results
+are cached per source for the lifetime of the loaded Sirius module; later planning
+lookups do not repeat host symbol resolution.
 
 Iceberg's trusted definitions come from the already-loaded extension's registration
 entry point, run in a private CPU reference catalog. This initialization occurs
 when Iceberg loads, or when Sirius loads if Iceberg is already present. It adds
 extension-load work; scan lookup neither creates the reference database nor
 retries its initialization. Missing trusted definitions cause GPU admission to
-decline.
+decline. A successful extension-load bootstrap replaces an earlier unavailable
+result, including one recorded by a lookup before Iceberg was loaded.
 
 The caller's mutable catalog only confirms registration. Replacing a function
 before its first lookup cannot make the replacement trusted.
@@ -118,9 +121,11 @@ bound snapshot selector is not exposed symmetrically through `MultiFileBindData`
 This selector evidence is checked separately from canonical identity.
 
 Path encoding avoids retaining another inventory beside the canonical content.
-Already sorted inventories need no sorting index during capture. Parquet keeps
-an index from scan file order to evidence order, preserving file order and
-duplicate entries without copying the path strings.
+Already sorted inventories need no sorting index during capture. Parquet builds
+an index from scan file order to evidence order only when physical evidence is
+consumed and the scan files are not already sorted. Metadata tasks share this
+index, preserving file order and duplicate entries without copying path strings.
+Sorted files use their original positions directly.
 
 ## Plan correspondence
 
@@ -155,14 +160,20 @@ and is never reused. Two scans can share read identity while retaining separate
 contracts for different projections or predicates.
 
 Fresh splits carry their consuming contract handle and per-slice materializer
-certificates. Parquet coalescing preserves every slice's certificate and
-dependencies. Native splits retain their range certificates, including the
-empty or fully pruned completion case. Insert-delta splits receive the consuming
+certificates. Parquet coalescing accepts a file only when its contract matches
+the consuming scan and it carries exactly one certificate and dependency. These
+checks precede any batching state changes. Each emitted slice retains that pair.
+An entirely pruned Parquet scan completes with one slice containing no row groups
+and one certificate.
+Native splits retain their range certificates; an empty or fully pruned native
+completion has no range certificates. Insert-delta splits receive the consuming
 scan's handle when cut from a shared delta job.
 
 Before materialization, the scan validates both the split handle and its
-certificate handles. A split from another scan is rejected even when both scans
-read the same files. Resident cached batches use pin identity and MVCC guards.
+certificate handles. Parquet splits must have one certificate and dependency per
+slice, with each dependency retaining that slice's footer. A split from another
+scan is rejected even when both scans read the same files. Resident cached batches
+use pin identity and MVCC guards.
 Streaming sources have scan contracts but do not produce fresh scan splits.
 
 An eligibility certificate begins as `not_evaluated` with evidence scope `none`.
@@ -253,9 +264,11 @@ converted to ordinary query errors.
 The explicit `gpu_execution()` entry captures its policy from the bound logical
 plan and retains it with the SQL template. After a GPU failure, it checks the
 fallback setting, then the bound policy, before rerunning the SQL on its CPU
-connection. This also applies when execution-window entry fails. Missing or
-incomplete source discovery forbids replay. The fallback helper additionally
-checks the SQL text for S3 references.
+connection. This also applies when execution-window entry fails. The replay
+connection validates the newly bound CPU plan before execution, so a changed view
+cannot inherit replay permission from the earlier binding. This check also runs
+with optimization disabled. Missing or incomplete source discovery forbids
+replay. The fallback helper additionally checks the SQL text for S3 references.
 
 Both entry paths propagate interrupts before replay decisions. At execution,
 a typed runtime-unavailable error for a query containing a literal S3 reference

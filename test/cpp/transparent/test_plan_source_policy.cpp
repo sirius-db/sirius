@@ -18,6 +18,7 @@
 #include "helper/type_conversions.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "sirius_sql_rewrite.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/read_view_registry.hpp"
@@ -33,6 +34,7 @@
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <duckdb/main/client_config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/parallel/interrupt.hpp>
@@ -398,6 +400,131 @@ TEST_CASE("Explicit replay permits local Parquet after refused window entry",
 }
 
 namespace {
+unsigned replay_source_executions = 0;
+unsigned replay_source_binds      = 0;
+
+struct replay_source_state : duckdb::GlobalTableFunctionState {
+  bool emitted = false;
+};
+
+// This source exposes its bound inventory without opening a filesystem. It proves
+// the plan-policy check itself rejects a changed source, independently of httpfs.
+duckdb::TableFunction rebound_policy_source(std::string name)
+{
+  return duckdb::TableFunction(
+    std::move(name),
+    {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN},
+    [](duckdb::ClientContext&, duckdb::TableFunctionInput& input, duckdb::DataChunk& output) {
+      auto& state = input.global_state->Cast<replay_source_state>();
+      if (state.emitted) return;
+      state.emitted = true;
+      ++replay_source_executions;
+      output.SetCardinality(1);
+      output.SetValue(0, 0, duckdb::Value::INTEGER(42));
+    },
+    [](duckdb::ClientContext& context,
+       duckdb::TableFunctionBindInput& input,
+       duckdb::vector<duckdb::LogicalType>& types,
+       duckdb::vector<std::string>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+      auto state = duckdb::get_sirius_connection_state(context);
+      if (state && state->is_cpu_fallback_active()) {
+        ++replay_source_binds;
+        duckdb::ClientConfig::GetConfig(context).enable_optimizer =
+          input.inputs[1].GetValue<bool>();
+      }
+      types             = {duckdb::LogicalType::INTEGER};
+      names             = {"id"};
+      auto bind         = duckdb::make_uniq<duckdb::MultiFileBindData>();
+      bind->types       = types;
+      bind->names       = names;
+      auto const source = input.inputs[0].ToString();
+      if (source == "incomplete") {
+        bind->file_list = duckdb::make_shared_ptr<throwing_list>();
+      } else {
+        bind->file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(
+          duckdb::vector<duckdb::OpenFileInfo>{duckdb::OpenFileInfo(
+            source == "s3" ? "s3://bucket/rebound.parquet" : "local.parquet")});
+      }
+      return std::move(bind);
+    },
+    [](duckdb::ClientContext&,
+       duckdb::TableFunctionInitInput&) -> duckdb::unique_ptr<duckdb::GlobalTableFunctionState> {
+      return duckdb::make_uniq<replay_source_state>();
+    });
+}
+}  // namespace
+
+TEST_CASE("Explicit replay validates sources after a view is replaced",
+          "[integration][policy][explicit_replay][rebound_replay]")
+{
+  if (sirius::test::run_isolated()) return;
+  auto const source    = GENERATE("s3", "incomplete", "local");
+  auto const optimizer = GENERATE(true, false);
+  auto const fallback  = GENERATE(true, false);
+  CAPTURE(source, optimizer, fallback);
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con = *fixture.con;
+  fixture.run_ok("SET gpu_execution=false");
+  fixture.run_ok(std::string("SET enable_duckdb_fallback=") + (fallback ? "true" : "false"));
+  auto const function = "replay_source_" + fixture.attach_alias;
+  auto const view     = fixture.attach_alias + ".main.replay_view";
+  duckdb::ExtensionLoader loader(*con.context->db, "rebound_replay_test");
+  loader.RegisterFunction(rebound_policy_source(function));
+  fixture.run_ok("CREATE VIEW " + view + " AS SELECT * FROM " + function + "('local', true)");
+
+  duckdb::Connection replace(*con.context->db);
+  REQUIRE_FALSE(replace.Query("SET gpu_execution=false")->HasError());
+  auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(context);
+  unsigned replays                     = 0;
+  context->cpu_replay_hook_for_testing = [&] {
+    ++replays;
+    auto changed =
+      replace.Query("CREATE OR REPLACE VIEW " + view + " AS SELECT * FROM " + function + "('" +
+                    source + "', " + (optimizer ? "true" : "false") + ")");
+    INFO((changed->HasError() ? changed->GetError() : "view replaced"));
+    REQUIRE_FALSE(changed->HasError());
+  };
+  struct reset_hook {
+    duckdb::SiriusContext& context;
+    ~reset_hook() { context.cpu_replay_hook_for_testing = {}; }
+  } reset{*context};
+  fixture.run_ok("SET sirius_test_sync_cpu_replay=true");
+  fixture.run_ok("SET sirius_test_mark_runtime_unavailable_before_window=true");
+  auto prepared = con.Prepare("SELECT * FROM gpu_execution('SELECT id FROM " + view + "')");
+  REQUIRE(prepared);
+  INFO((prepared->HasError() ? prepared->GetError() : ""));
+  REQUIRE_FALSE(prepared->HasError());
+  replay_source_executions = 0;
+  replay_source_binds      = 0;
+  auto result              = prepared->Execute();
+  REQUIRE(result);
+  INFO((result->HasError() ? result->GetError() : "CPU source executed"));
+  CHECK(replays == (fallback ? 1 : 0));
+  CHECK(replay_source_binds == (fallback ? 1 : 0));
+  CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+  if (fallback && std::string_view(source) == "local") {
+    REQUIRE_FALSE(result->HasError());
+    auto chunk = result->Fetch();
+    REQUIRE(chunk);
+    REQUIRE(chunk->size() == 1);
+    CHECK(chunk->GetValue(0, 0).GetValue<int32_t>() == 42);
+    CHECK(replay_source_executions == 1);
+  } else {
+    CHECK(replay_source_executions == 0);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+    if (fallback) {
+      CHECK(result->GetError().find(std::string_view(source) == "s3"
+                                      ? "S3 CPU fallback is not supported"
+                                      : "source discovery incomplete") != std::string::npos);
+    } else {
+      CHECK(result->GetError().find("SiriusExecuteQuery error:") != std::string::npos);
+    }
+  }
+}
+
+namespace {
 int precedence_bind_count = 0;
 std::string precedence_replan_error;
 
@@ -478,6 +605,83 @@ TEST_CASE("Transparent finalize preserves GPU errors before incomplete-source ve
       CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
     }
   }
+}
+
+TEST_CASE("Finalize preserves runtime-unavailable errors after S3 scan elimination",
+          "[integration][policy][transparent_precedence][finalize_s3_unavailable]")
+{
+  if (sirius::test::run_isolated()) return;
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con = *fixture.con;
+  fixture.run_ok("SET gpu_execution = false");
+  duckdb::ExtensionLoader loader(*con.context->db, "eliminated_s3_test");
+  // Bind an S3 inventory without network I/O. The extra argument selects this test overload.
+  loader.RegisterFunction(duckdb::TableFunction(
+    "read_parquet",
+    {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::INTEGER},
+    [](duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {
+      FAIL("The eliminated scan must not execute");
+    },
+    [](duckdb::ClientContext&,
+       duckdb::TableFunctionBindInput& input,
+       duckdb::vector<duckdb::LogicalType>& types,
+       duckdb::vector<std::string>& names) -> duckdb::unique_ptr<duckdb::FunctionData> {
+      types           = {duckdb::LogicalType::INTEGER};
+      names           = {"id"};
+      auto bind       = duckdb::make_uniq<duckdb::MultiFileBindData>();
+      bind->types     = types;
+      bind->names     = names;
+      bind->file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(
+        duckdb::vector<duckdb::OpenFileInfo>{duckdb::OpenFileInfo(input.inputs[0].ToString())});
+      return std::move(bind);
+    }));
+  std::string const source = "SELECT * FROM read_parquet('s3://bucket/data.parquet', 0)";
+  std::string const query  = source + " WHERE false";
+  REQUIRE(sirius::references_sirius_owned_s3_parquet(query));
+  fixture.run_ok("BEGIN");
+  for (bool eliminate : {false, true}) {
+    auto prepared = con.Prepare(eliminate ? query : source);
+    REQUIRE_FALSE(prepared->HasError());
+    REQUIRE(prepared->data->physical_plan);
+    auto policy = derive_plan_source_policy(prepared->data->physical_plan->Root(), *con.context);
+    REQUIRE(policy.discovery_complete);
+    CHECK(policy.reads_sirius_owned_s3() == !eliminate);
+    CHECK(policy.scans.empty() == eliminate);
+  }
+  fixture.run_ok("ROLLBACK");
+
+  fixture.run_ok("SET gpu_execution = true");
+  fixture.run_ok("SET enable_duckdb_fallback = false");
+  auto context = sirius::test::get_registered_sirius_context(con);
+  REQUIRE(context);
+  context->mark_runtime_unavailable();
+  auto local_error = con.Query("SELECT 42");
+  REQUIRE(local_error->HasError());
+  REQUIRE(local_error->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+  auto const expected_message = local_error->GetErrorObject().RawMessage();
+  REQUIRE(expected_message.starts_with("Sirius GPU runtime is unavailable"));
+
+  for (bool fallback : {false, true}) {
+    CAPTURE(fallback);
+    fixture.run_ok(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"));
+    auto const before = context->get_transparent_execution_stats();
+    auto result       = con.Query(query);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+    CHECK(result->GetErrorObject().RawMessage() == expected_message);
+    auto const after = context->get_transparent_execution_stats();
+    CHECK(after.fallbacks == before.fallbacks);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.successful_rebinds == before.successful_rebinds);
+    CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+  }
+
+  auto const before = context->get_transparent_execution_stats();
+  auto local_result = con.Query("SELECT 42");
+  REQUIRE_FALSE(local_result->HasError());
+  CHECK(local_result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  CHECK(context->get_transparent_execution_stats().fallbacks == before.fallbacks + 1);
 }
 
 TEST_CASE("Transparent stream planning preserves errors when fallback is disabled",

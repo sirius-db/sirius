@@ -88,7 +88,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   candidate_origin logical_plan_origin_;
 
   /// Optimizer-hook originals, generation-stamped and keyed by LogicalGet table index.
-  /// Commit C compares its rebuilt candidates against this retained capture.
+  /// Execution rebuilds compare candidates against this retained capture.
   mutable std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views_;
 
   /// Bound views captured from DuckDB's retained CPU plan at finalize.

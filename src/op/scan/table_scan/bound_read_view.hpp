@@ -125,6 +125,7 @@ struct logical_bound_read_view_capture {
 };
 
 // Maps original file order to evidence order without retaining another path inventory.
+// An empty result means the paths are already sorted; use the original file position.
 std::vector<std::size_t> make_read_view_evidence_index(std::span<std::string const> paths);
 
 // Paths are borrowed only while encoding and are not retained beside the canonical text.
