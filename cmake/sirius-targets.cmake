@@ -82,9 +82,7 @@ foreach(_target sirius_objects sirius_core sirius_extension
   # protobuf.
   target_include_directories(
     ${_target}
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
-            ${SIRIUS_SUBSTRAIT_DIR}/src/include
+    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
@@ -111,8 +109,7 @@ foreach(_target sirius_objects sirius_core sirius_extension
     yaml-cpp::yaml-cpp
     roaring::roaring
     telemetry_bridge
-    core_functions_extension
-    parquet_extension
+    $<BUILD_INTERFACE:sirius::duckdb_dependency>
     simpatico)
   if(BUILD_WITH_CTRACK)
     target_link_libraries(${_target} ${_link_scope} ctrack::ctrack)
@@ -134,7 +131,6 @@ foreach(_target sirius_objects sirius_core sirius_extension
     ${SIRIUS_CURL_TARGET}
     OpenSSL::Crypto
     absl::any_invocable)
-  add_dependencies(${_target} duckdb_static)
 endforeach()
 
 # `sirius_core` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
@@ -186,7 +182,7 @@ target_include_directories(
 target_compile_features(sirius_shared PUBLIC cxx_std_20)
 target_link_libraries(
   sirius_shared
-  PRIVATE duckdb_static
+  PRIVATE sirius::duckdb_dependency
           "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
 set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
 
