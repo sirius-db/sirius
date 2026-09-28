@@ -653,9 +653,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
-  // The duckdb-table probe is OWNING: the shared_ptr holds the entry alive across the
-  // guards below, so a concurrent UNPIN on another connection cannot invalidate it
-  // mid-check. `pinned` is the shared raw view over whichever probe matched.
+  // Both probes are OWNING: the shared_ptr holds the entry alive across the guards below, so a
+  // concurrent UNPIN on another connection cannot invalidate it mid-check. `pinned` is the
+  // shared raw view over whichever probe matched.
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
@@ -685,7 +685,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     auto const files =
       resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned       = pinned_owner.get();
     }
   }
 

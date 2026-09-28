@@ -3060,12 +3060,12 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   return covering_mismatch != nullptr ? covering_mismatch : identity_match;
 }
 
-pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
+std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_parquet_files(
   std::span<std::string const> resolved_file_paths) const
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
-    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry.get(); }
+    if (entry->cache_info.matches_parquet_files(resolved_file_paths)) { return entry; }
   }
   return nullptr;
 }
@@ -3365,12 +3365,13 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
 {
   const auto& table_info = op->get_ingestible().table_info();
 
-  // Snapshot the pin table, then match outside the lock. Each snapshotted shared_ptr also
-  // pins the entry for the rest of this match, so a concurrent unpin cannot invalidate an
-  // entry mid-match — and the matching below (can_serve_with_columns, validate, zone-map plan
-  // building, the MVCC branch) is slow enough that holding _pinned_entries_mutex across it
-  // would serialize every concurrent query's prepare against every other's.
-  std::vector<std::pair<std::string, std::shared_ptr<pinned_entry>>> snapshot;
+  // Snapshot the pin table as read-only owners, then match outside the lock. Each snapshotted
+  // shared_ptr pins the entry for the rest of this match, so a concurrent unpin cannot
+  // invalidate an entry mid-match — and the matching below (can_serve_with_columns, validate,
+  // zone-map plan building, the MVCC branch) is slow enough that holding
+  // _pinned_entries_mutex across it would serialize every concurrent query's prepare against
+  // every other's.
+  std::vector<std::pair<std::string, std::shared_ptr<const pinned_entry>>> snapshot;
   {
     std::lock_guard pin_lk{_pinned_entries_mutex};
     snapshot.reserve(_pinned_entries.size());

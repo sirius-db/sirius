@@ -249,8 +249,10 @@ struct pinned_entry {
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
   /// Version-keyed cache of the last keep-mask set: a query at an unchanged table version
   /// reuses it instead of re-running the capture+fill walk. Lazily created, reset on
-  /// unpin/re-pin, null for parquet pins.
-  std::shared_ptr<mvcc_mask_version_cache> mvcc_mask_cache;
+  /// unpin/re-pin, null for parquet pins. Mutable because this is a logically const cache:
+  /// the slot is read and published under the pin-table lock, and the cache contents have
+  /// their own mutex.
+  mutable std::shared_ptr<mvcc_mask_version_cache> mvcc_mask_cache;
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -773,11 +775,12 @@ class sirius_scan_manager {
     duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
-  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
-  /// and read it inside one slot-scoped window, and never hold it across a pin
-  /// or unpin. First match wins if one file set was pinned under two names.
+  /// (cache_entry_info::matches_parquet_files), or nullptr. OWNING: the returned
+  /// shared_ptr keeps the entry alive while the plan-time residency gate reads
+  /// it, even if another connection concurrently unpins it. First match wins if
+  /// one file set was pinned under two names.
   /// Read by the plan-time compressed-materialization residency gate.
-  [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
+  [[nodiscard]] std::shared_ptr<const pinned_entry> find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
@@ -849,17 +852,11 @@ class sirius_scan_manager {
    * Handed out as a `shared_ptr` keyed by query id: a caller resolves it under the state
    * mutex and uses it outside, so an erase racing a reader cannot pull the state out from
    * under them. The manager's shared members (ioctxs, registry, pinned entries, thread pool)
-   * stay outside — they are process-wide and outlive every query. What lives here is exactly
-   * what the old global `reset()` used to wipe, and wiping it globally is what made
-   * finishing query A tear down query B's scan work.
+   * stay outside — they are process-wide and outlive every query.
    *
    * Operator ids restart at 0 for every query, so `metadata_processor`'s slot map (keyed by
    * `scan_op->get_operator_id()`) is unique only *within* an entry; one shared coalescer
    * would let two queries' scans collide on the same slot.
-   *
-   * Member order is teardown order: `dispatcher` is declared LAST so it is destroyed FIRST,
-   * while the coalescer and providers its tasks captured are still alive. The destructor's
-   * `drain()` makes that safe even if a member is later added below it.
    */
   struct query_scan_manager_state {
     ~query_scan_manager_state() { drain(); }
@@ -933,12 +930,12 @@ class sirius_scan_manager {
   /// One matched (scan op ← pinned entry) pairing from the cache-match pass.
   /// Provider construction is deferred to after run_mvcc_mask_jobs so each
   /// provider takes its own copy of the entry's completed mask set. The
-  /// assignment SHARES OWNERSHIP of the entry across that gap: the mask and
+  /// assignment SHARES READ-ONLY OWNERSHIP of the entry across that gap: the mask and
   /// insert-delta jobs block for as long as their IO takes, and with concurrent
   /// queries another connection may unpin in that window.
   struct cached_assignment {
     op::scan::sirius_gpu_scan_operator* op{nullptr};
-    std::shared_ptr<pinned_entry> entry;
+    std::shared_ptr<const pinned_entry> entry;
     std::vector<std::size_t> columns;  ///< selected columns, materialized order
     std::string entry_name;            ///< handoff key into the state's pending mask jobs
     cached_scan_plan plan;             ///< zone-map survivor plan, moved into the provider
