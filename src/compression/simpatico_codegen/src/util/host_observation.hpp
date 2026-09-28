@@ -11,7 +11,7 @@ namespace simpatico {
  * @brief Pinned host storage that one thread reuses as the destination of its device-to-host
  * observation copies.
  *
- * Capacity doubles from 64 KiB up to `cap_bytes`; a request above the cap is refused with nullptr
+ * Allocations range from 64 KiB to `cap_bytes`; a request above the cap is refused with nullptr
  * instead of served. Thread-exit destruction may run after the CUDA context is gone, so the
  * destructor ignores the `cudaFreeHost` result, the convention `stream_pool::shutdown` follows.
  */
@@ -28,6 +28,9 @@ class pinned_staging_slab {
 
   /**
    * @brief Pinned storage of at least @p bytes, or nullptr when @p bytes exceeds `cap_bytes`.
+   *
+   * The returned storage is borrowed until the slab grows or is destroyed. Finish any GPU copy
+   * using it before reserving again; reserve() does not wait for pending copies.
    *
    * @throw std::runtime_error if the pinned allocation fails
    */
@@ -48,15 +51,13 @@ pinned_staging_slab& thread_pinned_staging();
  * @brief Copy @p bytes device bytes at @p source into @p destination and return once @p stream has
  * completed.
  *
- * Decode-time host observations that need one copy completed before the caller continues go through
- * this call; the row-id selection helpers (`chunk_row_set_build`, `row_id_space`) pair two copies
- * with one wait and still copy into pageable memory. The copy lands in the calling thread's pinned
- * staging slab (`thread_pinned_staging`) and completes with an explicit `cudaStreamSynchronize` on
- * @p stream, after which the bytes are moved into @p destination; a copy into pageable memory would
- * instead wait inside the driver and serialize other threads' CUDA calls behind it. Only a read
- * above `pinned_staging_slab::cap_bytes` copies straight into @p destination. Because every read
- * completes before returning, the slab is idle again at the next reservation; do not hand it to
- * work that outlives the call. The wait also covers whatever other work is queued on @p stream.
+ * Copies through thread_pinned_staging(), waits for @p stream, then copies the bytes to @p
+ * destination. Reads above `pinned_staging_slab::cap_bytes` copy directly to @p destination
+ * instead. The wait also covers other work queued on @p stream.
+ *
+ * On failure, stream completion is not guaranteed. The caller must complete any pending copy before
+ * releasing its buffers or reusing the staging storage. decode_frame::read_bytes() attempts to
+ * complete the stream before rethrowing.
  *
  * @throw std::runtime_error carrying the CUDA error string if the copy, the wait, or the pinned
  * allocation fails

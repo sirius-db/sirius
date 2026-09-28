@@ -105,7 +105,7 @@ struct PlanNode {
   std::unordered_map<std::string, std::unique_ptr<compressed_representation>> channels;
 
   // Per-node decode metadata populated by the compress walk from
-  // rep->describe_meta(). Used by reconstruct_representation to supply
+  // rep->describe_meta(). Used by reconstruct_decode_representation to supply
   // information (e.g. uncompressed_size for ANS/Bitcomp) that cannot be
   // recovered from the stored channel buffers alone.
   leaf_meta_v meta{leaf_meta::none{}};
@@ -113,12 +113,14 @@ struct PlanNode {
   // Byte width of a `dictionary` node's keys: > 0 when every key has that uniform width, 0 when the
   // keys are variable-width or empty, -1 when unknown. Written only before the tree is published
   // and never serialized: the compress walk (plan/compress.cpp) copies the representation's
-  // prepared width, and the reader (api/compressed_table_io.cpp) derives the same value from the
-  // self-stored representation or the stored identity `keys_offsets` leaf, so both producers agree
-  // route for route and a `keys_offsets` output consumed by another node stays -1 on both. Consumed
-  // by make_decode_dictionary (plan/representation_factory.cpp), which publishes it on the
-  // frame-local representation and rejects a value that contradicts the key channels, and by the
-  // dict_codes gather specialization (plan/decompress.cpp), which declines a value <= 0.
+  // prepared width, and the reader (api/compressed_table_io.cpp) derives it from the self-stored
+  // representation or a supported identity `keys_offsets` leaf. Loading leaves the hint unknown for
+  // offsets it cannot inspect, including large arrays and INT64 offsets. A `keys_offsets` output
+  // consumed by another node stays -1 on both. Consumed by make_decode_dictionary
+  // (plan/representation_factory.cpp), which publishes it on the decode-local representation and
+  // checks that a positive width matches the total key character size, and by the dict_codes gather
+  // specialization (plan/decompress.cpp), which declines a value <= 0. A positive hint must
+  // describe every key; decode does not recheck each offset.
   std::int64_t dictionary_key_width_hint = -1;
 };
 

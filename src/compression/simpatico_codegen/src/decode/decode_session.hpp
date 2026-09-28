@@ -196,8 +196,8 @@ class decode_session final {
    *
    * @param streams Nonempty list of borrowed streams, assigned to requests in rotation
    * @param mr Borrowed resource for device allocations; it must honor the stream-ordered
-   * deallocation contract of `device_async_resource_ref` (a synchronous resource stays correct but
-   * synchronizes the device on every release, which is unsuitable for production and gated tests)
+   * deallocation contract of `device_async_resource_ref` (a synchronous resource may block on
+   * release)
    */
   decode_session(std::span<rmm::cuda_stream_view const> streams, rmm::device_async_resource_ref mr);
   /**
@@ -213,11 +213,12 @@ class decode_session final {
   /**
    * @brief Copy a request and submit its decode work, retaining the result until finish().
    *
-   * Waits only on the request's own stream, for host readbacks the request needs and inside cuDF
-   * calls that synchronize it (such as constructing a predicate needle); it never waits to release
-   * memory. Such waits can include other work already queued on that stream, so that work must not
-   * depend on a later call from this CPU thread. Submission failures attempt to complete pending
-   * work, close the session, and rethrow the original exception.
+   * May wait for host readbacks and cuDF calls on the request's stream, such as constructing a
+   * generic predicate needle. Device temporaries release in stream order; allocation or release may
+   * still block depending on the memory resource. Such waits can include other work already queued
+   * on that stream, so that work must not depend on a later call from this CPU thread. Submission
+   * failures attempt to complete pending work, close the session, and rethrow the original
+   * exception.
    */
   void append(column_decode_request const& request);
   /**
@@ -279,7 +280,8 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
  *
  * Otherwise as the overload above, which leaves a dictionary's key width unknown.
  *
- * @throw std::invalid_argument also if the hint contradicts the key channels
+ * @throw std::invalid_argument also if the hint is below -1 or a positive hint disagrees with the
+ * total key character size
  */
 [[nodiscard]] std::unique_ptr<compressed_representation> reconstruct_decode_representation(
   PlanNode const& node,
