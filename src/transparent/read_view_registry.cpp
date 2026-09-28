@@ -17,6 +17,7 @@
 #include "transparent/read_view_registry.hpp"
 
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -547,6 +548,16 @@ void validate_split_for_gpu(scan_contract_id expected, scan_info const& split)
       throw std::runtime_error("scan split certificate contract mismatch: expected " +
                                std::to_string(expected) + ", got " +
                                std::to_string(certificate.contract_id));
+    }
+  }
+  if (auto const* parquet = dynamic_cast<parquet_split_info const*>(&split)) {
+    if (split.certificates().size() != parquet->rg_slices.size()) {
+      throw std::runtime_error("parquet split requires one certificate and dependency per slice");
+    }
+    for (std::size_t i = 0; i < parquet->rg_slices.size(); ++i) {
+      if (split.dependencies()[i].footer != parquet->rg_slices[i].file_metadata) {
+        throw std::runtime_error("parquet split dependency footer does not match its slice");
+      }
     }
   }
 }

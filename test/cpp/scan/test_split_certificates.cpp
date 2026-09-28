@@ -44,9 +44,12 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -155,6 +158,93 @@ std::unique_ptr<parquet_ingestible_table_info> parquet_info(scan_contract_id con
   return info;
 }
 
+struct parquet_certificate_fixture {
+  static constexpr scan_contract_id contract_id = 53;
+  temporary_directory files;
+  std::shared_ptr<sirius::io::kvikio_context> ioctx =
+    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<gpu_ingestible> ingestible;
+
+  parquet_certificate_fixture()
+  {
+    auto info         = parquet_info(contract_id);
+    auto const source = info->resolved_file_paths.front();
+    info->resolved_file_paths.clear();
+    for (auto const* name : {"first.parquet", "second.parquet", "third.parquet"}) {
+      auto path = (files.path / name).string();
+      std::filesystem::copy_file(source, path);
+      info->resolved_file_paths.push_back(std::move(path));
+    }
+    info->approximate_batch_size = 64 * 1024 * 1024;
+    ingestible                   = make_ingestible(std::move(info));
+  }
+
+  std::unique_ptr<parquet_file_scan_info> next_file()
+  {
+    auto provider = ingestible->next_split_provider(
+      [this](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    REQUIRE(provider);
+    auto info  = provider();
+    auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
+    REQUIRE(file);
+    REQUIRE(file->certificates().size() == 1);
+    REQUIRE(file->dependencies().size() == 1);
+    REQUIRE_FALSE(file->row_groups.empty());
+    info.release();
+    return std::unique_ptr<parquet_file_scan_info>(file);
+  }
+};
+
+// Duplicate only the metadata under test; each input keeps fresh prefetch state.
+std::unique_ptr<parquet_file_scan_info> copy_parquet_file_metadata(
+  parquet_file_scan_info const& file)
+{
+  auto copy                     = std::make_unique<parquet_file_scan_info>();
+  copy->file_metadata           = file.file_metadata;
+  copy->file_path               = file.file_path;
+  copy->file_index              = file.file_index;
+  copy->datasource              = file.datasource;
+  copy->row_groups              = file.row_groups;
+  copy->reader_options          = file.reader_options;
+  copy->partition_values        = file.partition_values;
+  copy->disable_filter_pushdown = file.disable_filter_pushdown;
+  copy->carrier_unavailable     = file.carrier_unavailable;
+  copy->set_contract_payload(
+    file.contract_id(),
+    std::vector<split_materializer_certificate>(file.certificates().begin(),
+                                                file.certificates().end()),
+    std::vector<split_dependencies>(file.dependencies().begin(), file.dependencies().end()));
+  return copy;
+}
+
+void check_parquet_file_split(scan_info const& info,
+                              parquet_file_scan_info const& file,
+                              uint64_t split_id)
+{
+  auto const* split = dynamic_cast<parquet_split_info const*>(&info);
+  REQUIRE(split);
+  REQUIRE(split->rg_slices.size() == 1);
+  REQUIRE(split->certificates().size() == 1);
+  REQUIRE(split->dependencies().size() == 1);
+  CHECK(split->contract_id() == file.contract_id());
+  CHECK(split->certificates()[0].input_identity == file.certificates()[0].input_identity);
+  CHECK(split->certificates()[0].split_id == split_id);
+  CHECK(split->dependencies()[0].footer == file.file_metadata);
+  CHECK(split->rg_slices[0].file_metadata == file.file_metadata);
+  CHECK(split->rg_slices[0].file_path == file.file_path);
+  CHECK(split->rg_slices[0].file_index == file.file_index);
+  std::vector<cudf::size_type> row_groups;
+  for (auto const& group : file.row_groups)
+    row_groups.push_back(group.index);
+  CHECK(split->rg_slices[0].row_group_indices == row_groups);
+  CHECK(split->estimated_bytes() == file.estimated_bytes());
+  CHECK(split->estimated_working_set_bytes() == file.estimated_working_set_bytes());
+  CHECK(split->partition_values == file.partition_values);
+  CHECK(split->disable_filter_pushdown == file.disable_filter_pushdown);
+  CHECK(split->reader_options == file.reader_options);
+  REQUIRE_NOTHROW(validate_split_for_gpu(file.contract_id(), *split));
+}
+
 bound_read_view test_view()
 {
   bound_read_identity identity;
@@ -241,7 +331,7 @@ TEST_CASE("Scan contract handles are process-wide monotonic and name immutable e
                                              column_requirements{},
                                              predicate_contract{},
                                              {materializer_kind::parquet, "parquet.v1"}),
-                      Catch::Matchers::Contains("duplicate scan node"));
+                      Catch::Matchers::ContainsSubstring("duplicate scan node"));
 }
 
 TEST_CASE("Split certificates expose parallel dependencies and unevaluated eligibility",
@@ -357,6 +447,99 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   CHECK(position == paths.size());
 }
 
+TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
+          "[scan][certificate][parquet_certificate]")
+{
+  auto const defect  = std::string{GENERATE("missing", "extra", "foreign", "uncertified_foreign")};
+  auto const pending = std::string{GENERATE("empty", "rows", "pruned")};
+  auto const all_pruned = GENERATE(false, true);
+  CAPTURE(defect, pending, all_pruned);
+  parquet_certificate_fixture fixture;
+  auto coalescer = fixture.ingestible->create_batch_coalescer();
+  auto saved     = fixture.next_file();
+  if (pending == "pruned") saved->row_groups.clear();
+  if (pending != "empty") { REQUIRE(coalescer->push(copy_parquet_file_metadata(*saved)).empty()); }
+
+  auto malformed = fixture.next_file();
+  if (all_pruned) malformed->row_groups.clear();
+  // A rejected file must not flush a pending batch or replace its metadata.
+  malformed->partition_values        = {"rejected"};
+  malformed->disable_filter_pushdown = !saved->disable_filter_pushdown;
+  malformed->reader_options =
+    std::make_shared<cudf::io::parquet_reader_options>(*saved->reader_options);
+  auto id = fixture.contract_id;
+  std::vector<split_materializer_certificate> certificates(malformed->certificates().begin(),
+                                                           malformed->certificates().end());
+  std::vector<split_dependencies> dependencies(malformed->dependencies().begin(),
+                                               malformed->dependencies().end());
+  if (defect == "missing" || defect == "uncertified_foreign") {
+    certificates.clear();
+    dependencies.clear();
+  } else if (defect == "extra") {
+    certificates.push_back(certificates.front());
+    dependencies.push_back(dependencies.front());
+  }
+  if (defect == "foreign" || defect == "uncertified_foreign") {
+    ++id;
+    for (auto& certificate : certificates)
+      certificate.contract_id = id;
+  }
+  malformed->set_contract_payload(id, std::move(certificates), std::move(dependencies));
+  REQUIRE_THROWS_AS(coalescer->push(std::move(malformed)), std::invalid_argument);
+
+  auto preserved = coalescer->flush();
+  REQUIRE(preserved.size() == (pending == "empty" ? 0 : 1));
+  if (!preserved.empty()) check_parquet_file_split(*preserved.front(), *saved, 1);
+  REQUIRE(coalescer->flush().empty());
+
+  auto next = fixture.next_file();
+  REQUIRE(coalescer->push(copy_parquet_file_metadata(*next)).empty());
+  auto reused = coalescer->flush();
+  REQUIRE(reused.size() == 1);
+  check_parquet_file_split(*reused.front(), *next, pending == "empty" ? 1 : 2);
+  CHECK(coalescer->flush().empty());
+}
+
+TEST_CASE("Parquet split validation requires one matching certificate per slice",
+          "[scan][certificate][parquet_certificate]")
+{
+  auto const defect = std::string{GENERATE("missing", "partial", "extra", "swapped_footers")};
+  CAPTURE(defect);
+  parquet_certificate_fixture fixture;
+  auto coalescer = fixture.ingestible->create_batch_coalescer();
+  REQUIRE(coalescer->push(fixture.next_file()).empty());
+  REQUIRE(coalescer->push(fixture.next_file()).empty());
+  auto splits = coalescer->flush();
+  REQUIRE(splits.size() == 1);
+  auto* split = dynamic_cast<parquet_split_info*>(splits.front().get());
+  REQUIRE(split);
+  REQUIRE(split->rg_slices.size() == 2);
+  REQUIRE(split->certificates().size() == 2);
+  REQUIRE(split->dependencies().size() == 2);
+  REQUIRE_NOTHROW(validate_split_for_gpu(fixture.contract_id, *split));
+
+  std::vector<split_materializer_certificate> certificates(split->certificates().begin(),
+                                                           split->certificates().end());
+  std::vector<split_dependencies> dependencies(split->dependencies().begin(),
+                                               split->dependencies().end());
+  if (defect == "missing") {
+    certificates.clear();
+    dependencies.clear();
+  } else if (defect == "partial") {
+    certificates.pop_back();
+    dependencies.pop_back();
+  } else if (defect == "extra") {
+    certificates.push_back(certificates.front());
+    dependencies.push_back(dependencies.front());
+  } else {
+    REQUIRE(dependencies[0].footer != dependencies[1].footer);
+    std::swap(dependencies[0].footer, dependencies[1].footer);
+  }
+  split->set_contract_payload(
+    fixture.contract_id, std::move(certificates), std::move(dependencies));
+  REQUIRE_THROWS_AS(validate_split_for_gpu(fixture.contract_id, *split), std::runtime_error);
+}
+
 TEST_CASE("Parquet certificates include physical-original file evidence after comparison",
           "[scan][certificate][read_view]")
 {
@@ -368,6 +551,10 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   std::filesystem::copy_file(source, first);
   std::filesystem::copy_file(source, second);
   std::vector<std::string> paths{first, second};
+  auto const sorted        = GENERATE(false, true);
+  auto const with_evidence = GENERATE(false, true);
+  CAPTURE(sorted, with_evidence);
+  if (sorted) { std::swap(paths[0], paths[1]); }
   bound_read_identity identity;
   identity.source      = {"read_parquet", source_kind::parquet_local, "duckdb.read_parquet.v1"};
   identity.data_view   = file_inventory{2};
@@ -388,47 +575,58 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
                            {materializer_kind::parquet, "parquet.v1"});
   bound_read_view physical = candidate;
   auto evidence            = std::make_shared<file_evidence_arrays>();
-  // Evidence arrays use canonical sorted-path order: a-nation, then z-nation. The ingestible
-  // deliberately consumes the reverse order to verify the position mapping.
+  // Evidence arrays use canonical sorted-path order: a-nation, then z-nation.
   evidence->size                  = {1234, 4321};
   evidence->last_modified         = {5678, 8765};
   evidence->size_present          = {1, 1};
   evidence->last_modified_present = {1, 1};
   evidence->etag                  = {"a-tag", "z-tag"};
-  physical.evidence               = evidence;
-  physical.depth                  = evidence_depth::path_size_and_tag;
+  if (with_evidence) {
+    physical.evidence = evidence;
+    physical.depth    = evidence_depth::path_size_and_tag;
+  }
   std::vector<bound_read_view> physical_original{physical};
-  registry->publish_supported(
-    certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
 
   auto info                 = parquet_info(contract_id);
   info->resolved_file_paths = paths;
   info->read_views          = registry;
   auto ingestible           = make_ingestible(std::move(info));
-  auto ioctx                = std::make_shared<sirius::io::kvikio_context>();
-  auto next_identity        = [&]() {
-    auto provider = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-    REQUIRE(provider);
-    auto file = provider();
-    REQUIRE(file);
-    REQUIRE(file->certificates().size() == 1);
-    return file->certificates().front().input_identity;
-  };
-  auto const first_identity = next_identity();
-  CHECK(first_identity.find("z-nation.parquet|footer=") != std::string::npos);
-  CHECK(first_identity.find("|size=4321") != std::string::npos);
-  CHECK(first_identity.find("|last_modified=8765") != std::string::npos);
-  CHECK(first_identity.find("|etag=z-tag") != std::string::npos);
-  auto const second_identity = next_identity();
-  CHECK(second_identity.find("a-nation.parquet|footer=") != std::string::npos);
-  CHECK(second_identity.find("|size=1234") != std::string::npos);
-  CHECK(second_identity.find("|last_modified=5678") != std::string::npos);
-  CHECK(second_identity.find("|etag=a-tag") != std::string::npos);
+  // Finalize can publish evidence after constructing the ingestible, before metadata dispatch.
+  registry->publish_supported(
+    certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
+  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
+  auto resolve = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
+  auto first_provider  = ingestible->next_split_provider(resolve);
+  auto second_provider = ingestible->next_split_provider(resolve);
+  REQUIRE(first_provider);
+  REQUIRE(second_provider);
+  // Metadata tasks share the ingestible and may initialize its evidence index concurrently.
+  auto first_file  = std::async(std::launch::async, std::move(first_provider));
+  auto second_file = std::async(std::launch::async, std::move(second_provider));
+  std::vector<std::unique_ptr<scan_info>> splits;
+  splits.push_back(first_file.get());
+  splits.push_back(second_file.get());
+  for (std::size_t i = 0; i < splits.size(); ++i) {
+    REQUIRE(splits[i]);
+    REQUIRE(splits[i]->certificates().size() == 1);
+    auto const& input_identity = splits[i]->certificates().front().input_identity;
+    CHECK(input_identity.find(paths[i] + "|footer=") == 0);
+    if (with_evidence) {
+      auto const is_first = paths[i] == first;
+      CHECK(input_identity.find(is_first ? "|size=4321" : "|size=1234") != std::string::npos);
+      CHECK(input_identity.find(is_first ? "|last_modified=8765" : "|last_modified=5678") !=
+            std::string::npos);
+      CHECK(input_identity.find(is_first ? "|etag=z-tag" : "|etag=a-tag") != std::string::npos);
+    } else {
+      CHECK(input_identity.find("|size=") == std::string::npos);
+      CHECK(input_identity.find("|last_modified=") == std::string::npos);
+      CHECK(input_identity.find("|etag=") == std::string::npos);
+    }
+  }
   auto const& entry = registry->entry(contract_id);
-  CHECK(entry.eligibility.depth == evidence_depth::path_size_and_tag);
+  CHECK(entry.eligibility.depth == physical.depth);
   CHECK(entry.eligibility.correspondence == "table_index");
-  CHECK(entry.physical_evidence == evidence);
+  CHECK(entry.physical_evidence == physical.evidence);
 }
 
 TEST_CASE("Local glob evidence reaches Parquet certificates through physical comparison",
@@ -669,6 +867,24 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   CHECK(empty->contract_id() == contract_id);
   CHECK(empty->certificates().empty());
   CHECK(empty->dependencies().empty());
+  CHECK_NOTHROW(validate_split_for_gpu(contract_id, *empty));
+}
+
+TEST_CASE("GPU scan construction requires an explicit contract",
+          "[scan][certificate][scan_contract_required]")
+{
+  CHECK_FALSE((std::is_constructible_v<sirius_gpu_scan_operator,
+                                       duckdb::vector<sirius::logical_type>,
+                                       duckdb::idx_t,
+                                       std::shared_ptr<gpu_ingestible>>));
+}
+
+TEST_CASE("GPU scan construction rejects a zero contract",
+          "[scan][certificate][scan_contract_required]")
+{
+  REQUIRE_THROWS_AS((sirius_gpu_scan_operator{{}, 0, nullptr, /*contract_id=*/0}),
+                    std::invalid_argument);
+  CHECK_NOTHROW((sirius_gpu_scan_operator{{}, 0, nullptr, /*contract_id=*/71}));
 }
 
 TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][certificate]")
@@ -677,14 +893,13 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   sirius_gpu_scan_operator scan{/*types=*/{},
                                 /*estimated_cardinality=*/0,
                                 /*ingestible=*/nullptr,
-                                /*compressed_materialization_observer=*/&observer,
-                                /*read_views=*/nullptr,
-                                /*contract_id=*/71};
+                                /*contract_id=*/71,
+                                /*compressed_materialization_observer=*/&observer};
   scan_operator_input foreign_input(std::make_unique<certificate_test_split>(72));
   auto const before = observer.get_transparent_execution_stats();
 
   REQUIRE_THROWS_WITH(scan.execute(foreign_input, rmm::cuda_stream_view{}),
-                      Catch::Matchers::Contains("contract"));
+                      Catch::Matchers::ContainsSubstring("contract"));
   auto const after = observer.get_transparent_execution_stats();
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
 }

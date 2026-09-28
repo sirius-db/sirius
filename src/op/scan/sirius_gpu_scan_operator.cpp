@@ -56,6 +56,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -345,9 +346,9 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   std::shared_ptr<gpu_ingestible> ingestible,
+  scan_contract_id contract_id,
   duckdb::SiriusContext* compressed_materialization_observer,
-  std::shared_ptr<transparent::read_view_registry> read_views,
-  scan_contract_id contract_id)
+  std::shared_ptr<transparent::read_view_registry> read_views)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
@@ -356,6 +357,10 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
+  if (_contract_id == 0) {
+    throw std::invalid_argument("GPU scan operator requires a nonzero scan contract ID");
+  }
+
   // Resolve the scan's dynamic-filter channel once (null for formats that carry
   // none): every split gets it stamped so prepare_for_processing can snapshot
   // membership filters at decode time.
@@ -463,7 +468,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
       std::string(typeid(input_data).name()));
   }
-  if (scan_input->has_scan_metadata() && _contract_id != 0) {
+  if (scan_input->has_scan_metadata()) {
     try {
       validate_split_for_gpu(_contract_id, scan_input->get_scan_info());
     } catch (...) {

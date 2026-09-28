@@ -19,6 +19,7 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "log/logging.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
+#include "planner/connector_reference_cache.hpp"
 #include "sirius_registration.hpp"
 
 #include <dlfcn.h>
@@ -244,7 +245,7 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
 
 struct verified_callbacks {
   explicit verified_callbacks(duckdb::TableFunction const& value) : reference(value) {}
-  duckdb::TableFunction reference;
+  duckdb::TableFunction const& reference;
 
   bool matches(duckdb::TableFunction const& candidate) const
   {
@@ -289,7 +290,7 @@ struct verified_callbacks {
 };
 struct accepted_callbacks {
   std::mutex mutex;
-  std::vector<verified_callbacks> values;
+  detail::connector_reference_cache reference;
   bool missing_reference_reported = false;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
@@ -301,14 +302,10 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
     if (entries[i].function_name != "iceberg_scan") continue;
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
-    if (!cache.values.empty()) return;
+    if (cache.reference.has_verified_functions()) return;
     try {
-      std::vector<verified_callbacks> verified;
-      for (auto const& value : iceberg_reference_functions(db)) {
-        verified.emplace_back(value);
-      }
       // Publish the complete independent reference only after registration succeeds.
-      cache.values = std::move(verified);
+      cache.reference.publish(iceberg_reference_functions(db));
     } catch (std::exception const& error) {
       // Optional GPU admission must not break LOAD or fall back to trusting the caller's
       // catalog. An empty cache makes lookup decline without retrying initialization there.
@@ -352,13 +349,10 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
         context, DEFAULT_SCHEMA, entry.function_name, duckdb::OnEntryNotFound::RETURN_NULL);
     if (!catalog_entry) return nullptr;
-    if (cache.values.empty()) {
-      // A mutable catalog can confirm registration, but must never grant trust.
-      for (auto const& value : reference_functions(entry.function_name, context)) {
-        cache.values.emplace_back(value);
-      }
-    }
-    if (cache.values.empty()) {
+    // A mutable catalog can confirm registration, but must never grant trust.
+    auto const& references = cache.reference.get_or_resolve(
+      [&] { return reference_functions(entry.function_name, context); });
+    if (references.empty()) {
       if (!cache.missing_reference_reported) {
         auto const* requirement =
           "The source extension must provide a verifiable function definition.";
@@ -379,7 +373,8 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
       }
       return nullptr;
     }
-    for (auto const& callbacks : cache.values) {
+    for (auto const& reference : references) {
+      verified_callbacks const callbacks(reference);
       if (!callbacks.matches(function)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
         if (callbacks.matches(registered)) return &entry;

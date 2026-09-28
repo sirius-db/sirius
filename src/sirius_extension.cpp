@@ -55,6 +55,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -184,6 +185,28 @@ std::uint64_t count_narrowed_columns(
   return count;
 }
 
+// SQL replay binds again on another connection. Validate that connection's final
+// CPU plan, including when optimization is disabled, before any source executes.
+struct cpu_replay_policy_validator final : ClientContextState {
+  explicit cpu_replay_policy_validator(std::string error) : gpu_error(std::move(error)) {}
+
+  bool CanRequestRebind() override { return true; }
+
+  RebindQueryInfo OnFinalizePrepare(ClientContext& context,
+                                    PreparedStatementData& prepared,
+                                    PreparedStatementMode) override
+  {
+    auto policy = prepared.physical_plan ? sirius::transparent::derive_plan_source_policy(
+                                             prepared.physical_plan->Root(), context)
+                                         : sirius::transparent::plan_source_policy{{}, false};
+    sirius::transparent::require_cpu_replay(policy, "", gpu_error);
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+
+ private:
+  std::string gpu_error;
+};
+
 unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
                                                         Connection& connection,
                                                         const string& query,
@@ -211,6 +234,10 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
   // per-connection state there.
   duckdb::SiriusContext::InternalQueryGuard guard(*connection.context);
   duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*connection.context);
+  auto& states                 = *connection.context->registered_state;
+  constexpr auto validator_key = "sirius_cpu_replay_policy";
+  states.Insert(validator_key, make_shared_ptr<cpu_replay_policy_validator>(gpu_error));
+  absl::Cleanup remove_validator = [&] { states.Remove(validator_key); };
   return connection.Query(query);
 }
 

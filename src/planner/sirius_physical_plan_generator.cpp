@@ -409,9 +409,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.types,
       scan.estimated_cardinality,
       std::move(ingestible),
+      scan.contract_id,
       compressed_materialization_observer,
-      scan.read_views,
-      scan.contract_id);
+      scan.read_views);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 

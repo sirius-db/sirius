@@ -1158,7 +1158,7 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
 {
   duckdb::vector<sirius::logical_type> types;
   sirius::op::scan::sirius_gpu_scan_operator scan(
-    std::move(types), /*estimated_cardinality=*/0, /*ingestible=*/nullptr);
+    std::move(types), /*estimated_cardinality=*/0, /*ingestible=*/nullptr, /*contract_id=*/1);
 
   CHECK_NOTHROW(
     sirius::planner::sirius_physical_plan_generator::set_parent_ops(scan, /*parent=*/nullptr));
