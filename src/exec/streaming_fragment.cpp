@@ -248,7 +248,7 @@ void streaming_fragment::build()
   try {
     auto& sirius_ctx = sirius_context_of(_context);
     catalog          = catalog_for(_context);
-    // declare() replaces any earlier binding of the id, including the FFI's view placeholders.
+    // declare() replaces any earlier binding of the id.
     for (const auto& [id, input] : _spec.inputs) {
       catalog->declare(id,
                        stream_input_binding{input.names,
@@ -309,7 +309,11 @@ void streaming_fragment::run()
   }
 
   auto& sirius_ctx = sirius_context_of(_context);
-  _phase           = phase::running;
+  // The switch above names the state; this closes the gap for a run() racing on another thread.
+  auto expected = phase::built;
+  if (!_phase.compare_exchange_strong(expected, phase::running)) {
+    throw sirius::invalid_input_exception("streaming_fragment: already running");
+  }
   std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
   try {
     window.emplace(sirius_ctx, _context, kFragmentQueryLabel);

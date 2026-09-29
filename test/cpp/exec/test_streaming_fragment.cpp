@@ -736,7 +736,7 @@ TEST_CASE_METHOD(fragment_fixture,
                  "[integration][streaming_fragment]")
 {
   // Both senders emit the same INTEGER keys, so a key split across destinations means the
-  // senders hashed it differently (the INT32 -> INT64 key cast is what keeps them in step).
+  // senders hashed it differently.
   std::string values = "SELECT a FROM (VALUES ";
   for (int k = 1; k <= 20; ++k) {
     values += (k > 1 ? ", (" : "(") + std::to_string(k) + ")";
@@ -793,6 +793,72 @@ TEST_CASE_METHOD(fragment_fixture,
       expected.push_back(k);
     }
     REQUIRE(all == expected);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-9b: senders planned with different integer widths agree on each key's destination
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9b: an INTEGER and a BIGINT sender route each key to the same destination",
+                 "[integration][streaming_fragment]")
+{
+  // cuDF hashes raw bytes, so without the INT32 -> INT64 key cast the two senders would split
+  // matching keys across destinations.
+  std::string keys;
+  for (int k = 1; k <= 20; ++k) {
+    keys += (k > 1 ? ", (" : "(") + std::to_string(k) + ")";
+  }
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const std::string& query) {
+      fragment_spec spec;
+      spec.plan_source  = sirius::test::sql_plan_source(query);
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      auto sender       = std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+      sender->build();
+      sender->run();
+      return sender;
+    };
+    auto narrow = make_sender("SELECT a FROM (VALUES " + keys + ") t(a)");
+    auto wide   = make_sender("SELECT a::BIGINT AS a FROM (VALUES " + keys + ") t(a)");
+    REQUIRE(narrow->sink_types()[0].id() == sirius::type_id::INTEGER);
+    REQUIRE(wide->sink_types()[0].id() == sirius::type_id::BIGINT);
+
+    auto drain_keys = [](streaming_fragment& sender, stream_id_t destination, bool is_wide) {
+      std::vector<std::int64_t> values;
+      while (auto batch = sender.pull(destination)) {
+        auto column = sirius::get_cudf_table_view(**batch).column(0);
+        if (is_wide) {
+          auto host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(column);
+          values.insert(values.end(), host.begin(), host.end());
+        } else {
+          auto host = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(column);
+          values.insert(values.end(), host.begin(), host.end());
+        }
+      }
+      std::sort(values.begin(), values.end());
+      return values;
+    };
+
+    std::size_t routed = 0;
+    for (stream_id_t destination : {0, 1}) {
+      auto const from_narrow = drain_keys(*narrow, destination, false);
+      auto const from_wide   = drain_keys(*wide, destination, true);
+      // Both destinations get keys, so matching sets are not just "everything went to one".
+      REQUIRE_FALSE(from_narrow.empty());
+      REQUIRE(from_narrow == from_wide);
+      routed += from_narrow.size();
+    }
+    REQUIRE(routed == 20);
 
     con->Rollback();
   } catch (...) {
