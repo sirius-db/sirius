@@ -13,6 +13,7 @@ vcpkg_from_github(
   PATCHES
   fix-pq-kernel-optional.patch
   static-cuda-math.patch
+  disable-openmp.patch
   HEAD_REF
   main)
 
@@ -93,8 +94,7 @@ vcpkg_replace_string(
 
 # Static link forces BUILD_TESTS/BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
 # gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
-# path. Only cuvs::neighbors::brute_force + cuvs::distance are consumed by
-# Sirius, but libcuvs still compiles the full kernel set.
+# path. Sirius uses GPU brute-force and IVF-Flat; disable CPU OpenMP support.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
@@ -110,6 +110,7 @@ vcpkg_cmake_configure(
   -DBUILD_C_LIBRARY=OFF
   -DBUILD_CAGRA_HNSWLIB=OFF
   -DBUILD_MG_ALGOS=OFF
+  -DDISABLE_OPENMP=ON
   -DCUVS_NVTX=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
