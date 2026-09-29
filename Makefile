@@ -146,6 +146,9 @@ list-presets: $(PRESETS_LINK)
 #                     bucket, and assume-role TEMPORARY credentials including the
 #                     session token); keep usage bounded.
 #
+# The S3 targets pass `--order decl`, so cases run in declaration order;
+# Catch2 3.9.0 and later would otherwise pick a random order.
+#
 # Deprecated names, kept for one round: `s3-tpch` (its suites also run in
 # s3-test and s3-test-large), `s3-test-aws-sigv4` (runs s3-test-aws, which
 # selects the same cases) and `s3-test-aws-broker` (no case carries [broker]).
@@ -182,7 +185,7 @@ s3-test:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]"
+	$(S3_TEST_BIN) --order decl "[s3][integration]~[large]~[aws]"
 
 s3-test-large:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -200,8 +203,8 @@ s3-test-large:
 	@# the second group's bring-up must not see them (it would re-generate / re-upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-nocache]"
+	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) --order decl "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
+	$(S3_TEST_BIN) --order decl "[s3][sql][large][large-nocache]"
 
 # Deprecated: the tiny TPC-H suite runs in s3-test and the SF1 suite in
 # s3-test-large. Kept for one round with its old selection (uploads the SF1
@@ -214,7 +217,7 @@ s3-tpch:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
-	$(S3_TEST_BIN) "[s3][integration][sql][tpch]"
+	$(S3_TEST_BIN) --order decl "[s3][integration][sql][tpch]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -228,7 +231,7 @@ s3-test-aws:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]"
+	$(S3_TEST_BIN) --order decl "[s3][aws]"
 
 # Deprecated: selects the same cases as s3-test-aws.
 s3-test-aws-sigv4:

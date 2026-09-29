@@ -21,11 +21,12 @@ S3 tests off.
 | `make s3-test-aws-sigv4` | Deprecated; forwards to `s3-test-aws` |
 | `make s3-test-aws-broker` | Deprecated; prints a warning and runs nothing |
 
+The S3 make targets pass `--order decl` to run cases in declaration order.
 The manual equivalent of `make s3-test` is:
 
 ```bash
 SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
-  build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]~[large]~[aws]"
+  build/release/extension/sirius/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
 ```
 
 ## Tags and gates

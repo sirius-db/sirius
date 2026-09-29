@@ -348,10 +348,12 @@ class s3_tpch_suite {
   std::string object_prefix_;
   fs::path local_dir_;
   s3_tpch_config_guard config_guard_;
-  std::unique_ptr<duckdb::DuckDB> gpu_db_;
-  std::unique_ptr<duckdb::Connection> gpu_connection_;
+  // Outlive the GPU database: each Sirius context restores the device memory
+  // resource that was current when it was created.
   duckdb::DuckDB cpu_db_;
   duckdb::Connection cpu_connection_;
+  std::unique_ptr<duckdb::DuckDB> gpu_db_;
+  std::unique_ptr<duckdb::Connection> gpu_connection_;
 };
 
 }  // namespace
