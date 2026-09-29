@@ -998,7 +998,7 @@ class sirius_scan_manager {
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.
   std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type,
-                                                   std::string_view path = {});
+                                                    std::string_view path = {});
 
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).

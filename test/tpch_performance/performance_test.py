@@ -562,7 +562,9 @@ def _plant(doc, keys, values):
     return node
 
 
-def check_profile_sanity(profile_name, overrides, config_path, engine, pin, source=None):
+def check_profile_sanity(
+    profile_name, overrides, config_path, engine, pin, source=None
+):
     """Validate the run's inputs before anything runs.
 
     Every check here catches a mistake that would otherwise yield a plausible
@@ -2180,7 +2182,12 @@ def main():
         if cache_overrides:
             log("Checking profile sanity")
             check_profile_sanity(
-                args.profile, cache_overrides, config_path, args.engine, args.pin, source
+                args.profile,
+                cache_overrides,
+                config_path,
+                args.engine,
+                args.pin,
+                source,
             )
 
     if args.pin != "none":
