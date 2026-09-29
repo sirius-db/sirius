@@ -23,6 +23,7 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -108,7 +109,7 @@ struct progress_line_listener : Catch::EventListenerBase {
 
   void testCaseStarting(Catch::TestCaseInfo const& info) override
   {
-    if (isatty(STDOUT_FILENO) == 0) { std::cout << "Running: " << info.name << std::endl; }
+    if (isatty(STDERR_FILENO) == 0) { std::cerr << "Running: " << info.name << std::endl; }
   }
 };
 

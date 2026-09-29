@@ -126,7 +126,7 @@ jobs:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
@@ -176,25 +176,31 @@ jobs:
           nvidia-smi
           bin=./build/release/extension/sirius/test/cpp/sirius_unittest
           log_root=$PWD/build/release/extension/sirius/test/cpp/log
-          gpus=$(nvidia-smi -L | wc -l)
+          gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+          if ((gpus < 2)); then
+            echo "::error::Expected at least 2 GPUs, found $gpus" >&2
+            exit 1
+          fi
           for ((i = 0; i < gpus; i++)); do
             mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
             # Stream each shard live with a prefix; keep its full log for the failure summary.
             {
               status=0
+              started_at=$(date +%s)
               CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
                 TMPDIR="/tmp/shard-$i" \
-                timeout 60m "$bin" --abort --order decl --durations yes \
+                timeout 45m "$bin" --abort --order decl --durations yes \
                   --shard-count "$gpus" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
-              echo "$status" > "/tmp/shard-$i.status"
+              echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
             } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
           done
           wait
           status=0
           for ((i = 0; i < gpus; i++)); do
             summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
-            echo "Shard $i (exit $(cat "/tmp/shard-$i.status")): $summary"
-            [ "$(cat "/tmp/shard-$i.status")" = 0 ] || status=1
+            read -r shard_status elapsed < "/tmp/shard-$i.status"
+            echo "Shard $i (exit $shard_status, ${elapsed}s): $summary"
+            [ "$shard_status" = 0 ] || status=1
           done
           cat /tmp/unittest-*.log > /tmp/unittest.log
           exit $status

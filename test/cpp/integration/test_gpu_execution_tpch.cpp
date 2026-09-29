@@ -118,6 +118,10 @@ class GPUExecutionFixtureBase {
     release_env();
     auto* env = sirius::test::acquire_integration_env_for(num_gpus);
     if (env == nullptr) { return false; }
+    if (env != sirius::test::g_integration_env && sirius::test::g_integration_env != nullptr &&
+        sirius::test::g_integration_env->is_active()) {
+      sirius::test::g_integration_env->pause();
+    }
     if (!env->is_active()) { env->resume(); }
     active_env_ = env;
     con         = std::make_unique<duckdb::Connection>(env->make_connection());
