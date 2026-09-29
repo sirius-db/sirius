@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -563,8 +564,10 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
 }
 
 TEST_CASE("sirius_config forces the sirius backend for multi-GPU",
-          "[scan_manager][config][backend]")
+          "[scan_manager][config][backend][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
+
   auto const cfg = load_scan_manager("sirius_backend_multi_gpu.yaml",
                                      "sirius:\n"
                                      "  topology:\n"
