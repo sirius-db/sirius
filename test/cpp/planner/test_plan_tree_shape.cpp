@@ -1130,6 +1130,23 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
   }
 
+  SECTION("DISTINCT over an aggregate planned narrower than declared takes the child's types")
+  {
+    // The DISTINCT node declares sum()'s HUGEINT; the aggregate below is planned as BIGINT.
+    auto plan =
+      generate_sirius_plan(*con, "SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val");
+    INFO(tree_to_string(plan.get()));
+
+    duckdb::vector<sirius::logical_type> const planned{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->get_types() == planned);
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY)->get_types() ==
+          planned);
+  }
+
   SECTION("DISTINCT over nested materialized CTEs checks the innermost body's schema")
   {
     // `d` is read twice and joined on `other`, so it keeps both columns and is wider than the
@@ -1255,17 +1272,6 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     // no target covers.
     require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
                      "DISTINCT ON with carried (non-key) columns");
-  }
-
-  SECTION("a DISTINCT node that disagrees with its planned child's schema is rejected")
-  {
-    // create_plan(LogicalAggregate&) rewrites sum()'s HUGEINT return type to BIGINT in its own
-    // logical operator and leaves the parents that already resolved against HUGEINT alone. The
-    // projection above the aggregate is an identity, so create_plan(LogicalProjection&) omits it
-    // and the DISTINCT node's [INTEGER, HUGEINT] meets a child declaring [INTEGER, BIGINT].
-    // Match the per-column half of the message: both guard arms open with "the planned child
-    // produces", and only the element-type arm names a column.
-    require_rejected("SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val", "for column 1");
   }
 }
 
@@ -1403,6 +1409,16 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
   CHECK_NOTHROW(
     sirius::planner::sirius_physical_plan_generator::set_parent_ops(scan, /*parent=*/nullptr));
   CHECK(scan.get_parent_op() == nullptr);
+}
+
+TEST_CASE("planned_aggregate_type narrows HUGEINT only", "[plan_tree_shape]")
+{
+  using generator = sirius::planner::sirius_physical_plan_generator;
+  CHECK(generator::planned_aggregate_type(LogicalType::HUGEINT) == LogicalType::BIGINT);
+  CHECK(generator::planned_aggregate_type(LogicalType::INTEGER) == LogicalType::INTEGER);
+  CHECK(generator::planned_aggregate_type(LogicalType::UHUGEINT) == LogicalType::UHUGEINT);
+  CHECK(generator::planned_aggregate_type(LogicalType::DECIMAL(38, 0)) ==
+        LogicalType::DECIMAL(38, 0));
 }
 
 TEST_CASE("get_output_types reads through nested CTEs to the innermost body", "[plan_tree_shape]")

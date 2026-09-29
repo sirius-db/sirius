@@ -18,13 +18,14 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
-#include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
+#include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,28 +37,6 @@
 // would need a grouped FIRST, which Sirius cannot execute, so those shapes throw and run on CPU.
 
 namespace sirius::planner {
-
-namespace {
-
-// Drains `exprs`, preserving size and order. A null node crashes at execution time, so a
-// declined translation throws here.
-duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs)
-{
-  duckdb::vector<std::unique_ptr<sirius::ast::node>> out;
-  out.reserve(exprs.size());
-  for (auto& e : exprs) {
-    auto translated = e ? sirius::ast::from_duckdb(*e) : nullptr;
-    if (e && translated == nullptr) {
-      throw duckdb::NotImplementedException(
-        "Unsupported expression in DISTINCT (falling back to CPU): " + e->ToString());
-    }
-    out.push_back(std::move(translated));
-  }
-  return out;
-}
-
-}  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
@@ -87,26 +66,26 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   auto plan = create_plan(*op.children[0]);
   // op.types normally equals the planned child's schema, but a child built by another arm can
   // narrow a type without its parents re-resolving, so compare element types and not only width.
-  auto const& child_types = plan->get_output_types();
-  auto declared_types     = sirius::from_duckdb_vec(op.types);
-  if (child_types.size() != declared_types.size()) {
+  auto const& planned_types = plan->get_output_types();
+  auto const declared_types = sirius::from_duckdb_vec(op.types);
+  if (planned_types.size() != declared_types.size()) {
     throw duckdb::NotImplementedException(
-      "DISTINCT: the planned child produces " + std::to_string(child_types.size()) +
-      (child_types.size() == 1 ? " column" : " columns") + " but the DISTINCT node declares " +
+      "DISTINCT: the planned child produces " + std::to_string(planned_types.size()) +
+      (planned_types.size() == 1 ? " column" : " columns") + " but the DISTINCT node declares " +
       std::to_string(declared_types.size()) + " (falling back to CPU)");
   }
   for (duckdb::idx_t i = 0; i < declared_types.size(); i++) {
-    if (child_types[i] == declared_types[i]) { continue; }
+    if (planned_types[i] == declared_types[i]) { continue; }
+    // An aggregate below may plan a result narrower than its parents declare.
+    if (planned_types[i] == sirius::from_duckdb(planned_aggregate_type(op.types[i]))) { continue; }
     throw duckdb::NotImplementedException("DISTINCT: the planned child produces " +
-                                          child_types[i].to_string() + " for column " +
+                                          planned_types[i].to_string() + " for column " +
                                           std::to_string(i) + " but the DISTINCT node declares " +
                                           declared_types[i].to_string() + " (falling back to CPU)");
   }
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> projections;
-  // With zero aggregates this holds exactly the group key types.
-  duckdb::vector<duckdb::LogicalType> aggregate_types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> projections;
   // Child column index -> the group position that reads it, for bare BOUND_REF targets only.
   std::unordered_map<duckdb::idx_t, duckdb::idx_t> group_by_references;
 
@@ -120,7 +99,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     } else if (!first_non_reference_target) {
       first_non_reference_target = i;
     }
-    aggregate_types.push_back(target->return_type);
     groups.push_back(std::move(target));
   }
 
@@ -129,12 +107,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   bool requires_projection = op.types.size() != group_count;
 
   for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
-    auto const& logical_type = op.types[i];
-    auto const entry         = group_by_references.find(i);
+    auto const entry = group_by_references.find(i);
     if (entry != group_by_references.end()) {
       auto const group_index = entry->second;
-      projections.push_back(
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(logical_type, group_index));
+      projections.push_back(std::make_unique<sirius::ast::node>(
+        sirius::ast::reference{static_cast<std::uint32_t>(group_index), planned_types[i]}));
       if (group_index != i) { requires_projection = true; }
       continue;
     }
@@ -171,7 +148,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   // The operator requires every group to be a bare reference to a column the child has. Checked
   // here because neither consumer can still fall back cleanly: one throws in the vocabulary of
   // aggregates, and the other reads the index unguarded at execution time.
-  auto const child_column_count = child_types.size();
+  auto const child_column_count = planned_types.size();
   for (duckdb::idx_t i = 0; i < groups.size(); i++) {
     auto const& group = *groups[i];
     if (group.GetExpressionType() != duckdb::ExpressionType::BOUND_REF) {
@@ -189,11 +166,23 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     }
   }
 
+  // With zero aggregates the operator's output is exactly its group key columns.
+  duckdb::vector<sirius::logical_type> group_types;
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> group_nodes;
+  group_types.reserve(groups.size());
+  group_nodes.reserve(groups.size());
+  for (auto const& group : groups) {
+    auto const index = group->Cast<duckdb::BoundReferenceExpression>().index;
+    group_types.push_back(planned_types[index]);
+    group_nodes.push_back(std::make_unique<sirius::ast::node>(
+      sirius::ast::reference{static_cast<std::uint32_t>(index), planned_types[index]}));
+  }
+
   auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                          sirius::op::sirius_physical_grouped_aggregate>(
-    sirius::from_duckdb_vec(aggregate_types),
+    std::move(group_types),
     duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
-    translate_expressions(std::move(groups)),
+    std::move(group_nodes),
     op.estimated_cardinality);
   group_by->children.push_back(std::move(plan));
 
@@ -202,10 +191,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   // Restore the output order op.types declares; the select list is a permutation, not an
   // identity, so this is never elided.
   auto const estimated_cardinality = group_by->estimated_cardinality;
-  return push_projection(std::move(group_by),
-                         std::move(declared_types),
-                         translate_expressions(std::move(projections)),
-                         estimated_cardinality);
+  return push_projection(
+    std::move(group_by), planned_types, std::move(projections), estimated_cardinality);
 }
 
 }  // namespace sirius::planner

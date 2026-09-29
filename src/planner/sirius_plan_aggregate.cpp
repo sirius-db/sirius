@@ -667,16 +667,20 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
   for (auto& type : types) {
-    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+    type = sirius_physical_plan_generator::planned_aggregate_type(type);
   }
   for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
-    }
+    expr->return_type = sirius_physical_plan_generator::planned_aggregate_type(expr->return_type);
   }
 }
 
 }  // namespace
+
+duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
+  duckdb::LogicalType const& type)
+{
+  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)

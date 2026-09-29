@@ -114,6 +114,9 @@ class sirius_physical_plan_generator {
   static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
+  //! The type an aggregate result declared as @p type is planned as; HUGEINT narrows to BIGINT.
+  [[nodiscard]] static duckdb::LogicalType planned_aggregate_type(duckdb::LogicalType const& type);
+
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 

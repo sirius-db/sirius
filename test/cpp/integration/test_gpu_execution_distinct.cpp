@@ -158,6 +158,13 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     // second CPU run, and DISTINCT ON without ORDER BY may pick a different row each time.
     run_ok("CREATE TABLE dist_fd (k INTEGER, v INTEGER);");
     run_ok("INSERT INTO dist_fd VALUES (1, 10), (1, 10), (2, 20), (2, 20), (3, 30), (NULL, NULL);");
+    // Per-`k` sums reach both ends of BIGINT exactly, plus a negative, a zero and a NULL group.
+    run_ok("CREATE TABLE dist_sum (k INTEGER, x BIGINT);");
+    run_ok(
+      "INSERT INTO dist_sum VALUES "
+      "(1, -4611686018427387904), (1, -4611686018427387904),"
+      "(2, 4611686018427387904), (2, 4611686018427387903),"
+      "(3, -5), (3, 2), (4, 0), (NULL, 7);");
     run_ok("CHECKPOINT;");
   }
 };
@@ -301,6 +308,13 @@ TEST_CASE_METHOD(DistinctFixture,
                  "[integration][gpu_execution][distinct][aggregate]")
 {
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT DISTINCT a, b FROM dist_t)");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT directly over a grouped sum",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  compare_gpu_vs_cpu("SELECT DISTINCT k, sum(x) FROM dist_sum GROUP BY k");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
