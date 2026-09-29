@@ -764,6 +764,15 @@ sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::s
   return *rest_ctx;
 }
 
+void require_kvikio_ioctx(s3_sql_fixture& fixture, std::string const& uri)
+{
+  auto& sirius_ctx = require_sirius_context(fixture);
+  auto datasource  = sirius_ctx.get_scan_manager().create_datasource(uri);
+  REQUIRE(datasource != nullptr);
+  REQUIRE(datasource->io_ctx() != nullptr);
+  REQUIRE(datasource->io_ctx()->type() == sirius::io::io_context_type::kvikio);
+}
+
 void require_s3_keys_listed(s3_sql_fixture& fixture,
                             s3_test_env const& env,
                             std::vector<std::string_view> const& expected_keys)
@@ -1199,7 +1208,7 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
-TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius datasource is off",
+TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvikio",
           "[s3][integration][sql][gpu_execution][transparent]")
 {
   auto env = load_s3_test_env();
@@ -1210,14 +1219,20 @@ TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius
   s3_sql_fixture fixture(*env, limits);
   set_gpu_execution(fixture.con, true);
 
+  // kvikIO serves S3 reads through RemoteHandle; LIST still uses REST.
   auto const uri = s3_uri(env->bucket, "parquet/nation.parquet");
-  auto& rest     = require_rest_ioctx(fixture, uri);
-  CHECK(rest.type() == sirius::io::io_context_type::restful);
+  require_kvikio_ioctx(fixture, uri);
 
   auto result =
     require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+
+  auto const s3_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                        s3_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
+                           local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
