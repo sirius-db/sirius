@@ -17,13 +17,17 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
@@ -42,6 +46,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -318,6 +323,18 @@ std::size_t device_l2_cache_bytes(
   }
   return minimum == std::numeric_limits<std::size_t>::max() ? 0 : minimum;
 }
+
+// Converts a zone-map bound to the recorded storage type through a one-row column, so DATE bounds
+// take the same INT32 tunnel (cast_through_rep) the build column would.
+std::unique_ptr<cudf::scalar> restore_scalar(cudf::scalar const& bound,
+                                             cudf::data_type target,
+                                             ::cuda::stream_ref stream,
+                                             rmm::device_async_resource_ref mr)
+{
+  auto const one      = cudf::make_column_from_scalar(bound, 1, stream, mr);
+  auto const restored = sirius::cast_through_rep(one->view(), target, stream, mr);
+  return cudf::get_element(restored->view(), 0, stream, mr);
+}
 }  // namespace
 
 dynamic_filter_publication_outcome publish_dynamic_filters(
@@ -382,8 +399,15 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
 
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_zone_map(admitted_keys.size());
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
-  std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
-                                                  cudf::data_type{cudf::type_id::EMPTY});
+  // Type the zone map bounds carry, which is what a binding must probe at for the lowered AST
+  // literal to compare against the consumer column: the plan's recorded storage type.
+  std::vector<cudf::data_type> per_key_zone_map_type(admitted_keys.size(),
+                                                     cudf::data_type{cudf::type_id::EMPTY});
+  // Domain the membership filter was built over (classification of the runtime build column).
+  std::vector<std::optional<membership_key_domain>> per_key_membership_domain(admitted_keys.size());
+  // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
+  // `stream`, so they must outlive the synchronize below.
+  std::vector<std::unique_ptr<cudf::column>> restored_build_columns;
 
   try {
     for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
@@ -418,23 +442,63 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
           "build "
           "table");
       }
-      auto const& col = build_view.column(admitted_key.build_key_ordinal);
-      if (col.type() != admitted_key.storage_type) {
-        SIRIUS_LOG_WARN(
-          "[publish_dynamic_filters] dynamic filter key {}: skipped (plan recorded type id {} "
-          "but "
-          "build column {} carries type id {}).",
-          admitted_key_index,
-          static_cast<int32_t>(admitted_key.storage_type.id()),
-          admitted_key.build_key_ordinal,
-          static_cast<int32_t>(col.type().id()));
-        ++outcome.keys_skipped_type_mismatch;
-        continue;
+      // The build column may arrive at a narrower carrier than the plan recorded: compressed
+      // materialization casts a pinned column to the narrowest carrier its values fit, and that
+      // carrier is restorable to the recorded type without changing any value. Any other
+      // disagreement is a type-derivation bug and skips the key; the join stays authoritative.
+      cudf::column_view col   = build_view.column(admitted_key.build_key_ordinal);
+      auto const arrived_type = col.type();
+      if (arrived_type != admitted_key.storage_type) {
+        if (!sirius::can_restore_to(arrived_type, admitted_key.storage_type)) {
+          SIRIUS_LOG_WARN(
+            "[publish_dynamic_filters] dynamic filter key {}: skipped (plan recorded type id {} "
+            "but build column {} carries type id {}).",
+            admitted_key_index,
+            static_cast<int32_t>(admitted_key.storage_type.id()),
+            admitted_key.build_key_ordinal,
+            static_cast<int32_t>(arrived_type.id()));
+          ++outcome.keys_skipped_type_mismatch;
+          continue;
+        }
+        // One rule for every key family. The membership filters classify on the runtime column,
+        // so they are built at the carrier when it lands the key in the same family as the
+        // recorded type (an INT16 carrier of a BIGINT key, a DECIMAL32 carrier of a DECIMAL64
+        // key): every probe the recorded type accepts is comparable to the carrier-sized set and
+        // range-checks into it, and no widened build copy is made. A carrier that changes the
+        // family (a DATE stored as INT16 classifies as a signed integer, and a signed-integer set
+        // would decline the native TIMESTAMP_DAYS probe) is restored to the recorded type first;
+        // the cast is small (the build side) and costs no set width.
+        if (!membership_same_family(admitted_key.storage_type, arrived_type)) {
+          restored_build_columns.push_back(
+            sirius::cast_through_rep(col, admitted_key.storage_type, stream, allocator_ref));
+          col = restored_build_columns.back()->view();
+          SIRIUS_LOG_DEBUG(
+            "[publish_dynamic_filters] dynamic filter key {}: build column {} arrives at carrier "
+            "type id {} outside the recorded type's key family; restored to type id {} for "
+            "publication.",
+            admitted_key_index,
+            admitted_key.build_key_ordinal,
+            static_cast<int32_t>(arrived_type.id()),
+            static_cast<int32_t>(admitted_key.storage_type.id()));
+        } else {
+          SIRIUS_LOG_DEBUG(
+            "[publish_dynamic_filters] dynamic filter key {}: build column {} arrives at "
+            "narrowed carrier type id {} (plan recorded type id {}); building filters at the "
+            "carrier.",
+            admitted_key_index,
+            admitted_key.build_key_ordinal,
+            static_cast<int32_t>(arrived_type.id()),
+            static_cast<int32_t>(admitted_key.storage_type.id()));
+        }
       }
-      per_key_build_type[admitted_key_index] = col.type();
 
+      // Zone-map bounds are lowered to AST literals compared against the consumer's column, which
+      // carries the recorded storage type once decoded, so the bounds are reduced at whatever
+      // carrier the build arrived at and then restored to the recorded type: two scalars, not the
+      // whole column, so a narrowed build publishes the same zone map a native one does.
+      per_key_zone_map_type[admitted_key_index] = admitted_key.storage_type;
       if (plan.emit_zone_map_filters() &&
-          sirius::op::sirius_dynamic_zone_map_filter::supports(col.type())) {
+          sirius::op::sirius_dynamic_zone_map_filter::supports(admitted_key.storage_type)) {
         nvtx_scoped_range vr{"dynfilter::build_zone_map"};
         auto min_s = cudf::reduce(col,
                                   *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
@@ -447,6 +511,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
                                   stream,
                                   allocator_ref);
         if (min_s && max_s && min_s->is_valid(stream) && max_s->is_valid(stream)) {
+          if (col.type() != admitted_key.storage_type) {
+            min_s = restore_scalar(*min_s, admitted_key.storage_type, stream, allocator_ref);
+            max_s = restore_scalar(*max_s, admitted_key.storage_type, stream, allocator_ref);
+          }
           std::vector<sirius::op::zone_map_entry> zones;
           zones.push_back({std::move(min_s), std::move(max_s)});
           per_key_zone_map[admitted_key_index] =
@@ -454,19 +522,40 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
               std::move(zones), true, true);
         }
       }
+      per_key_membership_domain[admitted_key_index] = classify_membership_key(col.type());
 
+      // Every membership filter compacts null build keys out (they match nothing under the join's
+      // null_equality::UNEQUAL), so the representation is sized and chosen on the valid rows.
+      auto const valid_rows = build_rows - static_cast<std::size_t>(col.null_count());
       auto const set_bytes =
-        sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
-      auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
+        sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(valid_rows, col.type());
+      auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(valid_rows);
+
+      // The type gates below are necessary, not sufficient: a DECIMAL128 key sits on the int64 rep
+      // only when its unscaled build values fit, which is a property of this build, not the type.
+      // One min/max reduction here spares every filter's supports() from re-deriving it; an
+      // unfitting build declines membership for the key while the zone map (exact at DECIMAL128)
+      // still publishes.
+      bool const fits_rep = membership_key_supported(col.type()) &&
+                            membership_build_fits_rep(col, stream, allocator_ref);
+      if (membership_key_supported(col.type()) && !fits_rep) {
+        SIRIUS_LOG_DEBUG(
+          "[publish_dynamic_filters] dynamic filter key {}: build values exceed the membership "
+          "key rep (DECIMAL128 outside int64); membership filters declined.",
+          admitted_key_index);
+      }
 
       auto const chosen = choose_membership_filter(
-        {.build_rows               = build_rows,
+        {.build_rows               = valid_rows,
          .l2_cache_bytes           = l2_bytes,
          .estimated_hash_set_bytes = set_bytes,
          .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-         .supports_small_in_list   = sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-         .supports_hash_in_list    = sirius::op::sirius_dynamic_in_list_filter::supports(col),
-         .supports_bloom = sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+         .supports_small_in_list =
+           fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
+         .supports_hash_in_list =
+           fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
+         .supports_bloom =
+           fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
 
       char const* choice = "none";
       switch (chosen) {
@@ -497,10 +586,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       if (per_key_membership[admitted_key_index]) { ++outcome.membership_filters_built; }
       if (per_key_zone_map[admitted_key_index]) { ++outcome.zone_map_filters_built; }
       SIRIUS_LOG_DEBUG(
-        "[publish_dynamic_filters] dynamic filter key {}: build_rows={} zone_map={} membership: "
-        "in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
+        "[publish_dynamic_filters] dynamic filter key {}: build_rows={} (valid={}) zone_map={} "
+        "membership: in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
         admitted_key_index,
         build_rows,
+        valid_rows,
         per_key_zone_map[admitted_key_index] ? "yes" : "no",
         set_bytes,
         bloom_bytes,
@@ -550,14 +640,33 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       for (auto const& binding : tgt.key_bindings) {
         assert(binding.admitted_key_index < admitted_keys.size());
         auto const& zone_map = per_key_zone_map[binding.admitted_key_index];
+        // A zone map lowers to literals of its bound type against the probe column, so it goes
+        // only to a binding probing at exactly that type (an EMPTY probe type suppresses it).
         if (zone_map && tgt.accepts_zone_map_filters &&
-            binding.probe_storage_type == per_key_build_type[binding.admitted_key_index] &&
+            binding.probe_storage_type == per_key_zone_map_type[binding.admitted_key_index] &&
             producers[target_index].push_filter(binding.channel_push_ordinal, zone_map)) {
           ++total_pushed;
         }
         auto const& membership = per_key_membership[binding.admitted_key_index];
-        if (membership &&
-            producers[target_index].push_filter(binding.channel_push_ordinal, membership)) {
+        if (!membership) { continue; }
+        // A membership filter converts per element, so it serves any probe carrier its key
+        // domain accepts (membership_probe_compatible, the same rule compute_mask applies). A
+        // binding whose recorded probe type the domain cannot read would decline every batch, so
+        // it is not pushed; an EMPTY probe type (no cuDF mapping recorded) is left to the runtime
+        // check.
+        auto const& domain = per_key_membership_domain[binding.admitted_key_index];
+        if (binding.probe_storage_type.id() != cudf::type_id::EMPTY && domain.has_value() &&
+            !membership_probe_compatible(*domain, binding.probe_storage_type)) {
+          SIRIUS_LOG_DEBUG(
+            "[publish_dynamic_filters] dynamic filter key {}: membership filter not pushed to "
+            "channel ordinal {}: probe storage type id {} is not a carrier of the key family.",
+            binding.admitted_key_index,
+            binding.channel_push_ordinal,
+            static_cast<int32_t>(binding.probe_storage_type.id()));
+          ++outcome.bindings_skipped_incompatible_probe;
+          continue;
+        }
+        if (producers[target_index].push_filter(binding.channel_push_ordinal, membership)) {
           ++total_pushed;
         }
       }
