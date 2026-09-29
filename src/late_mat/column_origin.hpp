@@ -93,26 +93,28 @@ struct row_range {
 /**
  * @brief A generation-checked handle to a pinned entry.
  *
- * A deferred column outlives the operator that deferred it, so it holds a
- * reference to pinned data that the scan manager may meanwhile have unpinned,
- * replaced or merged. Holding the pointer would make that a use-after-free
- * discovered as wrong data; holding a name would make it a lookup that quietly
- * finds a DIFFERENT entry. So the handle carries a generation, and every
- * lifecycle event moves it:
+ * A deferred column outlives the operator that deferred it, so it must resolve
+ * the exact pinned entry that query acquired even if the registry meanwhile
+ * unpins or replaces the name. Holding a raw pointer would make that a
+ * use-after-free; holding a name would quietly find a DIFFERENT entry. The
+ * handle therefore keeps a weak reference to the exact entry and returns a
+ * shared ownership lease when it resolves:
  *
- *   - unpin, or a re-pin that replaces the entry -> invalidate(): the entry
- *     goes null and the generation goes to 0, which no origin can match;
+ *   - unpin or a replacing re-pin removes only the registry's ownership. A
+ *     query already serving the old entry keeps it alive, while new queries see
+ *     only the replacement (or no entry);
  *   - an in-place column merge -> bump_generation(): origins captured before
- *     the merge fail closed, since an origin never legitimately spans a pin
- *     call (pin/unpin is serialized against query execution).
+ *     the merge fail closed because their positional metadata may be stale;
+ *   - once the registry and every serving query release the entry, the weak
+ *     reference expires and all remaining origins fail closed naturally.
  *
- * resolve(expected) therefore yields nullptr for any origin captured against a
- * pin state that no longer exists — never a dangling pointer. Failing closed
- * costs a re-read; failing open costs a wrong answer.
+ * resolve(expected) therefore yields an owning lease or nullptr, never a
+ * dangling pointer and never an entry subsequently installed under the name.
  *
- * Thread-safety: pin/unpin is serialized against query execution by the
- * engine, so readers during a query see a stable value; the atomics are what
- * keep several pipeline threads resolving origins concurrently race-free.
+ * Thread-safety: the weak owner is installed once before publication and then
+ * only locked by readers. Generation changes are atomic so several pipeline
+ * threads may resolve concurrently with explicit revocation or an in-place
+ * generation bump.
  */
 class pin_entry_handle {
  public:
@@ -124,14 +126,19 @@ class pin_entry_handle {
   pin_entry_handle(pin_entry_handle const&)            = delete;
   pin_entry_handle& operator=(pin_entry_handle const&) = delete;
 
-  /// The entry this handle points at, iff @p expected is still the live
-  /// generation; nullptr otherwise.
-  [[nodiscard]] scan_manager::pinned_entry const* resolve(pin_generation_t expected) const
+  /// An owning lease on the exact entry this handle names, iff @p expected is
+  /// still the live generation; nullptr otherwise.
+  [[nodiscard]] std::shared_ptr<scan_manager::pinned_entry const> resolve(
+    pin_generation_t expected) const
   {
     if (expected == 0 || _generation.load(std::memory_order_acquire) != expected) {
       return nullptr;
     }
-    return _entry.load(std::memory_order_acquire);
+    auto entry = _entry.lock();
+    // A concurrent in-place mutation may have advanced the generation while
+    // lock() acquired the owner. Re-check before publishing the lease.
+    if (_generation.load(std::memory_order_acquire) != expected) { return nullptr; }
+    return entry;
   }
 
   [[nodiscard]] pin_generation_t generation() const
@@ -145,18 +152,12 @@ class pin_entry_handle {
 
   // ── scan-manager lifecycle ────────────────────────────────────────────────
 
-  /// Point the handle at its entry. Called once, after the entry is installed.
-  void set_entry(scan_manager::pinned_entry const* entry)
-  {
-    _entry.store(entry, std::memory_order_release);
-  }
+  /// Point the handle at its entry. Called once, before the handle is published.
+  void set_entry(std::shared_ptr<scan_manager::pinned_entry const> const& entry) { _entry = entry; }
 
-  /// The entry was destroyed or replaced: every outstanding origin fails closed.
-  void invalidate()
-  {
-    _entry.store(nullptr, std::memory_order_release);
-    _generation.store(0, std::memory_order_release);
-  }
+  /// Explicitly revoke every outstanding origin. Registry removal and replacement
+  /// do not call this: existing query leases remain valid until query completion.
+  void invalidate() { _generation.store(0, std::memory_order_release); }
 
   /// The entry changed in place: origins captured before now fail closed.
   void bump_generation(pin_generation_t next)
@@ -166,7 +167,7 @@ class pin_entry_handle {
 
  private:
   std::string _name;
-  std::atomic<scan_manager::pinned_entry const*> _entry{nullptr};
+  std::weak_ptr<scan_manager::pinned_entry const> _entry;
   std::atomic<pin_generation_t> _generation{0};
 };
 
@@ -184,8 +185,8 @@ struct column_origin {
 
   [[nodiscard]] bool has_origin() const noexcept { return handle != nullptr; }
 
-  /// Generation-checked resolution; nullptr when the origin is stale or empty.
-  [[nodiscard]] scan_manager::pinned_entry const* resolve() const
+  /// Generation-checked owning lease; nullptr when the origin is stale or empty.
+  [[nodiscard]] std::shared_ptr<scan_manager::pinned_entry const> resolve() const
   {
     return handle ? handle->resolve(generation) : nullptr;
   }
