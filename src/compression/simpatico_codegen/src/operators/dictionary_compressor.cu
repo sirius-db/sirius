@@ -8,6 +8,7 @@
 #include "codegen/util/nvtx.hpp"
 #include "constant_width_offsets.hpp"
 #include "decode/decode_session.hpp"
+#include "util/host_observation.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -23,10 +24,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/device_buffer.hpp>
-#include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -39,13 +38,11 @@
 #include <thrust/transform.h>
 
 #include <algorithm>
-#include <concepts>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -90,23 +87,14 @@ struct matching_key_width {
   }
 };
 
-struct key_width_storage {
-  void* scratch;
-  int64_t* result;
-};
-
-/**
- * Enqueue the positive uniform key width, or zero for variable/empty strings, for nonempty keys.
- * The caller owns the storage and must retain it and the keys until the supplied stream completes.
- */
-template <typename Allocate>
-  requires requires(Allocate allocate, std::size_t bytes) {
-    { allocate(bytes) } -> std::same_as<key_width_storage>;
-  }
-int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
-                                    ::cuda::stream_ref stream,
-                                    Allocate allocate)
+// The positive uniform key width, or zero for variable-width or empty keys. One CUB reduction
+// writes the result beside its scratch in a single allocation, read back through the calling
+// thread's pinned staging slab; returns after @p stream completes.
+int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
+                                   ::cuda::stream_ref stream,
+                                   rmm::device_async_resource_ref mr)
 {
+  if (keys.size() <= 0) return 0;
   matching_key_width const matching_width{
     cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets(), keys.offset())};
   auto reduce = [&](void* scratch, std::size_t& scratch_bytes, int64_t* result) {
@@ -124,34 +112,16 @@ int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
   };
   std::size_t scratch_bytes = 0;
   reduce(nullptr, scratch_bytes, nullptr);
-  auto const storage = allocate(scratch_bytes);
-  reduce(storage.scratch, scratch_bytes, storage.result);
-  return storage.result;
-}
-
-int64_t measure_constant_key_width(cudf::strings_column_view const& keys, decode_frame& frame)
-{
-  if (keys.size() <= 0) return 0;
-  std::optional<rmm::device_buffer> storage;
-  auto const* width = enqueue_constant_key_width(
-    keys, frame.stream(), [&](std::size_t scratch_bytes) -> key_width_storage {
-      if (scratch_bytes > std::numeric_limits<std::size_t>::max() - sizeof(int64_t)) {
-        throw std::overflow_error("dictionary key width scratch size overflow");
-      }
-      storage.emplace(sizeof(int64_t) + scratch_bytes, frame.stream(), frame.mr());
-      // CUB's queried size includes padding to align the scratch following the scalar.
-      return {static_cast<char*>(storage->data()) + sizeof(int64_t),
-              static_cast<int64_t*>(storage->data())};
-    });
-  return frame.read_scalar(width);
-}
-
-void drain_dictionary_observation(::cuda::stream_ref stream) noexcept
-{
-  auto const status = cudaStreamSynchronize(stream.get());
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "simpatico dictionary cleanup failed: %s\n", cudaGetErrorString(status));
+  if (scratch_bytes > std::numeric_limits<std::size_t>::max() - sizeof(int64_t)) {
+    throw std::overflow_error("dictionary key width scratch size overflow");
   }
+  // CUB's queried size includes padding to align the scratch following the result.
+  rmm::device_buffer storage(sizeof(int64_t) + scratch_bytes, stream, mr);
+  auto* const result = static_cast<int64_t*>(storage.data());
+  reduce(static_cast<char*>(storage.data()) + sizeof(int64_t), scratch_bytes, result);
+  int64_t width = 0;
+  read_device_bytes_completed(&width, result, sizeof width, stream);
+  return width;
 }
 
 // Compile-time width lets the stitch loop fully unroll into registers — with a
@@ -287,7 +257,8 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
   auto const mr     = frame.mr();
   if (indices.null_count() > 0 || keys.parent().null_count() > 0) return nullptr;
   if (indices.type().id() != cudf::type_id::INT32) return nullptr;
-  int64_t const width = cached_width < 0 ? measure_constant_key_width(keys, frame) : cached_width;
+  int64_t const width =
+    cached_width < 0 ? measure_constant_key_width(keys, stream, mr) : cached_width;
   if (width <= 0) return nullptr;
   auto const n_rows    = indices.size();
   int64_t const nbytes = static_cast<int64_t>(n_rows) * width;
@@ -437,35 +408,21 @@ dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::
                                                           ::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr)
 {
-  std::unique_ptr<dictionary_compressed_representation> result;
-  std::optional<rmm::device_buffer> width_storage;
-  // The explicit pinned resource makes this buffer both host- and device-accessible.
-  std::optional<rmm::device_buffer> width_result;
+  if (!dict_col) throw std::invalid_argument("dictionary construction: missing column");
+  auto result = std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
   try {
-    if (!dict_col) throw std::invalid_argument("dictionary construction: missing column");
-    result = std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
-    result->constant_key_width = 0;
-    if (result->dict_column->size() > 0) {
-      auto const keys = cudf::dictionary_column_view(result->dict_column->view()).keys();
-      if (keys.size() > 0) {
-        enqueue_constant_key_width(
-          cudf::strings_column_view(keys), stream, [&](std::size_t bytes) -> key_width_storage {
-            width_storage.emplace(bytes, stream, mr);
-            width_result.emplace(sizeof(int64_t), stream, cudf::get_pinned_memory_resource());
-            return {width_storage->data(), static_cast<int64_t*>(width_result->data())};
-          });
-      }
-    }
+    auto const& column = *result->dict_column;
+    result->constant_key_width =
+      column.size() > 0
+        ? measure_constant_key_width(cudf::dictionary_column_view(column.view()).keys(), stream, mr)
+        : 0;
     stream.sync();
-    if (width_result) {
-      result->constant_key_width = *static_cast<int64_t const*>(width_result->data());
-    }
-    return result;
   } catch (...) {
-    // Keep the column, scratch, and private result destination alive until pending work drains.
-    drain_dictionary_observation(stream);
+    // Keep the column alive until pending work that reads it drains.
+    (void)cudaStreamSynchronize(stream.get());
     throw;
   }
+  return result;
 }
 
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(

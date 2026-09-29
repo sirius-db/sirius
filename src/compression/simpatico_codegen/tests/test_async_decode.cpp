@@ -355,92 +355,6 @@ class current_resource_guard {
   cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
 };
 
-class pinned_resource_guard {
- public:
-  explicit pinned_resource_guard(rmm::host_device_async_resource_ref resource)
-    : previous_(cudf::set_pinned_memory_resource(resource))
-  {
-  }
-  ~pinned_resource_guard() { cudf::set_pinned_memory_resource(previous_); }
-  pinned_resource_guard(pinned_resource_guard const&)            = delete;
-  pinned_resource_guard& operator=(pinned_resource_guard const&) = delete;
-
- private:
-  rmm::host_device_async_resource_ref previous_;
-};
-
-// Reuse one pinned address without adding waits: publication must finish before returning it.
-class pinned_scalar_resource {
- public:
-  struct state {
-    explicit state(::cuda::stream_ref stream)
-      : storage(sizeof(int64_t), stream, cudf::get_pinned_memory_resource())
-    {
-    }
-    rmm::device_buffer storage;
-    cudaStream_t allocated_stream = nullptr;
-    std::size_t attempts          = 0;
-    bool live                     = false;
-    bool fail_next                = false;
-    bool invalid_release          = false;
-  };
-
-  explicit pinned_scalar_resource(::cuda::stream_ref stream)
-    : observations(std::make_shared<state>(stream))
-  {
-  }
-
-  void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
-  {
-    ++observations->attempts;
-    expect(!observations->live && bytes == sizeof(int64_t) &&
-             alignment <= rmm::CUDA_ALLOCATION_ALIGNMENT,
-           "pinned scalar fixture received an invalid allocation");
-    if (observations->fail_next) {
-      observations->fail_next = false;
-      throw injected_out_of_memory(bytes);
-    }
-    observations->live             = true;
-    observations->allocated_stream = stream.get();
-    // Poison each recycled slot so reading it before the GPU result cannot look like valid
-    // metadata.
-    *static_cast<int64_t*>(observations->storage.data()) = std::numeric_limits<int64_t>::min();
-    return observations->storage.data();
-  }
-
-  void deallocate(cuda::stream_ref stream,
-                  void* ptr,
-                  std::size_t bytes,
-                  std::size_t alignment) noexcept
-  {
-    observations->invalid_release |=
-      !observations->live || ptr != observations->storage.data() || bytes != sizeof(int64_t) ||
-      alignment > rmm::CUDA_ALLOCATION_ALIGNMENT || stream.get() != observations->allocated_stream;
-    observations->live = false;
-  }
-
-  void* allocate_sync(std::size_t, std::size_t)
-  {
-    throw std::logic_error("pinned observation requested synchronous allocation");
-  }
-  void deallocate_sync(void*, std::size_t, std::size_t) noexcept
-  {
-    observations->invalid_release = true;
-  }
-  bool operator==(pinned_scalar_resource const& other) const noexcept
-  {
-    return observations == other.observations;
-  }
-  friend void get_property(pinned_scalar_resource const&, cuda::mr::host_accessible) noexcept {}
-  friend void get_property(pinned_scalar_resource const&, cuda::mr::device_accessible) noexcept {}
-
-  std::shared_ptr<state> observations;
-};
-
-static_assert(cuda::mr::resource_with<pinned_scalar_resource,
-                                      cuda::mr::host_accessible,
-                                      cuda::mr::device_accessible>);
-
 // The deadlock watchdog's budget. SIMPATICO_TEST_GATE_TIMEOUT_MS overrides the default for slow
 // machines; the variable is read once.
 std::chrono::milliseconds gate_timeout()
@@ -1743,12 +1657,14 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
   default_resource.check();
 }
 
-void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
+// Publication measures the key width on whichever stream it is given, with one device allocation
+// for the result and its scratch and none for an empty key set, and returns only after that stream
+// completes.
+void test_dictionary_width_across_streams(rmm::device_async_resource_ref upstream)
 {
   simpatico::stream_pool pool;
-  expect(pool.init(2), "dictionary pinned observation pool init");
+  expect(pool.init(2), "dictionary width stream pool init");
   ::cuda::stream_ref const first{pool.streams.front()};
-  pinned_scalar_resource pinned(first);
   checked_resource device(upstream);
   std::array<std::vector<std::string>, 5> const values{
     {{"aa", "bb"}, {"abcd", "efgh"}, {"a", "bbb"}, {}, {"ignored", "ignored"}}};
@@ -1765,86 +1681,19 @@ void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
       auto const& original =
         dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded[i]);
       auto copied = std::make_unique<cudf::column>(original.dict_column->view(), stream, upstream);
-      auto const pinned_attempts = pinned.observations->attempts;
       auto const device_attempts = device.observations->attempts.size();
       stream_gate gate(stream);
       gate.release_after_delay.store(true);
-      pinned_resource_guard override(pinned);
       auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
         std::move(copied), stream, device);
-      gate.expect_completed("dictionary read an unfinished pinned scalar");
-      expect(prepared->constant_key_width == widths[i],
-             "dictionary read an unfinished or recycled pinned scalar");
-      auto const expected_allocations = i < 3 ? 1U : 0U;
-      expect(pinned.observations->attempts - pinned_attempts == expected_allocations &&
-               device.observations->attempts.size() - device_attempts == expected_allocations,
-             "dictionary empty/nonempty observation allocation count mismatch");
-      expect(!pinned.observations->live && !pinned.observations->invalid_release,
-             "dictionary returned pinned staging with invalid ownership");
+      gate.expect_completed("dictionary publication returned before its stream completed");
+      expect(prepared->constant_key_width == widths[i], "dictionary published a wrong key width");
+      expect(device.observations->attempts.size() - device_attempts == (i < 3 ? 1U : 0U),
+             "dictionary empty/nonempty measurement allocation count mismatch");
       device.check();
-      gate.expect_not_timed_out("dictionary pinned observation watchdog expired");
+      gate.expect_not_timed_out("dictionary width watchdog expired");
     }
   }
-
-  auto const& original =
-    dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded.front());
-  {
-    auto copied = std::make_unique<cudf::column>(original.dict_column->view(), first, upstream);
-    auto const pinned_attempts   = pinned.observations->attempts;
-    device.observations->fail_at = device.observations->attempts.size();
-    event_markers markers(pool);
-    stream_gate gate(first);
-    markers.record();
-    gate.release_after_delay.store(true);
-    pinned_resource_guard override(pinned);
-    bool injected = false;
-    try {
-      (void)simpatico::dictionary_compressed_representation::from_encoded_column(
-        std::move(copied), first, device);
-    } catch (injected_out_of_memory const& error) {
-      injected = error.requested_bytes == device.observations->failed_request_bytes &&
-                 error.requested_bytes > 0;
-    }
-    device.observations->fail_at.reset();
-    expect(injected && pinned.observations->attempts == pinned_attempts,
-           "dictionary allocated pinned output before device scratch or lost device OOM details");
-    gate.expect_completed("dictionary device OOM escaped before prior stream work drained");
-    expect(markers.complete(), "dictionary device OOM escaped before prior stream work drained");
-    expect(!pinned.observations->live && !pinned.observations->invalid_release,
-           "dictionary device OOM changed pinned ownership");
-    device.check();
-    gate.expect_not_timed_out("dictionary device OOM watchdog expired");
-  }
-  auto copied = std::make_unique<cudf::column>(original.dict_column->view(), first, upstream);
-  auto const device_attempts     = device.observations->attempts.size();
-  auto const pinned_attempts     = pinned.observations->attempts;
-  pinned.observations->fail_next = true;
-  event_markers markers(pool);
-  stream_gate gate(first);
-  markers.record();
-  release_observation device_release(device, gate);
-  gate.release_after_delay.store(true);
-  {
-    pinned_resource_guard override(pinned);
-    bool injected = false;
-    try {
-      (void)simpatico::dictionary_compressed_representation::from_encoded_column(
-        std::move(copied), first, device);
-    } catch (injected_out_of_memory const& error) {
-      injected = error.requested_bytes == sizeof(int64_t);
-    }
-    expect(injected && !pinned.observations->fail_next,
-           "dictionary pinned OOM subtype/request size was lost");
-    expect(device.observations->attempts.size() == device_attempts + 1 &&
-             pinned.observations->attempts == pinned_attempts + 1,
-           "dictionary pinned OOM did not follow exactly one scratch allocation");
-    gate.expect_completed("dictionary pinned OOM escaped before queued work drained");
-    expect(markers.complete(), "dictionary pinned OOM escaped before queued work drained");
-    expect(!pinned.observations->live && !pinned.observations->invalid_release,
-           "dictionary pinned OOM leaked staging");
-    device.check();
-  }
-  gate.expect_not_timed_out("dictionary pinned OOM watchdog expired");
   cuda_check(pool.sync_all());
 }
 
@@ -3023,7 +2872,7 @@ int main()
     test_dictionary_width_sliced_input(upstream);
     test_dictionary_width_large_keys(upstream);
     test_dictionary_width_failures(upstream);
-    test_dictionary_pinned_observation(upstream);
+    test_dictionary_width_across_streams(upstream);
     test_dictionary_key_width_hint(upstream);
     test_dictionary_predicate_lookup(upstream);
     test_submission_and_kernel_lifetime(upstream);
