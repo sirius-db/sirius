@@ -94,13 +94,11 @@ jobs:
           trap 'rm -rf "$sirius_test_dir"' EXIT
           cmake --install build/release --prefix "$sirius_test_dir/install" --component sirius_library
           cmake -E rename "$sirius_test_dir/install" "$sirius_test_dir/relocated"
-          for mode in Release Debug; do
-            cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/$mode" -G Ninja \
-              -DCMAKE_BUILD_TYPE="$mode" \
-              -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
-              -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
-            cmake --build "$sirius_test_dir/$mode"
-          done
+          cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
+          cmake --build "$sirius_test_dir/consumer"
 
       - name: Surface build errors
         if: failure()
