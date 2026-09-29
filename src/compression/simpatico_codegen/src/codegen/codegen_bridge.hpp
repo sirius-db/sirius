@@ -13,7 +13,6 @@
 #include <cuda/stream>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -60,11 +59,6 @@ bool launch_encode_fused_tree(CodegenHead const& head,
                               rmm::device_async_resource_ref const& mr,
                               fused_leaf_builder& builder,
                               std::string* error_out);
-
-/// Callback used by the high-level decode bridge to decode an entropy tail while binding a fused
-/// subtree: materialize the consumer node and return the decoded value it consumes. A consumer may
-/// take several inputs (a bitjoin), so the value, not the consumer, selects the column.
-using decode_materialize_fn = std::function<cudf::column const*(NodeId consumer, ValueId value)>;
 
 /// Launch an already-prepared fused decode tree. ``labeled`` must contain all persisted buffers;
 /// decode-only scratch is allocated and released on the frame's stream, and the frame keeps the
