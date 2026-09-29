@@ -14,8 +14,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -209,6 +213,202 @@ void numeric_sources(simpatico::stream_pool& pool,
          "non-BOOL8 membership result is an error, not semantic decline");
   output = simpatico::decompress(compressed, selected, pool, mr);
   verify_values(output->view(), all, stream);
+}
+
+std::vector<std::int32_t> first_rows(std::int32_t count, std::int32_t step = 1)
+{
+  std::vector<std::int32_t> rows;
+  for (std::int32_t row = 0; row < count; row += step)
+    rows.push_back(row);
+  return rows;
+}
+
+// What the membership probes of one decompress_scan_filter call observed, in call order.
+struct probe_trace {
+  std::vector<cudaStream_t> lanes;
+  std::vector<std::vector<std::uint32_t>> priors;  // empty when the probe received no prior
+};
+
+// A probe that keeps rows whose key is below @p keep_below, or declines when it is empty, after
+// copying its prior to the host on the probe's own stream.
+decltype(sc::membership_filter_directive::probe) traced_probe(
+  probe_trace& trace,
+  std::optional<std::int32_t> keep_below,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::shared_ptr<cudf::numeric_scalar<std::int32_t>> limit;
+  if (keep_below) {
+    limit = std::make_shared<cudf::numeric_scalar<std::int32_t>>(*keep_below, true, stream, mr);
+    stream.sync();
+  }
+  return [&trace, limit](cudf::column_view keys,
+                         std::uint32_t const* prior,
+                         ::cuda::stream_ref lane,
+                         rmm::device_async_resource_ref resource) -> std::unique_ptr<cudf::column> {
+    trace.lanes.push_back(lane.get());
+    auto& words = trace.priors.emplace_back();
+    if (prior != nullptr) {
+      words.resize((row_count + 31) / 32);
+      cuda_check(cudaMemcpyAsync(
+        words.data(), prior, words.size() * sizeof(words[0]), cudaMemcpyDeviceToHost, lane.get()));
+      lane.sync();
+    }
+    if (!limit) { return nullptr; }
+    return cudf::binary_operation(keys,
+                                  *limit,
+                                  cudf::binary_operator::LESS,
+                                  cudf::data_type{cudf::type_id::BOOL8},
+                                  lane,
+                                  resource);
+  };
+}
+
+// Compares the bits of @p words for the batch's rows; padding bits past the last row are ignored.
+template <typename Keep>
+void expect_rows(std::vector<std::uint32_t> const& words, Keep keep, char const* message)
+{
+  expect(words.size() == (row_count + 31) / 32, message);
+  for (int row = 0; row < row_count; ++row)
+    expect(((words[row / 32] >> (row % 32)) & 1U) == (keep(row) ? 1U : 0U), message);
+}
+
+// With a range or keep-mask source, membership probes run one at a time on the first lane, each
+// given the running combined mask as its prior. Membership-only chunks probe concurrently without
+// a prior, and a declined probe's all-ones strip must then be an exact AND identity.
+void membership_cascade(simpatico::stream_pool& pool,
+                        ::cuda::stream_ref stream,
+                        rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(sequence(0, stream, mr));
+  columns.push_back(sequence(10000, stream, mr));
+  cudf::table input{std::move(columns)};
+  auto compressed = simpatico::compress_with_plan(
+    input.view(), "input -> bitpack\n---\ninput -> identity\n", stream, mr);
+  std::array<std::size_t, 2> selected{0, 1};
+  cudaStream_t const first_lane = pool.streams.front();
+  auto const on_first_lane      = [&](probe_trace const& trace) {
+    return std::all_of(
+      trace.lanes.begin(), trace.lanes.end(), [&](auto lane) { return lane == first_lane; });
+  };
+
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+    request.filters.push_back({0, {0, 199}});
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10150, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, 10050, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.survivor_count == 50, "cascade survivor count");
+    expect(trace.lanes.size() == 3 && on_first_lane(trace), "cascade probes run on the first lane");
+    expect_rows(trace.priors[0], [](int row) { return row < 200; }, "first prior is the range");
+    expect_rows(
+      trace.priors[1], [](int row) { return row < 150; }, "prior includes the accepted probe");
+    expect_rows(
+      trace.priors[2],
+      [](int row) { return row < 150; },
+      "a declined cascade probe leaves the mask unchanged");
+    verify_values(output->view(), first_rows(50), stream);
+  }
+
+  // A keep mask alone primes the cascade.
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::full, sc::decode_route::full};
+    std::vector<std::uint32_t> keep((row_count + 31) / 32, 0);
+    for (int i = 0; i < row_count; i += 2)
+      keep[i / 32] |= std::uint32_t{1} << (i % 32);
+    request.keep_mask_words = keep.data();
+    request.keep_mask_rows  = row_count;
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, 10010, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.keep_mask_applied && result.survivor_count == 5,
+           "keep-mask cascade counts only visible rows");
+    expect(trace.lanes.size() == 2 && on_first_lane(trace), "keep-mask cascade lane");
+    for (auto const& prior : trace.priors)
+      expect_rows(prior, [](int row) { return row % 2 == 0; }, "keep-mask cascade prior");
+    verify_values(output->view(), first_rows(10, 2), stream);
+  }
+
+  // A probe that throws after an earlier probe queued work and declined.
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+    request.filters.push_back({0, {0, 19}});
+    auto const limit =
+      std::make_shared<cudf::numeric_scalar<std::int32_t>>(10010, true, stream, mr);
+    stream.sync();
+    request.membership_filters.push_back(
+      {1,
+       [limit](cudf::column_view keys,
+               std::uint32_t const*,
+               ::cuda::stream_ref lane,
+               rmm::device_async_resource_ref resource) -> std::unique_ptr<cudf::column> {
+         (void)cudf::binary_operation(keys,
+                                      *limit,
+                                      cudf::binary_operator::LESS,
+                                      cudf::data_type{cudf::type_id::BOOL8},
+                                      lane,
+                                      resource);
+         return nullptr;
+       }});
+    request.membership_filters.push_back(
+      {1,
+       [](cudf::column_view,
+          std::uint32_t const*,
+          ::cuda::stream_ref,
+          rmm::device_async_resource_ref) -> std::unique_ptr<cudf::column> {
+         throw probe_failure{};
+       }});
+    sc::scan_filter_result result;
+    bool const propagated = throws<probe_failure>([&] {
+      (void)simpatico::decompress_scan_filter(
+        compressed, selected, request, result, pool, stream, mr);
+    });
+    expect(propagated && result.status == sc::scan_filter_status::failed,
+           "cascade probe failure propagates");
+  }
+
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::full, sc::decode_route::full};
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, 10030, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(result.applied && result.survivor_count == 30,
+           "concurrent declined probe is an AND identity");
+    expect(trace.priors.size() == 2 && std::all_of(trace.priors.begin(),
+                                                   trace.priors.end(),
+                                                   [](auto const& prior) { return prior.empty(); }),
+           "concurrent probes receive no prior");
+    verify_values(output->view(), first_rows(30), stream);
+  }
+
+  {
+    sc::scan_filter_request request;
+    request.routes = {sc::decode_route::full, sc::decode_route::full};
+    probe_trace trace;
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    request.membership_filters.push_back({1, traced_probe(trace, std::nullopt, stream, mr)});
+    sc::scan_filter_result result;
+    auto output =
+      simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+    expect(!result.applied && result.status == sc::scan_filter_status::refused,
+           "all-declined concurrent probes refuse the selection");
+    verify_values(output->view(), first_rows(row_count), stream);
+  }
 }
 
 void bool8_delivery(simpatico::stream_pool& pool,
@@ -540,6 +740,7 @@ int main()
     simpatico::stream_pool pool;
     expect(pool.init(4), "stream pool initialization");
     numeric_sources(pool, stream.view(), resource);
+    membership_cascade(pool, stream.view(), resource);
     bool8_delivery(pool, stream.view(), resource);
     dict_codes_gather(pool, stream.view(), resource);
     nullable_full_route_declines(pool, stream.view(), resource);

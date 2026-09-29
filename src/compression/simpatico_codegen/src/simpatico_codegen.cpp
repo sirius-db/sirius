@@ -290,7 +290,11 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //           streams; stream 0 waits on the others (events, no host sync),
 //           AND-combines, counts (per-chunk popcount + CUB scan -> chunk_offsets)
 //           and D2H's the survivor count — the one added host sync, and it
-//           gates wave-2 allocations.
+//           gates wave-2 allocations. Membership probes are wave-1 sources
+//           only when there is no range, BOOL8, or keep-mask source;
+//           otherwise they run after the combine and before the count, one
+//           at a time on stream 0, each given the running combined mask as
+//           its prior.
 //   wave 2: compactable columns decode straight to survivor width; the rest
 //           decode full width and gather to survivor rows on their own
 //           streams, in parallel, each waiting first for the gather map

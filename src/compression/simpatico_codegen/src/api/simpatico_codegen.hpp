@@ -224,14 +224,15 @@ std::unique_ptr<cudf::table> decompress(
 /// carries the conjuncts a decode can resolve plus the output shape tag per
 /// selected column (see codegen/selection/selection.hpp).
 ///
-/// When the gate is on and every precondition holds, columns are decoded with
-/// the two-wave mask pipeline: wave 1 ballots each filter column's rows into
-/// mask words, the masks are AND-combined and counted (one host sync for the
-/// survivor count), then wave 2 decodes the compactable columns straight into
-/// survivor_count-row columns and gathers the rest to survivor rows on their own streams. @p result
-/// comes back with applied=true, the selection mask/offsets, and the gather map (row_indices) it
-/// used. The returned table is uniformly survivor-sized, so the caller only has to skip its own
-/// filter pass.
+/// When the gate is on and every precondition holds, columns are decoded with the two-wave mask
+/// pipeline: wave 1 ballots each filter column's rows into mask words, the masks are AND-combined
+/// and counted (one host sync for the survivor count), then wave 2 decodes the compactable columns
+/// straight into survivor_count-row columns and gathers the rest to survivor rows on their own
+/// streams. Membership probes join wave 1 only when there is no range, BOOL8, or keep-mask source;
+/// otherwise they run between the combine and the count, one at a time on the first stream, each
+/// given the running combined mask as its prior. @p result comes back with applied=true, the
+/// selection mask/offsets, and the gather map (row_indices) it used. The returned table is
+/// uniformly survivor-sized, so the caller only has to skip its own filter pass.
 ///
 /// When the gate is off, @p request is empty, or any precondition fails
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered

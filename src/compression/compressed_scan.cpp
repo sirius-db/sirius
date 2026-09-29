@@ -632,8 +632,13 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   // One lane per selected column or filter mask source, whichever is more, up to kDecodeStreams:
   // the filter's first wave decodes one request per source, so several sources on one column still
   // run in parallel, while a lane that would receive no request would only add another shared
-  // stream to the decode's waits. cuda::stream_ref has no default constructor, so the unused tail
-  // of the array repeats the first lane and is never passed on.
+  // stream to the decode's waits. Membership probes run in the first wave only when the chunk has
+  // no range, equality, or visibility mask; otherwise they run one at a time on the first lane
+  // after it. They are counted regardless, because whether a range survives planning is decided
+  // later, by build_chunk_pushdown_config inside decompress_with_pushdown: an extra lane receives
+  // no decode work, while a missing one would serialize concurrent probes. cuda::stream_ref has no
+  // default constructor, so the unused tail of the array repeats the first lane and is never passed
+  // on.
   std::size_t mask_sources = 0;
   if (!request.empty() && !request.row_selection_disabled) {
     for (auto const& entry : request.columns) {

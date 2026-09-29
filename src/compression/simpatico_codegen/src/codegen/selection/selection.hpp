@@ -138,17 +138,17 @@ struct filter_column_directive {
   range_predicate pred;  // inclusive [lo,hi] in the decoded integer domain
 };
 
-// One dynamic MEMBERSHIP conjunct (a join build's in_list / cuco set / Bloom
-// over a scan key column). Wave 1 decodes the key column full
-// width, invokes `probe` (device-side membership test -> BOOL8, nonzero =
-// keep, NO null mask, exactly the batch's row count) and ANDs the packed
-// result into the batch mask; wave 2 compacts everything else as usual.
-// Probe contract (same as every wave-1 launcher): ALL device work enqueued on
-// the given stream before returning — no internal stream hops, no host sync
-// required; the closure must PIN the filter structure it captures (e.g. a
-// shared_ptr to the published device set) for the duration of the
-// decompress_scan_filter call. Directives snapshot the filter SET per batch —
-// the converter must never hand a probe that reads mutable live state.
+// One dynamic MEMBERSHIP conjunct (a join build's in_list / cuco set / Bloom over a scan key
+// column). Wave 1 decodes the key column full width, invokes `probe` (device-side membership test
+// -> BOOL8, nonzero = keep, NO null mask, exactly the batch's row count) and ANDs the packed result
+// into the batch mask; wave 2 compacts everything else as usual. When the batch also has a range,
+// BOOL8 or keep-mask source, the probes instead run one at a time on stream 0 after wave 1's
+// combine, each given the running combined mask as its prior. Probe contract (same as every wave-1
+// launcher): ALL device work enqueued on the given stream before returning — no internal stream
+// hops, no host sync required; the closure must PIN the filter structure it captures (e.g. a
+// shared_ptr to the published device set) for the duration of the decompress_scan_filter call.
+// Directives snapshot the filter SET per batch — the converter must never hand a probe that reads
+// mutable live state.
 struct membership_filter_directive {
   std::size_t column;  // key column, indexes into `selected`
   // Second argument is an OPTIONAL prior keep-mask over the batch's rows (packed selection-mask
