@@ -60,6 +60,5 @@ pixi run cmake --build build/consumer
 
 Consumers are responsible for DuckDB and C++ runtime ABI compatibility.
 
-CI runs `python scripts/check-installed-package.py build/release` after building.
-It installs and relocates the package and builds Debug and Release consumers
-with Git discovery disabled. These checks require no GPU.
+CI installs and relocates the package, then uses CMake to build Debug and Release
+consumers with Git discovery disabled. These checks require no GPU.
