@@ -276,6 +276,10 @@ TEST_CASE_METHOD(fragment_fixture,
     auto sirius_ctx  = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     query_window window(*sirius_ctx, *con->context, "frag_control");
+    // execute() routes through task_creator::prepare_for_query, which requires
+    // set_client_context to have already run for the engine's exact query id — that only
+    // happens for the window's own id (begin_execution_window calls it), so the engine must be
+    // built on window.query_id() rather than with_initialized_engine's default synthesized one.
     sirius::test::with_initialized_engine(
       *con,
       query,
@@ -320,6 +324,8 @@ TEST_CASE_METHOD(fragment_fixture,
   auto const parquet = lineitem_parquet_path();
   REQUIRE(fs::exists(parquet));
 
+  // Filter on l_quantity so row-group pruning does not collapse the scan. Still one batch
+  // per file; FRAG-5 covers multi-batch streams.
   auto const leaf =
     "SELECT l_orderkey FROM read_parquet('" + parquet.string() + "') WHERE l_quantity < 2";
 
@@ -405,6 +411,7 @@ TEST_CASE_METHOD(fragment_fixture,
     std::size_t relayed_batches = 0;
     relayed_batches += receiver.relay_from(*first, 0, 0, 0);
     relayed_batches += receiver.relay_from(*second, 0, 0, 1);
+    // Multi-batch premise: if only one batch arrives this degrades to FRAG-2.
     REQUIRE(relayed_batches > 1);
 
     receiver.run();
@@ -441,6 +448,245 @@ TEST_CASE_METHOD(fragment_fixture,
       duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
         std::move(result));
     REQUIRE(materialized->RowCount() == kLeafRows);
+    REQUIRE(materialized->names == duckdb::vector<std::string>{"col_0"});
+    REQUIRE(materialized->types ==
+            duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+    std::vector<std::int32_t> values;
+    for (duckdb::idx_t row = 0; row < materialized->RowCount(); ++row) {
+      values.push_back(materialized->GetValue(0, row).GetValue<std::int32_t>());
+    }
+    std::sort(values.begin(), values.end());
+    REQUIRE(values == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-7: relay_from rejects a bad relay before any batch moves
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-7: relay_from checks its preconditions before moving data",
+                 "[integration][streaming_fragment]")
+{
+  auto const integer_type =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+
+  auto make_fragment = [&](duckdb::ClientContext& context,
+                           const std::string& query,
+                           std::vector<stream_id_t> outputs) {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(query);
+    spec.outputs     = std::move(outputs);
+    return std::make_unique<streaming_fragment>(context, std::move(spec));
+  };
+  auto make_receiver = [&](stream_input_spec input) {
+    fragment_spec spec;
+    // SELECT *: a stream read cannot project a subset of its declared columns.
+    spec.plan_source = sirius::test::sql_plan_source("SELECT * FROM sirius_stream_source(0)");
+    spec.inputs[0]   = std::move(input);
+    spec.outputs     = {1};
+    return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+  };
+
+  con->BeginTransaction();
+  try {
+    // Only one fragment may sit between build() and run(), so every source runs before the
+    // receiver is built.
+    auto sender = make_fragment(*con->context, kLeafQuery, {0});
+    sender->build();
+    sender->run();
+
+    // Each section throws and must leave the receiver's input open: the valid relay at the end
+    // still delivers every row.
+    auto require_receiver_still_open = [&](streaming_fragment& receiver) {
+      REQUIRE(receiver.relay_from(*sender, 0, 0, 0) > 0);
+      receiver.run();
+      REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+    };
+
+    SECTION("source was never built")
+    {
+      auto unbuilt  = make_fragment(*con->context, kLeafQuery, {0});
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*unbuilt, 0, 0, 0), sirius::invalid_input_exception);
+      require_receiver_still_open(*receiver);
+    }
+
+    SECTION("source is a result fragment")
+    {
+      auto result = make_fragment(*con->context, kLeafQuery, {});
+      result->build();
+      result->run();
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*result, 0, 0, 0), sirius::invalid_input_exception);
+      require_receiver_still_open(*receiver);
+    }
+
+    SECTION("source is on another ClientContext")
+    {
+      auto other_con =
+        std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+      other_con->context->registered_state->Insert(stream_bind_catalog::kStateKey,
+                                                   duckdb::make_shared_ptr<stream_bind_catalog>());
+      other_con->BeginTransaction();
+      auto foreign = make_fragment(*other_con->context, kLeafQuery, {0});
+      foreign->build();
+      foreign->run();
+      other_con->Rollback();
+
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*foreign, 0, 0, 0), sirius::invalid_input_exception);
+      require_receiver_still_open(*receiver);
+    }
+
+    SECTION("input stream was never declared")
+    {
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 9, 0), sirius::invalid_input_exception);
+      require_receiver_still_open(*receiver);
+    }
+
+    SECTION("sender is not in the expected set")
+    {
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 0, 5), sirius::invalid_input_exception);
+      require_receiver_still_open(*receiver);
+    }
+
+    SECTION("column count differs from the declared input")
+    {
+      auto receiver = make_receiver({{"a", "b"},
+                                     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+                                       duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER}),
+                                     {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 0, 0), sirius::invalid_input_exception);
+    }
+
+    SECTION("column type differs from the declared input")
+    {
+      auto receiver = make_receiver(
+        {{"a"},
+         sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+         {0}});
+      receiver->build();
+      REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 0, 0), sirius::invalid_input_exception);
+    }
+
+    SECTION("target has already run")
+    {
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      receiver->close_input(0, 0);
+      receiver->run();
+      REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 0, 0), sirius::invalid_input_exception);
+    }
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-8: failure paths and single-use calls
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-8: failed and out-of-order calls throw and release the window",
+                 "[integration][streaming_fragment]")
+{
+  auto make_fragment = [&](const std::string& query, std::vector<stream_id_t> outputs) {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(query);
+    spec.outputs     = std::move(outputs);
+    return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+  };
+  // A later fragment on the connection builds and runs, so the window was released.
+  auto require_window_free = [&] {
+    auto next = make_fragment(kLeafQuery, {0});
+    next->build();
+    next->run();
+    REQUIRE(drain_values(*next, 0) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+  };
+
+  con->BeginTransaction();
+  try {
+    SECTION("run() twice")
+    {
+      auto fragment = make_fragment(kLeafQuery, {0});
+      fragment->build();
+      fragment->run();
+      REQUIRE_THROWS_AS(fragment->run(), sirius::invalid_input_exception);
+    }
+
+    SECTION("pull() before run()")
+    {
+      auto fragment = make_fragment(kLeafQuery, {0});
+      fragment->build();
+      REQUIRE_THROWS_AS(fragment->pull(0), sirius::invalid_input_exception);
+      fragment->run();
+    }
+
+    SECTION("take_result() on a streaming fragment")
+    {
+      auto fragment = make_fragment(kLeafQuery, {0});
+      fragment->build();
+      fragment->run();
+      REQUIRE_THROWS_AS(fragment->take_result(), sirius::invalid_input_exception);
+    }
+
+    SECTION("take_result() twice, and output_batch_count() on a result fragment")
+    {
+      auto fragment = make_fragment(kLeafQuery, {});
+      fragment->build();
+      fragment->run();
+      REQUIRE_THROWS_AS(fragment->output_batch_count(0), sirius::invalid_input_exception);
+      REQUIRE(fragment->take_result() != nullptr);
+      REQUIRE_THROWS_AS(fragment->take_result(), sirius::invalid_input_exception);
+    }
+
+    SECTION("prepared types that do not match the plan")
+    {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+      spec.prepared    = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+        duckdb::StatementType::SELECT_STATEMENT);
+      spec.prepared->names = {"a", "b"};
+      spec.prepared->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR};
+      streaming_fragment fragment(*con->context, std::move(spec));
+      REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
+      // A failed build() is single-shot, rather than failing later on a half-registered session.
+      REQUIRE_THROWS_WITH(fragment.build(), Catch::Contains("cannot be retried"));
+      require_window_free();
+    }
+
+    SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
+    {
+      // The scan reads the file during run(), so deleting it after build() fails execution.
+      auto const copy = fs::temp_directory_path() / "sirius_frag8_lineitem.parquet";
+      fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
+      auto fragment =
+        make_fragment("SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
+      fragment->build();
+      fs::remove(copy);
+
+      REQUIRE_THROWS(fragment->run());
+      REQUIRE_FALSE(fragment->drained(0));
+      REQUIRE_THROWS_WITH(fragment->run(), Catch::Contains("query window is closed"));
+      require_window_free();
+    }
 
     con->Rollback();
   } catch (...) {

@@ -172,9 +172,10 @@ void streaming_fragment::open_window()
 
 void streaming_fragment::close_window(bool finish)
 {
-  if (!_lifecycle) { return; }
-  if (finish) { _lifecycle->scope.finish(); }
-  _lifecycle.reset();
+  // Detach first so a throwing finish() still leaves the window closed; run() relies on
+  // !_lifecycle to refuse a retry.
+  auto window = std::move(_lifecycle);
+  if (window && finish) { window->scope.finish(); }
 }
 
 void streaming_fragment::poison_outputs(std::exception_ptr cause) noexcept
@@ -242,7 +243,13 @@ void streaming_fragment::build_result_collector(
 {
   auto prepared = _spec.prepared;
   if (!prepared) { prepared = synthesize_prepared(subtree->types); }
+  // The collector decodes GPU output with prepared->types; a mismatch would misread it.
   _sink_types = sirius::from_duckdb_vec(prepared->types);
+  if (_sink_types != subtree->types) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: prepared result types do not match the physical plan's " +
+      std::to_string(subtree->types.size()) + " output column(s)");
+  }
 
   _result_plan = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
     std::move(prepared), std::move(subtree));
@@ -259,13 +266,17 @@ void streaming_fragment::build_result_collector(
   register_sources();
 }
 
-void streaming_fragment::build()
+void streaming_fragment::build(bool park_window)
 {
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
+  if (_build_failed) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: a failed build() cannot be retried; create a new fragment");
+  }
 
   auto catalog = catalog_for(_context);
-  // Same as the destructor: erase our own ids so a rebuild is idempotent and does not
-  // drop another fragment's declarations on this connection.
+  // Replace any earlier declaration of our ids (the FFI declares placeholders to bind its
+  // views) without touching another fragment's ids on this connection.
   for (const auto& [id, _] : _spec.inputs) {
     catalog->erase(id);
   }
@@ -294,8 +305,10 @@ void streaming_fragment::build()
       build_streaming_sink(std::move(subtree));
     }
     _built = true;
-    _lifecycle->scope.set_parked(true);
+    if (park_window) { _lifecycle->scope.set_parked(true); }
   } catch (...) {
+    // The session and engine keep partial registrations, so the fragment is single-shot.
+    _build_failed = true;
     // Release the slot so a later fragment on this connection can build. The destructor
     // would do the same, but only when this object is dropped.
     try {
@@ -324,7 +337,6 @@ void streaming_fragment::run()
     if (is_result()) { _result = _engine->get_result(); }
   } catch (...) {
     // Fail every output before the window closes. Otherwise a peer in wait() blocks forever.
-    // fail_output is first-failure-wins, so a caller that poisons again is safe.
     poison_outputs(std::current_exception());
     try {
       close_window(false);
@@ -332,9 +344,12 @@ void streaming_fragment::run()
     }
     throw;
   }
-  _ran = true;
   close_window(true);
-  if (_result && _result->HasError()) { _result->ThrowError(); }
+  if (_result && _result->HasError()) {
+    auto failed = std::move(_result);
+    failed->ThrowError();
+  }
+  _ran = true;
 }
 
 std::size_t streaming_fragment::relay_from(streaming_fragment& source,
@@ -412,12 +427,6 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
   return moved;
 }
 
-bool streaming_fragment::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
-{
-  require_built("push()");
-  return _session.push(id, std::move(batch));
-}
-
 void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 {
   require_built("close_input()");
@@ -453,9 +462,12 @@ duckdb::unique_ptr<duckdb::QueryResult> streaming_fragment::take_result()
     throw sirius::invalid_input_exception(
       "streaming_fragment: take_result() is only valid on a fragment with no output streams");
   }
-  if (!_ran || !_result) {
+  if (!_ran) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: run() must complete before take_result()");
+  }
+  if (!_result) {
+    throw sirius::invalid_input_exception("streaming_fragment: the result was already taken");
   }
   return std::move(_result);
 }
@@ -468,7 +480,6 @@ const duckdb::vector<sirius::logical_type>& streaming_fragment::sink_types() con
 
 std::size_t streaming_fragment::output_batch_count(stream_id_t id) const
 {
-  if (is_result()) { return 0; }
   require_built("output_batch_count()");
   auto it = _output_repos.find(id);
   if (it == _output_repos.end()) {

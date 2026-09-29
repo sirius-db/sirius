@@ -90,14 +90,21 @@ class streaming_fragment {
   /// window stays open until run(), a failed build, or destruction, and run() or destruction may
   /// happen on another thread. Until then the engine's single query-lifecycle slot is held, so
   /// any other GPU query or fragment build on this SiriusContext throws instead of waiting.
-  /// @throws sirius::invalid_input_exception when already built, no catalog, no Sirius state,
-  ///         null plan, or a declared input the plan never reads.
+  /// A failed build() closes the window and cannot be retried; create a new fragment.
+  /// @throws sirius::invalid_input_exception when already built, after a failed build(), no
+  ///         catalog, no Sirius state, null plan, a declared input the plan never reads, or
+  ///         spec.prepared types that do not match the plan's output types.
+  /// @throws std::runtime_error when another fragment's window is open (see above).
   /// @throws whatever the plan source, binder, or plan generator raises.
-  void build();
+  /// @param park_window false for a caller that calls run() right away on the same thread: the
+  ///        window is not parked, so concurrent queries wait for it instead of failing.
+  void build(bool park_window = true);
 
   /// Submit and block. Closes the query window on success. On failure, poisons every output,
-  /// then closes the window. The query_window destructor is a backstop.
-  /// @throws sirius::invalid_input_exception when build() has not run, or when already run.
+  /// then closes the window.
+  /// @throws sirius::invalid_input_exception when build() has not run, when already run, or
+  ///         after a failed run() (the window is closed; create a new fragment).
+  /// @throws the result's error for a result fragment whose query failed.
   /// @throws whatever the engine's execution raises.
   void run();
 
@@ -110,19 +117,24 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
-  /// @return false if the input had already ended.
-  bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
-
+  /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
   /// nullopt means no batch is parked now. That is not EOS. Call drained(id) for EOS.
+  /// @throws sirius::invalid_input_exception before a successful run() or on an unknown id.
+  /// @throws the output's poison error.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
 
+  /// False while batches remain, before EOS, and on a poisoned output.
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   [[nodiscard]] bool drained(stream_id_t id) const;
 
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   void fail_output(stream_id_t id, std::exception_ptr error);
 
-  /// Take the materialized QueryResult of a result fragment. Valid after a successful run.
+  /// Take the materialized QueryResult of a result fragment. Valid once, after a successful run.
+  /// @throws sirius::invalid_input_exception on a streaming fragment, before a successful run(),
+  ///         or when the result was already taken.
   duckdb::unique_ptr<duckdb::QueryResult> take_result();
 
   /// Physical output column types of the plan root, set during build().
@@ -130,8 +142,9 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception when build() has not run.
   [[nodiscard]] const duckdb::vector<sirius::logical_type>& sink_types() const;
 
-  /// Batches currently parked on output stream `id`. Returns 0 for a result fragment.
-  /// Unknown ids throw.
+  /// Batches currently parked on output stream `id`.
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id, including
+  ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
 
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
@@ -166,6 +179,7 @@ class streaming_fragment {
   std::unique_ptr<query_window> _lifecycle;
 
   bool _built{false};
+  bool _build_failed{false};
   bool _ran{false};
   duckdb::vector<sirius::logical_type> _sink_types;
 };
