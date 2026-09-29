@@ -47,8 +47,7 @@ extension's DuckDB versions requires a separate API/ABI change.
 
 Install the `sirius_library` component and consume `sirius::sirius` with
 `find_package(sirius CONFIG REQUIRED)`. Its public headers do not require CUDA or
-DuckDB headers. The shared library records its runtime dependencies; an installed
-consumer does not need the engine's CMake dependency targets.
+DuckDB headers. The shared library records its runtime dependencies.
 
 ```bash
 pixi run cmake --install build/release --prefix "$PWD/build/stage" --component sirius_library
