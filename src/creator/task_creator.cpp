@@ -438,12 +438,10 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
-  // Most calls here come from a completion callback (notify_downstream_pipelines, or the GPU
-  // executor scheduling a finished task's consumers). If the query is tearing down, `node` points
-  // into a plan that is about to be destroyed and a drain has very likely already passed this
-  // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
-  // queue, which refused EVERY query's pushes at once.
-  if (!accepts_work(query_id)) { return; }
+  // Callers still own the plan while extracting keys above. Register this publisher through
+  // push(), so cleanup cannot drain between checking the gate and inserting the request.
+  auto submission = begin_submission(query_id);
+  if (_query_lifecycle != nullptr && !submission) { return; }
   auto request      = std::make_unique<task_creation_request>();
   request->node     = node;
   request->query_id = query_id;
@@ -453,7 +451,8 @@ void task_creator::schedule(op::sirius_physical_operator* node)
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
-  if (!accepts_work(query_id)) { return; }
+  auto submission = begin_submission(query_id);
+  if (_query_lifecycle != nullptr && !submission) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
@@ -462,11 +461,12 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   _task_creation_queue.push(std::move(request));
 }
 
-bool task_creator::accepts_work(sirius::query_id_t query_id) const
+sirius::exec::query_lifecycle_registry::submission_guard task_creator::begin_submission(
+  sirius::query_id_t query_id) const
 {
-  if (_query_lifecycle == nullptr) { return true; }
-  const auto state = _query_lifecycle->state(query_id);
-  if (!state) {
+  if (_query_lifecycle == nullptr) { return {}; }
+  auto submission = _query_lifecycle->try_begin_submission(query_id);
+  if (submission.status() == sirius::exec::query_submission_status::unknown) {
     if (auto query_state = get_query_task_global_state(query_id);
         query_state && query_state->completion_handler) {
       query_state->completion_handler->report_error(
@@ -474,7 +474,7 @@ bool task_creator::accepts_work(sirius::query_id_t query_id) const
     }
     SIRIUS_LOG_ERROR("task_creator: refusing work for unknown query {}", query_id);
   }
-  return state == sirius::exec::query_lifecycle_state::open;
+  return submission;
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
@@ -519,7 +519,8 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   if (!state) { return; }
   // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
   // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
-  if (!accepts_work(query_id)) { return; }
+  auto submission = begin_submission(query_id);
+  if (_query_lifecycle != nullptr && !submission) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
   for (; state->index_of_next_lookahead < state->lookahead_queue.size();

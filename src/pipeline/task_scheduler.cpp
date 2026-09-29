@@ -101,15 +101,18 @@ task_scheduler::task_scheduler(
 
 task_scheduler::~task_scheduler() { stop(); }
 
-void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
+void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
 {
+  // Declared before task so an exception destroys unsubmitted work before settling its publisher.
+  exec::query_lifecycle_registry::submission_guard submission;
+  auto task = std::move(input);
   // Refuse work for a query that is tearing down. A task creation worker can land here after
   // that query's queue drain already ran, and the task would then sit in the shared queue holding
   // raw repository pointers into a manager about to be erased.
   if (_query_lifecycle != nullptr && task) {
     const auto query_id = sirius::make_query_id(index_keys_for(*task).query_id);
-    const auto state    = _query_lifecycle->state(query_id);
-    if (!state) {
+    submission          = _query_lifecycle->try_begin_submission(query_id);
+    if (submission.status() == exec::query_submission_status::unknown) {
       if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
         if (auto handler = gpu_task->get_completion_handler()) {
           handler->report_error("task_scheduler: query lifecycle registration is missing");
@@ -117,7 +120,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
       }
       SIRIUS_LOG_ERROR("task_scheduler: refusing work for unknown query {}", query_id);
     }
-    if (state != sirius::exec::query_lifecycle_state::open) { return; }
+    if (!submission) { return; }
   }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({
@@ -204,6 +207,10 @@ void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& 
 
 void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 {
+  // Settle publishers before interrupting/draining queues. Keep the existing worker joins:
+  // submission accounting does not yet cover running tasks and repository borrowers.
+  if (_query_lifecycle) { _query_lifecycle->quiesce_and_wait_for_submissions(query_id); }
+
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
   // Teardown ordering is load-bearing. The scan/gpu executor drains below run
   // in-flight tasks to completion, and a completing task schedules its
@@ -250,6 +257,10 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 
 void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
 {
+  // Settle publishers before interrupting/draining queues. Keep the existing worker joins:
+  // submission accounting does not yet cover running tasks and repository borrowers.
+  if (_query_lifecycle) { _query_lifecycle->quiesce_and_wait_for_submissions(query_id); }
+
   // Once the query has signaled completion, NOTHING should still be queued. Rather
   // than drain (which would hide the bug), validate that every queue is empty and
   // throw if not — a non-empty queue means tasks were still being scheduled when we

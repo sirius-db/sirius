@@ -85,40 +85,40 @@ class convertible_gpu_pipeline_task : public convertible_data {
    * Pushes the task back to the queue; if the queue is closed (shutdown),
    * the task is destroyed -- this is expected during query teardown.
    *
-   * The lifecycle gate is what makes that "expected during query teardown" actually hold. TIER-2
-   * downgrade pops a task off the shared scheduler queue into a processing-thread local, carries
-   * it across a *blocking* pool reserve() and a full host/device conversion, and only then gets
-   * here. That window easily outlives the owning query's drain, so an ungated push resurrects a
-   * task after its query was cleaned up: the push itself runs the key extractor over a plan that
-   * has already been destroyed, and the resurrected task holds raw repository pointers into a
-   * manager that is about to be erased.
+   * TIER-2 spilling holds an extracted task across pool reservation and conversion. Register
+   * the return as a publisher, so cleanup either refuses it or waits for its insertion before
+   * draining. This guard covers publication only: the existing downgrade drain must still keep
+   * the plan/repositories alive through conversion and task destruction. Full borrowed-resource
+   * lifetime tracking is separate from preventing reinsertion behind a completed drain.
    */
   ~convertible_gpu_pipeline_task() override
   {
     if (!_task) { return; }
+    sirius::exec::query_lifecycle_registry::submission_guard submission;
+    // Destroy a refused/unsubmitted task before releasing an admitted publisher on unwind.
+    auto task = std::move(_task);
     if (_query_lifecycle != nullptr) {
-      const auto query_id =
-        sirius::make_query_id(sirius::pipeline::index_keys_for(*_task).query_id);
-      const auto state = _query_lifecycle->state(query_id);
-      if (!state) {
+      const auto query_id = sirius::make_query_id(sirius::pipeline::index_keys_for(*task).query_id);
+      submission          = _query_lifecycle->try_begin_submission(query_id);
+      if (submission.status() == sirius::exec::query_submission_status::unknown) {
         try {
           SIRIUS_LOG_ERROR("convertible_gpu_pipeline_task: refusing work for unknown query {}",
                            query_id);
         } catch (...) {
           // Destructors must not throw while unwinding a failed query.
         }
-        if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(_task.get())) {
+        if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(task.get())) {
           if (auto handler = gpu_task->get_completion_handler()) {
             handler->report_error(
               "convertible_gpu_pipeline_task: query lifecycle registration is missing");
           }
         }
       }
-      if (state != sirius::exec::query_lifecycle_state::open) {
+      if (!submission) {
         return;  // query is tearing down or has already closed; do not resurrect its task
       }
     }
-    (void)_queue.push(std::move(_task));
+    (void)_queue.push(std::move(task));
   }
 
   /**

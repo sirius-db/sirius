@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -409,4 +410,95 @@ TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_sched
   }
   REQUIRE(global_state->executed_count.load() == num_tasks);
   sched.stop();
+}
+
+namespace {
+class submission_observing_task : public mock_gpu_pipeline_task {
+ public:
+  submission_observing_task(sirius::exec::query_lifecycle_registry& lifecycle,
+                            std::size_t& publishers_at_destruction)
+    : mock_gpu_pipeline_task(1,
+                             std::make_unique<mock_gpu_pipeline_task_local_state>(1, 0),
+                             std::make_shared<mock_gpu_pipeline_task_global_state>()),
+      lifecycle_(lifecycle),
+      publishers_at_destruction_(publishers_at_destruction)
+  {
+  }
+
+  ~submission_observing_task() override
+  {
+    publishers_at_destruction_ = lifecycle_.activity(sirius::make_query_id(0)).submissions;
+  }
+
+ private:
+  sirius::exec::query_lifecycle_registry& lifecycle_;
+  std::size_t& publishers_at_destruction_;
+};
+}  // namespace
+
+TEST_CASE("scheduler and spill return retain submission through rejected task destruction",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  const auto q = sirius::make_query_id(0);  // Mock tasks have no pipeline and therefore query 0.
+  lifecycle.open_query(q);
+  std::size_t publishers_at_destruction = 99;
+
+  SECTION("scheduler enqueue")
+  {
+    auto manager = initialize_memory_manager(1);
+    task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
+    scheduler.set_query_lifecycle_registry(&lifecycle);
+    scheduler.get_pipeline_task_queue()->interrupt();
+    scheduler.schedule(
+      std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction));
+  }
+  SECTION("spill return enqueue")
+  {
+    sirius::exec::multi_index_priority_queue<itask> queue(&index_keys_for);
+    queue.interrupt();
+    {
+      sirius::convertible_gpu_pipeline_task spilled(
+        std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction),
+        queue,
+        &lifecycle);
+    }
+    REQUIRE(queue.empty());
+  }
+  REQUIRE(publishers_at_destruction == 1);
+  REQUIRE(lifecycle.activity(q).submissions == 0);
+  REQUIRE(lifecycle.activity(q).work == 0);
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  lifecycle.close(q);
+}
+
+TEST_CASE("scheduler error cleanup waits for publishers before its existing drains",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
+  scheduler.set_query_lifecycle_registry(&lifecycle);
+  const auto q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  auto publisher = lifecycle.try_begin_submission(q);
+  lifecycle.quiesce(q);
+  std::promise<void> cleanup_started;
+  auto started = cleanup_started.get_future();
+  auto cleanup = std::async(std::launch::async, [&] {
+    cleanup_started.set_value();
+    scheduler.drain_after_error(q);
+  });
+  started.wait();
+  CHECK(cleanup.wait_for(20ms) == std::future_status::timeout);
+  // Simulate the final insertion by a producer admitted before quiesce.
+  std::size_t publishers_at_destruction = 99;
+  CHECK(scheduler.get_pipeline_task_queue()->push(
+    std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction)));
+  publisher.finish();
+  CHECK(cleanup.wait_for(5s) == std::future_status::ready);
+  cleanup.get();
+  CHECK(scheduler.get_pipeline_task_queue()->empty());
+  CHECK(publishers_at_destruction == 0);  // The drain happened after publication settled.
+  lifecycle.close(q);
 }

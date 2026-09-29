@@ -48,15 +48,18 @@ itask_executor::itask_executor(
 
 itask_executor::~itask_executor() { stop(); }
 
-void itask_executor::schedule(std::unique_ptr<itask> task)
+void itask_executor::schedule(std::unique_ptr<itask> input)
 {
+  // Declared before task so an exception destroys unsubmitted work before settling its publisher.
+  exec::query_lifecycle_registry::submission_guard submission;
+  auto task = std::move(input);
   if (task) {
     // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
     // drain for this query may already have passed. Refuse rather than re-arm work behind it.
     if (_query_lifecycle != nullptr) {
       const auto query_id = sirius::make_query_id(pipeline::index_keys_for(*task).query_id);
-      const auto state    = _query_lifecycle->state(query_id);
-      if (!state) {
+      submission          = _query_lifecycle->try_begin_submission(query_id);
+      if (submission.status() == exec::query_submission_status::unknown) {
         if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
           if (auto handler = gpu_task->get_completion_handler()) {
             handler->report_error("task_executor: query lifecycle registration is missing");
@@ -64,7 +67,7 @@ void itask_executor::schedule(std::unique_ptr<itask> task)
         }
         SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
       }
-      if (state != exec::query_lifecycle_state::open) { return; }
+      if (!submission) { return; }
     }
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({

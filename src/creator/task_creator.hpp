@@ -280,11 +280,12 @@ class task_creator {
 
  protected:
   /**
-   * @brief Whether the lifecycle gate still accepts work for @p query_id.
+   * @brief Register a publisher and diagnose an unknown query. Retain the guard through push.
    *
-   * True when no registry is bound (the unit-test default), preserving pre-gate behaviour.
+   * An empty guard with no registry bound preserves the standalone unit-test behavior.
    */
-  [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const;
+  [[nodiscard]] sirius::exec::query_lifecycle_registry::submission_guard begin_submission(
+    sirius::query_id_t query_id) const;
 
   /**
    * @brief Stop the worker thread pool.

@@ -186,6 +186,7 @@ If any task throws an exception during execution:
 
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
 2. `drain_after_error()` is called on the pipeline executor which:
+   - Closes the query's submission gate and waits for admitted publishers before draining
    - Stops the task creator threads
    - Drains the task queue
    - Calls `drain_and_wait()` on the GPU executors

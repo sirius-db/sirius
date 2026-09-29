@@ -421,12 +421,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
-  // Close the enqueue gate BEFORE any drain runs. Every producer consults it, so from here on a
-  // completion callback for this query — notify_downstream_pipelines, the GPU executor scheduling
-  // a finished task's consumers, an OOM reschedule, or a TIER-2 downgrade returning a task it
-  // extracted — is refused instead of adding work behind a drain that already passed. Scoped to
-  // this query: other in-flight queries keep scheduling normally.
-  query_lifecycle_.quiesce(query_id);
+  // Close publication and wait for producers that already acquired a submission guard. Only
+  // then may queues be drained: an earlier gate check alone cannot prevent a late insertion.
+  // Existing worker and downgrade drains below remain responsible for execution/borrow lifetime.
+  query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
 
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
   // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
@@ -542,7 +540,7 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // Same order as the main path: shut the gate, stop the producer, then drop what it queued. Each
   // step is independently guarded so a throw in one still lets the others run.
   try {
-    query_lifecycle_.quiesce(query_id);
+    query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
   } catch (...) {
   }
   try {

@@ -71,6 +71,8 @@ class dummy_task_executor : public itask_executor {
   {
   }
 
+  void interrupt_queue_for_test() { _task_queue.interrupt(); }
+
  protected:
   void manager_loop() override
   {
@@ -123,4 +125,41 @@ TEST_CASE("Executor executes scheduled tasks", "[task_executor]")
   REQUIRE(g->counter.load() == expected_counter);
 
   REQUIRE_NOTHROW(executor.stop());
+}
+
+TEST_CASE("executor retains submission through rejected task destruction",
+          "[task_executor][query_lifecycle_gate][concurrency]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  const auto q = sirius::make_query_id(0);  // Non-pipeline test tasks use query 0.
+  lifecycle.open_query(q);
+  dummy_task_executor executor({1, "submission-test"});
+  executor.set_query_lifecycle_registry(&lifecycle);
+  executor.interrupt_queue_for_test();
+  std::size_t publishers_at_destruction = 99;
+  class observing_task : public dummy_task {
+   public:
+    observing_task(sirius::exec::query_lifecycle_registry& registry, std::size_t& observed)
+      : dummy_task(1,
+                   std::make_unique<dummy_task_local_state>(1),
+                   std::make_shared<dummy_task_global_state>()),
+        registry_(registry),
+        observed_(observed)
+    {
+    }
+    ~observing_task() override
+    {
+      observed_ = registry_.activity(sirius::make_query_id(0)).submissions;
+    }
+
+   private:
+    sirius::exec::query_lifecycle_registry& registry_;
+    std::size_t& observed_;
+  };
+  executor.schedule(std::make_unique<observing_task>(lifecycle, publishers_at_destruction));
+  REQUIRE(publishers_at_destruction == 1);
+  REQUIRE(lifecycle.activity(q).submissions == 0);
+  REQUIRE(lifecycle.activity(q).work == 0);
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  lifecycle.close(q);
 }
