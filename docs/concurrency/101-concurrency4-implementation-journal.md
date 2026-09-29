@@ -183,3 +183,14 @@ Implementation entries will be added here as each buildable change is validated 
   stress child runs two overlapping queries with twelve scan branches each on two producer
   threads. Pure CPU budget tests also passed AddressSanitizer/UBSan (3 cases, 21 assertions).
 - Previous commit: `6bbdbf9b9`.
+
+### 9. `fix(exec): settle dispatcher slots on submission failure`
+
+- Pending scoped work transfers directly through a worker loop. Completion no longer needs an
+  allocating thread-pool submission that could lose its in-flight count on failure.
+- Initial submission failures settle their reserved slot before propagating; cancellation destroys
+  pending captures outside the dispatcher mutex. A stopped pool refuses new work explicitly.
+- Partial thread-pool construction stops and joins already-created threads before unwinding.
+- Validation: full build; 16 dispatcher/MVCC/concurrent SQL cases, 225 assertions, including a
+  refused submission and a 10,000-task pending chain without recursive completion.
+- Previous commit: `cfb2c73d0`.

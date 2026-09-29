@@ -26,6 +26,7 @@
 #include <latch>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -49,23 +50,32 @@ class static_thread_pool {
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
     auto* latch_ptr   = init_latch.get();
 
-    for (int i = 0; i < num_threads; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-        if (init_fn_ptr) {
-          (*init_fn_ptr)();
-          latch_ptr->count_down();
+    try {
+      for (int i = 0; i < num_threads; ++i) {
+        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+          if (init_fn_ptr) {
+            (*init_fn_ptr)();
+            latch_ptr->count_down();
+          }
+          work_loop();
+        });
+        if (!name.empty()) {
+          std::ignore =
+            sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
         }
-        work_loop();
-      });
-      if (!name.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
+        if (!cpu_ids.empty()) {
+          std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
+        }
       }
-      if (!cpu_ids.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
-      }
-    }
 
-    if (init_latch) { init_latch->wait(); }
+      if (init_latch) { init_latch->wait(); }
+    } catch (...) {
+      stop();
+      for (auto& thread : threads_) {
+        if (thread.joinable()) { thread.join(); }
+      }
+      throw;
+    }
   }
 
   static_thread_pool(const static_thread_pool&)            = delete;
@@ -82,6 +92,7 @@ class static_thread_pool {
   void schedule(std::invocable auto&& fn)
   {
     std::lock_guard l(mu_);
+    if (stop_requested_) { throw std::runtime_error("thread pool is stopped"); }
     queue_.emplace([callable = std::forward<decltype(fn)>(fn)]() mutable noexcept {
       try {
         callable();

@@ -70,7 +70,7 @@ class scoped_dispatcher {
     if (inflight_ < max_inflight_) {
       ++inflight_;
       lk.unlock();
-      pool_.schedule(std::move(task));
+      submit(std::move(task));
     } else {
       pending_.push_back(std::move(task));
     }
@@ -89,16 +89,20 @@ class scoped_dispatcher {
 
     ++inflight_;
     lk.unlock();
-    pool_.schedule(std::move(task));
+    submit(std::move(task));
     return true;
   }
 
   void request_stop()
   {
-    std::lock_guard lk(mu_);
-    stop_.request_stop();  // wakes cv_slot_ waiters via stop_callback
-    pending_.clear();      // drop queued-but-not-started work
-    if (inflight_ == 0) { cv_done_.notify_all(); }
+    std::deque<task_t> discarded;
+    {
+      std::lock_guard lk(mu_);
+      stop_.request_stop();
+      discarded.swap(pending_);
+      if (inflight_ == 0) { cv_done_.notify_all(); }
+    }
+    // Captures can release leases and invoke callbacks. Destroy outside mu_.
   }
 
   void wait_for_all()
@@ -135,7 +139,6 @@ class scoped_dispatcher {
           log_exception_ptr(std::current_exception());
         }
       }
-      on_task_done();
     };
   }
 
@@ -149,24 +152,45 @@ class scoped_dispatcher {
     }
   }
 
-  void on_task_done()
+  // A slot is transferred through a worker-local chain. There is no allocating
+  // pool enqueue between completion and the next pending task.
+  void run(task_t task) noexcept
   {
-    task_t next;
-    bool have_next = false;
-    {
+    for (;;) {
+      if (task) {
+        try {
+          task();
+        } catch (...) {
+          try {
+            log_exception_ptr(std::current_exception());
+          } catch (...) {
+          }
+        }
+        task = nullptr;
+      }
       std::lock_guard lk(mu_);
       if (!stop_.stop_requested() && !pending_.empty()) {
-        // Hand the slot to a queued task; inflight_ unchanged → no slot opened.
-        next = std::move(pending_.front());
+        task = std::move(pending_.front());
         pending_.pop_front();
-        have_next = true;
       } else {
         --inflight_;
-        cv_slot_.notify_one();  // a real slot opened — wake one schedule()
+        cv_slot_.notify_one();
         if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+        return;
       }
     }
-    if (have_next) pool_.schedule(std::move(next));
+  }
+
+  void submit(task_t task)
+  {
+    try {
+      pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); });
+    } catch (...) {
+      // Submission failed before a worker acquired the slot. Settle it, including
+      // any concurrently queued tasks, before propagating to the query producer.
+      run({});
+      throw;
+    }
   }
 
   static_thread_pool& pool_;
