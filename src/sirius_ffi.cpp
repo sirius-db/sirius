@@ -17,11 +17,11 @@
 // Implementation of sirius/ffi.hpp. This translation unit sees the heavy internal types so
 // consumers (e.g. the Rust bindings) never include sirius_context.hpp.
 
-#include "config.hpp"                                      // duckdb::Config::LOG_*
-#include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
-#include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
-#include "data/data_batch_utils.hpp"                       // sirius::get_cudf_table_view, make_data_batch
-#include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
+#include "config.hpp"                          // duckdb::Config::LOG_*
+#include "core_functions_extension.hpp"        // duckdb::CoreFunctionsExtension
+#include "cudf/cudf_utils.hpp"                 // sirius::get_cudf_type
+#include "data/data_batch_utils.hpp"           // sirius::get_cudf_table_view, make_data_batch
+#include "data/sirius_converter_registry.hpp"  // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
