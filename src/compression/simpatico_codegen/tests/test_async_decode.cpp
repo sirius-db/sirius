@@ -1345,9 +1345,48 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
   }
 }
 
+// A dictionary the decoder rebuilds keeps its decoded INT32 indices, type and buffer, so the
+// constant-width gather and the lookup-table predicate, which both require INT32 codes, still
+// apply.
+void test_dictionary_rebuild_keeps_indices(rmm::device_async_resource_ref mr)
+{
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{::cuda::stream_ref{stream}};
+  std::vector<std::string> const keys{"AA", "BB", "CC"};
+  std::vector<std::string> values;
+  for (int row = 0; row < 1037; ++row)
+    values.push_back(keys[(row * 7) % keys.size()]);
+  auto input   = make_strings_column(values, {}, stream.view());
+  auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
+  std::vector<std::string> names;
+  std::vector<std::unique_ptr<cudf::column>> channels;
+  for (auto const& channel : encoded->named_channels(stream.view())) {
+    names.push_back(channel.name);
+    channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+  }
+  expect(channels[2]->type().id() == cudf::type_id::INT32, "fixture indices are not INT32");
+  auto const* const decoded_indices = channels[2]->view().head<void>();
+  stream.synchronize();
+
+  simpatico::decode_session session(streams, mr);
+  auto& frame        = simpatico::decode_session_test_access::frame(session);
+  auto const rebuilt = simpatico::reconstruct_decode_representation(
+    dictionary_plan_node(2), names, std::move(channels), frame);
+  auto const& dictionary =
+    dynamic_cast<simpatico::dictionary_compressed_representation const&>(*rebuilt);
+  auto const indices = cudf::dictionary_column_view(dictionary.dict_column->view()).indices();
+  expect(indices.type().id() == cudf::type_id::INT32,
+         "decoder rebuild changed the dictionary index type");
+  expect(indices.head<void>() == decoded_indices, "decoder rebuild copied the dictionary indices");
+  auto const hits = dictionary.decompress_predicate(simpatico::decode_predicate{{"BB"}}, frame);
+  expect(hits != nullptr, "rebuilt dictionary declined the lookup-table predicate");
+  expect(session.finish().empty(), "rebuild fixture published a session result");
+}
+
 // Unsigned indices, such as a narrow field a bitjoin decodes, take cuDF's dictionary factory on
 // both the decoder and the loader. cuDF retags them as the signed type of the same width, so these
-// codes stay within that range.
+// codes stay within that range; UINT8 codes above 127 would read as negative on every path, a known
+// limitation tracked outside this test.
 void test_dictionary_unsigned_indices(rmm::device_async_resource_ref mr)
 {
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
@@ -2694,6 +2733,73 @@ void test_selection_and_predicate_routes(rmm::device_async_resource_ref upstream
   ledger.check();
 }
 
+// The filtered decode completes the lanes that carry its own work, including a BOOL8 gather that no
+// session request covers, and leaves a supplied lane that received no work alone.
+void test_scan_filter_phase_lanes(rmm::device_async_resource_ref upstream)
+{
+  namespace sc                   = sirius::codegen;
+  constexpr cudf::size_type rows = 1037;
+  std::vector<std::string> strings(rows, "other");
+  cudf::size_type matches = 0;
+  for (cudf::size_type row = 0; row < rows; row += 97, ++matches)
+    strings[row] = "match";
+  auto const numbers = make_int32_table(1, rows, 137);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::make_unique<cudf::column>(numbers->view().column(0)));
+  columns.push_back(make_strings_column(strings, {}, cudf::get_default_stream()));
+  cudf::table const input{std::move(columns)};
+  auto const compressed = simpatico::compress_with_plan(
+    input.view(),
+    "input -> bitpack\n---\n"
+    "input -> dictionary -> keys_offsets, keys_chars, indices\ndictionary.indices -> bitpack\n",
+    cudf::get_default_stream(),
+    upstream);
+  cudf::get_default_stream().synchronize();
+
+  // The range source (every row) runs on lane 0 and the BOOL8 source on lane 1, where its survivor
+  // gather also runs; lane 2 receives nothing.
+  simpatico::stream_pool pool;
+  expect(pool.init(3), "phase lane pool init");
+  auto const lanes = pool.refs();
+  std::array<std::size_t, 2> const selected{0, 1};
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::dict_codes};
+  request.filters.push_back(
+    {0, {std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()}});
+  request.bool8_filters.push_back({1, {"match"}});
+  rmm::cuda_stream out(rmm::cuda_stream::flags::non_blocking);
+  sc::scan_filter_result result;
+  // Compiles and loads the kernels first: a module load can wait for every stream.
+  auto output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, lanes, out, upstream);
+  cuda_check(pool.sync_all());
+  output.reset();
+  {
+    stream_gate idle(pool.streams[2]);
+    {
+      stream_observation_scope observed;
+      output = simpatico::decompress_scan_filter(
+        compressed, selected, request, result, lanes, out, upstream);
+      auto const unused = observed.count(pool.streams[2]);
+      expect(unused.queries == 0 && unused.synchronizations == 0,
+             "filtered decode waited for a lane without work");
+    }
+    idle.expect_not_released("filtered decode waited for a lane without work");
+    for (std::size_t lane = 0; lane < 2; ++lane)
+      expect(cudaStreamQuery(pool.streams[lane]) == cudaSuccess,
+             "filtered decode returned with its own lane work pending");
+    idle.release_after_delay.store(true);
+    idle.expect_not_timed_out("phase lane watchdog expired");
+  }
+  expect(result.applied && output->num_rows() == matches, "phase lane fixture was not filtered");
+  auto const flags = output->view().column(1);
+  expect(flags.type().id() == cudf::type_id::BOOL8, "phase lane fixture lost its BOOL8 answer");
+  std::vector<std::uint8_t> host(static_cast<std::size_t>(flags.size()));
+  cuda_check(cudaMemcpy(host.data(), flags.head<void>(), host.size(), cudaMemcpyDeviceToHost));
+  expect(std::all_of(host.begin(), host.end(), [](auto flag) { return flag != 0; }),
+         "phase lane fixture BOOL8 values");
+}
+
 void test_resources_and_failures(rmm::device_async_resource_ref upstream)
 {
   decode_fixture fixture(upstream, "input -> bitpack\n", 8, 65549, 71, 4);
@@ -2766,6 +2872,8 @@ int main()
     cuda_check(cudaSetDevice(0));
     // cuDF intentionally retains its default pinned pool until process exit.
     // Keep this fixture's pinned allocations individually freed and leak-checkable.
+    // The scan-filter policy reads its gate once.
+    setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", 1);
     setenv("LIBCUDF_PINNED_POOL_SIZE", "0", 1);
     setenv("LIBCUDF_PINNED_POOL_MAX_SIZE", "0", 1);
     expect(cudf::config_default_pinned_memory_resource({.pool_size = 0}),
@@ -2778,6 +2886,7 @@ int main()
     test_identity_owned_children(upstream);
     test_dictionary_width_metadata(upstream);
     test_dictionary_offsets_validation(upstream);
+    test_dictionary_rebuild_keeps_indices(upstream);
     test_dictionary_unsigned_indices(upstream);
     test_dictionary_width_sliced_input(upstream);
     test_dictionary_width_large_keys(upstream);
@@ -2800,6 +2909,7 @@ int main()
     test_failure_after_enqueue_unwinds_stream_ordered(upstream);
     test_constant_width_offsets_bounds(upstream);
     test_selection_and_predicate_routes(upstream);
+    test_scan_filter_phase_lanes(upstream);
     test_resources_and_failures(upstream);
     cuda_check(cudaDeviceSynchronize());
     std::puts("test_async_decode: OK");

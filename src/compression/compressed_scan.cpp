@@ -429,8 +429,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   sirius::codegen::scan_filter_result result;
   auto table =
     simpatico::decompress_scan_filter(chunk, selected, wave_request, result, lanes, stream, mr);
-  // The decode synchronized `stream`; re-point the selection buffers there
-  // anyway so their teardown follows the batch's ordering.
+  // The decode's work has completed; re-point the selection buffers to `stream` so their teardown
+  // follows the batch's ordering.
   result.set_stream(stream);
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan
@@ -629,10 +629,20 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   // stream: a lane that is also a memory prefetcher worker's stream charges the decode's
   // allocations to that worker's reservation, so compressed scans are not accounted correctly in
   // that mode.
-  // One lane per selected column, up to kDecodeStreams: a lane without a column would only add
-  // another shared stream to the decode's waits. cuda::stream_ref has no default constructor, so
-  // the unused tail of the array repeats the first lane and is never passed on.
-  auto const lane_count = std::clamp<std::size_t>(selected.size(), 1, kDecodeStreams);
+  // One lane per selected column or filter mask source, whichever is more, up to kDecodeStreams:
+  // the filter's first wave decodes one request per source, so several sources on one column still
+  // run in parallel, while a lane that would receive no request would only add another shared
+  // stream to the decode's waits. cuda::stream_ref has no default constructor, so the unused tail
+  // of the array repeats the first lane and is never passed on.
+  std::size_t mask_sources = 0;
+  if (!request.empty() && !request.row_selection_disabled) {
+    for (auto const& entry : request.columns) {
+      mask_sources +=
+        (entry.range ? 1 : 0) + (entry.equals_any.empty() ? 0 : 1) + entry.membership.size();
+    }
+  }
+  auto const lane_count =
+    std::clamp<std::size_t>(std::max(selected.size(), mask_sources), 1, kDecodeStreams);
   auto const first_lane = space.acquire_stream();
   auto const all_lanes  = [&]<std::size_t... I>(std::index_sequence<I...>) {
     return std::array<::cuda::stream_ref, kDecodeStreams>{

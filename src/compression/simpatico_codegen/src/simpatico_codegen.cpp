@@ -290,9 +290,10 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 //           AND-combines, counts (per-chunk popcount + CUB scan -> chunk_offsets)
 //           and D2H's the survivor count — the one added host sync, and it
 //           gates wave-2 allocations.
-//   wave 2: compactable columns decode straight to survivor width, the rest
-//           decode plainly, in parallel; the full-width columns' gather map
-//           (mask -> int32 row indices) is built on stream 0 concurrently.
+//   wave 2: compactable columns decode straight to survivor width; the rest
+//           decode full width and gather to survivor rows on their own
+//           streams, in parallel, each waiting first for the gather map
+//           (mask -> int32 row indices) built once on stream 0.
 // Semantic preconditions and selectivity policy may decline to ordinary decode.
 // Execution failures propagate after checked cleanup, preserving engine OOM recovery.
 //
@@ -444,9 +445,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     routes[f.column] = sc::decode_route::bitpack_mask;
   for (size_t i = 0; i < selected.size(); ++i) {
     if (is_bool8_slot[i]) continue;  // the slot's output is the compacted BOOL8 answer
-    // `full` is always available — every plan decodes full width, and the
-    // gather guards null-masked columns with a loud error rather than
-    // corrupting. Any other requested route must be the one this plan
+    // `full` is always available — every plan decodes full width, and a
+    // null-masked column declines the batch rather than corrupting it. Any
+    // other requested route must be the one this plan
     // supports; one probe answers that, so a route and a capability cannot
     // disagree.
     if (routes[i] == sc::decode_route::full) { continue; }
@@ -730,7 +731,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                             mr)
                                  ->release()
                                  .front());
-        index_lanes.push_back(lane);
+        if (std::none_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
+          index_lanes.push_back(lane);
         // BOOL8 was excluded from full-value selectivity policy above; it is survivor-sized.
         result.routes[i] = sc::decode_route::full;
         continue;
@@ -755,7 +757,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     for (std::size_t i = 0; i < decoded.size(); ++i)
       columns[decoded_positions[i]] = std::move(decoded[i]);
     // The session completed its own lanes; the indices kernel and the BOOL8 gathers are this
-    // phase's work on s0 and the gather lanes.
+    // phase's work on s0 and the lanes in index_lanes.
     throw_if_cuda_error(synchronize_distinct(index_lanes), "filtered decode: gather completion");
 
     result.applied           = true;
@@ -764,8 +766,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     return columns;
   } catch (unsupported_nullable_selection const&) {
     // The existing row-selection policy excludes null-masked columns, which a full-route decode
-    // discovers only once it runs: an explicit decline after draining, not an execution failure.
-    synchronize_distinct_or_log(streams, "simpatico: filtered decode cleanup failed");
+    // discovers only once it runs: an explicit decline after a clean drain, not an execution
+    // failure. A failed drain is a failure.
+    if (auto const status = synchronize_distinct(streams); status != cudaSuccess) {
+      reset_result(sc::scan_filter_status::failed);
+      throw_if_cuda_error(status, "simpatico: filtered decode cleanup");
+    }
     reset_result(sc::scan_filter_status::refused);
     return refuse("row selection on a null-masked column is not supported");
   } catch (...) {
@@ -1074,7 +1080,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
   std::span<const ::cuda::stream_ref> streams,
-  ::cuda::stream_ref stream,
+  ::cuda::stream_ref /*stream*/,
   rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,streams]"};
@@ -1101,18 +1107,9 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
                    n_b,
                    request.filters.size() + request.bool8_filters.size());
     }
-    // Reconcile the wave's ragged output into one uniformly survivor-sized
-    // table before it leaves: the compacted routes came back survivor-sized and
-    // the `full` ones full width, and nothing outside knows which is which.
-    try {
-      return compact_scan_filter_output(std::move(*cols), result, stream, mr);
-    } catch (...) {
-      // The grouped-gather helper completes its own phase before unwinding.
-      result                   = sirius::codegen::scan_filter_result{};
-      result.status            = sirius::codegen::scan_filter_status::failed;
-      result.source_generation = request.source_generation;
-      throw;
-    }
+    // Every route, including `full` and the dictionary-answered BOOL8 slots, came back
+    // survivor-sized and completed.
+    return std::make_unique<cudf::table>(std::move(*cols));
   }
   // Gate off / nothing requested / explicit completed policy refusal:
   // exactly the unfiltered path — with one obligation: when the request routed

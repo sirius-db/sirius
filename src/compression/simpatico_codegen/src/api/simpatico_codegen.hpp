@@ -228,11 +228,10 @@ std::unique_ptr<cudf::table> decompress(
 /// the two-wave mask pipeline: wave 1 ballots each filter column's rows into
 /// mask words, the masks are AND-combined and counted (one host sync for the
 /// survivor count), then wave 2 decodes the compactable columns straight into
-/// survivor_count-row columns and the rest full width. @p result comes back
-/// with applied=true, the selection mask/offsets, and the gather map
-/// (row_indices) it used. The returned table is uniformly survivor-sized —
-/// the compacted routes came back that way and the full-width ones are
-/// compacted here — so the caller only has to skip its own filter pass.
+/// survivor_count-row columns and gathers the rest to survivor rows on their own streams. @p result
+/// comes back with applied=true, the selection mask/offsets, and the gather map (row_indices) it
+/// used. The returned table is uniformly survivor-sized, so the caller only has to skip its own
+/// filter pass.
 ///
 /// When the gate is off, @p request is empty, or any precondition fails
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
@@ -255,8 +254,9 @@ std::unique_ptr<cudf::table> decompress(
 /// Unsupported nullable selection is an explicit completed policy decline. Malformed output shape
 /// or assembly failures throw; a caller never sees a half-filtered batch.
 ///
-/// Synchronizes @p stream before returning when the filtering applied, so the
-/// caller may free or rebind the inputs immediately.
+/// When the filtering applied, all work the call queued has completed before it returns, so the
+/// caller may free or rebind the inputs immediately. The filtered path queues nothing on @p stream;
+/// it is kept for compatibility, and the unfiltered fallback does not use it either.
 ///
 /// @p error_out is kept for source compatibility and is never written: failures throw.
 // ── Per-column decode, for a caller-supplied selection ──────────────────────

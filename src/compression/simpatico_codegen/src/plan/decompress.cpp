@@ -344,7 +344,10 @@ void bind_real_node_buffers(std::int32_t node_id,
   for (auto const& e : node.children)
     edge_by_channel.emplace(e.channel, e.child);
 
-  for (auto const& slot : consumed_slots(kind)) {
+  auto const slots = consumed_slots(kind);
+  if (slots.empty())
+    throw std::runtime_error("codegen decode: no consumed-slot list for '" + kind + "'");
+  for (auto const& slot : slots) {
     auto eit                      = edge_by_channel.find(slot);
     const bool has_edge           = eit != edge_by_channel.end();
     const bool downstream_has_rep = has_edge && node_rep(eit->second, tree) != nullptr;
@@ -1429,65 +1432,6 @@ bool decompress_column_selection_mask(PlanTree const& tree,
   (void)decode_one(*request, stream, mr);
   if (error_out) error_out->clear();
   return true;
-}
-
-std::unique_ptr<cudf::table> compact_scan_filter_output(
-  std::vector<std::unique_ptr<cudf::column>>&& columns,
-  sirius::codegen::scan_filter_result const& result,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
-{
-  if (!result.applied) return std::make_unique<cudf::table>(std::move(columns));
-  if (result.routes.size() != columns.size() || result.survivor_count < 0) {
-    throw std::invalid_argument("compact_scan_filter_output: routes or survivor count mismatch");
-  }
-  auto const survivors = static_cast<cudf::size_type>(result.survivor_count);
-  std::vector<std::size_t> full_positions;
-  std::vector<cudf::column_view> full_views;
-  for (std::size_t i = 0; i < columns.size(); ++i) {
-    if (!columns[i]) throw std::invalid_argument("compact_scan_filter_output: null column");
-    // Compacted routes and full routes the decode already gathered arrive survivor-sized. When
-    // survivors == num_rows the two shapes coincide and the ascending all-rows gather is the
-    // identity, so passing the column through is correct either way.
-    if (columns[i]->size() == survivors) continue;
-    if (result.routes[i] != sirius::codegen::decode_route::full ||
-        static_cast<std::int64_t>(columns[i]->size()) != result.num_rows) {
-      throw std::invalid_argument(
-        "compact_scan_filter_output: column is neither survivor-sized nor a full-width full route");
-    }
-    full_positions.push_back(i);
-    full_views.push_back(columns[i]->view());
-  }
-  if (full_positions.empty()) return std::make_unique<cudf::table>(std::move(columns));
-  if (survivors == 0) {
-    for (auto const pos : full_positions)
-      columns[pos] = cudf::empty_like(columns[pos]->view());
-    return std::make_unique<cudf::table>(std::move(columns));
-  }
-  if (result.row_indices.size() < static_cast<std::size_t>(survivors) * sizeof(std::int32_t)) {
-    throw std::invalid_argument(
-      "compact_scan_filter_output: row_indices smaller than survivor_count");
-  }
-  cudf::column_view const gather_map{
-    cudf::data_type{cudf::type_id::INT32}, survivors, result.row_indices.data(), nullptr, 0};
-  // One gather compacts every full-width column of the batch. The full-width sources are released
-  // below on the streams that produced them, so the gather completes first.
-  std::vector<std::unique_ptr<cudf::column>> gathered;
-  try {
-    gathered = cudf::gather(cudf::table_view{full_views},
-                            gather_map,
-                            cudf::out_of_bounds_policy::DONT_CHECK,
-                            stream,
-                            mr)
-                 ->release();
-    stream.sync();
-  } catch (...) {
-    (void)cudaStreamSynchronize(stream.get());
-    throw;
-  }
-  for (std::size_t k = 0; k < full_positions.size(); ++k)
-    columns[full_positions[k]] = std::move(gathered[k]);
-  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 }  // namespace simpatico

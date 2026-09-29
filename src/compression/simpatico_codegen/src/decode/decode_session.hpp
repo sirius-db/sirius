@@ -182,7 +182,8 @@ class decode_frame final {
  *  2. Lifetime management: keep each request's copy, its decode_frame host state, and pending
  * outputs alive until the streams drain. Device temporaries are released during append() in stream
  * order.
- *  3. Completion: wait for all streams to finish and return the final outputs (finish())
+ *  3. Completion: wait for the streams that received a request and return the final outputs
+ * (finish())
  */
 class decode_session final {
  public:

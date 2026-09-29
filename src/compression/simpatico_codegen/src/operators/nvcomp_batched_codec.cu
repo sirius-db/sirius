@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -220,11 +221,17 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   std::size_t const off_uncomp_ptrs  = off_uncomp_bytes + sz_size;
   std::size_t const off_actual       = off_uncomp_ptrs + sz_ptr;
   std::size_t const off_statuses     = off_actual + sz_size;
-  auto const host                    = owner.host_array<std::byte>(off_actual);
-  auto* const h_comp_ptrs            = reinterpret_cast<void const**>(host.data() + off_comp_ptrs);
-  auto* const h_comp_bytes           = reinterpret_cast<std::size_t*>(host.data() + off_comp_bytes);
-  auto* const h_uncomp_bytes = reinterpret_cast<std::size_t*>(host.data() + off_uncomp_bytes);
-  auto* const h_uncomp_ptrs  = reinterpret_cast<void**>(host.data() + off_uncomp_ptrs);
+  // Pointer and size tables share one 8-byte stride, so every sub-region stays aligned.
+  static_assert(sizeof(void*) == sizeof(std::size_t) && alignof(void*) <= sizeof(std::size_t));
+  auto const host = owner.host_array<std::byte>(off_actual);
+  // The byte allocation implicitly creates the table elements; launder reaches them.
+  auto* const h_comp_ptrs =
+    std::launder(reinterpret_cast<void const**>(host.data() + off_comp_ptrs));
+  auto* const h_comp_bytes =
+    std::launder(reinterpret_cast<std::size_t*>(host.data() + off_comp_bytes));
+  auto* const h_uncomp_bytes =
+    std::launder(reinterpret_cast<std::size_t*>(host.data() + off_uncomp_bytes));
+  auto* const h_uncomp_ptrs = std::launder(reinterpret_cast<void**>(host.data() + off_uncomp_ptrs));
   owner.read_bytes(h_comp_bytes, fbase + 16, sz_size);
 
   std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
