@@ -41,6 +41,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
@@ -49,6 +50,8 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <helper/numeric_carrier_rule.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
@@ -61,6 +64,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using sirius::op::classify_membership_key;
@@ -626,17 +630,32 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
     CHECK_FALSE(membership_probe_compatible(us_domain, cudf::data_type{t}));
   }
 
-  // The device reads every temporal type through its integer storage.
-  CHECK(sirius::op::membership_storage_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+  // The device reads every temporal type through its integer storage (the shared rule in
+  // helper/numeric_carrier_rule.hpp; the narrowing helper applies it to DATE only).
+  CHECK(sirius::integer_storage_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
         cudf::data_type{id::INT32});
   for (auto const t : {id::TIMESTAMP_SECONDS,
                        id::TIMESTAMP_MILLISECONDS,
                        id::TIMESTAMP_MICROSECONDS,
                        id::TIMESTAMP_NANOSECONDS}) {
-    CHECK(sirius::op::membership_storage_type(cudf::data_type{t}) == cudf::data_type{id::INT64});
+    CHECK(sirius::integer_storage_type(cudf::data_type{t}) == cudf::data_type{id::INT64});
+    CHECK(sirius::narrowing_rep_type(cudf::data_type{t}) == cudf::data_type{t});
   }
-  CHECK(sirius::op::membership_storage_type(cudf::data_type{id::INT16}) ==
-        cudf::data_type{id::INT16});
+  CHECK(sirius::integer_storage_type(cudf::data_type{id::INT16}) == cudf::data_type{id::INT16});
+  CHECK(sirius::narrowing_rep_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+        sirius::integer_storage_type(cudf::data_type{id::TIMESTAMP_DAYS}));
+
+  // The publisher's carrier rule: a carrier in the recorded type's family builds at the carrier,
+  // one outside it (a DATE stored as INT16) is restored first.
+  CHECK(sirius::op::membership_same_family(cudf::data_type{id::INT64}, cudf::data_type{id::INT16}));
+  CHECK(
+    sirius::op::membership_same_family(cudf::data_type{id::UINT64}, cudf::data_type{id::UINT8}));
+  CHECK_FALSE(sirius::op::membership_same_family(cudf::data_type{id::TIMESTAMP_DAYS},
+                                                 cudf::data_type{id::INT16}));
+  CHECK_FALSE(
+    sirius::op::membership_same_family(cudf::data_type{id::INT64}, cudf::data_type{id::UINT16}));
+  CHECK_FALSE(
+    sirius::op::membership_same_family(cudf::data_type{id::INT64}, cudf::data_type{id::FLOAT64}));
 
   // The three filters' type gates are the same predicate.
   for (auto const t : {id::INT8,
@@ -2192,4 +2211,218 @@ TEST_CASE("string keys: an empty build column builds an empty fingerprint set",
   auto const probe = make_strings({"", "x"}, stream);
   CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{0, 0});
   CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{0, 0});
+}
+
+//===----------------------------------------------------------------------===//
+// Device conversion == host predicate (helper/numeric_carrier_rule.hpp)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Inclusive bounds of a probe carrier as __int128. numeric_limits<__int128> is not specialized
+/// in strict C++ mode, so the 16-byte carrier gets bounds far outside every rep instead.
+template <class Carrier>
+std::pair<__int128_t, __int128_t> carrier_bounds()
+{
+  if constexpr (sizeof(Carrier) == 16) {
+    return {-(static_cast<__int128_t>(1) << 100), static_cast<__int128_t>(1) << 100};
+  } else {
+    return {static_cast<__int128_t>(std::numeric_limits<Carrier>::min()),
+            static_cast<__int128_t>(std::numeric_limits<Carrier>::max())};
+  }
+}
+
+/// Every value a (rep, carrier) conversion could get wrong, restricted to what the carrier itself
+/// can hold (a probe column can contain nothing else): the rep's min/max and their neighbours, the
+/// carrier's min/max and their neighbours, the set sentinel and its neighbours, and small values.
+template <class Rep, class Carrier>
+std::vector<__int128_t> boundary_values()
+{
+  auto const [carrier_min, carrier_max] = carrier_bounds<Carrier>();
+  auto const rep_min                    = static_cast<__int128_t>(std::numeric_limits<Rep>::min());
+  auto const rep_max                    = static_cast<__int128_t>(std::numeric_limits<Rep>::max());
+  auto const sentinel                   = static_cast<__int128_t>(sirius::set_sentinel<Rep>::value);
+  std::vector<__int128_t> raw{0,
+                              1,
+                              -1,
+                              2,
+                              rep_min,
+                              rep_min + 1,
+                              rep_min - 1,
+                              rep_max,
+                              rep_max - 1,
+                              rep_max + 1,
+                              carrier_min,
+                              carrier_min + 1,
+                              carrier_max,
+                              carrier_max - 1,
+                              sentinel,
+                              sentinel + 1,
+                              sentinel - 1};
+  std::vector<__int128_t> values;
+  for (auto const v : raw) {
+    if (v < carrier_min || v > carrier_max) { continue; }
+    if (std::find(values.begin(), values.end(), v) == values.end()) { values.push_back(v); }
+  }
+  return values;
+}
+
+/// Uploads @p values as a column of @p type whose storage element is T (numeric or fixed-point).
+template <class T>
+std::unique_ptr<cudf::column> make_storage_column(std::vector<T> const& values,
+                                                  cudf::data_type type,
+                                                  ::cuda::stream_ref stream)
+{
+  auto const n = static_cast<cudf::size_type>(values.size());
+  auto col =
+    cudf::is_fixed_point(type)
+      ? cudf::make_fixed_point_column(
+          type, n, cudf::mask_state::UNALLOCATED, stream, cudf::get_current_device_resource_ref())
+      : cudf::make_numeric_column(
+          type, n, cudf::mask_state::UNALLOCATED, stream, cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(col->mutable_view().head<T>(),
+                                   values.data(),
+                                   values.size() * sizeof(T),
+                                   cudaMemcpyHostToDevice,
+                                   stream.get());
+  REQUIRE(err == cudaSuccess);
+  stream.sync();
+  return col;
+}
+
+/// Builds every membership filter over the boundary values the rep holds (at @p key_type) and
+/// probes all boundary values the carrier holds (at @p probe_type). The device adapter must accept
+/// exactly the values the host rule `sirius::value_fits<Rep>` accepts: the exact filters' masks
+/// equal the host predicate row for row, and the Bloom filter (no false negatives; a rejected
+/// conversion is the only way it answers false for a stored value) is false wherever the host
+/// says the value does not fit. The host layers are cross-checked against each other as well:
+/// `numeric_range_fits` on a degenerate range must agree with `value_fits`.
+template <class Rep, class Carrier>
+void check_device_matches_host(cudf::data_type key_type,
+                               cudf::data_type probe_type,
+                               ::cuda::stream_ref stream)
+{
+  INFO("key " << static_cast<int>(key_type.id()) << " probe " << static_cast<int>(probe_type.id()));
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto const values = boundary_values<Rep, Carrier>();
+  // An unsigned rep probed through UINT8 has only {0, 1, 2, 254, 255}: no negatives, and its
+  // sentinel (the rep's maximum) lies outside the carrier.
+  REQUIRE(values.size() >= 4);
+
+  std::vector<Rep> key_values;
+  std::vector<Carrier> probe_values;
+  std::vector<std::uint8_t> expected;
+  auto const rep_type = sirius::op::membership_rep_type(*classify_membership_key(key_type));
+  for (auto const v : values) {
+    bool const fits = sirius::value_fits<Rep>(v);
+    // Host layers agree: the range predicate compressed materialization uses is the same rule.
+    auto const range =
+      cudf::is_fixed_point(rep_type)
+        ? sirius::decimal_range(v, v, static_cast<std::uint8_t>(-rep_type.scale()))
+      : std::is_signed_v<Rep>
+        ? sirius::signed_integer_range(
+            static_cast<std::int64_t>(std::clamp<__int128_t>(v, INT64_MIN, INT64_MAX)),
+            static_cast<std::int64_t>(std::clamp<__int128_t>(v, INT64_MIN, INT64_MAX)))
+        : sirius::unsigned_integer_range(
+            static_cast<std::uint64_t>(std::clamp<__int128_t>(v, 0, UINT64_MAX)),
+            static_cast<std::uint64_t>(std::clamp<__int128_t>(v, 0, UINT64_MAX)));
+    bool const clamped = !cudf::is_fixed_point(rep_type) &&
+                         (v < (std::is_signed_v<Rep> ? static_cast<__int128_t>(INT64_MIN) : 0) ||
+                          v > (std::is_signed_v<Rep> ? static_cast<__int128_t>(INT64_MAX)
+                                                     : static_cast<__int128_t>(UINT64_MAX)));
+    if (!clamped) { CHECK(sirius::numeric_range_fits(rep_type, range) == fits); }
+    if (fits) { key_values.push_back(static_cast<Rep>(v)); }
+    probe_values.push_back(static_cast<Carrier>(v));
+    expected.push_back(fits ? 1 : 0);
+  }
+  REQUIRE(!key_values.empty());
+  auto const keys  = make_storage_column<Rep>(key_values, key_type, stream);
+  auto const probe = make_storage_column<Carrier>(probe_values, probe_type, stream);
+
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  REQUIRE(in_list.domain().rep == classify_membership_key(key_type)->rep);
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+  if (key_values.size() <= sirius_dynamic_small_in_list_filter::k_max_keys) {
+    sirius_dynamic_small_in_list_filter small{keys->view(), stream, mr};
+    CHECK(probe_mask(small, probe->view(), nullptr, stream) == expected);
+  }
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  auto const bloom_mask = probe_mask(bloom, probe->view(), nullptr, stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    // A stored value passes (no false negatives); a value the rep cannot hold is rejected by the
+    // conversion before the Bloom lookup, exactly where the host rule says it does not fit. The
+    // sentinel is the one representable value cuco cannot store, so the Bloom may answer either
+    // way for it and the exact filters keep it conservatively.
+    if (expected[i] == 0) {
+      CHECK(bloom_mask[i] == 0);
+    } else if (values[i] != static_cast<__int128_t>(sirius::set_sentinel<Rep>::value)) {
+      CHECK(bloom_mask[i] == 1);
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("device probe conversion matches the host fit rule at every carrier boundary",
+          "[dynamic_filter][probe][key_domain]")
+{
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  using id                        = cudf::type_id;
+  auto const t = [](id i, std::int32_t scale = 0) { return cudf::data_type{i, scale}; };
+
+  SECTION("signed reps over every signed carrier")
+  {
+    check_device_matches_host<std::int32_t, std::int8_t>(t(id::INT32), t(id::INT8), stream);
+    check_device_matches_host<std::int32_t, std::int16_t>(t(id::INT32), t(id::INT16), stream);
+    check_device_matches_host<std::int32_t, std::int32_t>(t(id::INT32), t(id::INT32), stream);
+    check_device_matches_host<std::int32_t, std::int64_t>(t(id::INT32), t(id::INT64), stream);
+    check_device_matches_host<std::int64_t, std::int8_t>(t(id::INT64), t(id::INT8), stream);
+    check_device_matches_host<std::int64_t, std::int16_t>(t(id::INT64), t(id::INT16), stream);
+    check_device_matches_host<std::int64_t, std::int32_t>(t(id::INT64), t(id::INT32), stream);
+    check_device_matches_host<std::int64_t, std::int64_t>(t(id::INT64), t(id::INT64), stream);
+  }
+  SECTION("unsigned reps over every unsigned carrier")
+  {
+    check_device_matches_host<std::uint32_t, std::uint8_t>(t(id::UINT32), t(id::UINT8), stream);
+    check_device_matches_host<std::uint32_t, std::uint16_t>(t(id::UINT32), t(id::UINT16), stream);
+    check_device_matches_host<std::uint32_t, std::uint32_t>(t(id::UINT32), t(id::UINT32), stream);
+    check_device_matches_host<std::uint32_t, std::uint64_t>(t(id::UINT32), t(id::UINT64), stream);
+    check_device_matches_host<std::uint64_t, std::uint8_t>(t(id::UINT64), t(id::UINT8), stream);
+    check_device_matches_host<std::uint64_t, std::uint16_t>(t(id::UINT64), t(id::UINT16), stream);
+    check_device_matches_host<std::uint64_t, std::uint32_t>(t(id::UINT64), t(id::UINT32), stream);
+    check_device_matches_host<std::uint64_t, std::uint64_t>(t(id::UINT64), t(id::UINT64), stream);
+  }
+  SECTION("decimal reps over every same-scale fixed-point carrier, including the __int128 one")
+  {
+    check_device_matches_host<std::int32_t, std::int32_t>(
+      t(id::DECIMAL32, -2), t(id::DECIMAL32, -2), stream);
+    check_device_matches_host<std::int32_t, std::int64_t>(
+      t(id::DECIMAL32, -2), t(id::DECIMAL64, -2), stream);
+    check_device_matches_host<std::int32_t, __int128_t>(
+      t(id::DECIMAL32, -2), t(id::DECIMAL128, -2), stream);
+    check_device_matches_host<std::int64_t, std::int32_t>(
+      t(id::DECIMAL64, -2), t(id::DECIMAL32, -2), stream);
+    check_device_matches_host<std::int64_t, std::int64_t>(
+      t(id::DECIMAL64, -2), t(id::DECIMAL64, -2), stream);
+    check_device_matches_host<std::int64_t, __int128_t>(
+      t(id::DECIMAL64, -2), t(id::DECIMAL128, -2), stream);
+  }
+  SECTION("the host rule itself, on the mixed-signedness cases the kernels never take")
+  {
+    STATIC_REQUIRE(sirius::value_fits<std::int32_t>(std::int64_t{INT32_MAX}));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::int32_t>(std::int64_t{INT32_MAX} + 1));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::int32_t>(std::int64_t{INT32_MIN} - 1));
+    STATIC_REQUIRE(sirius::value_fits<std::int64_t>(std::int8_t{-128}));
+    STATIC_REQUIRE(sirius::value_fits<std::uint8_t>(std::int64_t{255}));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::uint8_t>(std::int64_t{256}));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::uint64_t>(std::int8_t{-1}));
+    STATIC_REQUIRE(sirius::value_fits<std::uint64_t>(std::int64_t{INT64_MAX}));
+    STATIC_REQUIRE(sirius::value_fits<std::int64_t>(std::uint64_t{INT64_MAX}));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::int64_t>(std::uint64_t{INT64_MAX} + 1));
+    STATIC_REQUIRE(sirius::value_fits<std::int16_t>(std::uint8_t{255}));
+    STATIC_REQUIRE(sirius::value_fits<std::int64_t>(static_cast<__int128_t>(INT64_MIN)));
+    STATIC_REQUIRE_FALSE(sirius::value_fits<std::int64_t>(static_cast<__int128_t>(INT64_MIN) - 1));
+    STATIC_REQUIRE(sirius::range_fits<std::int16_t>(-32768, 32767));
+    STATIC_REQUIRE_FALSE(sirius::range_fits<std::int16_t>(-32768, 32768));
+  }
 }

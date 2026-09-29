@@ -14,14 +14,10 @@
  * limitations under the License.
  */
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/stream_compaction.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_device.hpp>
 
-#include <cub/device/device_for.cuh>
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuda/dynamic_filter_probe.cuh>
@@ -133,32 +129,16 @@ bloom_owner<Filter> build_bloom(membership_key_domain const& domain,
   return result;
 }
 
-/// @brief Per-row Bloom membership probe. The adapter converts probe values into the key domain
-/// per element; an inserted key always fits that domain, so a non-representable value is a
-/// definite non-member and the conversion preserves the no-false-negative contract. A null probe
-/// row is likewise a definite non-member (null build slots were compacted out and the join never
-/// matches nulls). Rows the prior keep-mask killed skip the block fetch.
-template <class Adapter, class FilterRef>
-struct bloom_contains {
+/// @brief The Bloom half of detail::membership_probe_functor: a converted key passes when the
+/// filter reports it. An inserted key always fits the key domain, so the adapter's rejection of a
+/// non-representable value preserves the no-false-negative contract.
+template <class FilterRef>
+struct bloom_lookup {
   using key_type = typename FilterRef::key_type;
-  Adapter adapt;
-  bool* __restrict__ out;
   FilterRef ref;
-  std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
-  sirius::op::detail::probe_validity valid;
-
-  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  __device__ __forceinline__ bool operator()(key_type key) const noexcept
   {
-    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    key_type key;
-    if (!adapt(idx, key)) {
-      out[idx] = false;
-      return;
-    }
-    out[idx] = ref.contains(key);
+    return ref.contains(key);
   }
 };
 
@@ -229,37 +209,20 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
                                                          ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
-  auto const domain = classify_membership_key(keys.type());
-  if (!domain.has_value()) {
-    throw std::invalid_argument("[sirius_dynamic_bloom_filter] unsupported key type.");
-  }
-  // A DECIMAL128 build whose unscaled values exceed the int64 rep cannot be stored exactly.
-  if (!membership_build_fits_rep(keys, stream, mr)) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_bloom_filter] build keys do not fit the key rep (DECIMAL128 values outside "
-      "int64).");
-  }
-  _domain = *domain;
-  // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are dropped
-  // exactly. Keep compacted storage alive until add_async is queued on stream.
-  std::unique_ptr<cudf::table> compacted;
-  cudf::column_view build_keys = keys;
-  if (keys.null_count() > 0) {
-    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
-    build_keys = compacted->view().column(0);
-  }
-  auto const n = build_keys.size();
+  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
+  // device; `build.compacted` stays alive until add_async is queued on `stream`.
+  auto const build = prepare_membership_build("[sirius_dynamic_bloom_filter]", keys, stream, mr);
+  _domain          = build.domain;
+  auto const n     = build.keys.size();
   cuda::stream_ref const s{stream.get()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
-  if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
-    throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
-  }
+  _impl->source_device  = build.source_device;
 
   auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return build_bloom_replica<key_type>(
-      _impl->source_device, _domain, build_keys, num_blocks, mr, s);
+      _impl->source_device, _domain, build.keys, num_blocks, mr, s);
   });
   _impl->replicas.push_back(std::move(source));
 }
@@ -380,15 +343,6 @@ std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
 
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,
-  int device_id,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr) const
-{
-  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
-}
-
-std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
-  cudf::column_view const& probe,
   std::uint32_t const* prior_mask_words,
   int device_id,
   ::cuda::stream_ref stream,
@@ -398,30 +352,15 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  // A pinned chunk may store this key narrowed while the filter was published at the native
-  // carrier; the kernel converts per element rather than materializing a widened copy.
-  std::unique_ptr<cudf::column> out;
-  auto const n          = probe.size();
-  auto const dispatched = std::visit(
+  return std::visit(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return detail::dispatch_probe_adapter<key_type>(_domain, probe, stream, [&](auto adapter) {
-        out = cudf::make_numeric_column(
-          cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-        auto* const outp = out->mutable_view().data<bool>();
-        auto ref         = bloom->ref();
-        cub::DeviceFor::Bulk(
-          n,
-          bloom_contains<decltype(adapter), decltype(ref)>{
-            adapter, outp, ref, prior_mask_words, detail::probe_validity_of(probe)},
-          stream.get());
-      });
+      auto ref         = bloom->ref();
+      return detail::run_membership_probe<key_type>(
+        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
     },
     replica->bloom);
-  if (!dispatched) { return nullptr; }
-  // Null probe rows were written as `false` in-kernel: the mask is non-nullable by construction.
-  return out;
 }
 
 }  // namespace sirius::op

@@ -24,16 +24,12 @@
 
 // cudf
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
-#include <cudf/stream_compaction.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
 
 // cccl
-#include <cub/device/device_for.cuh>
 #include <cuda/dynamic_filter_probe.cuh>
 #include <thrust/copy.h>
 
@@ -64,38 +60,22 @@
 
 namespace {
 
-/// @brief Per-row brute-force membership scan: out[idx] == true iff probe[idx] equals any of the m
-/// needles. For the small m this filter gates on (<= k_max_keys), a compare-all linear scan beats a
-/// hash probe and reserves no sentinel value. The adapter converts probe values into the needle
-/// domain per element; one the domain cannot represent is a definite non-member, and so is a null
-/// probe row (the needles hold no nulls and the join never matches them). String needles are
-/// 64-bit fingerprints compared as such (one code path, no byte compare), so the scan is exact for
-/// integers and no-false-negatives for strings. Rows the prior keep-mask killed skip the scan.
-template <class Adapter, class KeyT>
-struct small_in_list_scan {
-  Adapter adapt;
+/// @brief Brute-force needle scan, the filter-specific half of detail::membership_probe_functor:
+/// a converted key is a member iff it equals any of the m needles. For the small m this filter
+/// gates on (<= k_max_keys), a compare-all linear scan beats a hash probe and reserves no sentinel
+/// value. String needles are 64-bit fingerprints compared as such (one code path, no byte
+/// compare), so the scan is exact for integers and no-false-negatives for strings.
+template <class KeyT>
+struct needle_lookup {
   KeyT const* __restrict__ needles;
   int m;
-  bool* __restrict__ out;
-  std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
-  sirius::op::detail::probe_validity valid;
-
-  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  __device__ __forceinline__ bool operator()(KeyT x) const noexcept
   {
-    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    KeyT x;
-    if (!adapt(idx, x)) {
-      out[idx] = false;
-      return;
-    }
     bool hit = false;
     for (int j = 0; j < m; ++j) {
       hit |= (x == needles[j]);
     }
-    out[idx] = hit;
+    return hit;
   }
 };
 
@@ -164,36 +144,20 @@ bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys
 sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   cudf::column_view const& keys, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
-  auto const domain = classify_membership_key(keys.type());
-  if (!domain.has_value() || !supports(keys)) {
+  if (!supports(keys)) {
     throw std::invalid_argument(
       "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys valid keys of "
       "a membership_key_supported type required).");
   }
-  // A DECIMAL128 build whose unscaled values exceed the int64 rep cannot be stored exactly.
-  if (!membership_build_fits_rep(keys, stream, mr)) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_small_in_list_filter] build keys do not fit the key rep (DECIMAL128 values "
-      "outside int64).");
-  }
-  _domain = *domain;
+  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
+  // device; `build.compacted` stays alive until the needle copy is queued on `stream`.
+  auto const build =
+    prepare_membership_build("[sirius_dynamic_small_in_list_filter]", keys, stream, mr);
+  _domain   = build.domain;
+  _num_keys = static_cast<std::size_t>(build.keys.size());
 
-  // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are dropped
-  // exactly rather than copied. The compacted storage stays alive until the needle copy is queued
-  // on `stream`; its stream-ordered free then follows the copy.
-  std::unique_ptr<cudf::table> compacted;
-  cudf::column_view build_keys = keys;
-  if (keys.null_count() > 0) {
-    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
-    build_keys = compacted->view().column(0);
-  }
-  _num_keys = static_cast<std::size_t>(build_keys.size());
-
-  _store = std::make_unique<needle_store>();
-  if (cudaGetDevice(&_store->source_device) != cudaSuccess) {
-    throw std::runtime_error(
-      "[sirius_dynamic_small_in_list_filter] failed to identify source device.");
-  }
+  _store                = std::make_unique<needle_store>();
+  _store->source_device = build.source_device;
 
   // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier;
   // a build carrier other than the rep converts per element on the way in.
@@ -202,7 +166,7 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return detail::with_build_key_iterator<key_type>(
-      _domain, build_keys, stream, mr, [&](auto first, auto last) {
+      _domain, build.keys, stream, mr, [&](auto first, auto last) {
         thrust::copy(
           rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
       });
@@ -219,46 +183,22 @@ sirius_dynamic_small_in_list_filter::~sirius_dynamic_small_in_list_filter() = de
 
 std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   cudf::column_view const& probe,
-  int device_id,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr) const
-{
-  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
-}
-
-std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
-  cudf::column_view const& probe,
   std::uint32_t const* prior_mask_words,
   int device_id,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  // A pinned chunk may store this key narrowed while the filter was published at the native
-  // carrier; the kernel converts per element rather than materializing a widened copy.
   auto const* replica =
     _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  std::unique_ptr<cudf::column> out;
-  auto const n          = probe.size();
-  auto const m          = static_cast<int>(_num_keys);
-  auto const dispatched = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+  auto const m = static_cast<int>(_num_keys);
+  return detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type      = decltype(key_tag);
     auto const* needles = static_cast<key_type const*>(replica->needles.data());
-    return detail::dispatch_probe_adapter<key_type>(_domain, probe, stream, [&](auto adapter) {
-      out = cudf::make_numeric_column(
-        cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-      auto* const outp = out->mutable_view().data<bool>();
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<decltype(adapter), key_type>{
-          adapter, needles, m, outp, prior_mask_words, detail::probe_validity_of(probe)},
-        stream.get()));
-    });
+    return detail::run_membership_probe<key_type>(
+      _domain, probe, prior_mask_words, stream, mr, needle_lookup<key_type>{needles, m});
   });
-  if (!dispatched || !out) { return nullptr; }
-  // Null probe rows were written as `false` in-kernel: the mask is non-nullable by construction.
-  return out;
 }
 
 void sirius_dynamic_small_in_list_filter::replicate_to_devices(

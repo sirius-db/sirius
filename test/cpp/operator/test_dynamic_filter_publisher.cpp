@@ -61,6 +61,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
@@ -711,13 +712,12 @@ TEST_CASE("dynamic-filter publisher builds exact IN-lists from a nullable build 
     auto replica_spaces = fixture.replica_spaces;
     dynamic_filter_publish_plan plan{
       {make_int64_key(0, 0)}, std::move(targets), std::move(replica_spaces)};
-    auto const outcome =
-      publish_for_test(plan, fixture.build_view(), fixture.stream);
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
     REQUIRE(outcome.keys_considered == 1);
     REQUIRE(outcome.keys_skipped_type_mismatch == 0);
     REQUIRE(outcome.membership_filters_built == 1);
     REQUIRE(outcome.filters_pushed == 1);
-    auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+    auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
     REQUIRE(snapshot.size() == 1);
     return snapshot.front();
   };
@@ -791,13 +791,12 @@ TEST_CASE(
     auto replica_spaces = fixture.replica_spaces;
     dynamic_filter_publish_plan plan{
       {make_int64_key(0, 0)}, std::move(targets), std::move(replica_spaces)};
-    auto const outcome =
-      publish_for_test(plan, fixture.build_view(), fixture.stream);
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
     REQUIRE(outcome.keys_considered == 1);
     REQUIRE(outcome.keys_skipped_type_mismatch == 0);
     REQUIRE(outcome.membership_filters_built == 1);
     REQUIRE(outcome.filters_pushed == 1);
-    auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+    auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
     REQUIRE(snapshot.size() == 1);
     return snapshot.front();
   };
@@ -866,15 +865,14 @@ TEST_CASE("dynamic-filter publisher publishes membership and zone-map filters fo
   dynamic_filter_publish_plan plan{
     {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    publish_for_test(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   REQUIRE(outcome.keys_considered == 1);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
   REQUIRE(outcome.membership_filters_built == 1);
   REQUIRE(outcome.zone_map_filters_built == 1);
   REQUIRE(outcome.filters_pushed == 2);
 
-  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(snapshot) == 1);
   auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
@@ -928,8 +926,7 @@ TEST_CASE("dynamic-filter publisher restores a DATE build column arriving at an 
   dynamic_filter_publish_plan plan{
     {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    publish_for_test(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   REQUIRE(outcome.keys_considered == 1);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
   REQUIRE(outcome.membership_filters_built == 1);
@@ -937,7 +934,7 @@ TEST_CASE("dynamic-filter publisher restores a DATE build column arriving at an 
   // The restored build type equals the native probe type, so the zone map is pushed as well.
   REQUIRE(outcome.filters_pushed == 2);
 
-  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
   auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
     return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get()) !=
@@ -982,14 +979,13 @@ TEST_CASE("dynamic-filter publisher accepts a DECIMAL32-carrier build column for
                                                    .channel_push_ordinal = kProbeColumnIndex,
                                                    .probe_storage_type   = kDecimal64}}});
   dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(fixture.replica_spaces)};
-  auto const outcome =
-    publish_for_test(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   REQUIRE(outcome.keys_considered == 1);
   REQUIRE(outcome.keys_skipped_type_mismatch == 0);
   REQUIRE(outcome.membership_filters_built == 1);
   REQUIRE(outcome.filters_pushed == 1);
 
-  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
   REQUIRE(snapshot.size() == 1);
   auto const* small =
     dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(snapshot.front().get());
@@ -1011,6 +1007,189 @@ TEST_CASE("dynamic-filter publisher accepts a DECIMAL32-carrier build column for
   auto const rescaled = make_decimal_values<std::int64_t>(
     fixture, cudf::data_type{cudf::type_id::DECIMAL64, -3}, {10000, 20000});
   REQUIRE(small->compute_mask(rescaled->view(), kDeviceId, fixture.stream, mr) == nullptr);
+}
+
+// The publisher applies one rule to every narrowed build carrier: a carrier in the recorded
+// type's key family builds the membership filter at the carrier, and the zone map's bounds are
+// restored to the recorded type so the binding probing at that type receives it too. An INT64 key
+// arriving as INT16 therefore publishes both filters, exactly as a native INT64 build would.
+TEST_CASE("dynamic-filter publisher publishes a zone map for an INT64 key from an INT16 carrier",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+  fixture.add_key_column_as(3, cudf::data_type{cudf::type_id::INT16}, /*first=*/10);
+  REQUIRE(fixture.columns.front()->type().id() == cudf::type_id::INT16);
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kInt64}}});
+  dynamic_filter_publish_plan plan{{make_int64_key(0, 0)},
+                                   std::move(targets),
+                                   std::move(fixture.replica_spaces),
+                                   {.emit_zone_map_filters = true}};
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.zone_map_filters_built == 1);
+  REQUIRE(outcome.bindings_skipped_incompatible_probe == 0);
+  // Both filters reach the binding, as they do for a build arriving at the native type.
+  REQUIRE(outcome.filters_pushed == 2);
+
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(snapshot) == 1);
+
+  // The zone map's bounds carry the recorded INT64 type (what the probe column has after decode)
+  // and the carrier's values.
+  auto const zone_map = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_zone_map_filter const*>(filter.get()) != nullptr;
+  });
+  REQUIRE(zone_map != snapshot.end());
+  auto const* zones =
+    dynamic_cast<sirius::op::sirius_dynamic_zone_map_filter const*>(zone_map->get());
+  REQUIRE(zones->num_zones() == 1);
+  auto const& zone = zones->zones().front();
+  CHECK(zone.min->type() == kInt64);
+  CHECK(zone.max->type() == kInt64);
+  CHECK(static_cast<cudf::numeric_scalar<std::int64_t> const&>(*zone.min).value(fixture.stream) ==
+        10);
+  CHECK(static_cast<cudf::numeric_scalar<std::int64_t> const&>(*zone.max).value(fixture.stream) ==
+        12);
+
+  // The membership filter is built at the carrier and answers the native and narrow probes alike.
+  auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get()) !=
+           nullptr;
+  });
+  auto const* small =
+    dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(membership->get());
+  CHECK(small->domain().rep == sirius::op::membership_key_rep::i32);
+  CHECK(small->domain().native.id() == cudf::type_id::INT16);
+  auto const native = make_int64_values(fixture, {10, 11, 12, 13, 5'000'000'000LL});
+  REQUIRE(membership_mask(**membership, native->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 1, 1, 0, 0});
+  auto const narrowed = cudf::cast(make_int64_values(fixture, {10, 11, 12, 13})->view(),
+                                   cudf::data_type{cudf::type_id::INT16},
+                                   fixture.stream,
+                                   mr);
+  REQUIRE(membership_mask(**membership, narrowed->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 1, 1, 0});
+}
+
+TEST_CASE(
+  "dynamic-filter publisher publishes a zone map for a DECIMAL64 key from a DECIMAL32 carrier",
+  "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const native_keys =
+    make_decimal_values<std::int64_t>(fixture, kDecimal64, {1000, 2000, 3000});
+  fixture.columns.push_back(cudf::cast(native_keys->view(), kDecimal32, fixture.stream, mr));
+  REQUIRE(fixture.columns.front()->type() == kDecimal32);
+
+  auto key         = make_int64_key(0, 0);
+  key.storage_type = kDecimal64;
+  auto channel     = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kDecimal64}}});
+  dynamic_filter_publish_plan plan{
+    {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.zone_map_filters_built == 1);
+  REQUIRE(outcome.filters_pushed == 2);
+
+  auto const snapshot = filters_on_column(*channel, kProbeColumnIndex);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+  auto const zone_map = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_zone_map_filter const*>(filter.get()) != nullptr;
+  });
+  auto const* zones =
+    dynamic_cast<sirius::op::sirius_dynamic_zone_map_filter const*>(zone_map->get());
+  auto const& zone = zones->zones().front();
+  CHECK(zone.min->type() == kDecimal64);
+  CHECK(zone.max->type() == kDecimal64);
+  CHECK(static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(*zone.min).value(
+          fixture.stream) == 1000);
+  CHECK(static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(*zone.max).value(
+          fixture.stream) == 3000);
+
+  auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get()) !=
+           nullptr;
+  });
+  REQUIRE(membership != snapshot.end());
+  auto const* small =
+    dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(membership->get());
+  CHECK(small->domain().native == kDecimal32);
+  auto const native = make_decimal_values<std::int64_t>(
+    fixture, kDecimal64, {1000, 1500, 2000, 3000, 6'000'000'000LL});
+  REQUIRE(membership_mask(*small, native->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 0, 1, 1, 0});
+  auto const carrier =
+    make_decimal_values<std::int32_t>(fixture, kDecimal32, {1000, 1500, 2000, 3000});
+  REQUIRE(membership_mask(*small, carrier->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 0, 1, 1});
+}
+
+// A membership filter goes only to bindings whose recorded probe type its key domain can read
+// (membership_probe_compatible, the rule compute_mask applies per batch); one it could never
+// serve is not pushed and is counted, rather than declining silently on every batch.
+TEST_CASE("dynamic-filter publisher pushes membership only to compatible probe bindings",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+
+  auto compatible   = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto incompatible = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto unknown      = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  // Same family, narrower carrier: served in-kernel.
+  targets.push_back(
+    {.filter_set               = compatible,
+     .route_class              = dynamic_filter_route_class::scan,
+     .accepts_zone_map_filters = false,
+     .key_bindings             = {{.admitted_key_index   = 0,
+                                   .channel_push_ordinal = kProbeColumnIndex,
+                                   .probe_storage_type   = cudf::data_type{cudf::type_id::INT16}}}});
+  // Another family: no adapter can read a STRING probe against an integer set.
+  targets.push_back({.filter_set               = incompatible,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kString}}});
+  // No cuDF mapping recorded: left to the runtime check, so it is still pushed.
+  targets.push_back(
+    {.filter_set               = unknown,
+     .route_class              = dynamic_filter_route_class::scan,
+     .accepts_zone_map_filters = false,
+     .key_bindings             = {{.admitted_key_index   = 0,
+                                   .channel_push_ordinal = kProbeColumnIndex,
+                                   .probe_storage_type   = cudf::data_type{cudf::type_id::EMPTY}}}});
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.bindings_skipped_incompatible_probe == 1);
+  REQUIRE(outcome.filters_pushed == 2);
+  REQUIRE(filters_on_column(*compatible, kProbeColumnIndex).size() == 1);
+  REQUIRE(filters_on_column(*incompatible, kProbeColumnIndex).empty());
+  REQUIRE(filters_on_column(*unknown, kProbeColumnIndex).size() == 1);
 }
 
 // A DECIMAL128 key (TPC-H q15's total_revenue, join-edge route) sits on the int64 rep. The
@@ -1038,9 +1217,8 @@ TEST_CASE("dynamic-filter publisher publishes DECIMAL128 membership only when th
     auto replica_spaces = fixture.replica_spaces;
     dynamic_filter_publish_plan plan{
       {key}, std::move(targets), std::move(replica_spaces), {.emit_zone_map_filters = true}};
-    auto const outcome =
-      publish_for_test(plan, fixture.build_view(), fixture.stream);
-    return std::pair{outcome, channel->filters_for_column(kProbeColumnIndex)};
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
+    return std::pair{outcome, filters_on_column(*channel, kProbeColumnIndex)};
   };
 
   SECTION("values within int64: membership and zone map both publish")
@@ -1108,14 +1286,13 @@ TEST_CASE("dynamic-filter publisher publishes fingerprint membership for STRING 
     sirius::op::dynamic_filter_publication_policy policy{};
     policy.emit_zone_map_filters = emit_zone_maps;
     dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(replica_spaces), policy};
-    auto const outcome =
-      publish_for_test(plan, fixture.build_view(), fixture.stream);
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
     REQUIRE(outcome.keys_considered == 1);
     REQUIRE(outcome.keys_skipped_type_mismatch == 0);
     REQUIRE(outcome.membership_filters_built == 1);
     REQUIRE(outcome.zone_map_filters_built == (emit_zone_maps ? 1 : 0));
     REQUIRE(outcome.filters_pushed == (emit_zone_maps ? 2 : 1));
-    return channel->filters_for_column(kProbeColumnIndex);
+    return filters_on_column(*channel, kProbeColumnIndex);
   };
 
   SECTION("small IN-list tier")

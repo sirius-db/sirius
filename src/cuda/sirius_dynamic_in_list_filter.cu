@@ -22,14 +22,10 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 // cudf
-#include <cudf/column/column_factories.hpp>
-#include <cudf/stream_compaction.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
 // cccl
-#include <cub/device/device_for.cuh>
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
@@ -155,32 +151,17 @@ set_owner<KeyT> build_set(membership_key_domain const& domain,
   return set;
 }
 
-// The adapter converts probe values into the key domain per element; one the domain cannot
-// represent is a definite non-member, and so is a null probe row (the set holds no nulls and the
-// join never matches them). Rows the prior keep-mask killed skip the lookup. A key equal to the
-// set's reserved sentinel cannot be stored (cuco's insert of its empty key is a no-op), so such a
-// probe is kept conservatively; for the string family that is a probe whose fingerprint is
-// UINT64_MAX, which therefore always passes.
-template <class Adapter, class SetRef>
-struct set_contains {
-  using key_type = typename Adapter::key_type;
-  Adapter adapt;
-  bool* out;
+// The filter-specific half of detail::membership_probe_functor: a converted key is a member when
+// the set contains it. A key equal to the set's reserved sentinel cannot be stored (cuco's insert
+// of its empty key is a no-op), so such a probe is kept conservatively; for the string family that
+// is a probe whose fingerprint is UINT64_MAX, which therefore always passes.
+template <class SetRef>
+struct set_lookup {
+  using key_type = typename SetRef::key_type;
   SetRef set;
-  std::uint32_t const* prior_words;  // packed 1 bit/row, or null
-  detail::probe_validity valid;
-  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  __device__ __forceinline__ bool operator()(key_type key) const noexcept
   {
-    if (!detail::prior_mask_keeps(prior_words, idx) || !valid(idx)) {
-      out[idx] = false;
-      return;
-    }
-    key_type key;
-    if (!adapt(idx, key)) {
-      out[idx] = false;
-      return;
-    }
-    out[idx] = set.contains(key) || key == detail::set_sentinel<key_type>::value;
+    return set.contains(key) || key == detail::set_sentinel<key_type>::value;
   }
 };
 
@@ -227,42 +208,22 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
                                                              ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
 {
-  auto const domain = classify_membership_key(keys.type());
-  if (!domain.has_value() || !supports(keys)) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_in_list_filter] unsupported key column (see membership_key_supported).");
-  }
-  // A DECIMAL128 build whose unscaled values exceed the int64 rep cannot be stored exactly.
-  if (!membership_build_fits_rep(keys, stream, mr)) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_in_list_filter] build keys do not fit the key rep (DECIMAL128 values "
-      "outside int64).");
-  }
-  _domain = *domain;
-
-  // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are dropped
-  // exactly rather than inserted. The compacted storage stays alive until insert_async is queued
-  // on `stream`; its stream-ordered free then follows the insert.
-  std::unique_ptr<cudf::table> compacted;
-  cudf::column_view build_keys = keys;
-  if (keys.null_count() > 0) {
-    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
-    build_keys = compacted->view().column(0);
-  }
-  _num_keys = static_cast<std::size_t>(build_keys.size());
+  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
+  // device; `build.compacted` stays alive until insert_async is queued on `stream`.
+  auto const build = prepare_membership_build("[sirius_dynamic_in_list_filter]", keys, stream, mr);
+  _domain          = build.domain;
+  _num_keys        = static_cast<std::size_t>(build.keys.size());
 
   cuda::stream_ref const s{stream.get()};
   auto const rep_bytes = membership_rep_bytes(_domain.rep);
   auto const factor    = capacity_factor_for(_num_keys, rep_bytes);
   auto const capacity  = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
   _set                 = std::make_unique<set_impl>();
-  if (cudaGetDevice(&_set->source_device) != cudaSuccess) {
-    throw std::runtime_error("[sirius_dynamic_in_list_filter] failed to identify source device.");
-  }
-  auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+  _set->source_device  = build.source_device;
+  auto source          = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return std::make_unique<set_replica>(_set->source_device,
-                                         build_set<key_type>(_domain, build_keys, capacity, mr, s));
+                                         build_set<key_type>(_domain, build.keys, capacity, mr, s));
   });
   SIRIUS_LOG_DEBUG(
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
@@ -411,48 +372,24 @@ std::size_t sirius_dynamic_in_list_filter::replica_count() const noexcept
 
 std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   cudf::column_view const& probe,
-  int device_id,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr) const
-{
-  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
-}
-
-std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
-  cudf::column_view const& probe,
   std::uint32_t const* prior_mask_words,
   int device_id,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
-  // A pinned chunk may store this key narrowed while the filter was published at the native
-  // carrier; the kernel converts per element rather than materializing a widened copy.
   auto const* replica =
     _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  std::unique_ptr<cudf::column> out;
-  auto const n          = probe.size();
-  auto const dispatched = std::visit(
+  return std::visit(
     [&](auto const& set) {
       using owner_type = std::decay_t<decltype(set)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return detail::dispatch_probe_adapter<key_type>(_domain, probe, stream, [&](auto adapter) {
-        out = cudf::make_numeric_column(
-          cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-        auto* const outp = out->mutable_view().data<bool>();
-        auto ref         = set->ref(cuco::contains);
-        cub::DeviceFor::Bulk(
-          n,
-          set_contains<decltype(adapter), decltype(ref)>{
-            adapter, outp, ref, prior_mask_words, detail::probe_validity_of(probe)},
-          stream.get());
-      });
+      auto ref         = set->ref(cuco::contains);
+      return detail::run_membership_probe<key_type>(
+        _domain, probe, prior_mask_words, stream, mr, set_lookup<decltype(ref)>{ref});
     },
     replica->set);
-  if (!dispatched) { return nullptr; }
-  // Null probe rows were written as `false` in-kernel: the mask is non-nullable by construction.
-  return out;
 }
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }

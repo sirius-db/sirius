@@ -173,8 +173,12 @@ class sirius_mask_applicable {
    * consumer should have to materialize a widened copy to probe it. A DATE key accepts
    * TIMESTAMP_DAYS or its INT8/INT16/INT32 storage carriers; a sub-day timestamp key accepts only
    * its own unit. String keys accept a STRING probe, fingerprinted in-kernel with the hash the
-   * build side used. `membership_probe_compatible` is the host-side mirror of what a filter
-   * accepts.
+   * build side used. `membership_probe_compatible` is the one rule for what a filter accepts.
+   *
+   * @p prior_mask_words is packed 1 bit/row over @p probe's rows (bit `row % 32` of word
+   * `row / 32`, 1 = keep), or null for no restriction: rows the prior keep-mask already killed
+   * skip the probe. A pruning hint only; ignoring it is sound because every caller ANDs the
+   * result with that same mask.
    *
    * The result is never nullable. A null probe row is written as `false`: admission never routes
    * a null-safe comparison to a dynamic filter and the authoritative join runs with
@@ -182,26 +186,19 @@ class sirius_mask_applicable {
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const = 0;
 
-  /**
-   * @brief Prior-mask-aware variant: rows the prior keep-mask already killed skip the probe
-   *
-   * @p prior_mask_words is packed 1 bit/row over @p probe's rows (bit `row % 32` of word
-   * `row / 32`, 1 = keep), or null for no restriction. A pruning hint only: ignoring it is sound
-   * because every caller ANDs the result with that same mask.
-   */
-  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
-    cudf::column_view const& probe,
-    std::uint32_t const* prior_mask_words,
-    int device_id,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const
+  /// The prior-free form: every implementation is the overload above with no prior mask, so the
+  /// forwarder is defined once here. Implementations re-expose it with a using-declaration.
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(cudf::column_view const& probe,
+                                                           int device_id,
+                                                           ::cuda::stream_ref stream,
+                                                           rmm::device_async_resource_ref mr) const
   {
-    (void)prior_mask_words;
-    return compute_mask(probe, device_id, stream, mr);
+    return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
   }
 };
 
@@ -246,12 +243,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     return sirius_dynamic_filter_kind::IN_LIST;
   }
 
-  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
-    cudf::column_view const& probe,
-    int device_id,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const override;
-
+  using sirius_mask_applicable::compute_mask;
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     std::uint32_t const* prior_mask_words,
@@ -317,12 +309,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     return sirius_dynamic_filter_kind::IN_LIST;
   }
 
-  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
-    cudf::column_view const& probe,
-    int device_id,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const override;
-
+  using sirius_mask_applicable::compute_mask;
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     std::uint32_t const* prior_mask_words,
@@ -377,12 +364,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     return sirius_dynamic_filter_kind::BLOOM;
   }
 
-  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
-    cudf::column_view const& probe,
-    int device_id,
-    ::cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) const override;
-
+  using sirius_mask_applicable::compute_mask;
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     std::uint32_t const* prior_mask_words,

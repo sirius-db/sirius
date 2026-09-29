@@ -28,6 +28,12 @@
 //     column at its own carrier into the rep. A family is the correctness surface: it names the
 //     probe carriers whose values are comparable to the stored keys.
 //
+// The numeric families are derived from the carrier domains compressed materialization uses
+// (`sirius::narrow_domain_of` in helper/numeric_narrowing.hpp), and the per-element range rule the
+// probe kernels apply is the one the host narrowing predicates apply
+// (helper/numeric_carrier_rule.hpp), so a probe that narrowing could have produced is exactly a
+// probe a filter can serve.
+//
 // Integer, temporal, and decimal families store the key values themselves (at their integer
 // storage), so their IN-lists are exact. The string family stores a 64-bit XXHash_64 fingerprint
 // of each key (cudf::hashing::xxhash_64 over the build column, the identical hash computed
@@ -37,6 +43,7 @@
 
 // cudf
 #include <cudf/column/column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 // rmm
@@ -47,7 +54,9 @@
 // standard library
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <string_view>
 
 namespace sirius::op {
 
@@ -59,8 +68,9 @@ enum class membership_key_rep : std::uint8_t { i32, i64, u32, u64 };
 /// family adds a value here and those three arms.
 ///
 /// Temporal keys are integers underneath (cudf stores `TIMESTAMP_DAYS` as int32 epoch days and
-/// the other timestamp units as int64 ticks), so they share the signed integral adapter over the
-/// column's storage type; the family only decides which probe types are comparable:
+/// the other timestamp units as int64 ticks, see `sirius::integer_storage_type`), so they share
+/// the signed integral adapter over the column's storage type; the family only decides which probe
+/// types are comparable:
 ///   * `date_days`: a `DATE` key. Probes are `TIMESTAMP_DAYS` or the `INT8`/`INT16`/`INT32`
 ///     carriers compressed materialization stores a `DATE` in;
 ///   * `timestamp`: a sub-day timestamp key. Probes must carry the same unit; a different unit
@@ -119,13 +129,36 @@ struct membership_key_domain {
 [[nodiscard]] bool membership_key_supported(cudf::data_type t) noexcept;
 
 /**
+ * @brief True when two build carriers would land a key in the same family
+ *
+ * The publisher's rule for a build column arriving at a carrier other than the plan's recorded
+ * storage type: when both classify to one family (and, for decimals, one scale) the filters can
+ * be built at the carrier, because every probe the recorded type accepts is also comparable to a
+ * set built at the carrier. When they do not (a `DATE` key stored as an `INT16` carrier classifies
+ * as a signed integer), the build column has to be restored to the recorded type first, or the
+ * native probe would be declined.
+ */
+[[nodiscard]] bool membership_same_family(cudf::data_type recorded,
+                                          cudf::data_type arrived) noexcept;
+
+/**
+ * @brief cudf type the rep of @p domain holds
+ *
+ * INT32/INT64/UINT32/UINT64 for the integer, temporal, and string families; DECIMAL32/DECIMAL64 at
+ * the domain's scale for the decimal family. This is the carrier a build column must fit for the
+ * set to be exact (`membership_build_fits_rep`).
+ */
+[[nodiscard]] cudf::data_type membership_rep_type(membership_key_domain const& domain) noexcept;
+
+/**
  * @brief True when every non-null value of @p keys is representable in its domain's rep
  *
  * Only a DECIMAL128 build column can fail: its unscaled values may exceed int64, and a set built by
  * truncating them would produce false negatives. That case runs a min/max reduction on @p stream
- * and reads the bounds back (synchronizing); every other supported type answers true without GPU
- * work. An unsupported type answers false. Callers that gate publication call this once before
- * consulting the filters' `supports()`; the constructors re-check and throw on a violation.
+ * and reads the bounds back (synchronizing, through `sirius::column_values_fit`); every other
+ * supported type answers true without GPU work. An unsupported type answers false. Callers that
+ * gate publication call this once before consulting the filters' `supports()`; the constructors
+ * re-check and throw on a violation.
  */
 [[nodiscard]] bool membership_build_fits_rep(cudf::column_view const& keys,
                                              ::cuda::stream_ref stream,
@@ -134,12 +167,13 @@ struct membership_key_domain {
 /**
  * @brief True when a probe column of type @p probe can be adapted to @p domain
  *
- * Host mirror of the device-side adapter dispatch: a probe type this rejects is one every filter's
- * `compute_mask` declines with a null result. Signed and unsigned carriers never mix; decimal
- * probes must carry the domain's scale (a rescale is a planner cast and never reaches a filter);
- * the string family accepts only a STRING probe (the fused decode materializes dictionary and
- * str_split carriers back into STRING before probing, so DICTIONARY32 never reaches a probe and
- * declines).
+ * The one acceptance rule for probe types: the device dispatch (`dispatch_probe_adapter`) consults
+ * this predicate rather than keeping a list of its own, so a probe type this rejects is exactly
+ * one every filter's `compute_mask` declines with a null result. Signed and unsigned carriers never
+ * mix; decimal probes must carry the domain's scale (a rescale is a planner cast and never reaches
+ * a filter); the string family accepts only a STRING probe (the fused decode materializes
+ * dictionary and str_split carriers back into STRING before probing, so DICTIONARY32 never reaches
+ * a probe and declines).
  */
 [[nodiscard]] bool membership_probe_compatible(membership_key_domain const& domain,
                                                cudf::data_type probe) noexcept;
@@ -148,13 +182,33 @@ struct membership_key_domain {
 [[nodiscard]] std::size_t membership_rep_bytes(membership_key_rep rep) noexcept;
 
 /**
- * @brief cudf type whose buffer layout @p t shares
+ * @brief A build column validated and compacted for one of the membership filters
  *
- * Temporal columns store plain integers: `TIMESTAMP_DAYS` maps to `INT32`, every other timestamp
- * unit to `INT64`. Any other type is its own storage type. The probe adapters and build-side
- * iterators read a column through this type, so a temporal key is bit-identical to an integer
- * one on the device and adds no kernel instantiations.
+ * `keys` holds the rows the filter stores: the input column when it has no nulls, otherwise a view
+ * of `compacted`, which owns the null-free copy and must stay alive until the filter's copy or
+ * insert has been enqueued on the construction stream.
  */
-[[nodiscard]] cudf::data_type membership_storage_type(cudf::data_type t) noexcept;
+struct membership_build_keys {
+  membership_key_domain domain{};
+  std::unique_ptr<cudf::table> compacted;
+  cudf::column_view keys;
+  int source_device = -1;
+};
+
+/**
+ * @brief Shared constructor prologue of the three membership filters
+ *
+ * Classifies @p keys, verifies its values fit the rep (`membership_build_fits_rep`), drops null
+ * build keys (they match nothing under the join's `null_equality::UNEQUAL`, so the drop is exact),
+ * and records the current CUDA device as the source replica's device.
+ *
+ * @param filter_name Bracketed filter name used as the exception message prefix
+ * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
+ * @throw std::runtime_error if the current CUDA device cannot be identified
+ */
+[[nodiscard]] membership_build_keys prepare_membership_build(std::string_view filter_name,
+                                                             cudf::column_view const& keys,
+                                                             ::cuda::stream_ref stream,
+                                                             rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op

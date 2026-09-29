@@ -22,6 +22,12 @@
 // *probe adapter* selected on the host from (key domain, probe type); see
 // op/dynamic_filter/dynamic_filter_key_domain.hpp for the two axes.
 //
+// Nothing in this header decides which probe types are acceptable: `dispatch_probe_adapter` asks
+// the host predicate `membership_probe_compatible`, and the per-element range rule the adapters
+// apply is `sirius::value_fits` from helper/numeric_carrier_rule.hpp, the same rule the host
+// narrowing predicates use. What is left here is the mapping from an accepted cudf type to the
+// C++ integer the kernel reads it as.
+//
 // cudf::type_dispatcher is deliberately not used for the (key rep, probe carrier) pair: the
 // allowed pairs are a short explicit list and are the correctness surface, so they are spelled
 // out here, and the instantiation count stays bounded. Per filter kind: 2 signed reps x 4 signed
@@ -31,11 +37,13 @@
 // adapter adds one on the u64 rep (+1), for 19 probe kernels in total.
 
 // sirius
+#include <helper/numeric_carrier_rule.hpp>
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/strings/string_view.cuh>
@@ -52,10 +60,13 @@
 #include <cuda/stream>
 
 // cccl
+#include <cub/device/device_for.cuh>
 #include <cuda/std/cstddef>
-#include <cuda/std/limits>
 #include <cuda/std/type_traits>
 #include <thrust/iterator/transform_iterator.h>
+
+// cucascade
+#include <cucascade/error.hpp>
 
 // standard library
 #include <cstdint>
@@ -63,6 +74,8 @@
 #include <utility>
 
 namespace sirius::op::detail {
+
+using sirius::set_sentinel;
 
 /// Invokes @p fn with a value-initialized instance of the rep's device type.
 template <class Fn>
@@ -77,38 +90,22 @@ decltype(auto) dispatch_key_rep(membership_key_rep rep, Fn&& fn)
   return fn(std::int32_t{});  // unreachable for a well-formed enum value
 }
 
-/// Value a hash set reserves as its empty slot, which therefore cannot be stored. Signed reps use
-/// the minimum; unsigned reps use the maximum because 0 is a common real key.
-template <class KeyT>
-struct set_sentinel {
-  static constexpr KeyT value = cuda::std::is_signed_v<KeyT>
-                                  ? cuda::std::numeric_limits<KeyT>::min()
-                                  : cuda::std::numeric_limits<KeyT>::max();
-};
-
 //===----------------------------------------------------------------------===//
 // Element conversion
 //===----------------------------------------------------------------------===//
 
-/// Lossless conversion into the key domain. Widening always succeeds; narrowing only when @p value
-/// is representable, and a non-representable value can never equal a stored key. Both types
-/// share a signedness (the dispatchers below never mix them).
+/// Lossless conversion into the key domain: `sirius::value_fits` decides, so the device converts
+/// exactly the values the host narrowing predicates call representable. Widening always succeeds;
+/// narrowing only when @p value is representable, and a non-representable value can never equal a
+/// stored key. Both types share a signedness (the dispatchers below never mix them).
 template <class KeyT, class ProbeT>
 __device__ __forceinline__ bool probe_key_convert(ProbeT value, KeyT& out) noexcept
 {
   static_assert(cuda::std::is_signed_v<KeyT> == cuda::std::is_signed_v<ProbeT>,
                 "probe and key carriers must share a signedness");
-  if constexpr (sizeof(ProbeT) <= sizeof(KeyT)) {
-    out = static_cast<KeyT>(value);
-    return true;
-  } else {
-    if constexpr (cuda::std::is_signed_v<ProbeT>) {
-      if (value < static_cast<ProbeT>(cuda::std::numeric_limits<KeyT>::min())) { return false; }
-    }
-    if (value > static_cast<ProbeT>(cuda::std::numeric_limits<KeyT>::max())) { return false; }
-    out = static_cast<KeyT>(value);
-    return true;
-  }
+  if (!sirius::value_fits<KeyT>(value)) { return false; }
+  out = static_cast<KeyT>(value);
+  return true;
 }
 
 /// @p words is packed 1 bit/row (bit `row % 32` of word `row / 32`, 1 = keep); null = no prior.
@@ -194,18 +191,24 @@ struct string_hash_adapter {
 // Host-side dispatch
 //===----------------------------------------------------------------------===//
 
-/// Invokes @p fn with a value-initialized instance of the integer carrier behind @p t when it
-/// shares KeyT's signedness, or returns false without invoking it. Covers every carrier a key
-/// column can be narrowed to; any other type is a semantic mismatch, not a width one.
+/// Maps an accepted probe or build type to the C++ integer the kernel reads its buffer as, and
+/// invokes @p fn with a value-initialized instance of it; returns false without invoking @p fn for
+/// a type of the other signedness (never reached after `membership_probe_compatible`) or a type
+/// with no integer storage. Temporal types read through `sirius::integer_storage_type`;
+/// fixed-point types read their unscaled storage integer (scale is the caller's check). Only the
+/// carriers of KeyT's signedness are instantiated, which is what bounds the kernel count.
 template <class KeyT, class Fn>
-bool dispatch_family_carrier(cudf::data_type t, Fn&& fn)
+bool dispatch_storage_carrier(cudf::data_type t, Fn&& fn)
 {
   if constexpr (cuda::std::is_signed_v<KeyT>) {
-    switch (t.id()) {
+    switch (sirius::integer_storage_type(t).id()) {
       case cudf::type_id::INT8: fn(std::int8_t{}); return true;
       case cudf::type_id::INT16: fn(std::int16_t{}); return true;
-      case cudf::type_id::INT32: fn(std::int32_t{}); return true;
-      case cudf::type_id::INT64: fn(std::int64_t{}); return true;
+      case cudf::type_id::INT32:
+      case cudf::type_id::DECIMAL32: fn(std::int32_t{}); return true;
+      case cudf::type_id::INT64:
+      case cudf::type_id::DECIMAL64: fn(std::int64_t{}); return true;
+      case cudf::type_id::DECIMAL128: fn(__int128_t{}); return true;
       default: return false;
     }
   } else {
@@ -219,24 +222,11 @@ bool dispatch_family_carrier(cudf::data_type t, Fn&& fn)
   }
 }
 
-/// Invokes @p fn with a value-initialized instance of the unscaled storage integer behind the
-/// fixed-point type @p t, or returns false without invoking it. Scale is the caller's check: the
-/// storage integers of two scales are not comparable.
-template <class Fn>
-bool dispatch_decimal_carrier(cudf::data_type t, Fn&& fn)
-{
-  switch (t.id()) {
-    case cudf::type_id::DECIMAL32: fn(std::int32_t{}); return true;
-    case cudf::type_id::DECIMAL64: fn(std::int64_t{}); return true;
-    case cudf::type_id::DECIMAL128: fn(__int128_t{}); return true;
-    default: return false;
-  }
-}
-
 /// The (key domain, probe type) switch. Invokes @p fn once with the adapter that reads @p probe
-/// into KeyT, or returns false (= decline) without invoking it. KeyT must be the rep the domain
-/// was classified to; a rep/family disagreement is unreachable and also declines. Each key family
-/// owns one arm here, mirrored on the host by membership_probe_compatible.
+/// into KeyT, or returns false (= decline) without invoking it. Acceptance is decided by the host
+/// predicate `membership_probe_compatible` alone; this function only picks the adapter for an
+/// accepted probe. KeyT must be the rep the domain was classified to; a rep/family disagreement is
+/// unreachable and also declines.
 ///
 /// @p stream orders any device-side view the adapter needs (a strings column's device view owns
 /// a small allocation for its offsets child); @p fn must enqueue its kernel on the same stream so
@@ -247,53 +237,84 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
                             ::cuda::stream_ref stream,
                             Fn&& fn)
 {
-  // Reads the probe at the integer carrier `probe_tag` names (its own type, the integer type a
-  // temporal column stores, or the unscaled storage of a fixed-point column) and hands fn the
-  // matching integral adapter.
-  auto const adapt = [&](auto probe_tag) {
+  if (!membership_probe_compatible(domain, probe.type())) { return false; }
+  if (domain.family == membership_key_family::string_hash) {
+    if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
+      // The device view is a host object whose child views live in a stream-ordered device
+      // allocation released when it goes out of scope, after fn enqueued its kernel on stream.
+      auto const device_view = cudf::column_device_view::create(probe, stream);
+      fn(string_hash_adapter{*device_view});
+      return true;
+    }
+    return false;
+  }
+  // Every other family reads the probe at the integer carrier its type names (its own type, the
+  // integer a temporal column stores, or the unscaled storage of a fixed-point column) and hands
+  // fn the matching integral adapter; a comparable probe is then bit-identical to an integer one.
+  return dispatch_storage_carrier<KeyT>(probe.type(), [&](auto probe_tag) {
     using probe_type = decltype(probe_tag);
     fn(integral_probe_adapter<probe_type, KeyT>{probe.data<probe_type>()});
-  };
-  switch (domain.family) {
-    case membership_key_family::signed_int:
-      if constexpr (cuda::std::is_signed_v<KeyT>) {
-        return dispatch_family_carrier<KeyT>(probe.type(), adapt);
-      }
-      return false;
-    case membership_key_family::unsigned_int:
-      if constexpr (cuda::std::is_unsigned_v<KeyT>) {
-        return dispatch_family_carrier<KeyT>(probe.type(), adapt);
-      }
-      return false;
-    // Temporal keys: the host mirror decides which probe types are comparable (same unit, or a
-    // DATE storage carrier); a comparable probe is then bit-identical to an integer one.
-    case membership_key_family::date_days:
-    case membership_key_family::timestamp:
-      if constexpr (cuda::std::is_signed_v<KeyT>) {
-        if (!membership_probe_compatible(domain, probe.type())) { return false; }
-        return dispatch_family_carrier<KeyT>(membership_storage_type(probe.type()), adapt);
-      }
-      return false;
-    case membership_key_family::decimal:
-      // Same scale, any fixed-point width: the unscaled storage is then a plain signed integer
-      // and the integral adapter's range check makes a wider carrier exact.
-      if constexpr (cuda::std::is_signed_v<KeyT>) {
-        if (probe.type().scale() != domain.scale) { return false; }
-        return dispatch_decimal_carrier(probe.type(), adapt);
-      }
-      return false;
-    case membership_key_family::string_hash:
-      if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
-        if (probe.type().id() != cudf::type_id::STRING) { return false; }
-        // The device view is a host object whose child views live in a stream-ordered device
-        // allocation released when it goes out of scope, after fn enqueued its kernel on stream.
-        auto const device_view = cudf::column_device_view::create(probe, stream);
-        fn(string_hash_adapter{*device_view});
-        return true;
-      }
-      return false;
+  });
+}
+
+//===----------------------------------------------------------------------===//
+// Probe kernel
+//===----------------------------------------------------------------------===//
+
+/// The per-row probe shared by the three filters. A row the prior keep-mask killed or whose probe
+/// key is null is a definite non-member (null build slots were compacted out and the join never
+/// matches nulls); so is a value the adapter cannot represent in the key domain, since every
+/// stored key fits it. Only a converted key reaches @p Lookup, which is the filter-specific part:
+/// a set `contains`, a Bloom `contains`, or a needle scan.
+template <class Adapter, class Lookup>
+struct membership_probe_functor {
+  using key_type = typename Adapter::key_type;
+  Adapter adapt;
+  Lookup lookup;
+  bool* __restrict__ out;
+  std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
+  probe_validity valid;
+
+  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  {
+    if (!prior_mask_keeps(prior_words, idx) || !valid(idx)) {
+      out[idx] = false;
+      return;
+    }
+    key_type key;
+    out[idx] = adapt(idx, key) && lookup(key);
   }
-  return false;
+};
+
+/// Runs one membership probe over @p probe: selects the adapter for (domain, probe type), or
+/// returns null when the probe type is incompatible; otherwise allocates the BOOL8 result and
+/// launches `membership_probe_functor` with @p lookup on @p stream. A pinned chunk may store the
+/// key narrowed while the filter was published at the native carrier; the kernel converts per
+/// element rather than materializing a widened copy. Null probe rows are written as `false`
+/// in-kernel, so the mask is non-nullable by construction.
+template <class KeyT, class Lookup>
+[[nodiscard]] std::unique_ptr<cudf::column> run_membership_probe(
+  membership_key_domain const& domain,
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  Lookup lookup)
+{
+  std::unique_ptr<cudf::column> out;
+  auto const n          = probe.size();
+  bool const dispatched = dispatch_probe_adapter<KeyT>(domain, probe, stream, [&](auto adapter) {
+    out = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto* const outp = out->mutable_view().data<bool>();
+    CUCASCADE_CUDA_TRY(
+      cub::DeviceFor::Bulk(n,
+                           membership_probe_functor<decltype(adapter), Lookup>{
+                             adapter, lookup, outp, prior_mask_words, probe_validity_of(probe)},
+                           stream.get()));
+  });
+  if (!dispatched) { return nullptr; }
+  return out;
 }
 
 //===----------------------------------------------------------------------===//
@@ -335,8 +356,21 @@ bool with_build_key_iterator(membership_key_domain const& domain,
                              rmm::device_async_resource_ref mr,
                              Fn&& fn)
 {
-  bool invoked         = false;
-  auto const emit_from = [&](auto carrier_tag) {
+  if (domain.family == membership_key_family::string_hash) {
+    if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
+      if (keys.type().id() != cudf::type_id::STRING) { return false; }
+      auto const fingerprints = materialize_string_fingerprints(keys, stream, mr);
+      auto const* first       = fingerprints->view().data<std::uint64_t>();
+      fn(first, first + keys.size());
+      return true;
+    }
+    return false;
+  }
+  // The build column is a carrier of its own domain by construction; the same acceptance rule
+  // the probes use keeps a scale or family disagreement from being read as integers.
+  if (!membership_probe_compatible(domain, keys.type())) { return false; }
+  bool invoked = false;
+  dispatch_storage_carrier<KeyT>(keys.type(), [&](auto carrier_tag) {
     using carrier_type            = decltype(carrier_tag);
     constexpr bool widens_or_same = sizeof(carrier_type) <= sizeof(KeyT);
     constexpr bool verified_narrowing =
@@ -347,34 +381,7 @@ bool with_build_key_iterator(membership_key_domain const& domain,
       fn(first, first + keys.size());
       invoked = true;
     }
-  };
-  switch (domain.family) {
-    // Integer carriers, and the integer storage a temporal column sits on (identity for plain
-    // integers).
-    case membership_key_family::signed_int:
-    case membership_key_family::unsigned_int:
-    case membership_key_family::date_days:
-    case membership_key_family::timestamp:
-      dispatch_family_carrier<KeyT>(membership_storage_type(keys.type()), emit_from);
-      break;
-    case membership_key_family::decimal:
-      if constexpr (cuda::std::is_signed_v<KeyT>) {
-        if (keys.type().scale() == domain.scale) {
-          dispatch_decimal_carrier(keys.type(), emit_from);
-        }
-      }
-      break;
-    case membership_key_family::string_hash:
-      if constexpr (cuda::std::is_same_v<KeyT, std::uint64_t>) {
-        if (keys.type().id() == cudf::type_id::STRING) {
-          auto const fingerprints = materialize_string_fingerprints(keys, stream, mr);
-          auto const* first       = fingerprints->view().data<std::uint64_t>();
-          fn(first, first + keys.size());
-          invoked = true;
-        }
-      }
-      break;
-  }
+  });
   return invoked;
 }
 

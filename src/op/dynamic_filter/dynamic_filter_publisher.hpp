@@ -124,6 +124,8 @@ struct dynamic_filter_publication_outcome {
   std::size_t zone_map_filters_built     = 0;
   std::size_t active_targets             = 0;
   std::size_t filters_pushed             = 0;
+  // Bindings whose recorded probe type no membership adapter can read (would decline every batch).
+  std::size_t bindings_skipped_incompatible_probe = 0;
 };
 
 /**
