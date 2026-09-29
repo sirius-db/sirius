@@ -58,6 +58,8 @@ pixi run cmake -S test/cmake/installed_consumer -B build/consumer \
 pixi run cmake --build build/consumer
 ```
 
-The package records the compiler and build mode. Extension wrappers call
-`sirius_check_duckdb_compatibility()` before linking. DuckDB API/ABI compatibility
-remains the caller's responsibility.
+Consumers are responsible for DuckDB and C++ runtime ABI compatibility.
+
+CI runs `python scripts/check-installed-package.py build/release` after building.
+It installs and relocates the package and builds Debug and Release consumers
+with Git discovery disabled. These checks require no GPU.

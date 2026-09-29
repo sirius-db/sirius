@@ -88,6 +88,9 @@ jobs:
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
 
+      - name: Check installed Sirius package
+        run: python scripts/check-installed-package.py build/release
+
       - name: Surface build errors
         if: failure()
         run: |
