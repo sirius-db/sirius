@@ -322,7 +322,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` routes local files to the kvikIO fallback (single-GPU only; multi-GPU requires `sirius`). Values are lowercase. |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
@@ -370,7 +370,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and presigned-URL TTL (0 = no limit). Data GETs use the stall detector below instead. |
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
 | `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
 | `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
 | `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
@@ -402,10 +402,10 @@ those blocks stay owned through curl retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work
 instead of being reserved as one fixed bounce slot per connection.
 
-### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
+### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
 
-Used only when `backend: kvikio` routes local files to the kvikIO
-fallback. **Every key is optional and unset means "leave kvikIO's own default
+Used when `backend: kvikio` routes reads (local files and `s3://` objects)
+to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
 alone"** — kvikIO seeds each setting from an environment variable at first use, so
 omitting a key preserves that value and setting one overrides it.
 

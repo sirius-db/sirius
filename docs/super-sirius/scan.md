@@ -218,7 +218,7 @@ A lock-protected queue of pre-built splits. The producer (sequencer) enqueues vi
 
 **Files:** `src/pin_table.hpp`, `src/pin_table.cpp`; pinned-entry storage + cache matching in `src/scan_manager/sirius_scan_manager.hpp` and `src/scan_manager/sirius_scan_manager.cpp`; zone-map capture and pruning in `src/scan_manager/pinned_chunk_stats.hpp` and `src/scan_manager/pinned_chunk_stats.cpp`; MVCC reconciliation in `src/op/scan/duckdb_mvcc_visibility.cpp`, `src/scan_manager/mvcc_mask_job.cpp`, `src/op/scan/duckdb_insert_delta.cpp`, and `src/scan_manager/insert_delta_job.cpp` (with their headers).
 
-The `pin_table` table function pre-loads a table's columns into memory so subsequent scans of the same source bypass file I/O entirely. It supports both source formats and two memory tiers.
+The `pin_table` table function preloads data for later scans. It supports parquet and DuckDB sources, with the tiers described below.
 
 ```sql
 CALL pin_table('/path/to/lineitem.parquet',
@@ -236,7 +236,7 @@ SELECT SUM(l_extendedprice * l_quantity)
 CALL unpin_table('lineitem');
 ```
 
-`format` is `parquet` or `duckdb`, resolved at bind time from an explicit parameter or inferred from the path extension. `tier` is `gpu` (columns in GPU device memory) or `host` (columns in pinned host memory).
+`format` is `parquet` or `duckdb`, resolved at bind time from an explicit parameter or inferred from the path extension. `tier` is `gpu` (columns in GPU device memory), `host` (columns in pinned host memory) or `parquet` (parquet sources only: caches undecoded column-chunk ranges for the selected columns, or all columns when `cols` is omitted; cache hits avoid fetching those ranges, but scans still decode them; requires `scan_manager.cache.mode: sirius`).
 
 ### Materializing a pin
 
