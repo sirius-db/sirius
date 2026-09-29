@@ -907,7 +907,7 @@ impl SiriusComputeNodeService {
             .map_err(|err| err.to_string())?;
         info!(
             output_names = ?translated.output_names,
-            plan = %translated.explain(),
+            plan = ?translated.plan,
             "translated StarRocks plan fragment"
         );
         Self::dump_substrait(&translated, dump_seq);
