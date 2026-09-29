@@ -221,7 +221,7 @@ jobs:
         run: |
           set -o pipefail
           pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
-          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo sirius_unittest 2>&1 | tee -a /tmp/vcpkg.log
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo 2>&1 | tee -a /tmp/vcpkg.log
 
       - name: Surface build errors (vcpkg)
         if: failure() && matrix.build.environment == 'vcpkg'

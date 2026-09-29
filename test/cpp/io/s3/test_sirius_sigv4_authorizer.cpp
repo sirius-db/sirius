@@ -226,7 +226,7 @@ TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list_pars
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("<Contents> without <Key>"));
+    Catch::Matchers::ContainsSubstring("<Contents> without <Key>"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects an unclosed Key", "[s3][list_parser]")
@@ -234,7 +234,7 @@ TEST_CASE("ListObjectsV2 parser rejects an unclosed Key", "[s3][list_parser]")
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a<Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("<Contents> without <Key>"));
+    Catch::Matchers::ContainsSubstring("<Contents> without <Key>"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
@@ -242,7 +242,7 @@ TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key></Key><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("empty <Key>"));
+    Catch::Matchers::ContainsSubstring("empty <Key>"));
 }
 
 TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
@@ -250,7 +250,7 @@ TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents></ListBucketResult>)"),
-    Catch::Contains("missing <IsTruncated>"));
+    Catch::Matchers::ContainsSubstring("missing <IsTruncated>"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_parser]")
@@ -264,7 +264,7 @@ TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_
           "</Contents><IsTruncated>"} +
         value + "</IsTruncated></ListBucketResult>";
       CHECK_THROWS_WITH(sirius::io::rest::s3::parse_list_objects_v2(xml),
-                        Catch::Contains("invalid <IsTruncated>"));
+                        Catch::Matchers::ContainsSubstring("invalid <IsTruncated>"));
     }
   }
 
@@ -273,7 +273,7 @@ TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_
     CHECK_THROWS_WITH(
       sirius::io::rest::s3::parse_list_objects_v2(
         R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</ListBucketResult>)"),
-      Catch::Contains("missing <IsTruncated>"));
+      Catch::Matchers::ContainsSubstring("missing <IsTruncated>"));
   }
 }
 
@@ -282,7 +282,8 @@ TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][li
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+    Catch::Matchers::ContainsSubstring("without") &&
+      Catch::Matchers::ContainsSubstring("ContinuationToken"));
 }
 
 TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_parser]")
@@ -299,14 +300,14 @@ TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", 
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult><Contents><Key>outside</Key><Size>1</Size></Contents>)"),
-    Catch::Contains("after </ListBucketResult>"));
+    Catch::Matchers::ContainsSubstring("after </ListBucketResult>"));
 }
 
 TEST_CASE("ListObjectsV2 parser does not read IsTruncated outside the root", "[s3][list_parser]")
 {
   CHECK_THROWS_WITH(sirius::io::rest::s3::parse_list_objects_v2(
                       R"(<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>)"),
-                    Catch::Contains("missing <IsTruncated>"));
+                    Catch::Matchers::ContainsSubstring("missing <IsTruncated>"));
 }
 
 TEST_CASE("ListObjectsV2 parser does not read a continuation token outside the root",
@@ -315,7 +316,8 @@ TEST_CASE("ListObjectsV2 parser does not read a continuation token outside the r
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult><NextContinuationToken>outside</NextContinuationToken>)"),
-    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+    Catch::Matchers::ContainsSubstring("without") &&
+      Catch::Matchers::ContainsSubstring("ContinuationToken"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list_parser]")
@@ -346,7 +348,7 @@ TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][lis
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<ListBucketResultBogus><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("not a ListObjectsV2 response"));
+    Catch::Matchers::ContainsSubstring("not a ListObjectsV2 response"));
 }
 
 TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][list_parser]")
@@ -354,7 +356,7 @@ TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<Foo/><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("before <ListBucketResult>"));
+    Catch::Matchers::ContainsSubstring("before <ListBucketResult>"));
 }
 
 TEST_CASE("ListObjectsV2 parser accepts a prologue and newline before the root",

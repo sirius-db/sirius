@@ -87,6 +87,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/c-ares-1.34.8-hebe6cf0_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/c-compiler-1.11.0-h4d9bdce_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/catch2-3.16.0-h4dbf13b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py312h703531f_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/clang-21-21.1.8-default_h6209e06_6.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/clang-21.1.8-default_cfg_hfed155c_6.conda
@@ -350,6 +351,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/c-ares-1.34.8-h29ee22c_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/c-compiler-1.11.0-hdceaead_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/catch2-3.16.0-h45ce4d5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cffi-2.1.1-py312h563f9cf_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/clang-21-21.1.8-default_hd92c461_6.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/clang-21.1.8-default_cfg_h710bdcc_6.conda
@@ -620,6 +622,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/brotli-python-1.2.0-py312he9c40d5_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/c-ares-1.34.8-hebe6cf0_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/catch2-3.16.0-h4dbf13b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py312h703531f_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/clang-21-21.1.8-default_h6209e06_6.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/clang-21.1.8-default_cfg_hfed155c_6.conda
@@ -883,6 +886,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/brotli-python-1.2.0-py312h41c1d46_4.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/c-ares-1.34.8-h29ee22c_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/catch2-3.16.0-h45ce4d5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cffi-2.1.1-py312h563f9cf_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/clang-21-21.1.8-default_hd92c461_6.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/clang-21.1.8-default_cfg_h710bdcc_6.conda
@@ -2937,6 +2941,20 @@ packages:
   run_exports: {}
   size: 6693
   timestamp: 1753098721814
+- conda: https://conda.anaconda.org/conda-forge/linux-64/catch2-3.16.0-h4dbf13b_0.conda
+  sha256: 2912874e38b635b89db9bbecb284f13ae449a6c3925a28a87f78b23e4730d767
+  md5: ff146041192f4d830974030bdec19f86
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - libstdcxx >=15
+  - libgcc >=15
+  license: BSL-1.0
+  purls: []
+  run_exports:
+    weak:
+    - catch2 >=3.16.0,<4.0a0
+  size: 659129
+  timestamp: 1787658434406
 - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py312h703531f_3.conda
   sha256: 7c6e8b24d62e0bfa5d14050cd29053778f399feefa7d6887b04575210285a849
   md5: 41f019d067f8c52c6d9283d8afb28889
@@ -7697,6 +7715,19 @@ packages:
   run_exports: {}
   size: 6721
   timestamp: 1753098688332
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/catch2-3.16.0-h45ce4d5_0.conda
+  sha256: 674ee6e038149d00572feddd7dc27d21f84c36966060850184dada23b1c5e21b
+  md5: 9c3d4936cdb5a00b8665f3136387d094
+  depends:
+  - libstdcxx >=15
+  - libgcc >=15
+  license: BSL-1.0
+  purls: []
+  run_exports:
+    weak:
+    - catch2 >=3.16.0,<4.0a0
+  size: 651219
+  timestamp: 1787658438323
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cffi-2.1.1-py312h563f9cf_3.conda
   sha256: 4d82c1db47442fa875fc28a9bb558936ce1eaf6ee7dd75342d2b08c673ef1895
   md5: e24f093fe036550d5e9810fcceff3849

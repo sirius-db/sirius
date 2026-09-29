@@ -111,7 +111,7 @@ class GPUExecutionFixtureBase {
    * num_gpus configuration. Pauses the previously-active env (if any) first
    * so at most one Sirius context is live. Returns false if the requested
    * env is unavailable on this host (e.g., num_gpus=2 on a single-GPU host);
-   * caller should WARN+return per Catch2 v2 convention.
+   * caller should WARN+return per Catch2 convention.
    */
   bool bind_env(int num_gpus)
   {
@@ -4464,7 +4464,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 //
 // These TEST_CASEs run TPC-H Q1, Q6, Q12 at SF10 on num_gpus=2. They are
 // gated on the SIRIUS_TEST_SF10_PATH env var (skip with WARN if unset) AND
-// on >=2 GPUs (WARN+return per Catch2 v2 convention). The views are built on
+// on >=2 GPUs (WARN+return per Catch2 convention). The views are built on
 // top of the SF10 parquet via compare_gpu_vs_cpu_sf10_for which CREATE OR
 // REPLACE VIEWs the 8 TPC-H tables after bind_env.
 //===----------------------------------------------------------------------===//

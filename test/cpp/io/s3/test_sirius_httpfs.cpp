@@ -501,7 +501,7 @@ TEST_CASE("sirius_httpfs glob helper throws instead of silently truncating match
   CHECK_THROWS_WITH(sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob/multi/nation_*.parquet"),
                                                 manager,
                                                 /*max_matches=*/1),
-                    Catch::Contains("narrow the glob prefix"));
+                    Catch::Matchers::ContainsSubstring("narrow the glob prefix"));
 }
 
 TEST_CASE("sirius_httpfs rejects write opens before opener resolution", "[s3][filesystem]")
