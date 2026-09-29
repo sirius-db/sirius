@@ -207,26 +207,10 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
     throw std::runtime_error("nvcomp batched: corrupt frame header");
   }
 
-  auto h_comp_bytes = owner.host_array<std::size_t>(num_chunks);
-  owner.read_bytes(h_comp_bytes.data(), fbase + 16, h_comp_bytes.size_bytes());
-
-  std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
-  auto h_comp_ptrs         = owner.host_array<void const*>(num_chunks);
-  auto h_uncomp_bytes      = owner.host_array<std::size_t>(num_chunks);
-  auto h_uncomp_ptrs       = owner.host_array<void*>(num_chunks);
-  auto* d                  = static_cast<std::uint8_t*>(dst);
-  std::size_t cursor       = header;
-  for (std::size_t i = 0; i < num_chunks; ++i) {
-    h_comp_ptrs[i]    = fbase + cursor;
-    cursor            = align_up(cursor + h_comp_bytes[i], kFrameAlign);
-    h_uncomp_bytes[i] = std::min(chunk, out_bytes - i * chunk);
-    h_uncomp_ptrs[i]  = d + i * chunk;
-  }
-
-  // Coalesce the per-chunk metadata arrays into ONE device allocation instead of six
-  // tiny ones (comp ptrs/bytes, uncomp bytes/ptrs, plus the actual-size and status
-  // outputs some codecs require). Sub-regions at 8*num_chunks strides are 8-byte
-  // aligned, which is all nvcomp needs.
+  // One device allocation holds the per-chunk tables (comp ptrs/bytes, uncomp bytes/ptrs) plus the
+  // actual-size and status outputs some codecs require. Sub-regions at 8*num_chunks strides are
+  // 8-byte aligned, which is all nvcomp needs. The four input tables are assembled in one
+  // frame-owned host block laid out like the device block and uploaded with one copy.
   std::size_t const sz_ptr           = num_chunks * sizeof(void*);
   std::size_t const sz_size          = num_chunks * sizeof(std::size_t);
   std::size_t const sz_stat          = num_chunks * sizeof(nvcompStatus_t);
@@ -236,37 +220,35 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   std::size_t const off_uncomp_ptrs  = off_uncomp_bytes + sz_size;
   std::size_t const off_actual       = off_uncomp_ptrs + sz_ptr;
   std::size_t const off_statuses     = off_actual + sz_size;
+  auto const host                    = owner.host_array<std::byte>(off_actual);
+  auto* const h_comp_ptrs            = reinterpret_cast<void const**>(host.data() + off_comp_ptrs);
+  auto* const h_comp_bytes           = reinterpret_cast<std::size_t*>(host.data() + off_comp_bytes);
+  auto* const h_uncomp_bytes = reinterpret_cast<std::size_t*>(host.data() + off_uncomp_bytes);
+  auto* const h_uncomp_ptrs  = reinterpret_cast<void**>(host.data() + off_uncomp_ptrs);
+  owner.read_bytes(h_comp_bytes, fbase + 16, sz_size);
+
+  std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
+  auto* d                  = static_cast<std::uint8_t*>(dst);
+  std::size_t cursor       = header;
+  for (std::size_t i = 0; i < num_chunks; ++i) {
+    h_comp_ptrs[i]    = fbase + cursor;
+    cursor            = align_up(cursor + h_comp_bytes[i], kFrameAlign);
+    h_uncomp_bytes[i] = std::min(chunk, out_bytes - i * chunk);
+    h_uncomp_ptrs[i]  = d + i * chunk;
+  }
+
   rmm::device_buffer meta(off_statuses + sz_stat, owner.stream(), owner.mr());
-  auto* const meta_base      = static_cast<std::uint8_t*>(meta.data());
+  auto* const meta_base = static_cast<std::uint8_t*>(meta.data());
+  throw_if_cuda_error(
+    cudaMemcpyAsync(meta_base, host.data(), host.size(), cudaMemcpyHostToDevice, s),
+    "H2D chunk tables");
   void* const d_comp_ptrs    = meta_base + off_comp_ptrs;
   void* const d_comp_bytes   = meta_base + off_comp_bytes;
   void* const d_uncomp_bytes = meta_base + off_uncomp_bytes;
   void* const d_uncomp_ptrs  = meta_base + off_uncomp_ptrs;
-  // Some codecs (e.g. Cascaded) require the actual-size and status output arrays
-  // to be non-null, unlike LZ4/Snappy where they are optional. Always provide
-  // them (carved from `meta`); we do not read them back (verified upstream).
+  // We do not read the actual sizes or statuses back (verified upstream).
   void* const d_actual   = meta_base + off_actual;
   void* const d_statuses = meta_base + off_statuses;
-  throw_if_cuda_error(
-    cudaMemcpyAsync(
-      d_comp_ptrs, h_comp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
-    "H2D comp ptrs");
-  throw_if_cuda_error(cudaMemcpyAsync(d_comp_bytes,
-                                      h_comp_bytes.data(),
-                                      num_chunks * sizeof(std::size_t),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D comp bytes");
-  throw_if_cuda_error(cudaMemcpyAsync(d_uncomp_bytes,
-                                      h_uncomp_bytes.data(),
-                                      num_chunks * sizeof(std::size_t),
-                                      cudaMemcpyHostToDevice,
-                                      s),
-                      "H2D uncomp bytes");
-  throw_if_cuda_error(
-    cudaMemcpyAsync(
-      d_uncomp_ptrs, h_uncomp_ptrs.data(), num_chunks * sizeof(void*), cudaMemcpyHostToDevice, s),
-    "H2D uncomp ptrs");
 
   std::size_t temp_bytes = 0;
   check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),

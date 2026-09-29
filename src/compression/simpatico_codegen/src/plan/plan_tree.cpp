@@ -128,6 +128,24 @@ std::optional<ChannelId> output_port(PlanTree const& tree, NodeId node, std::str
   return static_cast<ChannelId>(std::distance(names.begin(), found));
 }
 
+cudf::column const* terminal_identity_channel(PlanNode const& node, std::string const& channel)
+{
+  auto const output = std::find(node.output_names.begin(), node.output_names.end(), channel);
+  auto const index  = static_cast<std::size_t>(std::distance(node.output_names.begin(), output));
+  if (output == node.output_names.end() || index >= node.output_paths.size() ||
+      std::any_of(node.children.begin(), node.children.end(), [&](PlanEdge const& edge) {
+        return edge.channel == channel;
+      })) {
+    return nullptr;
+  }
+  auto const stored = node.channels.find(node.output_paths[index]);
+  if (stored == node.channels.end()) return nullptr;
+  auto const* identity =
+    dynamic_cast<identity_compressed_representation const*>(stored->second.get());
+  if (!identity || identity->channels_.size() != 1) return nullptr;
+  return identity->channels_[0].get();
+}
+
 namespace {
 
 // The value that `consumer` reads from `producer` through `channel`.

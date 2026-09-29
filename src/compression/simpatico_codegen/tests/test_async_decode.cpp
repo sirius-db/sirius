@@ -2180,8 +2180,8 @@ void test_host_uploads_survive_until_completion(rmm::device_async_resource_ref u
   {
     simpatico::decode_session session(streams, upstream);
     session.append(value_request(compressed.columns[0]));
-    // Compressed sizes, compressed and output pointers, and output sizes.
-    expect(simpatico::decode_session_test_access::host_uploads(session) == 4,
+    // One block holds the compressed sizes, compressed and output pointers, and output sizes.
+    expect(simpatico::decode_session_test_access::host_uploads(session) == 1,
            "an nvCOMP leaf did not keep its chunk tables until the session drains");
     outputs = session.finish();
     expect(simpatico::decode_session_test_access::host_uploads(session) == 0,
@@ -2204,7 +2204,7 @@ void test_host_observation_staging(rmm::device_async_resource_ref upstream)
     simpatico::decode_session session(streams, resource);
     auto& frame                 = simpatico::decode_session_test_access::frame(session);
     auto const uploads_before   = simpatico::decode_session_test_access::host_uploads(session);
-    constexpr std::size_t cap   = simpatico::pinned_staging_slab::cap_bytes;
+    constexpr std::size_t cap   = simpatico::pinned_staging_cap_bytes;
     constexpr std::size_t total = cap + 4096;
     std::vector<std::uint8_t> source(total);
     for (std::size_t i = 0; i < total; ++i)

@@ -537,21 +537,9 @@ static std::string derive_dictionary_key_width_hints(PlanTree& tree, ::cuda::str
       }
       continue;
     }
-    auto const output =
-      std::find(node.output_names.begin(), node.output_names.end(), "keys_offsets");
-    auto const index = static_cast<std::size_t>(output - node.output_names.begin());
-    if (output == node.output_names.end() || index >= node.output_paths.size()) continue;
-    bool const consumed =
-      std::any_of(node.children.begin(), node.children.end(), [](PlanEdge const& edge) {
-        return edge.channel == "keys_offsets";
-      });
-    if (consumed) continue;
-    auto const channel = node.channels.find(node.output_paths[index]);
-    if (channel == node.channels.end()) continue;
-    auto const* identity =
-      dynamic_cast<identity_compressed_representation const*>(channel->second.get());
-    if (!identity || identity->channels_.size() != 1 || !identity->channels_[0]) continue;
-    cudf::column_view const offsets = identity->channels_[0]->view();
+    auto const* stored = terminal_identity_channel(node, "keys_offsets");
+    if (!stored) continue;
+    cudf::column_view const offsets = stored->view();
     if (offsets.type().id() != cudf::type_id::INT32 || offsets.null_count() != 0) continue;
     auto const count = static_cast<std::size_t>(offsets.size());
     if (count < 2) {

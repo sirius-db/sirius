@@ -517,18 +517,10 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   auto output           = cudf::make_fixed_width_column(
     bool_t,
     n_rows,
-    null_count > 0 ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED,
+    null_count > 0 ? cudf::copy_bitmask(dict_column->view(), stream, mr) : rmm::device_buffer{},
+    null_count,
     stream,
     mr);
-  output->set_null_count(null_count);
-  if (null_count > 0) {
-    throw_if_cuda_error(cudaMemcpyAsync(output->mutable_view().null_mask(),
-                                        dict_column->view().null_mask(),
-                                        cudf::bitmask_allocation_size_bytes(n_rows),
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.get()),
-                        "dictionary predicate: copy null mask");
-  }
 
   auto* d_out       = output->mutable_view().data<bool>();
   auto const* d_lut = lut->view().data<bool>();

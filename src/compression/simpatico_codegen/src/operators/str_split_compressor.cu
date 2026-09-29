@@ -5,7 +5,6 @@
 
 #include "codegen/plan/bitjoin_layout.hpp"  // copy_column_view
 #include "codegen/plan/representation.hpp"
-#include "codegen/util/cuda_check.hpp"
 #include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
@@ -35,45 +34,22 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
 
   auto const chars_bytes = static_cast<std::size_t>(chars->size()) *
                            static_cast<std::size_t>(cudf::size_of(chars->type()));
+  rmm::device_buffer chars_buf(chars->view().head<void>(), chars_bytes, stream, mr);
+
   cudf::size_type nc = 0;
+  rmm::device_buffer mask_buf(0, stream, mr);
   if (null_mask) {
     auto const* bits =
       reinterpret_cast<cudf::bitmask_type const*>(null_mask->view().data<std::uint8_t>());
     nc = cudf::null_count(bits, 0, num_rows, stream);
+    if (nc > 0) {
+      mask_buf = rmm::device_buffer(
+        null_mask->view().head<void>(), static_cast<std::size_t>(null_mask->size()), stream, mr);
+    }
   }
-  auto const mask_bytes = nc > 0 ? static_cast<std::size_t>(null_mask->size()) : 0;
-  auto offsets_copy     = cudf::make_fixed_width_column(
-    offsets->type(), offsets->size(), cudf::mask_state::UNALLOCATED, stream, mr);
-  rmm::device_buffer chars_buf(chars_bytes, stream, mr);
-  rmm::device_buffer mask_buf(mask_bytes, stream, mr);
-  auto output = cudf::make_strings_column(
+  auto offsets_copy = std::make_unique<cudf::column>(*offsets, stream, mr);
+  return cudf::make_strings_column(
     num_rows, std::move(offsets_copy), std::move(chars_buf), nc, std::move(mask_buf));
-
-  auto const result = output->mutable_view();
-  throw_if_cuda_error(
-    cudaMemcpyAsync(result.child(0).head<void>(),
-                    offsets->view().head<void>(),
-                    static_cast<std::size_t>(offsets->size()) * cudf::size_of(offsets->type()),
-                    cudaMemcpyDeviceToDevice,
-                    stream.get()),
-    "str_split: copy offsets");
-  if (chars_bytes != 0) {
-    throw_if_cuda_error(cudaMemcpyAsync(result.head<void>(),
-                                        chars->view().head<void>(),
-                                        chars_bytes,
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.get()),
-                        "str_split: copy chars");
-  }
-  if (mask_bytes != 0) {
-    throw_if_cuda_error(cudaMemcpyAsync(result.null_mask(),
-                                        null_mask->view().head<void>(),
-                                        mask_bytes,
-                                        cudaMemcpyDeviceToDevice,
-                                        stream.get()),
-                        "str_split: copy null mask");
-  }
-  return output;
 }
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(

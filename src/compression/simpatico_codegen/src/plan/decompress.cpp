@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "decode/decode_session.hpp"
 #include "operators/constant_width_offsets.hpp"
@@ -665,12 +666,12 @@ void DecodeWalk::decode_bitjoin(NodeId nid)
                                                 cudf::mask_state::UNALLOCATED,
                                                 frame.stream(),
                                                 frame.mr());
-    auto status =
+    throw_if_cuda_error(
       cudaMemsetAsync(output->mutable_view().head<void>(),
                       0,
                       static_cast<std::size_t>(packed_view.size()) * cudf::size_of(output->type()),
-                      frame.stream().get());
-    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+                      frame.stream().get()),
+      "bitjoin decode: clear field");
     for (auto const& ref : refs) {
       launch_bitjoin_field(output->mutable_view(),
                            packed_view,
@@ -909,24 +910,8 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   auto const& node = tree.nodes[dict_nid];
   auto const width = node.dictionary_key_width_hint;
   if (width <= 0) return nullptr;
-  auto const terminal_identity_channel = [&node](char const* name) -> cudf::column const* {
-    for (std::size_t i = 0; i < node.output_names.size() && i < node.output_paths.size(); ++i) {
-      if (node.output_names[i] != name) continue;
-      if (std::any_of(node.children.begin(), node.children.end(), [name](auto const& edge) {
-            return edge.channel == name;
-          }))
-        return nullptr;
-      auto const it = node.channels.find(node.output_paths[i]);
-      if (it == node.channels.end() || !it->second) return nullptr;
-      auto const* identity =
-        dynamic_cast<identity_compressed_representation const*>(it->second.get());
-      if (!identity || identity->channels_.size() != 1) return nullptr;
-      return identity->channels_[0].get();
-    }
-    return nullptr;
-  };
-  auto const* const chars_column   = terminal_identity_channel("keys_chars");
-  auto const* const offsets_column = terminal_identity_channel("keys_offsets");
+  auto const* const chars_column   = terminal_identity_channel(node, "keys_chars");
+  auto const* const offsets_column = terminal_identity_channel(node, "keys_offsets");
   if (!chars_column || !offsets_column) return nullptr;
   auto const chars = chars_column->view();
   if (chars.type().id() != cudf::type_id::UINT8 || chars.null_count() != 0) return nullptr;
@@ -1010,11 +995,11 @@ std::unique_ptr<cudf::column> decode_str_split_selected(PlanTree const& tree,
                                                frame.mr());
   rmm::device_buffer source_offsets(
     static_cast<std::size_t>(survivors) * sizeof(std::int64_t), frame.stream(), frame.mr());
-  auto status = cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
-                                0,
-                                sizeof(std::int32_t),
-                                frame.stream().get());
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  throw_if_cuda_error(cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
+                                      0,
+                                      sizeof(std::int32_t),
+                                      frame.stream().get()),
+                      "selected str_split: clear length tail");
   if (survivors > 0) {
     launch_decode_fused_tree_str_split_meta(*region.built.tree,
                                             region.labeled,
@@ -1405,8 +1390,8 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
     auto const bytes = static_cast<std::size_t>(
                          sirius::codegen::selection_mask::AllocWordsFor(destination.num_rows)) *
                        sizeof(std::uint32_t);
-    auto status = cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().get());
-    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    throw_if_cuda_error(cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().get()),
+                        "membership decline: fill mask");
     return mask_source_status::DECLINED;
   }
   if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != destination.num_rows ||

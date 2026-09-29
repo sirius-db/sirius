@@ -145,6 +145,10 @@ void compute_input_sources(PlanTree& tree);
 // channel on it names its single value, port 0.
 std::optional<ChannelId> output_port(PlanTree const& tree, NodeId node, std::string const& channel);
 
+// The column stored by the identity leaf for `channel`, an output of `node` that no child consumes,
+// or nullptr when the channel is consumed, absent, or stored by another codec.
+cudf::column const* terminal_identity_channel(PlanNode const& node, std::string const& channel);
+
 std::string dotted_label(PlanTree const& tree, NodeId node);
 
 // Render a PlanTree back to plan DSL text (the inverse of plan_tree_from_dsl).

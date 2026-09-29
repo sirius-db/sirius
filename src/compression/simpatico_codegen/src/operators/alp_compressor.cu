@@ -197,59 +197,21 @@ void alp_upload_constants(::cuda::stream_ref stream)
     }
   }
 
-  auto const s = stream.get();
+  auto const s      = stream.get();
+  auto const upload = [s](auto const& symbol, auto const& table, char const* what) {
+    static_assert(sizeof(symbol) == sizeof(table));
+    throw_if_cuda_error(
+      cudaMemcpyToSymbolAsync(symbol, table, sizeof(table), 0, cudaMemcpyHostToDevice, s), what);
+  };
   try {
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_exp_f32,
-                                                host_consts_f32::kExp,
-                                                sizeof(host_consts_f32::kExp),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f32 exponents");
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_frac_f32,
-                                                host_consts_f32::kFrac,
-                                                sizeof(host_consts_f32::kFrac),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f32 fractions");
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_fact_f32,
-                                                host_consts_f32::kFact,
-                                                sizeof(host_consts_f32::kFact),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f32 factors");
-    throw_if_cuda_error(
-      cudaMemcpyToSymbolAsync(
-        d_alp_combos_f32, combos_f32, sizeof(combos_f32), 0, cudaMemcpyHostToDevice, s),
-      "alp: upload f32 combinations");
-
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_exp_f64,
-                                                host_consts_f64::kExp,
-                                                sizeof(host_consts_f64::kExp),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f64 exponents");
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_frac_f64,
-                                                host_consts_f64::kFrac,
-                                                sizeof(host_consts_f64::kFrac),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f64 fractions");
-    throw_if_cuda_error(cudaMemcpyToSymbolAsync(d_alp_fact_f64,
-                                                host_consts_f64::kFact,
-                                                sizeof(host_consts_f64::kFact),
-                                                0,
-                                                cudaMemcpyHostToDevice,
-                                                s),
-                        "alp: upload f64 factors");
-    throw_if_cuda_error(
-      cudaMemcpyToSymbolAsync(
-        d_alp_combos_f64, combos_f64, sizeof(combos_f64), 0, cudaMemcpyHostToDevice, s),
-      "alp: upload f64 combinations");
+    upload(d_alp_exp_f32, host_consts_f32::kExp, "alp: upload f32 exponents");
+    upload(d_alp_frac_f32, host_consts_f32::kFrac, "alp: upload f32 fractions");
+    upload(d_alp_fact_f32, host_consts_f32::kFact, "alp: upload f32 factors");
+    upload(d_alp_combos_f32, combos_f32, "alp: upload f32 combinations");
+    upload(d_alp_exp_f64, host_consts_f64::kExp, "alp: upload f64 exponents");
+    upload(d_alp_frac_f64, host_consts_f64::kFrac, "alp: upload f64 fractions");
+    upload(d_alp_fact_f64, host_consts_f64::kFact, "alp: upload f64 factors");
+    upload(d_alp_combos_f64, combos_f64, "alp: upload f64 combinations");
 
     // Constants must be visible before any kernel that reads them runs; the
     // upload is host-side one-time work so a bounded sync here is acceptable.
