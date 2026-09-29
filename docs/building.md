@@ -59,6 +59,3 @@ pixi run cmake --build build/consumer
 ```
 
 Consumers are responsible for DuckDB and C++ runtime ABI compatibility.
-
-CI installs and relocates the package, then uses CMake to build Debug and Release
-consumers with Git discovery disabled. These checks require no GPU.
