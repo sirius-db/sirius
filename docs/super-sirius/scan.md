@@ -297,6 +297,13 @@ differs from the bound identity, execution fails with an instruction to re-pin a
 Refreshing only the cache key would leave the prepared output types and vector dimension stale.
 A dropped table fails catalog lookup. This check applies to both exact and ANN searches.
 
+ANN indexes additionally record a weak reference to the pin snapshot used for their build.
+Unpinning, replacing a pin, or merging a re-pin invalidates that match. This matters even when
+DML preserves the table's catalog/storage identity: new vectors or row positions in a new pin
+must not be searched with the old index. ANN searches reject the stale index and request a rebuild
+with `sirius_create_ann_index`; `use_index => false` can search the current pin immediately.
+The stale index remains cached until it is rebuilt, explicitly dropped, or the cache is cleared.
+
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
 ### Re-pin semantics

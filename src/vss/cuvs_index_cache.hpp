@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb_table_identity.hpp"
+#include "pin_snapshot_identity.hpp"
 
 #include <rmm/cuda_stream.hpp>
 
@@ -63,6 +64,9 @@ struct index_metadata {
   /// Catalog/storage identity of the indexed table. DROP/CREATE or an ALTER rewrite
   /// must not route to an index containing the old vectors and row positions.
   sirius::duckdb_table_identity table_identity;
+  /// The materialized pin used to build the index. Table identity alone survives
+  /// unpin, DML, and re-pin; it cannot prove vectors or row positions still match.
+  std::weak_ptr<const pin_snapshot_identity> pin_snapshot;
   std::string column_name;   ///< Vector column the index was built on
   std::int64_t dim{0};       ///< Vector dimensionality
   std::int64_t num_rows{0};  ///< Number of indexed vectors
@@ -70,6 +74,12 @@ struct index_metadata {
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
   std::size_t resident_bytes{
     0};  ///< Resident GPU bytes the finished index occupies (capacity-accounted)
+
+  [[nodiscard]] bool matches_pin(std::shared_ptr<const pin_snapshot_identity> const& snapshot) const
+  {
+    auto built_from = pin_snapshot.lock();
+    return built_from && built_from == snapshot;
+  }
 };
 
 /// Build the cache key for an index from its routing identity.
@@ -212,6 +222,8 @@ class cuvs_index_cache {
   /// metadata matches (@p catalog, @p schema, @p table, @p table_identity, @p column,
   /// @p metric). Returns nullptr if no pinned index covers that column under that
   /// metric. Metrics are compared up to canonicalization.
+  /// Before searching, the caller must also verify @ref index_metadata::matches_pin
+  /// against the current pin: a table can be re-pinned without changing its identity.
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
     std::string_view catalog,
     std::string_view schema,

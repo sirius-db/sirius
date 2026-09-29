@@ -252,6 +252,66 @@ TEST_CASE_METHOD(VectorSearchFixture,
 }
 
 TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - re-pin requires rebuilding the ANN index after DML",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_repin_dml AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec "
+    "FROM range(1000, 2000) t(i);");
+  run_ok("CHECKPOINT;");
+  std::string const pin_sql =
+    "SELECT * FROM pin_table(name => 'vs_repin_dml', tier => 'gpu', format => 'duckdb');";
+  std::string const build_sql =
+    "SELECT * FROM sirius_create_ann_index('vs_repin_dml', 'vec', metric => 'l2', n_lists => 8);";
+  std::string const args =
+    "'vs_repin_dml', 'vec', [0.0, 0.0, 0.0]::FLOAT[3], k => 1, output_columns => ['id']";
+  std::string const ann = "SELECT id FROM sirius_knn_search(" + args + ", n_probes => 8);";
+  std::string const enn = "SELECT id FROM sirius_knn_search(" + args + ", use_index => false);";
+  run_ok(pin_sql);
+  run_ok(build_sql);
+  REQUIRE(ok_col(*con, ann) == std::vector<std::vector<std::string>>{{"1000"}});
+  run_ok("PREPARE vs_repin_search AS " + ann);
+  auto const original = table_identity(*con, attach_alias, "vs_repin_dml");
+
+  run_ok("SELECT * FROM unpin_table('vs_repin_dml');");
+  std::string nearest;
+  SECTION("INSERT adds a new nearest vector")
+  {
+    run_ok("INSERT INTO vs_repin_dml VALUES (0, [0, 0, 0]::FLOAT[3]);");
+    nearest = "0";
+  }
+  SECTION("UPDATE changes vectors without changing the row count")
+  {
+    run_ok("UPDATE vs_repin_dml SET vec = [0, 0, 0]::FLOAT[3] WHERE id = 1999;");
+    nearest = "1999";
+  }
+  run_ok("CHECKPOINT;");
+  run_ok(pin_sql);
+  // Even the composite catalog/storage identity is unchanged by this sequence.
+  REQUIRE(original.matches(table_identity(*con, attach_alias, "vs_repin_dml")));
+  // Confirm the stale index is still cached, so refusal is due to its pin snapshot.
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  REQUIRE(sirius_ctx->get_cuvs_index_cache().find_by_column(
+            attach_alias,
+            "main",
+            "vs_repin_dml",
+            original,
+            "vec",
+            cuvs::distance::DistanceType::L2SqrtExpanded) != nullptr);
+  expect_error(*con, ann, "previous pin snapshot");
+  expect_error(*con, "EXECUTE vs_repin_search;", "previous pin snapshot");
+  REQUIRE(ok_col(*con, enn) == std::vector<std::vector<std::string>>{{nearest}});
+
+  run_ok(build_sql);
+  REQUIRE(ok_col(*con, ann) == std::vector<std::vector<std::string>>{{nearest}});
+  REQUIRE(ok_col(*con, "EXECUTE vs_repin_search;") ==
+          std::vector<std::vector<std::string>>{{nearest}});
+  run_ok("DEALLOCATE vs_repin_search;");
+  run_ok("SELECT * FROM unpin_table('vs_repin_dml');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
                  "sirius_knn_search - explicit n_probes and distance column",
                  "[integration][gpu_execution][array][vss][vector_search]")
 {

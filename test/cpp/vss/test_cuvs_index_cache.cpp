@@ -115,6 +115,27 @@ void insert_dummy(cuvs_index_cache& cache, std::string name, index_metadata meta
 
 }  // namespace
 
+TEST_CASE("ANN index metadata requires the pin snapshot used at build time", "[vss]")
+{
+  index_metadata meta;
+  auto original = std::make_shared<const sirius::pin_snapshot_identity>();
+  REQUIRE_FALSE(meta.matches_pin(original));
+  meta.pin_snapshot = original;
+  REQUIRE(meta.matches_pin(original));
+  REQUIRE_FALSE(meta.matches_pin(nullptr));
+
+  // A replacement must miss even while another owner keeps the old token alive.
+  auto replacement = std::make_shared<const sirius::pin_snapshot_identity>();
+  REQUIRE_FALSE(meta.matches_pin(replacement));
+  original.reset();
+  REQUIRE(meta.pin_snapshot.expired());
+  REQUIRE_FALSE(meta.matches_pin(replacement));
+
+  // Rebuilding captures the new materialization and restores eligibility.
+  meta.pin_snapshot = replacement;
+  REQUIRE(meta.matches_pin(replacement));
+}
+
 TEST_CASE("cuvs_index_cache inserts and looks up by management name", "[vss]")
 {
   auto manager = sirius::test::operator_utils::initialize_memory_manager();

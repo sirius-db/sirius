@@ -2519,6 +2519,9 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
                                     entry.cache_info.column_ids.size(),
                                     "[sirius_scan_manager::insert_pinned_entry existing entry]",
                                     /*allow_empty=*/false);
+      // Invalidate derived caches before any mutation, including a partial merge
+      // that later throws. A re-pin conservatively requires an ANN index rebuild.
+      entry.snapshot_identity = std::make_shared<const pin_snapshot_identity>();
       // Same row count → merge unique columns into the existing entry.
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new

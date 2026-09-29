@@ -2072,6 +2072,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.schema_name    = entry_schema;
   meta.table_name     = entry.name;
   meta.table_identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
+  meta.pin_snapshot   = pin->snapshot_identity;
   meta.column_name    = data.column_name;
   meta.dim            = dim;
   meta.num_rows       = n_rows;

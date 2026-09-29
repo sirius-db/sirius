@@ -124,6 +124,16 @@ struct epoch_fixture {
 
   [[nodiscard]] std::uint64_t epoch() const { return manager.pin_registry_epoch(); }
 
+  [[nodiscard]] std::shared_ptr<const sirius::pin_snapshot_identity> snapshot() const
+  {
+    std::shared_ptr<const sirius::pin_snapshot_identity> result;
+    manager.visit_pinned_entries([&](std::string_view name, pinned_entry const& entry) {
+      if (name == kTable) { result = entry.snapshot_identity; }
+      return true;
+    });
+    return result;
+  }
+
   [[nodiscard]] bool has_entry() const
   {
     bool found = false;
@@ -155,10 +165,13 @@ TEST_CASE("the same-row-count merge path moves the pin-registry epoch",
   REQUIRE(f.entry_column_count() == 1);
 
   auto const before_merge = f.epoch();
+  auto const old_snapshot = f.snapshot();
+  REQUIRE(old_snapshot);
   // Same name, same row count, same chunk boundaries: takes the merge branch's early return.
   f.insert({1}, 8, 1);
   REQUIRE(f.entry_column_count() == 2);
   CHECK(f.epoch() > before_merge);
+  CHECK(f.snapshot() != old_snapshot);
 }
 
 TEST_CASE("a throw after the stale entry is erased still moves the pin-registry epoch",
@@ -194,8 +207,22 @@ TEST_CASE("removing a pinned entry moves the pin-registry epoch",
 {
   epoch_fixture f;
   f.insert({0}, 8, 1);
-  auto const before_remove = f.epoch();
+  auto const before_remove                                        = f.epoch();
+  std::weak_ptr<const sirius::pin_snapshot_identity> old_snapshot = f.snapshot();
   f.manager.remove_pinned_entry(kTable);
   CHECK_FALSE(f.has_entry());
   CHECK(f.epoch() > before_remove);
+  CHECK(old_snapshot.expired());
+}
+
+TEST_CASE("replacing a pin renews its snapshot without unpinning",
+          "[scan_manager][pin_registry_epoch]")
+{
+  epoch_fixture f;
+  f.insert({0}, 8, 1);
+  auto const old_snapshot = f.snapshot();
+  REQUIRE(old_snapshot);
+  f.insert({0}, 9, 1);
+  REQUIRE(f.snapshot());
+  CHECK(f.snapshot() != old_snapshot);
 }

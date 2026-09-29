@@ -128,6 +128,13 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
       "use_index => false");
   }
 
+  if (!index_entry->meta.matches_pin(c.pin.snapshot_identity)) {
+    throw duckdb::InvalidInputException(
+      "sirius_knn_search: the ANN index on '" + req.table_name + "." + req.column_name +
+      "' was built on a previous pin snapshot; rebuild it with sirius_create_ann_index "
+      "after re-pinning, or pass use_index => false");
+  }
+
   auto const n_lists =
     index_entry->meta.n_lists > 0 ? static_cast<std::uint32_t>(index_entry->meta.n_lists) : 1u;
   std::uint32_t const n_probes =

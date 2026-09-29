@@ -26,6 +26,7 @@
 #include "io/sirius_datasource.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "pin_snapshot_identity.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
@@ -189,6 +190,11 @@ class cache_entry_info {
  * pinned table. The vector may be empty until splits are populated.
  */
 struct pinned_entry {
+  /// Identity of this materialization, independent of the source table's identity.
+  /// ANN indexes must match it before using row positions from their build snapshot.
+  std::shared_ptr<const pin_snapshot_identity> snapshot_identity{
+    std::make_shared<const pin_snapshot_identity>()};
+
   /// Cache identity + column layout for this pinned table. Drives the cache-hit
   /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
   /// gather; replaces the heavyweight read-side ingestible_table_info.
