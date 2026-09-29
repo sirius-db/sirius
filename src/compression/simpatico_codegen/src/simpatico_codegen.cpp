@@ -5,6 +5,7 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "codegen/util/stream_pool.hpp"
 #include "decode/decode_session.hpp"
@@ -249,40 +250,14 @@ compressed_table compress_columns_parallel(cudf::table_view table,
   return out;
 }
 
-// All completed table facades submit the same typed requests. Streams and the
-// explicit allocator are borrowed by the session; no codec eligibility path exists.
-std::vector<::cuda::stream_ref> stream_refs(stream_pool const& pool)
-{
-  std::vector<::cuda::stream_ref> streams;
-  streams.reserve(pool.streams.size());
-  for (auto stream : pool.streams)
-    streams.emplace_back(stream);
-  return streams;
-}
-
-// Wait once for each distinct stream, returning the first failure after trying them all.
-cudaError_t synchronize_all(std::span<const ::cuda::stream_ref> streams) noexcept
-{
-  cudaError_t first = cudaSuccess;
-  for (auto it = streams.begin(); it != streams.end(); ++it) {
-    auto const handle = it->get();
-    if (std::any_of(
-          streams.begin(), it, [handle](auto earlier) { return earlier.get() == handle; }))
-      continue;
-    auto const status = cudaStreamSynchronize(handle);
-    if (first == cudaSuccess) first = status;
-  }
-  return first;
-}
-
+// Every table facade submits the same typed requests to one session. Streams and the explicit
+// allocator are borrowed by the session.
 std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
                                                   std::span<std::size_t const> selected,
                                                   std::span<decode_predicate const> predicates,
                                                   std::span<const ::cuda::stream_ref> streams,
                                                   rmm::device_async_resource_ref mr)
 {
-  if (!predicates.empty() && predicates.size() != selected.size())
-    throw plan_error("decompress: predicates and selected columns must have the same length");
   for (auto index : selected) {
     if (index >= table.columns.size()) throw plan_error("selected column index out of range");
     if (!table.columns[index].plan_tree) throw plan_error("decompress: column missing plan tree");
@@ -299,31 +274,11 @@ std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
   return std::make_unique<cudf::table>(session.finish());
 }
 
-std::unique_ptr<cudf::table> decompress_columns(compressed_table const& table,
-                                                std::span<std::size_t const> selected,
-                                                std::span<decode_predicate const> predicates,
-                                                stream_pool& pool,
-                                                rmm::device_async_resource_ref mr)
-{
-  auto streams = stream_refs(pool);
-  return decode_table_columns(table, selected, predicates, streams, mr);
-}
-
-std::unique_ptr<cudf::table> decompress_columns(compressed_table const& table,
-                                                std::span<std::size_t const> selected,
-                                                stream_pool& pool,
-                                                rmm::device_async_resource_ref mr)
-{
-  return decompress_columns(table, selected, {}, pool, mr);
-}
-
-std::unique_ptr<cudf::table> decompress_columns(compressed_table const& table,
-                                                stream_pool& pool,
-                                                rmm::device_async_resource_ref mr)
+std::vector<std::size_t> all_columns(compressed_table const& table)
 {
   std::vector<std::size_t> selected(table.num_columns());
   std::iota(selected.begin(), selected.end(), std::size_t{0});
-  return decompress_columns(table, selected, {}, pool, mr);
+  return selected;
 }
 
 // ── Filtering while decoding (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ────────
@@ -419,7 +374,7 @@ class event_pool {
 };
 
 // The events one phase draws for its cross-stream joins, returned to the thread's pool when the
-// phase ends; on the failure path that is after the catch's synchronize_all, since the set is
+// phase ends; on the failure path that is after the catch's synchronization, since the set is
 // declared before the try. The pool is resolved on first use so that constructing the set makes no
 // CUDA call, and make() is the only writer, so a non-null event always has a pool to return to.
 class event_set {
@@ -891,10 +846,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     if (submitted_positions.empty()) {
       // With only dual-delivery outputs, the empty session has no submitted
       // work. The phase still owns the indices kernel and its consumer waits.
-      auto status = synchronize_all(streams);
-      if (status != cudaSuccess)
-        throw plan_error(std::string("filtered decode: indices completion failed: ") +
-                         cudaGetErrorString(status));
+      throw_if_cuda_error(synchronize_distinct(streams), "filtered decode: indices completion");
     }
     for (std::size_t i = 0; i < decoded.size(); ++i)
       columns[submitted_positions[i]] = std::move(decoded[i]);
@@ -916,10 +868,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   } catch (...) {
     // Phase-owned masks/events outlive this drain, including work queued after session-owned decode
     // work. Preserve the original exception and OOM subtype.
-    auto const status = synchronize_all(streams);
-    if (status != cudaSuccess)
-      std::fprintf(
-        stderr, "simpatico: filtered decode cleanup failed: %s\n", cudaGetErrorString(status));
+    synchronize_distinct_or_log(streams, "simpatico: filtered decode cleanup failed");
     reset_result(sc::scan_filter_status::failed);
     throw;
   }
@@ -1022,9 +971,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
-  std::vector<std::size_t> selected(table.num_columns());
-  std::iota(selected.begin(), selected.end(), std::size_t{0});
-  return decode_table_columns(table, selected, {}, {&stream, 1}, mr);
+  return decode_table_columns(table, all_columns(table), {}, {&stream, 1}, mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1033,7 +980,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
   leased_pool lp(column_threads);
-  return decompress_columns(table, lp.pool, mr);
+  return decode_table_columns(table, all_columns(table), {}, lp.pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1041,7 +988,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
-  return decompress_columns(table, pool, mr);
+  return decode_table_columns(table, all_columns(table), {}, pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1089,10 +1036,7 @@ std::unique_ptr<cudf::column> decode_complete_column(PlanTree const& plan,
       return nullptr;
     }
   }
-  decode_session session{{&stream, 1}, mr};
-  session.append(std::move(request));
-  auto columns = session.finish();
-  return std::move(columns.front());
+  return decode_one(request, stream, mr);
 }
 
 }  // namespace
@@ -1179,7 +1123,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
   leased_pool lp(column_threads);
-  return decompress_columns(table, selected_columns, lp.pool, mr);
+  return decode_table_columns(table, selected_columns, {}, lp.pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1187,7 +1131,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  return decompress(table, selected_columns, stream_refs(pool), mr);
+  return decompress(table, selected_columns, pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1196,7 +1140,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  return decompress(table, selected_columns, predicates, stream_refs(pool), mr);
+  return decompress(table, selected_columns, predicates, pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1294,8 +1238,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   rmm::device_async_resource_ref mr,
   std::string* /*error_out*/)
 {
-  return decompress_scan_filter(
-    table, selected_columns, request, result, stream_refs(pool), stream, mr);
+  return decompress_scan_filter(table, selected_columns, request, result, pool.refs(), stream, mr);
 }
 
 }  // namespace simpatico

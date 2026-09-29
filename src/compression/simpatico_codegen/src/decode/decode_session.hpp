@@ -249,6 +249,18 @@ class decode_session final {
 };
 
 /**
+ * @brief Decode one request through a single-stream session and return its completed result.
+ *
+ * Validation and execution failures propagate as from decode_session::append() and finish().
+ */
+[[nodiscard]] std::unique_ptr<cudf::column> decode_one(column_decode_request const& request,
+                                                       ::cuda::stream_ref stream,
+                                                       rmm::device_async_resource_ref mr);
+mask_source_status decode_one(mask_decode_request const& request,
+                              ::cuda::stream_ref stream,
+                              rmm::device_async_resource_ref mr);
+
+/**
  * @brief Decode one column request on the frame's stream.
  *
  * @return An owning column whose writes may still be pending on the frame's stream

@@ -21,7 +21,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
@@ -369,10 +368,7 @@ std::unique_ptr<cudf::column> decompress_standalone_representation(
                    " is storage-only and requires the PlanTree decode bridge (e.g. DecodeWalk)";
     return nullptr;
   }
-  std::array const streams{stream};
-  decode_session session{streams, mr};
-  session.append(column_decode_request{std::cref(*standalone)});
-  return std::move(session.finish().front());
+  return decode_one(column_decode_request{std::cref(*standalone)}, stream, mr);
 }
 
 }  // namespace simpatico

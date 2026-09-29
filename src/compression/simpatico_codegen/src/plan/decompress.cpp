@@ -17,6 +17,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
@@ -27,6 +28,7 @@
 #include <array>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 // The high-level JIT decode bridge is defined here alongside DecodeWalk because
@@ -472,6 +474,8 @@ bound_fused_region bind_fused_region(PlanTree const& tree,
   return region;
 }
 
+bool uses_index_walk(PlanTree const& tree, decode_selection const& sel);
+
 // Bind one region, allocate its output, and queue the decode launch.
 std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                                         NodeId root_nid,
@@ -497,9 +501,10 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
     launch_decode_fused_tree(*built.tree, labeled, dtype, num_rows, out, frame);
     return output;
   }
+  // validated_selection checked the selection's own consistency; only the column's row count is
+  // new here.
   if (sel->rows) {
-    if (!sel->rows->valid() || sel->rows->num_survivors != sel->survivor_count ||
-        sel->rows->num_rows != num_rows) {
+    if (sel->rows->num_rows != num_rows) {
       throw std::runtime_error("decode row set does not match the selected column");
     }
     sirius::codegen::selection_mask const hollow{nullptr, num_rows, sel->survivor_count, nullptr};
@@ -513,12 +518,7 @@ std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
                                        frame);
     return output;
   }
-  if (!sel->mask->chunk_offsets || sel->mask->survivor_count != sel->survivor_count) {
-    throw std::runtime_error("decode selection mask has no matching count/offsets");
-  }
-  bool const by_index =
-    sel->enumerate_by_index && sel->route == sirius::codegen::decode_route::bitpack_mask &&
-    tree.nodes[root_nid].op == "bitpack" && sel->survivor_indices.size() == sel->survivor_count;
+  bool const by_index = uses_index_walk(tree, *sel);
   launch_decode_fused_tree_compacted(
     *built.tree,
     labeled,
@@ -876,6 +876,15 @@ namespace {
 NodeId root_value_producer(PlanTree const& tree);
 bool mask_consume_selection_root(PlanTree const& tree);
 
+// A compacted bitpack decode enumerates survivors from the index list rather than the mask bits.
+bool uses_index_walk(PlanTree const& tree, decode_selection const& sel)
+{
+  auto const root = root_value_producer(tree);
+  return sel.enumerate_by_index && sel.route == sirius::codegen::decode_route::bitpack_mask &&
+         sel.survivor_count > 0 && root < tree.nodes.size() && tree.nodes[root].op == "bitpack" &&
+         sel.survivor_indices.size() == sel.survivor_count;
+}
+
 struct str_split_shape {
   compressed_representation const* chars_rep = nullptr;
   NodeId offsets_nid                         = 0;
@@ -1072,13 +1081,7 @@ validated_selection::validated_selection(PlanTree const& plan, decode_selection 
         (selection.compacted() && !selection.mask->chunk_offsets)) {
       throw std::invalid_argument("decode: inconsistent selection count or offsets");
     }
-    auto const root = root_value_producer(plan);
-    bool const uses_indices =
-      !selection.compacted() ||
-      (selection.enumerate_by_index && selection.route == sc::decode_route::bitpack_mask &&
-       selection.survivor_count > 0 && root < plan.nodes.size() &&
-       plan.nodes[root].op == "bitpack" &&
-       selection.survivor_indices.size() == selection.survivor_count);
+    bool const uses_indices = !selection.compacted() || uses_index_walk(plan, selection);
     if (uses_indices &&
         (selection.survivor_indices.type().id() != cudf::type_id::INT32 ||
          selection.survivor_indices.size() != selection.survivor_count ||
@@ -1089,27 +1092,61 @@ validated_selection::validated_selection(PlanTree const& plan, decode_selection 
   }
 }
 
+namespace {
+
+// The host checks of a column request, before any device work.
+void validate_request(column_decode_request const& request)
+{
+  auto const* predicate = std::get_if<predicate_result>(&request.result);
+  auto const* tree      = std::get_if<std::reference_wrapper<PlanTree const>>(&request.source);
+  if (!tree) {
+    if (predicate || request.selection)
+      throw std::invalid_argument("standalone request cannot substitute or select");
+    return;
+  }
+  validate_plan(tree->get());
+  if (predicate && !predicate->predicate.active())
+    throw std::invalid_argument("decode: empty predicate request");
+  if (predicate && request.selection &&
+      request.selection->get().route != sirius::codegen::decode_route::dict_codes &&
+      request.selection->get().route != sirius::codegen::decode_route::full) {
+    throw std::invalid_argument("decode: predicate selection requires dict_codes or full route");
+  }
+}
+
+// The host checks of a mask request, before any device work.
+void validate_request(mask_decode_request const& request)
+{
+  validate_plan(request.plan);
+  auto const destination = request.destination;
+  if (destination.num_rows < 0 || (destination.num_rows > 0 && !destination.words)) {
+    throw std::invalid_argument("decode: invalid mask destination");
+  }
+  if (std::holds_alternative<sirius::codegen::range_predicate>(request.source)) {
+    if (!probe_column(request.plan).can_produce_mask()) {
+      throw std::invalid_argument("decode: plan cannot produce a range ballot");
+    }
+  } else if (!std::get<membership_source>(request.source).probe) {
+    throw std::invalid_argument("decode: empty membership probe");
+  }
+}
+
+}  // namespace
+
 std::unique_ptr<cudf::column> decode_request(column_decode_request const& request,
                                              decode_frame& frame)
 {
+  validate_request(request);
   auto const* predicate = std::get_if<predicate_result>(&request.result);
   auto const* selection = request.selection ? &request.selection->get() : nullptr;
   auto const* pred      = predicate ? &predicate->predicate : nullptr;
   if (auto const* standalone =
         std::get_if<std::reference_wrapper<standalone_compressed_representation const>>(
           &request.source)) {
-    if (predicate || selection)
-      throw std::invalid_argument("standalone request cannot substitute or select");
     return standalone->get().decompress(frame);
   }
   auto const& tree = std::get<std::reference_wrapper<PlanTree const>>(request.source).get();
-  validate_plan(tree);
-  namespace sc = sirius::codegen;
-  if (predicate && !pred->active()) throw std::invalid_argument("decode: empty predicate request");
-  if (predicate && selection && selection->route != sc::decode_route::dict_codes &&
-      selection->route != sc::decode_route::full) {
-    throw std::invalid_argument("decode: predicate selection requires dict_codes or full route");
-  }
+  namespace sc     = sirius::codegen;
   DecodeWalk walk{tree, frame, pred, selection};
   std::unique_ptr<cudf::column> output;
   if (selection && selection->route == sc::decode_route::str_split) {
@@ -1166,26 +1203,16 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   column_decode_request request{std::cref(tree)};
   // Translate only documented host validation failures; submitted execution failures propagate.
   try {
-    validate_plan(tree);
     if (pred && pred->active()) request.result = predicate_result{*pred, std::nullopt};
-    if (sel && sel->active()) {
-      request.selection.emplace(tree, *sel);
-      if (pred && pred->active() && sel->route != sirius::codegen::decode_route::dict_codes &&
-          sel->route != sirius::codegen::decode_route::full) {
-        throw std::invalid_argument(
-          "decode: predicate selection requires dict_codes or full route");
-      }
-    }
+    if (sel && sel->active()) request.selection.emplace(tree, *sel);
+    validate_request(request);
   } catch (std::invalid_argument const& e) {
     if (error_out) *error_out = e.what();
     return nullptr;
   }
-  std::array const streams{stream};
-  decode_session session{streams, mr};
-  session.append(std::move(request));
-  auto columns = session.finish();
+  auto column = decode_one(request, stream, mr);
   if (error_out) error_out->clear();
-  return std::move(columns.front());
+  return column;
 }
 
 namespace {
@@ -1343,16 +1370,10 @@ column_decode_caps probe_column(PlanTree const& tree)
 
 mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame)
 {
-  validate_plan(request.plan);
+  validate_request(request);
   auto const destination = request.destination;
-  if (destination.num_rows < 0 || (destination.num_rows > 0 && !destination.words)) {
-    throw std::invalid_argument("decode: invalid mask destination");
-  }
   DecodeWalk walk{request.plan, frame, nullptr, nullptr};
   if (auto const* range = std::get_if<sirius::codegen::range_predicate>(&request.source)) {
-    if (!probe_column(request.plan).can_produce_mask()) {
-      throw std::invalid_argument("decode: plan cannot produce a range ballot");
-    }
     auto const region =
       bind_fused_region(request.plan, root_value_producer(request.plan), walk, frame.stream());
     if (destination.num_rows != region.num_rows)
@@ -1365,15 +1386,13 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
     return mask_source_status::ACCEPTED;
   }
   auto const& source = std::get<membership_source>(request.source);
-  if (!source.probe) throw std::invalid_argument("decode: empty membership probe");
-  auto const keys = walk.run();
+  auto const keys    = walk.run();
   if (keys->size() != destination.num_rows) {
     throw std::invalid_argument("decode: membership key row count mismatch");
   }
   auto key_view = keys->view();
-  if (key_view.type() != source.stored_type && cudf::is_fixed_width(key_view.type()) &&
-      cudf::is_fixed_width(source.stored_type) &&
-      cudf::size_of(key_view.type()) == cudf::size_of(source.stored_type)) {
+  if (key_view.type() != source.stored_type &&
+      cudf::is_bit_castable(key_view.type(), source.stored_type)) {
     key_view = cudf::column_view{source.stored_type,
                                  key_view.size(),
                                  key_view.head<void>(),
@@ -1408,23 +1427,21 @@ bool decompress_column_selection_mask(PlanTree const& tree,
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_column_selection_mask"};
 
-  compressed_representation const* rep = nullptr;
+  std::optional<mask_decode_request> request;
   try {
     validate_plan(tree);
     if (!mask_words || !probe_column(tree).can_produce_mask()) {
       throw std::invalid_argument("decode: plan or destination cannot serve range ballot");
     }
-    auto const root = root_value_producer(tree);
-    rep             = node_rep(root, tree);
+    auto const* rep = node_rep(root_value_producer(tree), tree);
     if (!rep) throw std::invalid_argument("decode: range ballot root has no representation");
+    request.emplace(tree, pred, mask_destination{mask_words, rep->num_rows});
+    validate_request(*request);
   } catch (std::invalid_argument const& e) {
     if (error_out) *error_out = e.what();
     return false;
   }
-  std::array const streams{stream};
-  decode_session session{streams, mr};
-  session.append(mask_decode_request{tree, pred, {mask_words, rep->num_rows}});
-  session.finish();
+  (void)decode_one(*request, stream, mr);
   if (error_out) error_out->clear();
   return true;
 }

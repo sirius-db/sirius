@@ -564,11 +564,6 @@ std::string repeated_plan(std::string const& plan, int columns)
   return result;
 }
 
-std::vector<::cuda::stream_ref> stream_refs(simpatico::stream_pool const& pool)
-{
-  return {pool.streams.begin(), pool.streams.end()};
-}
-
 // A `dictionary` plan node carrying `hint` as its key width, for reconstruction fixtures.
 simpatico::PlanNode dictionary_plan_node(std::int64_t hint = -1)
 {
@@ -1722,7 +1717,7 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
   std::weak_ptr<codegen::jit::CompiledKernel const> retained = handle;
   handle.reset();
 
-  auto streams = stream_refs(pool);
+  auto streams = pool.refs();
   simpatico::decode_session session(streams, resource);
   event_markers markers(pool);
   // Gate destruction releases on exceptions before the session unwinds.
@@ -1767,7 +1762,7 @@ void test_abandoned_session(rmm::device_async_resource_ref upstream)
   }
   cuda_check(pool.sync_all());
   resource.check();
-  auto streams = stream_refs(pool);
+  auto streams = pool.refs();
   std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
   event_markers markers(pool);
   stream_gate gate(pool.streams[0]);
@@ -1842,7 +1837,8 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
       try {
         (void)session->finish();
       } catch (std::runtime_error const& error) {
-        propagated = std::string(error.what()) == cudaGetErrorString(cudaErrorInvalidValue);
+        propagated =
+          std::string_view(error.what()).ends_with(cudaGetErrorString(cudaErrorInvalidValue));
       }
       expect(stream_fault::next == stream_fault::operation::none,
              "stream failure injection was not consumed");
@@ -2002,7 +1998,7 @@ void test_external_phase_tail(rmm::device_async_resource_ref upstream)
   simpatico::stream_pool pool;
   expect(pool.init(1), "phase-tail pool init");
   checked_resource resource(upstream);
-  auto streams = stream_refs(pool);
+  auto streams = pool.refs();
   simpatico::decode_session session(streams, resource);
   session.append(value_request(compressed.columns[0]));
   // The request's own work is complete before this external tail starts. Final completion must
@@ -2051,7 +2047,7 @@ void test_request_copy_failure(rmm::device_async_resource_ref upstream)
   simpatico::stream_pool pool;
   expect(pool.init(1), "request-copy pool init");
   checked_resource resource(upstream);
-  auto streams = stream_refs(pool);
+  auto streams = pool.refs();
   auto fail    = std::make_shared<bool>(false);
   auto const mask_bytes =
     sirius::codegen::selection_mask::AllocWordsFor(input->num_rows()) * sizeof(std::uint32_t);
@@ -2203,7 +2199,7 @@ void test_host_observation_staging(rmm::device_async_resource_ref upstream)
   simpatico::stream_pool pool;
   expect(pool.init(1), "observation pool init");
   checked_resource resource(upstream);
-  auto const streams = stream_refs(pool);
+  auto const streams = pool.refs();
   {
     simpatico::decode_session session(streams, resource);
     auto& frame                 = simpatico::decode_session_test_access::frame(session);
@@ -2319,7 +2315,7 @@ void test_temporaries_released_at_submission(rmm::device_async_resource_ref upst
 
   simpatico::stream_pool pool;
   expect(pool.init(2), "temporary fixture pool init");
-  auto const streams = stream_refs(pool);
+  auto const streams = pool.refs();
   checked_resource ledger(upstream);
   current_resource_guard current(ledger);
 
@@ -2443,7 +2439,7 @@ void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resourc
 {
   simpatico::stream_pool pool;
   expect(pool.init(1), "failure-unwind pool init");
-  auto const streams = stream_refs(pool);
+  auto const streams = pool.refs();
   checked_resource resource(upstream);
   scratch_probe_representation const representation(1U << 20, 0x2a, true);
   std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
@@ -2668,7 +2664,7 @@ void test_selection_and_predicate_routes(rmm::device_async_resource_ref upstream
 
   simpatico::stream_pool pool;
   expect(pool.init(2), "route coverage pool init");
-  auto const streams = stream_refs(pool);
+  auto const streams = pool.refs();
   checked_resource ledger(upstream);
   current_resource_guard current(ledger);
   std::vector<std::size_t> solo_peak(requests.size());
