@@ -149,8 +149,6 @@ class streaming_fragment {
 
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
 
-  [[nodiscard]] bool has_run() const { return _ran; }
-
  private:
   void require_built(const char* what) const;
   void open_window();
