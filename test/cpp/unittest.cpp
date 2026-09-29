@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
-#define CATCH_CONFIG_NO_POSIX_SIGNALS
 #include "catch.hpp"
 #include "config.hpp"
 #include "log/logging.hpp"
@@ -25,6 +23,7 @@
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -37,6 +36,17 @@
 
 using namespace duckdb;
 
+struct progress_line_listener : Catch::EventListenerBase {
+  using EventListenerBase::EventListenerBase;
+
+  void testCaseStarting(Catch::TestCaseInfo const& info) override
+  {
+    if (isatty(STDOUT_FILENO) == 0) { std::cout << "Running: " << info.name << std::endl; }
+  }
+};
+
+CATCH_REGISTER_LISTENER(progress_line_listener)
+
 /**
  * @brief Catch2 listener that activates/deactivates shared test environments
  * based on test tags.
@@ -48,21 +58,33 @@ using namespace duckdb;
  * any intermediate teardown.
  *
  *   [shared_context]  → g_shared_env      (scan/operator unit tests)
- *   [integration]     → g_integration_env (GPU execution integration tests)
- *   anything else     → no env active     (isolated / standalone tests)
+ *   [integration]               → g_integration_env (one-GPU integration tests)
+ *   [integration][multi_gpu]    → g_integration_env_2gpu
+ *   anything else               → no env active     (isolated / standalone tests)
  */
-struct shared_env_listener : Catch::TestEventListenerBase {
-  using TestEventListenerBase::TestEventListenerBase;
+struct shared_env_listener : Catch::EventListenerBase {
+  using EventListenerBase::EventListenerBase;
 
-  enum class env_need { NONE, SHARED, INTEGRATION };
+  enum class env_need { NONE, SHARED, INTEGRATION, INTEGRATION_2GPU };
 
   static env_need classify(Catch::TestCaseInfo const& info)
   {
+    bool is_integration = false;
+    bool is_multi_gpu   = false;
     for (auto const& tag : info.tags) {
-      if (tag == "shared_context") return env_need::SHARED;
-      if (tag == "integration") return env_need::INTEGRATION;
+      if (tag.original == "shared_context") return env_need::SHARED;
+      if (tag.original == "integration") is_integration = true;
+      if (tag.original == "multi_gpu") is_multi_gpu = true;
     }
+    if (is_integration && is_multi_gpu) return env_need::INTEGRATION_2GPU;
+    if (is_integration) return env_need::INTEGRATION;
     return env_need::NONE;
+  }
+
+  void testRunStarting(Catch::TestRunInfo const&) override
+  {
+    // Catch2 installs its fatal-signal handler when the run starts.
+    sirius::util::install_segfault_backtrace_handler();
   }
 
   void testCaseStarting(Catch::TestCaseInfo const& info) override
@@ -78,10 +100,9 @@ struct shared_env_listener : Catch::TestEventListenerBase {
         sirius::test::g_integration_env->is_active()) {
       sirius::test::g_integration_env->pause();
     }
-    // The 2-GPU integration env is switched on/off by the TEST_CASE body via
-    // acquire_integration_env_for(2); the listener only ensures it's paused
-    // between tests so it never holds the extension lock unexpectedly.
-    if (sirius::test::g_integration_env_2gpu && sirius::test::g_integration_env_2gpu->is_active()) {
+    // Keep the selected integration environment active across adjacent cases.
+    if (needs != env_need::INTEGRATION_2GPU && sirius::test::g_integration_env_2gpu &&
+        sirius::test::g_integration_env_2gpu->is_active()) {
       sirius::test::g_integration_env_2gpu->pause();
     }
 
@@ -94,25 +115,14 @@ struct shared_env_listener : Catch::TestEventListenerBase {
         !sirius::test::g_integration_env->is_active()) {
       sirius::test::g_integration_env->resume();
     }
+    if (needs == env_need::INTEGRATION_2GPU && sirius::test::g_integration_env_2gpu &&
+        !sirius::test::g_integration_env_2gpu->is_active()) {
+      sirius::test::g_integration_env_2gpu->resume();
+    }
   }
 };
 
 CATCH_REGISTER_LISTENER(shared_env_listener)
-
-/**
- * @brief Ends DuckDB Catch's "[n/N] test" progress line when stdout is not a terminal. Catch
- * leaves it open until the next test starts, so line-streamed CI logs would hide the running test.
- */
-struct progress_line_listener : Catch::TestEventListenerBase {
-  using TestEventListenerBase::TestEventListenerBase;
-
-  void testCaseStarting(Catch::TestCaseInfo const&) override
-  {
-    if (isatty(STDOUT_FILENO) == 0) { std::cout << std::endl; }
-  }
-};
-
-CATCH_REGISTER_LISTENER(progress_line_listener)
 
 int main(int argc, char* argv[])
 {
@@ -125,8 +135,8 @@ int main(int argc, char* argv[])
   sirius::util::install_segfault_backtrace_handler();
 
   // Initialize the logger
-  // SIRIUS_LOG_DIR lets concurrent test processes (CI shards) log to separate dirs.
-  auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
+  // SIRIUS_TEST_LOG_DIR lets concurrent test processes (CI shards) log to separate dirs.
+  auto const* log_dir_env = std::getenv("SIRIUS_TEST_LOG_DIR");
   Config::LOG_DIR         = log_dir_env ? log_dir_env : SIRIUS_UNITTEST_LOG_DIR;
   auto lvl = sirius::log::string_to_enum(Config::LOG_LEVEL).value_or(sirius::log::level::info);
   auto flush =
@@ -153,10 +163,8 @@ int main(int argc, char* argv[])
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
 
-  // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
-  // that parameterize on num_gpus via GENERATE(1, 2) pick this env up via
-  // sirius::test::acquire_integration_env_for(2) and call resume()/pause()
-  // around each call to compare_gpu_vs_cpu.
+  // 2-GPU integration env. The listener activates it for [integration][multi_gpu]
+  // cases and keeps it active across adjacent cases.
   auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
                                       "integration" / "integration-2gpu.yaml";
   int _dev_count = 0;

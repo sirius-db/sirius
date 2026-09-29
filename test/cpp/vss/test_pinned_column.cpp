@@ -16,6 +16,7 @@
 
 // test
 #include "operator/operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 
@@ -97,28 +98,16 @@ TEST_CASE("pinned_column_chunk_views rejects a missing or empty column", "[vss]"
   }
 }
 
-TEST_CASE("pinned_column_chunk_views rejects chunks on a different GPU", "[vss]")
+TEST_CASE("pinned_column_chunk_views rejects chunks on a different GPU", "[vss][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   auto* space = ou::get_default_gpu_space();
 
-  // The multi-GPU guard compares device ids, so it needs a second space on a
-  // different device. Skip cleanly on single-GPU hosts rather than fail.
-  cucascade::memory::memory_space* other = nullptr;
-  try {
-    static auto mgr2 = ou::initialize_memory_manager(/*n_gpus=*/2);
-    auto* candidate  = const_cast<cucascade::memory::memory_space*>(
-      mgr2->get_memory_space(cucascade::memory::Tier::GPU, 1));
-    if (candidate != nullptr && candidate->get_device_id() != space->get_device_id()) {
-      other = candidate;
-    }
-  } catch (...) {
-    other = nullptr;
-  }
-
-  if (other == nullptr) {
-    SUCCEED("single-GPU host: multi-GPU rejection path not exercised");
-    return;
-  }
+  static auto mgr2 = ou::initialize_memory_manager(/*n_gpus=*/2);
+  auto* other      = const_cast<cucascade::memory::memory_space*>(
+    mgr2->get_memory_space(cucascade::memory::Tier::GPU, 1));
+  REQUIRE(other != nullptr);
+  REQUIRE(other->get_device_id() != space->get_device_id());
 
   sirius::scan_manager::pinned_entry pin;
   pin.data_batches_by_column["vec"] = {make_int32_chunk({1, 2, 3})};

@@ -707,7 +707,7 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     has_dense_count_join(
       "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp > 0 "
       "GROUP BY c_id"),
-    Catch::Contains("Any join not supported"));
+    Catch::Matchers::ContainsSubstring("Any join not supported"));
   // INTEGER = BIGINT inserts a CAST, so the plain-reference gate declines.
   CHECK_FALSE(has_dense_count_join(
     "SELECT c_id, count(o_cust) FROM cust LEFT JOIN ord ON c_id = o_id GROUP BY c_id"));

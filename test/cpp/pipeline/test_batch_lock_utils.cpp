@@ -91,7 +91,7 @@ bool enable_p2p_for_test(int num_gpus)
   return all_enabled;
 }
 
-/// Skip idiom for multi-GPU tests (Catch2 v2): WARN + return true when fewer than two GPUs
+/// Skip idiom for multi-GPU tests (Catch2): WARN + return true when fewer than two GPUs
 /// are present. These tests validate lock/clone semantics, which hold on both cross-GPU
 /// transfer flavors, so P2P is enabled best-effort rather than required: with it the clone
 /// peer-DMAs, without it cucascade host-stages — exactly as production would on the same
