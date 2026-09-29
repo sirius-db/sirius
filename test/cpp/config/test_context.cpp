@@ -228,9 +228,26 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "eager_agg_pushdown_force") == 0);
+    // The eager-agg kill switch is a production knob: it stays on the surface
+    // even without the test opt-in, defaults to on, and round-trips.
+    REQUIRE(setting_count(con, "enable_eager_agg_pushdown") == 1);
+    auto enabled = con.Query("SELECT current_setting('enable_eager_agg_pushdown')::BOOLEAN");
+    REQUIRE(enabled != nullptr);
+    REQUIRE_FALSE(enabled->HasError());
+    REQUIRE(enabled->GetValue(0, 0).GetValue<bool>());
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET eager_agg_pushdown_force = true");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET enable_eager_agg_pushdown = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_eager_agg_pushdown");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
     result = con.Query("SET enable_pinned_zone_map_pruning = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -250,6 +267,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
+    REQUIRE(setting_count(con, "eager_agg_pushdown_force") == 0);
+    REQUIRE(setting_count(con, "enable_eager_agg_pushdown") == 1);
   }
 
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
@@ -260,6 +279,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_pushdown") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
+    REQUIRE(setting_count(con, "eager_agg_pushdown_force") == 1);
+    REQUIRE(setting_count(con, "enable_eager_agg_pushdown") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -279,6 +300,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dynamic_zone_map_filter");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET eager_agg_pushdown_force = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET eager_agg_pushdown_force");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
   }
@@ -785,6 +812,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('dynamic_filter_domain_coverage_threshold')::DOUBLE,
       current_setting('dynamic_filter_keep_threshold')::DOUBLE,
       current_setting('enable_pinned_zone_map_pruning')::BOOLEAN,
+      current_setting('enable_eager_agg_pushdown')::BOOLEAN,
+      current_setting('eager_agg_pushdown_force')::BOOLEAN,
       current_setting('enable_compressed_materialization')::BOOLEAN,
       current_setting('pin_table_compression')::BOOLEAN,
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
@@ -812,10 +841,12 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE_FALSE(settings->GetValue(13, 0).GetValue<bool>());
   REQUIRE_FALSE(settings->GetValue(14, 0).GetValue<bool>());
   REQUIRE(settings->GetValue(15, 0).GetValue<bool>());
-  REQUIRE(settings->GetValue(16, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
-  REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
-  REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
-  REQUIRE_FALSE(settings->GetValue(19, 0).GetValue<bool>());
+  REQUIRE_FALSE(settings->GetValue(16, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(17, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(18, 0).GetValue<std::string>() == "/tmp/sirius-compression-plans");
+  REQUIRE(settings->GetValue(19, 0).GetValue<uint64_t>() == 8 * mib);
+  REQUIRE(settings->GetValue(20, 0).GetValue<double>() == Approx(0.6));
+  REQUIRE_FALSE(settings->GetValue(21, 0).GetValue<bool>());
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -885,6 +916,16 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET dynamic_filter_keep_threshold");
   require_ok("SET enable_runtime_distinct_build_probe = true");
   require_ok("RESET enable_runtime_distinct_build_probe");
+  // The eager-agg knobs land in the shared operator params, not just DuckDB's
+  // setting table — the plan pass reads them from there.
+  require_ok("SET enable_eager_agg_pushdown = true");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().enable_eager_agg_pushdown);
+  require_ok("RESET enable_eager_agg_pushdown");
+  REQUIRE_FALSE(sirius_ctx->get_config().get_operator_params().enable_eager_agg_pushdown);
+  require_ok("SET eager_agg_pushdown_force = false");
+  REQUIRE_FALSE(sirius_ctx->get_config().get_operator_params().eager_agg_pushdown_force);
+  require_ok("RESET eager_agg_pushdown_force");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().eager_agg_pushdown_force);
   require_ok("SET pin_table_compression = false");
   require_ok("RESET pin_table_compression");
   require_ok("SET pin_table_compression_max_compressed_fraction = 0.9");
@@ -913,6 +954,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(params.max_sort_partition_memory_fraction == Approx(0.25));
   REQUIRE_FALSE(params.enable_dynamic_filter_pushdown);
   REQUIRE_FALSE(params.enable_runtime_distinct_build_probe);
+  REQUIRE_FALSE(params.enable_eager_agg_pushdown);
+  REQUIRE(params.eager_agg_pushdown_force);
   auto const& compression = sirius_ctx->get_config().get_compression_config();
   REQUIRE(compression.enable_pin_table_compression);
   REQUIRE(compression.max_compressed_fraction == Approx(0.6));

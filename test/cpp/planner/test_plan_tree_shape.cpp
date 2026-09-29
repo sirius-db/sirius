@@ -38,6 +38,7 @@
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/plan_shape_test_utils.hpp"
 
 #include <cudf/types.hpp>
 
@@ -66,161 +67,24 @@ using namespace duckdb;
 using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
+using sirius::test::collect;
+using sirius::test::contains;
+using sirius::test::find_first;
+using sirius::test::scoped_temp_db_path;
+using sirius::test::tree_to_string;
+
 namespace {
 
-/// RAII on-disk DuckDB path: the GPU-native seq_scan ingestible refuses non-single-file
-/// block managers, so these tests need an on-disk database rather than :memory:.
-class scoped_temp_db_path {
- public:
-  scoped_temp_db_path()
-  {
-    char tmpl[] = "/tmp/sirius_plan_tree_shape_XXXXXX";
-    int fd      = ::mkstemp(tmpl);
-    REQUIRE(fd >= 0);
-    ::close(fd);
-    ::unlink(tmpl);
-    _path = tmpl;
-  }
-
-  ~scoped_temp_db_path()
-  {
-    if (!_path.empty()) {
-      std::remove(_path.c_str());
-      std::remove((_path + ".wal").c_str());
-    }
-  }
-
-  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
-  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
-
-  const std::string& path() const { return _path; }
-
- private:
-  std::string _path;
-};
-
-/// Generate a Sirius physical plan from a SQL query string. Throws on any failure (after
-/// rolling back and restoring the optimizer settings) so a planner regression fails the
-/// test instead of silently skipping it.
+/// This suite asserts on the FULLY RESOLVED tree, with the shape-sensitive
+/// optimizers (notably STATISTICS_PROPAGATION) disabled so the deliminator
+/// retains the DELIM_JOINs asserted below.
 duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& con,
                                                                   const std::string& query)
 {
-  auto& context = *con.context;
-
-  auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
-  auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
-  // Keep STATISTICS_PROPAGATION disabled only for this shape-sensitive suite:
-  // disabling it lets the deliminator retain the DELIM_JOINs asserted below.
-  disabled.insert(OptimizerType::IN_CLAUSE);
-  disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  disabled.insert(OptimizerType::STATISTICS_PROPAGATION);
-
-  con.Query("BEGIN TRANSACTION");
-
-  duckdb::unique_ptr<sirius_physical_operator> result;
-  try {
-    Parser parser(context.GetParserOptions());
-    parser.ParseQuery(query);
-    REQUIRE(!parser.statements.empty());
-
-    Planner planner(context);
-    planner.CreatePlan(std::move(parser.statements[0]));
-    REQUIRE(planner.plan);
-
-    auto plan = std::move(planner.plan);
-
-    if (context.config.enable_optimizer) {
-      Optimizer optimizer(*planner.binder, context);
-      plan = optimizer.Optimize(std::move(plan));
-    }
-
-    plan->ResolveOperatorTypes();
-
-    ColumnBindingResolver resolver;
-    ColumnBindingResolver::Verify(*plan);
-    resolver.VisitOperator(*plan);
-
-    sirius::planner::sirius_physical_plan_generator gen(context);
-    result = gen.create_plan(std::move(plan));
-  } catch (...) {
-    con.Query("ROLLBACK");
-    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
-    throw;
-  }
-
-  con.Query("COMMIT");
-  DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled;
-  return result;
-}
-
-/// Visit every operator in the tree, including DELIM JOIN internal `join`/`distinct_root`
-/// subtrees (owned outside `children[]`).
-template <typename Fn>
-void for_each_operator(sirius_physical_operator* root, const Fn& fn)
-{
-  if (!root) { return; }
-  fn(root);
-  for (auto& child : root->children) {
-    for_each_operator(child.get(), fn);
-  }
-  if (root->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      root->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
-    for_each_operator(delim.join.get(), fn);
-    for_each_operator(delim.distinct_root.get(), fn);
-  }
-}
-
-std::vector<sirius_physical_operator*> collect(sirius_physical_operator* root,
-                                               SiriusPhysicalOperatorType type)
-{
-  std::vector<sirius_physical_operator*> out;
-  for_each_operator(root, [&](sirius_physical_operator* op) {
-    if (op->type == type) { out.push_back(op); }
-  });
-  return out;
-}
-
-sirius_physical_operator* find_first(sirius_physical_operator* root,
-                                     SiriusPhysicalOperatorType type)
-{
-  auto all = collect(root, type);
-  return all.empty() ? nullptr : all.front();
-}
-
-bool contains(sirius_physical_operator* root, const sirius_physical_operator* target)
-{
-  bool found = false;
-  for_each_operator(root, [&](sirius_physical_operator* op) {
-    if (op == target) { found = true; }
-  });
-  return found;
-}
-
-/// Render the tree (including delim-join internals) for failure diagnostics.
-void tree_to_string(sirius_physical_operator* root, int depth, std::ostringstream& out)
-{
-  if (!root) { return; }
-  out << std::string(static_cast<size_t>(depth) * 2, ' ')
-      << sirius::op::SiriusPhysicalOperatorToString(root->type) << "\n";
-  for (auto& child : root->children) {
-    tree_to_string(child.get(), depth + 1, out);
-  }
-  if (root->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
-      root->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-    auto& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
-    out << std::string(static_cast<size_t>(depth + 1) * 2, ' ') << "(join)\n";
-    tree_to_string(delim.join.get(), depth + 2, out);
-    out << std::string(static_cast<size_t>(depth + 1) * 2, ' ') << "(distinct_root)\n";
-    tree_to_string(delim.distinct_root.get(), depth + 2, out);
-  }
-}
-
-std::string tree_to_string(sirius_physical_operator* root)
-{
-  std::ostringstream out;
-  tree_to_string(root, 0, out);
-  return out.str();
+  return sirius::test::generate_sirius_plan(con,
+                                            query,
+                                            {/*disable_shape_sensitive_optimizers=*/true,
+                                             /*resolve_column_bindings=*/true});
 }
 
 duckdb::unique_ptr<duckdb::Expression> untranslatable_table_filter_expression()
@@ -343,7 +207,7 @@ struct plan_tree_shape_fixture {
   ~plan_tree_shape_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
-  scoped_temp_db_path _db_path;
+  scoped_temp_db_path _db_path{"sirius_plan_tree_shape"};
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };

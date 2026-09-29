@@ -158,6 +158,53 @@ Both feed the same `resolve_mark_join_result()`, which scatters the match indice
 - `src/planner/sirius_physical_plan_generator.cpp` — post-pass invocation of `fold_adjacent_projections()`
 - `src/expression/ast/reference_utils.cpp` — `visit_references()`, `substitute_references()`
 
+### Eager Aggregation Pushdown (PR #1581)
+
+**Motivation:** When a grouped aggregate sits on an equi-join and every aggregate input comes from one join side, that side can be pre-aggregated by its join keys *below* the join, so the join consumes one row per distinct key instead of one row per input row (Yan & Larson, "Eager Aggregation and Lazy Aggregation", VLDB 1995). DuckDB's own optimizer does not do this — verified on v1.5.5, where the optimized TPC-H q13 plan still keeps the aggregate above the join — so the rewrite has to happen in Sirius's planner. On q13 the `customer ⋈ orders` join then consumes ~100M partial counts instead of ~1.48B filtered order rows.
+
+**Mechanism:** `try_eager_aggregation_pushdown()` matches an AGGREGATE over a COMPARISON_JOIN, directly or through one *pure pass-through* projection (every slot a plain column ref — DuckDB's column pruning inserts one on some shapes; references are traced through it). It rewrites
+
+```
+AGGREGATE g=[keys from S], a=[AGG(col from R), ...]
+  [PROJECTION [colrefs from R and S]]              (optional pass-through)
+    COMPARISON_JOIN on R.k1 = S.e1 AND ...
+      [R: pushed side]   [S: preserved / non-pushed side]
+```
+
+into
+
+```
+PROJECTION [groups..., CAST(COALESCE(combined, 0))...]   (only when needed)
+  AGGREGATE g=[keys from S], a=[SUM(partial), ...]
+    [PROJECTION [kept S colrefs..., partials...]]
+      COMPARISON_JOIN on AGG_R.k1 = S.e1 AND ...
+        AGGREGATE g=[R.k1, ...], a=[AGG(col), ...]       (lower/partial)
+          [R]
+        [S]
+```
+
+COUNT and SUM partials combine by SUM, MIN/MAX by MIN/MAX. The pass-through projection's slots are rewritten in place: slots referencing R are dropped, surviving S slots keep their order with the group keys remapped, and one slot per partial is appended.
+
+**Correctness gates** (all provable at plan time; the matcher fails closed on anything else):
+- Single grouping set, no `GROUPING()` calls; group keys are plain column refs that never touch the pushed side.
+- Every aggregate is a single-column-ref `COUNT` / `SUM` / `MIN` / `MAX` without `DISTINCT` / `FILTER` / `ORDER BY`, and every aggregate input comes from the pushed side. `SUM` over `FLOAT` / `DOUBLE` is excluded: floating-point addition is not associative, so summing per-key partials need not equal the single-pass sum. `sum_no_overflow` is excluded too — DuckDB installs it only when the aggregate's input node carries a max-cardinality bound, which a comparison join does not propagate.
+- The join is a plain comparison join — INNER, or LEFT/RIGHT pushing into the *non-preserved* side — whose conditions are all `=` with a plain column ref on the pushed side, and with no residual predicate.
+- Under outer joins the preserved side's unmatched rows see one NULL partial, which `SUM`/`MIN`/`MAX` reproduce exactly but `COUNT` would have to report as 0; that is repaired by a `COALESCE(combined, 0)` above the aggregate, and any combine-type widening (SUM over BIGINT partials returns HUGEINT) is cast back, so the plan's output schema stays byte-identical.
+
+**Benefit gates** (heuristic only — never affect correctness), two independent refusals:
+- The non-pushed side must be a bare, unfiltered table scan (modulo projections), i.e. the join is not expected to discard most of the pushed side's rows.
+- The pushed side's join keys must not be *provably* unique (a PRIMARY KEY of the scanned base table); a unique key makes the lower aggregate emit one row per input row, paying a full partition + merge for no reduction. Only provable uniqueness is used — no distinct-count statistics exist at this point in planning, so a merely near-unique key is not caught.
+
+**Fail-closed:** the rewrite is applied to a *copy* of the logical plan, the first planning attempt runs on a throwaway generator, and `create_plan()` retries with the untouched original if any later planning stage throws — an unsupported rewritten shape costs only the optimization attempt. See [physical-plan-generation.md](physical-plan-generation.md) → Part 1.
+
+**Measured:** TPC-H q13 −9.7% at SF1000; suite-neutral otherwise.
+
+**Code path:**
+- `src/planner/eager_agg_pushdown_plan_pass.cpp` — `try_eager_aggregation_pushdown()` (matcher, rewrite, gates; its file header carries the full soundness argument)
+- `src/planner/sirius_physical_plan_generator.cpp` — `create_plan()` / `create_plan_stages()` split, `adopt_state_from()`
+
+**Config:** `enable_eager_agg_pushdown` (default: true) — kill switch, settable via the YAML `sirius.operator_params` envelope and the `enable_eager_agg_pushdown` SET option. `eager_agg_pushdown_force` (default: false) is TEST ONLY (registered only when `SIRIUS_ENABLE_TEST_OPTIONS=1`) and bypasses the benefit heuristic, never the correctness gates.
+
 ## Memory Optimizations
 
 ### Memory-Pressure-Driven Downgrade (PR #368)

@@ -2064,6 +2064,26 @@ static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scop
                    params->enable_dynamic_filter_pushdown);
 }
 
+static void SetEnableEagerAggPushdown(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                         = lock_operator_params_slot(context);
+  params->enable_eager_agg_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EAGER_AGG_PUSHDOWN to {}",
+                   params->enable_eager_agg_pushdown);
+}
+
+static void SetEagerAggPushdownForce(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                        = lock_operator_params_slot(context);
+  params->eager_agg_pushdown_force = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EAGER_AGG_PUSHDOWN_FORCE to {}",
+                   params->eager_agg_pushdown_force);
+}
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2246,7 +2266,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                               LogicalType::BOOLEAN,
                               Value::BOOLEAN(operator_defaults.enable_dynamic_zone_map_filter),
                               SetEnableDynamicZoneMapFilter);
+    // A/B knob only: it relaxes a cost heuristic, never a correctness gate, so it has no
+    // business on the production surface.
+    config.AddExtensionOption("eager_agg_pushdown_force",
+                              "TEST ONLY: bypass the eager-aggregation-pushdown benefit heuristic",
+                              LogicalType::BOOLEAN,
+                              Value::BOOLEAN(operator_defaults.eager_agg_pushdown_force),
+                              SetEagerAggPushdownForce);
   }
+
+  config.AddExtensionOption("enable_eager_agg_pushdown",
+                            "Whether to pre-aggregate one side of an equi-join below the join and "
+                            "combine the partials above it (eager aggregation pushdown)",
+                            LogicalType::BOOLEAN,
+                            Value::BOOLEAN(operator_defaults.enable_eager_agg_pushdown),
+                            SetEnableEagerAggPushdown);
 
   // Add in config options for special JIT implementation for regex
   config.AddExtensionOption(

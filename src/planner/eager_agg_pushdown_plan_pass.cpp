@@ -18,20 +18,31 @@
 //! Aggregation", VLDB 1995).
 //!
 //! Pattern (q13 shape; DuckDB flips `customer LEFT JOIN orders` into
-//! `orders RIGHT JOIN customer`, so the pushed side may be either child):
+//! `orders RIGHT JOIN customer`, so the pushed side may be either child). The
+//! PASS-THROUGH projection (PT) is optional — DuckDB's column pruning inserts
+//! one on some shapes, e.g. INNER joins — and every one of its slots must be a
+//! plain column ref:
 //!
 //!     AGGREGATE g=[keys from S], a=[AGG(col from R), ...]        (upper, A)
-//!       COMPARISON_JOIN INNER/LEFT/RIGHT on R.k1=S.e1 AND ...    (J)
-//!         [R: pushed side]      [S: preserved / non-pushed side]
+//!       [PROJECTION [colrefs from R and S]]                      (PT, optional)
+//!         COMPARISON_JOIN INNER/LEFT/RIGHT on R.k1=S.e1 AND ...  (J)
+//!           [R: pushed side]    [S: preserved / non-pushed side]
 //!
 //! becomes
 //!
 //!     PROJECTION [groups..., CAST(COALESCE(combined, 0))...]     (PX, only
 //!       AGGREGATE g=[keys from S], a=[SUM(partial), ...]          when needed)
-//!         COMPARISON_JOIN on AGG_R.k1=S.e1 AND ...
-//!           AGGREGATE g=[R.k1,...], a=[AGG(col), ...]            (lower)
-//!             [R]
-//!           [S]
+//!         [PROJECTION [kept S colrefs..., partials...]]          (PT, rewritten)
+//!           COMPARISON_JOIN on AGG_R.k1=S.e1 AND ...
+//!             AGGREGATE g=[R.k1,...], a=[AGG(col), ...]          (lower)
+//!               [R]
+//!             [S]
+//!
+//! PT's slots are rewritten in place: every slot referencing R is DROPPED (each
+//! was only ever consumed as an aggregate input, and its join column no longer
+//! exists below), the surviving S slots keep their order with the upper
+//! aggregate's group keys remapped onto their new positions, and one slot per
+//! partial is APPENDED so the combines route through PT.
 //!
 //! Soundness: every R row that joins a given S row carries the same join-key
 //! tuple, so all of them land in exactly one lower-aggregate group and their
@@ -58,14 +69,18 @@
 #include "planner/eager_agg_pushdown_plan_pass.hpp"
 
 #include "log/logging.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp>
+#include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/enums/join_type.hpp>
 #include <duckdb/function/function_binder.hpp>
 #include <duckdb/optimizer/column_binding_replacer.hpp>
+#include <duckdb/parser/constraints/unique_constraint.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
@@ -77,8 +92,6 @@
 #include <duckdb/planner/operator/logical_projection.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <cstdlib>
 #include <exception>
 #include <optional>
 #include <string>
@@ -91,34 +104,27 @@ namespace sirius::planner {
 
 namespace {
 
-std::atomic<std::uint64_t> g_applied_count{0};
-
 // ---------------------------------------------------------------------------
-// Environment gates (read per use so tests can flip them in-process)
+// Settings (read per use from the connection's Sirius operator params, so a SET
+// takes effect on the next query and tests can A/B in-process)
 // ---------------------------------------------------------------------------
 
-bool pass_enabled()
+const sirius::operator_params* eager_agg_params(duckdb::ClientContext& context)
 {
-  const char* v = std::getenv("SIRIUS_EAGER_AGG_PUSHDOWN");
-  return v == nullptr || std::string_view{v} != "0";
+  if (!context.registered_state) { return nullptr; }
+  auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!state) { return nullptr; }
+  return &state->get_config().get_operator_params();
 }
 
-bool benefit_gate_bypassed()
+bool pass_enabled(const sirius::operator_params* params)
 {
-  const char* v = std::getenv("SIRIUS_EAGER_AGG_FORCE");
-  return v != nullptr && std::string_view{v} == "1";
+  return params == nullptr || params->enable_eager_agg_pushdown;
 }
 
-double min_join_to_input_ratio()
+bool benefit_gate_bypassed(const sirius::operator_params* params)
 {
-  if (const char* v = std::getenv("SIRIUS_EAGER_AGG_MIN_RATIO")) {
-    try {
-      return std::stod(v);
-    } catch (std::exception&) {  // NOLINT(bugprone-empty-catch)
-      // fall through to the default on a malformed value
-    }
-  }
-  return 0.5;
+  return params != nullptr && params->eager_agg_pushdown_force;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,9 +134,29 @@ double min_join_to_input_ratio()
 /// Combine function applied above the join for each pushable aggregate, or
 /// nullptr when the aggregate is not decomposable this way. COUNT partials are
 /// non-NULL counts, so they combine by SUM like SUM partials do.
-const char* combine_function_name(const std::string& name)
+///
+/// SUM over FLOAT / DOUBLE is refused: floating-point addition is not
+/// associative, so `sum(per-key partials)` need not equal the single-pass
+/// `sum` the unrewritten plan computes (e.g. addends 1e16, 1.0, -1e16 grouped
+/// by join key yield 1.0 where the original order yields 0.0). Exact types
+/// (integers, fixed-point DECIMAL, and COUNT's own BIGINT partials) reassociate
+/// losslessly, so they stay in the set.
+///
+/// `sum_no_overflow` is deliberately absent: DuckDB installs it only from
+/// SumPropagateStats, which needs the aggregate's input node to carry a
+/// max-cardinality bound. A comparison join does not propagate one, so an
+/// aggregate sitting on a join (the only shape this pass matches) never carries
+/// it — accepting it would be untestable dead code.
+const char* combine_function_name(const std::string& name, const duckdb::LogicalType& arg_type)
 {
-  if (name == "count" || name == "sum" || name == "sum_no_overflow") { return "sum"; }
+  if (name == "count") { return "sum"; }
+  if (name == "sum") {
+    switch (arg_type.InternalType()) {
+      case duckdb::PhysicalType::FLOAT:
+      case duckdb::PhysicalType::DOUBLE: return nullptr;
+      default: return "sum";
+    }
+  }
   if (name == "min") { return "min"; }
   if (name == "max") { return "max"; }
   return nullptr;
@@ -145,7 +171,7 @@ std::unordered_set<duckdb::idx_t> output_table_indexes(duckdb::LogicalOperator& 
   return out;
 }
 
-/// The heuristic benefit gate: push only when the non-pushed side is a bare,
+/// First half of the heuristic benefit gate: push only when the non-pushed side is a bare,
 /// unfiltered table scan (modulo projections). Then the join is not expected
 /// to discard most pushed-side rows, so the pre-aggregation's reduction
 /// carries through to the join (q13: customer is a bare scan). A filtered or
@@ -160,6 +186,76 @@ bool non_pushed_side_is_bare_scan(const duckdb::LogicalOperator& side)
   }
   if (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) { return false; }
   return node->Cast<duckdb::LogicalGet>().table_filters.filters.empty();
+}
+
+/// The single base scan a row-preserving subtree reads, or nullptr when the
+/// subtree is anything else (a join, a set operation, an aggregate, ...).
+/// LOGICAL_PROJECTION is deliberately NOT traversed: it renumbers bindings, so
+/// the caller's join-key bindings would no longer address the scan's outputs.
+const duckdb::LogicalGet* sole_base_scan(const duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    return &op.Cast<duckdb::LogicalGet>();
+  }
+  if (op.children.size() != 1) { return nullptr; }
+  switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_FILTER:
+    case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: return sole_base_scan(*op.children[0]);
+    default: return nullptr;
+  }
+}
+
+/// Second half of the benefit gate: the pre-aggregation only pays when it
+/// actually reduces rows, and it provably does not when the join keys on the
+/// pushed side contain a PRIMARY KEY of the scanned base table — then every
+/// input row is already its own group and the lower aggregate is a full
+/// PARTITION + MERGE_GROUP_BY for nothing (`customer JOIN orders ON c_custkey =
+/// o_custkey` aggregating a customer column: 150M rows in, 150M groups out).
+///
+/// Only PRIMARY KEY is used, mirroring prove_unique_columns in
+/// sirius_plan_comparison_join.cpp: a nullable UNIQUE column may repeat NULLs.
+/// This is provable evidence only — no distinct-count statistics exist at this
+/// point in planning, so a merely near-unique key is not caught.
+bool pushed_keys_are_provably_unique(const duckdb::LogicalOperator& pushed_side,
+                                     const std::unordered_set<duckdb::idx_t>& key_columns,
+                                     duckdb::idx_t key_table_index)
+{
+  const auto* get = sole_base_scan(pushed_side);
+  if (get == nullptr || get->table_index != key_table_index) { return false; }
+  auto table = get->GetTable();
+  if (!table) { return false; }
+
+  // LogicalGet output position -> the table's logical column index.
+  const auto& column_ids = get->GetColumnIds();
+  const auto& proj_ids   = get->projection_ids;
+  std::unordered_set<duckdb::idx_t> key_logical_indexes;
+  for (auto position : key_columns) {
+    if (proj_ids.empty()) {
+      if (position >= column_ids.size()) { return false; }
+      key_logical_indexes.insert(column_ids[position].GetPrimaryIndex());
+    } else {
+      if (position >= proj_ids.size() || proj_ids[position] >= column_ids.size()) { return false; }
+      key_logical_indexes.insert(column_ids[proj_ids[position]].GetPrimaryIndex());
+    }
+  }
+
+  for (const auto& constraint : table->GetConstraints()) {
+    if (constraint->type != duckdb::ConstraintType::UNIQUE) { continue; }
+    auto& unique = constraint->Cast<duckdb::UniqueConstraint>();
+    if (!unique.IsPrimaryKey()) { continue; }
+    auto logical_indexes = unique.GetLogicalIndexes(table->GetColumns());
+    if (logical_indexes.empty()) { continue; }
+    bool covered = true;
+    for (const auto& idx : logical_indexes) {
+      if (key_logical_indexes.count(idx.index) == 0) {
+        covered = false;
+        break;
+      }
+    }
+    if (covered) { return true; }
+  }
+  return false;
 }
 
 struct match_info {
@@ -202,7 +298,8 @@ const duckdb::BoundColumnRefExpression* trace_to_join_output(
 /// Match @p op against the pushdown pattern. Purely read-only; returns
 /// std::nullopt (refusal) unless every correctness gate and the benefit gate
 /// hold.
-std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
+std::optional<match_info> match_candidate(duckdb::LogicalOperator& op,
+                                          const sirius::operator_params* params)
 {
   if (op.type != duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
     return std::nullopt;
@@ -256,11 +353,11 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
     if (aggr.IsDistinct() || aggr.filter || (aggr.order_bys && !aggr.order_bys->orders.empty())) {
       return std::nullopt;
     }
-    const char* combine = combine_function_name(aggr.function.name);
-    if (combine == nullptr) { return std::nullopt; }
     if (aggr.children.size() != 1) { return std::nullopt; }
     auto* traced = trace_to_join_output(*aggr.children[0], info.projection);
     if (traced == nullptr) { return std::nullopt; }
+    const char* combine = combine_function_name(aggr.function.name, traced->return_type);
+    if (combine == nullptr) { return std::nullopt; }
     auto table_index = traced->binding.table_index;
     if (left_tables.count(table_index) != 0) {
       args_in_left = true;
@@ -292,28 +389,35 @@ std::optional<match_info> match_candidate(duckdb::LogicalOperator& op)
   }
 
   // --- join conditions: all `=`, pushed side is a plain column ref ---
+  std::unordered_set<duckdb::idx_t> pushed_key_columns;
+  duckdb::idx_t pushed_key_table = 0;
+  bool single_key_table          = true;
   for (auto& cond : join.conditions) {
     if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL) { return std::nullopt; }
     auto& pushed_expr = info.pushed_slot == 0 ? cond.left : cond.right;
     if (pushed_expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
       return std::nullopt;
     }
-    auto table_index = pushed_expr->Cast<duckdb::BoundColumnRefExpression>().binding.table_index;
-    if (pushed_tables.count(table_index) == 0) { return std::nullopt; }
+    const auto& binding = pushed_expr->Cast<duckdb::BoundColumnRefExpression>().binding;
+    if (pushed_tables.count(binding.table_index) == 0) { return std::nullopt; }
+    if (pushed_key_columns.empty()) {
+      pushed_key_table = binding.table_index;
+    } else if (binding.table_index != pushed_key_table) {
+      single_key_table = false;
+    }
+    pushed_key_columns.insert(binding.column_index);
   }
 
   // --- benefit gate (heuristic; never affects correctness) ---
-  if (!benefit_gate_bypassed()) {
-    auto& pushed_child = *join.children[info.pushed_slot];
-    if (join.has_estimated_cardinality && pushed_child.has_estimated_cardinality &&
-        pushed_child.estimated_cardinality > 0) {
-      // Optimizer estimates survive on directly-planned paths (they are lost
-      // by LogicalOperator::Copy on the transparent capture path): the join
-      // must keep most of the pushed side's rows for the reduction to pay.
-      auto ratio = static_cast<double>(join.estimated_cardinality) /
-                   static_cast<double>(pushed_child.estimated_cardinality);
-      if (ratio < min_join_to_input_ratio()) { return std::nullopt; }
-    } else if (!non_pushed_side_is_bare_scan(*join.children[1 - info.pushed_slot])) {
+  if (!benefit_gate_bypassed(params)) {
+    if (!non_pushed_side_is_bare_scan(*join.children[1 - info.pushed_slot])) {
+      return std::nullopt;
+    }
+    // A provably unique pushed key means the lower aggregate emits one row per
+    // input row: all cost, no reduction.
+    if (single_key_table &&
+        pushed_keys_are_provably_unique(
+          *join.children[info.pushed_slot], pushed_key_columns, pushed_key_table)) {
       return std::nullopt;
     }
   }
@@ -402,17 +506,15 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
   }
   lower->grouping_sets.push_back(std::move(grouping_set));
   auto& pushed_child = join.children[info.pushed_slot];
-  // Upper bound; only pinned when the child actually carries an estimate —
-  // pinning 0 would freeze EstimateCardinality's later bottom-up recomputation.
-  if (pushed_child->has_estimated_cardinality) {
-    lower->SetEstimatedCardinality(pushed_child->estimated_cardinality);
-  }
+  // No cardinality is pinned on the lower aggregate: the copy this pass rewrites
+  // comes out of LogicalOperator::Copy, which does not carry
+  // estimated_cardinality, and create_plan recomputes it bottom-up anyway.
   lower->children.push_back(std::move(pushed_child));
   pushed_child = std::move(lower);
 
   // --- join now reads the lower aggregate's keys on the pushed side; its
-  // former per-row output no longer exists, so drop any pushed-side projection
-  // map (the new output is exactly keys + partials, all of them consumed) ---
+  // former per-row output no longer exists, so the pushed-side projection map
+  // is rebuilt to emit exactly the partials ---
   for (duckdb::idx_t k = 0; k < join.conditions.size(); k++) {
     auto& cond        = join.conditions[k];
     auto& pushed_expr = info.pushed_slot == 0 ? cond.left : cond.right;
@@ -421,6 +523,15 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
   auto& pushed_projection_map =
     info.pushed_slot == 0 ? join.left_projection_map : join.right_projection_map;
   pushed_projection_map.clear();
+  pushed_projection_map.reserve(num_aggregates);
+  for (duckdb::idx_t i = 0; i < num_aggregates; i++) {
+    // The lower aggregate emits [keys..., partials...]. Only the partials are
+    // read above the join: the matcher proved nothing above it references the
+    // pushed side's keys, which are consumed by the conditions themselves. An
+    // empty map would mean "all columns" and carry every key through the build
+    // payload and every output row for nothing.
+    pushed_projection_map.push_back(join.conditions.size() + i);
+  }
 
   // --- upper aggregate combines the partials ---
   std::vector<duckdb::LogicalType> original_types;
@@ -470,7 +581,6 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
   }
 
   if (!needs_projection) {
-    g_applied_count.fetch_add(1, std::memory_order_relaxed);
     SIRIUS_LOG_INFO("Eager aggregation pushdown applied ({} keys, {} aggregates)",
                     join.conditions.size(),
                     num_aggregates);
@@ -527,7 +637,6 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
   replacer.stop_operator = op_ref.get();
   replacer.VisitOperator(*root);
 
-  g_applied_count.fetch_add(1, std::memory_order_relaxed);
   SIRIUS_LOG_INFO(
     "Eager aggregation pushdown applied ({} keys, {} aggregates, with fix-up projection)",
     join.conditions.size(),
@@ -540,36 +649,40 @@ void apply_rewrite(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
 void visit(duckdb::unique_ptr<duckdb::LogicalOperator>& op_ref,
            duckdb::unique_ptr<duckdb::LogicalOperator>& root,
            duckdb::ClientContext& context,
-           int& applied)
+           const sirius::operator_params* params,
+           std::uint64_t& applied)
 {
   for (auto& child : op_ref->children) {
-    visit(child, root, context, applied);
+    visit(child, root, context, params, applied);
   }
-  if (auto info = match_candidate(*op_ref)) {
+  if (auto info = match_candidate(*op_ref, params)) {
     apply_rewrite(op_ref, root, *info, context);
     applied++;
   }
 }
 
-bool contains_candidate(duckdb::LogicalOperator& op)
+bool contains_candidate(duckdb::LogicalOperator& op, const sirius::operator_params* params)
 {
-  if (match_candidate(op)) { return true; }
+  if (match_candidate(op, params)) { return true; }
   for (auto& child : op.children) {
-    if (contains_candidate(*child)) { return true; }
+    if (contains_candidate(*child, params)) { return true; }
   }
   return false;
 }
 
 }  // namespace
 
-duckdb::unique_ptr<duckdb::LogicalOperator> try_eager_aggregation_pushdown(
-  duckdb::LogicalOperator& plan, duckdb::ClientContext& context)
+eager_agg_pushdown_result try_eager_aggregation_pushdown(duckdb::LogicalOperator& plan,
+                                                         duckdb::ClientContext& context)
 {
-  if (!pass_enabled()) { return nullptr; }
+  const auto* params = eager_agg_params(context);
+  if (!pass_enabled(params)) { return {}; }
 
   // Cheap read-only scan first: the copy below is only paid when a provable
-  // candidate exists (on TPC-H that is q13 alone).
-  if (!contains_candidate(plan)) { return nullptr; }
+  // candidate exists (on TPC-H that is q13 alone). Every gate is structural, so
+  // the pre-scan and the rewrite below decide identically — the copy carries the
+  // same tree, and no gate reads metadata that LogicalOperator::Copy drops.
+  if (!contains_candidate(plan, params)) { return {}; }
 
   duckdb::unique_ptr<duckdb::LogicalOperator> copy;
   try {
@@ -578,24 +691,19 @@ duckdb::unique_ptr<duckdb::LogicalOperator> try_eager_aggregation_pushdown(
     copy = sirius::transparent::copy_logical_plan(plan, context);
   } catch (std::exception& e) {
     SIRIUS_LOG_DEBUG("Eager aggregation pushdown: plan not copyable, skipping: {}", e.what());
-    return nullptr;
+    return {};
   }
 
-  int applied = 0;
+  std::uint64_t applied = 0;
   try {
-    visit(copy, copy, context, applied);
+    visit(copy, copy, context, params, applied);
   } catch (std::exception& e) {
     // E.g. no matching combine overload in the catalog. Fail closed.
     SIRIUS_LOG_DEBUG("Eager aggregation pushdown: rewrite failed, skipping: {}", e.what());
-    return nullptr;
+    return {};
   }
-  if (applied == 0) { return nullptr; }
-  return copy;
-}
-
-std::uint64_t eager_agg_pushdown_applied_count()
-{
-  return g_applied_count.load(std::memory_order_relaxed);
+  if (applied == 0) { return {}; }
+  return {std::move(copy), applied};
 }
 
 }  // namespace sirius::planner

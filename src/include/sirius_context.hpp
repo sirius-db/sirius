@@ -176,6 +176,22 @@ class SiriusConnectionState : public ClientContextState {
   /// objects across DatabaseInstances still get distinct ids).
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
+  /// \brief Record eager-aggregation-pushdown rewrites that were actually
+  /// EXECUTED on this connection. Bumped by
+  /// sirius_physical_plan_generator::create_plan only after the rewritten plan
+  /// has survived every later planning stage, so a rewrite that was built and
+  /// then discarded (the fail-closed retry with the original plan) never counts.
+  /// Monotonic per connection; tests bracket a query with it to assert the pass
+  /// really fired without depending on process-global state.
+  void record_eager_agg_pushdown_applied(uint64_t count) noexcept
+  {
+    eager_agg_pushdown_applied_ += count;
+  }
+  [[nodiscard]] uint64_t eager_agg_pushdown_applied_count() const noexcept
+  {
+    return eager_agg_pushdown_applied_;
+  }
+
  private:
   uint64_t planning_generation_ = 0;
   uint64_t captured_generation_ = 0;
@@ -188,7 +204,8 @@ class SiriusConnectionState : public ClientContextState {
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
   uint64_t connection_id_;
-  uint64_t query_ordinal_ = 0;
+  uint64_t query_ordinal_              = 0;
+  uint64_t eager_agg_pushdown_applied_ = 0;
 };
 
 /// \brief Resolve the per-connection Sirius state, or nullptr when Sirius has

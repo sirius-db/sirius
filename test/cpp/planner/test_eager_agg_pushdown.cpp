@@ -30,147 +30,42 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/plan_shape_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <duckdb/main/config.hpp>
-#include <duckdb/optimizer/optimizer.hpp>
-#include <duckdb/parser/parser.hpp>
-#include <duckdb/planner/planner.hpp>
-#include <unistd.h>
+#include <duckdb/planner/operator/logical_aggregate.hpp>
 
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
-#include <sstream>
 #include <string>
-#include <vector>
 
 using namespace duckdb;
 
 using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
+using sirius::test::count_ops;
+using sirius::test::find_first;
+using sirius::test::find_first_logical;
+using sirius::test::generate_optimized_logical_plan;
+using sirius::test::generate_sirius_plan;
+using sirius::test::scoped_setting;
+using sirius::test::scoped_temp_db_path;
+using sirius::test::tree_to_string;
+
 namespace {
 
-/// RAII environment variable override.
-struct scoped_env {
-  scoped_env(const char* name, const char* value) : _name(name) { setenv(name, value, 1); }
-  ~scoped_env() { unsetenv(_name); }
-  scoped_env(const scoped_env&)            = delete;
-  scoped_env& operator=(const scoped_env&) = delete;
-
- private:
-  const char* _name;
-};
-
-class scoped_temp_db_path {
- public:
-  scoped_temp_db_path()
-  {
-    char tmpl[] = "/tmp/sirius_eager_agg_pushdown_XXXXXX";
-    int fd      = ::mkstemp(tmpl);
-    REQUIRE(fd >= 0);
-    ::close(fd);
-    ::unlink(tmpl);
-    _path = tmpl;
-  }
-
-  ~scoped_temp_db_path()
-  {
-    if (!_path.empty()) {
-      std::remove(_path.c_str());
-      std::remove((_path + ".wal").c_str());
-    }
-  }
-
-  scoped_temp_db_path(const scoped_temp_db_path&)            = delete;
-  scoped_temp_db_path& operator=(const scoped_temp_db_path&) = delete;
-
-  const std::string& path() const { return _path; }
-
- private:
-  std::string _path;
-};
-
-/// Parse + bind + optimize, then hand the UNRESOLVED optimized plan to
-/// create_plan — the same shape the transparent capture path provides (the
-/// eager-agg pass matches bound column refs, which ColumnBindingResolver would
-/// have rewritten away; create_plan resolves them itself).
-duckdb::unique_ptr<sirius_physical_operator> generate_sirius_plan(Connection& con,
-                                                                  const std::string& query)
+/// Locate the optimizer's upper aggregate — the node the pass matches on. The
+/// default plan_generation_options are exactly this suite's: plain optimizer
+/// output with the bindings left UNRESOLVED, the same shape the transparent
+/// capture path hands create_plan.
+LogicalAggregate& require_upper_aggregate(LogicalOperator& logical)
 {
-  auto& context = *con.context;
-
-  con.Query("BEGIN TRANSACTION");
-  duckdb::unique_ptr<sirius_physical_operator> result;
-  try {
-    Parser parser(context.GetParserOptions());
-    parser.ParseQuery(query);
-    REQUIRE(parser.statements.size() == 1);
-
-    Planner planner(context);
-    planner.CreatePlan(std::move(parser.statements[0]));
-    REQUIRE(planner.plan);
-
-    Optimizer optimizer(*planner.binder, context);
-    auto plan = optimizer.Optimize(std::move(planner.plan));
-
-    sirius::planner::sirius_physical_plan_generator gen(context);
-    result = gen.create_plan(std::move(plan));
-  } catch (...) {
-    con.Query("ROLLBACK");
-    throw;
-  }
-  con.Query("COMMIT");
-  return result;
-}
-
-template <typename Fn>
-void for_each_operator(sirius_physical_operator* root, const Fn& fn)
-{
-  if (!root) { return; }
-  fn(root);
-  for (auto& child : root->children) {
-    for_each_operator(child.get(), fn);
-  }
-}
-
-std::size_t count_ops(sirius_physical_operator* root, SiriusPhysicalOperatorType type)
-{
-  std::size_t count = 0;
-  for_each_operator(root, [&](sirius_physical_operator* op) {
-    if (op->type == type) { count++; }
-  });
-  return count;
-}
-
-sirius_physical_operator* find_first(sirius_physical_operator* root,
-                                     SiriusPhysicalOperatorType type)
-{
-  sirius_physical_operator* found = nullptr;
-  for_each_operator(root, [&](sirius_physical_operator* op) {
-    if (found == nullptr && op->type == type) { found = op; }
-  });
-  return found;
-}
-
-void tree_to_string(sirius_physical_operator* root, int depth, std::ostringstream& out)
-{
-  if (!root) { return; }
-  out << std::string(static_cast<size_t>(depth) * 2, ' ')
-      << sirius::op::SiriusPhysicalOperatorToString(root->type) << "\n";
-  for (auto& child : root->children) {
-    tree_to_string(child.get(), depth + 1, out);
-  }
-}
-
-std::string tree_to_string(sirius_physical_operator* root)
-{
-  std::ostringstream out;
-  tree_to_string(root, 0, out);
-  return out.str();
+  auto* found = find_first_logical(&logical, LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY);
+  REQUIRE(found != nullptr);
+  return found->Cast<LogicalAggregate>();
 }
 
 struct eager_agg_pushdown_fixture {
@@ -195,6 +90,10 @@ struct eager_agg_pushdown_fixture {
     con->Query("INSERT INTO cust SELECT range, range % 2 FROM range(20)");
     con->Query("CREATE TABLE ord (o_cid INTEGER, o_grp INTEGER, o_key INTEGER, o_val INTEGER)");
     con->Query("INSERT INTO ord SELECT range % 20, range % 2, range, range * 3 FROM range(200)");
+    // Same shape, but the join key is a PRIMARY KEY: pre-aggregating it cannot
+    // reduce anything, so the benefit gate must decline.
+    con->Query("CREATE TABLE ordpk (p_id INTEGER PRIMARY KEY, p_val INTEGER)");
+    con->Query("INSERT INTO ordpk SELECT range, range * 3 FROM range(20)");
   }
 
   ~eager_agg_pushdown_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
@@ -224,7 +123,7 @@ struct eager_agg_pushdown_fixture {
   }
 
   // Declared before db/con so the backing file outlives the database.
-  scoped_temp_db_path _db_path;
+  scoped_temp_db_path _db_path{"sirius_eager_agg_pushdown"};
   std::unique_ptr<DuckDB> db;
   std::unique_ptr<Connection> con;
 };
@@ -242,7 +141,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - fires on the q13 shape (LEFT join + grouped COUNT)",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   require_fired(kQ13Inner);
 }
 
@@ -250,7 +148,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - fires with a RIGHT join (DuckDB's flipped q13 plan)",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   require_fired("SELECT c_id, count(o_key) FROM ord RIGHT JOIN cust ON o_cid = c_id GROUP BY c_id");
 }
 
@@ -258,17 +155,45 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - fires on INNER joins and SUM/MIN/MAX",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   require_fired(
     "SELECT c_id, sum(o_val), min(o_val), max(o_val) FROM cust JOIN ord ON c_id = o_cid "
     "GROUP BY c_id");
 }
 
 TEST_CASE_METHOD(eager_agg_pushdown_fixture,
+                 "eager agg pushdown - fires through a pass-through projection above the join",
+                 "[eager_agg_pushdown][isolated_context]")
+{
+  // The pass's projection tracing (trace_to_join_output + the kept_slots /
+  // slot_remap / partial_base rewrite) only runs when a pure column-ref
+  // PROJECTION actually sits between the aggregate and the join. The direct
+  // `cust JOIN ord ... GROUP BY c_id` shapes above do NOT get one on this DuckDB
+  // version — the explicit sub-select below does — so assert that input shape
+  // here: if DuckDB stops inserting the projection, this fails loudly instead of
+  // quietly turning the tracing into dead code.
+  const std::string query =
+    "SELECT c_id, sum(o_val) FROM ("
+    "  SELECT c_id, o_val FROM cust JOIN ord ON c_id = o_cid) GROUP BY c_id";
+
+  auto logical    = generate_optimized_logical_plan(*con, query);
+  auto& aggregate = require_upper_aggregate(*logical);
+  INFO(logical->ToString());
+  REQUIRE(aggregate.children.size() == 1);
+  auto& pass_through = *aggregate.children[0];
+  REQUIRE(pass_through.type == LogicalOperatorType::LOGICAL_PROJECTION);
+  for (auto& slot : pass_through.expressions) {
+    CHECK(slot->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF);
+  }
+  REQUIRE(pass_through.children.size() == 1);
+  REQUIRE(pass_through.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
+
+  require_fired(query);
+}
+
+TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - fires on multi-key equi joins",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   require_fired(
     "SELECT c_id, count(o_key) FROM cust LEFT JOIN ord ON c_id = o_cid AND c_grp = o_grp "
     "GROUP BY c_id");
@@ -278,7 +203,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - fires on the full q13 (nested second GROUP BY)",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   // Two aggregates in the baseline plan (inner per-customer count + outer
   // histogram); the rewrite adds a third below the join.
   require_fired(
@@ -296,7 +220,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - refuses non-decomposable or decorated aggregates",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   SECTION("count(*) counts join rows, not pushed-side rows")
   {
     require_refused("SELECT c_id, count(*) FROM cust LEFT JOIN ord ON c_id = o_cid GROUP BY c_id");
@@ -330,7 +253,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - refuses when references would escape the pushed side",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   SECTION("group key on the pushed side")
   {
     require_refused("SELECT o_grp, count(o_key) FROM cust JOIN ord ON c_id = o_cid GROUP BY o_grp");
@@ -340,13 +262,50 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
     require_refused(
       "SELECT c_id, count(o_key), sum(c_grp) FROM cust JOIN ord ON c_id = o_cid GROUP BY c_id");
   }
+  SECTION("pass-through projection slot is not a plain column ref")
+  {
+    // Same sub-select shape as the pass-through fire test, but one slot is a
+    // computed expression: the matcher refuses the whole projection rather than
+    // trace through it.
+    const std::string query =
+      "SELECT c_id, sum(v) FROM ("
+      "  SELECT c_id, o_val * 2 AS v FROM cust JOIN ord ON c_id = o_cid) GROUP BY c_id";
+
+    auto logical    = generate_optimized_logical_plan(*con, query);
+    auto& aggregate = require_upper_aggregate(*logical);
+    INFO(logical->ToString());
+    REQUIRE(aggregate.children.size() == 1);
+    auto& pass_through = *aggregate.children[0];
+    REQUIRE(pass_through.type == LogicalOperatorType::LOGICAL_PROJECTION);
+    bool has_computed_slot = false;
+    for (auto& slot : pass_through.expressions) {
+      has_computed_slot =
+        has_computed_slot || slot->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF;
+    }
+    CHECK(has_computed_slot);
+
+    require_refused(query);
+  }
+}
+
+TEST_CASE_METHOD(eager_agg_pushdown_fixture,
+                 "eager agg pushdown - refuses to pre-aggregate an outer join's preserved side",
+                 "[eager_agg_pushdown][isolated_context]")
+{
+  // The aggregate reads the PRESERVED side (cust), so cust would be the pushed
+  // side: pre-aggregating it would collapse preserved rows that the outer join
+  // must emit one by one. DuckDB flips this into `ord RIGHT JOIN cust`, which
+  // the RIGHT mirror of the gate refuses; every other gate passes (the group key
+  // sits on the non-pushed side, the non-pushed side is a bare scan, and c_id is
+  // not a primary key).
+  require_refused(
+    "SELECT o_grp, sum(c_grp) FROM cust LEFT JOIN ord ON c_id = o_cid GROUP BY o_grp");
 }
 
 TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - refuses unsupported join shapes",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   SECTION("FULL OUTER join")
   {
     require_refused(
@@ -369,7 +328,6 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - refuses ungrouped aggregates",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
   auto plan =
     generate_sirius_plan(*con, "SELECT count(o_key) FROM cust LEFT JOIN ord ON c_id = o_cid");
   INFO(tree_to_string(plan.get()));
@@ -381,21 +339,39 @@ TEST_CASE_METHOD(eager_agg_pushdown_fixture,
 //===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(eager_agg_pushdown_fixture,
-                 "eager agg pushdown - estimate ratio gate is honored",
+                 "eager agg pushdown - benefit gate refuses a filtered non-pushed side",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  // Plans generated directly (not via the transparent capture copy) carry
-  // optimizer cardinality estimates, so the ratio branch decides. An
-  // unattainable threshold must refuse the otherwise-provable q13 shape.
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "1000000000");
-  require_refused(kQ13Inner);
+  // The preserved side carries a table filter, so the join is expected to throw
+  // most pre-aggregated groups away: the heuristic declines.
+  require_refused(
+    "SELECT c_id, count(o_key) FROM cust LEFT JOIN ord ON c_id = o_cid WHERE c_grp = 1 "
+    "GROUP BY c_id");
+}
+
+TEST_CASE_METHOD(eager_agg_pushdown_fixture,
+                 "eager agg pushdown - force setting bypasses the benefit gate",
+                 "[eager_agg_pushdown][isolated_context]")
+{
+  scoped_setting force(*con, "eager_agg_pushdown_force", "true");
+  require_fired(
+    "SELECT c_id, count(o_key) FROM cust LEFT JOIN ord ON c_id = o_cid WHERE c_grp = 1 "
+    "GROUP BY c_id");
+}
+
+TEST_CASE_METHOD(eager_agg_pushdown_fixture,
+                 "eager agg pushdown - benefit gate refuses a provably unique pushed key",
+                 "[eager_agg_pushdown][isolated_context]")
+{
+  // ordpk's join key is its PRIMARY KEY, so the lower aggregate would emit one
+  // row per input row — a full partition + merge that reduces nothing.
+  require_refused("SELECT c_id, sum(p_val) FROM cust JOIN ordpk ON c_id = p_id GROUP BY c_id");
 }
 
 TEST_CASE_METHOD(eager_agg_pushdown_fixture,
                  "eager agg pushdown - kill switch disables the pass",
                  "[eager_agg_pushdown][isolated_context]")
 {
-  scoped_env ratio("SIRIUS_EAGER_AGG_MIN_RATIO", "0");
-  scoped_env off("SIRIUS_EAGER_AGG_PUSHDOWN", "0");
+  scoped_setting off(*con, "enable_eager_agg_pushdown", "false");
   require_refused(kQ13Inner);
 }

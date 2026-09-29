@@ -29,6 +29,8 @@ sirius:
     dynamic_filter_domain_coverage_threshold: 0.8
     dynamic_filter_keep_threshold: 0.7
     enable_pinned_zone_map_pruning: false
+    enable_eager_agg_pushdown: false
+    eager_agg_pushdown_force: true
     enable_compressed_materialization: false
   compression:
     enable_pin_table_compression: true

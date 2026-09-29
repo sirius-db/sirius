@@ -95,6 +95,7 @@ sirius:
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    enable_eager_agg_pushdown: true       # pre-aggregate one equi-join side below the join
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -393,6 +394,7 @@ individually.
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Positive finite threshold for skipping publication when the build covers at least this fraction of the key's domain; ≥ 1.0 effectively disables the gate. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `enable_eager_agg_pushdown` | true | Master switch for eager aggregation pushdown: when a grouped aggregate sits on an equi-join and every aggregate input comes from one side, pre-aggregate that side by its join keys below the join and combine the partials above it. Only provable shapes are rewritten, and planning falls back to the original plan if the rewritten one fails any later stage. |
 
 **Note:** `max_build_hash_table_bytes` can be larger than `concat_batch_bytes`. When it is, the partition operator configures CONCAT to concatenate all batches, enabling the more efficient BUILD_PROBE join mode for larger build sides. Other joins (STANDARD, MIXED) still use `concat_batch_bytes` as the batch size threshold.
 
@@ -585,6 +587,22 @@ envelopes can override either behavior in YAML under `sirius.operator_params`.
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
+
+### Eager Aggregation Pushdown
+
+The planner's eager-aggregation-pushdown pass is automatic and enabled by default.
+The kill switch is also settable in YAML under `sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_eager_agg_pushdown` | true | Master switch for eager aggregation pushdown. When off, the pass never fires and plans are built exactly as before. |
+| `eager_agg_pushdown_force` | false | TEST ONLY: bypass the pass's benefit heuristic so an A/B run can measure shapes it declines. The correctness gates always apply. |
+
+See [optimizations.md](optimizations.md) → Eager Aggregation Pushdown for the rewrite
+shape and the full gate list.
+
+`eager_agg_pushdown_force` is registered only when the process explicitly enables Sirius
+test options (`SIRIUS_ENABLE_TEST_OPTIONS=1`); it is not part of the normal user surface.
 
 ### Pinned Tables
 

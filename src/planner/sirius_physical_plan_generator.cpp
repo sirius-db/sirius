@@ -1059,9 +1059,28 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
   // the rewrite is applied to a COPY, and if the rewritten plan fails ANY
   // later planning stage we fall back to the untouched original — the query
   // then behaves exactly as if the pass did not exist.
-  if (auto rewritten = planner::try_eager_aggregation_pushdown(*op, context)) {
+  auto rewrite = planner::try_eager_aggregation_pushdown(*op, context);
+  if (rewrite.plan) {
+    // The first attempt runs on a SCRATCH generator, never on `this`.
+    // create_plan_stages is not idempotent: it registers dynamic-filter
+    // producers on channels keyed by DynamicTableFilterSet pointers that
+    // copy_logical_plan deliberately SHARES with the original plan, hands out
+    // delim indexes, and records CTE tables and dependencies. Retrying on a
+    // generator that kept the abandoned attempt's state would leave phantom
+    // producers behind (widening probe-scan carriers for a filter nobody
+    // publishes) and could flip range-join planning via a stale
+    // recursive_cte_tables entry. A scratch generator makes the failure path
+    // leave `this` byte-identical to never having tried.
+    sirius_physical_plan_generator scratch(context);
     try {
-      return create_plan_stages(std::move(rewritten));
+      auto plan = scratch.create_plan_stages(std::move(rewrite.plan));
+      adopt_state_from(scratch);
+      // Only now is the rewrite committed: a rewritten plan that dies in
+      // create_plan_stages must not register as applied.
+      if (auto state = duckdb::get_sirius_connection_state(context)) {
+        state->record_eager_agg_pushdown_applied(rewrite.applied);
+      }
+      return plan;
     } catch (std::exception& e) {
       SIRIUS_LOG_INFO(
         "Eager aggregation pushdown: rewritten plan failed physical planning ({}); "
@@ -1070,6 +1089,18 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
     }
   }
   return create_plan_stages(std::move(op));
+}
+
+void sirius_physical_plan_generator::adopt_state_from(sirius_physical_plan_generator& other)
+{
+  // create_plan(unique_ptr) is the single entry point and runs once per
+  // generator, so `this` is still pristine here and a move is exactly right.
+  dependencies            = std::move(other.dependencies);
+  recursive_cte_tables    = std::move(other.recursive_cte_tables);
+  recurring_cte_tables    = std::move(other.recurring_cte_tables);
+  materialized_ctes       = std::move(other.materialized_ctes);
+  dynamic_filter_channels = std::move(other.dynamic_filter_channels);
+  delim_index             = other.delim_index;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>

@@ -135,9 +135,14 @@ class sirius_physical_plan_generator {
  protected:
   //! The actual planning stages (type resolution, column binding, physical operator
   //! generation, plan passes). create_plan() runs these on the eager-agg-rewritten copy
-  //! first and again on the original plan if that attempt throws.
+  //! first — on a throwaway generator, since the stages are not idempotent — and again on
+  //! the original plan, on this generator, if that attempt throws.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan_stages(
     duckdb::unique_ptr<duckdb::LogicalOperator> logical);
+
+  //! Take over the planning state (dynamic-filter channels, CTE tables, dependencies, delim
+  //! indexes) accumulated by a throwaway generator whose create_plan_stages succeeded.
+  void adopt_state_from(sirius_physical_plan_generator& other);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 

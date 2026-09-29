@@ -166,6 +166,16 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Eager aggregation pushdown (Yan & Larson): pre-aggregate one side of an equi-join by its
+  /// join keys below the join and combine the partials above it, when the rewrite is provable at
+  /// plan time. On by default; the master switch for the pass
+  /// (src/planner/eager_agg_pushdown_plan_pass.cpp).
+  bool enable_eager_agg_pushdown = true;
+
+  /// Bypass the pass's BENEFIT heuristic (the correctness gates always apply), so an A/B run can
+  /// measure shapes the heuristic declines. Test-only; never relax this in production.
+  bool eager_agg_pushdown_force = false;
 };
 
 struct telemetry_config {
