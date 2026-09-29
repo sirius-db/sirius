@@ -23,10 +23,12 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -40,6 +42,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -100,9 +103,7 @@ std::optional<topk_delim_match> match_topk_delim_join(duckdb::LogicalComparisonJ
   }
 
   auto const& cond = op.conditions[0];
-  if (cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-    return std::nullopt;
-  }
+  if (cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { return std::nullopt; }
   auto const lhs = as_float_array_ref(*cond.left);
   auto const rhs = as_float_array_ref(*cond.right);
   if (!lhs || !rhs || lhs->second != rhs->second) { return std::nullopt; }
@@ -188,8 +189,10 @@ std::optional<topk_subquery_match> match_topk_subquery(duckdb::LogicalOperator& 
   if (node->children.size() != 2) { return std::nullopt; }
 
   // Exactly one side is the DELIM_GET; the other is the right table's subtree.
-  bool const delim_first  = node->children[0]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET;
-  bool const delim_second = node->children[1]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET;
+  bool const delim_first =
+    node->children[0]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET;
+  bool const delim_second =
+    node->children[1]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET;
   if (delim_first == delim_second) { return std::nullopt; }
   m.delim_get_child_idx = delim_first ? 0 : 1;
   m.right_child_idx     = 1 - m.delim_get_child_idx;
@@ -200,8 +203,8 @@ std::optional<topk_subquery_match> match_topk_subquery(duckdb::LogicalOperator& 
 //! What the top-k join computes, read off the matched subquery.
 struct topk_params {
   std::int64_t k;
-  std::string metric;              // "l2" or "cosine"
-  bool is_similarity;              // ranking keeps the largest values (arg_max) instead of smallest
+  std::string metric;  // "l2" or "cosine"
+  bool is_similarity;  // ranking keeps the largest values (arg_max) instead of smallest
   std::size_t right_vector_col_idx;  // within the right table subtree's output
   std::size_t distance_col_idx;      // the distance column within distance_projection's output
 };
@@ -224,7 +227,8 @@ std::optional<topk_params> extract_topk_params(const topk_subquery_match& m, std
   // k is the third argument; the 2-argument form is k = 1 and has no UNNEST above it.
   std::int64_t k = 1;
   if (aggr.children.size() == 3) {
-    if (!m.unnest || aggr.children[2]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+    if (!m.unnest ||
+        aggr.children[2]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return std::nullopt;
     }
     auto const& k_val = aggr.children[2]->Cast<duckdb::BoundConstantExpression>().value;
@@ -246,7 +250,7 @@ std::optional<topk_params> extract_topk_params(const topk_subquery_match& m, std
       projected[dist_idx]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
     return std::nullopt;
   }
-  auto const& func = projected[dist_idx]->Cast<duckdb::BoundFunctionExpression>();
+  auto const& func  = projected[dist_idx]->Cast<duckdb::BoundFunctionExpression>();
   auto const metric = metric_of(func.function.name);
   if (!metric || func.children.size() != 2) { return std::nullopt; }
   // Nearest means smallest distance or largest similarity; the opposite is a farthest-k query.
@@ -381,7 +385,9 @@ std::optional<topk_output_col> trace_subquery_col(const topk_subquery_match& m,
   if (col >= right_lo && col < right_lo + right_cols) {
     return topk_output_col{topk_output_col::source::right, col - right_lo};
   }
-  if (col == delim_lo) { return topk_output_col{topk_output_col::source::left, left_vector_col_idx}; }
+  if (col == delim_lo) {
+    return topk_output_col{topk_output_col::source::left, left_vector_col_idx};
+  }
   return std::nullopt;
 }
 
@@ -397,7 +403,9 @@ std::optional<std::vector<topk_output_col>> trace_output_cols(duckdb::LogicalCom
     auto const n    = op.children[child]->GetColumnBindings().size();
     std::vector<std::size_t> cols;
     if (map.empty()) {
-      for (std::size_t i = 0; i < n; ++i) { cols.push_back(i); }
+      for (std::size_t i = 0; i < n; ++i) {
+        cols.push_back(i);
+      }
     } else {
       cols.assign(map.begin(), map.end());
     }
@@ -414,16 +422,102 @@ std::optional<std::vector<topk_output_col>> trace_output_cols(duckdb::LogicalCom
   return out;
 }
 
+//! A global top-k vector join as DuckDB plans `SELECT ... FROM l, r ORDER BY dist LIMIT k`:
+//! TOP_N over a PROJECTION that computes the distance over a CROSS_PRODUCT of the two tables.
+//! When the distance is reused, common-subexpression elimination computes it once in that bottom
+//! projection and adds projections above it that pass it through.
+struct global_topk_match {
+  std::vector<duckdb::LogicalProjection*> projections;  // top first; the last computes the distance
+  duckdb::LogicalOperator* cross_product;
+  std::size_t distance_col;          // the ranking column within the bottom projection's output
+  std::size_t left_vector_col_idx;   // within cross_product->children[0]'s output
+  std::size_t right_vector_col_idx;  // within cross_product->children[1]'s output
+  std::int64_t dim;
+  std::string metric;
+  bool is_similarity;
+  std::int64_t k;
+};
+
+std::optional<global_topk_match> match_global_topk(duckdb::LogicalTopN& op)
+{
+  if (op.orders.size() != 1 || op.offset != 0 || op.limit < 1 || op.children.size() != 1) {
+    return std::nullopt;
+  }
+  std::vector<duckdb::LogicalProjection*> projections;
+  duckdb::LogicalOperator* node = op.children[0].get();
+  while (node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    projections.push_back(&node->Cast<duckdb::LogicalProjection>());
+    node = node->children[0].get();
+  }
+  if (projections.empty() || node->type != duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
+      node->children.size() != 2) {
+    return std::nullopt;
+  }
+  auto& cross = *node;
+  auto& proj  = *projections.back();
+
+  // The ORDER BY key must reach the bottom projection's distance/similarity column, passed
+  // through unchanged by any projections above it.
+  auto const& order = op.orders[0];
+  if (order.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+    return std::nullopt;
+  }
+  auto dist_col = order.expression->Cast<duckdb::BoundReferenceExpression>().index;
+  for (std::size_t i = 0; i + 1 < projections.size(); ++i) {
+    auto const& exprs = projections[i]->expressions;
+    if (dist_col >= exprs.size() ||
+        exprs[dist_col]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+      return std::nullopt;
+    }
+    dist_col = exprs[dist_col]->Cast<duckdb::BoundReferenceExpression>().index;
+  }
+  if (dist_col >= proj.expressions.size() ||
+      proj.expressions[dist_col]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
+    return std::nullopt;
+  }
+  auto const& func  = proj.expressions[dist_col]->Cast<duckdb::BoundFunctionExpression>();
+  auto const metric = metric_of(func.function.name);
+  if (!metric || func.children.size() != 2) { return std::nullopt; }
+  // Nearest means ascending distance or descending similarity.
+  auto const nearest_order =
+    metric->second ? duckdb::OrderType::DESCENDING : duckdb::OrderType::ASCENDING;
+  if (order.type != nearest_order) { return std::nullopt; }
+
+  // One argument from each side of the cross product (output is [left cols..., right cols...]).
+  auto const n_left = cross.children[0]->GetColumnBindings().size();
+  std::optional<std::pair<std::size_t, std::int64_t>> left_vec, right_vec;
+  for (auto const& arg : func.children) {
+    auto const ref = as_float_array_ref(*arg);
+    if (!ref) { return std::nullopt; }
+    if (ref->first < n_left) {
+      left_vec = ref;
+    } else {
+      right_vec = std::make_pair(ref->first - n_left, ref->second);
+    }
+  }
+  if (!left_vec || !right_vec || left_vec->second != right_vec->second) { return std::nullopt; }
+
+  return global_topk_match{std::move(projections),
+                           &cross,
+                           dist_col,
+                           left_vec->first,
+                           right_vec->first,
+                           left_vec->second,
+                           metric->first,
+                           metric->second,
+                           static_cast<std::int64_t>(op.limit)};
+}
+
 }  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalComparisonJoin& op)
+sirius_physical_plan_generator::try_plan_vector_perrow_topk_join(duckdb::LogicalComparisonJoin& op)
 {
   auto match = match_topk_delim_join(op);
   if (!match) { return nullptr; }
 
   SIRIUS_LOG_DEBUG(
-    "[vector_topk_join] matched delim join: left_child={} subquery_child={} left_vec_col={} "
+    "[vector_perrow_topk_join] matched delim join: left_child={} subquery_child={} left_vec_col={} "
     "subquery_vec_col={} dim={} join_type={}",
     match->left_child_idx,
     match->subquery_child_idx,
@@ -434,11 +528,12 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
 
   auto sub = match_topk_subquery(*op.children[match->subquery_child_idx]);
   if (!sub) {
-    SIRIUS_LOG_DEBUG("[vector_topk_join] subquery is not the top-k shape; using generic delim join");
+    SIRIUS_LOG_DEBUG(
+      "[vector_perrow_topk_join] subquery is not the top-k shape; using generic delim join");
     return nullptr;
   }
   SIRIUS_LOG_DEBUG(
-    "[vector_topk_join] matched subquery: top_projections={} unnest={} aggregate={} "
+    "[vector_perrow_topk_join] matched subquery: top_projections={} unnest={} aggregate={} "
     "inner_join={} delim_get_child={} right_child={}",
     sub->top_projections.size(),
     sub->unnest != nullptr,
@@ -449,11 +544,13 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
 
   auto params = extract_topk_params(*sub, match->dim);
   if (!params) {
-    SIRIUS_LOG_DEBUG("[vector_topk_join] unsupported ranking or k; using generic delim join");
+    SIRIUS_LOG_DEBUG(
+      "[vector_perrow_topk_join] unsupported ranking or k; using generic delim join");
     return nullptr;
   }
   SIRIUS_LOG_DEBUG(
-    "[vector_topk_join] params: k={} metric={} similarity={} right_vec_col={} distance_col={}",
+    "[vector_perrow_topk_join] params: k={} metric={} similarity={} right_vec_col={} "
+    "distance_col={}",
     params->k,
     params->metric,
     params->is_similarity,
@@ -462,7 +559,8 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
 
   auto output_cols = trace_output_cols(op, *match, *sub, *params);
   if (!output_cols) {
-    SIRIUS_LOG_DEBUG("[vector_topk_join] could not trace output columns; using generic delim join");
+    SIRIUS_LOG_DEBUG(
+      "[vector_perrow_topk_join] could not trace output columns; using generic delim join");
     return nullptr;
   }
   std::string layout;
@@ -474,17 +572,18 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
       case topk_output_col::source::distance: layout += "D"; break;
     }
   }
-  SIRIUS_LOG_DEBUG("[vector_topk_join] output columns: [{}]", layout);
+  SIRIUS_LOG_DEBUG("[vector_perrow_topk_join] output columns: [{}]", layout);
 
   // The merge stage (cuVS knn_merge_parts) caps k.
   if (params->k > vss::KNN_MERGE_MAX_K) {
-    SIRIUS_LOG_DEBUG("[vector_topk_join] k={} exceeds the merge limit; using generic delim join",
-                     params->k);
+    SIRIUS_LOG_DEBUG(
+      "[vector_perrow_topk_join] k={} exceeds the merge limit; using generic delim join",
+      params->k);
     return nullptr;
   }
 
-  auto left_plan  = create_plan(*op.children[match->left_child_idx]);
-  auto right_plan = create_plan(*sub->inner_join->children[sub->right_child_idx]);
+  auto left_plan     = create_plan(*op.children[match->left_child_idx]);
+  auto right_plan    = create_plan(*sub->inner_join->children[sub->right_child_idx]);
   auto const n_left  = left_plan->get_types().size();
   auto const n_right = right_plan->get_types().size();
 
@@ -495,17 +594,17 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
                       : nullptr;
   if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
 
-  auto join = duckdb::make_uniq<sirius::op::sirius_physical_vector_topk_join>(
-    std::move(left_plan),
-    std::move(right_plan),
-    match->left_vector_col_idx,
-    params->right_vector_col_idx,
-    params->k,
-    params->metric,
-    params->is_similarity,
-    match->dim,
-    match->join_type,
-    op.estimated_cardinality);
+  auto join =
+    duckdb::make_uniq<sirius::op::sirius_physical_vector_topk_join>(std::move(left_plan),
+                                                                    std::move(right_plan),
+                                                                    match->left_vector_col_idx,
+                                                                    params->right_vector_col_idx,
+                                                                    params->k,
+                                                                    params->metric,
+                                                                    params->is_similarity,
+                                                                    match->dim,
+                                                                    match->join_type,
+                                                                    op.estimated_cardinality);
   // The join finds each left row's top-k within every right batch; the merge combines them.
   auto merge = duckdb::make_uniq<sirius::op::sirius_physical_vector_topk_merge>(
     *join, op_params.concat_batch_bytes);
@@ -525,6 +624,83 @@ sirius_physical_plan_generator::try_plan_vector_topk_join(duckdb::LogicalCompari
                          sirius::from_duckdb_vec(op.types),
                          std::move(select_list),
                          op.estimated_cardinality);
+}
+
+}  // namespace sirius::planner
+
+namespace sirius::planner {
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::LogicalTopN& op)
+{
+  auto match = match_global_topk(op);
+  if (!match) { return nullptr; }
+  SIRIUS_LOG_DEBUG(
+    "[vector_global_topk_join] matched: k={} metric={} similarity={} distance_col={} "
+    "left_vec_col={} right_vec_col={} dim={} dynamic_filter={}",
+    match->k,
+    match->metric,
+    match->is_similarity,
+    match->distance_col,
+    match->left_vector_col_idx,
+    match->right_vector_col_idx,
+    match->dim,
+    op.dynamic_filter != nullptr);
+
+  auto& proj         = *match->projections.back();
+  auto& cross        = *match->cross_product;
+  auto left_plan     = create_plan(*cross.children[0]);
+  auto right_plan    = create_plan(*cross.children[1]);
+  auto const n_left  = left_plan->get_types().size();
+  auto const n_right = right_plan->get_types().size();
+
+  auto join =
+    duckdb::make_uniq<sirius::op::sirius_physical_vector_topk_join>(std::move(left_plan),
+                                                                    std::move(right_plan),
+                                                                    match->left_vector_col_idx,
+                                                                    match->right_vector_col_idx,
+                                                                    match->k,
+                                                                    match->metric,
+                                                                    match->is_similarity,
+                                                                    match->dim,
+                                                                    duckdb::JoinType::INNER,
+                                                                    cross.estimated_cardinality,
+                                                                    sirius::op::topk_scope::global);
+
+  // The join emits [left cols, right cols, ranking], the cross product's layout plus one column,
+  // so the projection only needs its distance calls pointed at that column.
+  auto const& distance = *proj.expressions[match->distance_col];
+  std::function<void(duckdb::unique_ptr<duckdb::Expression>&)> use_ranking_column =
+    [&](duckdb::unique_ptr<duckdb::Expression>& expr) {
+      if (expr->Equals(distance)) {
+        expr =
+          duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->return_type, n_left + n_right);
+        return;
+      }
+      duckdb::ExpressionIterator::EnumerateChildren(*expr, use_ranking_column);
+    };
+  // Rebuild the projections bottom-up; only the bottom one computes the distance.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = std::move(join);
+  for (auto it = match->projections.rbegin(); it != match->projections.rend(); ++it) {
+    auto& p     = **it;
+    bool bottom = &p == &proj;
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    for (auto const& e : p.expressions) {
+      auto rewritten = e->Copy();
+      if (bottom) { use_ranking_column(rewritten); }
+      auto node = sirius::ast::from_duckdb(*rewritten);
+      if (!node) {
+        throw duckdb::NotImplementedException(
+          "Unsupported expression in vector global top-k projection: " + e->ToString());
+      }
+      select_list.push_back(std::move(node));
+    }
+    plan = push_projection(std::move(plan),
+                           sirius::from_duckdb_vec(p.types),
+                           std::move(select_list),
+                           p.estimated_cardinality);
+  }
+  return plan;
 }
 
 }  // namespace sirius::planner

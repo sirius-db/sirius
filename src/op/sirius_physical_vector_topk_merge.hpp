@@ -38,8 +38,9 @@ class sirius_physical_vector_topk_merge : public sirius_physical_partition_consu
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_TOPK_MERGE;
 
-  sirius_physical_vector_topk_merge(const sirius_physical_vector_topk_join& join,
-                                    uint64_t batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
+  sirius_physical_vector_topk_merge(
+    const sirius_physical_vector_topk_join& join,
+    uint64_t batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);
 
   std::int64_t k;
   //! Ranked by cosine similarity: report `1 - cosine distance`.

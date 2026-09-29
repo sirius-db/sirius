@@ -158,4 +158,52 @@ TEST_CASE_METHOD(VectorTopkJoinFixture,
     "(SELECT r.id FROM r ORDER BY array_distance(l.v, r.v) LIMIT 3) rr");
 }
 
+// Global top-k: `FROM l, r ORDER BY dist LIMIT k` plans as TOP_N over a CROSS_PRODUCT and runs as
+// VECTOR_TOPK_JOIN (global scope) -> TOP_N -> MERGE_TOP_N.
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "gpu_execution global top-k join matches CPU",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  compare_gpu_vs_cpu("SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4");
+  compare_gpu_vs_cpu("SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 1");
+  // k larger than the number of pairs returns every pair.
+  compare_gpu_vs_cpu("SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 100");
+  compare_gpu_vs_cpu(
+    "SELECT l.id, r.id FROM l, r_empty r ORDER BY array_distance(l.v, r.v) LIMIT 4");
+  compare_gpu_vs_cpu(
+    "SELECT l.id, r.id FROM lc l, r ORDER BY array_cosine_distance(l.v, r.v) LIMIT 3");
+}
+
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "gpu_execution global top-k join returns the ranking value",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  compare_gpu_vs_cpu_approx(
+    "SELECT l.id, r.id, array_distance(l.v, r.v) AS distance FROM l, r ORDER BY distance LIMIT 5",
+    {2},
+    1e-5);
+  compare_gpu_vs_cpu_approx(
+    "SELECT l.id, r.id, array_cosine_similarity(l.v, r.v) AS s FROM lc l, r ORDER BY s DESC "
+    "LIMIT 3",
+    {2},
+    1e-5);
+  // The distance used inside a larger select expression.
+  compare_gpu_vs_cpu_approx(
+    "SELECT l.id, r.id, array_distance(l.v, r.v) * 2 AS twice FROM l, r "
+    "ORDER BY array_distance(l.v, r.v) LIMIT 5",
+    {2},
+    1e-5);
+}
+
+TEST_CASE_METHOD(VectorTopkJoinFixture,
+                 "global top-k shapes that are not taken over stay on CPU",
+                 "[integration][gpu_execution][join][vss][vector_topk]")
+{
+  // Farthest pairs and an OFFSET are not global nearest-neighbor queries.
+  expect_plan_fallback_matches_cpu(
+    "SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) DESC LIMIT 4");
+  expect_plan_fallback_matches_cpu(
+    "SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4 OFFSET 1");
+}
+
 }  // namespace

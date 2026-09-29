@@ -16,14 +16,14 @@
 
 #include "op/sirius_physical_vector_threshold_join.hpp"
 
+#include "cuda/vss/brute_force_threshold.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "cuda/vss/brute_force_threshold.hpp"
-#include "cuda/vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -77,8 +77,8 @@ sirius_physical_vector_threshold_join::sirius_physical_vector_threshold_join(
   children.push_back(std::move(right));
   auto const n_left  = children[0]->get_types().size();
   auto const n_right = children[1]->get_types().size();
-  auto const& join = op.Cast<duckdb::LogicalJoin>();
-  auto fill        = [](const duckdb::vector<duckdb::idx_t>& projection_map,
+  auto const& join   = op.Cast<duckdb::LogicalJoin>();
+  auto fill          = [](const duckdb::vector<duckdb::idx_t>& projection_map,
                  std::size_t n_cols,
                  duckdb::vector<std::size_t>& out) {
     if (projection_map.empty()) {
@@ -407,7 +407,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
     auto const n_left_sz = static_cast<std::size_t>(n_left);
     auto const n_right   = static_cast<std::size_t>(right.num_rows());
     auto const edge_cap  = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-    auto query_tile = std::max<std::size_t>(1, edge_cap / std::max<std::size_t>(1, n_right));
+    auto query_tile      = std::max<std::size_t>(1, edge_cap / std::max<std::size_t>(1, n_right));
     // Test hook
     if (const char* env = std::getenv("SIRIUS_VSS_QUERY_TILE_ROWS")) {
       auto const forced = std::strtoull(env, nullptr, 10);
@@ -421,9 +421,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
     for (std::size_t s = 0; s < n_left_sz; s += query_tile) {
       auto const qs      = std::min(query_tile, n_left_sz - s);
       auto const queries = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
-        queries_full.data_handle() + static_cast<int64_t>(s) * dim,
-        static_cast<int64_t>(qs),
-        dim);
+        queries_full.data_handle() + static_cast<int64_t>(s) * dim, static_cast<int64_t>(qs), dim);
       auto tj = vss::brute_force_threshold(res, dataset, queries, cutoff, metric_type, mr);
       if (tj.query_rows->size() == 0) { continue; }
 

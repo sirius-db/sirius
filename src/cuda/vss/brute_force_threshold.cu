@@ -27,8 +27,6 @@
 #include <raft/linalg/map.cuh>
 #include <raft/linalg/norm.cuh>
 
-#include <cuvs/distance/distance.hpp>
-
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
@@ -36,6 +34,8 @@
 #include <thrust/copy.h>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
+
+#include <cuvs/distance/distance.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -48,11 +48,8 @@ namespace {
 // Mirror of cuVS faiss_select::chooseTileSize, kept here so this wrapper depends
 // only on public headers. Same shape as brute_force_peak_scratch_bytes(): a row
 // tile sized by dimensionality, and a column tile capped to a fixed byte budget.
-void choose_tile_size(std::size_t m,
-                      std::size_t n,
-                      std::size_t d,
-                      std::size_t& tile_rows,
-                      std::size_t& tile_cols)
+void choose_tile_size(
+  std::size_t m, std::size_t n, std::size_t d, std::size_t& tile_rows, std::size_t& tile_cols)
 {
   constexpr std::size_t k512MiB = std::size_t{512} << 20;
   constexpr std::size_t k1GiB   = std::size_t{1} << 30;
@@ -98,20 +95,19 @@ template <typename T>
 std::unique_ptr<cudf::column> uvector_to_column(rmm::device_uvector<T>&& v, cudf::data_type dt)
 {
   auto const size = static_cast<cudf::size_type>(v.size());
-  return std::make_unique<cudf::column>(
-    dt, size, v.release(), rmm::device_buffer{}, 0);
+  return std::make_unique<cudf::column>(dt, size, v.release(), rmm::device_buffer{}, 0);
 }
 
 }  // namespace
 
 threshold_join_result brute_force_threshold(raft::device_resources const& res,
-                                           dataset_matrix_view dataset,
-                                           dataset_matrix_view queries,
-                                           float eps,
-                                           cuvs::distance::DistanceType metric,
-                                           rmm::device_async_resource_ref mr,
-                                           std::size_t tile_rows,
-                                           std::size_t tile_cols)
+                                            dataset_matrix_view dataset,
+                                            dataset_matrix_view queries,
+                                            float eps,
+                                            cuvs::distance::DistanceType metric,
+                                            rmm::device_async_resource_ref mr,
+                                            std::size_t tile_rows,
+                                            std::size_t tile_cols)
 {
   auto const stream = raft::resource::get_cuda_stream(res);
   auto const policy = raft::resource::get_thrust_policy(res);
@@ -145,9 +141,15 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
     auto d_mat = raft::make_device_matrix_view<const float, int64_t>(dataset.data_handle(), n, d);
     if (cosine) {
       raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
-        res, q_mat, raft::make_device_vector_view<float, int64_t>(q_norms.data(), m), raft::sqrt_op{});
+        res,
+        q_mat,
+        raft::make_device_vector_view<float, int64_t>(q_norms.data(), m),
+        raft::sqrt_op{});
       raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
-        res, d_mat, raft::make_device_vector_view<float, int64_t>(d_norms.data(), n), raft::sqrt_op{});
+        res,
+        d_mat,
+        raft::make_device_vector_view<float, int64_t>(d_norms.data(), n),
+        raft::sqrt_op{});
     } else {
       raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
         res, q_mat, raft::make_device_vector_view<float, int64_t>(q_norms.data(), m));
@@ -164,7 +166,7 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
   rmm::device_uvector<int64_t> out_n(0, stream, mr);
   rmm::device_uvector<float> out_dist(0, stream, mr);
   std::size_t out_size = 0;
-  auto const grow_to = [&](std::size_t need) {
+  auto const grow_to   = [&](std::size_t need) {
     if (need <= out_q.capacity()) return;
     std::size_t cap = std::max<std::size_t>(need, out_q.capacity() * 2);
     out_q.reserve(cap, stream);
@@ -207,8 +209,7 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
 
       auto const first = thrust::make_counting_iterator<int64_t>(0);
       auto* kept_end   = thrust::copy_if(
-        policy, first, first + static_cast<int64_t>(ntil), kept.data(),
-        [=] __device__(int64_t f) {
+        policy, first, first + static_cast<int64_t>(ntil), kept.data(), [=] __device__(int64_t f) {
           float v = td(f);
           return select_min ? v <= eps : v >= eps;
         });
@@ -227,22 +228,23 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
       auto* oq             = out_q.data() + base;
       auto* on             = out_n.data() + base;
       auto* od             = out_dist.data() + base;
-      thrust::for_each(
-        policy, thrust::make_counting_iterator<int64_t>(0),
-        thrust::make_counting_iterator<int64_t>(static_cast<int64_t>(tile_nnz)),
-        [=] __device__(int64_t t) {
-          int64_t f = kept_idx[t];
-          oq[t]     = i + (f / cs);  // local query-batch row
-          on[t]     = j + (f % cs);  // local dataset-batch row
-          od[t]     = td(f);
-        });
+      thrust::for_each(policy,
+                       thrust::make_counting_iterator<int64_t>(0),
+                       thrust::make_counting_iterator<int64_t>(static_cast<int64_t>(tile_nnz)),
+                       [=] __device__(int64_t t) {
+                         int64_t f = kept_idx[t];
+                         oq[t]     = i + (f / cs);  // local query-batch row
+                         on[t]     = j + (f % cs);  // local dataset-batch row
+                         od[t]     = td(f);
+                       });
     }
   }
 
-  return threshold_join_result{uvector_to_column(std::move(out_q), cudf::data_type{cudf::type_id::INT64}),
-                               uvector_to_column(std::move(out_n), cudf::data_type{cudf::type_id::INT64}),
-                               uvector_to_column(std::move(out_dist), cudf::data_type{cudf::type_id::FLOAT32}),
-                               static_cast<int64_t>(out_size)};
+  return threshold_join_result{
+    uvector_to_column(std::move(out_q), cudf::data_type{cudf::type_id::INT64}),
+    uvector_to_column(std::move(out_n), cudf::data_type{cudf::type_id::INT64}),
+    uvector_to_column(std::move(out_dist), cudf::data_type{cudf::type_id::FLOAT32}),
+    static_cast<int64_t>(out_size)};
 }
 
 }  // namespace sirius::vss

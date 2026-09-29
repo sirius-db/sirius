@@ -71,11 +71,19 @@ class topk_partial_output : public pipelineable_operator_data {
 inline std::size_t topk_partials_partition(std::size_t left_ordinal) { return 2 * left_ordinal; }
 inline std::size_t topk_left_partition(std::size_t left_ordinal) { return 2 * left_ordinal + 1; }
 
+//! Per-row: each left row's k nearest right rows.
+//! Global: the k nearest (left, right) pairs overall.
+enum class topk_scope : std::uint8_t { per_row, global };
+
 //! Select stage of the exact per-row top-k vector join. For each (left batch, right batch) pair it
 //! finds every left row's k nearest rows within that right batch and emits a partial
 //! [right cols..., distance] of exactly n_left * k rows (padded with NULL rows at +inf distance
 //! when the right batch has fewer than k rows). The first pair of each left batch also forwards
 //! the left batch's columns. VECTOR_TOPK_MERGE combines the partials into the final top-k.
+//!
+//! In global scope it instead streams [left cols..., right cols..., ranking value] for the k best
+//! pairs of each (left batch, right batch) into TOP_N / MERGE_TOP_N. Every pair in the global top-k
+//! is in its left row's per-row top-k, so these candidates always contain the answer.
 class sirius_physical_vector_topk_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -91,7 +99,8 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
                                    bool is_similarity,
                                    std::int64_t dim,
                                    duckdb::JoinType join_type,
-                                   std::size_t estimated_cardinality);
+                                   std::size_t estimated_cardinality,
+                                   topk_scope scope = topk_scope::per_row);
 
   //! Column index of the FLOAT[dim] vector column within the left (probe) child's output.
   std::size_t left_vector_col_idx;
@@ -107,6 +116,7 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
   std::int64_t dim;
   //! INNER or LEFT; LEFT only differs when the right side is empty.
   duckdb::JoinType join_type;
+  topk_scope scope;
 
  protected:
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -114,12 +124,15 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
 
  public:
   bool is_source() const override { return true; }
-  //! Always feeds VECTOR_TOPK_MERGE through a repository.
-  bool is_sink() const override { return true; }
-  //! Emits two schemas (partials and forwarded left columns), so skip the output-schema check.
+  //! Per-row always feeds VECTOR_TOPK_MERGE through a repository; global streams into TOP_N.
+  bool is_sink() const override
+  {
+    return scope == topk_scope::per_row || sirius_physical_partition_consumer_operator::is_sink();
+  }
+  //! Per-row emits two schemas (partials and forwarded left columns), so skip the output check.
   [[nodiscard]] bool declared_output_schema_is_runtime_schema() const noexcept override
   {
-    return false;
+    return scope == topk_scope::global;
   }
 
   //! Enumerates every (left batch, right batch) pair, one per task.
@@ -135,8 +148,13 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  //! Routes each output batch to the merge partition chosen in execute().
+  //! Per-row: routes each output batch to the merge partition chosen in execute().
   void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
+
+ private:
+  //! Global scope: this pair's k best (left, right) rows.
+  std::unique_ptr<operator_data> execute_global(const topk_pair_input& input,
+                                                ::cuda::stream_ref stream);
 
  protected:
   std::mutex batches_to_processed_mutex;

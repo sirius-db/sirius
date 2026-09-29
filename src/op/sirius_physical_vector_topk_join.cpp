@@ -18,6 +18,7 @@
 
 #include "cuda/vss/brute_force_search.hpp"
 #include "cuda/vss/cudf_raft_interop.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "helper/type_conversions.hpp"
@@ -26,11 +27,13 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "vss/distance_metric.hpp"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
@@ -51,10 +54,15 @@ namespace op {
 
 namespace {
 
-//! Partial schema: [right types..., FLOAT distance].
-duckdb::vector<sirius::logical_type> partial_types(const sirius_physical_operator& right)
+//! Per-row partials are [right types..., FLOAT distance];
+//! Global rows are [left types..., right types..., FLOAT ranking value].
+duckdb::vector<sirius::logical_type> output_types(const sirius_physical_operator& left,
+                                                  const sirius_physical_operator& right,
+                                                  topk_scope scope)
 {
-  auto types = right.get_types();
+  duckdb::vector<sirius::logical_type> types;
+  if (scope == topk_scope::global) { types = left.get_types(); }
+  types.insert(types.end(), right.get_types().begin(), right.get_types().end());
   types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
   return types;
 }
@@ -101,17 +109,23 @@ sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
   bool is_similarity,
   std::int64_t dim,
   duckdb::JoinType join_type,
-  std::size_t estimated_cardinality)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN, partial_types(*right), estimated_cardinality),
+  std::size_t estimated_cardinality,
+  topk_scope scope)
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN,
+                                                output_types(*left, *right, scope),
+                                                estimated_cardinality),
     left_vector_col_idx(left_vector_col_idx),
     right_vector_col_idx(right_vector_col_idx),
     k(k),
     metric(std::move(metric)),
     is_similarity(is_similarity),
     dim(dim),
-    join_type(join_type)
+    join_type(join_type),
+    scope(scope)
 {
+  if (scope == topk_scope::global && join_type != duckdb::JoinType::INNER) {
+    throw duckdb::NotImplementedException("Vector global top-k join: only INNER is supported");
+  }
   if (join_type != duckdb::JoinType::INNER && join_type != duckdb::JoinType::LEFT) {
     throw duckdb::NotImplementedException("Vector top-k join: only INNER and LEFT are supported");
   }
@@ -125,21 +139,31 @@ sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
 void sirius_physical_vector_topk_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // Its own single-operator pipeline (it always sinks into the merge), with build then probe inputs.
-  auto& sink_meta    = meta_pipeline.create_child_meta_pipeline(current, *this);
-  auto* host_current = sink_meta.get_base_pipeline().get();
+  // Per-row: its own single-operator pipeline sinking into the merge.
+  // Global: the head of the pipeline that streams into TOP_N. Either way, build then probe inputs.
+  pipeline::sirius_meta_pipeline* host_meta;
+  pipeline::sirius_pipeline* host_current;
+  if (is_sink()) {
+    auto& sink_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+    host_meta       = &sink_meta;
+    host_current    = sink_meta.get_base_pipeline().get();
+  } else {
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    host_meta    = &meta_pipeline;
+    host_current = &current;
+  }
 
   D_ASSERT(children.size() == 2);
   auto& build_child = *children[1];
   D_ASSERT(build_child.is_sink());
   D_ASSERT(!build_child.children.empty());
-  auto& build_meta = sink_meta.create_child_meta_pipeline(*host_current, build_child);
+  auto& build_meta = host_meta->create_child_meta_pipeline(*host_current, build_child);
   build_meta.build(*build_child.children[0]);
 
   auto& probe_child = *children[0];
   D_ASSERT(probe_child.is_sink());
   D_ASSERT(!probe_child.children.empty());
-  auto& probe_meta = sink_meta.create_child_meta_pipeline(*host_current, probe_child);
+  auto& probe_meta = host_meta->create_child_meta_pipeline(*host_current, probe_child);
   probe_meta.build(*probe_child.children[0]);
 }
 
@@ -169,8 +193,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::get_next_task_i
   // Moves the cursor past partitions with no left batch. Their right batches are popped and dropped
   // so the build repository still drains and the pipeline can finish.
   auto skip_empty_left = [&]() {
-    while (cursor_partition_ < left_batch_ids.size() &&
-           left_batch_ids[cursor_partition_].empty()) {
+    while (cursor_partition_ < left_batch_ids.size() && left_batch_ids[cursor_partition_].empty()) {
       for (auto id : right_batch_ids[cursor_partition_]) {
         build_port->repo->pop_data_batch_by_id(id, cursor_partition_);
       }
@@ -266,6 +289,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> out_batches;
   std::vector<std::size_t> out_partitions;
 
+  if (scope == topk_scope::global) { return execute_global(*input, stream); }
+
   // Forward the left columns once per left batch; the merge repeats them per neighbor.
   if (input->emit_left_part) {
     out_batches.push_back(make_data_batch(
@@ -327,9 +352,104 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
   return std::make_unique<topk_partial_output>(std::move(out_batches), std::move(out_partitions));
 }
 
-void sirius_physical_vector_topk_join::sink(const operator_data& output_data,
-                                            ::cuda::stream_ref /*stream*/)
+std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute_global(
+  const topk_pair_input& input, ::cuda::stream_ref stream)
 {
+  const auto& input_batches = input.get_read_only_batches();
+  auto const& left_batch    = input_batches[0];
+  cudf::table_view left     = get_cudf_table_view(left_batch);
+  auto* space               = left_batch.get_memory_space();
+  auto mr                   = space->get_default_allocator();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> out_batches;
+  auto finish = [&](std::unique_ptr<cudf::table> table) {
+    out_batches.push_back(make_data_batch(std::move(table), *space, stream, batch_telemetry()));
+    return std::make_unique<pipelineable_operator_data>(std::move(out_batches));
+  };
+
+  // No pairs: still emit one (empty) batch so TOP_N downstream sees input and can finish.
+  auto const n_left = static_cast<std::int64_t>(left.num_rows());
+  if (input_batches.size() == 1 || n_left == 0) { return finish(make_empty_table(types)); }
+  cudf::table_view right = get_cudf_table_view(input_batches[1]);
+  auto const n_right     = static_cast<std::int64_t>(right.num_rows());
+  if (n_right == 0) { return finish(make_empty_table(types)); }
+
+  // A NULL vector has no distance to rank by; not supported.
+  if (left.column(left_vector_col_idx).null_count() > 0) {
+    throw std::runtime_error("Vector top-k join: the left input has NULL vectors");
+  }
+  if (right.column(right_vector_col_idx).null_count() > 0) {
+    throw std::runtime_error("Vector top-k join: the right input has NULL vectors");
+  }
+  auto const k_eff = std::min(k, n_right);
+  if (n_left * k_eff > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::runtime_error(
+      "Vector top-k join: left batch rows * k exceeds a cuDF column; lower the batch size");
+  }
+
+  auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
+  auto const queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
+  raft::device_resources res{stream};
+  auto const metric_type =
+    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
+  auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
+
+  // Candidates are k_eff per left row: left row i repeated k_eff times.
+  cudf::numeric_scalar<cudf::size_type> zero(0, true, stream);
+  cudf::numeric_scalar<cudf::size_type> one(1, true, stream);
+  auto left_rows = cudf::sequence(static_cast<cudf::size_type>(n_left), zero, one, stream, mr);
+  auto candidates =
+    cudf::repeat(
+      cudf::table_view({left_rows->view()}), static_cast<cudf::size_type>(k_eff), stream, mr)
+      ->release();
+  candidates.push_back(std::move(knn.neighbors));
+  candidates.push_back(std::move(knn.distances));
+  auto kept = std::make_unique<cudf::table>(std::move(candidates));
+
+  // Only this pair's k closest candidates can reach the global top-k; drop the rest before
+  // gathering any columns.
+  if (kept->num_rows() > k) {
+    auto order = cudf::top_k_order(kept->get_column(2).view(),
+                                   static_cast<cudf::size_type>(k),
+                                   cudf::order::ASCENDING,
+                                   stream,
+                                   mr);
+    kept =
+      cudf::gather(kept->view(), order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  }
+  auto kept_cols = kept->release();
+
+  auto cols =
+    cudf::gather(left, kept_cols[0]->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
+      ->release();
+  auto right_cols =
+    cudf::gather(right, kept_cols[1]->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr)
+      ->release();
+  for (auto& c : right_cols) {
+    cols.push_back(std::move(c));
+  }
+  auto ranking = std::move(kept_cols[2]);
+  if (is_similarity) {
+    // cuVS ranks cosine by distance; a similarity query reports `1 - distance`.
+    cudf::numeric_scalar<float> one_f(1.0F, true, stream);
+    ranking = cudf::binary_operation(one_f,
+                                     ranking->view(),
+                                     cudf::binary_operator::SUB,
+                                     cudf::data_type{cudf::type_id::FLOAT32},
+                                     stream,
+                                     mr);
+  }
+  cols.push_back(std::move(ranking));
+  return finish(std::make_unique<cudf::table>(std::move(cols)));
+}
+
+void sirius_physical_vector_topk_join::sink(const operator_data& output_data,
+                                            ::cuda::stream_ref stream)
+{
+  if (scope == topk_scope::global) {
+    sirius_physical_partition_consumer_operator::sink(output_data, stream);
+    return;
+  }
   auto const& output  = dynamic_cast<const topk_partial_output&>(output_data);
   auto const& batches = output.get_data_batches();
   for (std::size_t i = 0; i < batches.size(); ++i) {

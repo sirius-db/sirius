@@ -51,7 +51,7 @@ namespace {
 //! [left types..., right types..., FLOAT ranking value].
 duckdb::vector<sirius::logical_type> merged_types(const sirius_physical_vector_topk_join& join)
 {
-  auto types = join.children[0]->get_types();
+  auto types        = join.children[0]->get_types();
   auto const& right = join.children[1]->get_types();
   types.insert(types.end(), right.begin(), right.end());
   types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
@@ -62,8 +62,9 @@ duckdb::vector<sirius::logical_type> merged_types(const sirius_physical_vector_t
 
 sirius_physical_vector_topk_merge::sirius_physical_vector_topk_merge(
   const sirius_physical_vector_topk_join& join, uint64_t batch_bytes)
-  : sirius_physical_partition_consumer_operator(
-      SiriusPhysicalOperatorType::VECTOR_TOPK_MERGE, merged_types(join), join.estimated_cardinality),
+  : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::VECTOR_TOPK_MERGE,
+                                                merged_types(join),
+                                                join.estimated_cardinality),
     k(join.k),
     is_similarity(join.is_similarity),
     join_type(join.join_type),
@@ -87,9 +88,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::get_next_task_
     batches.push_back(std::move(batch));
   }
   if (batches.size() != 1) {
-    throw std::runtime_error("sirius_physical_vector_topk_merge: expected one left part for left "
-                             "batch " + std::to_string(ordinal) + ", got " +
-                             std::to_string(batches.size()));
+    throw std::runtime_error(
+      "sirius_physical_vector_topk_merge: expected one left part for left "
+      "batch " +
+      std::to_string(ordinal) + ", got " + std::to_string(batches.size()));
   }
   while (auto batch = repo->pop_next_data_batch(topk_partials_partition(ordinal))) {
     batches.push_back(std::move(batch));
@@ -130,13 +132,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
 
   // No right rows at all: LEFT keeps every left row with NULL right columns and a NULL ranking.
   if (n_parts == 0) {
-    auto const n       = static_cast<cudf::size_type>(n_left);
-    auto empty_right   = make_empty_table(right_types_);
+    auto const n     = static_cast<cudf::size_type>(n_left);
+    auto empty_right = make_empty_table(right_types_);
     cudf::numeric_scalar<cudf::size_type> zero(0, true, stream);
     // Every index is out of range of the empty right table, so NULLIFY yields all-NULL rows.
-    auto pad        = cudf::make_column_from_scalar(zero, n, stream, mr);
-    auto right_cols = cudf::gather(
-      empty_right->view(), pad->view(), cudf::out_of_bounds_policy::NULLIFY, stream, mr)->release();
+    auto pad = cudf::make_column_from_scalar(zero, n, stream, mr);
+    auto right_cols =
+      cudf::gather(
+        empty_right->view(), pad->view(), cudf::out_of_bounds_policy::NULLIFY, stream, mr)
+        ->release();
     auto cols = std::make_unique<cudf::table>(left, stream, mr)->release();
     for (auto& c : right_cols) {
       cols.push_back(std::move(c));
@@ -171,8 +175,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
   // Ids are row positions in the stacked payload, so the merged ids gather it directly.
   cudf::numeric_scalar<std::int64_t> zero64(0, true, stream);
   cudf::numeric_scalar<std::int64_t> one64(1, true, stream);
-  auto stacked_ids = cudf::sequence(
-    static_cast<cudf::size_type>(n_parts * part_rows), zero64, one64, stream, mr);
+  auto stacked_ids =
+    cudf::sequence(static_cast<cudf::size_type>(n_parts * part_rows), zero64, one64, stream, mr);
 
   raft::device_resources res{stream};
   auto merged = vss::knn_merge_parts_topk(
@@ -182,8 +186,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
   cudf::numeric_scalar<cudf::size_type> zero(0, true, stream);
   cudf::numeric_scalar<cudf::size_type> one(1, true, stream);
   auto left_rows = cudf::sequence(static_cast<cudf::size_type>(n_left), zero, one, stream, mr);
-  auto left_map =
-    cudf::repeat(cudf::table_view({left_rows->view()}), static_cast<cudf::size_type>(k), stream, mr);
+  auto left_map  = cudf::repeat(
+    cudf::table_view({left_rows->view()}), static_cast<cudf::size_type>(k), stream, mr);
 
   // When the whole right side has fewer than k rows, padding rows (at +inf) survive the merge;
   // drop them.
@@ -194,8 +198,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
                                         cudf::data_type{cudf::type_id::BOOL8},
                                         stream,
                                         mr);
-  auto kept = cudf::apply_boolean_mask(
-    cudf::table_view({left_map->get_column(0).view(), merged.neighbors->view(), merged.distances->view()}),
+  auto kept    = cudf::apply_boolean_mask(
+    cudf::table_view(
+      {left_map->get_column(0).view(), merged.neighbors->view(), merged.distances->view()}),
     is_real->view(),
     stream,
     mr);
@@ -214,13 +219,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
   }
 
   // Emit within the byte budget.
-  auto const total          = static_cast<std::size_t>(left_idx.size());
-  auto const left_row_bytes = left_batch.get_data()->get_size_in_bytes() /
-                              static_cast<std::size_t>(n_left);
-  auto const right_row_bytes =
-    partial_bytes / static_cast<std::size_t>(n_parts * part_rows);
-  auto const max_rows =
-    std::max<std::size_t>(1, batch_bytes / std::max<std::size_t>(1, left_row_bytes + right_row_bytes));
+  auto const total = static_cast<std::size_t>(left_idx.size());
+  auto const left_row_bytes =
+    left_batch.get_data()->get_size_in_bytes() / static_cast<std::size_t>(n_left);
+  auto const right_row_bytes = partial_bytes / static_cast<std::size_t>(n_parts * part_rows);
+  auto const max_rows        = std::max<std::size_t>(
+    1, batch_bytes / std::max<std::size_t>(1, left_row_bytes + right_row_bytes));
   for (std::size_t start = 0; start < total; start += max_rows) {
     auto const s = static_cast<cudf::size_type>(start);
     auto const e = static_cast<cudf::size_type>(std::min(total, start + max_rows));
