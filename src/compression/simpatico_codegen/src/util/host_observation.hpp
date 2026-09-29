@@ -55,9 +55,7 @@ pinned_staging_slab& thread_pinned_staging();
  * destination. Reads above `pinned_staging_slab::cap_bytes` copy directly to @p destination
  * instead. The wait also covers other work queued on @p stream.
  *
- * On failure, stream completion is not guaranteed. The caller must complete any pending copy before
- * releasing its buffers or reusing the staging storage. decode_frame::read_bytes() attempts to
- * complete the stream before rethrowing.
+ * On failure, waits for @p stream before rethrowing, so @p destination may be local storage.
  *
  * @throw std::runtime_error carrying the CUDA error string if the copy, the wait, or the pinned
  * allocation fails

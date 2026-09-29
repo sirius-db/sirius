@@ -61,12 +61,7 @@ std::span<std::byte> decode_frame::host_bytes(std::size_t bytes)
 
 void decode_frame::read_bytes(void* destination, void const* source, std::size_t bytes)
 {
-  try {
-    read_device_bytes_completed(destination, source, bytes, stream_);
-  } catch (...) {
-    (void)cudaStreamSynchronize(stream_.get());
-    throw;
-  }
+  read_device_bytes_completed(destination, source, bytes, stream_);
 }
 
 //===----------------------------------------------------------------------===//

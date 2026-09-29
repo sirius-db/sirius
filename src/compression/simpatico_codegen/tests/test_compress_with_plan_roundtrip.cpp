@@ -991,7 +991,7 @@ int main()
 
     {
       // Nullable decomposed dictionary WITH the null_mask channel routed:
-      // validity must survive the from_outputs rebuild.
+      // validity must survive the channel-based rebuild.
       auto stream             = cudf::get_default_stream();
       std::vector<bool> valid = {true, false, true, true};
       auto tn                 = make_strings_table({"apple", "", "cherry", "apple"}, valid, stream);

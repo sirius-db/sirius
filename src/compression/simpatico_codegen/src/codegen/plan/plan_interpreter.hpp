@@ -245,13 +245,14 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
-/// Reconstruct a compressed_representation from named output columns. A thin
-/// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)
-/// to the matching rep subclass's ``from_outputs`` factory, which validates
-/// names/arity/type and reconstructs the rep. ``meta`` carries per-node decode
-/// metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
-/// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered
-/// from the channel buffers alone. Used when loading stored representations.
+/// Reconstruct a compressed_representation from named output columns: validate the names, arity,
+/// and types for the compressor name (or the ``bitextract_<spec>`` prefix) and adopt the columns.
+/// ``meta`` carries per-node decode metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
+/// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered from the channel
+/// buffers alone. A dictionary measures and publishes its key width before returning, waiting for
+/// @p stream. Used when loading stored representations; the decoder rebuilds representations with
+/// reconstruct_decode_representation (`decode/decode_session.hpp`), which shares this validation.
+/// Returns nullptr with @p error_out set when the channels do not describe the compressor.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,

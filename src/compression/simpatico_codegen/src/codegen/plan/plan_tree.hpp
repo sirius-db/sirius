@@ -116,7 +116,7 @@ struct PlanNode {
   // prepared width, and the reader (api/compressed_table_io.cpp) derives it from the self-stored
   // representation or a supported identity `keys_offsets` leaf. Loading leaves the hint unknown for
   // offsets it cannot inspect, including large arrays and INT64 offsets. A `keys_offsets` output
-  // consumed by another node stays -1 on both. Consumed by make_decode_dictionary
+  // consumed by another node stays -1 on both. Consumed by reconstruct_decode_representation
   // (plan/representation_factory.cpp), which publishes it on the decode-local representation and
   // checks that a positive width matches the total key character size, and by the dict_codes gather
   // specialization (plan/decompress.cpp), which declines a value <= 0. A positive hint must

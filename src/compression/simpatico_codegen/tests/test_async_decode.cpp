@@ -1074,8 +1074,8 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       channels.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
     }
     std::string error;
-    auto imported = simpatico::dictionary_compressed_representation::from_outputs(
-      channel_names, std::move(channels), stream.view(), mr, &error);
+    auto imported = simpatico::reconstruct_representation(
+      "dictionary", channel_names, std::move(channels), stream.view(), mr, &error);
     auto const* imported_dictionary =
       dynamic_cast<simpatico::dictionary_compressed_representation const*>(imported.get());
     expect(imported_dictionary != nullptr && error.empty(), "dictionary channel import failed");
@@ -1494,6 +1494,73 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
       expect(session.finish().empty(), "offsets validation fixture published a session result");
     }
   }
+}
+
+// Unsigned indices, such as a narrow field a bitjoin decodes, take cuDF's dictionary factory on
+// both the decoder and the loader. cuDF retags them as the signed type of the same width, so these
+// codes stay within that range.
+void test_dictionary_unsigned_indices(rmm::device_async_resource_ref mr)
+{
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{::cuda::stream_ref{stream}};
+  constexpr int key_count = 120;
+  std::vector<std::string> keys;
+  std::vector<std::int32_t> offsets{0};
+  std::string chars;
+  for (int key = 0; key < key_count; ++key) {
+    keys.push_back("k" + std::to_string(1000 + key));
+    chars += keys.back();
+    offsets.push_back(static_cast<std::int32_t>(chars.size()));
+  }
+  std::vector<std::uint8_t> codes;
+  std::vector<std::string> expected_values;
+  for (int row = 0; row < 3 * key_count; ++row) {
+    codes.push_back(static_cast<std::uint8_t>((row * 7) % key_count));
+    expected_values.push_back(keys[codes.back()]);
+  }
+  auto const upload = [&](auto const& host, cudf::type_id type) {
+    auto column = cudf::make_numeric_column(cudf::data_type{type},
+                                            static_cast<cudf::size_type>(host.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream.view(),
+                                            mr);
+    cuda_check(cudaMemcpyAsync(column->mutable_view().head<void>(),
+                               host.data(),
+                               host.size() * sizeof(host[0]),
+                               cudaMemcpyHostToDevice,
+                               stream.value()));
+    return column;
+  };
+  auto const channels = [&] {
+    std::vector<std::unique_ptr<cudf::column>> result;
+    result.push_back(upload(offsets, cudf::type_id::INT32));
+    result.push_back(upload(chars, cudf::type_id::UINT8));
+    result.push_back(upload(codes, cudf::type_id::UINT8));
+    stream.synchronize();
+    return result;
+  };
+  std::vector<std::string> const names{"keys_offsets", "keys_chars", "indices"};
+  auto const expected = make_strings_column(expected_values, {}, stream.view());
+
+  std::unique_ptr<cudf::column> decoded;
+  {
+    simpatico::decode_session session(streams, mr);
+    auto& frame        = simpatico::decode_session_test_access::frame(session);
+    auto const rebuilt = simpatico::reconstruct_decode_representation(
+      dictionary_plan_node(), names, channels(), frame);
+    decoded = simpatico::decode_standalone(*rebuilt, frame);
+    expect(session.finish().empty(), "unsigned-index fixture published a session result");
+  }
+  expect(strings_equal_completed(expected->view(), decoded->view(), stream.view()),
+         "decode reconstruction changed unsigned dictionary indices");
+
+  std::string error;
+  auto const loaded = simpatico::reconstruct_representation(
+    "dictionary", names, channels(), stream.view(), mr, &error);
+  expect(loaded != nullptr && error.empty(), "loader rejected unsigned dictionary indices");
+  auto const loaded_output = decode_completed(*loaded, stream.view(), mr);
+  expect(strings_equal_completed(expected->view(), loaded_output->view(), stream.view()),
+         "loader changed unsigned dictionary indices");
 }
 
 void test_dictionary_width_sliced_input(rmm::device_async_resource_ref mr)
@@ -2952,6 +3019,7 @@ int main()
     test_identity_owned_children(upstream);
     test_dictionary_width_metadata(upstream);
     test_dictionary_offsets_validation(upstream);
+    test_dictionary_unsigned_indices(upstream);
     test_dictionary_width_sliced_input(upstream);
     test_dictionary_width_large_keys(upstream);
     test_dictionary_width_failures(upstream);

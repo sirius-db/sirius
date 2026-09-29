@@ -922,7 +922,7 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   auto const chars = chars_column->view();
   if (chars.type().id() != cudf::type_id::UINT8 || chars.null_count() != 0) return nullptr;
   // The gather addresses the chars with the width, so the extent it implies is checked against host
-  // metadata first, the property make_decode_dictionary enforces on the general route.
+  // metadata first, the property reconstruct_decode_representation enforces on the general route.
   auto const keys = static_cast<std::int64_t>(offsets_column->size()) - 1;
   if (keys < 0 || static_cast<std::int64_t>(chars.size()) != keys * width) return nullptr;
   // The analytic offsets are INT32; a larger output takes the general route.

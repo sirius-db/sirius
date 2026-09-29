@@ -41,13 +41,19 @@ void read_device_bytes_completed(void* destination,
                                  std::size_t bytes,
                                  ::cuda::stream_ref stream)
 {
-  void* const staging = thread_pinned_staging().reserve(bytes);
-  throw_if_cuda_error(
-    cudaMemcpyAsync(
-      staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.get()),
-    "host observation: device-to-host copy");
-  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "host observation: stream wait");
-  if (staging) std::memcpy(destination, staging, bytes);
+  try {
+    void* const staging = thread_pinned_staging().reserve(bytes);
+    throw_if_cuda_error(
+      cudaMemcpyAsync(
+        staging ? staging : destination, source, bytes, cudaMemcpyDeviceToHost, stream.get()),
+      "host observation: device-to-host copy");
+    throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "host observation: stream wait");
+    if (staging) std::memcpy(destination, staging, bytes);
+  } catch (...) {
+    // A copy may still be queued into the destination or the staging storage.
+    (void)cudaStreamSynchronize(stream.get());
+    throw;
+  }
 }
 
 }  // namespace simpatico
