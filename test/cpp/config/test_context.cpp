@@ -2315,3 +2315,32 @@ TEST_CASE("Sirius query options stay local and snapshots remain immutable",
   CHECK(duckdb::query_operator_options(*a.context)->scan_task_batch_size ==
         defaults.scan_task_batch_size);
 }
+
+TEST_CASE("Sirius admission configuration has one authoritative limit",
+          "[sirius][config][query_admission]")
+{
+  auto path = fs::temp_directory_path() / "sirius_admission_config.yaml";
+  finally remove{[&] { fs::remove(path); }};
+  auto load = [&](const char* yaml) {
+    {
+      std::ofstream out(path);
+      out << yaml;
+    }
+    sirius::sirius_config cfg;
+    cfg.load_from_file(path);
+    return cfg;
+  };
+  CHECK(load("sirius: {max_concurrent_queries: 4}").max_concurrent_queries() == 4);
+  CHECK(load("sirius: {executor: {scan_manager: {max_concurrent_queries: 2}}}")
+          .max_concurrent_queries() == 2);
+  CHECK(
+    load(
+      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 2}}}")
+      .max_concurrent_queries() == 2);
+  REQUIRE_THROWS_WITH(
+    load(
+      "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
+    Catch::Contains("conflicting"));
+  REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
+  CHECK(load("sirius: {}").max_concurrent_queries() == 1);
+}

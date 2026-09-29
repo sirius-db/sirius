@@ -246,6 +246,8 @@ void sirius_engine::execute()
   try {
     while (future.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
       if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
+      if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+        sirius_ctx->throw_runtime_unavailable();
     }
     future.get();
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);

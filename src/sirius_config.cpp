@@ -759,15 +759,31 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       mr.reject_unknown();
     }
 
+    int query_limit            = 1;
+    bool const has_query_limit = r.has_value("max_concurrent_queries");
+    r.optional("max_concurrent_queries", query_limit, yaml::greater_than<int>{0});
+    bool has_scan_limit = false;
     // Executors
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
-      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
+      if (auto n = er.optional_node("scan_manager")) {
+        yaml::reader scan_reader(*n, "sirius.executor.scan_manager");
+        has_scan_limit = scan_reader.has_value("max_concurrent_queries");
+        from_yaml(*n, _scan_manager_config);
+      }
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       er.reject_unknown();
     }
+
+    if (has_query_limit && has_scan_limit &&
+        query_limit != _scan_manager_config.max_concurrent_queries)
+      throw std::runtime_error(
+        "conflicting sirius.max_concurrent_queries and deprecated "
+        "executor.scan_manager.max_concurrent_queries");
+    if (has_query_limit) _scan_manager_config.max_concurrent_queries = query_limit;
+    // The scan-manager key remains a compatibility alias, with one stored authority.
 
     // Preserve the node until memory-space capacities are resolved below. Explicit
     // values are applied after capacity-derived defaults so they always win.

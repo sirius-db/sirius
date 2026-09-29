@@ -286,6 +286,10 @@ struct sirius_config {
 
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
+  [[nodiscard]] int max_concurrent_queries() const noexcept
+  {
+    return _scan_manager_config.max_concurrent_queries;
+  }
 
   /// Read only `sirius.telemetry` from @p config_path, without the hardware discovery a
   /// sirius_config performs (which makes NVTX calls). Returns defaults when the file cannot

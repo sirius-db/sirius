@@ -128,3 +128,27 @@ Implementation entries will be added here as each buildable change is validated 
   tests passed (3 cases, 244 assertions). The new isolation test also checks RESET and refused
   GLOBAL writes.
 - Previous commit: `6b1384720`.
+
+### 6. `feat(exec): admit bounded concurrent SQL queries`
+
+- Startup `sirius.max_concurrent_queries` controls query admission and scan capacity, default 1.
+  The former scan-manager key is accepted as an alias; contradictory values are rejected.
+- Transferable permits cover initialization through retirement. FIFO arrival tickets also supply
+  scheduling IDs. Waiting queries poll cancellation/health every 20 ms. Shutdown closes admission,
+  wakes queued callers and waits for active windows before dismantling the runtime.
+- Planning has shared access. Pin/unpin, cache reset and ANN operations retain exclusive access;
+  pending maintenance blocks new admissions. Pin/update locking follows admission order, including
+  repeated UPDATE validation. Nested execution windows (including dormant concurrent FFI fragments
+  on one context) fail explicitly instead of deadlocking. Concurrent SQL uses separate connections.
+- Automatic sort partition caps use configured per-query GPU capacity instead of current global
+  free memory. Concurrent execution requires the default per-thread reservation tracking mode;
+  explicit per-stream tracking is rejected because conversions change streams and tracker reset
+  cannot safely race another caller's allocator access.
+- Validation: full build; 17 admission/lifecycle cases, 148 assertions. Watchdog children proved
+  actual SQL overlap at N=2 and N=4, N+1 queueing, prompt queued cancellation, pending maintenance,
+  query-local injected failure, correct peer results, and a successful subsequent query. CPU
+  admission smoke tests also passed AddressSanitizer/UBSan and ThreadSanitizer.
+- Remaining integration work: shared prefetch budgets, stream leases, scan-pool dependency
+  separation, broader feature/pressure tests and final documentation. This commit alone is not
+  the complete concurrency qualification.
+- Previous commit: `67dfcd671`.
