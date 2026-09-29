@@ -2036,7 +2036,7 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   sirius::io::io_context_type type, std::string_view path)
 {
-  auto const file_path = path.empty() ? std::string{} : normalize_path(std::string(path));
+  auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
   std::uint64_t config_id = 0;
   std::shared_ptr<const sirius::io::object_store_config> resolved_config;
   if (type == sirius::io::io_context_type::restful && !file_path.empty()) {
