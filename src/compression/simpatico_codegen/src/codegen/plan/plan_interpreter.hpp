@@ -230,22 +230,20 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
-/// Assemble one filtered decode's ragged output into a uniformly
-/// survivor-sized table: compacted-route columns pass through; ALL full-width
-/// columns are compacted with ONE ``cudf::gather`` over ``result.row_indices``.
-/// When ``result.applied`` is false the columns are assembled unchanged.
-/// Null-masked columns are refused (returns nullptr + @p error_out).
-/// Synchronizes @p stream before returning, so the caller may free/rebind the
-/// inputs immediately.
+/// Assemble one filtered decode's output into a uniformly survivor-sized table: survivor-sized
+/// columns pass through; full-width `full`-route columns are compacted with one ``cudf::gather``
+/// over ``result.row_indices``, which completes @p stream before returning. When
+/// ``result.applied`` is false the columns are assembled unchanged.
 ///
-/// Internal to the decode: ``decompress_scan_filter`` calls this before
-/// returning, so no caller outside sees the ragged intermediate.
+/// Internal to the decode: ``decompress_scan_filter`` calls this before returning, so no caller
+/// outside sees the ragged intermediate.
+///
+/// @throw std::invalid_argument if a column's size does not match its route
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out);
+  rmm::device_async_resource_ref mr);
 
 /// Reconstruct a compressed_representation from named output columns. A thin
 /// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)

@@ -257,6 +257,8 @@ std::unique_ptr<cudf::table> decompress(
 ///
 /// Synchronizes @p stream before returning when the filtering applied, so the
 /// caller may free or rebind the inputs immediately.
+///
+/// @p error_out is kept for source compatibility and is never written: failures throw.
 // ── Per-column decode, for a caller-supplied selection ──────────────────────
 //
 // Late materialization produces one deferred column at a time. Unsupported selection routes and
@@ -351,7 +353,6 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   sirius::codegen::scan_filter_result& result,
   std::span<const ::cuda::stream_ref> streams,
   ::cuda::stream_ref stream         = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 }  // namespace simpatico

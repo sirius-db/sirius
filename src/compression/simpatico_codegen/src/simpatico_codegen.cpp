@@ -1228,8 +1228,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   sirius::codegen::scan_filter_result& result,
   std::span<const ::cuda::stream_ref> streams,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,streams]"};
   result = sirius::codegen::scan_filter_result{};
@@ -1259,13 +1258,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
     // table before it leaves: the compacted routes came back survivor-sized and
     // the `full` ones full width, and nothing outside knows which is which.
     try {
-      auto reconciled = compact_scan_filter_output(std::move(*cols), result, stream, mr, error_out);
-      if (!reconciled) {
-        throw plan_error(error_out && !error_out->empty()
-                           ? *error_out
-                           : "filtered decode: output assembly validation failed");
-      }
-      return reconciled;
+      return compact_scan_filter_output(std::move(*cols), result, stream, mr);
     } catch (...) {
       // The grouped-gather helper completes its own phase before unwinding.
       result                   = sirius::codegen::scan_filter_result{};
@@ -1299,10 +1292,10 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   simpatico::stream_pool& pool,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  std::string* /*error_out*/)
 {
   return decompress_scan_filter(
-    table, selected_columns, request, result, stream_refs(pool), stream, mr, error_out);
+    table, selected_columns, request, result, stream_refs(pool), stream, mr);
 }
 
 }  // namespace simpatico

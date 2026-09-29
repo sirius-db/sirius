@@ -427,18 +427,11 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   }
 
   sirius::codegen::scan_filter_result result;
-  std::string error;
-  auto table = simpatico::decompress_scan_filter(
-    chunk, selected, wave_request, result, lanes, stream, mr, &error);
+  auto table =
+    simpatico::decompress_scan_filter(chunk, selected, wave_request, result, lanes, stream, mr);
   // The decode synchronized `stream`; re-point the selection buffers there
   // anyway so their teardown follows the batch's ordering.
   result.set_stream(stream);
-  if (!error.empty()) {
-    SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decompression-pushdown] selection REFUSED ({}); ordinary decode preserves predicate "
-      "substitutions",
-      error);
-  }
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan
   // evaluates the residual (re-checking already-applied conjuncts on the

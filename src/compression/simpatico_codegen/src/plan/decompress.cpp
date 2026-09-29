@@ -1433,104 +1433,58 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,
   ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  rmm::device_async_resource_ref mr)
 {
-  if (!result.applied) {
-    // Unfiltered decode: every column is full width already; just assemble.
-    return std::make_unique<cudf::table>(std::move(columns));
-  }
-  if (result.routes.size() != columns.size()) {
-    if (error_out) *error_out = "compact_scan_filter_output: routes/columns arity mismatch";
-    return nullptr;
-  }
-  if (result.survivor_count < 0) {
-    if (error_out) *error_out = "compact_scan_filter_output: survivor_count not counted";
-    return nullptr;
+  if (!result.applied) return std::make_unique<cudf::table>(std::move(columns));
+  if (result.routes.size() != columns.size() || result.survivor_count < 0) {
+    throw std::invalid_argument("compact_scan_filter_output: routes or survivor count mismatch");
   }
   auto const survivors = static_cast<cudf::size_type>(result.survivor_count);
-
   std::vector<std::size_t> full_positions;
   std::vector<cudf::column_view> full_views;
   for (std::size_t i = 0; i < columns.size(); ++i) {
-    if (!columns[i]) {
-      if (error_out) *error_out = "compact_scan_filter_output: null column";
-      return nullptr;
-    }
-    if (columns[i]->null_count() != 0) {
-      // Selection targets NOT NULL columns only; refuse rather than risk a
-      // mask/null interaction the selection wave has not modeled.
-      if (error_out) {
-        *error_out =
-          "compact_scan_filter_output: selection on a null-masked column is not "
-          "supported";
-      }
-      return nullptr;
-    }
-    if (result.routes[i] != sirius::codegen::decode_route::full) {
-      // Any compacted route: the decode already emitted survivor rows.
-      if (columns[i]->size() != survivors) {
-        if (error_out) {
-          *error_out = "compact_scan_filter_output: compacted-route column is not survivor-sized";
-        }
-        return nullptr;
-      }
-      continue;
-    }
-    // A `full`-route column arrives in one of two shapes depending on the
-    // wave-2 routing: already survivor-sized (the in-call decode_selection
-    // gather compacted it per column) — pass through; or full width — collected for the single
-    // batch-level gather below. When survivors == num_rows the two are
-    // indistinguishable, and the ascending all-rows gather is the identity,
-    // so passing through is correct either way.
-    if (columns[i]->size() == survivors) { continue; }
-    if (static_cast<std::int64_t>(columns[i]->size()) != result.num_rows) {
-      if (error_out) {
-        *error_out =
-          "compact_scan_filter_output: full-route column is neither full width nor survivor-sized";
-      }
-      return nullptr;
+    if (!columns[i]) throw std::invalid_argument("compact_scan_filter_output: null column");
+    // Compacted routes and full routes the decode already gathered arrive survivor-sized. When
+    // survivors == num_rows the two shapes coincide and the ascending all-rows gather is the
+    // identity, so passing the column through is correct either way.
+    if (columns[i]->size() == survivors) continue;
+    if (result.routes[i] != sirius::codegen::decode_route::full ||
+        static_cast<std::int64_t>(columns[i]->size()) != result.num_rows) {
+      throw std::invalid_argument(
+        "compact_scan_filter_output: column is neither survivor-sized nor a full-width full route");
     }
     full_positions.push_back(i);
     full_views.push_back(columns[i]->view());
   }
-
-  if (!full_positions.empty()) {
-    if (survivors == 0) {
-      for (auto const pos : full_positions) {
-        columns[pos] = cudf::empty_like(columns[pos]->view());
-      }
-    } else {
-      if (result.row_indices.size() < static_cast<std::size_t>(survivors) * sizeof(std::int32_t)) {
-        if (error_out) {
-          *error_out = "compact_scan_filter_output: row_indices smaller than survivor_count";
-        }
-        return nullptr;
-      }
-      cudf::column_view const gather_map{
-        cudf::data_type{cudf::type_id::INT32}, survivors, result.row_indices.data(), nullptr, 0};
-      // ONE gather compacts every full-width column of the batch; the indices come
-      // from the mask→indices kernel and are in-bounds by construction.
-      std::unique_ptr<cudf::table> gathered;
-      std::vector<std::unique_ptr<cudf::column>> gathered_columns;
-      try {
-        gathered         = cudf::gather(cudf::table_view{full_views},
-                                gather_map,
-                                cudf::out_of_bounds_policy::DONT_CHECK,
-                                stream,
-                                mr);
-        gathered_columns = gathered->release();
-        // Complete this cross-column gather phase before replacing its source owners.
-        stream.sync();
-      } catch (...) {
-        (void)cudaStreamSynchronize(stream.get());
-        throw;
-      }
-      for (std::size_t k = 0; k < full_positions.size(); ++k) {
-        columns[full_positions[k]] = std::move(gathered_columns[k]);
-      }
-    }
+  if (full_positions.empty()) return std::make_unique<cudf::table>(std::move(columns));
+  if (survivors == 0) {
+    for (auto const pos : full_positions)
+      columns[pos] = cudf::empty_like(columns[pos]->view());
+    return std::make_unique<cudf::table>(std::move(columns));
   }
+  if (result.row_indices.size() < static_cast<std::size_t>(survivors) * sizeof(std::int32_t)) {
+    throw std::invalid_argument(
+      "compact_scan_filter_output: row_indices smaller than survivor_count");
+  }
+  cudf::column_view const gather_map{
+    cudf::data_type{cudf::type_id::INT32}, survivors, result.row_indices.data(), nullptr, 0};
+  // One gather compacts every full-width column of the batch. The full-width sources are released
+  // below on the streams that produced them, so the gather completes first.
+  std::vector<std::unique_ptr<cudf::column>> gathered;
+  try {
+    gathered = cudf::gather(cudf::table_view{full_views},
+                            gather_map,
+                            cudf::out_of_bounds_policy::DONT_CHECK,
+                            stream,
+                            mr)
+                 ->release();
+    stream.sync();
+  } catch (...) {
+    (void)cudaStreamSynchronize(stream.get());
+    throw;
+  }
+  for (std::size_t k = 0; k < full_positions.size(); ++k)
+    columns[full_positions[k]] = std::move(gathered[k]);
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
