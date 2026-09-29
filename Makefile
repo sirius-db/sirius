@@ -83,7 +83,7 @@ clang-tsan: build/clang-tsan/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(BUILD_TARGETS)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
@@ -103,6 +103,7 @@ test_reldebug: relwithdebinfo
 	./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest
 
 test_ci-release: ci-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
 	./build/ci-release/extension/sirius/test/cpp/sirius_unittest
 
 clean:
@@ -114,34 +115,44 @@ list-presets: $(PRESETS_LINK)
 # -----------------------------------------------------------------------------
 # S3 integration test gates
 # -----------------------------------------------------------------------------
-# MinIO is now started by the test binary itself (test/cpp/utils/s3_container.*,
-# via the vendored testcontainers-native bridge) when SIRIUS_TEST_S3_AUTO=1 is
-# set. There is no separate `s3-up`/`s3-down` step, no docker-compose, and no
-# env.sh to source: the binary spins up HTTP + TLS MinIO on dynamic ports,
-# uploads fixtures, runs the tests, and tears the containers down on exit.
+# MinIO is started by the test binary itself (test/cpp/utils/s3_container.*) when
+# SIRIUS_TEST_S3_AUTO=1 is set. The testcontainers-native bridge it uses is
+# fetched and patched at configure time (cmake/testcontainers_native.cmake,
+# third_party/testcontainers-native.patch) when SIRIUS_BUILD_S3_TESTS=ON. There
+# is no separate `s3-up`/`s3-down` step, no docker-compose, and no env.sh to
+# source: the binary spins up HTTP + TLS MinIO on dynamic ports, uploads
+# fixtures, runs the tests, and tears the containers down on exit.
 #
-# `make test`         runs the default Catch2 suite; AUTO is unset, so no Docker.
-# `make s3-test`      standard S3 correctness gate: runs [s3][integration] except
-#                     [large]/[aws] (incl. the SQL-over-S3 surface) with MinIO
-#                     auto-managed, in strict mode.
+# `make test`         runs the default Catch2 suite. Without
+#                     SIRIUS_TEST_S3_AUTO it does not start MinIO, and the
+#                     MinIO-backed cases skip.
+# `make s3-test`      standard S3 gate: runs [s3][integration] except
+#                     [large]/[aws] (incl. the SQL-over-S3 surface and the tiny
+#                     TPC-H Q1-Q22 suite) with MinIO auto-managed, in strict mode.
 # `make s3-test-large`
-#                     large-SF10 SQL-over-S3 gate. SIRIUS_TEST_S3_LARGE=1 makes
-#                     the harness generate + upload lineitem_sf10.parquet (needs
-#                     the DuckDB CLI from `make release`), then runs
-#                     [s3][sql][large].
+#                     large-fixture gate, run as two processes. Both run the
+#                     SF10 lineitem cases, with cache.mode sirius in the first
+#                     and cache.mode none in the second
+#                     (SIRIUS_TEST_S3_LARGE=1 makes the harness generate and
+#                     upload lineitem_sf10.parquet; needs the DuckDB CLI from
+#                     `make release`). The first process also runs the SF1 TPC-H
+#                     suite (SIRIUS_TEST_S3_TPCH=1) and the 1001-object glob case
+#                     (SIRIUS_TEST_S3_GLOB_SCALE=1).
+# `make s3-test-aws`  MANUAL real-AWS gate: runs the live [s3][aws] tests against
+#                     a real S3 endpoint. It does not set SIRIUS_TEST_S3_AUTO and
+#                     expects the caller to provide the endpoint; it is
+#                     deliberately excluded from CI. Export the AWS
+#                     environment yourself first — including
+#                     SIRIUS_TEST_S3_ENDPOINT — (regional S3 endpoint, real
+#                     bucket, and assume-role TEMPORARY credentials including the
+#                     session token); keep usage bounded.
 #
-# The s3-test-aws* targets are MANUAL real-AWS gates: they never start MinIO
-# (AUTO is unset) and are deliberately excluded from CI. Export the AWS
-# environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
-# endpoint, real bucket, and assume-role TEMPORARY credentials including the
-# session token); keep usage bounded.
-# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
-# `make s3-test-aws-sigv4`
-#                     subset using Sirius's built-in SigV4 presigner only
-#                     ([s3][aws] minus [broker]).
-# `make s3-test-aws-broker`
-#                     subset driven by an external presign broker
-#                     ([s3][aws][broker]).
+# The S3 targets pass `--order decl`, so cases run in declaration order;
+# Catch2 3.9.0 and later would otherwise pick a random order.
+#
+# Deprecated names, kept for one round: `s3-tpch` (its suites also run in
+# s3-test and s3-test-large), `s3-test-aws-sigv4` (runs s3-test-aws, which
+# selects the same cases) and `s3-test-aws-broker` (no case carries [broker]).
 #
 # See test/cpp/integration/s3/README.md for details.
 
@@ -175,36 +186,39 @@ s3-test:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][integration]~[large]~[aws]"
+	$(S3_TEST_BIN) --order decl "[s3][integration]~[large]~[aws]"
 
 s3-test-large:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@# Grouped by config (chunk-prewarm on vs off) so MinIO is brought up once per
-	@# group. Catch2 OR-combines specs within one argument via commas (multiple
-	@# positional args are AND-concatenated instead), so each group runs in a
-	@# single process where same-config cases share one SiriusContext lifecycle.
+	@# Two processes, so MinIO is brought up once per group: first the SF10
+	@# lineitem cases with cache.mode sirius ([large-cache]) plus the SF1 TPC-H
+	@# suite and the 1001-object glob case, which use cache.mode none; then the
+	@# SF10 lineitem cases with cache.mode none ([large-nocache]). Catch2
+	@# OR-combines specs within one argument via commas (multiple positional args
+	@# are AND-concatenated instead).
 	@# SIRIUS_TEST_S3_TPCH gates the SF1 TPC-H fixture + [tpch][large]; SIRIUS_TEST_S3_GLOB_SCALE
 	@# gates the 1001-object fixture + [glob-scale]. Both are scoped to the first group only, so
 	@# the second group's bring-up must not see them (it would re-generate / re-upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
+	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) --order decl "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
+	$(S3_TEST_BIN) --order decl "[s3][sql][large][large-nocache]"
 
-# TPC-H-over-S3 correctness tier (Q1-Q22 == local CPU oracle, GPU-only). Uploads
-# the SF1 TPC-H fixture (SIRIUS_TEST_S3_TPCH=1) and runs both the tiny and SF1
-# correctness cases. MinIO auto-managed.
+# Deprecated: the tiny TPC-H suite runs in s3-test and the SF1 suite in
+# s3-test-large. Kept for one round with its old selection (uploads the SF1
+# TPC-H fixture with SIRIUS_TEST_S3_TPCH=1 and runs both suites).
 s3-tpch:
+	@echo "s3-tpch is deprecated: the TPC-H suites run in s3-test (tiny) and s3-test-large (SF1)." >&2
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
-	$(S3_TEST_BIN) "[s3][integration][sql][tpch]"
+	$(S3_TEST_BIN) --order decl "[s3][integration][sql][tpch]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -218,22 +232,13 @@ s3-test-aws:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]"
+	$(S3_TEST_BIN) --order decl "[s3][aws]"
 
+# Deprecated: selects the same cases as s3-test-aws.
 s3-test-aws-sigv4:
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-test-aws-sigv4: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@set -e; \
-	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]~[broker]"
+	@echo "s3-test-aws-sigv4 is deprecated: use s3-test-aws, which selects the same cases." >&2
+	@$(MAKE) --no-print-directory s3-test-aws
 
+# Deprecated: no test case carries [broker], so this target runs nothing.
 s3-test-aws-broker:
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-test-aws-broker: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@set -e; \
-	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws][broker]"
+	@echo "s3-test-aws-broker is deprecated and runs nothing: no test case carries [broker]." >&2

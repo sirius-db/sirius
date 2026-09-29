@@ -51,49 +51,52 @@ TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
   CHECK(cfg.s3_signing_mode == object_store_config::signing_mode::presigned);
 }
 
-TEST_CASE("object_store_config string_to_enum accepts known transports", "[object_store_config]")
+TEST_CASE("object_store_config transport string helpers round-trip", "[object_store_config]")
 {
-  object_store_config::transport t = object_store_config::transport::RDMA;
+  SECTION("string_to_enum accepts known transports")
+  {
+    object_store_config::transport t = object_store_config::transport::RDMA;
 
-  REQUIRE(string_to_enum("auto", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    REQUIRE(string_to_enum("auto", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  REQUIRE(string_to_enum("http", t));
-  CHECK(t == object_store_config::transport::HTTP);
+    REQUIRE(string_to_enum("http", t));
+    CHECK(t == object_store_config::transport::HTTP);
 
-  REQUIRE(string_to_enum("https", t));
-  CHECK(t == object_store_config::transport::HTTP);
+    REQUIRE(string_to_enum("https", t));
+    CHECK(t == object_store_config::transport::HTTP);
 
-  REQUIRE(string_to_enum("rdma", t));
-  CHECK(t == object_store_config::transport::RDMA);
-}
+    REQUIRE(string_to_enum("rdma", t));
+    CHECK(t == object_store_config::transport::RDMA);
+  }
 
-TEST_CASE("object_store_config string_to_enum rejects unknown transports", "[object_store_config]")
-{
-  auto t = object_store_config::transport::AUTO;
+  SECTION("string_to_enum rejects unknown transports")
+  {
+    auto t = object_store_config::transport::AUTO;
 
-  CHECK_FALSE(string_to_enum("", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    CHECK_FALSE(string_to_enum("", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  CHECK_FALSE(string_to_enum("smb", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    CHECK_FALSE(string_to_enum("smb", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  CHECK_FALSE(string_to_enum("HTTP", t));
-  CHECK(t == object_store_config::transport::AUTO);
-}
+    CHECK_FALSE(string_to_enum("HTTP", t));
+    CHECK(t == object_store_config::transport::AUTO);
+  }
 
-TEST_CASE("object_store_config enum_to_string returns canonical names", "[object_store_config]")
-{
-  std::string out;
+  SECTION("enum_to_string returns canonical names")
+  {
+    std::string out;
 
-  REQUIRE(enum_to_string(object_store_config::transport::AUTO, out));
-  CHECK(out == "auto");
+    REQUIRE(enum_to_string(object_store_config::transport::AUTO, out));
+    CHECK(out == "auto");
 
-  REQUIRE(enum_to_string(object_store_config::transport::HTTP, out));
-  CHECK(out == "http");
+    REQUIRE(enum_to_string(object_store_config::transport::HTTP, out));
+    CHECK(out == "http");
 
-  REQUIRE(enum_to_string(object_store_config::transport::RDMA, out));
-  CHECK(out == "rdma");
+    REQUIRE(enum_to_string(object_store_config::transport::RDMA, out));
+    CHECK(out == "rdma");
+  }
 }
 
 TEST_CASE("object_store_config signing_mode string helpers round-trip",
@@ -234,26 +237,6 @@ TEST_CASE("sirius_config rejects removed s3_use_async_backend object_store key",
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the key",
-          "[scan_manager][config][prefetching_cache]")
-{
-  auto const path = std::filesystem::temp_directory_path() / "sirius_chunk_prewarm_default.yaml";
-  {
-    std::ofstream out(path);
-    out << "sirius:\n"
-           "  executor:\n"
-           "    scan_manager:\n"
-           "      backend: sirius\n";
-    REQUIRE(out);
-  }
-
-  sirius::sirius_config cfg;
-  cfg.load_from_file(path);
-
-  std::error_code ec;
-  std::filesystem::remove(path, ec);
-}
-
 TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][config][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unknown_key.yaml";
@@ -271,8 +254,7 @@ TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][conf
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
-          "[scan_manager][config][s3][rest][tls]")
+TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys", "[config][s3][rest]")
 {
   auto check_rejected = [](std::string const& key, std::string const& value) {
     auto const path =
@@ -286,10 +268,11 @@ TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
                  key + ": " + value + "\n");
 
     sirius::sirius_config cfg;
-    REQUIRE_THROWS_WITH(
-      cfg.load_from_file(path),
-      Catch::Contains("'sirius.executor.scan_manager.rest." + key + "': removed; configure '") &&
-        Catch::Contains("sirius.executor.scan_manager.object_store." + key + "' instead"));
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                        Catch::Matchers::ContainsSubstring("'sirius.executor.scan_manager.rest." +
+                                                           key + "': removed; configure '") &&
+                          Catch::Matchers::ContainsSubstring(
+                            "sirius.executor.scan_manager.object_store." + key + "' instead"));
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -299,8 +282,7 @@ TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
   SECTION("TLS verification") { check_rejected("tls_verify", "false"); }
 }
 
-TEST_CASE("sirius_config still loads unrelated REST YAML fields",
-          "[scan_manager][config][s3][rest]")
+TEST_CASE("sirius_config still loads unrelated REST YAML fields", "[config][s3][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unrelated_fields.yaml";
   write_yaml(path,
@@ -331,8 +313,9 @@ TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][
              "        max_connections: 7\n");
 
   sirius::sirius_config cfg;
-  REQUIRE_THROWS_WITH(cfg.load_from_file(path),
-                      Catch::Contains("unknown config key: 'max_connections' in rest"));
+  REQUIRE_THROWS_WITH(
+    cfg.load_from_file(path),
+    Catch::Matchers::ContainsSubstring("unknown config key: 'max_connections' in rest"));
   CHECK(cfg.get_scan_manager_config().rest.max_connections == 64);
 
   std::error_code ec;

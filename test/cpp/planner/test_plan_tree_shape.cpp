@@ -421,9 +421,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(create);
   REQUIRE_FALSE(create->HasError());
 
-  REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
-                      Catch::Contains("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
-                                      "carrier"));
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
+    Catch::Matchers::ContainsSubstring("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
+                                       "carrier"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -1442,8 +1443,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
-  CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
-                    Catch::Contains("Unsupported filter predicate on column 'id'"));
+  CHECK_THROWS_WITH(
+    generator.create_plan(std::move(logical)),
+    Catch::Matchers::ContainsSubstring("Unsupported filter predicate on column 'id'"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

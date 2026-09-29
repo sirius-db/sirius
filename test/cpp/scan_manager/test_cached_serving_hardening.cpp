@@ -113,6 +113,7 @@ struct test_env {
 test_env& env()
 {
   static test_env e;
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
   return e;
 }
 
@@ -1900,7 +1901,7 @@ TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
     /*compressed_bytes=*/64,
     /*uncompressed_bytes=*/256,
     /*num_rows=*/64);
-  auto const rejected = Catch::Contains("needs a GPU target memory space");
+  auto const rejected = Catch::Matchers::ContainsSubstring("needs a GPU target memory space");
 
   SECTION("host-to-GPU needs a GPU target")
   {
@@ -1937,6 +1938,6 @@ TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
                                                  *e.host_space,
                                                  e.stream(),
                                                  rmm::mr::get_current_device_resource_ref()),
-                        Catch::Contains("not a GPU space on the current device"));
+                        Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
   }
 }
