@@ -22,7 +22,7 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 
 **Motivation:** During pipeline executor drain (e.g., for error recovery or pipeline transitions), in-flight task creation must be safely completed before operator destruction.
 
-**Mechanism:** `drain_pending_tasks()` drains the task creation queue via `_task_creation_queue.drain()` and waits for in-flight task creation lambdas via `_kiosk.wait_all()`.
+**Mechanism:** `drain_pending_tasks(query_id)` drains that query's requests using the queue's query index, waits for its in-flight creation lambdas, and clears its look-ahead state. Other queries' queued requests remain available.
 
 **Code path:** `src/creator/task_creator.cpp` — `drain_pending_tasks()`
 
@@ -72,7 +72,7 @@ details.
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a per-query `lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on query drain/reset). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/creator/config.hpp` — `request_type`
 
@@ -504,7 +504,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Scan splits arrive sized by metadata-parse completion rather than by the configured batch size, so batches could come out smaller than requested, and multi-GPU runs need scan inputs spread across devices. Opportunistic prefetch hints issued in metadata-completion order also rob the head-of-line pipeline of lead time.
 
-**Mechanism:** The scan manager owns a `load_balancing_scan_batch_coalescer`. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. A single sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
+**Mechanism:** The scan manager creates a `load_balancing_scan_batch_coalescer` for each query. Each scan pipeline registers a per-pipeline slot holding a `batch_coalescer`, a `split_connector`, and a `balancing_strategy`. That query's sequencer task drains the slots in registration (execution) order: it coalesces each pipeline's splits to the requested batch size — independent of the configured max batch count — chooses a device via the balancing strategy, issues `fadvise(opportunistic)` / prefetch hints, and pushes the placed split onto the connector, advancing to the next pipeline only after the current one closes. The `balancing_strategy` interface stamps a `preferred_device_id` on each split (which the task creator honors); `round_robin_strategy` hands out GPUs via an atomic cursor and is the default.
 
 **Code path:**
 - `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push

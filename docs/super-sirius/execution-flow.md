@@ -118,10 +118,10 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 **File:** `src/sirius_engine.cpp` — `execute()`
 
-1. Calls `SiriusContext::create_query()` with the finalized pipelines
-2. Query preparation creates a `completion_handler` and installs it on the GPU executors and query-terminal pipelines
-3. Calls `task_scheduler::start_query()`, which schedules the initial scan operator and returns the completion future
-4. The main thread blocks on `future.get()` and then drains in-flight work before returning
+1. Creates this query's `completion_handler` and obtains its future
+2. Calls `SiriusContext::create_query()` with the finalized pipelines and handler; query preparation makes the handler available to its pipeline tasks
+3. Calls `task_scheduler::start_query(query)`, which schedules the initial scan operator
+4. The main thread blocks on its future and validates completion before returning; an error drains in-flight work
 
 ## Step 6: Scan Execution
 
@@ -129,7 +129,7 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 
-1. **Scan manager (per-query setup + I/O).** During `prepare_for_query()`, `sirius_scan_manager` walks the query's scan operators in order. For each scan it selects a provider: `split_provider` on a cache miss, `cached_databatch_provider` on a cache hit. Providers push splits into the connector the operator created at plan time. The operator retains the ingestible the plan generator created. A driver thread then runs the providers sequentially, populating each connector with splits.
+1. **Scan manager (per-query setup + I/O).** During `prepare_for_query()`, `sirius_scan_manager` walks the query's scan operators in order. A cache miss gets a disk-reading `split_provider`; a pinned-cache hit is served by a cached batch provider in that query's coalescer slot. The per-query sequencer coalesces metadata, balances each split, and pushes it into the connector the operator created at plan time. The operator retains the ingestible the plan generator created.
 2. **I/O layer.** The split providers read bytes through the scan manager's `io_context`: io_uring for local disk, with REST and kvikio backends resolved by per-backend path checkers via the datasource factory. The prefetching cache fronts the uring and REST backends.
 3. **GPU scan source (materialization).** The unified `sirius_gpu_scan_operator` pulls splits from its `split_connector` (`get_next_task_input_data`) and, in `execute()`, delegates each split to the installed `gpu_ingestible`'s `materialize_table` (and conditional `post_filter_and_project`). This runs as a `gpu_pipeline_task` on a GPU executor worker thread and publishes GPU-ready batches to the data repository, scheduling downstream consumers via `task_creator->schedule()`.
 
@@ -202,6 +202,7 @@ sequenceDiagram
     participant Ext as sirius_extension
     participant Iface as sirius_interface
     participant Engine as sirius_engine
+    participant Context as SiriusContext
     participant PE as task_scheduler
     participant SM as sirius_scan_manager
     participant GPE as gpu_pipeline_executor
@@ -214,11 +215,14 @@ sequenceDiagram
     Iface->>Engine: initialize(result_collector)
     Engine->>Engine: Build pipelines, rewrite scans to GPU scan source, wire repos
     Iface->>Engine: execute()
-    Engine->>PE: start_query(pipelines)
-    PE->>CH: create completion_handler
-    PE->>SM: prepare_for_query (split providers + connectors)
+    Engine->>CH: create completion_handler and future
+    Engine->>Context: create_query(pipelines, handler)
+    Context->>TC: prepare_for_query(query, handler)
+    Context->>SM: prepare_for_query(query, GPUs)
     SM->>SM: drive splits through io_context + prefetch cache
-    PE->>GPE: schedule initial GPU scan tasks
+    Engine->>PE: start_query(query)
+    PE->>TC: schedule initial scan operator
+    TC->>GPE: schedule initial GPU scan tasks
     GPE->>SM: pull splits via split_connector
     GPE->>GPE: materialize via gpu_ingestible, publish to repos
     GPE->>TC: schedule(downstream_op)
