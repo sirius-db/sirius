@@ -169,8 +169,8 @@ jobs:
           exit 1
 
       # One Catch2 shard per GPU. Each shard sees only its own GPU; [multi_gpu]
-      # tests run afterwards with all GPUs. Declaration order keeps the same
-      # test-to-shard assignment in every process.
+      # tests run afterwards with all GPUs. A fixed random seed distributes
+      # long-running cases while keeping assignments reproducible.
       - name: Run C++ unit tests
         run: |
           nvidia-smi
@@ -189,7 +189,7 @@ jobs:
               started_at=$(date +%s)
               CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
                 TMPDIR="/tmp/shard-$i" \
-                timeout 45m "$bin" --abort --order decl --durations yes \
+                timeout 45m "$bin" --abort --order rand --rng-seed 42 --durations yes \
                   --shard-count "$gpus" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
               echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
             } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
