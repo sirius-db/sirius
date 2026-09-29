@@ -41,7 +41,19 @@ enum class event_type : std::uint8_t {
   pipeline_closed,
   executor_awaiting_task,
   memory_downgrade_for_task,
-  wait_for_memory_for_task
+  wait_for_memory_for_task,
+  compressed_materialization
+};
+
+/// What happened to compressed carriers. Counts describe columns, except
+/// scan_sidecar_installed, which counts scan nodes at plan time.
+enum class compressed_materialization_activity : std::uint8_t {
+  scan_columns_narrowed,
+  scan_columns_restored,
+  pin_columns_narrowed,
+  scan_sidecar_installed,
+  partition_narrow_columns,
+  scan_narrow_targets_retracted
 };
 
 /// One published event: the tag that says which it is, and the arguments the
@@ -91,6 +103,9 @@ using memory_downgrade_for_task_event =
 using wait_for_memory_for_task_event =
   event<event_type::wait_for_memory_for_task, query_id_t, std::size_t, int, std::size_t>;
 
+using compressed_materialization_event =
+  event<event_type::compressed_materialization, compressed_materialization_activity, std::uint64_t>;
+
 /// Every event a @ref query_event_publisher can publish.  Subscribers receive this
 /// and nothing else, so adding an event is: an enumerator, an alias, an arm
 /// here, and an arm in the dispatch.
@@ -101,7 +116,8 @@ using query_events = std::variant<task_created_event,
                                   pipeline_closed_event,
                                   executor_awaiting_task_event,
                                   memory_downgrade_for_task_event,
-                                  wait_for_memory_for_task_event>;
+                                  wait_for_memory_for_task_event,
+                                  compressed_materialization_event>;
 
 /// Number of distinct events, and so the width of the publisher's routing table.
 inline constexpr std::size_t n_query_events = std::variant_size_v<query_events>;
@@ -117,8 +133,8 @@ static_assert(
                  task_created_event>);
 static_assert(
   std::is_same_v<
-    std::variant_alternative_t<event_index_v<wait_for_memory_for_task_event>, query_events>,
-    wait_for_memory_for_task_event>);
+    std::variant_alternative_t<event_index_v<compressed_materialization_event>, query_events>,
+    compressed_materialization_event>);
 
 /// Every event, for the @ref query_event_publisher::register_subscriber overload
 /// that takes no subscription list.
@@ -130,6 +146,7 @@ inline constexpr std::array<event_type, n_query_events> all_query_events{
   event_type::pipeline_closed,
   event_type::executor_awaiting_task,
   event_type::memory_downgrade_for_task,
-  event_type::wait_for_memory_for_task};
+  event_type::wait_for_memory_for_task,
+  event_type::compressed_materialization};
 
 }  // namespace sirius::event

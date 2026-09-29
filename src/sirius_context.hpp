@@ -298,28 +298,6 @@ class SiriusContext : public ClientContextState {
     uint64_t classification_failures = 0;
   };
 
-  /// Monotonic counters describing compressed-materialization activity.
-  ///
-  /// These counters intentionally describe columns rather than queries: a
-  /// single scan or pinned chunk can narrow or restore several columns.
-  struct compressed_materialization_stats {
-    uint64_t scan_columns_narrowed = 0;
-    uint64_t scan_columns_restored = 0;
-    uint64_t pin_columns_narrowed  = 0;
-    /// Plan-time count of TABLE_SCAN nodes that received a narrow physical
-    /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
-    /// still clear or prune it).
-    uint64_t scan_sidecars_installed = 0;
-    /// Runtime count of input-batch columns that crossed an engaged hash
-    /// PARTITION with a carrier narrower than their native mapping. Derived
-    /// from actual batch types, so a regression anywhere in the narrow-carrier
-    /// chain drops it to zero.
-    uint64_t partition_narrow_columns = 0;
-    /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
-    /// is `apply_tier_narrowing_policy`'s.
-    uint64_t scan_narrow_targets_retracted = 0;
-  };
-
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -651,27 +629,11 @@ class SiriusContext : public ClientContextState {
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
-  /// \brief Snapshot counters for compressed-materialization observability.
-  [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
-    const noexcept;
-
-  /// \brief Record columns narrowed while materializing a scan batch.
-  void record_compressed_materialization_scan_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns restored to their native type at a scan boundary.
-  void record_compressed_materialization_scan_columns_restored(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns narrowed while materializing a pinned chunk.
-  void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
-  void record_compressed_materialization_scan_sidecar_installed() noexcept;
-
-  /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
-  void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
-
-  /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
-  void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
+  /// Shared event source for planning, pinning, and execution observations.
+  [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
+  {
+    return *event_publisher_;
+  }
 
  private:
   void throw_if_not_initialized() const;
@@ -786,6 +748,8 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
+  std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
+    std::make_shared<sirius::event::query_event_publisher>()};
   sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
@@ -794,12 +758,6 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
-  std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
