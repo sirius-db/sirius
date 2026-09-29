@@ -59,6 +59,10 @@ namespace sirius::memory {
 class topology_index;
 }  // namespace sirius::memory
 
+namespace sirius::parallel {
+class itask;
+}
+
 namespace sirius::creator {
 
 /**
@@ -154,6 +158,7 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+  void reschedule(std::unique_ptr<parallel::itask> task);
 
   /// Attach the query-event observer. Until called, events go to an unsubscribed publisher.
   void set_query_event_publisher(sirius::event::query_event_publisher& publisher)

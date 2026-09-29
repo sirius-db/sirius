@@ -578,8 +578,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   // Window id + keyed tags are prepared BEFORE the slot is acquired: after
   // acquire, no statement on any path allocates, so release cannot be skipped
   // (and the noexcept destructor cannot terminate) for an allocation reason.
-  window_id_ =
-    sirius::make_query_id(ctx_.next_window_id_.fetch_add(1, std::memory_order_relaxed) + 1);
+  window_id_ = sirius::next_query_id(ctx_.next_window_id_);
   std::snprintf(begin_tag_,
                 sizeof(begin_tag_),
                 "QueryBegin instance=%p connection=%llu window=%llu query=%llu",

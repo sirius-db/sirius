@@ -382,16 +382,19 @@ void task_scheduler::management_eventloop()
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
 
-      // Exact preference match: the device index returns the highest-priority
-      // (lowest value) task preferring exactly this device.
-      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
+      // One atomic selection across exact and unbound affinity, ordered by query/pipeline
+      // priority. Delayed memory/lock retries yield to other compatible runnable work.
+      const auto now = std::chrono::steady_clock::now();
+      task =
+        _task_queue
+          .try_pop_if([&](auto const& candidate) {
+            const auto keys = index_keys_for(candidate);
+            return (keys.device_id == device_id || keys.device_id == exec::no_preferred_device) &&
+                   candidate.retry_not_before <= now;
+          })
+          .value_or(nullptr);
       if (!task) {
-        // Pick a task with no preference (any device will do). Which GPU gets it is decided by
-        // whichever executor signalled ready first, not by any counter.
-        task =
-          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-      }
-      if (!task) {
+        if (_task_creator) { _task_creator->schedule_lookahead(device_id); }
         // No dispatchable task for this device. Leave device in _ready_devices
         // and move on — it will match when an appropriate task arrives.
         // Only interesting while the queue is NOT empty: work exists but cannot
@@ -409,11 +412,8 @@ void task_scheduler::management_eventloop()
         if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
           task_id = gpu_task->get_task_id();
           {
-            // Priority packs query_id in its high 32 bits (see task_creator); the
-            // queue's key extractor unpacks it the same way.
-            auto const query_id = make_query_id(static_cast<std::uint32_t>(
-              static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
             auto const* pipe    = gpu_task->get_pipeline();
+            auto const query_id = pipe ? pipe->get_query_id() : make_query_id(0);
             auto const [operator_id, operator_type] =
               pipe != nullptr ? pipe->get_source_operator()
                               : std::pair{op::sirius_physical_operator::invalid_operator_id,
@@ -442,6 +442,9 @@ void task_scheduler::management_eventloop()
         if (failure_handler) { failure_handler->report_error(std::current_exception()); }
       }
       // Refusal does not consume the parked executor's readiness. Try its next task.
+    }
+    if (!_ready_devices.empty() && !_task_queue.empty()) {
+      _task_queue.wait_for_activity(std::chrono::milliseconds(2));
     }
   }
 }

@@ -156,6 +156,9 @@ void gpu_pipeline_executor::process_task(
       return;
     }
     iteration_completion = gpu_task->get_completion_handler();
+    if (!_task_creator && pipeline_task->retry_not_before > std::chrono::steady_clock::now()) {
+      std::this_thread::sleep_until(pipeline_task->retry_not_before);
+    }
     // Attribute the reserved slot now that the task's query is known, so
     // drain_and_wait(query_id) covers this execution. Not done at reserve() time: the manager
     // parks in pop() holding the slot before any task exists, and counting that against a query
@@ -206,160 +209,55 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_available_memory(),
       _memory_space->get_total_reserved_memory(),
       _memory_space->get_max_memory());
-    // Try without blocking first, purely so the blocking case can be reported.
-    // make_reservation() parks until the memory frees up, and a listener told
-    // only once it returns learns nothing it can act on -- by then the stall it
-    // would have exploited is over.  A reservation that succeeds outright is the
-    // common case and raises nothing.
+    auto const* pipe    = gpu_task->get_pipeline();
+    const auto query_id = pipe ? pipe->get_query_id() : make_query_id(0);
+    if (_query_lifecycle && !_query_lifecycle->accepts_work(query_id)) { return; }
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
-    if (!reservation) {
-      if (_query_event_publisher) {
-        auto const* pipe               = gpu_task->get_pipeline();
-        auto const stalled_operator_id = pipe != nullptr
-                                           ? pipe->get_source_operator().first
-                                           : op::sirius_physical_operator::invalid_operator_id;
-        _query_event_publisher->publish_wait_for_memory_for_task(
-          make_query_id(
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-          stalled_operator_id,
-          _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-          bytes_needs);
+    if (!reservation || reservation->size() < bytes_needs) {
+      reservation.reset();
+      const auto now = std::chrono::steady_clock::now();
+      if (pipeline_task->memory_wait_started == std::chrono::steady_clock::time_point{}) {
+        pipeline_task->memory_wait_started = now;
+        if (_query_event_publisher) {
+          _query_event_publisher->publish_wait_for_memory_for_task(
+            query_id,
+            pipe ? pipe->get_source_operator().first : 0,
+            _memory_space->get_device_id(),
+            bytes_needs);
+        }
       }
-      reservation = _memory_space->make_reservation(bytes_needs);
-    }
-    if (!reservation) {
-      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
-                       gpu_task->get_task_id());
-      if (auto handler = gpu_task->get_completion_handler()) {
-        handler->report_error(
-          "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
-          std::to_string(gpu_task->get_task_id()));
-      }
-      return;
-    } else if (reservation->size() < bytes_needs && _downgrade_executor) {
-      size_t shortfall    = bytes_needs - reservation->size();
-      size_t partial_size = reservation->size();
-
-      gpu_task->telemetry_handle().downgrading({
-        .instance_name              = "",
-        .shortfall_bytes            = shortfall,
-        .partial_bytes              = partial_size,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-      });
-
-      SIRIUS_LOG_DEBUG(
-        "GPU Pipeline Executor: requested reservation size {} but only got {} bytes, reservation "
-        "shortfall {} bytes for pipeline {} "
-        "task {}, requesting predicate-based downgrade",
-        bytes_needs,
-        partial_size,
-        shortfall,
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id());
-
-      // Reported before the (blocking) downgrade rather than after: the value of
-      // knowing is that the GPU is about to stall, and a listener told only once
-      // it has finished learns nothing it can act on.
-      auto const* downgrade_pipe     = gpu_task->get_pipeline();
-      auto const stalled_operator_id = downgrade_pipe != nullptr
-                                         ? downgrade_pipe->get_source_operator().first
-                                         : op::sirius_physical_operator::invalid_operator_id;
-      _query_event_publisher->publish_memory_downgrade_for_task(
-        make_query_id(
-          static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32)),
-        stalled_operator_id,
-        _memory_space != nullptr ? _memory_space->get_device_id() : -1,
-        shortfall);
-
-      reservation.reset();  // release partial reservation before downgrade
-
-      std::unique_ptr<cucascade::memory::reservation> new_reservation;
-      auto* mem_space = _memory_space;
-      size_t freed    = 0;
-      std::mutex reservation_mutex;
-      try {
-        freed =
-          _downgrade_executor
-            ->request_downgrade([mem_space, bytes_needs, &new_reservation, &reservation_mutex]() {
-              std::lock_guard<std::mutex> lock(reservation_mutex);
-              if (new_reservation) { return true; }
-              auto res = mem_space->make_reservation_or_null(bytes_needs);
-              if (res && res->size() >= bytes_needs) { new_reservation = std::move(res); }
-              return new_reservation != nullptr;
-            })
-            .get();
-      } catch (const std::exception& e) {
-        // The downgrade executor cancelled this request (its queue was drained). This task cannot
-        // get its reservation, so fail its query
-        SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
-                        gpu_task->get_task_id(),
-                        e.what());
+      // No manager or worker waits on a reservation/future. Bound persistent exhaustion;
+      // interruption can dispose of this task from the scheduler queue at any time.
+      if (now - pipeline_task->memory_wait_started > std::chrono::seconds(30)) {
         if (iteration_completion) {
-          iteration_completion->report_error(
-            "GPU Pipeline Executor: downgrade request cancelled for task " +
-            std::to_string(gpu_task->get_task_id()) + ": " + e.what());
+          iteration_completion->report_error("GPU reservation made no progress for 30 seconds");
         }
         return;
       }
-
-      if (new_reservation) {
-        reservation = std::move(new_reservation);
+      if (_pending_reclamation.valid() &&
+          _pending_reclamation.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+          _pending_reclamation.get();
+        } catch (...) { /* Retry within the bounded budget. */
+        }
+      }
+      if (_downgrade_executor && !_pending_reclamation.valid() && now >= _next_reclamation) {
+        // Runtime-owned pressure request: it borrows victims independently and captures no
+        // stack variables or requesting query. Finishing one query cannot cancel another's IO.
+        _pending_reclamation = _downgrade_executor->request_free_memory(bytes_needs);
+        _next_reclamation    = now + std::chrono::milliseconds(50);
+      }
+      pipeline_task->retry_not_before = now + std::chrono::milliseconds(5);
+      if (_task_creator) {
+        _task_creator->reschedule(std::move(pipeline_task));
       } else {
-        // Predicate never succeeded — try one final reservation attempt
-        reservation = _memory_space->make_reservation(bytes_needs);
+        // Standalone component compatibility; production always has a task creator.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        schedule(std::move(pipeline_task));
       }
-
-      // One INFO line per executor-driven (reserve-path) downgrade. The shortfall
-      // detail above is DEBUG, and the downgrade executor's own per-request line is
-      // DEBUG too, so without this a normal run cannot tell whether its spilling came
-      // from here or from the periodic monitor. Tagged to pair with the
-      // "[downgrade][monitor]" lines in downgrade_executor::monitor_loop.
-      SIRIUS_LOG_INFO(
-        "[downgrade][reserve] pipeline {} task {}: needed {} bytes (shortfall {}), downgrade freed "
-        "{} bytes, reservation {}",
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id(),
-        bytes_needs,
-        shortfall,
-        freed,
-        reservation ? (reservation->size() >= bytes_needs ? "satisfied" : "partial") : "failed");
-
-      if (!reservation) {
-        SIRIUS_LOG_ERROR(
-          "GPU Pipeline Executor: Failed to acquire memory reservation after "
-          "downgrade for task {} (freed {} bytes)",
-          gpu_task->get_task_id(),
-          freed);
-        if (auto handler = gpu_task->get_completion_handler()) {
-          handler->report_error(
-            "GPU Pipeline Executor: Failed to acquire memory reservation "
-            "after downgrade for task " +
-            std::to_string(gpu_task->get_task_id()));
-        }
-        return;
-      }
-      if (reservation->size() < bytes_needs) {
-        SIRIUS_LOG_WARN(
-          "GPU Pipeline Executor: after downgrade ({} bytes freed), reservation "
-          "still partial ({}/{} bytes) for pipeline {} task {} -- proceeding "
-          "with partial reservation",
-          freed,
-          reservation->size(),
-          bytes_needs,
-          gpu_task->get_pipeline_id(),
-          gpu_task->get_task_id());
-      }
-    } else if (reservation->size() < bytes_needs) {
-      // No downgrade executor available -- warn and proceed (this should never happen)
-      SIRIUS_LOG_WARN(
-        "GPU Pipeline Executor: Acquired memory reservation does not match "
-        "requested size for pipeline {} of {} bytes needed for task "
-        "{}. Reservation size: {}. WARNING: Downgrade executor is not available",
-        gpu_task->get_pipeline_id(),
-        bytes_needs,
-        gpu_task->get_task_id(),
-        reservation->size());
+      return;  // releases the reserved worker slot
     }
+    pipeline_task->memory_wait_started = {};
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -496,7 +394,8 @@ void gpu_pipeline_executor::process_task(
           // (cross-GPU processing contention, follow-up #17). 50 ms gives
           // typical SF100 probe tasks time to finish their current work
           // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          new_task->retry_not_before =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
@@ -508,7 +407,11 @@ void gpu_pipeline_executor::process_task(
             pipeline_task->telemetry_handle().exit();
             pipeline_task->set_telemetry_finalized();
           }
-          this->schedule(std::move(new_task));
+          if (_task_creator) {
+            _task_creator->reschedule(std::move(new_task));
+          } else {
+            this->schedule(std::move(new_task));
+          }
           return;
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());

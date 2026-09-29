@@ -433,6 +433,12 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 
 }  // namespace
 
+void task_creator::reschedule(std::unique_ptr<parallel::itask> task)
+{
+  if (!_task_scheduler) { throw std::logic_error("creator has no scheduler for retry"); }
+  _task_scheduler->schedule(std::move(task));
+}
+
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
@@ -530,63 +536,49 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }
 
-  // Select the first query, which is the implicit FIFO priority.
-  // TODO: Will want to revisit this, to have lookahead be able to schedule lookahead for the
-  // following query as well if needed.
-  sirius::query_id_t query_id{};
-  std::shared_ptr<query_task_global_state> state;
+  // Snapshot ownership, then try live queries oldest-first. A blocked/exhausted older
+  // lookahead must not prevent younger work that can release memory from being created.
+  std::vector<std::pair<query_id_t, std::shared_ptr<query_task_global_state>>> states;
   {
-    std::lock_guard<std::mutex> lock(_global_state_mutex);
-    // Oldest-first, matching the FIFO scheduling policy — but SKIPPING queries that are no longer
-    // accepting work rather than giving up on the first one. The oldest entry is routinely a
-    // query that has finished and is mid-cleanup but whose state has not been dropped yet:
-    // warming it up would dereference operators of a plan that is already gone, and bailing out
-    // entirely would starve every younger query of lookahead for the whole cleanup window.
-    for (auto& [id, candidate] : _query_task_global_states) {
-      if (candidate && (_query_lifecycle == nullptr || _query_lifecycle->accepts_work(id))) {
-        query_id = id;
-        state    = candidate;
-        break;
-      }
-    }
+    std::lock_guard lock(_global_state_mutex);
+    states.assign(_query_task_global_states.begin(), _query_task_global_states.end());
   }
-  if (!state) { return; }
-  // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
-  // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
-  auto submission = begin_submission(query_id);
-  if (_query_lifecycle != nullptr && !submission) { return; }
-
-  try {
-    std::lock_guard lock(state->lookahead_mutex);
-    for (; state->index_of_next_lookahead < state->lookahead_queue.size();
-         ++state->index_of_next_lookahead) {
-      auto* node = state->lookahead_queue[state->index_of_next_lookahead];
-      if (node == nullptr) { continue; }
-      auto hint = node->get_next_task_hint();
-      if (!hint.has_value()) {
-        if (!node->get_pipeline()->is_pipeline_finished()) { return; }
-        continue;
+  for (auto const& [query_id, state] : states) {
+    if (!state) { continue; }
+    auto submission = begin_submission(query_id);
+    if (_query_lifecycle && !submission) { continue; }
+    try {
+      std::lock_guard lock(state->lookahead_mutex);
+      for (; state->index_of_next_lookahead < state->lookahead_queue.size();
+           ++state->index_of_next_lookahead) {
+        auto* node = state->lookahead_queue[state->index_of_next_lookahead];
+        if (node == nullptr) { continue; }
+        auto hint = node->get_next_task_hint();
+        if (!hint.has_value()) {
+          if (!node->get_pipeline()->is_pipeline_finished()) { break; }
+          continue;
+        }
+        if (hint.value().hint == op::TaskCreationHint::READY) {
+          SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+                           node->get_name(),
+                           node->get_operator_id());
+          const auto [_, priority] = request_keys_for(node);
+          auto request             = std::make_unique<task_creation_request>();
+          request->node            = node;
+          request->type            = request_type::lookahead;
+          request->query_id        = query_id;
+          request->priority        = priority;
+          request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
+          request->operator_type   = node->type;
+          if (submission) { request->work = submission.take_work_lease(); }
+          report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
+          ++state->index_of_next_lookahead;
+          return;
+        }
       }
-      if (hint.value().hint == op::TaskCreationHint::READY) {
-        SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
-                         node->get_name(),
-                         node->get_operator_id());
-        const auto [_, priority] = request_keys_for(node);
-        auto request             = std::make_unique<task_creation_request>();
-        request->node            = node;
-        request->type            = request_type::lookahead;
-        request->query_id        = query_id;
-        request->priority        = priority;
-        request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
-        request->operator_type   = node->type;
-        if (submission) { request->work = submission.take_work_lease(); }
-        report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
-        ++state->index_of_next_lookahead;
-        return;
-      }
+    } catch (...) {
+      report_fatal_error(state->completion_handler, std::current_exception());
     }
-  } catch (...) {
-    report_fatal_error(state->completion_handler, std::current_exception());
   }
 }
 

@@ -20,6 +20,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -391,6 +392,14 @@ class multi_index_priority_queue {
       }
     }
     return std::nullopt;
+  }
+
+  /// Bounded retry wake: a new publication wakes immediately; otherwise retry after timeout.
+  template <class Rep, class Period>
+  void wait_for_activity(std::chrono::duration<Rep, Period> timeout)
+  {
+    std::unique_lock lock(_mutex);
+    if (_active) { _cv.wait_for(lock, timeout); }
   }
 
   /// Wakes every thread blocked in pop()/pop_back(); while interrupted they return

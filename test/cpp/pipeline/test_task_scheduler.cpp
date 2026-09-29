@@ -581,3 +581,58 @@ TEST_CASE("scheduler retirement waits for a task removed from its queue",
   CHECK(lifecycle.activity(q).work == 0);
   lifecycle.close(q);
 }
+
+TEST_CASE("scheduler chooses oldest compatible runnable task across affinity buckets",
+          "[task_scheduler][concurrency]")
+{
+  auto manager = initialize_memory_manager(1);
+  task_scheduler scheduler({1}, *manager, sirius::test::make_test_telemetry_context());
+  std::vector<int> order;
+  std::atomic<int> completed{0};
+  class ordered_task : public mock_gpu_pipeline_task {
+   public:
+    ordered_task(int id,
+                 std::shared_ptr<mock_gpu_pipeline_task_global_state> global,
+                 std::vector<int>& order,
+                 std::atomic<int>& completed,
+                 bool exact)
+      : mock_gpu_pipeline_task(
+          id, std::make_unique<mock_gpu_pipeline_task_local_state>(id, 0), global),
+        order(order),
+        completed(completed)
+    {
+      if (exact) {
+        local_state()->cast<gpu_pipeline_task_local_state>().set_preferred_device_id(0);
+      }
+    }
+    void execute(::cuda::stream_ref) override
+    {
+      order.push_back(static_cast<int>(get_task_id()));  // One executor worker.
+      completed.fetch_add(1);
+    }
+    std::vector<int>& order;
+    std::atomic<int>& completed;
+  };
+  auto first  = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  auto second = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  first->set_priority(1);
+  second->set_priority(2);
+  auto older    = std::make_unique<ordered_task>(1, first, order, completed, false);
+  bool deferred = false;
+  SECTION("unbound older work precedes device-specific younger work") {}
+  SECTION("waiting older work yields to runnable younger work")
+  {
+    older->retry_not_before = std::chrono::steady_clock::now() + 200ms;
+    deferred                = true;
+  }
+  scheduler.schedule(std::move(older));
+  scheduler.schedule(std::make_unique<ordered_task>(2, second, order, completed, true));
+  scheduler.start();
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (completed.load() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  scheduler.stop();
+  REQUIRE(order.size() == 2);
+  CHECK(order == (deferred ? std::vector<int>{2, 1} : std::vector<int>{1, 2}));
+}

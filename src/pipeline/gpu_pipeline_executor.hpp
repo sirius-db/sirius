@@ -28,6 +28,7 @@
 #include <cucascade/memory/stream_pool.hpp>
 
 #include <atomic>
+#include <future>
 #include <memory>
 #include <thread>
 
@@ -137,6 +138,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::exec::invocable<void() noexcept> get_per_thread_init() override;
 
  private:
+  std::future<size_t> _pending_reclamation;
+  std::chrono::steady_clock::time_point _next_reclamation{};
   /**
    * @brief Safely casts itask to gpu_pipeline_task with type validation
    *

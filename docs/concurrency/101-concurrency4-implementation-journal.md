@@ -84,3 +84,18 @@ Implementation entries will be added here as each buildable change is validated 
 - Validation: full `pixi run make`; CPU registry tests (15 cases, 128 assertions);
   lifecycle, downgrade and runtime fallback tests (32 cases, 244 assertions).
 - Previous commit: `671e8bd64`.
+
+### 3. `fix(exec): yield GPU workers while awaiting memory`
+
+- Failed reservations return tasks to the shared, spill-visible scheduler with a retry deadline.
+  GPU workers do not wait for downgrade futures or retain partial reservations. Reclamation is
+  rate limited per GPU; a task that cannot reserve for 30 seconds fails its own query.
+- OOM retries also yield their worker. The scheduler chooses the oldest runnable compatible
+  task across device-specific and unbound queues. Lookahead can advance a younger query when
+  an older query cannot currently produce runnable work.
+- HOST result transfer requires a successful reservation; it no longer bypasses accounting when
+  memory is unavailable. Query priorities reject exhausted 31-bit IDs instead of wrapping.
+- Validation: clean full `pixi run make`; focused scheduler, executor, OOM, query ID and lifetime
+  tests passed (41 cases, 209 assertions). The existing two-GPU affinity test skipped on this
+  one-GPU host; the new FIFO and retry-deadline tests executed.
+- Previous commit: `2b3acbad0`.
