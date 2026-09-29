@@ -153,6 +153,7 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     );
     run_ok("CREATE TABLE dist_r (a INTEGER, x INTEGER);");
     run_ok("INSERT INTO dist_r VALUES (1, 10), (2, 20), (2, 21), (3, 30), (NULL, 40);");
+    run_ok("CREATE TABLE dist_empty (a INTEGER, b INTEGER);");
     // `v` is a function of `k`, so a DISTINCT ON over `k` has one correct answer whichever row
     // represents a group. The guarded shapes need that: they compare a fallback run against a
     // second CPU run, and DISTINCT ON without ORDER BY may pick a different row each time.
@@ -356,6 +357,19 @@ TEST_CASE_METHOD(DistinctFixture,
     "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a FROM dist_t), "
     "d AS MATERIALIZED (SELECT a, b FROM dist_t) "
     "SELECT d1.a FROM d d1 JOIN d d2 ON d1.b = d2.b JOIN c ON c.a = d1.a) s");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT over zero input rows",
+                 "[integration][gpu_execution][distinct]")
+{
+  SECTION("empty table") { compare_gpu_vs_cpu("SELECT DISTINCT a, b FROM dist_empty"); }
+
+  // A constant outside the column's min/max folds the plan to EMPTY_RESULT; 15 lies inside.
+  SECTION("filter that keeps no row")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT a, x FROM dist_r WHERE x = 15");
+  }
 }
 
 //===----------------------------------------------------------------------===//
