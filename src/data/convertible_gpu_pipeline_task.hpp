@@ -96,9 +96,27 @@ class convertible_gpu_pipeline_task : public convertible_data {
   ~convertible_gpu_pipeline_task() override
   {
     if (!_task) { return; }
-    if (_query_lifecycle != nullptr && !_query_lifecycle->accepts_work(sirius::make_query_id(
-                                         sirius::pipeline::index_keys_for(*_task).query_id))) {
-      return;  // query is tearing down; drop instead of resurrecting
+    if (_query_lifecycle != nullptr) {
+      const auto query_id =
+        sirius::make_query_id(sirius::pipeline::index_keys_for(*_task).query_id);
+      const auto state = _query_lifecycle->state(query_id);
+      if (!state) {
+        try {
+          SIRIUS_LOG_ERROR("convertible_gpu_pipeline_task: refusing work for unknown query {}",
+                           query_id);
+        } catch (...) {
+          // Destructors must not throw while unwinding a failed query.
+        }
+        if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(_task.get())) {
+          if (auto handler = gpu_task->get_completion_handler()) {
+            handler->report_error(
+              "convertible_gpu_pipeline_task: query lifecycle registration is missing");
+          }
+        }
+      }
+      if (state != sirius::exec::query_lifecycle_state::open) {
+        return;  // query is tearing down or has already closed; do not resurrect its task
+      }
     }
     (void)_queue.push(std::move(_task));
   }

@@ -462,9 +462,19 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   _task_creation_queue.push(std::move(request));
 }
 
-bool task_creator::accepts_work(sirius::query_id_t query_id) const noexcept
+bool task_creator::accepts_work(sirius::query_id_t query_id) const
 {
-  return _query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id);
+  if (_query_lifecycle == nullptr) { return true; }
+  const auto state = _query_lifecycle->state(query_id);
+  if (!state) {
+    if (auto query_state = get_query_task_global_state(query_id);
+        query_state && query_state->completion_handler) {
+      query_state->completion_handler->report_error(
+        "task_creator: query lifecycle registration is missing");
+    }
+    SIRIUS_LOG_ERROR("task_creator: refusing work for unknown query {}", query_id);
+  }
+  return state == sirius::exec::query_lifecycle_state::open;
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,

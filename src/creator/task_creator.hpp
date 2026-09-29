@@ -284,7 +284,7 @@ class task_creator {
    *
    * True when no registry is bound (the unit-test default), preserving pre-gate behaviour.
    */
-  [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const noexcept;
+  [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const;
 
   /**
    * @brief Stop the worker thread pool.
