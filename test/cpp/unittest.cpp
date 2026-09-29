@@ -150,6 +150,9 @@ int main(int argc, char* argv[])
 
   auto integration_config_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
                                  "integration" / "integration.yaml";
+  if (auto const* shard_config = std::getenv("SIRIUS_TEST_INTEGRATION_CONFIG")) {
+    integration_config_path = shard_config;
+  }
   sirius::test::shared_test_env integration_env(integration_config_path);
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;

@@ -168,9 +168,9 @@ jobs:
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
 
-      # One Catch2 shard per GPU. Each shard sees only its own GPU; [multi_gpu]
-      # tests run afterwards with all GPUs. A fixed random seed distributes
-      # long-running cases while keeping assignments reproducible.
+      # Two Catch2 shards per GPU. Each shard sees only its assigned GPU;
+      # [multi_gpu] tests run afterwards with all GPUs. A fixed random seed
+      # spreads tests across shards while keeping assignments identical.
       - name: Run C++ unit tests
         run: |
           nvidia-smi
@@ -181,22 +181,25 @@ jobs:
             echo "::error::Expected at least 2 GPUs, found $gpus" >&2
             exit 1
           fi
-          for ((i = 0; i < gpus; i++)); do
+          shards=$((gpus * 2))
+          for ((i = 0; i < shards; i++)); do
+            gpu=$((i % gpus))
             mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
             # Stream each shard live with a prefix; keep its full log for the failure summary.
             {
               status=0
               started_at=$(date +%s)
-              CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
+              CUDA_VISIBLE_DEVICES=$gpu SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
+                SIRIUS_TEST_INTEGRATION_CONFIG="$PWD/test/cpp/integration/integration-shard.yaml" \
                 TMPDIR="/tmp/shard-$i" \
                 timeout 45m "$bin" --abort --order rand --rng-seed 42 --durations yes \
-                  --shard-count "$gpus" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
+                  --shard-count "$shards" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
               echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
             } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
           done
           wait
           status=0
-          for ((i = 0; i < gpus; i++)); do
+          for ((i = 0; i < shards; i++)); do
             summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
             read -r shard_status elapsed < "/tmp/shard-$i.status"
             echo "Shard $i (exit $shard_status, ${elapsed}s): $summary"
