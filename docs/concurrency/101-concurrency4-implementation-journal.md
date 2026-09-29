@@ -99,3 +99,15 @@ Implementation entries will be added here as each buildable change is validated 
   tests passed (41 cases, 209 assertions). The existing two-GPU affinity test skipped on this
   one-GPU host; the new FIFO and retry-deadline tests executed.
 - Previous commit: `2b3acbad0`.
+
+### 4. `fix(metadata): retire shared bookkeeping by query owner`
+
+- Batch telemetry placements and consumer ports carry query IDs. Retirement removes only that
+  query's records, including when a pinned batch has placements in several queries.
+- Iceberg delete-data memoization belongs to the connection and is cleared by its statement-end
+  callback, including planning declines. Internal metadata queries preserve the outer memo.
+- Cache summary baselines are synchronized. File-based pin compression plans are selected per
+  invocation, so a process-global bare table name cannot reuse another catalog's policy.
+- Validation: full `pixi run make`; Iceberg and telemetry regressions passed (70 cases, 1,344 assertions), after installing
+  the required official DuckDB avro/Iceberg test extensions.
+- Previous commit: `2b233ac6d`.

@@ -90,6 +90,7 @@ struct batch_telemetry_registry::impl {
     // Last seen tier/bytes, re-emitted verbatim by tier-agnostic transitions.
     uuid::UUID tier_resource_id;
     uint64_t bytes;
+    query_id_t query_id;
   };
 
   struct shard {
@@ -100,6 +101,7 @@ struct batch_telemetry_registry::impl {
   struct port_info {
     uuid::UUID pipeline_uuid;
     uuid::UUID port_uuid;
+    query_id_t query_id;
   };
 
   std::atomic<bool> enabled{false};
@@ -255,11 +257,12 @@ void batch_telemetry_registry::uninstall()
 
 void batch_telemetry_registry::register_consumer_port(const cucascade::shared_data_repository* repo,
                                                       uuid::UUID pipeline_uuid,
-                                                      uuid::UUID port_uuid)
+                                                      uuid::UUID port_uuid,
+                                                      query_id_t query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire) || repo == nullptr) { return; }
   std::unique_lock lock(impl_->ports_mutex);
-  impl_->ports[repo] = {pipeline_uuid, port_uuid};
+  impl_->ports[repo] = {pipeline_uuid, port_uuid, query_id};
 }
 
 void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::data_batch>& batch,
@@ -304,12 +307,14 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
     .state            = impl::placement_state::queued,
     .tier_resource_id = tier_resource_id,
     .bytes            = snap->bytes,
+    .query_id         = port.query_id,
   });
 }
 
 void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                                            uuid::UUID consumer_pipeline_uuid,
-                                           uuid::UUID task_uuid)
+                                           uuid::UUID task_uuid,
+                                           query_id_t query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
@@ -357,6 +362,7 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
       .state            = impl::placement_state::queued,
       .tier_resource_id = tier_resource_id,
       .bytes            = snap->bytes,
+      .query_id         = query_id,
     });
     target = &placements.back();
   }
@@ -472,7 +478,7 @@ uuid::UUID batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
   return impl_->tier_resource_id(tier, device_id);
 }
 
-void batch_telemetry_registry::on_query_end()
+void batch_telemetry_registry::on_query_end(std::optional<query_id_t> query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
 
@@ -480,16 +486,20 @@ void batch_telemetry_registry::on_query_end()
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
-      for (auto& p : placements) {
+      std::erase_if(placements, [&](auto& p) {
+        if (query_id && p.query_id != *query_id) return false;
         impl_->consume(p, batch_consumed_reason::query_end);
         ++drained;
-      }
+        return true;
+      });
     }
-    shard.placements.clear();
+    std::erase_if(shard.placements, [](auto const& entry) { return entry.second.empty(); });
   }
   {
     std::unique_lock lock(impl_->ports_mutex);
-    impl_->ports.clear();
+    std::erase_if(impl_->ports, [&](auto const& entry) {
+      return !query_id || entry.second.query_id == *query_id;
+    });
   }
   if (drained > 0) {
     SIRIUS_LOG_DEBUG("Batch telemetry: drained {} placement(s) at query end.", drained);

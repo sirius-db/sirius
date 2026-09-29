@@ -619,8 +619,17 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 namespace {
 
 /// Per-query memo; the wrapper below explains the key and the scope.
-std::mutex g_delete_data_cache_mtx;
-std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
+class delete_data_cache : public duckdb::ClientContextState {
+ public:
+  std::mutex mutex;
+  std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> entries;
+  void QueryEnd(duckdb::ClientContext& context) override
+  {
+    if (duckdb::SiriusContext::is_internal_query_active(context)) return;
+    std::lock_guard lock(mutex);
+    entries.clear();
+  }
+};
 
 /// See the header.
 std::atomic<uint64_t> g_uncached_read_count{0};
@@ -630,12 +639,6 @@ std::atomic<uint64_t> g_uncached_read_count{0};
 uint64_t iceberg_delete_data_uncached_read_count()
 {
   return g_uncached_read_count.load(std::memory_order_relaxed);
-}
-
-void clear_iceberg_delete_data_cache()
-{
-  std::lock_guard lk{g_delete_data_cache_mtx};
-  g_delete_data_cache.clear();
 }
 
 namespace {
@@ -726,6 +729,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   // unset, iceberg_metadata() reads current-snapshot-id from the table metadata, and resolving
   // latest independently disagrees with that after a rollback — filing one snapshot's deletes
   // under another's key.
+  auto cache =
+    context.registered_state->GetOrCreate<delete_data_cache>("sirius_iceberg_delete_cache");
   std::string key;
   try {
     key = std::to_string(context.ActiveTransaction().global_transaction_id) + "|" + table_path +
@@ -736,8 +741,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   }
 
   {
-    std::lock_guard lk{g_delete_data_cache_mtx};
-    if (auto it = g_delete_data_cache.find(key); it != g_delete_data_cache.end()) {
+    std::lock_guard lk{cache->mutex};
+    if (auto it = cache->entries.find(key); it != cache->entries.end()) {
       SIRIUS_LOG_DEBUG("[iceberg] delete-data cache hit for '{}'", table_path);
       return it->second;
     }
@@ -749,8 +754,8 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   // planning across every iceberg scan in the process.
   auto data = read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, snapshot_id);
 
-  std::lock_guard lk{g_delete_data_cache_mtx};
-  auto [it, inserted] = g_delete_data_cache.emplace(key, std::move(data));
+  std::lock_guard lk{cache->mutex};
+  auto [it, inserted] = cache->entries.emplace(key, std::move(data));
   return it->second;
 }
 

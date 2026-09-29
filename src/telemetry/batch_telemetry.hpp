@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "query_id.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
 #include <cucascade/memory/common.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 namespace cucascade {
@@ -94,7 +96,8 @@ class batch_telemetry_registry {
   /// Associate a consumer port's data repository with its pipeline and port.
   void register_consumer_port(const cucascade::shared_data_repository* repo,
                               uuid::UUID pipeline_uuid,
-                              uuid::UUID port_uuid);
+                              uuid::UUID port_uuid,
+                              query_id_t query_id = make_query_id(0));
 
   /// A producer published `batch` into `repo`: registered -> queued. Call
   /// before the batch is added to the repository.
@@ -106,7 +109,8 @@ class batch_telemetry_registry {
   /// packaged; unseen batches are lazily registered).
   void on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                    uuid::UUID consumer_pipeline_uuid,
-                   uuid::UUID task_uuid);
+                   uuid::UUID task_uuid,
+                   query_id_t query_id = make_query_id(0));
 
   /// The claiming task started computing: packaged -> processing.
   void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);
@@ -125,8 +129,8 @@ class batch_telemetry_registry {
                       int32_t device_id,
                       uint64_t bytes);
 
-  /// Drain all remaining placements and clear the consumer-port mappings.
-  void on_query_end();
+  /// Retire one query; omitted ID drains everything at runtime shutdown.
+  void on_query_end(std::optional<query_id_t> query_id = std::nullopt);
 
   /// The MemoryTier resource for (tier, device); nil when not installed.
   [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;

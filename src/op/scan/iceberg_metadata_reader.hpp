@@ -60,7 +60,7 @@ struct EqualityDeleteGroup {
  *
  * All delete I/O happens at PLAN time, on internal connections each bracketed by their own
  * InternalQueryGuard — which is also why the memo is cleared on QueryEnd rather than inside the
- * execution window; see clear_iceberg_delete_data_cache(). Immutable after construction.
+ * execution window; the connection owns its memo. Immutable after construction.
  */
 struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
@@ -112,16 +112,6 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   std::string const& table_path,
   sirius::io::ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id = std::nullopt);
-
-/**
- * @brief Drop everything the per-query delete-data cache is holding.
- *
- * MUST be called from the QueryEnd hook, not the execution window: a table declined at plan
- * time never opens one, and those entries are exactly the ones that would go stale. An entry
- * outliving its query could serve a previous snapshot's deletes; it also pins the GPU key table
- * and hash join its EqualityDeleteGroups own.
- */
-void clear_iceberg_delete_data_cache();
 
 /// Cache MISSES: reads that actually walked the manifests. Release builds compile the logging
 /// out, so this is what lets a test assert the memo still collapses the repeat reads rather than

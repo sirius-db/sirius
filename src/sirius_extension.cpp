@@ -1054,35 +1054,25 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       data.args.name);
   }
   const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
+  std::optional<std::string> plan_dsl;
   if (compression_active) {
-    namespace fs     = std::filesystem;
-    const auto& name = data.args.name;
-    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
-      std::error_code ec;
-      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-        if (!entry.is_regular_file()) { continue; }
-        if (entry.path().stem() == name) {
-          std::ifstream f(entry.path());
-          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-          if (!dsl.empty()) {
-            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
-          }
-          break;
-        }
-      }
-      if (ec) {
-        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
-                        comp_cfg.input_plan_dir,
-                        ec.message());
-      }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+      if (!entry.is_regular_file() || entry.path().stem() != data.args.name) continue;
+      std::ifstream file(entry.path());
+      std::string dsl((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+      if (!dsl.empty()) plan_dsl = std::move(dsl);
+      break;
     }
+    if (ec)
+      SIRIUS_LOG_WARN(
+        "[pin_table] cannot scan plan dir '{}': {}", comp_cfg.input_plan_dir, ec.message());
   }
 
   sirius::compression_pin_config pin_comp{};
   if (compression_active) {
-    if (auto plan_dsl =
-          sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
-        plan_dsl.has_value()) {
+    if (plan_dsl.has_value()) {
       // The plan file carries one block per full-table column (schema order). A pin
       // may cache only a subset, so select the blocks for the pinned columns by their
       // full-table index (cache_info.column_ids, in pinned order) — the result lines

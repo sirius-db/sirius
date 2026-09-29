@@ -497,6 +497,7 @@ class prefetching_cache {
   };
 
   counters _counters;
+  mutable std::mutex _summary_mutex;
   counters_snapshot _last_reported;
 
   /// One slot per issued cache-backed IO, retained by its physical completion
