@@ -736,9 +736,7 @@ mod tests {
     }
 
     fn aggregate_sum_by_key(input: Rel, key_field: i32, sum_field: i32) -> Rel {
-        #[allow(deprecated)]
         let grouping = aggregate_rel::Grouping {
-            grouping_expressions: Vec::new(),
             expression_references: vec![0],
         };
         Rel {
