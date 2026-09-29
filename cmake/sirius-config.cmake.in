@@ -2,5 +2,4 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake")
 
-set(sirius_shared_FOUND TRUE)
 check_required_components(sirius)
