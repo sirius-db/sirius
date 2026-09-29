@@ -93,12 +93,14 @@ Environment variables:
 ### Generating telemetry
 
 Telemetry is controlled by the Sirius YAML config used for the run. Enable Quent
-export and choose the output directory:
+export and choose the output directory. NVTX capture is off by default; set
+`enable_nvtx: true` to include NVTX ranges in the Quent output:
 
 ```yaml
 sirius:
   telemetry:
     enable_quent: true
+    enable_nvtx: true
     output_directory: telemetry_data
     engine_name: siriusDB
 ```

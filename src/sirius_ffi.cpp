@@ -203,6 +203,7 @@ Context::Context() : impl_(std::make_unique<Impl>())
 
 Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>())
 {
+  duckdb::publish_nvtx_injection(config_path);  // before sirius_config's first NVTX call
   sirius::sirius_config config;
   config.load_from_file(config_path);  // throws on a missing/invalid config file
   impl_->bring_up(config);

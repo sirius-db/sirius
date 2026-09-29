@@ -28,10 +28,18 @@
 // public NVTX entry point and forwards it into the same Quent hook state used by
 // Sirius's static-injection pointer.
 extern "C" int quent_InitializeInjectionNvtx2(void* get_export_table);
+extern "C" int (*InitializeInjectionNvtx2_fnptr)(void* get_export_table);
 extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
   void* get_export_table)
 {
   return quent_InitializeInjectionNvtx2(get_export_table);
+}
+
+// Quent's static shim starts with this pointer set. Clear it at load so paths
+// that never call configure_nvtx_injection (e.g. SIRIUS_DISABLE) stay off.
+__attribute__((constructor(101))) static void disarm_static_nvtx_injection() noexcept
+{
+  InitializeInjectionNvtx2_fnptr = nullptr;
 }
 
 // NVTX v3 discovers an injector independently in each ELF image. libcudf's
@@ -58,6 +66,8 @@ namespace sirius::telemetry::detail {
 
 void configure_nvtx_injection(bool enabled, const std::string& library) noexcept
 {
+  InitializeInjectionNvtx2_fnptr = enabled ? &quent_InitializeInjectionNvtx2 : nullptr;
+
   if (std::getenv("NVTX_INJECTION64_PATH") != nullptr || !enabled) { return; }
 
   if (!library.empty()) {

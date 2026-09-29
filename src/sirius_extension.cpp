@@ -108,7 +108,6 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
-#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -3645,20 +3644,17 @@ static void LoadInternal(ExtensionLoader& loader)
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
 
+  // Loading the callback's config makes the first NVTX call, so the NVTX
+  // decision must be published before the callback is constructed.
+  duckdb::SiriusContextExtensionCallback::publish_configured_nvtx_injection();
+
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
   auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
-  if (!sirius_disabled) {
-    // Config loading above must remain NVTX-free. Publish discovery after its
-    // validation, but before SiriusContext can make any NVTX call.
-    auto const& telemetry = callback_ptr->get_loaded_config().get_telemetry_config();
-    sirius::telemetry::detail::configure_nvtx_injection(telemetry.enable_quent,
-                                                        telemetry.nvtx_injection_lib);
-    callback_ptr->initialize_context();
-  }
+  if (!sirius_disabled) { callback_ptr->initialize_context(); }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the
