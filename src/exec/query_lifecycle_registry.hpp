@@ -45,13 +45,13 @@ enum class query_submission_status : std::uint8_t { accepted, quiescing, unknown
  * insertion. A refused publication must dispose of its work under the caller's existing ownership.
  *
  * A move-only work_lease can be taken from a submission and carried through queued/in-hand/running
- * work. Its count does not change on transfer. Neither handle owns the plan or repositories: the
- * execution owner must keep those alive until all their users retire.
+ * work. Its count does not change on transfer. The control block can retain the execution's
+ * physical plan independently of its front-end engine. Repository and scan-state ownership
+ * stays in the runtime until publication, work and borrow retirement complete.
  *
- * This branch wires submission guards into production producers. Full asynchronous work/borrow
- * coverage and execution ownership are follow-up work: the existing worker counters, executor
- * joins and downgrade drains MUST remain. A zero work count alone is not yet proof that query
- * resources can be destroyed. accepts_work() is advisory, never permission for a later push.
+ * Production tasks and creator requests retain leases through destruction and completion
+ * callbacks. Spill candidates borrow their victim's query. Scan producers use their existing
+ * scoped dispatcher join before providers are released. accepts_work() remains advisory.
  */
 class query_lifecycle_registry {
   struct query_control {
@@ -60,6 +60,7 @@ class query_lifecycle_registry {
     query_lifecycle_state state{query_lifecycle_state::open};
     std::size_t submissions{0};
     std::size_t work{0};
+    std::shared_ptr<void> resources;
   };
 
  public:
@@ -182,6 +183,7 @@ class query_lifecycle_registry {
   struct query_activity {
     std::size_t submissions{0};
     std::size_t work{0};
+    std::shared_ptr<void> resources;
   };
 
   query_lifecycle_registry()                                           = default;
@@ -265,18 +267,47 @@ class query_lifecycle_registry {
     }
   }
 
+  /// Keep the execution's plan alive independently of its front-end engine. Registration
+  /// precedes publication. Unknown IDs support standalone plan-building fixtures.
+  void retain_resources(query_id_t query_id, std::shared_ptr<void> resources)
+  {
+    auto control = find(query_id);
+    if (!control) { return; }
+    std::lock_guard lock(control->mutex);
+    if (control->state != query_lifecycle_state::open || control->resources) {
+      throw std::logic_error("query resources already registered or retiring");
+    }
+    control->resources = std::move(resources);
+  }
+
+  /// Retire resources only after all asynchronous users, before repositories are cleared.
+  /// Run destructors outside both locks: they can invoke callbacks into the runtime.
+  void release_resources(query_id_t query_id)
+  {
+    std::shared_ptr<void> resources;
+    if (auto control = find(query_id)) {
+      std::lock_guard lock(control->mutex);
+      require_quiescing(*control);
+      require_idle(*control);
+      resources = std::move(control->resources);
+    }
+  }
+
   /// Forget a retired query. Refuse to erase live accounting. Unknown IDs are a no-op, so failed
   /// initialization and repeated cleanup are supported. Existing drains are still mandatory.
   void close(sirius::query_id_t query_id)
   {
-    std::lock_guard registry_lock(mutex_);
-    auto it = queries_.find(query_id);
-    if (it == queries_.end()) { return; }
-    auto control = it->second;
-    std::lock_guard lock(control->mutex);
-    require_idle(*control);
-    control->state = query_lifecycle_state::quiescing;
-    queries_.erase(it);
+    std::shared_ptr<query_control> retired;
+    {
+      std::lock_guard registry_lock(mutex_);
+      auto it = queries_.find(query_id);
+      if (it == queries_.end()) { return; }
+      retired = it->second;
+      std::lock_guard lock(retired->mutex);
+      require_idle(*retired);
+      retired->state = query_lifecycle_state::quiescing;
+      queries_.erase(it);
+    }
   }
 
   /// Advisory snapshot only. Use a submission guard to authorize a subsequent queue push.
@@ -308,20 +339,33 @@ class query_lifecycle_registry {
     return queries_.size();
   }
 
-  /// Runtime teardown only, after producers and workers have stopped. Close every gate before
-  /// checking counts, including controls already obtained by callers racing a registry lookup.
-  void clear()
+  /// Shutdown: close every acquisition gate before stopping shared workers.
+  void quiesce_all()
   {
     std::lock_guard registry_lock(mutex_);
     for (auto const& [id, control] : queries_) {
       std::lock_guard lock(control->mutex);
       control->state = query_lifecycle_state::quiescing;
     }
-    for (auto const& [id, control] : queries_) {
-      std::lock_guard lock(control->mutex);
-      require_idle(*control);
+  }
+
+  /// Runtime teardown only, after producers and workers have stopped. Close every gate before
+  /// checking counts, including controls already obtained by callers racing a registry lookup.
+  void clear()
+  {
+    decltype(queries_) retired;
+    {
+      std::lock_guard registry_lock(mutex_);
+      for (auto const& [id, control] : queries_) {
+        std::lock_guard lock(control->mutex);
+        control->state = query_lifecycle_state::quiescing;
+      }
+      for (auto const& [id, control] : queries_) {
+        std::lock_guard lock(control->mutex);
+        require_idle(*control);
+      }
+      retired.swap(queries_);
     }
-    queries_.clear();
   }
 
  private:

@@ -179,7 +179,10 @@ class multi_index_priority_queue {
   /// \return true if the task was enqueued, false if it was dropped because the queue is
   ///         interrupted. Callers that only enqueue may ignore it; those that report dropped
   ///         work (itask_executor::schedule) rely on it.
-  bool push(task_ptr task)
+  bool push(task_ptr task) { return try_push(task); }
+
+  /// Preserve ownership on refusal/exception so callers can report failure before disposal.
+  bool try_push(task_ptr& task)
   {
     assert(task && "cannot push a null task");
     const index_keys keys = _extract(*task);

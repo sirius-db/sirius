@@ -136,9 +136,9 @@ sirius_engine::~sirius_engine()
       runtime->get_scan_manager().quiesce(query_id_);
       runtime->get_task_scheduler().drain_after_error(query_id_);
     } catch (...) {
-      // An unproven drain cannot be followed by freeing borrowed operators. This is a broken
-      // shared invariant, not an ordinary SQL error; terminating is preferable to a latent UAF.
-      std::terminate();
+      // The registry retains the plan if retirement fails. Do not free resources whose
+      // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
+      runtime->mark_runtime_unavailable();
     }
   }
   query_handle_->exit();
@@ -202,7 +202,10 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
   query_handle_->planning();
   reset();
-  sirius_owned_plan = std::move(plan);
+  sirius_owned_plan = std::shared_ptr<op::sirius_physical_operator>(plan.release());
+  if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    runtime->get_query_lifecycle_registry().retain_resources(query_id_, sirius_owned_plan);
+  }
   initialize_internal(*sirius_owned_plan);
 }
 
@@ -241,6 +244,9 @@ void sirius_engine::execute()
                                     });
   sirius_ctx->get_task_scheduler().start_query(*query_);
   try {
+    while (future.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
+      if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
+    }
     future.get();
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {

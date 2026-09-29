@@ -64,3 +64,23 @@ Implementation entries will be added here as each buildable change is validated 
   193 assertions; SQL lifecycle tests: 11 cases, 78 assertions. Formatting checks passed.
 - Remaining dependencies: repository spill borrows and per-query downgrade cleanup are the next
   change; bounded admission is not enabled by this commit.
+
+### 2. `fix(exec): isolate spill borrowing and failed query cleanup`
+
+- Spill discovery acquires one victim's work lease at a time; dispatched candidates retain
+  independent victim leases. Closing Q prevents new borrows. Retirement waits for Q's borrowers
+  without canceling or draining shared downgrade requests.
+- The lifecycle control now retains the physical plan. Engine destruction and failed cleanup
+  cannot free the plan behind a task or spill borrower. Resource release checks quiescence and
+  idle accounting and invokes destructors outside registry locks. Failed retirement latches
+  runtime health and retains registered resources for shutdown.
+- Ordinary registration/setup failures roll back their query, rather than marking the entire
+  runtime unavailable. Execution polls DuckDB interruption while waiting for completion.
+- Queue refusal reports an attributed failure before task destruction can signal success.
+  Creator hints/lookahead, scheduler routing, GPU retry and completion exceptions reach the
+  affected query's handler.
+- Shutdown closes all lifecycle gates and drains stopped scheduler/executor queues while
+  callback dependencies remain alive, then releases retained plans.
+- Validation: full `pixi run make`; CPU registry tests (15 cases, 128 assertions);
+  lifecycle, downgrade and runtime fallback tests (32 cases, 244 assertions).
+- Previous commit: `671e8bd64`.

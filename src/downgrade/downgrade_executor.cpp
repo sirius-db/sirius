@@ -268,8 +268,11 @@ void downgrade_executor::processing_loop()
     // re-scanned before leaving idle. Managers are held by shared_ptr for the duration of the
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
-    auto const managers   = _data_repo_registry.get_all();
-    for (auto const& manager : std::views::reverse(managers)) {
+    auto const managers   = _data_repo_registry.candidates();
+    for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
+      auto borrow = _query_lifecycle ? _query_lifecycle->try_acquire_work(victim_id)
+                                     : exec::query_lifecycle_registry::work_lease{};
+      if (_query_lifecycle && !borrow) { continue; }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
@@ -301,6 +304,13 @@ void downgrade_executor::processing_loop()
           already_dispatched[*pick] = true;
           auto candidate            = std::move(candidates[*pick]);
           auto candidate_bytes      = candidate_sizes[*pick];
+          // The manager-local borrow protects candidate discovery. Transfer a separate
+          // victim claim into each candidate before handing it to another thread.
+          if (_query_lifecycle) {
+            auto work = _query_lifecycle->try_acquire_work(victim_id);
+            if (!work) { break; }
+            candidate->retain_work(std::move(work));
+          }
 
           auto slot = _pool->reserve();
           if (!slot) {

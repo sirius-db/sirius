@@ -423,29 +423,25 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
 
   // Close publication and wait for producers that already acquired a submission guard. Only
   // then may queues be drained: an earlier gate check alone cannot prevent a late insertion.
-  // Existing worker and downgrade drains below remain responsible for execution/borrow lifetime.
   query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
+  if (scan_manager_) { scan_manager_->quiesce(query_id); }
 
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
   // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // On the transparent path the plan those pointers target is already gone: sirius_interface::
-  // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
-  // engine outlives the window, so its plan is still alive. Either way this only stops task
-  // creation from touching the plan; it never frees it.
+  // The lifecycle control retains the plan until all work and spill borrows have retired.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
   // reason. Other in-flight queries keep their queued work.
   if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
 
-  // Drain all downgrade executors before clearing repositories — ensures no downgrade
-  // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
-  for (auto& executor : downgrade_executors_) {
-    executor->drain();
-  }
+  // The closed gate prevents new spill victims for this query. Existing repository borrows
+  // and extracted tasks retain work leases; unrelated requests and monitors continue running.
+  query_lifecycle_.wait_for_work(query_id);
+  query_lifecycle_.release_resources(query_id);
 
   // Close out batch placements still alive (un-consumed repo contents,
   // result-collector outputs) before their repositories are cleared.
@@ -463,8 +459,8 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
 
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
-  // Safe to clear here because the downgrade executors were drained above, so nothing still
-  // holds a raw data_repository* borrowed from this query's manager.
+  // Safe to clear after the closed gate and work barrier: no spill borrower can retain a raw
+  // data_repository* into this query's manager.
   {
     auto leaked = data_repository_registry_.erase(query_id);
     try {
@@ -531,57 +527,20 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
 
 void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept
 {
-  // Reached only when run_mandatory_cleanup threw, which means it may have aborted BEFORE its
-  // own reset/drain pair ran. Once the runtime is latched unavailable no later window will run
-  // them either, so the failed query's per-query state (and the buffer handles it retains)
-  // would survive until ~task_creator during DB teardown — the exact shutdown-order crash the
-  // in-window reset prevents.
-  //
-  // Same order as the main path: shut the gate, stop the producer, then drop what it queued. Each
-  // step is independently guarded so a throw in one still lets the others run.
+  // Never continue destruction after an unproven retirement. Keep the complete query state
+  // registered for shutdown, where all shared workers have been stopped.
   try {
     query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
-  } catch (...) {
-  }
-  try {
+    if (scan_manager_) { scan_manager_->quiesce(query_id); }
+    if (task_scheduler_) { task_scheduler_->drain_after_error(query_id); }
     if (task_creator_) { task_creator_->reset(query_id); }
-  } catch (...) {
-  }
-  try {
-    if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
-  } catch (...) {
-  }
-  // The scan manager needs the same backstop. prepare_for_query no longer performs a global
-  // reset (it would tear down concurrently-running queries), so nothing else will ever drop
-  // this query's scan state: without this, a failed query leaks its dispatcher, coalescer and
-  // split providers until terminate().
-  try {
+    query_lifecycle_.wait_for_work(query_id);
+    query_lifecycle_.release_resources(query_id);
+    data_repository_registry_.erase(query_id);
     if (scan_manager_) { scan_manager_->reset(query_id); }
-  } catch (...) {
-  }
-  // Drop this query's repositories. run_mandatory_cleanup does this on the normal path, but this
-  // function runs precisely when that threw part-way — and once the runtime is latched
-  // unavailable no later window will ever run it. Without this the failed query's manager, and
-  // every batch still in it, survived until terminate(): its GPU/host memory was never returned,
-  // and the downgrade executors kept sweeping it on every monitor cycle for the life of the
-  // process. Guarded like every other step here so one failure cannot stop the others.
-  try {
-    auto leaked = data_repository_registry_.erase(query_id);
-    for (auto const& info : leaked) {
-      SIRIUS_LOG_WARN(
-        "drop_query_runtime_state_best_effort: query {} operator {} port '{}' still had {} "
-        "un-consumed data batch(es) (memory leak).",
-        query_id,
-        info.operator_id,
-        info.port_id,
-        info.count);
-    }
-  } catch (...) {
-  }
-  // The window is over either way; drop the gate entry so it does not accumulate.
-  try {
     query_lifecycle_.close(query_id);
   } catch (...) {
+    // Health was latched by the caller. Resources remain owned until terminate().
   }
 }
 
@@ -641,27 +600,21 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   try {
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
   } catch (std::exception& e) {
-    // A failed begin may have left the shared runtime part-mutated. This must
-    // NEVER be classified as an ordinary GPU failure (which entry points would
-    // CPU-fall-back on): latch unavailability, attempt the backstop cleanup,
-    // release, and throw the distinguishable begin-failure error. Entry-point
-    // catch blocks rethrow it as-is instead of falling back.
+    // Roll back this execution's registrations. Only a failed cleanup latches shared
+    // unavailability; an ordinary setup failure does not poison another connection.
     state_ = scope_state::FAILED;
-    ctx_.mark_runtime_unavailable();
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
-      string("Sirius execution-window initialization failed (runtime marked unavailable): ") +
-      e.what());
+      string("Sirius execution-window initialization failed: ") + e.what());
   } catch (...) {
     state_ = scope_state::FAILED;
-    ctx_.mark_runtime_unavailable();
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
     throw SiriusBeginWindowFailureException(
-      "Sirius execution-window initialization failed (runtime marked unavailable): "
+      "Sirius execution-window initialization failed: "
       "unknown exception");
   }
 }
@@ -1018,6 +971,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+  query_lifecycle_.quiesce_all();
 
   // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
   // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
@@ -1041,6 +995,7 @@ void SiriusContext::terminate()
   // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
   // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
   task_creator_->reset_all();
+  query_lifecycle_.clear();
   task_creator_.reset();
   downgrade_executors_.clear();
   task_scheduler_.reset();
@@ -1069,7 +1024,6 @@ void SiriusContext::terminate()
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
   data_repository_registry_.clear();
-  query_lifecycle_.clear();
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().

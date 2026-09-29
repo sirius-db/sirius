@@ -30,6 +30,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -389,6 +390,14 @@ void gpu_pipeline_executor::process_task(
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        // Retry bodies and completion callbacks can throw too. Report before captured tasks
+        // unwind and potentially signal pipeline completion; the pool's catch alone only logs.
+        const int entered_exceptions = std::uncaught_exceptions();
+        absl::Cleanup report_unwind  = [&] {
+          if (completion && std::uncaught_exceptions() > entered_exceptions) {
+            completion->report_error("GPU task retry or completion callback failed");
+          }
+        };
         try {
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);

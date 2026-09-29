@@ -474,6 +474,9 @@ void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) c
   //
   // For a quiescing/closed query the drop is the documented teardown contract, not a bug.
   if (_query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id)) {
+    if (auto state = get_query_task_global_state(query_id); state && state->completion_handler) {
+      state->completion_handler->report_error("creator queue closed before publication");
+    }
     SIRIUS_LOG_ERROR(
       "task_creator: creation request for query {} was DROPPED by an interrupted queue while the "
       "query was still accepting work; that query will not receive the task it was waiting for",
@@ -553,33 +556,37 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   auto submission = begin_submission(query_id);
   if (_query_lifecycle != nullptr && !submission) { return; }
 
-  std::lock_guard lock(state->lookahead_mutex);
-  for (; state->index_of_next_lookahead < state->lookahead_queue.size();
-       ++state->index_of_next_lookahead) {
-    auto* node = state->lookahead_queue[state->index_of_next_lookahead];
-    if (node == nullptr) { continue; }
-    auto hint = node->get_next_task_hint();
-    if (!hint.has_value()) {
-      if (!node->get_pipeline()->is_pipeline_finished()) { return; }
-      continue;
+  try {
+    std::lock_guard lock(state->lookahead_mutex);
+    for (; state->index_of_next_lookahead < state->lookahead_queue.size();
+         ++state->index_of_next_lookahead) {
+      auto* node = state->lookahead_queue[state->index_of_next_lookahead];
+      if (node == nullptr) { continue; }
+      auto hint = node->get_next_task_hint();
+      if (!hint.has_value()) {
+        if (!node->get_pipeline()->is_pipeline_finished()) { return; }
+        continue;
+      }
+      if (hint.value().hint == op::TaskCreationHint::READY) {
+        SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
+                         node->get_name(),
+                         node->get_operator_id());
+        const auto [_, priority] = request_keys_for(node);
+        auto request             = std::make_unique<task_creation_request>();
+        request->node            = node;
+        request->type            = request_type::lookahead;
+        request->query_id        = query_id;
+        request->priority        = priority;
+        request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
+        request->operator_type   = node->type;
+        if (submission) { request->work = submission.take_work_lease(); }
+        report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
+        ++state->index_of_next_lookahead;
+        return;
+      }
     }
-    if (hint.value().hint == op::TaskCreationHint::READY) {
-      SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
-                       node->get_name(),
-                       node->get_operator_id());
-      const auto [_, priority] = request_keys_for(node);
-      auto request             = std::make_unique<task_creation_request>();
-      request->node            = node;
-      request->type            = request_type::lookahead;
-      request->query_id        = query_id;
-      request->priority        = priority;
-      request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
-      request->operator_type   = node->type;
-      if (submission) { request->work = submission.take_work_lease(); }
-      report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
-      ++state->index_of_next_lookahead;
-      return;
-    }
+  } catch (...) {
+    report_fatal_error(state->completion_handler, std::current_exception());
   }
 }
 

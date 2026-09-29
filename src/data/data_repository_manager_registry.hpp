@@ -41,7 +41,8 @@ namespace sirius::data {
  *
  * Managers are handed out as `shared_ptr` rather than references: a downgrade worker may be
  * sweeping a manager while its query ends, and shared ownership means the manager object
- * survives until the last borrower releases it instead of dangling.
+ * survives until the last borrower releases it instead of dangling. The manager alone does
+ * not protect its repositories: spill callers must also hold the victim's lifecycle work lease.
  *
  * Thread-safe. `get_all()` returns a snapshot built under the lock so callers can iterate
  * without holding it — memory-pressure sweeps are long and blocking, and holding this mutex
@@ -114,6 +115,14 @@ class data_repository_manager_registry {
     return result;
   }
 
+  /// Identity snapshot only. A spill sweep acquires one victim's lifecycle lease before
+  /// dereferencing its manager, so a snapshot cannot prolong every query's retirement.
+  [[nodiscard]] std::vector<std::pair<query_id_t, manager_ptr>> candidates() const
+  {
+    std::lock_guard lock(_mutex);
+    return {_managers.begin(), _managers.end()};
+  }
+
   /**
    * @brief Drop @p query_id's manager and report any repositories that still held batches.
    *
@@ -121,7 +130,7 @@ class data_repository_manager_registry {
    * `{operator_id, port_id, count}` detail the single-manager path produced.
    *
    * Precondition: every borrower of this query's repositories has been quiesced (the query
-   * cleanup path drains the downgrade executors first). Clearing while a worker still holds a
+   * cleanup path closes its gate and waits for its work leases). Clearing while a worker holds a
    * raw `data_repository*` obtained from this manager would dangle — shared ownership protects
    * the manager object, not the repositories inside it.
    *

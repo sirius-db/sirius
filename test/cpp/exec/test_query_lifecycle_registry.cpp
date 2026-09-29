@@ -477,3 +477,33 @@ TEST_CASE("lifecycle waiters wake for each order of publisher and work retiremen
   CHECK(registry.activity(q).work == 0);
   registry.close(q);
 }
+
+TEST_CASE("query resources survive their engine and cannot retire while borrowed",
+          "[query_lifecycle_gate][concurrency]")
+{
+  query_lifecycle_registry registry;
+  auto q = make_query_id(31);
+  registry.open_query(q);
+  bool destroyed = false;
+  auto owner     = std::shared_ptr<int>(new int(42), [&](int* value) {
+    // Destruction can call back into the registry: neither mutex may be held here.
+    CHECK(registry.size() <= 1);
+    destroyed = true;
+    delete value;
+  });
+  registry.retain_resources(q, owner);
+  owner.reset();
+  auto borrow = registry.try_acquire_work(q);
+  registry.quiesce_and_wait_for_submissions(q);
+  CHECK_FALSE(destroyed);
+  REQUIRE_THROWS(registry.release_resources(q));
+  borrow.reset();
+  SECTION("explicit resource retirement")
+  {
+    registry.release_resources(q);
+    registry.close(q);
+  }
+  SECTION("close") { registry.close(q); }
+  SECTION("shutdown") { registry.clear(); }
+  CHECK(destroyed);
+}

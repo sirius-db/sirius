@@ -77,7 +77,12 @@ bool itask_executor::schedule(std::unique_ptr<itask> input)
       });
     }
   }
-  if (!_task_queue.push(std::move(task))) {
+  if (!_task_queue.try_push(task)) {
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      if (auto handler = gpu_task->get_completion_handler()) {
+        handler->report_error("task executor queue closed before dispatch");
+      }
+    }
     SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
     return false;
   }

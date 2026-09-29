@@ -132,7 +132,12 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
   // Read before the move: reporting a drop needs the query, and `task` is gone after push().
   const auto pushed_query =
     task ? sirius::make_query_id(index_keys_for(*task).query_id) : sirius::make_query_id(0);
-  if (!_task_queue.push(std::move(task))) {
+  if (!_task_queue.try_push(task)) {
+    if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+      if (auto handler = gpu_task->get_completion_handler()) {
+        handler->report_error("scheduler queue closed before dispatch");
+      }
+    }
     // push returns false only when the queue is interrupted. If the gate still reports this query
     // as accepting work, the task is destroyed and its query waits forever on a completion that
     // cannot arrive -- the silent-drop failure mode behind several "query just hangs" reports.
@@ -177,7 +182,9 @@ void task_scheduler::stop()
   if (_management_thread.joinable()) { _management_thread.join(); }
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
+    gpu_exec->drain_leftover_tasks();
   }
+  _task_queue.drain();
 }
 
 void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creator)
@@ -395,38 +402,44 @@ void task_scheduler::management_eventloop()
         ++it;
         continue;
       }
-      uint64_t task_id = 0;
-      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-        task_id = gpu_task->get_task_id();
-        {
-          // Priority packs query_id in its high 32 bits (see task_creator); the
-          // queue's key extractor unpacks it the same way.
-          auto const query_id = make_query_id(
-            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
-          auto const* pipe = gpu_task->get_pipeline();
-          auto const [operator_id, operator_type] =
-            pipe != nullptr ? pipe->get_source_operator()
-                            : std::pair{op::sirius_physical_operator::invalid_operator_id,
-                                        op::SiriusPhysicalOperatorType::INVALID};
-          _query_event_publisher->publish_task_deployed(
-            query_id, operator_id, operator_type, device_id);
+      auto* attributed     = dynamic_cast<gpu_pipeline_task*>(task.get());
+      auto failure_handler = attributed ? attributed->get_completion_handler() : nullptr;
+      try {
+        uint64_t task_id = 0;
+        if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+          task_id = gpu_task->get_task_id();
+          {
+            // Priority packs query_id in its high 32 bits (see task_creator); the
+            // queue's key extractor unpacks it the same way.
+            auto const query_id = make_query_id(static_cast<std::uint32_t>(
+              static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+            auto const* pipe    = gpu_task->get_pipeline();
+            auto const [operator_id, operator_type] =
+              pipe != nullptr ? pipe->get_source_operator()
+                              : std::pair{op::sirius_physical_operator::invalid_operator_id,
+                                          op::SiriusPhysicalOperatorType::INVALID};
+            _query_event_publisher->publish_task_deployed(
+              query_id, operator_id, operator_type, device_id);
+          }
         }
-      }
 
-      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_handle().routing({
-          .instance_name              = "",
-          .preferred_device_id        = device_id,
-          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
-        });
-      }
+        if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+          pipeline_task->telemetry_handle().routing({
+            .instance_name              = "",
+            .preferred_device_id        = device_id,
+            .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+          });
+        }
 
-      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-      // // load-bearing — verification greps depend on it.
-      // SIRIUS_LOG_INFO(
-      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
-      if (_gpu_executors.at(device_id)->schedule(std::move(task))) {
-        it = _ready_devices.erase(it);
+        // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+        // // load-bearing — verification greps depend on it.
+        // SIRIUS_LOG_INFO(
+        //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+        if (_gpu_executors.at(device_id)->schedule(std::move(task))) {
+          it = _ready_devices.erase(it);
+        }
+      } catch (...) {
+        if (failure_handler) { failure_handler->report_error(std::current_exception()); }
       }
       // Refusal does not consume the parked executor's readiness. Try its next task.
     }
