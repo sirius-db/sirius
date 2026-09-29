@@ -106,9 +106,18 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
   // Refuse work for a query that is tearing down. A task creation worker can land here after
   // that query's queue drain already ran, and the task would then sit in the shared queue holding
   // raw repository pointers into a manager about to be erased.
-  if (_query_lifecycle != nullptr && task &&
-      !_query_lifecycle->accepts_work(sirius::make_query_id(index_keys_for(*task).query_id))) {
-    return;
+  if (_query_lifecycle != nullptr && task) {
+    const auto query_id = sirius::make_query_id(index_keys_for(*task).query_id);
+    const auto state    = _query_lifecycle->state(query_id);
+    if (!state) {
+      if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error("task_scheduler: query lifecycle registration is missing");
+        }
+      }
+      SIRIUS_LOG_ERROR("task_scheduler: refusing work for unknown query {}", query_id);
+    }
+    if (state != sirius::exec::query_lifecycle_state::open) { return; }
   }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({

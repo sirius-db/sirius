@@ -53,11 +53,10 @@ enum class query_lifecycle_state : std::uint8_t {
  *
  * - `open_query()` at the start of an execution window, `quiesce()` at the start of its cleanup,
  *   `close()` once the drains are done.
- * - An **unknown** query id is treated as accepting work. This is deliberate: the failure mode of
- *   a missed `open_query()` would otherwise be a query that silently never schedules anything,
- *   i.e. a hang, which is exactly the class of bug this registry exists to remove. Components
- *   constructed without a registry (most unit tests) behave as they did before.
- * - `accepts_work()` is therefore "not known to be tearing down" rather than "known to be live".
+ * - Only a registered, open query accepts work. An unknown id indicates either a missed
+ *   `open_query()` or work arriving after `close()`; enqueue sites diagnose it and report an error
+ *   to the query's completion handler when one is available. Components constructed without a
+ *   registry (most unit tests) behave as they did before.
  *
  * Thread-safe. Every method takes the mutex for a map lookup only; nothing is called with it held.
  */
@@ -103,9 +102,8 @@ class query_lifecycle_registry {
    *
    * Called after the drains complete. The entry is erased rather than kept as a tombstone, so the
    * map stays bounded by the number of in-flight queries rather than growing for the life of the
-   * process. Work arriving after this point is by definition work that no drain will ever see;
-   * preventing *that* is the job of the per-query pool drains and shared repository ownership,
-   * not of this registry.
+   * process. Work arriving after this point is refused as an unknown query; pool drains still
+   * have to ensure that no producer retains a pointer to a destroyed plan.
    */
   void close(sirius::query_id_t query_id)
   {
@@ -116,14 +114,13 @@ class query_lifecycle_registry {
   /**
    * @brief Whether work may still be enqueued for @p query_id.
    *
-   * @return false only when @p query_id is registered and quiescing. Unknown ids return true; see
-   *         the class docs for why that direction is the safe one.
+   * @return true only when @p query_id is registered and open.
    */
   [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _states.find(query_id);
-    return it == _states.end() || it->second == query_lifecycle_state::open;
+    return it != _states.end() && it->second == query_lifecycle_state::open;
   }
 
   /// \brief The recorded state of @p query_id, or nullopt if it is not registered.

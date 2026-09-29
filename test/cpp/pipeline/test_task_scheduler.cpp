@@ -273,6 +273,28 @@ TEST_CASE("the lifecycle gate refuses scheduling for a quiescing query",
   executor.stop();
 }
 
+TEST_CASE("scheduling an unknown query reports an error instead of leaving it pending",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  executor.set_query_lifecycle_registry(&lifecycle);
+
+  auto handler      = std::make_shared<completion_handler>();
+  auto future       = handler->get_awaitable();
+  auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  global_state->set_completion_handler(handler);
+  auto local_state = std::make_unique<mock_gpu_pipeline_task_local_state>(1, 0);
+  executor.schedule(
+    std::make_unique<mock_gpu_pipeline_task>(1, std::move(local_state), global_state));
+
+  REQUIRE(handler->has_error());
+  REQUIRE_THROWS_AS(future.get(), std::runtime_error);
+  REQUIRE(global_state->executed_count.load() == 0);
+}
+
 TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 {
   auto manager = initialize_memory_manager(1);

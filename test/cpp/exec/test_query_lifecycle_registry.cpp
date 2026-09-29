@@ -26,12 +26,10 @@ using sirius::make_query_id;
 using sirius::exec::query_lifecycle_registry;
 using sirius::exec::query_lifecycle_state;
 
-TEST_CASE("an unknown query accepts work", "[query_lifecycle_gate][concurrency]")
+TEST_CASE("an unknown query refuses work", "[query_lifecycle_gate][concurrency]")
 {
-  // Deliberate direction: a missed open_query() must not silently stop a query from scheduling
-  // anything, which would present as a hang. Components with no registry bound behave as before.
   query_lifecycle_registry registry;
-  REQUIRE(registry.accepts_work(make_query_id(7)));
+  REQUIRE_FALSE(registry.accepts_work(make_query_id(7)));
   REQUIRE_FALSE(registry.state(make_query_id(7)).has_value());
   REQUIRE(registry.size() == 0);
 }
@@ -51,6 +49,7 @@ TEST_CASE("open -> quiescing -> closed", "[query_lifecycle_gate][concurrency]")
   REQUIRE(registry.state(q) == query_lifecycle_state::quiescing);
 
   registry.close(q);
+  REQUIRE_FALSE(registry.accepts_work(q));
   REQUIRE_FALSE(registry.state(q).has_value());
   REQUIRE(registry.size() == 0);
 }
@@ -92,7 +91,7 @@ TEST_CASE("quiesce and close are idempotent and safe on unknown queries",
   // best-effort teardown path quiesces a query that may never have opened.
   REQUIRE_NOTHROW(registry.quiesce(unknown));
   REQUIRE_NOTHROW(registry.close(unknown));
-  REQUIRE(registry.accepts_work(unknown));
+  REQUIRE_FALSE(registry.accepts_work(unknown));
 
   registry.open_query(q);
   registry.quiesce(q);
