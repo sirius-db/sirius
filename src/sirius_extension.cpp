@@ -1924,7 +1924,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // invalidate the entry mid-build.
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pin_owner =
     scan_mgr.find_pinned_entry_for_duckdb_table(
-      entry_catalog, entry_schema, entry.name,
+      entry_catalog,
+      entry_schema,
+      entry.name,
       {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {

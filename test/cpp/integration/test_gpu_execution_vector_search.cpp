@@ -1012,7 +1012,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     auto const& mgr = sirius_ctx->get_scan_manager();
-    auto entry = mgr.find_pinned_entry_for_duckdb_table(
+    auto entry      = mgr.find_pinned_entry_for_duckdb_table(
       attach_alias, "main", "vs_mc", table_identity(*con, attach_alias, "vs_mc"));
     REQUIRE(entry != nullptr);
     auto it = entry->data_batches_by_column.find("vec");
