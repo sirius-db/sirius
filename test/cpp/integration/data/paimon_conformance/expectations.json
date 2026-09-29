@@ -1,0 +1,924 @@
+{
+  "cases": [
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "append_a",
+      "rows": [
+        [
+          1,
+          "10.00"
+        ],
+        [
+          1,
+          "10.00"
+        ],
+        [
+          2,
+          null
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT * FROM {scan}",
+      "table": "append_basic"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "append_b",
+      "rows": [
+        [
+          1,
+          "10.00"
+        ],
+        [
+          1,
+          "10.00"
+        ],
+        [
+          2,
+          null
+        ],
+        [
+          3,
+          "5.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT * FROM {scan}",
+      "table": "append_basic"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "present",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "append_a_totals",
+      "rows": [
+        [
+          3,
+          2,
+          "20.00"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT count(*) AS n, count(amount) AS present, sum(amount) AS total FROM {scan}",
+      "table": "append_basic"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "present",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "append_b_totals",
+      "rows": [
+        [
+          4,
+          3,
+          "25.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT count(*) AS n, count(amount) AS present, sum(amount) AS total FROM {scan}",
+      "table": "append_basic"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "n",
+          "BIGINT"
+        ]
+      ],
+      "id": "append_group",
+      "rows": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          1
+        ],
+        [
+          3,
+          1
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT id, count(*) AS n FROM {scan} GROUP BY id",
+      "table": "append_basic"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "pk_a",
+      "rows": [
+        [
+          101,
+          "100.00"
+        ],
+        [
+          102,
+          "50.00"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT * FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "pk_b",
+      "rows": [
+        [
+          101,
+          "120.00"
+        ],
+        [
+          102,
+          "50.00"
+        ],
+        [
+          103,
+          "80.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT * FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "pk_c",
+      "rows": [
+        [
+          101,
+          "120.00"
+        ],
+        [
+          103,
+          "80.00"
+        ]
+      ],
+      "snapshot": "C",
+      "sql": "SELECT * FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "pk_d",
+      "rows": [
+        [
+          101,
+          "120.00"
+        ],
+        [
+          102,
+          "70.00"
+        ],
+        [
+          103,
+          "80.00"
+        ]
+      ],
+      "snapshot": "D",
+      "sql": "SELECT * FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "pk_latest",
+      "ordered": true,
+      "rows": [
+        [
+          103,
+          "80.00"
+        ],
+        [
+          102,
+          "70.00"
+        ],
+        [
+          101,
+          "120.00"
+        ]
+      ],
+      "snapshot": null,
+      "sql": "SELECT id, amount FROM {scan} ORDER BY id DESC",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "pk_a_total",
+      "rows": [
+        [
+          2,
+          "150.00"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT count(*) AS n, sum(amount) AS total FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "pk_b_total",
+      "rows": [
+        [
+          3,
+          "250.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT count(*) AS n, sum(amount) AS total FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "pk_c_total",
+      "rows": [
+        [
+          2,
+          "200.00"
+        ]
+      ],
+      "snapshot": "C",
+      "sql": "SELECT count(*) AS n, sum(amount) AS total FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "pk_d_total",
+      "rows": [
+        [
+          3,
+          "270.00"
+        ]
+      ],
+      "snapshot": "D",
+      "sql": "SELECT count(*) AS n, sum(amount) AS total FROM {scan}",
+      "table": "orders_pk"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "filter_no_old_row",
+      "rows": [],
+      "snapshot": "B",
+      "sql": "SELECT * FROM {scan} WHERE amount > 100",
+      "table": "pk_filter_history"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "label",
+          "VARCHAR"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ],
+      "id": "strings_all",
+      "rows": [
+        [
+          1,
+          "0.00",
+          null,
+          "2026-09-26"
+        ],
+        [
+          2,
+          "-1.25",
+          "",
+          "2026-09-26"
+        ],
+        [
+          3,
+          null,
+          "Alice",
+          "2026-09-27"
+        ],
+        [
+          4,
+          "2.50",
+          "\u8ba2\u5355",
+          "2026-09-27"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT * FROM {scan}",
+      "table": "nullable_strings"
+    },
+    {
+      "columns": [
+        [
+          "label",
+          "VARCHAR"
+        ],
+        [
+          "id",
+          "BIGINT"
+        ]
+      ],
+      "id": "strings_projection",
+      "ordered": true,
+      "rows": [
+        [
+          "",
+          2
+        ],
+        [
+          "Alice",
+          3
+        ],
+        [
+          "\u8ba2\u5355",
+          4
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT label, id FROM {scan} WHERE id >= 2 ORDER BY id",
+      "table": "nullable_strings"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ]
+      ],
+      "id": "strings_null",
+      "rows": [
+        [
+          1
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT id FROM {scan} WHERE label IS NULL",
+      "table": "nullable_strings"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "strings_totals",
+      "rows": [
+        [
+          3,
+          "1.25"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT count(amount) AS n, sum(amount) AS total FROM {scan}",
+      "table": "nullable_strings"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "empty_rows",
+      "rows": [],
+      "snapshot": null,
+      "sql": "SELECT * FROM {scan}",
+      "table": "empty_table"
+    },
+    {
+      "columns": [
+        [
+          "n",
+          "BIGINT"
+        ],
+        [
+          "total",
+          "DECIMAL(38,2)"
+        ]
+      ],
+      "id": "empty_total",
+      "rows": [
+        [
+          0,
+          null
+        ]
+      ],
+      "snapshot": null,
+      "sql": "SELECT count(*) AS n, sum(amount) AS total FROM {scan}",
+      "table": "empty_table"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ],
+      "id": "partitions_all",
+      "rows": [
+        [
+          1,
+          "10.00",
+          "2026-09-26"
+        ],
+        [
+          2,
+          "20.00",
+          "2026-09-27"
+        ],
+        [
+          3,
+          "30.00",
+          "2026-09-27"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT * FROM {scan}",
+      "table": "partitioned_files"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "partition_filter",
+      "rows": [
+        [
+          2,
+          "20.00"
+        ],
+        [
+          3,
+          "30.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT id, amount FROM {scan} WHERE day = DATE '2026-09-27'",
+      "table": "partitioned_files"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "filter_history_a",
+      "rows": [
+        [
+          201,
+          "200.00"
+        ]
+      ],
+      "snapshot": "A",
+      "sql": "SELECT * FROM {scan}",
+      "table": "pk_filter_history"
+    },
+    {
+      "columns": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ],
+      "id": "filter_history_b",
+      "rows": [
+        [
+          201,
+          "50.00"
+        ]
+      ],
+      "snapshot": "B",
+      "sql": "SELECT * FROM {scan}",
+      "table": "pk_filter_history"
+    }
+  ],
+  "extension": {
+    "duckdb_version": "v1.5.5",
+    "native_commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
+    "platform": "linux_amd64",
+    "sha256": "0617d2bf2263b3fd50a2220d77b9dc775222bab854e6faf1d5a7a216b04dfdde",
+    "source_commit": "5e89198235c8be6a402f2b02ef54f249914eee29",
+    "version": "5e89198"
+  },
+  "format_version": 1,
+  "recipes": {
+    "append_basic": {
+      "commits": [
+        {
+          "label": "A",
+          "rows": [
+            [
+              1,
+              "10.00"
+            ],
+            [
+              1,
+              "10.00"
+            ],
+            [
+              2,
+              null
+            ]
+          ]
+        },
+        {
+          "label": "B",
+          "rows": [
+            [
+              3,
+              "5.00"
+            ]
+          ]
+        }
+      ],
+      "mode": "append",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ]
+    },
+    "empty_table": {
+      "commits": [],
+      "mode": "append",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ]
+    },
+    "nullable_strings": {
+      "commits": [
+        {
+          "label": "A",
+          "rows": [
+            [
+              1,
+              "0.00",
+              null,
+              "2026-09-26"
+            ],
+            [
+              2,
+              "-1.25",
+              "",
+              "2026-09-26"
+            ],
+            [
+              3,
+              null,
+              "Alice",
+              "2026-09-27"
+            ],
+            [
+              4,
+              "2.50",
+              "\u8ba2\u5355",
+              "2026-09-27"
+            ]
+          ]
+        }
+      ],
+      "mode": "append",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "label",
+          "VARCHAR"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ]
+    },
+    "orders_pk": {
+      "commits": [
+        {
+          "label": "A",
+          "rows": [
+            [
+              101,
+              "100.00"
+            ],
+            [
+              102,
+              "50.00"
+            ]
+          ]
+        },
+        {
+          "label": "B",
+          "rows": [
+            [
+              101,
+              "120.00"
+            ],
+            [
+              103,
+              "80.00"
+            ]
+          ]
+        },
+        {
+          "kind": "delete",
+          "label": "C",
+          "rows": [
+            [
+              102,
+              "50.00"
+            ]
+          ]
+        },
+        {
+          "label": "D",
+          "rows": [
+            [
+              102,
+              "70.00"
+            ]
+          ]
+        }
+      ],
+      "mode": "pk",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ]
+    },
+    "partitioned_files": {
+      "commits": [
+        {
+          "label": "A",
+          "partition": "2026-09-26",
+          "rows": [
+            [
+              1,
+              "10.00",
+              "2026-09-26"
+            ]
+          ]
+        },
+        {
+          "label": "B",
+          "partition": "2026-09-27",
+          "rows": [
+            [
+              2,
+              "20.00",
+              "2026-09-27"
+            ],
+            [
+              3,
+              "30.00",
+              "2026-09-27"
+            ]
+          ]
+        }
+      ],
+      "mode": "append",
+      "partitioned": true,
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ],
+        [
+          "day",
+          "DATE"
+        ]
+      ]
+    },
+    "pk_filter_history": {
+      "commits": [
+        {
+          "label": "A",
+          "rows": [
+            [
+              201,
+              "200.00"
+            ]
+          ]
+        },
+        {
+          "label": "B",
+          "rows": [
+            [
+              201,
+              "50.00"
+            ]
+          ]
+        }
+      ],
+      "mode": "pk",
+      "schema": [
+        [
+          "id",
+          "BIGINT"
+        ],
+        [
+          "amount",
+          "DECIMAL(12,2)"
+        ]
+      ]
+    }
+  }
+}

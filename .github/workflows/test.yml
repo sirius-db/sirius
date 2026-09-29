@@ -19,6 +19,12 @@ on:
       - main
   pull_request:
   merge_group:
+  workflow_dispatch:
+    inputs:
+      paimon_conformance:
+        description: Run the optional Paimon CPU conformance corpus
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -199,6 +205,29 @@ jobs:
           python3 test/cpp/integration/data/iceberg_conformance/run_conformance.py \
             test/cpp/integration/data/iceberg_conformance \
             --duckdb ./build/release/duckdb 2>&1 | tee /tmp/conformance.log
+
+      - name: Provision optional Paimon conformance extension
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.paimon_conformance }}
+        run: |
+          mkdir -p build/paimon-conformance/extensions
+          SIRIUS_DISABLE=1 ./build/release/duckdb -batch -bail -c \
+            "SET extension_directory='$PWD/build/paimon-conformance/extensions'; INSTALL paimon FROM community;"
+
+      - name: Paimon CPU conformance and connection liveness
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.paimon_conformance }}
+        timeout-minutes: 10
+        run: |
+          python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
+            --paimon-extension build/paimon-conformance/extensions/v1.5.5/linux_amd64/paimon.duckdb_extension
+
+      - name: Upload optional Paimon conformance reports
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.paimon_conformance }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paimon-conformance-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
+          path: build/paimon-conformance/run-*
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Surface test failures
         if: failure()
