@@ -172,7 +172,7 @@ jobs:
         run: |
           set -o pipefail
           nvidia-smi
-          timeout 60m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
+          timeout 60m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl 2>&1 | tee /tmp/unittest.log
 
       # The late-materialization gate is read from the environment once per process, so the
       # feature is entirely absent from the run above. Without this step the end-to-end case
@@ -182,7 +182,7 @@ jobs:
         run: |
           set -o pipefail
           SIRIUS_EXP_LATE_MAT=1 \
-            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
+            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl \
             "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
 
       - name: Iceberg conformance (correctness + connection liveness)
