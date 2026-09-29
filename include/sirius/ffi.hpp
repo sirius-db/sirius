@@ -15,9 +15,9 @@
  */
 
 /*
- * Public C++ surface for embedding Sirius: the host process
- * (`sirius::ffi::Context` plus `Fragment`). That is the embedding process
- * (Rust `sirius-sys`, C++ tests), not GPU host memory.
+ * Public C++ surface for embedding Sirius (`sirius::ffi::Context` plus
+ * `Fragment`). The embedder is the process that links it: Rust `sirius-sys`
+ * or C++ tests.
  *
  * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without
@@ -44,9 +44,6 @@ namespace sirius::ffi {
 class Fragment;
 
 /// RAII handle to a Sirius engine context.
-///
-/// Together with [`Fragment`], this is the host process: the embedding process
-/// (Rust compute node, C++ tests). That name is not GPU host memory.
 ///
 /// Constructing a `Context` brings up an initialized engine (a
 /// `duckdb::SiriusContext`) and an embedded in-process DuckDB whose connection
@@ -84,7 +81,6 @@ class SIRIUS_FFI_EXPORT Context {
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
-/// Together they are the host process (the embedding process, not GPU host memory).
 ///
 /// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
@@ -93,10 +89,11 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// build() opens a query lifecycle inside streaming_fragment; run() closes it. Exactly one
-/// fragment may sit between its own build() and run() at a time (the engine serializes
-/// queries). A Fragment destroyed after build() but before run() closes the lifecycle
-/// itself.
+/// build() opens a query lifecycle; run() closes it. At most one fragment per Context may sit
+/// between its own build() and run(): while one does, any other build() or execute_substrait
+/// on the Context throws instead of waiting. run() and destruction may happen on a thread
+/// other than the one that called build(). A Fragment destroyed after build() but before
+/// run() closes the lifecycle itself.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -161,7 +158,8 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws on an intermediate fragment or before run().
   void result_to_arrow(std::uintptr_t out_stream_addr);
 
-  /// Batches currently parked on output stream `stream_id`. For diagnostics.
+  /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().
+  /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.

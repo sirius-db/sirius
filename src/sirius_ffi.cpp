@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-// Implementation of the public FFI surface (sirius/ffi.hpp). This is the host
-// process: Context plus Fragment. Not GPU host memory. This translation unit
-// sees the heavy internal types so consumers (e.g. the Rust bindings) never
-// include sirius_context.hpp.
+// Implementation of the public FFI surface (sirius/ffi.hpp): Context plus Fragment.
+// This translation unit sees the heavy internal types so consumers (e.g. the Rust
+// bindings) never include sirius_context.hpp.
 
 #include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
@@ -65,7 +64,7 @@ std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + st
 // The embedded DuckDB never loads the Sirius extension, so nothing on this path reads the
 // SIRIUS_LOG_{BACKEND,DIR,LEVEL} environment the transparent path honors
 // (SiriusContextExtensionCallback) — the engine would run with the noop sink and no log would
-// reach the host process. Install the same sink here when the host asks for one; without any
+// reach the embedder. Install the same sink here when the embedder asks for one; without any
 // of the variables the sink is left untouched (noop by default).
 void install_log_sink_from_env()
 {
@@ -285,7 +284,7 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
 // Fragment
 // ---------------------------------------------------------------------------
 
-// Host-process PIMPL around one streaming_fragment. Not GPU host memory.
+// PIMPL around one streaming_fragment.
 struct Fragment::Impl {
   explicit Impl(Context::Impl& ctx) : ctx(ctx) {}
 

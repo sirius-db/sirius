@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Public sirius::ffi::Fragment methods only (host process, not GPU host memory).
+// Public sirius::ffi Context and Fragment methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, the one-window-at-a-time rule on one and on two
 // threads, build() and run()/drop on different threads, drop after build(), a build() that fails
@@ -144,7 +144,7 @@ std::vector<std::int64_t> result_i64s(sirius::ffi::Fragment& fragment)
 
 TEST_CASE("FFI leaf result_to_arrow returns parquet rows", "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_leaf");
+  sirius::test::scratch_dir scratch("ffi_embedder_leaf");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -158,7 +158,7 @@ TEST_CASE("FFI leaf result_to_arrow returns parquet rows", "[isolated_context][s
 TEST_CASE("FFI relay_from chain matches a single-fragment parquet scan",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_relay");
+  sirius::test::scratch_dir scratch("ffi_embedder_relay");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -179,7 +179,7 @@ TEST_CASE("FFI relay_from chain matches a single-fragment parquet scan",
 TEST_CASE("FFI only one fragment may sit between build() and run()",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_nested_window");
+  sirius::test::scratch_dir scratch("ffi_embedder_nested_window");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -199,7 +199,7 @@ TEST_CASE("FFI only one fragment may sit between build() and run()",
 TEST_CASE("FFI build() on another thread fails fast while a fragment is built but not run",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_cross_thread_window");
+  sirius::test::scratch_dir scratch("ffi_embedder_cross_thread_window");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -228,7 +228,7 @@ TEST_CASE("FFI build() on another thread fails fast while a fragment is built bu
 
 TEST_CASE("FFI build() and run() may happen on different threads", "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_run_other_thread");
+  sirius::test::scratch_dir scratch("ffi_embedder_run_other_thread");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
   auto const plan = local_files_plan(path);
@@ -251,7 +251,7 @@ TEST_CASE("FFI build() and run() may happen on different threads", "[isolated_co
 
 TEST_CASE("FFI drop after build releases the query window", "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_drop");
+  sirius::test::scratch_dir scratch("ffi_embedder_drop");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
   auto const plan = local_files_plan(path);
@@ -273,7 +273,7 @@ TEST_CASE("FFI drop after build releases the query window", "[isolated_context][
 TEST_CASE("FFI a build() that fails after setup releases the window and rolls back",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_failed_lowering");
+  sirius::test::scratch_dir scratch("ffi_embedder_failed_lowering");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -302,7 +302,7 @@ TEST_CASE("FFI a build() that fails after setup releases the window and rolls ba
 
 TEST_CASE("FFI execute_substrait returns parquet rows", "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_host_execute_substrait");
+  sirius::test::scratch_dir scratch("ffi_embedder_execute_substrait");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
