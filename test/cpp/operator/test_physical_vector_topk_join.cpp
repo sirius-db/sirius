@@ -462,7 +462,7 @@ TEST_CASE("vector top-k join: a NULL vector throws a clear error", "[operator][v
   REQUIRE_THROWS_WITH(run(ops,
                           {make_left_batch(LEFT_VECS, LEFT_IDS, /*nulls=*/{1})},
                           {make_right_batch(RIGHT_VECS, RIGHT_IDS)}),
-                      Catch::Contains("NULL vectors"));
+                      Catch::Matchers::ContainsSubstring("NULL vectors"));
 }
 
 namespace {
