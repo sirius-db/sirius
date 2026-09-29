@@ -408,6 +408,7 @@ set(EXTENSION_SOURCES
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
+    src/op/dynamic_filter/complete_build_inventory.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
@@ -987,6 +988,9 @@ set(TEST_SOURCES
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
+    test/cpp/operator/test_complete_build_inventory.cpp
+    test/cpp/operator/test_dynamic_filter_accumulation.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
@@ -1008,6 +1012,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
+    test/cpp/pipeline/test_after_task_work.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp

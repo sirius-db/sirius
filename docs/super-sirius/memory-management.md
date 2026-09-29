@@ -77,6 +77,8 @@ Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
 3. During execution, operators allocate within the reservation
 4. Reservations are released when the task completes
 
+Multi-partition dynamic filters allocate outside task reservations. Their per-GPU Bloom arrays and publication scratch use their own non-blocking leases (`scoped_replica_reservation`), sized to the exact allocation charge and taken only on threads that track no task reservation; a refused lease skips the optional filter. No task reservation grows for them, and they record no memory history. See [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation).
+
 ### `reservation_aware_resource_adaptor`
 
 Wraps RMM device memory resource. On each allocation:

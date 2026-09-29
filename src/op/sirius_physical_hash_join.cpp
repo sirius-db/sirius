@@ -48,6 +48,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "parallel/after_task_work.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -70,6 +71,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -2190,13 +2192,14 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       port_id, batch, partition_idx);
   };
   if (port_id == "build" && batch) {
+    bool const accumulated = _dynamic_filter_session.accumulation_claimed();
     bool whole             = false;
     bool report_incomplete = false;
     {
       std::scoped_lock lock(op_state_mutex);
-      whole = _build_arrives_whole;
-      report_incomplete =
-        !whole && _dynamic_filter_session.plan().enabled() && !_build_not_whole_reported;
+      whole             = _build_arrives_whole;
+      report_incomplete = !whole && !accumulated && _dynamic_filter_session.plan().enabled() &&
+                          !_build_not_whole_reported;
       if (report_incomplete) { _build_not_whole_reported = true; }
     }
     if (report_incomplete) {
@@ -2216,6 +2219,38 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   }
 
   deposit();
+}
+
+bool sirius_physical_hash_join::begin_dynamic_filter_accumulation(
+  std::optional<complete_build_inventory> inventory) noexcept
+{
+  return _dynamic_filter_session.try_begin_accumulation(std::move(inventory));
+}
+
+namespace {
+static_assert(std::is_nothrow_constructible_v<parallel::after_task_work,
+                                              dynamic_filter_publication_session::accumulation_job>,
+              "wrapping an accumulation_job must not allocate");
+
+parallel::after_task_work as_after_task_work(
+  dynamic_filter_publication_session::accumulation_job job) noexcept
+{
+  return job ? parallel::after_task_work{std::move(job)} : parallel::after_task_work{};
+}
+}  // namespace
+
+parallel::after_task_work sirius_physical_hash_join::contribute_dynamic_filter(
+  std::uint64_t original_id,
+  cucascade::read_only_data_batch const& source,
+  ::cuda::stream_ref stream) noexcept
+{
+  return as_after_task_work(_dynamic_filter_session.contribute(original_id, source, stream));
+}
+
+parallel::after_task_work sirius_physical_hash_join::decline_dynamic_filter_accumulation(
+  accumulation_decline reason) noexcept
+{
+  return as_after_task_work(_dynamic_filter_session.decline_accumulation(reason));
 }
 
 void sirius_physical_hash_join::on_finalize_operator()

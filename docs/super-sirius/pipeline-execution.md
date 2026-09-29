@@ -305,9 +305,10 @@ work is exposed by task hints and completion-driven downstream scheduling — pl
 
 The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
 dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
-publication in the join pipeline. A scan reached transitively through an intervening join has no
-such edge and samples whatever complete filters are visible at its reader and post-decode
-checkpoints.
+publication in the join pipeline. An accumulated multi-partition filter is published as
+after-task work of the final build PARTITION task, so neither CONCAT nor the probe waits for it. A
+scan reached transitively through an intervening join has no such edge and samples whatever
+complete filters are visible at its reader and post-decode checkpoints.
 
 Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
 preference. It provided no coverage benefit while costing wall time and run-to-run variance, so it
@@ -357,6 +358,7 @@ while running:
          c. On success: check query completion
          d. Schedule downstream consumers via task_creator
          e. Or: completion_handler.mark_completed()
+         f. Last: run the task's after-task work, if any (see "After-Task Work" below)
 ```
 
 The reservation request size comes from the task's memory-history estimate (`peak_memory_estimate + bytes_to_materialize_input`). Before reserving, the manager loop clamps this request to the memory space's reservation limit (`memory_space::get_max_memory()`). The estimate can extrapolate far past GPU capacity — a small input that once drove a near-capacity peak yields a large `peak/estimated` ratio. An unclamped over-limit request would receive only a partial reservation from `make_reservation()`, while the predicate-based downgrade that follows requires reserving the **full** requested size, which the space can never grant — livelocking the task through the OOM-reschedule loop until the retry cap trips. Clamping to `get_max_memory()` loses no reservable memory (`make_reservation()` already caps there) and keeps both the reservation and the downgrade target achievable; per-batch overflow during execution is still handled by the OOM-reschedule + tiering path.
@@ -369,7 +371,7 @@ After a task completes:
 2. If query not complete: call `task_creator->schedule(consumer)` for each
 3. If pipeline sink is `RESULT_COLLECTOR` and pipeline is finished: `completion_handler->mark_completed()`
 
-The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
+The completion check happens **before** scheduling downstream tasks: the terminal task must not schedule consumers after it completes the query, because the query thread may then destroy the operators. Other work after success in the dispatch lambda (a non-terminal cascade, after-task work) is safe: the query thread's `wait_for_completion()` joins every worker (`wait_all`) before any operator is destroyed, and a stopped creator queue drops late schedule requests.
 
 This epilogue is the usual signaller, but not the only one — see the completion contract below.
 
@@ -386,8 +388,8 @@ after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
-operators are destroyed.
+`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work, including any
+after-task work still running on a worker, before operators are destroyed.
 
 ### Task Request Flow
 
@@ -433,8 +435,27 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
 7. Sleeps 50ms for backoff
 8. Reschedules the new task back through the manager loop
+9. Runs the after-task work the original task produced, if any, on the same worker (see below)
 
 If max retries are exceeded, the error propagates and terminates the query.
+
+## After-Task Work (feature infrastructure)
+
+**Files:** `src/parallel/after_task_work.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`, `src/pipeline/gpu_pipeline_task.cpp`
+
+Multi-partition dynamic filters need to finish work after a task, outside the task's memory accounting, without delaying downstream scheduling. `sirius_physical_operator::observe_task_input` lets an operator enqueue optional side work on a task's input, immediately before the operator runs, and return one `parallel::after_task_work` per task. Today only the build PARTITION overrides it (see [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation)). `gpu_pipeline_task` keeps the work in its local state; two operators returning work in one task is a logic error that fails the task.
+
+The executor takes the work only after `execute()` returned, so the task's allocation tracker is detached and its reservation released, and runs it on the same worker thread and task stream:
+
+| Task exit | After-task work |
+|---|---|
+| Success | Runs last: after the task is destroyed, consumers are scheduled, and a terminal task's `mark_completed()` |
+| Out-of-memory or launch reschedule | Runs after the retry task was scheduled |
+| Fatal error, or an error already reported for the query | Destroyed uninvoked with the task |
+| Retry limit exceeded | Destroyed uninvoked on the worker, after it was taken from the task |
+| Query already completed (success or error) | Destroyed uninvoked |
+
+The contract the work itself must meet is documented on `parallel::after_task_work`. The work holds its worker slot while it runs; on the reschedule exit, that slot is unavailable to the retry until the work ends. A query may complete while the work runs: `wait_all` in both `wait_for_completion()` and `drain_after_error()` joins it before teardown, which can extend that query's tail by at most one run of the work. `gpu_pipeline_executor::run_after_task_work` never throws; it logs an escaping exception at ERROR and reports a sticky CUDA error the work leaves behind to the task's query.
 
 ## Error Handling and Draining
 

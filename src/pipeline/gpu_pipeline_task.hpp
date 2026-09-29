@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "parallel/after_task_work.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
@@ -73,6 +74,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
 
   std::unique_ptr<op::operator_data> _input_data;  ///< Input data batches for the pipeline
   size_t _start_operator_index = 0;  ///< Operator index to resume from (0 = start of pipeline)
+  parallel::after_task_work after_task_work;  ///< Work to run after the task completes, if any
 
   /**
    * @brief Set the preferred GPU device ID for this task based on data locality.
@@ -212,6 +214,13 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     }
     return 0;
   }
+
+  /**
+   * @brief Moves out the after-task work an operator returned during `compute_task`.
+   *
+   * @return The work, or empty work when there is none
+   */
+  [[nodiscard]] parallel::after_task_work take_after_task_work() noexcept;
 
   /**
    * @brief The completion handler of the query this task belongs to.

@@ -33,10 +33,12 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,6 +46,10 @@
 namespace sirius {
 
 class like_multiliteral_cache;
+
+namespace parallel {
+class after_task_work;
+}  // namespace parallel
 
 namespace telemetry {
 struct batch_telemetry_info;
@@ -253,9 +259,18 @@ class pipelineable_operator_data : public operator_data {
     _data_batches = std::vector<std::shared_ptr<::cucascade::data_batch>>();
   }
   explicit pipelineable_operator_data(
-    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
-    : _data_batches(std::move(data_batches))
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches);
+
+  /**
+   * @brief IDs of the non-null input batches in input order, captured at construction.
+   *
+   * Feature infrastructure (multi-partition dynamic filters). The IDs survive preparation, which
+   * may replace a batch with a cross-GPU clone that has a new ID, and task retries, which reuse
+   * this object.
+   */
+  [[nodiscard]] std::span<std::uint64_t const> original_batch_ids() const noexcept
   {
+    return _original_batch_ids;
   }
 
   [[nodiscard]] operator_data_type get_type() const override
@@ -324,6 +339,7 @@ class pipelineable_operator_data : public operator_data {
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  std::vector<std::uint64_t> _original_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
@@ -577,6 +593,25 @@ class sirius_physical_operator {
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
 
+  /**
+   * @brief Lets this operator enqueue optional side work on one task's input.
+   *
+   * Feature infrastructure (multi-partition dynamic filters): `gpu_pipeline_task::compute_task`
+   * calls it on the task's stream and thread, with the task's allocation tracker attached,
+   * immediately before this operator runs. @p input is the task's input as it arrived at the port,
+   * before `materialize_deferred_input` restores deferred columns. An override must not allocate
+   * from or release into the task's reservation, and must not wait on the host on success; a
+   * failing call may host-join the work it enqueued. Enqueued work may read @p input
+   * asynchronously, because the task retires @p stream before it releases @p input (the operator
+   * loop's post-operator sync, and the executor's sync before a reschedule); a fatal task exit may
+   * release @p input early, as it may for any in-flight kernel. Anything to finish after the task
+   * is returned as after-task work (see `parallel::after_task_work`). An exception fails the task.
+   *
+   * @return Work to run after the task, or empty work (the default)
+   */
+  [[nodiscard]] virtual parallel::after_task_work observe_task_input(operator_data const& input,
+                                                                     ::cuda::stream_ref stream);
+
   //! The influence the operator has on order (insertion order means no influence)
   virtual sirius::OrderPreservationType operator_order() const
   {
@@ -722,7 +757,8 @@ class sirius_physical_operator {
     uuid::UUID pseudo_sink_port_uuid;
   };
 
-  // source pipeline pushed to repo of the ports
+  //! Push @p batch into port @p port_id. Calls on_input_batch_pushed() before the batch becomes
+  //! poppable.
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
@@ -779,6 +815,16 @@ class sirius_physical_operator {
   virtual void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
+  /**
+   * @brief Observes a batch pushed into port @p port_id, inside the pushing task, before the batch
+   * becomes poppable.
+   *
+   * Feature infrastructure (multi-partition dynamic filters). An override must not block or touch
+   * device memory. It may throw `std::logic_error` to report an engine-invariant violation; the
+   * batch is then not added. The default does nothing.
+   */
+  virtual void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch);
+
   std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;

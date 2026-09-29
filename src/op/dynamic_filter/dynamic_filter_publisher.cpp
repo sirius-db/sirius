@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -33,29 +34,99 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
 
-//===----------dynamic_filter_publication_session::state----------===//
+namespace {
+
+/** @brief The type of failure that occurred during accumulation. */
+enum class masked_failure : std::uint8_t { ERROR, TRANSIENT, LEAK };
+
+/**
+ * @brief Logs the exception in flight and classifies it for the accumulation counters.
+ *
+ * @pre Called from a catch handler
+ */
+masked_failure mask_current_exception(char const* where) noexcept
+{
+  auto kind = masked_failure::ERROR;
+  try {
+    try {
+      throw;
+    } catch (detail::unjoined_gpu_work const& e) {
+      kind = masked_failure::LEAK;
+      SIRIUS_LOG_ERROR(
+        "[{}] accumulated Bloom storage leaked after a failed host join: {}", where, e.what());
+    } catch (detail::accumulation_cuda_error const& e) {
+      kind = e.transient_launch_failure() ? masked_failure::TRANSIENT : masked_failure::ERROR;
+      SIRIUS_LOG_WARN("[{}] accumulated Bloom skipped after a CUDA error: {}", where, e.what());
+    } catch (std::logic_error const& e) {
+      SIRIUS_LOG_ERROR(
+        "[{}] accumulated Bloom skipped after an invariant failure: {}", where, e.what());
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("[{}] accumulated Bloom skipped: {}", where, e.what());
+    } catch (...) {
+      SIRIUS_LOG_WARN("[{}] accumulated Bloom skipped after a non-standard exception", where);
+    }
+  } catch (...) {  // Logging failed; the classification stands.
+  }
+  return kind;
+}
+
+void count_failure(dynamic_filter_publication_outcome& outcome, masked_failure kind) noexcept
+{
+  switch (kind) {
+    case masked_failure::TRANSIENT: outcome.accumulations_skipped_transient = 1; break;
+    case masked_failure::LEAK:
+      outcome.accumulation_storage_leaks  = 1;
+      outcome.accumulations_skipped_error = 1;
+      break;
+    case masked_failure::ERROR: outcome.accumulations_skipped_error = 1; break;
+  }
+}
+
+char const* describe(accumulation_decline reason) noexcept
+{
+  switch (reason) {
+    case accumulation_decline::CONTRIBUTION_UNACCOUNTABLE:
+      return "a task input is not exactly one certified batch";
+  }
+  return "unknown reason";
+}
+
+}  // namespace
+
+//===----------------------------------------------------------------------===//
+// dynamic_filter_publication_session::state
+//===----------------------------------------------------------------------===//
 struct dynamic_filter_publication_session::state {
   enum class phase {
-    open,        // A producer may still register on the plan's channels
-    publishing,  // A producer has observed a whole-build delivery and is publishing filters on it
-                 // (exclusively)
-    terminal  // The session has completed, cancelled, or failed; no further producer registration
+    OPEN,        // A producer may still register on the plan's channels
+    COLLECTING,  // An accumulation accepts contributions from certified build batches
+    PUBLISHING,  // One whole-build delivery or the publishing job owns publication (exclusively)
+    TERMINAL  // The session has completed, cancelled, or failed; no further producer registration
   };
+
+  enum class contribution : std::uint8_t { PENDING, IN_FLIGHT, COMPLETED };
 
   explicit state(dynamic_filter_publish_plan value, dynamic_filter_stats* sink)
     : plan(std::move(value)), stats(sink)
@@ -88,12 +159,18 @@ struct dynamic_filter_publication_session::state {
 
   void complete(sirius_dynamic_filter_set::completion result, bool account_attempt = false) noexcept
   {
-    if (current == phase::terminal) { return; }
+    if (current == phase::TERMINAL) { return; }
     for (auto const& producer : producers) {
       producer.finish(result);
     }
-    current = phase::terminal;
+    current = phase::TERMINAL;
     if (!stats || !account_attempt) { return; }
+    count_terminal(result);
+  }
+
+  void count_terminal(sirius_dynamic_filter_set::completion result) noexcept
+  {
+    if (!stats) { return; }
     if (result == sirius_dynamic_filter_set::completion::published ||
         result == sirius_dynamic_filter_set::completion::skipped) {
       stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
@@ -103,19 +180,218 @@ struct dynamic_filter_publication_session::state {
     }
   }
 
-  void record(dynamic_filter_publication_outcome const& outcome) noexcept
+  /**
+   * @brief Adds @p value to the shared counters. The caller holds the mutex, as for every other
+   * outcome update.
+   */
+  void record(dynamic_filter_publication_outcome const& value) noexcept
   {
     if (!stats) { return; }
     auto const relaxed = std::memory_order_relaxed;
-    stats->keys_considered.fetch_add(outcome.keys_considered, relaxed);
-    stats->keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
-    stats->keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
-    stats->keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
-    stats->keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
-    stats->membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
-    stats->zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
-    stats->publications_skipped_targets_drained.fetch_add(outcome.skipped_targets_drained, relaxed);
-    stats->filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
+    stats->accumulations_started.fetch_add(value.accumulations_started, relaxed);
+    stats->accumulation_expected_contributions.fetch_add(value.accumulation_expected_contributions,
+                                                         relaxed);
+    stats->accumulation_completed_contributions.fetch_add(
+      value.accumulation_completed_contributions, relaxed);
+    stats->accumulation_duplicate_contributions.fetch_add(
+      value.accumulation_duplicate_contributions, relaxed);
+    stats->accumulations_skipped_inventory.fetch_add(value.accumulations_skipped_inventory,
+                                                     relaxed);
+    stats->accumulations_skipped_admission.fetch_add(value.accumulations_skipped_admission,
+                                                     relaxed);
+    stats->accumulations_skipped_error.fetch_add(value.accumulations_skipped_error, relaxed);
+    stats->accumulations_skipped_transient.fetch_add(value.accumulations_skipped_transient,
+                                                     relaxed);
+    stats->accumulations_incomplete.fetch_add(value.accumulations_incomplete, relaxed);
+    stats->accumulations_abandoned.fetch_add(value.accumulations_abandoned, relaxed);
+    stats->accumulation_storage_leaks.fetch_add(value.accumulation_storage_leaks, relaxed);
+    stats->accumulation_publications_finished.fetch_add(value.accumulation_publications_finished,
+                                                        relaxed);
+    stats->accumulation_publication_latency_ns.fetch_add(value.accumulation_publication_latency_ns,
+                                                         relaxed);
+    stats->keys_skipped_bloom_size_gate.fetch_add(value.keys_skipped_bloom_size_gate, relaxed);
+    stats->keys_skipped_bloom_unsupported.fetch_add(value.keys_skipped_bloom_unsupported, relaxed);
+    stats->keys_considered.fetch_add(value.keys_considered, relaxed);
+    stats->keys_with_known_domain.fetch_add(value.keys_with_known_domain, relaxed);
+    stats->keys_skipped_domain_gate.fetch_add(value.keys_skipped_domain_gate, relaxed);
+    stats->keys_skipped_type_mismatch.fetch_add(value.keys_skipped_type_mismatch, relaxed);
+    stats->keys_build_exceeded_domain.fetch_add(value.keys_build_exceeded_domain, relaxed);
+    stats->membership_filters_built.fetch_add(value.membership_filters_built, relaxed);
+    stats->zone_map_filters_built.fetch_add(value.zone_map_filters_built, relaxed);
+    stats->publications_skipped_targets_drained.fetch_add(value.skipped_targets_drained, relaxed);
+    stats->filters_pushed.fetch_add(value.filters_pushed, relaxed);
+  }
+
+  [[nodiscard]] bool targets_accepting() const noexcept
+  {
+    return std::ranges::any_of(channels,
+                               [](auto const& channel) { return channel->accepting_filters(); });
+  }
+
+  /**
+   * @brief Ends the attempt with @p result unless it already has one. The caller holds the mutex.
+   */
+  void end_attempt(sirius_dynamic_filter_set::completion result) noexcept
+  {
+    if (!accumulation_result) { accumulation_result = result; }
+    input_closed = true;
+  }
+
+  /**
+   * @brief Moves an accumulation to terminal once its result is known and nothing is in flight,
+   * then releases a retired builder if this thread may.
+   *
+   * @return Whether a retired builder still awaits release on another thread
+   */
+  bool settle() noexcept
+  {
+    std::optional<detail::accumulated_bloom_builder> released;
+    std::optional<sirius_dynamic_filter_set::completion> finished;
+    bool pending = false;
+    {
+      std::scoped_lock lock(mutex);
+      if (accumulated && current != phase::TERMINAL && active_operations == 0 &&
+          accumulation_result) {
+        current  = phase::TERMINAL;
+        finished = accumulation_result;
+        record(outcome);
+        count_terminal(*finished);
+        retiring = std::move(builder);
+        builder.reset();
+      }
+      if (retiring && retiring->releasable_here()) {
+        released = std::move(retiring);
+        retiring.reset();
+      }
+      pending = retiring.has_value();
+    }
+    if (finished) {
+      for (auto const& producer : producers) {
+        producer.finish(*finished);
+      }
+    }
+    if (released) {
+      nvtx_scoped_range range{"dynfilter::accum::retire"};
+      released.reset();
+    }
+    return pending;
+  }
+
+  /**
+   * @brief The publishing job's body: reduce and replicate the partials, then fan out.
+   */
+  void publish(::cuda::stream_ref stream) noexcept
+  {
+    using completion = sirius_dynamic_filter_set::completion;
+    try {
+      {
+        std::scoped_lock lock(mutex);
+        if (accumulation_result) { return; }
+        if (cancelled) {
+          end_attempt(completion::cancelled);
+          return;
+        }
+        if (!targets_accepting()) {
+          outcome.skipped_targets_drained = 1;
+          end_attempt(completion::skipped);
+          return;
+        }
+      }
+      int device = -1;
+      if (auto const status = cudaGetDevice(&device); status != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error(std::string{"cudaGetDevice: "} + cudaGetErrorString(status));
+      }
+      auto filters = builder->finish(rmm::cuda_device_id{device}, stream);
+      if (!filters) {
+        SIRIUS_LOG_DEBUG(
+          "[dynamic_filter_publication_session] accumulated Bloom skipped: scratch lease refused.");
+        std::scoped_lock lock(mutex);
+        outcome.accumulations_skipped_admission = 1;
+        end_attempt(completion::skipped);
+        return;
+      }
+      {
+        std::scoped_lock lock(mutex);
+        if (cancelled) {
+          end_attempt(completion::cancelled);
+          return;
+        }
+        if (!targets_accepting()) {
+          outcome.skipped_targets_drained = 1;
+          end_attempt(completion::skipped);
+          return;
+        }
+        fanout_started = true;
+      }
+      std::size_t pushed         = 0;
+      std::size_t active_targets = 0;
+      std::optional<std::chrono::steady_clock::duration> latency;
+      for (std::size_t target_index = 0; target_index < plan.probe_targets().size();
+           ++target_index) {
+        auto const& target = plan.probe_targets()[target_index];
+        if (!target.filter_set->accepting_filters()) { continue; }
+        ++active_targets;
+        for (auto const& binding : target.key_bindings) {
+          auto const key = std::ranges::find(active_keys, binding.admitted_key_index);
+          if (key == active_keys.end()) { continue; }
+          auto const filter_index = static_cast<std::size_t>(key - active_keys.begin());
+          if (!latency) {
+            latency = std::chrono::steady_clock::now() - final_commit;
+            nvtx3::mark_in<nvtx_domain>("dynfilter::accum::visible");
+          }
+          if (producers[target_index].push_filter(binding.channel_push_ordinal,
+                                                  (*filters)[filter_index])) {
+            ++pushed;
+          }
+        }
+      }
+      std::scoped_lock lock(mutex);
+      outcome.membership_filters_built           = filters->size();
+      outcome.filters_pushed                     = pushed;
+      outcome.active_targets                     = active_targets;
+      outcome.accumulation_publications_finished = pushed != 0 ? 1 : 0;
+      if (latency) {
+        outcome.accumulation_publication_latency_ns = static_cast<std::size_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
+      }
+      end_attempt(pushed != 0 ? completion::published : completion::skipped);
+    } catch (...) {
+      auto const kind = mask_current_exception("dynamic_filter_publication_session::publish");
+      std::scoped_lock lock(mutex);
+      count_failure(outcome, kind);
+      end_attempt(completion::failed);
+    }
+  }
+
+  /**
+   * @brief Consumes a job: the publishing job publishes when invoked and abandons otherwise; every
+   * job settles.
+   */
+  static void consume(std::shared_ptr<state> operation,
+                      std::optional<::cuda::stream_ref> stream) noexcept
+  {
+    bool publishes = false;
+    {
+      std::scoped_lock lock(operation->mutex);
+      publishes = std::exchange(operation->publishing_share, false);
+    }
+    if (publishes) {
+      if (stream) {
+        operation->publish(*stream);
+      } else {
+        std::scoped_lock lock(operation->mutex);
+        if (operation->cancelled) {
+          operation->end_attempt(sirius_dynamic_filter_set::completion::cancelled);
+        } else {
+          if (!operation->accumulation_result) { operation->outcome.accumulations_abandoned = 1; }
+          operation->end_attempt(sirius_dynamic_filter_set::completion::skipped);
+        }
+      }
+      std::scoped_lock lock(operation->mutex);
+      --operation->active_operations;
+    }
+    (void)operation->settle();
   }
 
   std::mutex mutex;
@@ -123,14 +399,82 @@ struct dynamic_filter_publication_session::state {
   dynamic_filter_stats* stats;
   std::vector<sirius_dynamic_filter_set::producer> producers;
   std::vector<std::shared_ptr<sirius_dynamic_filter_set>> channels;
-  phase current       = phase::open;
-  bool sealed         = false;
-  bool input_closed   = false;
-  bool cancelled      = false;
-  bool fanout_started = false;
+  std::optional<complete_build_inventory> inventory;
+  std::vector<contribution> journal;  // One entry per inventory batch, in inventory order
+  std::vector<std::size_t> active_keys;
+  std::optional<detail::accumulated_bloom_builder> builder;
+  // A builder whose release would credit the settling thread's tracker; released by a later settle.
+  std::optional<detail::accumulated_bloom_builder> retiring;
+  dynamic_filter_publication_outcome outcome;
+  std::optional<sirius_dynamic_filter_set::completion> accumulation_result;
+  std::chrono::steady_clock::time_point final_commit{};
+  std::size_t active_operations = 0;  // Claimed contributions plus the outstanding publishing job
+  bool accumulated              = false;
+  bool publishing_share         = false;  // The publishing job exists and has not been consumed
+  phase current                 = phase::OPEN;
+  bool sealed                   = false;
+  bool input_closed             = false;
+  bool cancelled                = false;
+  bool fanout_started           = false;
 };
 
-//===----------dynamic_filter_publication_session----------===//
+//===----------------------------------------------------------------------===//
+// dynamic_filter_publication_session::accumulation_job
+//===----------------------------------------------------------------------===//
+dynamic_filter_publication_session::accumulation_job
+dynamic_filter_publication_session::decline_accumulation(accumulation_decline reason) noexcept
+{
+  auto operation = _state;
+  bool declined  = false;
+  {
+    std::scoped_lock lock(operation->mutex);
+    if (operation->current == state::phase::COLLECTING && !operation->accumulation_result) {
+      operation->outcome.accumulations_skipped_inventory = 1;
+      operation->end_attempt(sirius_dynamic_filter_set::completion::skipped);
+      declined = true;
+    }
+  }
+  if (declined) {
+    try {
+      SIRIUS_LOG_INFO("[dynamic_filter_publication_session] accumulated Bloom declined: {}.",
+                      describe(reason));
+    } catch (...) {  // The decline stands without its log line.
+    }
+  }
+  if (operation->settle()) { return accumulation_job{std::move(operation)}; }
+  return {};
+}
+
+dynamic_filter_publication_session::accumulation_job::~accumulation_job()
+{
+  if (_state) { state::consume(std::move(_state), std::nullopt); }
+}
+
+dynamic_filter_publication_session::accumulation_job::accumulation_job(
+  accumulation_job&& other) noexcept
+  : _state(std::move(other._state))
+{
+}
+
+dynamic_filter_publication_session::accumulation_job&
+dynamic_filter_publication_session::accumulation_job::operator=(accumulation_job&& other) noexcept
+{
+  if (this != &other) {
+    if (_state) { state::consume(std::move(_state), std::nullopt); }
+    _state = std::move(other._state);
+  }
+  return *this;
+}
+
+void dynamic_filter_publication_session::accumulation_job::operator()(
+  ::cuda::stream_ref stream) && noexcept
+{
+  if (_state) { state::consume(std::move(_state), stream); }
+}
+
+//===----------------------------------------------------------------------===//
+// dynamic_filter_publication_session
+//===----------------------------------------------------------------------===//
 dynamic_filter_publication_session::dynamic_filter_publication_session(
   dynamic_filter_publish_plan plan, dynamic_filter_stats* stats)
   : _state(std::make_shared<state>(std::move(plan), stats))
@@ -163,26 +507,250 @@ void dynamic_filter_publication_session::seal_plan() noexcept
   _state->seal();
 }
 
-void dynamic_filter_publication_session::finish_input() noexcept
+// 1. Start accumulation
+bool dynamic_filter_publication_session::try_begin_accumulation(
+  std::optional<complete_build_inventory> inventory) noexcept
 {
   auto operation = _state;
-  std::scoped_lock lock(operation->mutex);
-  operation->seal();
-  operation->input_closed = true;
-  if (operation->current == state::phase::open) {
-    operation->complete(sirius_dynamic_filter_set::completion::skipped);
+  nvtx_scoped_range range{"dynfilter::accum::begin"};
+  dynamic_filter_publication_outcome selection;
+  try {
+    std::vector<detail::accumulated_bloom_builder::key> keys;
+    std::vector<std::size_t> active_keys;
+    std::optional<detail::accumulated_bloom_geometry> geometry;
+    std::size_t expected = 0;
+    {
+      std::scoped_lock lock(operation->mutex);
+      if (operation->current != state::phase::OPEN || operation->input_closed ||
+          !operation->plan.multi_partition_enabled()) {
+        return false;
+      }
+      // Replica placement is final from here on, so the plan can be read without the mutex.
+      operation->seal();
+      if (!inventory || !inventory->valid()) {
+        selection.accumulations_skipped_inventory = 1;
+        operation->record(selection);
+        return false;
+      }
+      std::vector<bool> bound(operation->plan.admitted_keys().size(), false);
+      for (auto const& target : operation->plan.probe_targets()) {
+        for (auto const& binding : target.key_bindings) {
+          bound[binding.admitted_key_index] = true;
+        }
+      }
+      auto const rows = inventory->total_rows();
+      for (std::size_t index = 0; index < bound.size(); ++index) {
+        if (!bound[index]) { continue; }
+        auto const& key = operation->plan.admitted_keys()[index];
+        ++selection.keys_considered;
+        if (key.build_key_domain_cardinality != 0) {
+          ++selection.keys_with_known_domain;
+          if (rows > key.build_key_domain_cardinality) { ++selection.keys_build_exceeded_domain; }
+        }
+        if (key.build_key_ordinal < 0 ||
+            static_cast<std::size_t>(key.build_key_ordinal) >= inventory->schema().size() ||
+            inventory->schema()[key.build_key_ordinal].type != key.storage_type) {
+          ++selection.keys_skipped_type_mismatch;
+          continue;
+        }
+        if (domain_coverage_gate_fires(rows,
+                                       key.build_key_domain_cardinality,
+                                       key.build_key_proven_unique,
+                                       operation->plan.domain_coverage_threshold())) {
+          ++selection.keys_skipped_domain_gate;
+          continue;
+        }
+        if (!sirius_dynamic_bloom_filter::supports(key.storage_type)) {
+          ++selection.keys_skipped_bloom_unsupported;
+          continue;
+        }
+        if (rows == 0) { continue; }
+        active_keys.push_back(index);
+        keys.push_back({key.build_key_ordinal, key.storage_type});
+      }
+      if (!keys.empty()) {
+        geometry = detail::accumulated_bloom_geometry::try_create(
+          rows, keys.size(), operation->plan.max_bloom_bytes_per_gpu());
+        if (!geometry) { selection.keys_skipped_bloom_size_gate = keys.size(); }
+      }
+      if (!geometry) {
+        operation->record(selection);
+        return false;
+      }
+    }
+
+    auto const& replicas = operation->plan.replica_spaces();
+    if (replicas.empty()) {
+      selection.accumulations_skipped_admission = 1;
+      std::scoped_lock lock(operation->mutex);
+      operation->record(selection);
+      return false;
+    }
+    for (auto const& from : replicas) {
+      for (auto const& to : replicas) {
+        auto const source      = from.get_gpu_space().get_device_id();
+        auto const destination = to.get_gpu_space().get_device_id();
+        if (source != destination &&
+            !cucascade::memory::probe_peer_dma_works(source, destination)) {
+          SIRIUS_LOG_INFO(
+            "[dynamic_filter_publication_session] accumulated Bloom skipped: no working peer DMA "
+            "from GPU {} to GPU {}.",
+            source,
+            destination);
+          selection.accumulations_skipped_admission = 1;
+          std::scoped_lock lock(operation->mutex);
+          operation->record(selection);
+          return false;
+        }
+      }
+    }
+
+    // Allocation happens outside the mutex; the builder is installed only if nothing closed the
+    // session meanwhile.
+    auto built = detail::accumulated_bloom_builder::try_create(keys, *geometry, replicas);
+    if (!built) {
+      SIRIUS_LOG_DEBUG(
+        "[dynamic_filter_publication_session] accumulated Bloom skipped: partial-array lease "
+        "refused.");
+      selection.accumulations_skipped_admission = 1;
+      std::scoped_lock lock(operation->mutex);
+      operation->record(selection);
+      return false;
+    }
+    {
+      std::scoped_lock lock(operation->mutex);
+      if (operation->current != state::phase::OPEN || operation->input_closed) {
+        operation->record(selection);
+        return false;  // `built` is released here, on the untracked creator thread.
+      }
+      expected = inventory->batches().size();
+      operation->journal.assign(expected, state::contribution::PENDING);
+      operation->inventory.emplace(std::move(*inventory));
+      operation->active_keys = std::move(active_keys);
+      operation->builder     = std::move(built);
+      operation->accumulated = true;
+      operation->current     = state::phase::COLLECTING;
+      // Start counters are visible at once; the attempt's outcome is recorded when it settles.
+      selection.accumulations_started               = 1;
+      selection.accumulation_expected_contributions = expected;
+      operation->record(selection);
+      if (operation->stats) {
+        operation->stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    SIRIUS_LOG_INFO(
+      "[dynamic_filter_publication_session] accumulated Bloom started: {} key(s), {} batch(es), {} "
+      "array bytes per GPU on {} GPU(s), {}-byte transfer chunks.",
+      keys.size(),
+      expected,
+      geometry->arrays_bytes,
+      replicas.size(),
+      geometry->chunk_bytes);
+    return true;
+  } catch (...) {
+    count_failure(selection, mask_current_exception("dynamic_filter_publication_session::begin"));
+    std::scoped_lock lock(operation->mutex);
+    operation->record(selection);
+    return false;
   }
 }
 
-void dynamic_filter_publication_session::cancel() noexcept
+bool dynamic_filter_publication_session::accumulation_claimed() const noexcept
 {
-  auto operation = _state;
-  std::scoped_lock lock(operation->mutex);
-  operation->input_closed = true;
-  operation->cancelled    = true;
-  if (operation->current == state::phase::open) {
-    operation->complete(sirius_dynamic_filter_set::completion::cancelled);
+  std::scoped_lock lock(_state->mutex);
+  return _state->accumulated;
+}
+
+// 2. Contribute a batch to the accumulation
+dynamic_filter_publication_session::accumulation_job dynamic_filter_publication_session::contribute(
+  std::uint64_t original_id,
+  cucascade::read_only_data_batch const& source,
+  ::cuda::stream_ref stream) noexcept
+{
+  auto operation    = _state;
+  std::size_t index = 0;
+  bool claimed      = false;
+  try {
+    {
+      std::scoped_lock lock(operation->mutex);
+      if (!operation->accumulated) { return {}; }
+    }
+    auto const* gpu = dynamic_cast<cucascade::gpu_table_representation const*>(source.get_data());
+    std::optional<cudf::table_view> view;
+    if (gpu != nullptr) { view.emplace(gpu->get_table_view()); }
+    auto const* space = source.get_memory_space();
+    {
+      std::scoped_lock lock(operation->mutex);
+      auto const* entry = operation->inventory->find(original_id);
+      // A batch without rows that arrived after certification (`build_arrival_ledger` admits it)
+      // adds no key.
+      if (entry == nullptr && view && view->num_rows() == 0) { return {}; }
+      if (entry != nullptr) {
+        index = static_cast<std::size_t>(entry - operation->inventory->batches().data());
+        if (operation->journal[index] != state::contribution::PENDING) {
+          // A retry of an already claimed batch: its keys are, or are being, inserted. After the
+          // attempt settled, its outcome is already recorded, so the count goes straight to the
+          // stats.
+          if (operation->current != state::phase::TERMINAL) {
+            ++operation->outcome.accumulation_duplicate_contributions;
+          } else if (operation->stats) {
+            operation->stats->accumulation_duplicate_contributions.fetch_add(
+              1, std::memory_order_relaxed);
+          }
+          return {};
+        }
+      }
+      if (operation->current != state::phase::COLLECTING || operation->accumulation_result) {
+        return {};
+      }
+      bool const valid =
+        entry != nullptr && view && space != nullptr &&
+        space->get_tier() == cucascade::memory::Tier::GPU &&
+        static_cast<std::uint64_t>(view->num_rows()) == entry->rows &&
+        operation->inventory->schema_matches(*view) &&
+        operation->builder->has_partial(rmm::cuda_device_id{space->get_device_id()});
+      if (!valid) {
+        throw std::logic_error(
+          "[dynamic_filter_publication_session::contribute] the contribution does not match its "
+          "certified batch or has no partial on its GPU");
+      }
+      if (!operation->targets_accepting()) {
+        operation->outcome.skipped_targets_drained = 1;
+        operation->end_attempt(sirius_dynamic_filter_set::completion::skipped);
+      } else {
+        operation->journal[index] = state::contribution::IN_FLIGHT;
+        ++operation->active_operations;
+        claimed = true;
+      }
+    }
+    if (claimed) {
+      operation->builder->enqueue_add(*view, rmm::cuda_device_id{space->get_device_id()}, stream);
+      std::scoped_lock lock(operation->mutex);
+      operation->journal[index] = state::contribution::COMPLETED;
+      claimed                   = false;
+      if (++operation->outcome.accumulation_completed_contributions == operation->journal.size() &&
+          !operation->accumulation_result) {
+        // The final commit happens after every enqueue_add returned, so publication sees all
+        // inserts. The publishing job keeps this operation's share.
+        operation->current          = state::phase::PUBLISHING;
+        operation->publishing_share = true;
+        operation->final_commit     = std::chrono::steady_clock::now();
+        nvtx3::mark_in<nvtx_domain>("dynfilter::accum::final_commit");
+        return accumulation_job{std::move(operation)};
+      }
+      --operation->active_operations;
+    }
+  } catch (...) {
+    auto const kind = mask_current_exception("dynamic_filter_publication_session::contribute");
+    std::scoped_lock lock(operation->mutex);
+    if (claimed) { --operation->active_operations; }
+    if (operation->current == state::phase::COLLECTING) {
+      count_failure(operation->outcome, kind);
+      operation->end_attempt(sirius_dynamic_filter_set::completion::failed);
+    }
   }
+  if (operation->settle()) { return accumulation_job{std::move(operation)}; }
+  return {};
 }
 
 void dynamic_filter_publication_session::observe_whole_build(
@@ -193,8 +761,8 @@ void dynamic_filter_publication_session::observe_whole_build(
   {
     std::scoped_lock lock(operation->mutex);
     operation->seal();
-    if (operation->current == state::phase::open && operation->plan.enabled() && delivery._batch) {
-      operation->current = state::phase::publishing;
+    if (operation->current == state::phase::OPEN && operation->plan.enabled() && delivery._batch) {
+      operation->current = state::phase::PUBLISHING;
       claimed            = true;
       if (operation->stats) {
         operation->stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -233,7 +801,7 @@ void dynamic_filter_publication_session::observe_whole_build(
         operation->complete(operation->cancelled ? sirius_dynamic_filter_set::completion::cancelled
                                                  : sirius_dynamic_filter_set::completion::skipped);
       } else {
-        operation->current = state::phase::open;
+        operation->current = state::phase::OPEN;
       }
       return;
     }
@@ -320,6 +888,7 @@ std::size_t device_l2_cache_bytes(
 }
 }  // namespace
 
+// 3. Publish the accumulated filters to the probe targets, if any, and record the outcome.
 dynamic_filter_publication_outcome publish_dynamic_filters(
   dynamic_filter_publish_plan const& plan,
   cudf::table_view const& build_view,
@@ -580,6 +1149,43 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
     stream.sync();
     std::rethrow_exception(error);
   }
+}
+
+// 4. Settle the session after all contributions have been made and the input is closed, or the
+// accumulation has been cancelled.
+void dynamic_filter_publication_session::finish_input() noexcept
+{
+  auto operation = _state;
+  {
+    std::scoped_lock lock(operation->mutex);
+    operation->seal();
+    operation->input_closed = true;
+    if (operation->current == state::phase::OPEN) {
+      operation->complete(sirius_dynamic_filter_set::completion::skipped);
+    } else if (operation->current == state::phase::COLLECTING && !operation->accumulation_result &&
+               std::ranges::find(operation->journal, state::contribution::PENDING) !=
+                 operation->journal.end()) {
+      operation->outcome.accumulations_incomplete = 1;
+      operation->end_attempt(sirius_dynamic_filter_set::completion::skipped);
+    }
+  }
+  (void)operation->settle();
+}
+
+void dynamic_filter_publication_session::cancel() noexcept
+{
+  auto operation = _state;
+  {
+    std::scoped_lock lock(operation->mutex);
+    operation->input_closed = true;
+    operation->cancelled    = true;
+    if (operation->current == state::phase::OPEN) {
+      operation->complete(sirius_dynamic_filter_set::completion::cancelled);
+    } else if (operation->current == state::phase::COLLECTING) {
+      operation->end_attempt(sirius_dynamic_filter_set::completion::cancelled);
+    }
+  }
+  (void)operation->settle();
 }
 
 }  // namespace sirius::op
