@@ -337,6 +337,11 @@ TEST_CASE_METHOD(DistinctFixture,
     "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
   compare_gpu_vs_cpu(
     "SELECT DISTINCT a FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+  // Nested: `d` is read twice and joined on `b`, so it stays wider than the body under `c`.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a FROM dist_t), "
+    "d AS MATERIALIZED (SELECT a, b FROM dist_t) "
+    "SELECT d1.a FROM d d1 JOIN d d2 ON d1.b = d2.b JOIN c ON c.a = d1.a) s");
 }
 
 //===----------------------------------------------------------------------===//

@@ -87,12 +87,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   auto plan = create_plan(*op.children[0]);
   // op.types normally equals the planned child's schema, but a child built by another arm can
   // narrow a type without its parents re-resolving, so compare element types and not only width.
-  //
-  // A CTE node declares its materialization side, not the rows it forwards; the schema that
-  // reaches this operator is its body's, which is its second child.
-  auto const& child_types = plan->type == sirius::op::SiriusPhysicalOperatorType::CTE
-                              ? plan->children[1]->types
-                              : plan->types;
+  auto const& child_types = plan->get_output_types();
   auto declared_types     = sirius::from_duckdb_vec(op.types);
   if (child_types.size() != declared_types.size()) {
     throw duckdb::NotImplementedException(
