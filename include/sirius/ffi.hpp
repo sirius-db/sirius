@@ -89,11 +89,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// build() opens a query lifecycle; run() closes it. At most one fragment per Context may sit
-/// between its own build() and run(): while one does, any other build() or execute_substrait
-/// on the Context throws instead of waiting. run() and destruction may happen on a thread
-/// other than the one that called build(). A Fragment destroyed after build() but before
-/// run() closes the lifecycle itself.
+/// Any number of fragments may be built before any runs, and run in any order that respects
+/// relay_from (a source runs before its receiver's relay). run() executes one query at a time
+/// per Context: a second run() waits for the first. run() and destruction may happen on a
+/// thread other than the one that called build().
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -129,7 +128,7 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build(), or from build() itself when fewer than two outputs are declared.
   void declare_output_hash_key(std::uint32_t column_index);
 
-  /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.
+  /// Lower and plan `substrait_plan` against the declared streams.
   /// Creates a view `sirius_stream_<id>` for each declared input stream.
   /// @throws on translation/planning failure or if already built.
   void build(const std::string& substrait_plan);
@@ -149,8 +148,9 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
-  /// @throws before build() or on execution failure.
+  /// Execute the fragment. Blocks until pipelines finish. Every input must be closed first
+  /// (relay_from and close_input close their sender).
+  /// @throws before build(), while an input is still open, or on execution failure.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at

@@ -24,6 +24,8 @@
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -66,48 +68,44 @@ struct fragment_spec {
   duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
 };
 
-/// Owns repositories, engine, session, and the query window for one fragment.
-/// Repositories outlive data_repository_manager_ cleanup, so parked batches survive run().
-/// The engine owns the plan, so the sink stays pullable after run().
+/// Owns repositories, plan, engine, and session for one fragment. The query window exists only
+/// inside run(). Repositories outlive data_repository_manager_ cleanup, so queued batches
+/// survive run(). The engine owns the plan after run(), so the sink stays pullable.
 class streaming_fragment {
  public:
-  /// Validates the spec and creates one repository per declared stream.
+  /// Validates the spec and creates one repository per output stream.
   /// @throws sirius::invalid_input_exception when plan_source is unset, N>1 outputs have no
   ///         partitioning, partitioning is set on fewer than two outputs, or on a duplicate
   ///         output id. Empty outputs (a result fragment) are allowed.
   streaming_fragment(duckdb::ClientContext& context, fragment_spec spec);
 
-  /// Erases this fragment's stream_bind_catalog ids and closes a still-open query window
-  /// (drop after build, before run).
   ~streaming_fragment();
 
   streaming_fragment(const streaming_fragment&)            = delete;
   streaming_fragment& operator=(const streaming_fragment&) = delete;
 
-  /// Open the query window, declare inputs, lower to STREAMING_SOURCE plus STREAMING_SINK or
-  /// RESULT_COLLECTOR, and register with the session. Callers can push after this returns. The
-  /// window stays open until run(), a failed build, or destruction, and run() or destruction may
-  /// happen on another thread. Until then the engine's single query-lifecycle slot is held, so
-  /// any other GPU query or fragment build on this SiriusContext throws instead of waiting.
-  /// A failed build() closes the window and cannot be retried; create a new fragment.
+  /// Declare inputs, lower to STREAMING_SOURCE plus STREAMING_SINK or RESULT_COLLECTOR, and
+  /// register with the session. Holds the engine's query-lifecycle slot only while generating
+  /// the physical plan, so any number of fragments may be built before any runs. Inputs can be
+  /// filled after this returns. A failed build() cannot be retried; create a new fragment.
   /// @throws sirius::invalid_input_exception when already built, after a failed build(), no
   ///         catalog, no Sirius state, null plan, a declared input the plan never reads, or
   ///         spec.prepared types that do not match the plan's output types.
-  /// @throws std::runtime_error when another fragment's window is open (see above).
   /// @throws whatever the plan source, binder, or plan generator raises.
   void build();
 
-  /// Submit and block. Closes the query window on success. On failure, poisons every output,
-  /// then closes the window.
-  /// @throws sirius::invalid_input_exception when build() has not run, when already run, or
-  ///         after a failed run() (the window is closed; create a new fragment).
+  /// Open the query window, execute, and block until done; the window closes before this
+  /// returns. Every input must already be closed. On failure, poisons every output first.
+  /// @throws sirius::invalid_input_exception before build(), when an input is still open (the
+  ///         fragment stays runnable), when already run, after a failed run() (create a new
+  ///         fragment), or when a table was pinned or unpinned since build().
   /// @throws the result's error for a result fragment whose query failed.
   /// @throws whatever the engine's execution raises.
   void run();
 
   /// Move every parked batch on `source`'s output `source_stream_id` into this fragment's
   /// input `input_stream_id`, then close `sender_id` on it. Checks schema, shared context,
-  /// sender, and phase before any data moves.
+  /// sender, and phase (source ran, this fragment built but not run) before any data moves.
   /// @return number of batches moved.
   std::size_t relay_from(streaming_fragment& source,
                          stream_id_t source_stream_id,
@@ -147,34 +145,34 @@ class streaming_fragment {
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
 
  private:
+  enum class phase : std::uint8_t { declared, build_failed, built, running, ran, run_failed };
+
   void require_built(const char* what) const;
-  void open_window();
-  void close_window(bool finish);
-  void build_streaming_sink(duckdb::unique_ptr<op::sirius_physical_operator> subtree);
-  void build_result_collector(duckdb::unique_ptr<op::sirius_physical_operator> subtree);
+  duckdb::unique_ptr<op::sirius_physical_operator> make_streaming_sink(
+    duckdb::unique_ptr<op::sirius_physical_operator> subtree);
+  duckdb::unique_ptr<op::sirius_physical_operator> make_result_collector(
+    duckdb::unique_ptr<op::sirius_physical_operator> subtree);
   void register_sources();
   void poison_outputs(std::exception_ptr cause) noexcept;
 
   duckdb::ClientContext& _context;
   fragment_spec _spec;
 
-  // Declaration order is the lifetime contract (C++ destroys in reverse):
-  // repositories outlive the engine; `_result_plan` outlives `_engine` because a
-  // RESULT_COLLECTOR holds a reference into it; `_session` is destroyed before the engine
-  // whose operators it borrows; the query window is last so a drop after build() releases
-  // the slot before the engine it populated is destroyed.
-  std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _input_repos;
+  // Declaration order is the lifetime contract (C++ destroys in reverse): repositories
+  // outlive the plan; `_result_plan` outlives the plan because a RESULT_COLLECTOR holds a
+  // reference into it; `_session` is destroyed before the operators it borrows. The plan root
+  // lives in `_plan_root` from build() until run() hands it to `_engine`.
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _output_repos;
   duckdb::shared_ptr<sirius::sirius_prepared_statement_data> _result_plan;
   duckdb::unique_ptr<duckdb::QueryResult> _result;
+  duckdb::unique_ptr<op::sirius_physical_operator> _plan_root;
   std::unique_ptr<sirius::sirius_engine> _engine;
   stream_session _session;
-  struct query_window;
-  std::unique_ptr<query_window> _lifecycle;
 
-  bool _built{false};
-  bool _build_failed{false};
-  bool _ran{false};
+  // Atomic because pull() may be called from a thread other than the one in run().
+  std::atomic<phase> _phase{phase::declared};
+  // Pinned-table registry epoch the plan was generated against; run() rejects a changed one.
+  std::uint64_t _planned_pin_epoch{0};
   duckdb::vector<sirius::logical_type> _sink_types;
 };
 

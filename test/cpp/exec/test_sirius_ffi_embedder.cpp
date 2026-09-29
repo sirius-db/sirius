@@ -16,10 +16,10 @@
 
 // Public sirius::ffi Context and Fragment methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
-// Covers a result fragment, a relay_from chain, the one-window-at-a-time rule on one and on two
-// threads, build() and run()/drop on different threads, drop after build(), a build() that fails
-// after setup, and execute_substrait. Spec errors and
-// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
+// and on two threads), build() and run()/drop on different threads, drop after build(), a build()
+// that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
+// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
@@ -176,10 +176,10 @@ TEST_CASE("FFI relay_from chain matches a single-fragment parquet scan",
   REQUIRE(result_i64s(*receiver) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
-TEST_CASE("FFI only one fragment may sit between build() and run()",
+TEST_CASE("FFI several fragments may be built before any of them runs",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_embedder_nested_window");
+  sirius::test::scratch_dir scratch("ffi_embedder_build_before_run");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -188,18 +188,21 @@ TEST_CASE("FFI only one fragment may sit between build() and run()",
   sender->declare_output(0);
   sender->build(local_files_plan(path));
 
+  // build() holds no query window, so the receiver builds while the sender is still unrun.
   auto receiver = sirius::ffi::make_fragment(*ctx);
   receiver->declare_input_column(0, "a", "BIGINT");
-  REQUIRE_THROWS_WITH(receiver->build(stream_read_plan(0)),
-                      Catch::Contains("nested execution window"));
+  receiver->build(stream_read_plan(0));
+
   sender->run();
-  REQUIRE(sender->output_batch_count(0) > 0);
+  REQUIRE(receiver->relay_from(*sender, 0, 0, 0) > 0);
+  receiver->run();
+  REQUIRE(result_i64s(*receiver) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
-TEST_CASE("FFI build() on another thread fails fast while a fragment is built but not run",
+TEST_CASE("FFI build() on another thread proceeds while a fragment is built but not run",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_embedder_cross_thread_window");
+  sirius::test::scratch_dir scratch("ffi_embedder_cross_thread_build");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -208,22 +211,17 @@ TEST_CASE("FFI build() on another thread fails fast while a fragment is built bu
   sender->declare_output(0);
   sender->build(local_files_plan(path));
 
-  // Waiting here would deadlock whenever the sender's run() needs the receiver.
-  std::string error;
-  std::thread other([&] {
-    auto receiver = sirius::ffi::make_fragment(*ctx);
+  std::unique_ptr<sirius::ffi::Fragment> receiver;
+  std::thread([&] {
+    receiver = sirius::ffi::make_fragment(*ctx);
     receiver->declare_input_column(0, "a", "BIGINT");
-    try {
-      receiver->build(stream_read_plan(0));
-    } catch (std::exception const& e) {
-      error = e.what();
-    }
-  });
-  other.join();
-  REQUIRE_THAT(error, Catch::Contains("built fragment that has not run"));
+    receiver->build(stream_read_plan(0));
+  }).join();
 
   sender->run();
-  REQUIRE(sender->output_batch_count(0) > 0);
+  REQUIRE(receiver->relay_from(*sender, 0, 0, 0) > 0);
+  receiver->run();
+  REQUIRE(result_i64s(*receiver) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
 TEST_CASE("FFI build() and run() may happen on different threads", "[isolated_context][sirius_ffi]")
@@ -249,7 +247,7 @@ TEST_CASE("FFI build() and run() may happen on different threads", "[isolated_co
   REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
-TEST_CASE("FFI drop after build releases the query window", "[isolated_context][sirius_ffi]")
+TEST_CASE("FFI drop after build leaves the Context usable", "[isolated_context][sirius_ffi]")
 {
   sirius::test::scratch_dir scratch("ffi_embedder_drop");
   auto const path = scratch.file("ids.parquet");
@@ -270,7 +268,7 @@ TEST_CASE("FFI drop after build releases the query window", "[isolated_context][
   REQUIRE(next->output_batch_count(0) > 0);
 }
 
-TEST_CASE("FFI a build() that fails after setup releases the window and rolls back",
+TEST_CASE("FFI a build() that fails after setup rolls back and leaves the Context usable",
           "[isolated_context][sirius_ffi]")
 {
   sirius::test::scratch_dir scratch("ffi_embedder_failed_lowering");

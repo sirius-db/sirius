@@ -29,6 +29,7 @@
 #include <duckdb/main/query_result.hpp>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -97,13 +98,19 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> synthesize_prepared(
 
 }  // namespace
 
-struct streaming_fragment::query_window {
-  duckdb::SiriusContext::StandaloneQueryScope scope;
-  query_window(duckdb::SiriusContext& ctx, duckdb::ClientContext& client, std::string_view label)
-    : scope(ctx, client, label)
-  {
+namespace {
+
+duckdb::SiriusContext& sirius_context_of(duckdb::ClientContext& context)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (sirius_ctx == nullptr) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: Sirius is not registered on this connection");
   }
-};
+  return *sirius_ctx;
+}
+
+}  // namespace
 
 streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_spec spec)
   : _context(context), _spec(std::move(spec))
@@ -123,9 +130,6 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
   }
 
   // Repositories outlive data_repository_manager_ cleanup so sender output outlives this fragment.
-  for (const auto& [id, _] : _spec.inputs) {
-    _input_repos[id] = std::make_shared<cucascade::shared_data_repository>();
-  }
   for (auto id : _spec.outputs) {
     if (_output_repos.count(id) != 0) {
       throw sirius::invalid_input_exception("streaming_fragment: duplicate output stream id " +
@@ -135,47 +139,15 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
   }
 }
 
-streaming_fragment::~streaming_fragment()
-{
-  // Drop only the ids this fragment declared. clear() would wipe a peer fragment's
-  // declarations on this connection. Swallow in the destructor.
-  try {
-    auto catalog = catalog_for(_context);
-    for (const auto& [id, _] : _spec.inputs) {
-      catalog->erase(id);
-    }
-  } catch (...) {  // NOLINT(bugprone-empty-catch)
-  }
-  try {
-    _lifecycle.reset();
-  } catch (...) {  // NOLINT(bugprone-empty-catch)
-  }
-}
+streaming_fragment::~streaming_fragment() = default;
 
 void streaming_fragment::require_built(const char* what) const
 {
-  if (!_built) {
+  auto const current = _phase.load();
+  if (current == phase::declared || current == phase::build_failed) {
     throw sirius::invalid_input_exception(std::string("streaming_fragment: ") + what +
                                           " requires build()");
   }
-}
-
-void streaming_fragment::open_window()
-{
-  auto sirius_ctx = _context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (sirius_ctx == nullptr) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: Sirius is not registered on this connection");
-  }
-  _lifecycle = std::make_unique<query_window>(*sirius_ctx, _context, kFragmentQueryLabel);
-}
-
-void streaming_fragment::close_window(bool finish)
-{
-  // Detach first so a throwing finish() still leaves the window closed; run() relies on
-  // !_lifecycle to refuse a retry.
-  auto window = std::move(_lifecycle);
-  if (window && finish) { window->scope.finish(); }
 }
 
 void streaming_fragment::poison_outputs(std::exception_ptr cause) noexcept
@@ -203,7 +175,7 @@ void streaming_fragment::register_sources()
   }
 }
 
-void streaming_fragment::build_streaming_sink(
+duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_streaming_sink(
   duckdb::unique_ptr<op::sirius_physical_operator> subtree)
 {
   auto types       = subtree->types;
@@ -226,17 +198,11 @@ void streaming_fragment::build_streaming_sink(
       std::move(types), cardinality, sink_repos.front());
   }
   sink->children.push_back(std::move(subtree));
-
-  _engine = std::make_unique<sirius::sirius_engine>(
-    _context, _lifecycle->scope.query_id(), kFragmentQueryLabel);
-  _engine->initialize(std::move(sink));
-
-  auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
-  _session.add_sink(_spec.outputs, sink_ref);
-  register_sources();
+  _session.add_sink(_spec.outputs, *sink);
+  return sink;
 }
 
-void streaming_fragment::build_result_collector(
+duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_result_collector(
   duckdb::unique_ptr<op::sirius_physical_operator> subtree)
 {
   auto prepared = _spec.prepared;
@@ -251,101 +217,127 @@ void streaming_fragment::build_result_collector(
 
   _result_plan = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
     std::move(prepared), std::move(subtree));
-
-  auto collector =
-    duckdb::make_uniq_base<op::sirius_physical_result_collector,
-                           op::sirius_physical_materialized_collector>(*_result_plan, _context);
-
-  _engine = std::make_unique<sirius::sirius_engine>(
-    _context, _lifecycle->scope.query_id(), kFragmentQueryLabel);
-  _engine->initialize(std::move(collector));
-  register_sources();
+  return duckdb::make_uniq_base<op::sirius_physical_result_collector,
+                                op::sirius_physical_materialized_collector>(*_result_plan,
+                                                                            _context);
 }
 
 void streaming_fragment::build()
 {
-  if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
-  if (_build_failed) {
+  if (_phase == phase::build_failed) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: a failed build() cannot be retried; create a new fragment");
   }
-
-  auto catalog = catalog_for(_context);
-  // Replace any earlier declaration of our ids (the FFI declares placeholders to bind its
-  // views) without touching another fragment's ids on this connection.
-  for (const auto& [id, _] : _spec.inputs) {
-    catalog->erase(id);
+  if (_phase != phase::declared) {
+    throw sirius::invalid_input_exception("streaming_fragment: already built");
   }
 
-  // Declare before planning. Bind resolves schema. create_plan reads the repository and senders.
-  for (const auto& [id, input] : _spec.inputs) {
-    catalog->declare(
-      id,
-      stream_input_binding{
-        input.names, input.types, _input_repos.at(id), input.expected_senders, nullptr});
-  }
+  duckdb::shared_ptr<stream_bind_catalog> catalog;
+  // Bind and create_plan read these ids; nothing reads them after build(), so drop them on
+  // every exit rather than leave a stale binding for the next fragment on this connection.
+  auto erase_declared = [&]() noexcept {
+    if (!catalog) { return; }
+    for (const auto& [id, _] : _spec.inputs) {
+      try {
+        catalog->erase(id);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+  };
 
-  open_window();
   try {
+    auto& sirius_ctx = sirius_context_of(_context);
+    catalog          = catalog_for(_context);
+    // declare() replaces any earlier binding of the id, including the FFI's view placeholders.
+    for (const auto& [id, input] : _spec.inputs) {
+      catalog->declare(id,
+                       stream_input_binding{input.names,
+                                            input.types,
+                                            std::make_shared<cucascade::shared_data_repository>(),
+                                            input.expected_senders,
+                                            nullptr});
+    }
+
     auto logical_plan = _spec.plan_source(_context);
     if (!logical_plan) {
       throw sirius::invalid_input_exception("streaming_fragment: plan source produced no plan");
     }
 
-    sirius::planner::sirius_physical_plan_generator generator(_context);
-    auto subtree = generator.create_plan(std::move(logical_plan));
+    duckdb::unique_ptr<op::sirius_physical_operator> subtree;
+    {
+      // create_plan reads the pinned-table registry, which only the slot keeps stable. The
+      // window itself is opened by run(); stamp the epoch so run() can tell the plan went stale.
+      duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
+      _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
+      subtree            = sirius::planner::sirius_physical_plan_generator(_context).create_plan(
+        std::move(logical_plan));
+    }
 
-    if (_spec.outputs.empty()) {
-      build_result_collector(std::move(subtree));
-    } else {
-      build_streaming_sink(std::move(subtree));
-    }
-    _built = true;
-    _lifecycle->scope.set_parked(true);
+    _plan_root = is_result() ? make_result_collector(std::move(subtree))
+                             : make_streaming_sink(std::move(subtree));
+    register_sources();
   } catch (...) {
-    // The session and engine keep partial registrations, so the fragment is single-shot.
-    _build_failed = true;
-    // Release the slot so a later fragment on this connection can build. The destructor
-    // would do the same, but only when this object is dropped.
-    try {
-      close_window(false);
-    } catch (...) {  // NOLINT(bugprone-empty-catch)
-    }
+    // The session keeps partial registrations, so the fragment is single-shot.
+    _phase = phase::build_failed;
+    erase_declared();
     throw;
   }
+  erase_declared();
+  _phase = phase::built;
 }
 
 void streaming_fragment::run()
 {
   require_built("run()");
-  if (_ran) { throw sirius::invalid_input_exception("streaming_fragment: already run"); }
-  if (!_lifecycle) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: query window is closed (a previous run() failed); rebuild the fragment");
+  switch (_phase.load()) {
+    case phase::built: break;
+    case phase::run_failed:
+      throw sirius::invalid_input_exception(
+        "streaming_fragment: a previous run() failed; create a new fragment");
+    case phase::running:
+      throw sirius::invalid_input_exception("streaming_fragment: already running");
+    default: throw sirius::invalid_input_exception("streaming_fragment: already run");
   }
-  _lifecycle->scope.set_parked(false);
+  // A run() that waited on an open input would hold the query window, and every other query
+  // on this engine, until some other thread closed it. Fail instead; the fragment stays runnable.
+  for (auto id : _session.input_streams()) {
+    if (!_session.input_closed(id)) {
+      throw sirius::invalid_input_exception(
+        "streaming_fragment: run() needs every input closed first; input stream " +
+        std::to_string(id) + " is still open");
+    }
+  }
 
+  auto& sirius_ctx = sirius_context_of(_context);
+  _phase           = phase::running;
+  std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
   try {
-    // Reuse the window build() opened. A second StandaloneQueryScope resets the task
-    // creator and scan manager that build() filled, so execute() runs zero tasks and
-    // returns empty output with no error.
+    window.emplace(sirius_ctx, _context, kFragmentQueryLabel);
+    if (sirius_ctx.get_scan_manager().pin_registry_epoch() != _planned_pin_epoch) {
+      throw sirius::invalid_input_exception(
+        "streaming_fragment: a table was pinned or unpinned between build() and run(); "
+        "create a new fragment");
+    }
+    _engine =
+      std::make_unique<sirius::sirius_engine>(_context, window->query_id(), kFragmentQueryLabel);
+    _engine->initialize(std::move(_plan_root));
     _engine->execute();
     if (is_result()) { _result = _engine->get_result(); }
+    window->finish();
   } catch (...) {
     // Fail every output before the window closes. Otherwise a peer in wait() blocks forever.
     poison_outputs(std::current_exception());
-    try {
-      close_window(false);
-    } catch (...) {  // NOLINT(bugprone-empty-catch)
-    }
+    _result.reset();
+    _phase = phase::run_failed;
+    window.reset();
     throw;
   }
-  close_window(true);
   if (_result && _result->HasError()) {
+    _phase      = phase::run_failed;
     auto failed = std::move(_result);
     failed->ThrowError();
   }
-  _ran = true;
+  _phase = phase::ran;
 }
 
 std::size_t streaming_fragment::relay_from(streaming_fragment& source,
@@ -354,17 +346,22 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
                                            sender_id_t sender_id)
 {
   require_built("relay_from()");
-  if (!source._built) {
+  auto const source_phase = source._phase.load();
+  if (source_phase == phase::declared || source_phase == phase::build_failed) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: relay_from() requires the source fragment to have been built");
   }
-  if (!source._ran) {
+  if (source_phase == phase::run_failed) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: relay_from() source fragment's run() failed; its output is poisoned");
+  }
+  if (source_phase != phase::ran) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: relay_from() requires the source fragment to have run — call "
       "source.run() first, otherwise an empty stream is indistinguishable from a finished one "
       "and the input would be closed early");
   }
-  if (_ran) {
+  if (_phase != phase::built) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: relay_from() must run before this fragment's run()");
   }
@@ -432,9 +429,9 @@ void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(stream_id_t id)
 {
   require_built("pull()");
-  // An open window means run() has not started. After a failed run() the window is closed
-  // and the outputs are poisoned, so pulling rethrows the cause.
-  if (_lifecycle) {
+  // After a failed run() the outputs are poisoned, so pulling rethrows the cause.
+  auto const current = _phase.load();
+  if (current != phase::ran && current != phase::run_failed) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: pull() requires run() first, otherwise an empty stream is "
       "indistinguishable from a finished one");
@@ -460,7 +457,7 @@ duckdb::unique_ptr<duckdb::QueryResult> streaming_fragment::take_result()
     throw sirius::invalid_input_exception(
       "streaming_fragment: take_result() is only valid on a fragment with no output streams");
   }
-  if (!_ran) {
+  if (_phase != phase::ran) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: run() must complete before take_result()");
   }

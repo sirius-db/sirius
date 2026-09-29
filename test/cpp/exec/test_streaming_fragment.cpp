@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -99,8 +100,8 @@ struct fragment_fixture {
 //! The execution window a FRAG-CONTROL engine must sit inside. RAII matters here: a `REQUIRE`
 //! that fails inside a hand-bracketed window would leave the slot held and self-deadlock in the
 //! test's `Rollback`, so the scope's destructor backstop is what lets a failing assertion fail.
-//! streaming_fragment tests must not open one of these. streaming_fragment::build() owns the
-//! window.
+//! streaming_fragment tests must not open one of these around build() or run(): run() opens
+//! its own window, and build() takes the slot to generate the plan.
 using query_window = duckdb::SiriusContext::StandaloneQueryScope;
 
 //! Every INTEGER value sitting in an output stream, draining it. Row counts alone would not
@@ -495,8 +496,6 @@ TEST_CASE_METHOD(fragment_fixture,
 
   con->BeginTransaction();
   try {
-    // Only one fragment may sit between build() and run(), so every source runs before the
-    // receiver is built.
     auto sender = make_fragment(*con->context, kLeafQuery, {0});
     sender->build();
     sender->run();
@@ -532,7 +531,7 @@ TEST_CASE_METHOD(fragment_fixture,
       auto receiver = make_receiver({{"a"}, integer_type, {0}});
       receiver->build();
       REQUIRE_THROWS_WITH(receiver->relay_from(*failed, 0, 0, 0),
-                          Catch::Contains("requires the source fragment to have run"));
+                          Catch::Contains("source fragment's run() failed"));
       require_receiver_still_open(*receiver);
     }
 
@@ -710,7 +709,7 @@ TEST_CASE_METHOD(fragment_fixture,
       // The poisoned output surfaces the run's cause, not an empty or finished stream.
       REQUIRE_THROWS_WITH(fragment->pull(0), cause);
       REQUIRE_FALSE(fragment->drained(0));
-      REQUIRE_THROWS_WITH(fragment->run(), Catch::Contains("query window is closed"));
+      REQUIRE_THROWS_WITH(fragment->run(), Catch::Contains("previous run() failed"));
       require_window_free();
     }
 
@@ -790,6 +789,238 @@ TEST_CASE_METHOD(fragment_fixture,
 
     con->Rollback();
   } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-10: build() holds no query window, so fragments build up front and run in any order
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-10: fragments built up front run in any order",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const char* query) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(query);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto first  = make_sender("SELECT a FROM (VALUES (1), (2), (3)) t(a)");
+    auto second = make_sender("SELECT a FROM (VALUES (4), (5), (6)) t(a)");
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source =
+      sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    receiver_spec.inputs[0] = stream_input_spec{
+      {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0, 1}};
+    receiver_spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    receiver.build();
+    first->build();
+    second->build();
+    REQUIRE_FALSE(sirius_ctx->is_query_lifecycle_active());
+
+    second->run();
+    first->run();
+    receiver.relay_from(*first, 0, 0, 0);
+    receiver.relay_from(*second, 0, 0, 1);
+    receiver.run();
+    REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-11: other queries between a fragment's build() and run() leave its plan intact
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-11: another fragment and a transparent query between build and run",
+                 "[integration][streaming_fragment]")
+{
+  auto const parquet = lineitem_parquet_path();
+  REQUIRE(fs::exists(parquet));
+  auto const scan =
+    "SELECT l_orderkey FROM read_parquet('" + parquet.string() + "') WHERE l_quantity < 2";
+  auto expected = con->Query("SELECT count(*) FROM (" + scan + ") t");
+  REQUIRE_FALSE(expected->HasError());
+  auto const expected_rows =
+    static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
+  REQUIRE(expected_rows > 0);
+
+  con->BeginTransaction();
+  try {
+    auto make_scan = [&] {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(scan);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto later = make_scan();
+    later->build();
+
+    // A full window in between: its cleanup resets the scan manager and task creator state.
+    auto between = make_scan();
+    between->build();
+    between->run();
+    REQUIRE(drain_row_count(*between, 0) == expected_rows);
+    auto transparent = con->Query("SELECT count(*) FROM nation");
+    REQUIRE_FALSE(transparent->HasError());
+
+    later->run();
+    REQUIRE(drain_row_count(*later, 0) == expected_rows);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-12: run() guards: a stale plan, an open input, and a window already held on this thread
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-12: run() rejects a stale plan and open inputs, build() a held window",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+  auto make_leaf = [&] {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    spec.outputs     = {0};
+    return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+  };
+
+  con->BeginTransaction();
+  try {
+    SECTION("a pin change between build() and run() fails the run")
+    {
+      auto stale = make_leaf();
+      stale->build();
+      sirius_ctx->get_scan_manager().bump_pin_registry_epoch_for_testing();
+      REQUIRE_THROWS_WITH(stale->run(), Catch::Contains("pinned or unpinned"));
+      REQUIRE_THROWS_WITH(stale->pull(0), Catch::Contains("pinned or unpinned"));
+      REQUIRE_THROWS_WITH(stale->run(), Catch::Contains("previous run() failed"));
+
+      auto next = make_leaf();
+      next->build();
+      next->run();
+      REQUIRE(drain_values(*next, 0) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+    }
+
+    SECTION("run() with an input still open throws and leaves the fragment runnable")
+    {
+      auto sender = make_leaf();
+      sender->build();
+      sender->run();
+
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+      spec.inputs[0]   = stream_input_spec{
+          {"a"},
+        sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+          {0, 1}};
+      spec.outputs = {1};
+      streaming_fragment receiver(*con->context, std::move(spec));
+      receiver.build();
+      receiver.relay_from(*sender, 0, 0, 0);
+
+      REQUIRE_THROWS_WITH(receiver.run(), Catch::Contains("still open"));
+      receiver.close_input(0, 1);
+      receiver.run();
+      REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
+    }
+
+    SECTION("build() inside a window already held on this thread throws")
+    {
+      auto fragment = make_leaf();
+      {
+        query_window window(*sirius_ctx, *con->context, "frag12_outer");
+        REQUIRE_THROWS_WITH(fragment->build(), Catch::Contains("nested execution window"));
+      }
+      REQUIRE_THROWS_WITH(fragment->build(), Catch::Contains("cannot be retried"));
+    }
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-13: runs on two connections from two threads serialize on the slot
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-13: fragments on two connections run from two threads",
+                 "[integration][streaming_fragment]")
+{
+  auto other_con =
+    std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+  other_con->context->registered_state->Insert(stream_bind_catalog::kStateKey,
+                                               duckdb::make_shared_ptr<stream_bind_catalog>());
+
+  con->BeginTransaction();
+  other_con->BeginTransaction();
+  try {
+    auto make_leaf = [&](duckdb::Connection& connection, const char* query) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(query);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*connection.context, std::move(spec));
+    };
+    auto first  = make_leaf(*con, "SELECT a FROM (VALUES (1), (2), (3)) t(a)");
+    auto second = make_leaf(*other_con, "SELECT a FROM (VALUES (4), (5), (6)) t(a)");
+    first->build();
+    second->build();
+
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::thread first_run([&] {
+      try {
+        first->run();
+      } catch (...) {
+        first_error = std::current_exception();
+      }
+    });
+    std::thread second_run([&] {
+      try {
+        second->run();
+      } catch (...) {
+        second_error = std::current_exception();
+      }
+    });
+    first_run.join();
+    second_run.join();
+    if (first_error) { std::rethrow_exception(first_error); }
+    if (second_error) { std::rethrow_exception(second_error); }
+
+    REQUIRE(drain_values(*first, 0) == std::vector<std::int32_t>{1, 2, 3});
+    REQUIRE(drain_values(*second, 0) == std::vector<std::int32_t>{4, 5, 6});
+
+    other_con->Rollback();
+    con->Rollback();
+  } catch (...) {
+    other_con->Rollback();
     con->Rollback();
     throw;
   }
