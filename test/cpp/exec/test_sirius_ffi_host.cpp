@@ -17,7 +17,8 @@
 // Public sirius::ffi::Fragment methods only (host process, not GPU host memory).
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, the one-window-at-a-time rule on one and on two
-// threads, build() and run()/drop on different threads, and drop after build(). Spec errors and
+// threads, build() and run()/drop on different threads, drop after build(), a build() that fails
+// after setup, and execute_substrait. Spec errors and
 // failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
@@ -267,4 +268,46 @@ TEST_CASE("FFI drop after build releases the query window", "[isolated_context][
   next->build(plan);
   next->run();
   REQUIRE(next->output_batch_count(0) > 0);
+}
+
+TEST_CASE("FFI a build() that fails after setup releases the window and rolls back",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_host_failed_lowering");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+
+  SECTION("malformed Substrait bytes")
+  {
+    auto failed = sirius::ffi::make_fragment(*ctx);
+    failed->declare_input_column(0, "a", "BIGINT");
+    REQUIRE_THROWS(failed->build("not a substrait plan"));
+  }
+
+  SECTION("a plan that does not read the declared stream")
+  {
+    auto failed = sirius::ffi::make_fragment(*ctx);
+    failed->declare_input_column(0, "a", "BIGINT");
+    REQUIRE_THROWS_WITH(failed->build(local_files_plan(path)),
+                        Catch::Contains("the plan does not read it"));
+  }
+
+  auto next = sirius::ffi::make_fragment(*ctx);
+  next->build(local_files_plan(path));
+  next->run();
+  REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("FFI execute_substrait returns parquet rows", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_host_execute_substrait");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  ArrowArrayStream stream{};
+  ctx->execute_substrait(local_files_plan(path), reinterpret_cast<std::uintptr_t>(&stream));
+  REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
