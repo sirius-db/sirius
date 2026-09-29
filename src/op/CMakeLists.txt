@@ -11,6 +11,7 @@ target_sources(
           scan/duckdb_insert_delta.cpp
           scan/duckdb_mvcc_visibility.cpp
           scan/duckdb_native_metadata.cpp
+          scan/duckdb_native_metadata_cache.cpp
           scan/duckdb_native_decoder.cpp
           scan/dynamic_filter_merge.cpp
           scan/sirius_physical_dynamic_filter.cpp
@@ -33,6 +34,7 @@ target_sources(
           scan/equality_delete_filter.cpp
           scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
+          dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/sirius_dynamic_filter.cpp

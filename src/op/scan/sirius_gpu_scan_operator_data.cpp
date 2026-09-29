@@ -29,6 +29,7 @@
 #include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -97,14 +98,17 @@ membership_snapshot snapshot_membership_probes(sirius::op::dynamic_filter_snapsh
     // assigns this split's chunk to a GPU, so the device isn't known yet
     // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
     // device at probe time, which the task scheduler has already set to
-    // the chunk's assigned GPU by then.
-    snap.probes[i].push_back(
-      {[f = filter, applicable](
-         cudf::column_view const& keys, ::cuda::stream_ref s, rmm::device_async_resource_ref mr) {
-         return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
-       },
-       kind_rank,
-       num_keys});
+    // the chunk's assigned GPU by then. The prior mask is the decoder's already-combined
+    // conjuncts.
+    snap.probes[i].push_back({[f = filter, applicable](cudf::column_view const& keys,
+                                                       std::uint32_t const* prior_mask_words,
+                                                       ::cuda::stream_ref s,
+                                                       rmm::device_async_resource_ref mr) {
+                                return applicable->compute_mask(
+                                  keys, prior_mask_words, /*device_id=*/-1, s, mr);
+                              },
+                              kind_rank,
+                              num_keys});
     ++snap.attached_probes;
   }
   return snap;

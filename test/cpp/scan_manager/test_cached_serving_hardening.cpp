@@ -112,6 +112,7 @@ struct test_env {
 test_env& env()
 {
   static test_env e;
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
   return e;
 }
 
