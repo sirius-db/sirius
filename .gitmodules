@@ -34,4 +34,3 @@
 	path = experimental/doris/doris
 	url = https://github.com/apache/doris
 	shallow = true
-	ignore = dirty
