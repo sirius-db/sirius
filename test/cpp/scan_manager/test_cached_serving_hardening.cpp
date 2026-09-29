@@ -432,6 +432,14 @@ struct scripted_provider final : databatch_provider {
   }
 };
 
+// make_provider_for_pinned_entry takes shared ownership (the provider co-owns the entry it
+// serves). These provider-only tests keep entries on the stack and outlive their providers,
+// so a non-owning alias is safe and avoids restructuring every entry construction.
+std::shared_ptr<pinned_entry const> borrow(pinned_entry const& entry)
+{
+  return {std::shared_ptr<void>{}, &entry};
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -521,8 +529,11 @@ TEST_CASE("drain_cached_provider forwards the mvcc keep-mask and filter flag ont
 
 TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving][scan_manager]")
 {
-  auto& e    = env();
-  auto entry = make_gpu_entry(*e.gpu_space, 3, 4);
+  auto& e = env();
+  // shared_ptr because the provider co-owns the entry it serves — see
+  // make_provider_for_pinned_entry.
+  auto entry =
+    std::make_shared<sirius::scan_manager::pinned_entry>(make_gpu_entry(*e.gpu_space, 3, 4));
   std::vector<std::size_t> cols{0, 1, 2};
 
   SECTION("with a mask set")
@@ -609,16 +620,16 @@ TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask 
 
   std::vector<std::size_t> cols{0, 1};
   sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
-  auto provider =
-    sirius::scan_manager::make_provider_for_pinned_entry(entry,
-                                                         cols,
-                                                         std::move(plan),
-                                                         sirius::telemetry::batch_telemetry_info{},
-                                                         masks,
-                                                         /*delta_splits=*/{},
-                                                         /*normalization_targets=*/{},
-                                                         /*has_physical_overrides=*/false,
-                                                         request);
+  auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+    std::make_shared<pinned_entry const>(std::move(entry)),
+    cols,
+    std::move(plan),
+    sirius::telemetry::batch_telemetry_info{},
+    masks,
+    /*delta_splits=*/{},
+    /*normalization_targets=*/{},
+    /*has_physical_overrides=*/false,
+    request);
 
   struct served_attachments {
     std::shared_ptr<const sirius::decompression_pushdown_scan> scan;
@@ -680,7 +691,7 @@ TEST_CASE("cached provider marks only selected converting columns",
     std::vector<std::size_t> selected{1};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -698,7 +709,7 @@ TEST_CASE("cached provider marks only selected converting columns",
     std::vector<std::size_t> selected{2};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1, 2}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -748,7 +759,7 @@ TEST_CASE("cached provider computes exact conversion-destination bytes per chunk
                       bool has_overrides = false) {
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},
@@ -892,7 +903,7 @@ TEST_CASE("cached provider computes exact conversion-destination bytes per chunk
     std::vector<std::size_t> selected{0, 1};
     sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry,
+      borrow(entry),
       selected,
       std::move(plan),
       sirius::telemetry::batch_telemetry_info{},

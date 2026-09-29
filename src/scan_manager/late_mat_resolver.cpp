@@ -46,8 +46,9 @@ std::int64_t chunk_rows(sirius::device_pin_chunk const& chunk)
 std::optional<late_mat::pinned_table_layout> resolve_pinned_layout(
   late_mat::column_origin const& origin)
 {
-  auto const* entry = origin.resolve();
-  if (entry == nullptr) { return std::nullopt; }
+  auto entry_owner = origin.resolve();
+  if (entry_owner == nullptr) { return std::nullopt; }
+  auto const* entry = entry_owner.get();
   if (entry->tier != cucascade::memory::Tier::GPU) { return std::nullopt; }
 
   std::vector<std::int64_t> rows;
@@ -73,17 +74,18 @@ std::optional<late_mat::pinned_table_layout> resolve_pinned_layout(
   return late_mat::pinned_table_layout::from_batch_rows(std::move(rows), origin.generation);
 }
 
-std::optional<late_mat::pinned_column_view> resolve_pinned_column(
-  late_mat::column_origin const& origin)
+std::optional<resolved_pinned_column> resolve_pinned_column(late_mat::column_origin const& origin)
 {
-  auto const* entry = origin.resolve();
-  if (entry == nullptr) { return std::nullopt; }
+  auto entry_owner = origin.resolve();
+  if (entry_owner == nullptr) { return std::nullopt; }
+  auto const* entry = entry_owner.get();
   if (entry->tier != cucascade::memory::Tier::GPU) { return std::nullopt; }
 
   auto const& names = entry->cache_info.column_names();
   if (origin.column_pos >= names.size()) { return std::nullopt; }
 
-  late_mat::pinned_column_view view;
+  resolved_pinned_column view;
+  view.entry_owner    = std::move(entry_owner);
   view.pin_generation = origin.generation;
 
   if (uses_device_chunks(*entry)) {
