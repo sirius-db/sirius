@@ -172,7 +172,7 @@ struct operator_params {
   bool enable_dynamic_filter = true;
 
   /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
-  bool enable_dynamic_filter_multi_partition = false;
+  bool enable_dynamic_filter_multi_partition = true;
 
   /// Aggregate aligned Bloom-array budget per GPU for accumulation; zero disables accumulation, not
   /// whole-build publication.

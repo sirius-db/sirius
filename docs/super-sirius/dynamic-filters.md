@@ -171,7 +171,7 @@ The settings live under `sirius.operator_params`:
 | Setting | Default | Meaning |
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
-| `enable_dynamic_filter_multi_partition` | `false` | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition |
+| `enable_dynamic_filter_multi_partition` | `true` | Accumulate a Bloom filter for a non-broadcast HASH build with more than one partition |
 | `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Per-GPU cap on one join's accumulated arrays (active keys times the array size rounded up to 256 bytes); zero disables accumulation only |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |

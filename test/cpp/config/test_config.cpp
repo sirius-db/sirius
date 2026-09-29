@@ -708,21 +708,21 @@ TEST_CASE("multi-partition dynamic-filter settings preserve defaults and parse b
     std::ofstream out(path);
     out << "sirius:\n"
            "  operator_params:\n"
-           "    enable_dynamic_filter_multi_partition: true\n"
+           "    enable_dynamic_filter_multi_partition: false\n"
            "    max_dynamic_filter_bloom_bytes_per_gpu: "
         << budget << '\n';
   }
 
   sirius_config cfg;
-  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
   cfg.load_from_file(path);
-  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected_bytes);
   CHECK(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
   cfg.apply_defaults();
-  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
 
   std::error_code ec;
