@@ -2795,7 +2795,10 @@ void test_scan_filter_phase_lanes(rmm::device_async_resource_ref upstream)
   auto const flags = output->view().column(1);
   expect(flags.type().id() == cudf::type_id::BOOL8, "phase lane fixture lost its BOOL8 answer");
   std::vector<std::uint8_t> host(static_cast<std::size_t>(flags.size()));
-  cuda_check(cudaMemcpy(host.data(), flags.head<void>(), host.size(), cudaMemcpyDeviceToHost));
+  // Read on the gather's lane, where the warm-up's released blocks were reused.
+  cuda_check(cudaMemcpyAsync(
+    host.data(), flags.head<void>(), host.size(), cudaMemcpyDeviceToHost, pool.streams[1]));
+  cuda_check(cudaStreamSynchronize(pool.streams[1]));
   expect(std::all_of(host.begin(), host.end(), [](auto flag) { return flag != 0; }),
          "phase lane fixture BOOL8 values");
 }
