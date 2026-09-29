@@ -284,7 +284,7 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
-  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
+  r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
   r.optional("max_concurrent_queries", opt.max_concurrent_queries, yaml::greater_than<int>{0});

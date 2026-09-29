@@ -2134,13 +2134,21 @@ void run_concurrent_admission(std::string const& variant,
       sirius::log::set_sink(previous);
     }
   } restore_sink{previous_sink, gate};
+  std::string aggregate_sql = "SELECT sum(i) FROM concurrent_input";
+  std::string expected_sum  = range_sum(200000);
+  if (variant == "concurrent_many_scans") {
+    aggregate_sql = "SELECT sum(i) FROM (";
+    for (int scan = 0; scan < 12; ++scan) {
+      if (scan) aggregate_sql += " UNION ALL ";
+      aggregate_sql += "SELECT i FROM concurrent_input";
+    }
+    aggregate_sql += ") scans";
+    expected_sum = std::to_string(12ULL * 200000 * 199999 / 2);
+  }
   auto execute = [&](unsigned i) {
     async_query_result result;
-    run_async_scalar_query(*connections[i],
-                           "SELECT sum(i) FROM concurrent_input",
-                           range_sum(200000),
-                           "concurrent aggregate",
-                           result);
+    run_async_scalar_query(
+      *connections[i], aggregate_sql, expected_sum, "concurrent aggregate", result);
     return result.error;
   };
   std::vector<std::future<std::string>> queries;
@@ -2317,6 +2325,10 @@ class QueryLifecycleSlotFixture {
       yaml.insert(
         pos + 7,
         "\n  max_concurrent_queries: " + std::string(variant == "concurrent_4" ? "4" : "2"));
+      if (variant == "concurrent_many_scans") {
+        auto executor = yaml.find("  executor:");
+        yaml.insert(executor + 11, "\n    scan_manager:\n      num_threads: 2");
+      }
       child_config = work_dir / (variant + ".yaml");
       std::ofstream config_out(child_config);
       config_out << yaml;
@@ -2513,7 +2525,8 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                               "concurrent_4",
                               "concurrent_failure",
                               "concurrent_cancel",
-                              "concurrent_maintenance"}) {
+                              "concurrent_maintenance",
+                              "concurrent_many_scans"}) {
     INFO(variant);
     require_variant_succeeds(variant);
   }

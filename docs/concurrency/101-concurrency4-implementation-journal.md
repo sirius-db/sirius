@@ -168,3 +168,18 @@ Implementation entries will be added here as each buildable change is validated 
   A new regression holds 40 exclusive streams simultaneously and verifies that returned streams
   remain usable. Multi-GPU execution remains unqualified on this one-GPU host.
 - Previous commit: `c00a2d8bc`.
+
+### 8. `fix(scan): share prefetch budgets and separate producer capacity`
+
+- One runtime budget accounts for speculative reads across query managers and backend contexts.
+  Oldest-query waiters receive speculative capacity first; demand reads borrow immediately and
+  their debt pauses speculation. Completion tokens retain capacity independently of a canceled
+  subscriber, and events are filtered by query identity.
+- Cache pressure permits one synchronous eviction retry, then abandons speculative work instead
+  of occupying shared capacity indefinitely. Demand reads remain responsible for required data.
+- Metadata producers and blocking coalescers use separate pools. Scan thread counts can now be
+  as low as one; admission determines coalescer capacity. Per-query stop joins both dispatchers.
+- Validation: full build; 30 scan-budget/readahead/concurrent SQL cases, 172 assertions. The new
+  stress child runs two overlapping queries with twelve scan branches each on two producer
+  threads. Pure CPU budget tests also passed AddressSanitizer/UBSan (3 cases, 21 assertions).
+- Previous commit: `6bbdbf9b9`.

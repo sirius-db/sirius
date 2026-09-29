@@ -209,7 +209,7 @@ struct scan_manager_config {
                                        .thread_name_prefix = "scan_manager"};
   /// Number of blocking per-query sequencers reserved alongside the scan workers.
   /// Each sequencer waits for metadata tasks running on the same pool, so the pool
-  /// has num_threads + max_concurrent_queries threads. Raise this with query concurrency.
+  /// uses separate producer and coalescer pools; admission supplies the query limit.
   int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::sirius};

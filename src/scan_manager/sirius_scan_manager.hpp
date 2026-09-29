@@ -961,6 +961,7 @@ class sirius_scan_manager {
     //! request_stop() here stops only this query's work; the shared pool and every other
     //! query keep running.
     std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+    std::unique_ptr<exec::scoped_dispatcher> coalescer_dispatcher;
   };
 
   /// \brief Enqueue @p state's metadata producers before starting its coalescer consumers.
@@ -1027,6 +1028,9 @@ class sirius_scan_manager {
   /// the GPU id set fed to the round-robin scan-balancing strategy.
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
+  exec::static_thread_pool _coalescer_pool;
+  std::shared_ptr<shared_scan_budget> _shared_readahead_budget =
+    std::make_shared<shared_scan_budget>();
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once

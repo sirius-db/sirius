@@ -40,6 +40,7 @@ readahead_scan_manager::~readahead_scan_manager() { stop(); }
 
 void readahead_scan_manager::prepare_for_query(const sirius::planner::query& query)
 {
+  _query_id        = query.query_id();
   auto scan_orders = query.get_scan_operators();
 
   size_t index = 0;
@@ -55,11 +56,12 @@ void readahead_scan_manager::prepare_for_query(const sirius::planner::query& que
 
 void readahead_scan_manager::on_task_deployed(event::event_id_t,
                                               event::timestamp_t,
-                                              query_id_t,
+                                              query_id_t query_id,
                                               std::size_t,
                                               op::SiriusPhysicalOperatorType operator_type,
                                               int) noexcept
 {
+  if (query_id != _query_id) return;
   // A scan deployment means a pipeline thread is about to read for itself, and
   // prefetching alongside it only reorders the device queue.  Anything else is a
   // thread that went to compute instead, which is capacity the executor is not
@@ -68,17 +70,27 @@ void readahead_scan_manager::on_task_deployed(event::event_id_t,
   arm_prefetching();
 }
 
-void readahead_scan_manager::on_memory_downgrade_for_task(
-  event::event_id_t, event::timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept
+void readahead_scan_manager::on_memory_downgrade_for_task(event::event_id_t,
+                                                          event::timestamp_t,
+                                                          query_id_t query_id,
+                                                          std::size_t,
+                                                          int,
+                                                          std::size_t) noexcept
 {
+  if (query_id != _query_id) return;
   // The executor is spilling to make room, so the GPU does no work for the
   // duration and the device's IO path is unambiguously free.
   arm_prefetching();
 }
 
-void readahead_scan_manager::on_wait_for_memory_for_task(
-  event::event_id_t, event::timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept
+void readahead_scan_manager::on_wait_for_memory_for_task(event::event_id_t,
+                                                         event::timestamp_t,
+                                                         query_id_t query_id,
+                                                         std::size_t,
+                                                         int,
+                                                         std::size_t) noexcept
 {
+  if (query_id != _query_id) return;
   // Parked waiting on memory somebody else holds: same idle GPU as a downgrade,
   // arrived at differently.
   arm_prefetching();
@@ -121,7 +133,6 @@ void readahead_scan_manager::stop() noexcept
   // prefetching we are about to tear down -- while the rest of teardown runs.
   event::query_event_subscriber::stop();
   _stop_source.request_stop();
-  _disposable_cv.notify_all();
   // Cuts short the worker's wait for a ticket, which is otherwise the one place
   // teardown can sit for a full timeout -- and a ticket handed out now would
   // only buy a prefetch that is about to be abandoned.
@@ -222,6 +233,16 @@ void readahead_scan_manager::update_scan_state(std::size_t,
     // Nothing was prefetched, so this read is about to do the IO itself. It
     // spends from the same budget the readahead does -- and never waits for it.
     if (!split->take_readahead_ticket()) { return; }
+    if (_shared_budget) {
+      try {
+        auto ticket = acquire_shared_ticket(*task, true);
+        std::lock_guard lock(_demand_mutex);
+        _demand_tickets.emplace(task, std::move(ticket));
+      } catch (...) {
+        split->give_back_readahead_ticket();
+        throw;
+      }
+    }
     _counters.cold_read_tickets.fetch_add(1, std::memory_order_relaxed);
     if (_gatekeeper.acquire_or_borrow()) {
       _counters.borrowed.fetch_add(1, std::memory_order_relaxed);
@@ -231,12 +252,11 @@ void readahead_scan_manager::update_scan_state(std::size_t,
 
   if (stage == io::cache::scan_stage::disposed) {
     // The read is over, so give the ticket back -- paying down any debt first.
-    if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
-    {
-      std::lock_guard lock(_disposable_mutex);
-      ++_disposable_generation;
+    if (split->give_back_readahead_ticket()) {
+      _gatekeeper.release();
+      std::lock_guard lock(_demand_mutex);
+      _demand_tickets.erase(task);
     }
-    _disposable_cv.notify_all();
   }
 }
 
@@ -315,12 +335,20 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
   // Bound the wait for a disposal notification. The timeout is also a recovery
   // path for a coalesced or missed notification.
-  constexpr auto k_memory_retry = std::chrono::milliseconds{25};
 
   // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
   // the prefetch was issued -- which is also whether the completion has taken
   // ownership of the slot.
   auto try_issue = [&](prefetch_candidate const& candidate) {
+    shared_scan_budget::token shared_ticket;
+    try {
+      if (_shared_budget) {
+        shared_ticket = acquire_shared_ticket(*candidate.task, false);
+        if (!shared_ticket) return false;
+      }
+    } catch (...) {
+      return false;
+    }
     bool evict_on_failure = false;
     while (!st.stop_requested()) {
       if (candidate.task->has_fallen_behind()) {
@@ -328,11 +356,6 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         return false;
       }
 
-      std::uint64_t disposal_generation = 0;
-      {
-        std::lock_guard lock(_disposable_mutex);
-        disposal_generation = _disposable_generation;
-      }
       bool const attempted_eviction = evict_on_failure;
       op::scan::scan_info::prepare_outcome prep;
       // This runs on a jthread, so an escaping exception is std::terminate for
@@ -346,7 +369,8 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       try {
         prep = candidate.task->prepare_for_prefetching(evict_on_failure);
         if (prep.ready()) {
-          candidate.task->prefetch([weak  = weak_from_this(),
+          candidate.task->prefetch([shared_ticket,
+                                    weak  = weak_from_this(),
                                     op_id = candidate.operator_id,
                                     split = std::weak_ptr{candidate.task}](
                                      op::scan::scan_info::prefetch_outcome out) noexcept {
@@ -384,15 +408,9 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
       evict_on_failure = true;
       // The first failure immediately advances to a synchronous-eviction
-      // attempt. Only a failed attempt that already processed eviction waits
-      // for another scan to become disposable (or the bounded timer).
+      // attempt. Abandon speculation if that also fails, releasing shared capacity.
       if (!attempted_eviction) { continue; }
-
-      std::unique_lock lock(_disposable_mutex);
-      _disposable_cv.wait_for(lock, k_memory_retry, [&] {
-        return st.stop_requested() || candidate.task->has_fallen_behind() ||
-               _disposable_generation != disposal_generation;
-      });
+      return false;  // Demand and another query get the budget after one failed eviction attempt.
     }
     // Stopped mid-preparation: the pool never satisfied it.
     _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
@@ -429,6 +447,23 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
     _counters.candidates_taken.fetch_add(1, std::memory_order_relaxed);
     if (!try_issue(candidate)) { _gatekeeper.release(); }
   }
+}
+
+shared_scan_budget::token readahead_scan_manager::acquire_shared_ticket(
+  const op::scan::scan_info& task, bool demand)
+{
+  std::vector<shared_scan_budget::request> requests;
+  for (auto const& source : task.datasources()) {
+    auto backend = source->io_ctx();
+    if (!backend || !backend->can_use_prefetching_cache()) continue;
+    auto limit = _budget_override.value_or(backend->n_max_concurrent_scans());
+    if (!limit) {
+      if (!demand) return {};
+      continue;
+    }
+    requests.push_back({reinterpret_cast<std::uintptr_t>(backend.get()), limit});
+  }
+  return _shared_budget->acquire(std::move(requests), _query_id, _stop_source.get_token(), demand);
 }
 
 void readahead_scan_manager::arm_prefetching()
