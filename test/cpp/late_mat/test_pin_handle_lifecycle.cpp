@@ -108,7 +108,8 @@ column_origin capture_origin(sirius_scan_manager const& manager)
 
 std::shared_ptr<pinned_entry const> capture_entry_owner(sirius_scan_manager const& manager)
 {
-  return manager.find_pinned_entry_for_duckdb_table("", "", kTable);
+  return manager.find_pinned_entry_for_duckdb_table(
+    "", "", kTable, sirius::test::test_table_identity(42));
 }
 
 std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()

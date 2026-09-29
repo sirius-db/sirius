@@ -190,8 +190,8 @@ TEST_CASE("split pin: a request only the wide entry covers lands on the wide ent
   split_pin_fixture fixture;
 
   auto const wide_only = request({2, 3});
-  auto const chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &wide_only);
+  auto const chosen    = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &wide_only);
   REQUIRE(chosen != nullptr);
   REQUIRE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(wide_only).empty());
@@ -203,8 +203,8 @@ TEST_CASE("split pin: a request only the split entry covers lands on the split e
   split_pin_fixture fixture;
 
   auto const split_only = request({1, 8});
-  auto const chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &split_only);
+  auto const chosen     = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &split_only);
   REQUIRE(chosen != nullptr);
   REQUIRE_FALSE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(split_only).empty());
@@ -216,9 +216,9 @@ TEST_CASE("split pin: a request both entries cover returns a serving entry",
   split_pin_fixture fixture;
 
   // {c0, c1} is a subset of both entries; either answer is valid if it serves.
-  auto const both = request({0, 1});
-  auto const chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &both);
+  auto const both   = request({0, 1});
+  auto const chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &both);
   REQUIRE(chosen != nullptr);
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(both).empty());
 }
@@ -230,8 +230,8 @@ TEST_CASE("split pin: no covering entry falls back to a non-null identity match"
 
   // No entry covers {c1, c7, c8}; the guard declines the scan on the fallback.
   auto const uncovered = request({1, 7, 8});
-  auto const chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &uncovered);
+  auto const chosen    = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &uncovered);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
   REQUIRE(chosen->cache_info.column_projection_for(uncovered).empty());
@@ -247,8 +247,8 @@ TEST_CASE("split pin: null or empty requested ids keep the first-identity-match 
 {
   split_pin_fixture fixture;
 
-  auto chosen =
-    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), nullptr);
+  auto chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), nullptr);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
 
@@ -271,9 +271,14 @@ TEST_CASE("type match: a covering entry whose recorded types no longer match los
   auto const matching_name = GENERATE(std::string{"orders"}, std::string{"main.orders"});
   type_match_fixture fixture{matching_name};
 
-  auto const both   = request({0, 1});
-  auto const chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
-    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid), &both, &fixture.returned_types);
+  auto const both = request({0, 1});
+  auto const chosen =
+    fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog,
+                                                       kSchema,
+                                                       kTable,
+                                                       sirius::test::test_table_identity(kTableOid),
+                                                       &both,
+                                                       &fixture.returned_types);
   REQUIRE(type_match_fixture::types_match(chosen.get()));
 }
 
