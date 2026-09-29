@@ -36,6 +36,7 @@
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,7 +52,6 @@ class sirius_physical_table_scan;
 namespace sirius {
 
 struct operator_params;
-class sirius_interface;
 
 class sirius_engine {
   friend class pipeline::sirius_pipeline_build_state;
@@ -59,16 +59,17 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context,
-                         sirius_interface& sirius_iface,
-                         sirius::query_id_t query_id);
+  /// @p query_label and @p session_label name the query and its session in telemetry.
+  sirius_engine(duckdb::ClientContext& context,
+                sirius::query_id_t query_id,
+                const std::optional<std::string>& query_label   = std::nullopt,
+                const std::optional<std::string>& session_label = std::nullopt);
   ~sirius_engine();
 
   /// \brief The query_id this engine belongs to.
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
-  sirius_interface& sirius_iface;
   duckdb::unique_ptr<op::sirius_physical_operator> sirius_owned_plan;
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 

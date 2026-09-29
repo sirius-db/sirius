@@ -69,7 +69,6 @@ using namespace duckdb;
 
 // sirius types
 using sirius::sirius_engine;
-using sirius::sirius_interface;
 using sirius::sirius_prepared_statement_data;
 using sirius::op::sirius_physical_materialized_collector;
 using sirius::op::sirius_physical_operator;
@@ -462,7 +461,6 @@ struct engine_test_state {
   std::unique_ptr<scoped_temp_db_path> db_path;
   duckdb::unique_ptr<DuckDB> db;
   duckdb::unique_ptr<Connection> con;
-  duckdb::unique_ptr<sirius_interface> iface;
   // Owns the physical plan and its DuckDB RowGroups. Must destruct after `engine` (which
   // references the plan) but before `db` (RowGroups free blocks via db's buffer manager).
   duckdb::shared_ptr<sirius_prepared_statement_data> prepared;
@@ -492,10 +490,9 @@ engine_test_state setup_and_initialize(const std::string& query)
   auto gpu_plan = generate_gpu_plan(*state.con, query, state.prepared);
   REQUIRE(gpu_plan != nullptr);
 
-  state.iface      = duckdb::make_uniq<sirius_interface>(*state.con->context);
   state.test_query = std::make_unique<sirius::test::scoped_test_query>(*state.con->context);
-  state.engine     = duckdb::make_uniq<sirius_engine>(
-    *state.con->context, *state.iface, state.test_query->query_id());
+  state.engine =
+    duckdb::make_uniq<sirius_engine>(*state.con->context, state.test_query->query_id());
   state.engine->initialize(std::move(gpu_plan));
 
   return state;

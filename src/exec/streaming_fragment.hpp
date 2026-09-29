@@ -38,7 +38,6 @@ class QueryResult;
 
 namespace sirius {
 class sirius_engine;
-class sirius_interface;
 class sirius_prepared_statement_data;
 }  // namespace sirius
 
@@ -168,7 +167,6 @@ class streaming_fragment {
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _output_repos;
   duckdb::shared_ptr<sirius::sirius_prepared_statement_data> _result_plan;
   duckdb::unique_ptr<duckdb::QueryResult> _result;
-  std::unique_ptr<sirius::sirius_interface> _iface;
   std::unique_ptr<sirius::sirius_engine> _engine;
   stream_session _session;
   struct query_window;

@@ -22,7 +22,7 @@
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
-#include "sirius_interface.hpp"
+#include "sirius_interface.hpp"  // sirius_prepared_statement_data
 
 #include <cudf/types.hpp>
 
@@ -227,10 +227,8 @@ void streaming_fragment::build_streaming_sink(
   }
   sink->children.push_back(std::move(subtree));
 
-  _iface = std::make_unique<sirius::sirius_interface>(
-    _context, std::optional<std::string>(kFragmentQueryLabel));
-  _engine =
-    std::make_unique<sirius::sirius_engine>(_context, *_iface, _lifecycle->scope.query_id());
+  _engine = std::make_unique<sirius::sirius_engine>(
+    _context, _lifecycle->scope.query_id(), kFragmentQueryLabel);
   _engine->initialize(std::move(sink));
 
   auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
@@ -258,10 +256,8 @@ void streaming_fragment::build_result_collector(
     duckdb::make_uniq_base<op::sirius_physical_result_collector,
                            op::sirius_physical_materialized_collector>(*_result_plan, _context);
 
-  _iface = std::make_unique<sirius::sirius_interface>(
-    _context, std::optional<std::string>(kFragmentQueryLabel));
-  _engine =
-    std::make_unique<sirius::sirius_engine>(_context, *_iface, _lifecycle->scope.query_id());
+  _engine = std::make_unique<sirius::sirius_engine>(
+    _context, _lifecycle->scope.query_id(), kFragmentQueryLabel);
   _engine->initialize(std::move(collector));
   register_sources();
 }
