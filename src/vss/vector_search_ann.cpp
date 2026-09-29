@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
+#include "../cuda/vss/ivf_flat_index.hpp"
 #include "duckdb/common/exception.hpp"
 #include "sirius_context.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
-#include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search_internal.hpp"
 

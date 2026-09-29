@@ -831,7 +831,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalComparisonJoin& op)
       // return plan_asof_join(op);
       throw duckdb::NotImplementedException("Asof join not supported in GPU");
     case duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN: return plan_comparison_join(op);
-    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN: return plan_delim_join(op);
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN:
+      if (auto plan = try_plan_vector_perrow_topk_join(op)) { return plan; }
+      return plan_delim_join(op);
     default:
       throw duckdb::InternalException("Unrecognized operator type for LogicalComparisonJoin");
   }

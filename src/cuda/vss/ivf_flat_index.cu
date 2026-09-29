@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "vss/cudf_raft_interop.hpp"
-#include "vss/ivf_flat_index.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
+#include "ivf_flat_index.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>

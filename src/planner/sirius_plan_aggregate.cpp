@@ -38,6 +38,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_vector_threshold_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius/exception.hpp"
@@ -695,6 +696,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);
+
+  // An ungrouped count_star directly over the vector threshold join reads only the row count, so
+  // let the join skip gathering the vector columns.
+  if (plan->type == sirius::op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN &&
+      op.groups.empty() && op.grouping_sets.size() <= 1 && !op.expressions.empty()) {
+    bool row_count_only = true;
+    for (auto& e : op.expressions) {
+      if (e->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
+        row_count_only = false;
+        break;
+      }
+      auto& aggr = e->Cast<duckdb::BoundAggregateExpression>();
+      if (!aggr.children.empty() || aggr.filter) {
+        row_count_only = false;
+        break;
+      }
+    }
+    if (row_count_only) {
+      static_cast<sirius::op::sirius_physical_vector_threshold_join&>(*plan)
+        .set_output_row_count_only();
+    }
+  }
 
   plan = extract_aggregate_expressions(
     context, std::move(plan), op.expressions, op.groups, op.grouping_sets);

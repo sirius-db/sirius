@@ -41,6 +41,7 @@ class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
+class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalDelimGet;
@@ -118,6 +119,7 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -200,6 +202,14 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
+  //! Per-row top-k vector join (a decorrelated LATERAL ORDER BY dist LIMIT k); nullptr if the
+  //! delim join is not that shape.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_vector_perrow_topk_join(
+    duckdb::LogicalComparisonJoin& op);
+  //! Global top-k vector join (`FROM l, r ORDER BY dist LIMIT k`): the plan for the TOP_N's input
+  //! (the join plus its projection), or nullptr if the TOP_N is not that shape.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_vector_global_topk_join(
+    duckdb::LogicalTopN& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);

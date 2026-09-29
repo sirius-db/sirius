@@ -76,6 +76,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_union_all.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_gpu_execution_vector_threshold_join.cpp
+    test/cpp/integration/test_gpu_execution_vector_topk_join.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -171,6 +173,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
+    test/cpp/operator/test_physical_vector_topk_join.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
     test/cpp/operator/test_dynamic_filter_probe.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
