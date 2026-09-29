@@ -4,6 +4,7 @@
 #include "test_utils.hpp"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -311,6 +312,46 @@ void bool8_delivery(simpatico::stream_pool& pool,
     expect((flags[i] != 0) == (i % 97 != 0), "unselected BOOL8 predicate value");
 }
 
+// Row selection has no null model: a null-masked `full` column declines the batch after its decode
+// discovers the nulls, and the plain decode keeps the validity.
+void nullable_full_route_declines(simpatico::stream_pool& pool,
+                                  ::cuda::stream_ref stream,
+                                  rmm::device_async_resource_ref mr)
+{
+  auto compressed = simpatico::compress_with_plan(
+    cudf::table_view{{sequence(0, stream, mr)->view()}}, "input -> bitpack\n", stream, mr);
+  auto nullable = sequence(10000, stream, mr);
+  nullable->set_null_mask(cudf::create_null_mask(row_count, cudf::mask_state::ALL_VALID), 0);
+  cudf::set_null_mask(nullable->mutable_view().null_mask(), 3, 4, false);
+  nullable->set_null_count(1);
+  // The compressor's null-input policy is separate; an identity leaf stores the nullable column.
+  auto tree = simpatico::plan_tree_from_dsl("input -> identity\n");
+  expect(tree.has_value(), "nullable fixture plan");
+  tree->nodes[1].rep = std::make_unique<simpatico::identity_compressed_representation>(
+    std::make_unique<cudf::column>(nullable->view(), stream, mr));
+  simpatico::compressed_column column;
+  column.dtype     = nullable->type();
+  column.num_rows  = row_count;
+  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
+  compressed.columns.push_back(std::move(column));
+  stream.sync();
+
+  std::array<std::size_t, 2> selected{0, 1};
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::bitpack_mask, sc::decode_route::full};
+  request.filters.push_back({0, {0, 19}});
+  sc::scan_filter_result result;
+  auto output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+  expect(!result.applied && result.status == sc::scan_filter_status::refused,
+         "a null-masked full route declines the selection");
+  expect(output->num_rows() == row_count && output->view().column(1).null_count() == 1,
+         "the declined batch decodes plainly with its validity");
+  std::vector<std::int32_t> all(row_count);
+  std::iota(all.begin(), all.end(), 0);
+  verify_values(output->view(), all, stream);
+}
+
 // Borrowed lanes may repeat and may include the output stream, as lanes taken from a shared pool
 // do. The phase joins, the index waits, and the cleanup waits must stay correct; results must match
 // the stream_pool overloads; and the call must leave every lane usable.
@@ -521,6 +562,7 @@ int main()
     numeric_sources(pool, stream.view(), resource);
     bool8_delivery(pool, stream.view(), resource);
     dict_codes_gather(pool, stream.view(), resource);
+    nullable_full_route_declines(pool, stream.view(), resource);
     aliased_borrowed_lanes(pool, stream.view(), resource);
     check(pool.sync_all());
     stream.synchronize();

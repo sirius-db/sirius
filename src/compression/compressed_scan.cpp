@@ -629,10 +629,16 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
   // stream: a lane that is also a memory prefetcher worker's stream charges the decode's
   // allocations to that worker's reservation, so compressed scans are not accounted correctly in
   // that mode.
-  // cuda::stream_ref has no default constructor, so the lanes are built in place.
-  auto const lanes = [&]<std::size_t... I>(std::index_sequence<I...>) {
-    return std::array<::cuda::stream_ref, kDecodeStreams>{((void)I, space.acquire_stream())...};
-  }(std::make_index_sequence<kDecodeStreams>{});
+  // One lane per selected column, up to kDecodeStreams: a lane without a column would only add
+  // another shared stream to the decode's waits. cuda::stream_ref has no default constructor, so
+  // the unused tail of the array repeats the first lane and is never passed on.
+  auto const lane_count = std::clamp<std::size_t>(selected.size(), 1, kDecodeStreams);
+  auto const first_lane = space.acquire_stream();
+  auto const all_lanes  = [&]<std::size_t... I>(std::index_sequence<I...>) {
+    return std::array<::cuda::stream_ref, kDecodeStreams>{
+      first_lane, (I + 1 < lane_count ? space.acquire_stream() : first_lane)...};
+  }(std::make_index_sequence<kDecodeStreams - 1>{});
+  std::span<const ::cuda::stream_ref> const lanes{all_lanes.data(), lane_count};
   if (!request.empty() && !request.row_selection_disabled) {
     out.table =
       decompress_with_pushdown(chunk, selected, request, keep_mask, lanes, stream, mr, out.outcome);

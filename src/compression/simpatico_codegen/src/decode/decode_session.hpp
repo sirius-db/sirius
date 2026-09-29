@@ -194,7 +194,8 @@ class decode_session final {
    * destruction. The resource and streams must outlive allocations that use them, including
    * returned columns.
    *
-   * @param streams Nonempty list of borrowed streams, assigned to requests in rotation
+   * @param streams Nonempty list of borrowed streams, assigned to requests in rotation (see
+   * next_stream())
    * @param mr Borrowed resource for device allocations; it must honor the stream-ordered
    * deallocation contract of `device_async_resource_ref` (a synchronous resource may block on
    * release)
@@ -232,13 +233,20 @@ class decode_session final {
   /**
    * @brief Complete submitted work and transfer decoded columns to the caller in request order.
    *
-   * Once any request has been submitted, completion includes other work queued on the supplied
-   * streams. An empty session performs no CUDA work. Success or failure closes the session: neither
-   * append() nor finish() may be called again. A failed call returns no partial results.
+   * Waits once for each distinct stream that received a request, which also covers other work
+   * queued there; a supplied stream that received no request is not waited for. An empty session
+   * performs no CUDA work. Success or failure closes the session: neither append() nor finish() may
+   * be called again. A failed call returns no partial results.
    *
    * @return Completed columns, excluding mask-only requests
    */
   std::vector<std::unique_ptr<cudf::column>> finish();
+
+  /**
+   * @brief The stream the next append() assigns its request to, so a caller can allocate storage
+   * that request writes, or order it after other work, on that stream.
+   */
+  [[nodiscard]] ::cuda::stream_ref next_stream() const noexcept;
 
  private:
   friend struct decode_session_test_access;
@@ -268,6 +276,15 @@ mask_source_status decode_one(mask_decode_request const& request,
 [[nodiscard]] std::unique_ptr<cudf::column> decode_request(column_decode_request const& request,
                                                            decode_frame& frame);
 mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame);
+
+/**
+ * @brief Thrown by a selected decode whose full-width value column is null-masked. Row selection
+ * has no null model, so a caller may decline the selection instead of failing.
+ */
+class unsupported_nullable_selection final : public std::invalid_argument {
+ public:
+  using std::invalid_argument::invalid_argument;
+};
 [[nodiscard]] std::unique_ptr<cudf::column> decode_standalone(compressed_representation const& rep,
                                                               decode_frame& frame);
 

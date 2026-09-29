@@ -151,7 +151,8 @@ void expect_failure(F&& action, char const* message)
 
 class event_markers {
  public:
-  explicit event_markers(simpatico::stream_pool const& pool) : streams_(pool.streams)
+  explicit event_markers(simpatico::stream_pool const& pool) : event_markers(pool.streams) {}
+  explicit event_markers(std::vector<cudaStream_t> streams) : streams_(std::move(streams))
   {
     events_.resize(streams_.size(), nullptr);
     try {
@@ -1811,14 +1812,14 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
   simpatico::stream_pool pool;
   expect(pool.init(3), "stream failure pool init");
   checked_resource resource(upstream);
-  // The third supplied handle receives no request in the finish-failure case, but still has work.
+  // The third supplied handle receives no request, so completion leaves its work alone.
   std::array const streams{::cuda::stream_ref{pool.streams[0]},
                            ::cuda::stream_ref{pool.streams[1]},
                            ::cuda::stream_ref{pool.streams[0]},
                            ::cuda::stream_ref{pool.streams[1]},
                            ::cuda::stream_ref{pool.streams[2]}};
   for (auto operation : {stream_fault::operation::query, stream_fault::operation::synchronize}) {
-    event_markers markers(pool);
+    event_markers markers({pool.streams[0], pool.streams[1]});
     stream_gate first_gate(pool.streams[0]);
     stream_gate second_gate(pool.streams[1]);
     stream_gate external_gate(pool.streams[2]);
@@ -1842,14 +1843,17 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
       }
       expect(stream_fault::next == stream_fault::operation::none,
              "stream failure injection was not consumed");
-      for (auto stream : pool.streams)
-        expect(observed.count(stream).queries >= 1,
-               "stream failure cleanup skipped a supplied physical stream");
+      for (std::size_t lane = 0; lane < 2; ++lane)
+        expect(observed.count(pool.streams[lane]).queries >= 1,
+               "stream failure cleanup skipped a lane that received a request");
+      auto const unused = observed.count(pool.streams[2]);
+      expect(unused.queries == 0 && unused.synchronizations == 0,
+             "completion waited for a supplied stream that received no request");
     }
     expect(propagated, "stream completion failure lost the original CUDA error");
     first_gate.expect_completed("stream failure escaped before the first lane completed");
     second_gate.expect_completed("stream failure escaped before the second lane completed");
-    expect(markers.complete(), "stream failure escaped before all supplied lanes completed");
+    expect(markers.complete(), "stream failure escaped before its request lanes completed");
     first_gate.expect_if_armed(!resource.observations->early_release,
                                "stream failure released an output before all lanes completed");
     expect_failure([&] { session->finish(); }, "failed session published partial output");
@@ -2807,10 +2811,10 @@ void test_resources_and_failures(rmm::device_async_resource_ref upstream)
     explicit_resource.observations->fail_at         = fail_at;
     explicit_resource.observations->failure_markers = &markers;
     bool injected                                   = false;
-    // Fail the first allocation before any codec work, then also fail cleanup's query on
-    // another supplied lane. The original allocation exception must retain priority.
+    // Fail the first allocation before any codec work, then also fail cleanup's query on the lane
+    // that request was assigned. The original allocation exception must retain priority.
     std::optional<stream_failure_scope> cleanup_failure;
-    if (fail_at == 0) cleanup_failure.emplace(stream_fault::operation::query, pool.streams[1]);
+    if (fail_at == 0) cleanup_failure.emplace(stream_fault::operation::query, pool.streams[0]);
     stream_observation_scope observed;
     try {
       (void)simpatico::decompress(compressed, pool, explicit_resource);
@@ -2823,9 +2827,8 @@ void test_resources_and_failures(rmm::device_async_resource_ref upstream)
     if (cleanup_failure) {
       expect(stream_fault::next == stream_fault::operation::none,
              "allocation cleanup did not consume its injected stream error");
-      for (auto handle : pool.streams)
-        expect(observed.count(handle).queries > 0,
-               "allocation cleanup skipped a supplied lane after a stream error");
+      expect(observed.count(pool.streams[0]).queries > 0,
+             "allocation cleanup skipped its request's lane after a stream error");
       cleanup_failure.reset();
     }
     // Query before any test-side synchronization or verification copies.

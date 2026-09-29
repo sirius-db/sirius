@@ -14,6 +14,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -317,93 +318,6 @@ std::vector<std::size_t> all_columns(compressed_table const& table)
 // Both waves submit typed session requests through the same plan interpreter.
 // probe_column describes row-route semantics, never asynchronous eligibility.
 
-// The calling thread's free list of CUDA events for one device, kept for the thread's lifetime
-// like thread_device_stream_pool's streams (events are device-bound the same way). Creating and
-// destroying events per chunk is not free under concurrency: those calls take a driver lock that
-// another thread's synchronous pageable copy holds for the whole of its stream wait, so a pipeline
-// thread could stall for milliseconds on a plain cudaEventCreate. Recycling makes the phase's event
-// traffic record/wait only. Thread-exit destruction may run after context teardown, so the
-// destructor ignores cudaEventDestroy errors, as stream_pool::shutdown does.
-class event_pool {
- public:
-  static event_pool& for_current_device()
-  {
-    thread_local std::map<int, event_pool> pools;
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess)
-      throw plan_error("filtered decode: cannot query the current device");
-    return pools[device];
-  }
-
-  event_pool()                             = default;
-  event_pool(event_pool const&)            = delete;
-  event_pool& operator=(event_pool const&) = delete;
-  event_pool(event_pool&&)                 = delete;
-  event_pool& operator=(event_pool&&)      = delete;
-  ~event_pool()
-  {
-    for (auto ev : free_)
-      (void)cudaEventDestroy(ev);
-  }
-
-  cudaEvent_t acquire()
-  {
-    if (!free_.empty()) {
-      auto ev = free_.back();
-      free_.pop_back();
-      return ev;
-    }
-    // Reserve the return slot before creating the event so release() never allocates.
-    free_.reserve(owned_ + 1);
-    cudaEvent_t ev = nullptr;
-    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
-      throw plan_error("filtered decode: cudaEventCreate failed");
-    ++owned_;
-    return ev;
-  }
-
-  // Safe as soon as every cudaStreamWaitEvent consuming the event has been ENQUEUED: a wait
-  // captures the recorded state at the call, so a later re-record cannot alter it. The phase
-  // enqueues all of its waits before it returns, and the next chunk on this thread starts only
-  // after that.
-  void release(cudaEvent_t ev) noexcept { free_.push_back(ev); }
-
- private:
-  std::vector<cudaEvent_t> free_;
-  std::size_t owned_ = 0;
-};
-
-// The events one phase draws for its cross-stream joins, returned to the thread's pool when the
-// phase ends; on the failure path that is after the catch's synchronization, since the set is
-// declared before the try. The pool is resolved on first use so that constructing the set makes no
-// CUDA call, and make() is the only writer, so a non-null event always has a pool to return to.
-class event_set {
- public:
-  event_set()                            = default;
-  event_set(event_set const&)            = delete;
-  event_set& operator=(event_set const&) = delete;
-  event_set(event_set&&)                 = delete;
-  event_set& operator=(event_set&&)      = delete;
-  ~event_set()
-  {
-    for (auto ev : events_)
-      if (ev) pool_->release(ev);
-  }
-
-  cudaEvent_t make()
-  {
-    if (!pool_) pool_ = &event_pool::for_current_device();
-    // Register the slot first: growing host storage must not leak an acquired event.
-    events_.push_back(nullptr);
-    events_.back() = pool_->acquire();
-    return events_.back();
-  }
-
- private:
-  event_pool* pool_ = nullptr;
-  std::vector<cudaEvent_t> events_;
-};
-
 // A semantic precondition or completed selectivity decision may decline this
 // optimization. Execution failures drain the phase and propagate unchanged;
 // allocation, compilation, and device errors never become ordinary-decode retries.
@@ -561,17 +475,13 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   }
 
   // Declared before the try so the mid-flight catch can synchronize the streams BEFORE these
-  // buffers/events unwind (their stream-ordered frees must not race the combine's cross-stream
-  // reads).
+  // buffers unwind (their stream-ordered frees must not race the combine's cross-stream reads).
   std::vector<rmm::device_buffer> per_filter;
-  // Declared before the try, like per_filter, so the catch's synchronization precedes its
-  // destruction.
   rmm::device_buffer keep_mask_dev;
-  // Full-width BOOL8 per bool8 source, retained for the wave-2 dual-delivery gather; declared
-  // before the try so the catch's synchronization runs before any cross-stream consumer unwinds
-  // them.
+  // Full-width BOOL8 per bool8 source, retained for the wave-2 dual-delivery gather on the wave-1
+  // lane that allocated it.
   std::vector<std::unique_ptr<cudf::column>> bool8_full(request.bool8_filters.size());
-  event_set join_events;
+  std::vector<::cuda::stream_ref> bool8_lanes;
   // Probes that declined this chunk and were stood down to the AND identity.
   size_t declined_members = 0;
   auto reset_result       = [&](sc::scan_filter_status status) {
@@ -582,66 +492,63 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   try {
     int64_t const nc          = sc::selection_mask::ChunksFor(num_rows);
     int64_t const alloc_words = sc::selection_mask::AllocWordsFor(num_rows);
-    size_t const n_streams    = streams.size();
+    auto const mask_bytes     = static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t);
     ::cuda::stream_ref s0     = streams.front();
+    auto const same_stream    = [](::cuda::stream_ref stream) {
+      return [stream](::cuda::stream_ref other) { return other.get() == stream.get(); };
+    };
 
-    result.num_rows = num_rows;
-    result.mask_words =
-      rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+    result.num_rows   = num_rows;
+    result.mask_words = rmm::device_buffer(mask_bytes, s0, mr);
     result.chunk_offsets =
       rmm::device_buffer(static_cast<std::size_t>(nc + 1) * sizeof(std::uint32_t), s0, mr);
     auto* combined = static_cast<std::uint32_t*>(result.mask_words.data());
 
-    // ── Wave 1: mask sources round-robin on the pool streams. Source 0 writes
-    // straight into the combined buffer on stream 0 (its allocation stream);
-    // sources 1..k-1 into per-filter buffers allocated on the stream that
-    // writes them. Range conjuncts run the range ballot; equality conjuncts run
-    // the shipped BOOL8 pushdown then the packed-mask adapter.
+    // ── Wave 1: one mask source per request, on the session's lanes in rotation. The first
+    // request's lane is s0, so source 0 writes straight into the combined buffer (allocated on s0);
+    // later sources write per-filter buffers allocated on the lane their request is assigned. Range
+    // conjuncts run the range ballot; equality conjuncts run the BOOL8 pushdown and ballot it.
     per_filter.reserve(k_total > 1 ? k_total - 1 : 0);
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
-    mask_ptrs.push_back(combined);
-
+    // Lanes other than s0 that produced a source, which the combine on s0 must wait for.
+    std::vector<rmm::cuda_stream_view> producer_lanes;
     decode_session wave1{streams, mr};
-    auto submit_mask_source = [&](size_t source, auto&& produce) {
-      auto stream                = streams[source % n_streams];
-      std::uint32_t* destination = combined;
-      if (source > 0) {
-        per_filter.emplace_back(
-          static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), stream, mr);
-        destination = static_cast<std::uint32_t*>(per_filter.back().data());
-        mask_ptrs.push_back(destination);
-      }
-      produce(mask_destination{destination, num_rows});
+    auto next_destination = [&] {
+      auto const lane = wave1.next_stream();
+      if (lane.get() != s0.get() &&
+          std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](auto other) {
+            return other.value() == lane.get();
+          }))
+        producer_lanes.emplace_back(lane);
+      auto* words =
+        mask_ptrs.empty()
+          ? combined
+          : static_cast<std::uint32_t*>(per_filter.emplace_back(mask_bytes, lane, mr).data());
+      mask_ptrs.push_back(words);
+      return mask_destination{words, num_rows};
     };
 
-    for (size_t f = 0; f < k_range; ++f) {
-      submit_mask_source(f, [&](mask_destination destination) {
-        auto const& directive = request.filters[f];
-        auto const& column    = table.columns[selected[directive.column]];
-        if (wave1.append(mask_decode_request{*column.plan_tree, directive.pred, destination}) !=
-            mask_source_status::ACCEPTED)
-          throw plan_error("filtered decode: preflighted range source declined");
-      });
+    for (auto const& directive : request.filters) {
+      auto const& column = table.columns[selected[directive.column]];
+      if (wave1.append(mask_decode_request{
+            *column.plan_tree, directive.pred, next_destination()}) != mask_source_status::ACCEPTED)
+        throw plan_error("filtered decode: preflighted range source declined");
     }
-    for (size_t b = 0; b < k_bool8; ++b) {
-      submit_mask_source(k_range + b, [&](mask_destination destination) {
-        auto const& directive = request.bool8_filters[b];
-        auto const& column    = table.columns[selected[directive.column]];
-        decode_predicate predicate;
-        predicate.equals_any = directive.equals_any;
-        wave1.append(column_decode_request{
-          std::cref(*column.plan_tree), predicate_result{std::move(predicate), destination}, {}});
-      });
+    for (auto const& directive : request.bool8_filters) {
+      auto const& column = table.columns[selected[directive.column]];
+      bool8_lanes.push_back(wave1.next_stream());
+      wave1.append(column_decode_request{
+        std::cref(*column.plan_tree),
+        predicate_result{decode_predicate{directive.equals_any}, next_destination()},
+        {}});
     }
     for (size_t m = 0; m < k_member; ++m) {
-      submit_mask_source(k_range + k_bool8 + m, [&](mask_destination destination) {
-        auto const& directive = request.membership_filters[m];
-        auto const& column    = table.columns[selected[directive.column]];
-        auto status           = wave1.append(mask_decode_request{
-          *column.plan_tree, membership_source{directive.probe, column.dtype}, destination});
-        declined_members += status == mask_source_status::DECLINED;
-      });
+      auto const& directive = request.membership_filters[m];
+      auto const& column    = table.columns[selected[directive.column]];
+      auto const status     = wave1.append(mask_decode_request{
+        *column.plan_tree, membership_source{directive.probe, column.dtype}, next_destination()});
+      declined_members += status == mask_source_status::DECLINED;
     }
 
     // An all-ones source is the AND identity only while a real source still
@@ -665,15 +572,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    static_cast<long long>(num_rows));
     }
 
-    // Join every supplied lane into s0 after all producers have been submitted. The phase knows
-    // mask destinations, not the session's pending column owners. Lanes may repeat: a lane equal to
-    // s0 needs no wait, and a repeated lane only records a redundant event.
-    for (auto stream : streams) {
-      auto event = join_events.make();
-      if (cudaEventRecord(event, stream.get()) != cudaSuccess ||
-          (stream.get() != s0.get() && cudaStreamWaitEvent(s0.get(), event, 0) != cudaSuccess))
-        throw plan_error("filtered decode: wave-1 stream join failed");
-    }
+    // Order the combine on s0 after every other lane that produced a source.
+    if (!producer_lanes.empty()) cudf::detail::join_streams(producer_lanes, s0);
 
     // ── Keep mask, appended last. No ballot producer zeroes its tail (selection.hpp:52),
     // so the gap between the host words and alloc_words is memset here. Upload on s0
@@ -781,15 +681,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    sc::decompression_pushdown_index_walk_max_selectivity());
     }
 
-    // ── Survivor index map on stream 0, ordered before every consuming lane.
-    // Built ONCE
-    // per batch and SHARED by every consumer: the full-width gathers and the
-    // index-list decodes (the same int32 buffer).
+    // ── Survivor index map on s0, built once per batch and shared by every consumer: the
+    // full-route gathers, the BOOL8 gathers and the index-list decodes.
     result.routes        = routes;
-    bool const any_bool8 = k_bool8 > 0;  // dual-delivery gathers need the indices too
+    bool const any_bool8 = k_bool8 > 0;
+    bool const indices_needed =
+      (any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0;
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
-    if ((any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
+    if (indices_needed) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
@@ -798,75 +698,78 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                            result.row_indices.data(),
                                            nullptr,
                                            0};
-      // Index consumers (the full-width gathers, the index-list decodes) run on the other supplied
-      // streams; order them after the indices kernel on s0 with a device-side wait (streams are
-      // FIFO, so one up-front wait per stream covers every wave-2 launch on it). A stream that
-      // repeats s0 waits on its own earlier event, which orders nothing new.
-      cudaEvent_t ev_idx = join_events.make();
-      if (cudaEventRecord(ev_idx, s0.get()) != cudaSuccess)
-        throw plan_error("filtered decode: indices event record failed");
-      for (size_t si = 1; si < n_streams; ++si) {
-        if (cudaStreamWaitEvent(streams[si].get(), ev_idx, 0) != cudaSuccess)
-          throw plan_error("filtered decode: indices stream wait failed");
-      }
     }
+    // Order a consuming lane after the indices kernel with one device-side wait; streams are FIFO,
+    // so it covers every later launch on that lane.
+    std::vector<::cuda::stream_ref> index_lanes{s0};
+    auto const wait_for_indices = [&](::cuda::stream_ref lane) {
+      if (!indices_needed || std::any_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
+        return;
+      rmm::cuda_stream_view const producer{s0};
+      cudf::detail::join_streams({&producer, 1}, lane);
+      index_lanes.push_back(lane);
+    };
 
-    // Full-route requests are deliberately unselected: one phase-level gather
-    // handles them together with wave-1 BOOL8 results. Compact-in-kernel requests
-    // carry selection and never enter that gather.
+    // ── Wave 2: every column decodes to survivor rows on its own lane. Compacted routes decode
+    // compacted in the kernel; `full` routes decode full width and gather in the same request, so
+    // the full-width column is released on its lane once the gather is queued. A slot answered off
+    // a dictionary gathers its wave-1 BOOL8 on the lane that allocated it, never decoding values.
     std::vector<std::unique_ptr<cudf::column>> columns(selected.size());
-    std::vector<std::size_t> submitted_positions;
-    submitted_positions.reserve(selected.size());
+    std::vector<std::size_t> decoded_positions;
+    decoded_positions.reserve(selected.size());
     decode_session wave2{streams, mr};
     for (std::size_t i = 0; i < selected.size(); ++i) {
       if (is_bool8_slot[i]) {
-        columns[i] = std::move(bool8_full[static_cast<std::size_t>(bool8_of_slot[i])]);
-        // This describes the full-width input to the shared gather; BOOL8 was
-        // excluded from full-value selectivity policy above.
+        auto const slot = static_cast<std::size_t>(bool8_of_slot[i]);
+        auto const lane = bool8_lanes[slot];
+        wait_for_indices(lane);
+        columns[i] = std::move(cudf::gather(cudf::table_view{{bool8_full[slot]->view()}},
+                                            survivor_indices,
+                                            cudf::out_of_bounds_policy::DONT_CHECK,
+                                            lane,
+                                            mr)
+                                 ->release()
+                                 .front());
+        index_lanes.push_back(lane);
+        // BOOL8 was excluded from full-value selectivity policy above; it is survivor-sized.
         result.routes[i] = sc::decode_route::full;
         continue;
       }
       auto const& column = table.columns[selected[i]];
-      column_decode_request decode{std::cref(*column.plan_tree), value_result{column.dtype}, {}};
-      if (result.routes[i] != sc::decode_route::full) {
-        decode_selection selection;
-        selection.mask               = &sel;
-        selection.survivor_count     = sel.survivor_count;
-        selection.survivor_indices   = survivor_indices;
-        selection.route              = result.routes[i];
-        selection.enumerate_by_index = index_walk_pick &&
-                                       selection.route == sc::decode_route::bitpack_mask &&
-                                       sel.survivor_count > 0;
-        decode.selection.emplace(*column.plan_tree, selection);
-      }
-      submitted_positions.push_back(i);
-      wave2.append(std::move(decode));
+      decode_selection selection;
+      selection.mask               = &sel;
+      selection.survivor_count     = sel.survivor_count;
+      selection.survivor_indices   = survivor_indices;
+      selection.route              = result.routes[i];
+      selection.enumerate_by_index = index_walk_pick &&
+                                     selection.route == sc::decode_route::bitpack_mask &&
+                                     sel.survivor_count > 0;
+      if (selection.route == sc::decode_route::full || selection.enumerate_by_index)
+        wait_for_indices(wave2.next_stream());
+      decoded_positions.push_back(i);
+      wave2.append(column_decode_request{std::cref(*column.plan_tree),
+                                         value_result{column.dtype},
+                                         validated_selection(*column.plan_tree, selection)});
     }
     auto decoded = wave2.finish();
-    if (submitted_positions.empty()) {
-      // With only dual-delivery outputs, the empty session has no submitted
-      // work. The phase still owns the indices kernel and its consumer waits.
-      throw_if_cuda_error(synchronize_distinct(streams), "filtered decode: indices completion");
-    }
     for (std::size_t i = 0; i < decoded.size(); ++i)
-      columns[submitted_positions[i]] = std::move(decoded[i]);
-
-    // The existing row-selection policy excludes null-masked columns. A full
-    // decode can discover that only here; decline explicitly after completion,
-    // without treating allocation/device/shape errors as policy decisions.
-    if (std::any_of(columns.begin(), columns.end(), [](auto const& column) {
-          return column && column->null_count() != 0;
-        })) {
-      reset_result(sc::scan_filter_status::refused);
-      return refuse("row selection on a null-masked column is not supported");
-    }
+      columns[decoded_positions[i]] = std::move(decoded[i]);
+    // The session completed its own lanes; the indices kernel and the BOOL8 gathers are this
+    // phase's work on s0 and the gather lanes.
+    throw_if_cuda_error(synchronize_distinct(index_lanes), "filtered decode: gather completion");
 
     result.applied           = true;
     result.status            = sc::scan_filter_status::applied;
     result.keep_mask_applied = has_keep_mask;
     return columns;
+  } catch (unsupported_nullable_selection const&) {
+    // The existing row-selection policy excludes null-masked columns, which a full-route decode
+    // discovers only once it runs: an explicit decline after draining, not an execution failure.
+    synchronize_distinct_or_log(streams, "simpatico: filtered decode cleanup failed");
+    reset_result(sc::scan_filter_status::refused);
+    return refuse("row selection on a null-masked column is not supported");
   } catch (...) {
-    // Phase-owned masks/events outlive this drain, including work queued after session-owned decode
+    // Phase-owned masks outlive this drain, including work queued after session-owned decode
     // work. Preserve the original exception and OOM subtype.
     synchronize_distinct_or_log(streams, "simpatico: filtered decode cleanup failed");
     reset_result(sc::scan_filter_status::failed);

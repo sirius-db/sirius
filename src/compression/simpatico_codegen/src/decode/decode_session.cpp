@@ -82,6 +82,8 @@ struct decode_session::impl {
                 !std::is_move_constructible_v<submitted_request>);
 
   std::vector<::cuda::stream_ref> streams;
+  // The distinct supplied streams that received a request, the only ones completion waits for.
+  std::vector<::cuda::stream_ref> used;
   rmm::device_async_resource_ref mr;
   std::thread::id thread = std::this_thread::get_id();
   // List nodes keep each frame at a stable address while its decoder or a test refers to it.
@@ -108,18 +110,22 @@ struct decode_session::impl {
   template <typename Request>
   submitted_request& submit(Request const& request)
   {
-    auto const lane = next_lane++ % streams.size();
-    auto& item      = requests.emplace_back(streams[lane], mr, request);
-    pending         = true;
+    auto const stream = streams[next_lane++ % streams.size()];
+    if (std::none_of(
+          used.begin(), used.end(), [stream](auto lane) { return lane.get() == stream.get(); })) {
+      used.push_back(stream);
+    }
+    auto& item = requests.emplace_back(stream, mr, request);
+    pending    = true;
     return item;
   }
 
-  // Every distinct stream is observed now: earlier host observations do not cover later
-  // submissions, stream-ordered frees, or external phase work.
+  // Every stream that received a request is observed now: earlier host observations do not cover
+  // later submissions or stream-ordered frees.
   cudaError_t drain() noexcept
   {
     if (!pending) return cudaSuccess;
-    auto const status = synchronize_distinct(streams);
+    auto const status = synchronize_distinct(used);
     pending           = status != cudaSuccess;
     return status;
   }
@@ -159,6 +165,11 @@ decode_session::~decode_session() noexcept
   if (auto const status = state_->drain(); status != cudaSuccess) {
     std::fprintf(stderr, "simpatico decode destruction failed: %s\n", cudaGetErrorString(status));
   }
+}
+
+::cuda::stream_ref decode_session::next_stream() const noexcept
+{
+  return state_->streams[state_->next_lane % state_->streams.size()];
 }
 
 decode_frame& decode_session::register_test_frame()

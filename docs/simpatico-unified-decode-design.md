@@ -4,9 +4,9 @@ Every decode entry point (single column, table, predicate, mask, selected rows, 
 
 ## Decomposition
 
-`decode_session` owns submission and completion. `append` accepts a `column_decode_request` (a borrowed plan or standalone representation; a value or BOOL8 predicate result, optionally also writing a ballot mask; an optional `validated_selection`) or a `mask_decode_request` (a range predicate or membership probe writing a borrowed mask; its `accepted`/`declined` result describes semantic applicability, not completion). `finish` drains every supplied stream and transfers completed columns in request order; the `noexcept` destructor drains abandoned work.
+`decode_session` owns submission and completion. `append` accepts a `column_decode_request` (a borrowed plan or standalone representation; a value or BOOL8 predicate result, optionally also writing a ballot mask; an optional `validated_selection`) or a `mask_decode_request` (a range predicate or membership probe writing a borrowed mask; its `accepted`/`declined` result describes semantic applicability, not completion). `finish` drains every stream that received a request and transfers completed columns in request order; the `noexcept` destructor drains abandoned work.
 
-`decode_frame` is one request's context: its stream (assigned in rotation), the memory resource, and the host state its queued work may still read (`host_array` uploads and compiled-kernel pins). It owns no device memory. The session keeps each frame and a copy of its request until the final drain, so predicate strings, descriptors and probe captures outlive pending work.
+`decode_frame` is one request's context: its stream (assigned in rotation; `next_stream` reports the next assignment), the memory resource, and the host state its queued work may still read (`host_array` uploads and compiled-kernel pins). It owns no device memory. The session keeps each frame and a copy of its request until the final drain, so predicate strings, descriptors and probe captures outlive pending work.
 
 `DecodeWalk` interprets the plan, owns the structural memo, and targets predicate and selection semantics at the final value producer. Codec leaves take the frame and return an owning column; they do not know whether the caller decodes one column or a table.
 
@@ -23,7 +23,7 @@ Device temporaries (scratch, intermediate columns, memo values, representations 
 1. A temporary is read and written only on its allocation stream. Data that crosses streams stays phase-owned with explicit events and synchronization (the scan-filter phases).
 2. No pointer to a temporary outlives its owner. Launchers bind decode-only scratch through a local overlay. A fused region binds only memo values keyed by codegen nodes, which stay in the memo until the walk ends; only a non-codegen node consumes memo values, moving them into the representation it rebuilds. `DecodeWalk::bind` enforces this and binds the exact value a slot consumes, because a bitjoin consumes several.
 
-On failure, temporaries are released in stream order as the exception unwinds; the session then becomes terminal, drains every supplied stream, and rethrows the original exception. The drain protects what is not stream-ordered: host uploads, request copies, borrowed caller memory and outputs.
+On failure, temporaries are released in stream order as the exception unwinds; the session then becomes terminal, drains every stream that received a request, and rethrows the original exception. The drain protects what is not stream-ordered: host uploads, request copies, borrowed caller memory and outputs.
 
 Host memory is different: an asynchronous copy from pageable memory may read its source after the call returns. Every upload decode issues reads from `host_array` storage (uninitialized; initialize every byte before use) or the retained request copy, both alive until the final drain. Synchronous readbacks (`read_bytes`, `read_scalar`) may target local storage; they stage through the calling thread's pinned slab (`read_device_bytes_completed`) and complete with an explicit stream wait.
 
@@ -39,7 +39,7 @@ A call-time ledger such as cuCascade's `reservation_aware_resource_adaptor` cred
 
 Semantic declines (an unsupported shape, an unselective batch, every membership probe declining) fall back to ordinary decoding. Submitted execution failures, including typed allocation (cuCascade OOM subtypes) and compilation failures, propagate unchanged after draining; they are never retried as ordinary decoding. Public compatibility functions keep their null/false plus `error_out` contract for host validation and explicit decline only.
 
-`finish` checks every distinct supplied stream, including phase work queued after the last request; it reports its first failure. Append and finish failures make the session terminal and publish no results. Borrowed mask contents after a failed request are unspecified.
+`finish` checks each distinct stream that received a request, including work queued there after the last request; it reports its first failure. A supplied stream that received no request is not waited for, so a phase that queues its own work on a lane completes that lane itself: the scan-filter phase joins only the lanes that produced wave-1 sources, orders only index-consuming lanes after the indices kernel, and synchronizes its own gather lanes. Append and finish failures make the session terminal and publish no results. Borrowed mask contents after a failed request are unspecified.
 
 ## Genuine host observations
 
