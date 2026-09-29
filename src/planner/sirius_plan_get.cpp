@@ -691,15 +691,17 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       auto& scan_manager = sirius_state->get_scan_manager();
       auto const catalog = table.ParentCatalog().GetName();
       auto const& schema = table.ParentSchema().name;
+      sirius::duckdb_table_identity const identity{table.oid,
+                                                   table.GetStorage().GetRowGroupCollection()};
       pinned_owner = scan_manager.find_pinned_entry_for_duckdb_table(
-        catalog, schema, table.name, table.oid, &column_ids, &op.returned_types);
+        catalog, schema, table.name, identity, &column_ids, &op.returned_types);
       pinned = pinned_owner.get();
       // A same-name pin for an older table cannot serve this scan, and the disk-native
       // read behind it is MVCC-blind, so it may still hold the dropped table's image or
       // this table's deleted rows.
       if (pinned == nullptr) {
         auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
-          catalog, schema, table.name, table.oid);
+          catalog, schema, table.name, identity);
         if (superseded && diverges_from_checkpointed_image(context, table)) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "

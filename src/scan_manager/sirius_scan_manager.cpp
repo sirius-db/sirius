@@ -2257,12 +2257,12 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
     ci.names      = aligned_column_names(p->names, p->column_ids);
   } else if (auto const* d =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
-    ci.catalog_name = d->catalog_name;
-    ci.schema_name  = d->schema_name;
-    ci.table_name   = d->table_name;
-    ci.table_oid    = d->table_oid;
-    ci.column_ids   = d->column_ids;
-    ci.names        = aligned_column_names(d->names, d->column_ids);
+    ci.catalog_name   = d->catalog_name;
+    ci.schema_name    = d->schema_name;
+    ci.table_name     = d->table_name;
+    ci.table_identity = d->table_identity;
+    ci.column_ids     = d->column_ids;
+    ci.names          = aligned_column_names(d->names, d->column_ids);
   }
   return ci;
 }
@@ -2289,7 +2289,7 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
-    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name, d->table_oid)) {
+    if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name, d->table_identity)) {
       return {};
     }
     return column_projection_for(d->column_ids);
@@ -2314,9 +2314,9 @@ bool cache_entry_info::matches_duckdb_table_name(std::string_view catalog,
 bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
                                             std::string_view schema,
                                             std::string_view table,
-                                            duckdb::idx_t oid) const
+                                            sirius::duckdb_table_identity const& identity) const
 {
-  return matches_duckdb_table_name(catalog, schema, table) && table_oid == oid;
+  return matches_duckdb_table_name(catalog, schema, table) && table_identity.matches(identity);
 }
 
 bool cache_entry_info::same_source_as(const cache_entry_info& other) const
@@ -2324,7 +2324,7 @@ bool cache_entry_info::same_source_as(const cache_entry_info& other) const
   // A DuckDB entry never matches a parquet entry.
   if (!table_name.empty() || !other.table_name.empty()) {
     return matches_duckdb_table(
-      other.catalog_name, other.schema_name, other.table_name, other.table_oid);
+      other.catalog_name, other.schema_name, other.table_name, other.table_identity);
   }
   // Reuse the canonical parquet identity matcher. Empty file sets do not match.
   return matches_parquet_files(other.resolved_file_paths);
@@ -3042,7 +3042,7 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   std::string_view catalog_name,
   std::string_view schema_name,
   std::string_view table_name,
-  duckdb::idx_t table_oid,
+  sirius::duckdb_table_identity const& table_identity,
   duckdb::vector<duckdb::ColumnIndex> const* requested_ids,
   duckdb::vector<duckdb::LogicalType> const* returned_types) const
 {
@@ -3052,7 +3052,7 @@ std::shared_ptr<const pinned_entry> sirius_scan_manager::find_pinned_entry_for_d
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
     if (!entry->cache_info.matches_duckdb_table(
-          catalog_name, schema_name, table_name, table_oid)) {
+          catalog_name, schema_name, table_name, table_identity)) {
       continue;
     }
     if (identity_match == nullptr) { identity_match = entry; }
@@ -3072,12 +3072,12 @@ std::optional<std::string> sirius_scan_manager::pinned_entry_name_for_superseded
   std::string_view catalog_name,
   std::string_view schema_name,
   std::string_view table_name,
-  duckdb::idx_t table_oid) const
+  sirius::duckdb_table_identity const& table_identity) const
 {
   std::lock_guard pin_lk{_pinned_entries_mutex};
   for (auto const& [name, entry] : _pinned_entries) {
     if (entry->cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) &&
-        entry->cache_info.table_oid != table_oid) {
+        !entry->cache_info.table_identity.matches(table_identity)) {
       return name;
     }
   }

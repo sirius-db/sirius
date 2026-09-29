@@ -36,6 +36,7 @@
 #include <late_mat/column_origin.hpp>
 #include <memory/topology_index.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <memory>
 #include <string>
@@ -70,8 +71,9 @@ sirius::device_pin_chunk make_chunk(cucascade::memory::memory_space& space,
 sirius::scan_manager::cache_entry_info make_cache_info()
 {
   sirius::scan_manager::cache_entry_info info;
-  info.table_name = kTable;
-  info.names      = {"l_quantity"};
+  info.table_name     = kTable;
+  info.table_identity = sirius::test::test_table_identity(42);
+  info.names          = {"l_quantity"};
   info.column_ids.emplace_back(0);  // aligned with names, as the insert requires
   return info;
 }

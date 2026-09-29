@@ -18,6 +18,7 @@
 #include "operator/operator_test_utils.hpp"
 
 #include <catch.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 // sirius
 #include <cudf/column/column.hpp>
@@ -93,7 +94,7 @@ index_metadata make_meta(std::string table,
   meta.catalog_name   = std::move(catalog);
   meta.schema_name    = std::move(schema);
   meta.table_name     = std::move(table);
-  meta.table_oid      = table_oid;
+  meta.table_identity = sirius::test::test_table_identity(table_oid);
   meta.column_name    = std::move(column);
   meta.dim            = 3;
   meta.num_rows       = 100;
@@ -145,40 +146,64 @@ TEST_CASE("cuvs_index_cache find_by_column matches the auto-routing identity", "
 
   SECTION("exact (catalog, schema, table, oid, column, metric) match hits")
   {
-    auto e =
-      cache.find_by_column("mem", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded);
+    auto e = cache.find_by_column("mem",
+                                  "main",
+                                  "docs",
+                                  sirius::test::test_table_identity(kDefaultOid),
+                                  "vec",
+                                  Metric::L2SqrtExpanded);
     REQUIRE(e != nullptr);
     REQUIRE(e->meta.table_name == "docs");
   }
   SECTION("wrong column misses")
   {
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "docs", kDefaultOid, "other", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "other",
+                                 Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("wrong table misses")
   {
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "other", kDefaultOid, "vec", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "other",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("wrong schema misses (a same-named table in another schema does not route here)")
   {
-    REQUIRE(cache.find_by_column(
-              "mem", "other", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "other",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("wrong catalog misses")
   {
-    REQUIRE(cache.find_by_column(
-              "other", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("other",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) == nullptr);
   }
   SECTION("right column but wrong metric misses (an l2 index can't serve a cosine query)")
   {
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "docs", kDefaultOid, "vec", Metric::CosineExpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::CosineExpanded) == nullptr);
   }
 }
 
 // A recreated table keeps its name but gets a new catalog object id. See
-// @c index_metadata::table_oid.
+// @c index_metadata::table_identity.
 TEST_CASE("cuvs_index_cache find_by_column distinguishes table incarnations", "[vss]")
 {
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -189,26 +214,48 @@ TEST_CASE("cuvs_index_cache find_by_column distinguishes table incarnations", "[
 
   SECTION("the incarnation the index was built on hits")
   {
-    REQUIRE(cache.find_by_column("mem", "main", "docs", 7, "vec", Metric::L2SqrtExpanded) !=
-            nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(7),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) != nullptr);
     REQUIRE_FALSE(cache.has_superseded_index_for_column(
-      "mem", "main", "docs", 7, "vec", Metric::L2SqrtExpanded));
+      "mem", "main", "docs", sirius::test::test_table_identity(7), "vec", Metric::L2SqrtExpanded));
   }
   SECTION("a recreated table under the same name misses, and is reported superseded")
   {
-    REQUIRE(cache.find_by_column("mem", "main", "docs", 8, "vec", Metric::L2SqrtExpanded) ==
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(8),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) == nullptr);
+    REQUIRE(cache.has_superseded_index_for_column(
+      "mem", "main", "docs", sirius::test::test_table_identity(8), "vec", Metric::L2SqrtExpanded));
+  }
+  SECTION("ALTER preserves the OID but replaces storage")
+  {
+    sirius::test::duckdb_identity_fixture rewritten;
+    auto identity       = sirius::test::test_table_identity(7);
+    identity.row_groups = rewritten.current().row_groups;
+    REQUIRE(cache.find_by_column("mem", "main", "docs", identity, "vec", Metric::L2SqrtExpanded) ==
             nullptr);
     REQUIRE(cache.has_superseded_index_for_column(
-      "mem", "main", "docs", 8, "vec", Metric::L2SqrtExpanded));
+      "mem", "main", "docs", identity, "vec", Metric::L2SqrtExpanded));
   }
   SECTION("superseded is per (column, metric), not per table")
   {
+    REQUIRE_FALSE(cache.has_superseded_index_for_column("mem",
+                                                        "main",
+                                                        "docs",
+                                                        sirius::test::test_table_identity(8),
+                                                        "other",
+                                                        Metric::L2SqrtExpanded));
     REQUIRE_FALSE(cache.has_superseded_index_for_column(
-      "mem", "main", "docs", 8, "other", Metric::L2SqrtExpanded));
+      "mem", "main", "docs", sirius::test::test_table_identity(8), "vec", Metric::CosineExpanded));
     REQUIRE_FALSE(cache.has_superseded_index_for_column(
-      "mem", "main", "docs", 8, "vec", Metric::CosineExpanded));
-    REQUIRE_FALSE(cache.has_superseded_index_for_column(
-      "mem", "main", "other", 8, "vec", Metric::L2SqrtExpanded));
+      "mem", "main", "other", sirius::test::test_table_identity(8), "vec", Metric::L2SqrtExpanded));
   }
   SECTION("a rebuild reclaims the superseded index instead of stranding its memory")
   {
@@ -226,20 +273,32 @@ TEST_CASE("cuvs_index_cache find_by_column folds L2 expanded/unexpanded", "[vss]
   SECTION("index built L2SqrtExpanded matches an L2SqrtUnexpanded query")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtExpanded));
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtUnexpanded) != nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtUnexpanded) != nullptr);
   }
   SECTION("index built L2SqrtUnexpanded matches an L2SqrtExpanded query")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::L2SqrtUnexpanded));
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded) != nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded) != nullptr);
   }
   SECTION("the fold stays within the metric family (an L2 query misses a cosine index)")
   {
     insert_dummy(cache, "idx", make_meta("docs", "vec", Metric::CosineExpanded));
-    REQUIRE(cache.find_by_column(
-              "mem", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtUnexpanded) == nullptr);
+    REQUIRE(cache.find_by_column("mem",
+                                 "main",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtUnexpanded) == nullptr);
   }
 }
 
@@ -293,8 +352,12 @@ TEST_CASE("cuvs_index_cache find_by_column returns a match among several entries
   insert_dummy(cache, "idx_b", make_meta("docs", "vec", Metric::L2SqrtExpanded));
   insert_dummy(cache, "idx_c", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
 
-  auto e =
-    cache.find_by_column("mem", "main", "docs", kDefaultOid, "title_vec", Metric::L2SqrtExpanded);
+  auto e = cache.find_by_column("mem",
+                                "main",
+                                "docs",
+                                sirius::test::test_table_identity(kDefaultOid),
+                                "title_vec",
+                                Metric::L2SqrtExpanded);
   REQUIRE(e != nullptr);
   REQUIRE(e->meta.table_name == "docs");
   REQUIRE(e->meta.column_name == "title_vec");
@@ -311,8 +374,18 @@ TEST_CASE("cuvs_index_cache keeps same-named tables in different schemas distinc
 
   REQUIRE(cache.size() == 2);  // distinct identities, not a replace
 
-  auto e1 = cache.find_by_column("mem", "s1", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded);
-  auto e2 = cache.find_by_column("mem", "s2", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded);
+  auto e1 = cache.find_by_column("mem",
+                                 "s1",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded);
+  auto e2 = cache.find_by_column("mem",
+                                 "s2",
+                                 "docs",
+                                 sirius::test::test_table_identity(kDefaultOid),
+                                 "vec",
+                                 Metric::L2SqrtExpanded);
   REQUIRE(e1 != nullptr);
   REQUIRE(e2 != nullptr);
   REQUIRE(e1->meta.schema_name == "s1");
@@ -345,10 +418,18 @@ TEST_CASE("cuvs_index_cache keeps colliding-name identities distinct", "[vss]")
 
     REQUIRE(cache.size() == 2);  // distinct keys, not a silent overwrite
 
-    auto e1 = cache.find_by_column(
-      "mem", "main", "orders_data", kDefaultOid, "vec", Metric::L2SqrtExpanded);
-    auto e2 = cache.find_by_column(
-      "mem", "main", "orders", kDefaultOid, "data_vec", Metric::L2SqrtExpanded);
+    auto e1 = cache.find_by_column("mem",
+                                   "main",
+                                   "orders_data",
+                                   sirius::test::test_table_identity(kDefaultOid),
+                                   "vec",
+                                   Metric::L2SqrtExpanded);
+    auto e2 = cache.find_by_column("mem",
+                                   "main",
+                                   "orders",
+                                   sirius::test::test_table_identity(kDefaultOid),
+                                   "data_vec",
+                                   Metric::L2SqrtExpanded);
     REQUIRE(e1 != nullptr);
     REQUIRE(e2 != nullptr);
     REQUIRE(e1->meta.table_name == "orders_data");
@@ -718,8 +799,12 @@ TEST_CASE("cuvs_index_cache refused second build leaves the first index holding 
   REQUIRE(cache.reserve_index_memory(8ull << 30, /*preferred_gpu=*/0) == nullptr);
 
   // The l2 index survives untouched and is discoverable as the holder the error names.
-  REQUIRE(cache.find_by_column("mem", "main", "docs", kDefaultOid, "vec", Metric::L2SqrtExpanded) !=
-          nullptr);
+  REQUIRE(cache.find_by_column("mem",
+                               "main",
+                               "docs",
+                               sirius::test::test_table_identity(kDefaultOid),
+                               "vec",
+                               Metric::L2SqrtExpanded) != nullptr);
   auto const others = cache.indexes_on_column("mem", "main", "docs", "vec");
   REQUIRE(others.size() == 1);
   REQUIRE(others[0].metric == Metric::L2SqrtExpanded);

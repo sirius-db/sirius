@@ -34,6 +34,7 @@
 #include <catch.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb/common/types.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -69,9 +70,10 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
 cache_entry_info make_cache_info(std::vector<std::size_t> const& primary_indices)
 {
   cache_entry_info info;
-  info.catalog_name = "memory";
-  info.schema_name  = "main";
-  info.table_name   = kTable;
+  info.catalog_name   = "memory";
+  info.schema_name    = "main";
+  info.table_name     = kTable;
+  info.table_identity = sirius::test::test_table_identity(42);
   for (auto const idx : primary_indices) {
     info.column_ids.emplace_back(idx);
     info.names.push_back("c" + std::to_string(idx));

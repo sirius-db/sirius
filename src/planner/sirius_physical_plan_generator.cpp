@@ -318,7 +318,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->catalog_name           = table.ParentCatalog().GetName();
   info->schema_name            = table.ParentSchema().name;
   info->table_name             = table.name;
-  info->table_oid              = table.oid;
+  info->table_identity         = {table.oid, table.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = op_params.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;

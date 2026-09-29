@@ -257,3 +257,47 @@ TEST_CASE_METHOD(PinRecreateFixture,
 
   run_ok("CALL unpin_table('repin_t');");
 }
+
+TEST_CASE_METHOD(PinRecreateFixture,
+                 "pin_table - ALTER COLUMN TYPE cannot serve the old values",
+                 "[integration][gpu_execution][pin_table][pin_table_alter]")
+{
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const target = GENERATE(std::string("INTEGER USING a + 100"), std::string("BIGINT"));
+  CAPTURE(tier, target);
+  run_ok("CREATE TABLE alter_t AS SELECT range::INTEGER AS a FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='alter_t', tier='" + tier + "');");
+  compare_gpu_vs_cpu("SELECT sum(a) FROM alter_t;");
+
+  run_ok("ALTER TABLE alter_t ALTER COLUMN a TYPE " + target + ";");
+  REQUIRE(entry_exists(*con, "alter_t"));
+  expect_fallback_matches_cpu(*this, "SELECT sum(a) FROM alter_t;");
+
+  // A checkpoint permits a fresh GPU read while the old pin stays registered.
+  run_ok("CHECKPOINT;");
+  run_ok("SET enable_duckdb_fallback = false;");
+  compare_gpu_vs_cpu("SELECT sum(a) FROM alter_t;");
+
+  // Same OID and row count must still replace the old storage's pin.
+  run_ok("CALL pin_table(format='duckdb', name='alter_t', tier='" + tier + "');");
+  compare_gpu_vs_cpu("SELECT sum(a) FROM alter_t;");
+  run_ok("CALL unpin_table('alter_t');");
+}
+
+TEST_CASE_METHOD(PinRecreateFixture,
+                 "pin_table - re-pinning after ALTER replaces the old column set",
+                 "[integration][gpu_execution][pin_table][pin_table_alter]")
+{
+  run_ok(
+    "CREATE TABLE alter_repin_t AS SELECT range::INTEGER AS a, range::INTEGER AS b "
+    "FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='alter_repin_t', tier='gpu', cols=['a']);");
+  run_ok("ALTER TABLE alter_repin_t ALTER COLUMN a TYPE INTEGER USING a + 100;");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='alter_repin_t', tier='gpu', cols=['b']);");
+  REQUIRE(cached_column_names(*con, "alter_repin_t") == std::set<std::string>{"b"});
+  compare_gpu_vs_cpu("SELECT sum(b) FROM alter_repin_t;");
+  run_ok("CALL unpin_table('alter_repin_t');");
+}

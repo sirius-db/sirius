@@ -32,6 +32,7 @@
 #include <catch.hpp>
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <cstddef>
 #include <string>
@@ -73,11 +74,11 @@ cache_entry_info duckdb_cache(std::string catalog,
                               duckdb::idx_t oid = kDefaultOid)
 {
   cache_entry_info ci;
-  ci.catalog_name = std::move(catalog);
-  ci.schema_name  = std::move(schema);
-  ci.table_name   = std::move(table);
-  ci.table_oid    = oid;
-  ci.column_ids   = make_ids(storage_indices);
+  ci.catalog_name   = std::move(catalog);
+  ci.schema_name    = std::move(schema);
+  ci.table_name     = std::move(table);
+  ci.table_identity = sirius::test::test_table_identity(oid);
+  ci.column_ids     = make_ids(storage_indices);
   return ci;
 }
 
@@ -98,11 +99,11 @@ void fill(duckdb_native_ingestible_table_info& info,
           std::vector<duckdb::idx_t> storage_indices,
           duckdb::idx_t oid = kDefaultOid)
 {
-  info.catalog_name = std::move(catalog);
-  info.schema_name  = std::move(schema);
-  info.table_name   = std::move(table);
-  info.table_oid    = oid;
-  info.column_ids   = make_ids(storage_indices);
+  info.catalog_name   = std::move(catalog);
+  info.schema_name    = std::move(schema);
+  info.table_name     = std::move(table);
+  info.table_identity = sirius::test::test_table_identity(oid);
+  info.column_ids     = make_ids(storage_indices);
 }
 
 }  // namespace
@@ -239,19 +240,25 @@ TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher
           "[scan][can_serve]")
 {
   auto cache = duckdb_cache("db", "main", "lineitem", {0, 1}, /*oid=*/7);
-  REQUIRE(cache.matches_duckdb_table("db", "main", "lineitem", 7));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db2", "main", "lineitem", 7));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db", "other", "lineitem", 7));
-  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "orders", 7));
+  REQUIRE(
+    cache.matches_duckdb_table("db", "main", "lineitem", sirius::test::test_table_identity(7)));
+  REQUIRE_FALSE(
+    cache.matches_duckdb_table("db2", "main", "lineitem", sirius::test::test_table_identity(7)));
+  REQUIRE_FALSE(
+    cache.matches_duckdb_table("db", "other", "lineitem", sirius::test::test_table_identity(7)));
+  REQUIRE_FALSE(
+    cache.matches_duckdb_table("db", "main", "orders", sirius::test::test_table_identity(7)));
   // Same qualified name, different incarnation (dropped and recreated).
-  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "lineitem", 8));
+  REQUIRE_FALSE(
+    cache.matches_duckdb_table("db", "main", "lineitem", sirius::test::test_table_identity(8)));
 
   // Name-only matching identifies superseded pins but never serves them.
   REQUIRE(cache.matches_duckdb_table_name("db", "main", "lineitem"));
   REQUIRE_FALSE(cache.matches_duckdb_table_name("db", "main", "orders"));
 
   auto parquet = parquet_cache({"a.parquet"}, {0});
-  REQUIRE_FALSE(parquet.matches_duckdb_table("", "", "", 0));  // parquet identity never matches
+  REQUIRE_FALSE(parquet.matches_duckdb_table(
+    "", "", "", sirius::test::test_table_identity(0)));  // parquet identity never matches
   REQUIRE_FALSE(parquet.matches_duckdb_table_name("", "", ""));
 }
 
@@ -334,4 +341,55 @@ TEST_CASE("cache_entry_info: column_projection_for misses on sentinel columns", 
   }
 
   SECTION("missing column misses") { REQUIRE(cache.column_projection_for(make_ids({5})).empty()); }
+}
+
+TEST_CASE("cache_entry_info: ALTER rewrites storage without changing the oid", "[scan][can_serve]")
+{
+  sirius::test::duckdb_identity_fixture table;
+  auto before          = table.current();
+  auto cache           = duckdb_cache("db", "main", "t", {0});
+  cache.table_identity = before;
+
+  SECTION("same-type USING rewrites the values")
+  {
+    table.run("ALTER TABLE identity_t ALTER COLUMN a TYPE INTEGER USING a + 100;");
+  }
+  SECTION("widening changes the storage too")
+  {
+    table.run("ALTER TABLE identity_t ALTER COLUMN a TYPE BIGINT;");
+  }
+  auto after = table.current();
+  REQUIRE(after.oid == before.oid);
+  REQUIRE_FALSE(before.matches(after));
+  REQUIRE_FALSE(cache.matches_duckdb_table("db", "main", "t", after));
+
+  duckdb_native_ingestible_table_info scan;
+  fill(scan, "db", "main", "t", {0});
+  scan.table_identity = after;
+  REQUIRE(cache.can_serve_with_columns(scan).empty());
+  auto replacement           = cache;
+  replacement.table_identity = after;
+  REQUIRE_FALSE(cache.same_source_as(replacement));
+}
+
+TEST_CASE("duckdb table identity: ordinary DML preserves storage", "[scan][can_serve]")
+{
+  sirius::test::duckdb_identity_fixture table;
+  auto before = table.current();
+  table.run("INSERT INTO identity_t VALUES (1), (2);");
+  REQUIRE(before.matches(table.current()));
+  table.run("DELETE FROM identity_t WHERE a = 1;");
+  REQUIRE(before.matches(table.current()));
+}
+
+TEST_CASE("duckdb table identity: expired storage cannot match", "[scan][can_serve]")
+{
+  sirius::duckdb_table_identity identity;
+  {
+    sirius::test::duckdb_identity_fixture table;
+    identity = table.current();
+    REQUIRE(identity.matches(identity));
+  }
+  REQUIRE_FALSE(identity.matches(identity));
+  REQUIRE_FALSE(sirius::duckdb_table_identity{}.matches({}));
 }

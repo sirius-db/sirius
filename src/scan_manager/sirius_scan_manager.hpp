@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
@@ -125,9 +126,9 @@ class cache_entry_info {
   std::string catalog_name;                      ///< duckdb identity: catalog (attach alias)
   std::string schema_name;                       ///< duckdb identity: schema
   std::string table_name;                        ///< duckdb identity: table
-  duckdb::idx_t table_oid{0};  ///< DuckDB catalog object id. Distinguishes tables that
-                               ///< reuse the same qualified name after a drop,
-                               ///< recreate, or alter.
+  /// Catalog object id plus storage identity: DROP/CREATE changes the former;
+  /// ALTER that rewrites values or column layout changes the latter.
+  sirius::duckdb_table_identity table_identity;
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
 
@@ -146,12 +147,12 @@ class cache_entry_info {
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
   /// MVCC guards — one matcher, so the probe and prepare can never disagree.
-  /// Qualified name AND incarnation (@p oid, see @c table_oid). False for parquet
+  /// Qualified name AND catalog/storage identity. False for parquet
   /// entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
                                           std::string_view table,
-                                          duckdb::idx_t oid) const;
+                                          sirius::duckdb_table_identity const& identity) const;
 
   /// Match only the qualified name. Used to find superseded pins, not cache hits.
   [[nodiscard]] bool matches_duckdb_table_name(std::string_view catalog,
@@ -773,7 +774,7 @@ class sirius_scan_manager {
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
   /// The pinned entry whose duckdb identity matches catalog.schema.table at
-  /// incarnation @p table_oid, or nullptr.
+  /// catalog/storage identity @p table_identity, or nullptr.
   /// OWNING: the returned shared_ptr keeps the entry alive for as long as the caller holds
   /// it, so a concurrent unpin on another connection cannot pull it out from under the
   /// plan-time MVCC guards that read it. When one table is pinned under two names with
@@ -785,17 +786,18 @@ class sirius_scan_manager {
     std::string_view catalog_name,
     std::string_view schema_name,
     std::string_view table_name,
-    duckdb::idx_t table_oid,
+    sirius::duckdb_table_identity const& table_identity,
     duckdb::vector<duckdb::ColumnIndex> const* requested_ids  = nullptr,
     duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
 
   /// Find a same-name pin for an older table incarnation: same qualified name,
-  /// different catalog object id. Used to report a superseded pin, never to serve.
+  /// different catalog object id or rewritten storage. Used to report a superseded
+  /// pin, never to serve.
   [[nodiscard]] std::optional<std::string> pinned_entry_name_for_superseded_duckdb_table(
     std::string_view catalog_name,
     std::string_view schema_name,
     std::string_view table_name,
-    duckdb::idx_t table_oid) const;
+    sirius::duckdb_table_identity const& table_identity) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. OWNING: the returned

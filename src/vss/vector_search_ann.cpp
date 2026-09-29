@@ -111,11 +111,11 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
 
   auto& index_cache = c.ctx.get_cuvs_index_cache();
   auto index_entry  = index_cache.find_by_column(
-    req.catalog, req.schema, req.table_name, req.table_oid, req.column_name, metric);
+    req.catalog, req.schema, req.table_name, req.table_identity, req.column_name, metric);
   if (index_entry == nullptr || !index_entry->index) {
     // Name a stale index rather than reporting it as a missing one.
     if (index_cache.has_superseded_index_for_column(
-          req.catalog, req.schema, req.table_name, req.table_oid, req.column_name, metric)) {
+          req.catalog, req.schema, req.table_name, req.table_identity, req.column_name, metric)) {
       throw duckdb::InvalidInputException(
         "sirius_knn_search: the ANN index on '" + req.table_name + "." + req.column_name +
         "' was built on a previous incarnation of the table (dropped and recreated, or altered, "
