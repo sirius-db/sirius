@@ -10,7 +10,7 @@
 
 #include <string>
 
-TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql][s3][rewrite]")
+TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql][s3]")
 {
   SECTION("rewrites a single s3 read_parquet call")
   {

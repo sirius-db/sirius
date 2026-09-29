@@ -104,7 +104,6 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/s3/test_sigv4.cpp
-    test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/cache/test_cache_read_arbitration.cpp

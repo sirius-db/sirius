@@ -468,7 +468,7 @@ TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "
 }
 
 TEST_CASE(
-  "io_context_registry keeps local paths on kvikio when Sirius local datasource is disabled",
+  "io_context_registry routes local paths by backend and S3 reads to kvikio under backend=kvikio",
   "[s3][routing]")
 {
   scan_manager_fixture fixture;
@@ -490,8 +490,7 @@ TEST_CASE(
   CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
-TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
-          "[s3][routing][scan_manager]")
+TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -559,7 +558,7 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
 }
 
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
-          "[s3][routing][scan_manager]")
+          "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -576,8 +575,7 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
 }
 
-TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio",
-          "[s3][routing][scan_manager]")
+TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -597,8 +595,7 @@ TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio",
   CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
-TEST_CASE("scan_manager re-primes routed S3 cache on every query",
-          "[s3][routing][scan_manager][cache]")
+TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -633,8 +630,7 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   REQUIRE(default_cache->query_epoch() == 2);
 }
 
-TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
-          "[s3][routing][scan_manager][cache]")
+TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -652,8 +648,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   REQUIRE_NOTHROW(manager.prepare_for_query(q, true, {}));
 }
 
-TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket",
-          "[s3][routing][scan_manager][warmup]")
+TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
@@ -699,8 +694,7 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   CHECK(server.request_count() == after_warm);
 }
 
-TEST_CASE("warmup is a no-op for backends with nothing to connect",
-          "[s3][routing][scan_manager][warmup]")
+TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
@@ -715,8 +709,7 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect",
   CHECK(server.request_count() == 0);
 }
 
-TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle",
-          "[s3][rest][dispatch]")
+TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle", "[s3][rest]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
   scan_manager_fixture fixture;
@@ -751,8 +744,7 @@ TEST_CASE("rest dispatch spreads a request over two reactors and rotates when id
   }
 }
 
-TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently",
-          "[s3][routing][scan_manager][parquet_gpu_ingestible]")
+TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently", "[s3][routing]")
 {
   auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
   auto parquet_bytes      = read_binary_file(fixture_path);
@@ -792,8 +784,7 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   CHECK(is_local_backend(routed.at(local_path)));
 }
 
-TEST_CASE("split_provider resolver routes mixed parquet files independently",
-          "[s3][routing][scan_manager][split_provider]")
+TEST_CASE("split_provider resolver routes mixed parquet files independently", "[s3][routing]")
 {
   auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
   auto parquet_bytes      = read_binary_file(fixture_path);

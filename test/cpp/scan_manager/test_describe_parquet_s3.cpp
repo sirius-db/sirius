@@ -204,7 +204,7 @@ TEST_CASE("describe_parquet reports nation and region row counts and the region 
 }
 
 TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU read_parquet",
-          "[scan_manager][describe_parquet][s3][nested]")
+          "[scan_manager][describe_parquet][nested]")
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};

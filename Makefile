@@ -129,8 +129,9 @@ list-presets: $(PRESETS_LINK)
 #                     [large]/[aws] (incl. the SQL-over-S3 surface and the tiny
 #                     TPC-H Q1-Q22 suite) with MinIO auto-managed, in strict mode.
 # `make s3-test-large`
-#                     large-fixture gate, run as two processes, one per cache
-#                     setting. Both run the SF10 lineitem cases
+#                     large-fixture gate, run as two processes. Both run the
+#                     SF10 lineitem cases, with cache.mode sirius in the first
+#                     and cache.mode none in the second
 #                     (SIRIUS_TEST_S3_LARGE=1 makes the harness generate and
 #                     upload lineitem_sf10.parquet; needs the DuckDB CLI from
 #                     `make release`). The first process also runs the SF1 TPC-H
@@ -188,17 +189,19 @@ s3-test-large:
 	  echo "s3-test-large: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
-	@# Grouped by config (chunk-prewarm on vs off) so MinIO is brought up once per
-	@# group. Catch2 OR-combines specs within one argument via commas (multiple
-	@# positional args are AND-concatenated instead), so each group runs in a
-	@# single process where same-config cases share one SiriusContext lifecycle.
+	@# Two processes, so MinIO is brought up once per group: first the SF10
+	@# lineitem cases with cache.mode sirius ([large-cache]) plus the SF1 TPC-H
+	@# suite and the 1001-object glob case, which use cache.mode none; then the
+	@# SF10 lineitem cases with cache.mode none ([large-nocache]). Catch2
+	@# OR-combines specs within one argument via commas (multiple positional args
+	@# are AND-concatenated instead).
 	@# SIRIUS_TEST_S3_TPCH gates the SF1 TPC-H fixture + [tpch][large]; SIRIUS_TEST_S3_GLOB_SCALE
 	@# gates the 1001-object fixture + [glob-scale]. Both are scoped to the first group only, so
 	@# the second group's bring-up must not see them (it would re-generate / re-upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
+	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
+	$(S3_TEST_BIN) "[s3][sql][large][large-nocache]"
 
 # Deprecated: the tiny TPC-H suite runs in s3-test and the SF1 suite in
 # s3-test-large. Kept for one round with its old selection (uploads the SF1

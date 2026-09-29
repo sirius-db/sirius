@@ -487,7 +487,7 @@ TEST_CASE("sirius_httpfs positional reads fail on short reads and negative sizes
 }
 
 TEST_CASE("sirius_httpfs exposes S3 ETags as DuckDB version tags",
-          "[.][s3][integration][filesystem][efc]")
+          "[.][s3][integration][filesystem]")
 {
   SECTION("plain and glob opens preserve the quoted MinIO ETag")
   {
@@ -536,7 +536,7 @@ TEST_CASE("sirius_httpfs exposes S3 ETags as DuckDB version tags",
 }
 
 TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETag",
-          "[.][s3][integration][filesystem][efc]")
+          "[.][s3][integration][filesystem]")
 {
   auto env = read_s3_test_env();
   if (skip_if_no_s3_env(env)) { return; }

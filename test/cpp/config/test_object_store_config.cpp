@@ -254,8 +254,7 @@ TEST_CASE("sirius_config rejects unknown rest config keys", "[scan_manager][conf
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
-          "[scan_manager][config][s3][rest][tls]")
+TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys", "[config][s3][rest]")
 {
   auto check_rejected = [](std::string const& key, std::string const& value) {
     auto const path =
@@ -282,8 +281,7 @@ TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys",
   SECTION("TLS verification") { check_rejected("tls_verify", "false"); }
 }
 
-TEST_CASE("sirius_config still loads unrelated REST YAML fields",
-          "[scan_manager][config][s3][rest]")
+TEST_CASE("sirius_config still loads unrelated REST YAML fields", "[config][s3][rest]")
 {
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_unrelated_fields.yaml";
   write_yaml(path,

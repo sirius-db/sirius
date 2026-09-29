@@ -28,11 +28,91 @@ SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
   build/release/extension/sirius/test/cpp/sirius_unittest "[s3][integration]~[large]~[aws]"
 ```
 
-Catch2's `[.]` hides a case from an unfiltered run, not from a matching
-tag selector. Ten hidden cases currently run in `s3-test`: the three SQL
-join/nested-column cases, the REST LIST-scale case, five HTTP filesystem
-cases (LIST caps, positional reads and ETag validation), and the tiny
-TPC-H suite.
+## Tags and gates
+
+Every S3 case carries `[s3]`. Gate membership comes from the full
+Makefile selector, not from any one tag:
+
+| Gate | Selector |
+|---|---|
+| `make s3-test` | `[s3][integration]~[large]~[aws]` |
+| `make s3-test-large`, first process | `[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]` |
+| `make s3-test-large`, second process | `[s3][sql][large][large-nocache]` |
+| `make s3-test-aws` | `[s3][aws]` |
+| `make s3-tpch` (deprecated) | `[s3][integration][sql][tpch]` |
+
+Adjacent tags mean AND; commas separate OR alternatives. Keep the
+gate tags when retagging a case. `[integration]` also tells the listener
+in `test/cpp/unittest.cpp` to resume the shared integration DuckDB
+environment.
+
+The S3 tag vocabulary is:
+
+| Role | Tags |
+|---|---|
+| Gate selection | `[s3]`, `[integration]`, `[sql]`, `[large]`, `[large-cache]`, `[large-nocache]`, `[tpch]`, `[glob-scale]`, `[aws]` |
+| Execution path | `[transparent]` marks the `SET gpu_execution` path |
+| Topics | `[rest]`, `[sigv4]`, `[list]`, `[filesystem]`, `[glob]`, `[routing]`, `[describe_parquet]`, `[config]`, `[footerbind]`, `[pushdown]`, `[nested]`, `[fallback]`, `[kvikio]` |
+| File topics | `[uri_parser]`, `[object_store_config]` |
+| Slow cases | `[stress]` |
+
+Use at most two topic tags per case. No make target selects on the
+topic, file-topic or stress tags. Unit cases without `[integration]`,
+`[large]` or `[aws]` run in `make test` unless hidden.
+
+The large gate selects three SF10 cases with `[large-cache]` and three
+with `[large-nocache]`. The tiny `[tpch]` suite runs in `s3-test`;
+`[tpch][large]` selects SF1 in the first large process, alongside the
+1001-object `[glob-scale]` case. `[aws]` cases belong to the manual
+real-AWS gate.
+
+Without an external endpoint, MinIO-backed cases skip when
+`SIRIUS_TEST_S3_AUTO` is unset. The gates set
+`SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
+SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
+GLOB_SCALE switches; the targets export them for the appropriate
+process. The two harness-PUT cases skip against an external endpoint,
+even in strict mode.
+
+Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
+still runs when it matches an explicit positive name or tag selector,
+subject to that selector's exclusions. Catch2 also adds `[!hide]` to
+hidden cases. These 15 hidden cases run in `make s3-test`:
+
+- `DuckDB external file cache invalidates an overwritten S3 range by ETag`
+- `gpu_execution rejects operations on nested S3 parquet columns cleanly`
+- `gpu_execution S3 nested parquet projections match local DuckDB CPU`
+- `rest_ioctx generated LIST scale obeys the default safety caps`
+- `S3 pushdown non-pruned aggregate still matches the local parquet oracle`
+- `S3 pushdown selective filters still match the local parquet oracle`
+- `S3 pushdown shape-C zero-side joins match the local parquet oracle`
+- `S3 pushdown zero-input grouped aggregate still emits no groups`
+- `S3 pushdown zero-input ungrouped aggregates emit SQL identity and null values`
+- `S3 pushdown zero-input ungrouped count emits the aggregate identity row`
+- `sirius_httpfs exposes S3 ETags as DuckDB version tags`
+- `sirius_httpfs glob helper throws instead of silently truncating matched files`
+- `sirius_httpfs opens through FileOpener and reads positional ranges`
+- `sirius_httpfs positional reads fail on short reads and negative sizes`
+- `transparent S3 TPC-H Q1-Q22 match the tiny local CPU oracle`
+
+Before changing tags, compare the case-name lists for every gate
+selector above. Run one command per selector, keeping the entire
+selector in one quoted argument:
+
+```bash
+bin=build/release/extension/sirius/test/cpp/sirius_unittest
+spec='[s3][integration]~[large]~[aws]'
+
+# Catch2 v2
+"$bin" --list-test-names-only "$spec"
+
+# Catch2 v3
+"$bin" --list-tests --verbosity quiet "$spec"
+```
+
+The gate lists contain 97, 5, 3 and 3 cases respectively; the deprecated
+TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
+plus `[.]` and `[!hide]`.
 
 ## MinIO lifecycle
 

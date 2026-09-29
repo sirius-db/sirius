@@ -138,7 +138,7 @@ class object_only_authorizer final : public sirius::io::rest::request_authorizer
 
 }  // namespace
 
-TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "[s3][list]")
 {
   using sirius::io::rest::s3::parse_list_objects_v2;
 
@@ -161,8 +161,7 @@ TEST_CASE("ListObjectsV2 parser extracts ordered keys, sizes, and pagination", "
   CHECK(page.next_continuation_token == "token/with+chars=");
 }
 
-TEST_CASE("ListObjectsV2 parser ignores non-object keys and preserves flat-key order",
-          "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser ignores non-object keys and preserves flat-key order", "[s3][list]")
 {
   using sirius::io::rest::s3::parse_list_objects_v2;
 
@@ -184,7 +183,7 @@ TEST_CASE("ListObjectsV2 parser ignores non-object keys and preserves flat-key o
   CHECK(page.next_continuation_token.empty());
 }
 
-TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[s3][list]")
 {
   using sirius::io::rest::s3::parse_list_objects_v2;
 
@@ -220,7 +219,7 @@ TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[
   CHECK(max_size.entries[0].size == std::numeric_limits<std::uint64_t>::max());
 }
 
-TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list]")
 {
   DYNAMIC_SECTION("missing Key")
   {
@@ -239,7 +238,7 @@ TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list_pars
   }
 }
 
-TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list]")
 {
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
@@ -247,7 +246,7 @@ TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
     Catch::Contains("empty <Key>"));
 }
 
-TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list]")
 {
   DYNAMIC_SECTION("absent")
   {
@@ -265,7 +264,7 @@ TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
   }
 }
 
-TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list]")
 {
   for (auto const value : {"TRUE", "1", "garbage"}) {
     DYNAMIC_SECTION("value=" << value)
@@ -289,7 +288,7 @@ TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_
   }
 }
 
-TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][list]")
 {
   DYNAMIC_SECTION("absent")
   {
@@ -308,7 +307,7 @@ TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][li
   }
 }
 
-TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list]")
 {
   auto const page = sirius::io::rest::s3::parse_list_objects_v2(
     R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated> true </IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>)");
@@ -317,7 +316,7 @@ TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_par
   CHECK(page.next_continuation_token == "next");
 }
 
-TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", "[s3][list]")
 {
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
@@ -325,7 +324,7 @@ TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", 
     Catch::Contains("after </ListBucketResult>"));
 }
 
-TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list]")
 {
   CHECK_THROWS_AS(sirius::io::rest::s3::parse_list_objects_v2(
                     R"(</ListBucketResult><ListBucketResult><IsTruncated>false</IsTruncated>)"),
@@ -334,7 +333,7 @@ TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3
 
 TEST_CASE(
   "ListObjectsV2 parser accepts an XML prologue, root namespace, and surrounding whitespace",
-  "[s3][list_parser]")
+  "[s3][list]")
 {
   SECTION("prologue, root namespace, and trailing whitespace")
   {
@@ -362,7 +361,7 @@ TEST_CASE(
   }
 }
 
-TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][list]")
 {
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
@@ -370,7 +369,7 @@ TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][lis
     Catch::Contains("not a ListObjectsV2 response"));
 }
 
-TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][list_parser]")
+TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][list]")
 {
   CHECK_THROWS_WITH(
     sirius::io::rest::s3::parse_list_objects_v2(
@@ -378,7 +377,7 @@ TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][
     Catch::Contains("before <ListBucketResult>"));
 }
 
-TEST_CASE("request_authorizer base rejects LIST until implementations opt in", "[s3][authorizer]")
+TEST_CASE("request_authorizer base rejects LIST until implementations opt in", "[s3][sigv4]")
 {
   object_only_authorizer provider;
 
@@ -387,7 +386,7 @@ TEST_CASE("request_authorizer base rejects LIST until implementations opt in", "
     credential_error);
 }
 
-TEST_CASE("sigv4_presigned_authorizer signs sorted ListObjectsV2 query params", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer signs sorted ListObjectsV2 query params", "[s3][sigv4]")
 {
   auto creds          = example_static_credentials();
   creds.session_token = "temporary/session+token=";
@@ -408,7 +407,7 @@ TEST_CASE("sigv4_presigned_authorizer signs sorted ListObjectsV2 query params", 
   CHECK(std::is_sorted(keys.begin(), keys.end()));
 }
 
-TEST_CASE("sigv4_header_authorizer signs ListObjectsV2 canonical queries", "[s3][authorizer]")
+TEST_CASE("sigv4_header_authorizer signs ListObjectsV2 canonical queries", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
     example_static_credentials(), "us-east-1", "http://minio.local:9000");
@@ -427,7 +426,7 @@ TEST_CASE("sigv4_header_authorizer signs ListObjectsV2 canonical queries", "[s3]
   CHECK_FALSE(header_value(request.headers, "x-amz-content-sha256").empty());
 }
 
-TEST_CASE("SigV4 LIST rejects X-Amz query smuggling", "[s3][authorizer]")
+TEST_CASE("SigV4 LIST rejects X-Amz query smuggling", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer presigned(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -440,7 +439,7 @@ TEST_CASE("SigV4 LIST rejects X-Amz query smuggling", "[s3][authorizer]")
     "bucket", "list-type=2&x-amz-credential=evil&prefix=p%2F", k_presign_timeout));
 }
 
-TEST_CASE("sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-west-2", "HTTPS://S3.US-WEST-2.AMAZONAWS.COM");
@@ -456,7 +455,7 @@ TEST_CASE("sigv4_presigned_authorizer normalizes HTTPS endpoint", "[s3][authoriz
   CHECK(query_value(url, "X-Amz-SignedHeaders") == "host");
 }
 
-TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "http://minio.local:9000");
@@ -470,7 +469,7 @@ TEST_CASE("sigv4_presigned_authorizer preserves HTTP endpoint ports", "[s3][auth
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }
 
-TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[s3][sigv4]")
 {
   auto creds = example_static_credentials();
 
@@ -502,8 +501,7 @@ TEST_CASE("sigv4_presigned_authorizer rejects malformed construction inputs", "[
     credential_error);
 }
 
-TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs",
-          "[s3][authorizer]")
+TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs", "[s3][sigv4]")
 {
   auto creds          = example_static_credentials();
   creds.session_token = "temporary/session+token=";
@@ -529,8 +527,7 @@ TEST_CASE("sigv4_header_authorizer signs with headers and plain path-style URLs"
   CHECK(get_auth != head_auth);
 }
 
-TEST_CASE("sigv4_header_authorizer omits session-token header for long-lived keys",
-          "[s3][authorizer]")
+TEST_CASE("sigv4_header_authorizer omits session-token header for long-lived keys", "[s3][sigv4]")
 {
   sigv4_header_authorizer provider(
     example_static_credentials(), "us-east-1", "http://minio.local:9000");
@@ -544,7 +541,7 @@ TEST_CASE("sigv4_header_authorizer omits session-token header for long-lived key
   CHECK(header_value(request.headers, "x-amz-security-token").empty());
 }
 
-TEST_CASE("sigv4_presigned_authorizer generates distinct GET and HEAD URLs", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer generates distinct GET and HEAD URLs", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -564,7 +561,7 @@ TEST_CASE("sigv4_presigned_authorizer generates distinct GET and HEAD URLs", "[s
 }
 
 TEST_CASE("sigv4_presigned_authorizer percent-encodes object keys and keeps their slashes",
-          "[s3][authorizer]")
+          "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -594,7 +591,7 @@ TEST_CASE("sigv4_presigned_authorizer percent-encodes object keys and keeps thei
 }
 
 TEST_CASE("static_credentials_from maps object_store_config session tokens into SigV4 URLs",
-          "[s3][authorizer]")
+          "[s3][sigv4]")
 {
   object_store_config cfg;
   cfg.endpoint      = "https://s3.us-east-1.amazonaws.com";
@@ -627,7 +624,7 @@ TEST_CASE("static_credentials_from maps object_store_config session tokens into 
   CHECK_FALSE(contains(no_token_url, "X-Amz-Security-Token="));
 }
 
-TEST_CASE("sigv4_presigned_authorizer honors per-call timeout", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer honors per-call timeout", "[s3][sigv4]")
 {
   auto creds          = example_static_credentials();
   creds.session_token = "temporary/session+token=";
@@ -656,7 +653,7 @@ TEST_CASE("sigv4_presigned_authorizer honors per-call timeout", "[s3][authorizer
   CHECK(contains(short_url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
 }
 
-TEST_CASE("sigv4_presigned_authorizer rejects empty object references", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer rejects empty object references", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -667,7 +664,7 @@ TEST_CASE("sigv4_presigned_authorizer rejects empty object references", "[s3][au
                   credential_error);
 }
 
-TEST_CASE("sigv4_presigned_authorizer is safe under concurrent presigning", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer is safe under concurrent presigning", "[s3][sigv4]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -714,7 +711,7 @@ TEST_CASE("sigv4_presigned_authorizer is safe under concurrent presigning", "[s3
   CHECK(produced == n_threads * n_iters);
 }
 
-TEST_CASE("mock_authorizer returns canned URLs and records calls", "[s3][authorizer]")
+TEST_CASE("mock_authorizer returns canned URLs and records calls", "[s3][sigv4]")
 {
   mock_authorizer provider(
     authorized_request{"https://signed.example/object", {{"x-test-header", "one"}}});
@@ -737,7 +734,7 @@ TEST_CASE("mock_authorizer returns canned URLs and records calls", "[s3][authori
   CHECK(provider.last_timeout() == k_presign_timeout);
 }
 
-TEST_CASE("mock_authorizer can force credential errors", "[s3][authorizer]")
+TEST_CASE("mock_authorizer can force credential errors", "[s3][sigv4]")
 {
   mock_authorizer provider(authorized_request{"https://signed.example/object", {}});
   provider.set_throw("boom");

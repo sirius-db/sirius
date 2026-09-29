@@ -1234,7 +1234,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
 }
 
 TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
-          "[s3][integration][rest][list][filesystem]")
+          "[s3][integration][rest][list]")
 {
   auto payload = deterministic_payload(4096);
   range_http_server server(payload);
@@ -1332,7 +1332,7 @@ TEST_CASE("rest data GET on a stalled connection fails under the stall detector"
   CHECK(server.get_count() == 2);
 }
 
-TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest][cache]")
+TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest]")
 {
   constexpr std::size_t page_size = 4096;
   constexpr std::size_t tail_size = 17;

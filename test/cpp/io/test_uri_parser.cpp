@@ -107,7 +107,7 @@ TEST_CASE("uri_parser keeps S3 keys byte for byte including encoded slashes and 
   }
 }
 
-TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser]")
+TEST_CASE("uri_parser preserves S3 leading slashes in object key", "[uri_parser][s3]")
 {
   CHECK(parse("s3://bucket/key").path == "key");
   CHECK(parse("s3://bucket//key").path == "/key");

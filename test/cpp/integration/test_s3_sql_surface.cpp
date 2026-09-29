@@ -273,19 +273,19 @@ struct sirius_memory_limits {
   std::string host_capacity{"512 MiB"};
   std::string disk_capacity{"2 GiB"};
   bool disk_tier{true};
-  std::optional<bool> enable_prefetch_cache;
+  std::optional<std::string> cache_mode;
   std::optional<sirius::scan_manager::io_backend> backend;
   std::optional<std::string> rest_footer_probe_bytes;
   std::optional<std::size_t> rest_list_max_matches;
 };
 
-sirius_memory_limits large_sirius_memory_limits(bool enable_prefetch_cache)
+sirius_memory_limits large_sirius_memory_limits(std::string cache_mode)
 {
   sirius_memory_limits limits;
-  limits.gpu_usage             = "5 GiB";
-  limits.host_capacity         = "8 GiB";
-  limits.disk_capacity         = "32 GiB";
-  limits.enable_prefetch_cache = enable_prefetch_cache;
+  limits.gpu_usage     = "5 GiB";
+  limits.host_capacity = "8 GiB";
+  limits.disk_capacity = "32 GiB";
+  limits.cache_mode    = std::move(cache_mode);
   return limits;
 }
 
@@ -345,10 +345,10 @@ class sirius_config_env_guard {
     }
     out << "  executor:\n"
            "    scan_manager:\n";
-    if (limits.enable_prefetch_cache.has_value()) {
+    if (limits.cache_mode.has_value()) {
       out << "      cache:\n"
              "        mode: "
-          << (*limits.enable_prefetch_cache ? "sirius" : "none") << "\n";
+          << *limits.cache_mode << "\n";
     }
     if (limits.backend.has_value()) {
       std::string backend_name;
@@ -983,7 +983,7 @@ void compare_s3_gpu_to_local_cpu_with_watchdog(
 }  // namespace
 
 TEST_CASE("internal sirius_read_parquet is registered as a one-argument table function",
-          "[sql][s3][registration]")
+          "[sql][s3]")
 {
   duckdb::DuckDB db(nullptr);
   load_sirius_extension(db);
@@ -1031,8 +1031,7 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
   }
 }
 
-TEST_CASE("S3 bench STS session token reaches presigned URLs",
-          "[s3][authorizer][credential_provider]")
+TEST_CASE("S3 bench STS session token reaches presigned URLs", "[s3][sigv4]")
 {
   sirius::io::rest::s3::static_credentials creds;
   creds.access_key_id     = "AKIAFAKEBENCHKEY";
@@ -1052,7 +1051,7 @@ TEST_CASE("S3 bench STS session token reaches presigned URLs",
 }
 
 TEST_CASE("real-AWS live env guard requires regional endpoint and temporary credentials",
-          "[s3][aws][env]")
+          "[s3][aws]")
 {
   scoped_env_vars env{{"SIRIUS_TEST_S3_ENDPOINT",
                        "SIRIUS_TEST_S3_ACCESS_KEY",
@@ -1122,7 +1121,7 @@ TEST_CASE("real-AWS live env guard requires regional endpoint and temporary cred
 }
 
 TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
-          "[s3][integration][sql][gpu_execution]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1153,7 +1152,7 @@ TEST_CASE("gpu_execution rewrites S3 read_parquet and scans through Sirius",
 }
 
 TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
-          "[s3][integration][sql][gpu_execution][transparent]")
+          "[s3][integration][sql][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1167,8 +1166,8 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
   SECTION("the query opens the object without a pre-resolved datasource")
   {
     sirius_memory_limits limits;
-    limits.enable_prefetch_cache = false;
-    limits.disk_tier             = false;
+    limits.cache_mode = "none";
+    limits.disk_tier  = false;
     s3_sql_fixture fixture(*env, limits);
     set_gpu_execution(fixture.con, true);
     auto s3_result = require_query_ok(fixture.con, s3_query);
@@ -1195,7 +1194,7 @@ TEST_CASE("transparent read_parquet over S3 scans through Sirius REST",
 }
 
 TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvikio",
-          "[s3][integration][sql][gpu_execution][transparent]")
+          "[s3][integration][sql][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1222,7 +1221,7 @@ TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvi
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1244,7 +1243,7 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
 }
 
 TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1267,7 +1266,7 @@ TEST_CASE("transparent S3 glob opens the literal percent key instead of its slas
 }
 
 TEST_CASE("transparent S3 glob opens keys containing URI fragment and query delimiters",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1291,7 +1290,7 @@ TEST_CASE("transparent S3 glob opens keys containing URI fragment and query deli
 }
 
 TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1308,7 +1307,7 @@ TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
 }
 
 TEST_CASE("transparent S3 glob decodes a percent-encoded Hive value exactly once",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1357,7 +1356,7 @@ TEST_CASE("S3 direct and glob routes share the literal object cache identity",
 }
 
 TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",
-          "[s3][integration][sql][gpu_execution][transparent]")
+          "[s3][integration][sql][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1386,7 +1385,7 @@ TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from s
 }
 
 TEST_CASE("transparent S3 glob rejects a literal question mark in a Hive partition segment",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1402,7 +1401,7 @@ TEST_CASE("transparent S3 glob rejects a literal question mark in a Hive partiti
 }
 
 TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition separator",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1418,7 +1417,7 @@ TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition
 }
 
 TEST_CASE("transparent S3 glob permits a question mark in the terminal filename",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1442,7 +1441,7 @@ TEST_CASE("transparent S3 glob permits a question mark in the terminal filename"
 }
 
 TEST_CASE("transparent S3 glob supports an encoded question mark in a Hive partition value",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1491,7 +1490,7 @@ TEST_CASE("S3 glob results are sorted by raw literal key bytes",
 }
 
 TEST_CASE("transparent S3 glob preserves hive partition columns",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1514,7 +1513,7 @@ TEST_CASE("transparent S3 glob preserves hive partition columns",
 }
 
 TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe window",
-          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+          "[s3][integration][sql][transparent][glob][footerbind]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1533,7 +1532,7 @@ TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe win
 }
 
 TEST_CASE("transparent S3 glob repeated scans remain correct",
-          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+          "[s3][integration][sql][transparent][glob][footerbind]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1552,7 +1551,7 @@ TEST_CASE("transparent S3 glob repeated scans remain correct",
 }
 
 TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1596,7 +1595,7 @@ TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
 }
 
 TEST_CASE("transparent S3 glob scans 1001 parquet objects across LIST pages",
-          "[.][s3][integration][sql][gpu_execution][transparent][glob][large][glob-scale]")
+          "[.][s3][integration][sql][transparent][glob][large][glob-scale]")
 {
   if (sirius::test::s3::skip_or_fail_unless(truthy_env("SIRIUS_TEST_S3_GLOB_SCALE"),
                                             "SIRIUS_TEST_S3_GLOB_SCALE is not enabled")) {
@@ -1622,7 +1621,7 @@ TEST_CASE("transparent S3 glob scans 1001 parquet objects across LIST pages",
 }
 
 TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
-          "[s3][integration][sql][gpu_execution][transparent][glob]")
+          "[s3][integration][sql][transparent][glob]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1676,59 +1675,39 @@ TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
   }
 }
 
-TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
-          "[s3][integration][sql][gpu_execution]")
-{
-  auto env = load_s3_test_env();
-  if (should_skip_s3_env(env)) { return; }
-
-  s3_sql_fixture fixture(*env);
-  auto const s3_query =
-    "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
-  auto result = require_query_ok(fixture.con, gpu_execution_sql(s3_query));
-  CHECK(result->RowCount() == 0);
-}
-
 TEST_CASE("S3 pushdown all-pruned filter completes with an empty result",
-          "[.][s3][pushdown][deadlock]")
-{
-  auto env = load_s3_test_env();
-  if (should_skip_s3_env(env)) { return; }
-
-  auto fixture        = std::make_shared<s3_sql_fixture>(*env);
-  auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
-                        " WHERE n_regionkey = 99 ORDER BY n_nationkey";
-
-  auto result =
-    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
-  CHECK(result.row_count == 0);
-  REQUIRE(result.column_count == 1);
-  REQUIRE(result.column_names.size() == 1);
-  CHECK(result.column_names[0] == "n_nationkey");
-  CHECK(result.rows.empty());
-}
-
-TEST_CASE("S3 pushdown all-pruned aggregate returns zero rows counted",
-          "[.][s3][pushdown][deadlock][agg-identity]")
+          "[s3][integration][sql][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   auto fixture = std::make_shared<s3_sql_fixture>(*env);
-  auto const s3_query =
-    "SELECT count(*) AS c FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
 
-  auto result =
-    require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
-  REQUIRE(result.row_count == 1);
-  REQUIRE(result.column_count == 1);
-  REQUIRE(result.rows.size() == 1);
-  REQUIRE(result.rows[0].size() == 1);
-  CHECK(result.rows[0][0] == "0");
+  SECTION("unordered projection returns no rows through a direct query")
+  {
+    auto const s3_query =
+      "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") + " WHERE n_regionkey = 99";
+    auto result = require_query_ok(fixture->con, gpu_execution_sql(s3_query));
+    CHECK(result->RowCount() == 0);
+  }
+
+  SECTION("ordered projection completes under the watchdog")
+  {
+    auto const s3_query = "SELECT n_nationkey FROM " + s3_parquet_scan(*env, "nation") +
+                          " WHERE n_regionkey = 99 ORDER BY n_nationkey";
+
+    auto result = require_query_ok_with_watchdog(
+      fixture, gpu_execution_sql(s3_query), std::chrono::seconds{120});
+    CHECK(result.row_count == 0);
+    REQUIRE(result.column_count == 1);
+    REQUIRE(result.column_names.size() == 1);
+    CHECK(result.column_names[0] == "n_nationkey");
+    CHECK(result.rows.empty());
+  }
 }
 
 TEST_CASE("S3 pushdown zero-input ungrouped count emits the aggregate identity row",
-          "[.][s3][pushdown][agg-identity]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1747,7 +1726,7 @@ TEST_CASE("S3 pushdown zero-input ungrouped count emits the aggregate identity r
 }
 
 TEST_CASE("S3 pushdown zero-input ungrouped aggregates emit SQL identity and null values",
-          "[.][s3][pushdown][agg-identity]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1770,7 +1749,7 @@ TEST_CASE("S3 pushdown zero-input ungrouped aggregates emit SQL identity and nul
 }
 
 TEST_CASE("S3 pushdown zero-input grouped aggregate still emits no groups",
-          "[.][s3][pushdown][agg-identity]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1788,7 +1767,7 @@ TEST_CASE("S3 pushdown zero-input grouped aggregate still emits no groups",
 }
 
 TEST_CASE("S3 pushdown non-pruned aggregate still matches the local parquet oracle",
-          "[.][s3][pushdown][agg-identity]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1815,7 +1794,7 @@ TEST_CASE("S3 pushdown non-pruned aggregate still matches the local parquet orac
 }
 
 TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
-          "[.][s3][pushdown][deadlock]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -1852,7 +1831,7 @@ TEST_CASE("S3 pushdown selective filters still match the local parquet oracle",
 }
 
 TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
-          "[.][s3][integration][pushdown][shape-c]")
+          "[.][s3][integration][pushdown]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2052,7 +2031,7 @@ TEST_CASE("S3 pushdown shape-C zero-side joins match the local parquet oracle",
 }
 
 TEST_CASE("gpu_execution S3 SQL surface counts rows in five uploaded TPC-H tables",
-          "[s3][integration][sql][gpu_execution]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2069,8 +2048,7 @@ TEST_CASE("gpu_execution S3 SQL surface counts rows in five uploaded TPC-H table
   }
 }
 
-TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
-          "[s3][integration][sql][gpu_execution]")
+TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2083,8 +2061,7 @@ TEST_CASE("gpu_execution S3 SQL surface scans all orders row groups",
   compare_s3_gpu_to_local_cpu(fixture, aggregate_sql, local_sql);
 }
 
-TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q1 shape",
-          "[s3][integration][sql][gpu_execution]")
+TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q1 shape", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2096,8 +2073,7 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q1 shape",
                               {6, 7, 8});
 }
 
-TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
-          "[s3][integration][sql][gpu_execution]")
+TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2113,8 +2089,7 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
                               {1});
 }
 
-TEST_CASE("S3 read_parquet op shape T1 matches outer join semantics",
-          "[s3][integration][sql][t1-outer-join]")
+TEST_CASE("S3 read_parquet op shape T1 matches outer join semantics", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2157,7 +2132,7 @@ TEST_CASE("S3 read_parquet op shape T1 matches outer join semantics",
 }
 
 TEST_CASE("S3 read_parquet op shape T2 matches grouped distinct aggregates",
-          "[s3][integration][sql][t2-groupby]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2178,8 +2153,7 @@ TEST_CASE("S3 read_parquet op shape T2 matches grouped distinct aggregates",
                               {4});
 }
 
-TEST_CASE("S3 read_parquet op shape T3 matches string predicates",
-          "[s3][integration][sql][t3-string]")
+TEST_CASE("S3 read_parquet op shape T3 matches string predicates", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2210,8 +2184,7 @@ TEST_CASE("S3 read_parquet op shape T3 matches string predicates",
       " WHERE n_name IN ('FRANCE', 'GERMANY', 'BRAZIL') ORDER BY n_nationkey");
 }
 
-TEST_CASE("S3 read_parquet op shape T4 mixes local and S3 scans",
-          "[s3][integration][sql][t4-mixed]")
+TEST_CASE("S3 read_parquet op shape T4 mixes local and S3 scans", "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2232,7 +2205,7 @@ TEST_CASE("S3 read_parquet op shape T4 mixes local and S3 scans",
 }
 
 TEST_CASE("S3 read_parquet op shape T5 preserves null decimal and timestamp values",
-          "[s3][integration][sql][t5-edge-types]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2259,7 +2232,7 @@ TEST_CASE("S3 read_parquet op shape T5 preserves null decimal and timestamp valu
 }
 
 TEST_CASE("S3 read_parquet op shape T6 matches CTE and scalar subquery results",
-          "[s3][integration][sql][t6-cte]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2298,7 +2271,7 @@ TEST_CASE("S3 read_parquet op shape T6 matches CTE and scalar subquery results",
 }
 
 TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
-          "[.][s3][integration][sql][gpu_execution][nested]")
+          "[.][s3][integration][sql][nested]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2329,7 +2302,7 @@ TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
 }
 
 TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly",
-          "[.][s3][integration][sql][gpu_execution][nested][unsupported]")
+          "[.][s3][integration][sql][nested]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2363,7 +2336,7 @@ TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly
 }
 
 TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
-          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+          "[s3][integration][sql][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2385,7 +2358,7 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
 }
 
 TEST_CASE("transparent S3 projection fallback reports prose instead of an exception envelope",
-          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+          "[s3][integration][sql][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2408,7 +2381,7 @@ TEST_CASE("transparent S3 projection fallback reports prose instead of an except
 }
 
 TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU",
-          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+          "[s3][integration][sql][fallback][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2436,7 +2409,7 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
 }
 
 TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disabled",
-          "[s3][integration][sql][gpu_execution][transparent]")
+          "[s3][integration][sql][transparent]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2456,7 +2429,7 @@ TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disable
 }
 
 TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for cardinality",
-          "[s3][integration][sql][planner-metadata]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2489,7 +2462,7 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
 }
 
 TEST_CASE("internal sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
-          "[s3][integration][sql][planner-metadata]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2503,7 +2476,7 @@ TEST_CASE("internal sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
 }
 
 TEST_CASE("internal sirius_read_parquet exposes distinct S3 table cardinalities in joins",
-          "[s3][integration][sql][planner-metadata]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2521,7 +2494,7 @@ TEST_CASE("internal sirius_read_parquet exposes distinct S3 table cardinalities 
 }
 
 TEST_CASE("gpu_execution S3 SQL supports both configured SigV4 signing modes",
-          "[s3][integration][sql][gpu_execution][config]")
+          "[s3][integration][sql][config]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2544,8 +2517,7 @@ TEST_CASE("gpu_execution S3 SQL supports both configured SigV4 signing modes",
   }
 }
 
-TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
-          "[.][s3][aws][live][sql][gpu_execution]")
+TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4", "[.][s3][aws][sql]")
 {
   auto env = read_aws_live_env();
   if (!env) { return; }
@@ -2569,8 +2541,7 @@ TEST_CASE("gpu_execution reads real AWS S3 parquet through Sirius SigV4",
   }
 }
 
-TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
-          "[.][s3][aws][live][sql][gpu_execution]")
+TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4", "[.][s3][aws][sql]")
 {
   auto env = read_aws_live_env();
   if (!env) { return; }
@@ -2595,7 +2566,7 @@ TEST_CASE("gpu_execution aggregates real AWS S3 parquet through Sirius SigV4",
 }
 
 TEST_CASE("gpu_execution S3 SQL works over TLS with the harness CA bundle",
-          "[s3][integration][sql][gpu_execution][config]")
+          "[s3][integration][sql][config]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2613,14 +2584,14 @@ TEST_CASE("gpu_execution S3 SQL works over TLS with the harness CA bundle",
       " ORDER BY n_nationkey");
 }
 
-TEST_CASE("gpu_execution S3 SQL preserves correctness with prefetch cache disabled",
-          "[s3][integration][sql][gpu_execution][config]")
+TEST_CASE("gpu_execution S3 SQL preserves correctness with cache.mode none",
+          "[s3][integration][sql][config]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
   sirius_memory_limits limits;
-  limits.enable_prefetch_cache = false;
+  limits.cache_mode = "none";
   s3_sql_fixture fixture(*env, limits);
   compare_s3_gpu_to_local_cpu(
     fixture,
@@ -2630,7 +2601,7 @@ TEST_CASE("gpu_execution S3 SQL preserves correctness with prefetch cache disabl
 }
 
 TEST_CASE("gpu_execution S3 SQL matches the local oracle with a 256 MiB GPU tier and a disk tier",
-          "[s3][integration][sql][gpu_execution][tiering]")
+          "[s3][integration][sql]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2650,12 +2621,12 @@ TEST_CASE("gpu_execution S3 SQL matches the local oracle with a 256 MiB GPU tier
 }
 
 TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracle",
-          "[.][s3][sql][large][large-count][gpu_execution][integration]")
+          "[.][s3][sql][large][large-cache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/true));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -2670,12 +2641,12 @@ TEST_CASE("gpu_execution large S3 lineitem count matches the local parquet oracl
 }
 
 TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
-          "[.][s3][sql][large][large-q1][gpu_execution][integration]")
+          "[.][s3][sql][large][large-cache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/true));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -2686,12 +2657,12 @@ TEST_CASE("gpu_execution large S3 lineitem TPC-H Q1 shape matches local CPU",
 }
 
 TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and matches local CPU",
-          "[.][s3][sql][large][large-join][gpu_execution][integration]")
+          "[.][s3][sql][large][large-cache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/true));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("sirius"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -2714,13 +2685,13 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));
 }
 
-TEST_CASE("gpu_execution large S3 lineitem count matches without prefetch cache",
-          "[.][s3][sql][large][large-count-no-prewarm][gpu_execution][integration]")
+TEST_CASE("gpu_execution large S3 lineitem count matches with cache.mode none",
+          "[.][s3][sql][large][large-nocache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/false));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("none"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -2732,13 +2703,13 @@ TEST_CASE("gpu_execution large S3 lineitem count matches without prefetch cache"
   CHECK(s3_result->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(expected_rows));
 }
 
-TEST_CASE("gpu_execution large S3 lineitem Q1 shape matches local CPU without prefetch cache",
-          "[.][s3][sql][large][large-q1-no-prewarm][gpu_execution][integration]")
+TEST_CASE("gpu_execution large S3 lineitem Q1 shape matches local CPU with cache.mode none",
+          "[.][s3][sql][large][large-nocache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/false));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("none"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
@@ -2748,13 +2719,13 @@ TEST_CASE("gpu_execution large S3 lineitem Q1 shape matches local CPU without pr
                               {6, 7, 8});
 }
 
-TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without prefetch cache",
-          "[.][s3][sql][large][large-join-no-prewarm][gpu_execution][integration]")
+TEST_CASE("gpu_execution large S3 lineitem join matches local CPU with cache.mode none",
+          "[.][s3][sql][large][large-nocache][integration]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
 
-  s3_sql_fixture fixture(*env, large_sirius_memory_limits(/*enable_prefetch_cache=*/false));
+  s3_sql_fixture fixture(*env, large_sirius_memory_limits("none"));
   auto large = read_large_lineitem_fixture(fixture, *env);
   if (!large) { return; }
 
