@@ -18,6 +18,7 @@
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
+#include <duckdb/common/virtual_file_system.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/caching_file_system.hpp>
 #include <netinet/in.h>
@@ -218,7 +219,8 @@ void load_sirius_extension(duckdb::DuckDB& db)
 
 class sirius_httpfs_config_env_guard {
  public:
-  explicit sirius_httpfs_config_env_guard(s3_test_env const& env)
+  explicit sirius_httpfs_config_env_guard(s3_test_env const& /*env*/,
+                                          bool perf_instrumentation = false)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -255,20 +257,6 @@ class sirius_httpfs_config_env_guard {
            "    scan_manager:\n"
            "      cache:\n"
            "        mode: none\n"
-           "      object_store:\n"
-           "        endpoint: "
-        << yaml_quote(env.endpoint)
-        << "\n"
-           "        region: "
-        << yaml_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << yaml_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << yaml_quote(env.secret_key)
-        << "\n"
-           "        tls_verify: false\n"
            "      rest:\n"
            "        request_timeout_s: 30\n";
     out.close();
@@ -308,7 +296,16 @@ class sirius_httpfs_fixture {
   explicit sirius_httpfs_fixture(s3_test_env const& env) : config_env(env), db(nullptr), con(db)
   {
     load_sirius_extension(db);
-    REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
+    auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    sirius::io::object_store_config object_store;
+    object_store.endpoint   = env.endpoint;
+    object_store.region     = env.region;
+    object_store.access_key = env.access_key;
+    object_store.secret_key = env.secret_key;
+    object_store.tls_verify = false;
+    context->get_config().set_object_store_config(object_store);
+    context->get_scan_manager().install_s3_config("s3://" + env.bucket, object_store);
     setenv("SIRIUS_DISABLE", "1", 1);
   }
 
@@ -361,6 +358,75 @@ class exposed_sirius_httpfs final : public sirius::io::s3::sirius_httpfs {
 };
 
 }  // namespace
+
+TEST_CASE("Sirius S3 filesystem keeps precedence over later S3 handlers", "[s3][filesystem]")
+{
+  class later_s3_fs final : public duckdb::FileSystem {
+   public:
+    bool CanHandleFile(const std::string& path) override { return path.rfind("s3://", 0) == 0; }
+    std::string GetName() const override { return "LaterS3FS"; }
+    duckdb::unique_ptr<duckdb::FileHandle> OpenFile(
+      const std::string&, duckdb::FileOpenFlags, duckdb::optional_ptr<duckdb::FileOpener>) override
+    {
+      throw duckdb::IOException("later S3 handler was selected");
+    }
+  };
+
+  duckdb::VirtualFileSystem fs;
+  fs.RegisterSubSystem(duckdb::make_uniq<sirius::io::s3::sirius_httpfs>());
+  fs.RegisterSubSystem(duckdb::make_uniq<later_s3_fs>());
+  auto const message = thrown_message([&] {
+    fs.OpenFile("s3://bucket/object.parquet", duckdb::FileFlags::FILE_FLAGS_READ, nullptr);
+  });
+  CHECK(message.find("[sirius_httpfs]") != std::string::npos);
+}
+
+TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
+          "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"a%2Fb.p"},
+                         std::string_view{"a%20b.p"},
+                         std::string_view{"a#b.p"},
+                         std::string_view{"a?b.p"},
+                         std::string_view{"100%x.p"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      auto const parsed = sirius::io::parse("s3://bkt/" + std::string{key});
+
+      CHECK(parsed.host == "bkt");
+      CHECK(parsed.path == key);
+    }
+  }
+}
+
+TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][filesystem][glob]")
+{
+  for (auto const key : {std::string_view{"plain.parquet"},
+                         std::string_view{"year=2026/part 0.parquet"},
+                         std::string_view{"nested/path/file.parquet"}}) {
+    DYNAMIC_SECTION("key=" << key)
+    {
+      CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
+    }
+  }
+}
+
+TEST_CASE("S3 literal-key implementation contains no retired URI escape or percent guard",
+          "[s3][filesystem][glob]")
+{
+  auto const root           = fs::path{SIRIUS_PROJECT_ROOT};
+  auto const source         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
+  auto const header         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.hpp");
+  auto const implementation = source + header;
+
+  auto const retired_escape  = std::string{"escape_s3_key_"} + "for_uri";
+  auto const retired_guard   = std::string{"key_has_percent_encoded_"} + "sequence";
+  auto const retired_wording = std::string{"containing a percent-"} + "encoded sequence";
+
+  CHECK(implementation.find(retired_escape) == std::string::npos);
+  CHECK(implementation.find(retired_guard) == std::string::npos);
+  CHECK(implementation.find(retired_wording) == std::string::npos);
+}
 
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {

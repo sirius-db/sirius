@@ -496,6 +496,10 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
 | `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
 
+### Programmatic S3 credentials
+
+S3 credentials are not YAML-loadable. Use `CREATE SECRET (TYPE SIRIUS_S3, ...)` for SQL-managed credentials, or set an in-memory `io::object_store_config` through `sirius_config::set_object_store_config()` before initializing the scan manager. A matching secret takes precedence over this programmatic fallback. YAML containing `sirius.executor.scan_manager.object_store` is rejected.
+
 ## Operator Parameters
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct

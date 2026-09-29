@@ -6,6 +6,7 @@
  */
 
 #include "catch.hpp"
+#include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/s3_test_env.hpp"
@@ -83,7 +84,7 @@ bool should_skip_s3_tpch_env(std::optional<s3_tpch_env> const& env)
 
 class s3_tpch_config_guard {
  public:
-  s3_tpch_config_guard(s3_tpch_env const& env, bool sf1)
+  s3_tpch_config_guard(s3_tpch_env const& /*env*/, bool sf1)
   {
     if (auto const* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       original_config_ = current;
@@ -131,22 +132,6 @@ class s3_tpch_config_guard {
         << "\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      object_store:\n"
-           "        endpoint: "
-        << sql_quote(env.endpoint)
-        << "\n"
-           "        region: "
-        << sql_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << sql_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << sql_quote(env.secret_key) << "\n";
-    if (!env.session_token.empty()) {
-      out << "        session_token: " << sql_quote(env.session_token) << "\n";
-    }
-    out << "        tls_verify: false\n"
            "      rest:\n"
            "        request_timeout_s: 30\n";
     out.close();
@@ -295,6 +280,18 @@ class s3_tpch_suite {
     gpu_db_ = std::make_unique<duckdb::DuckDB>(nullptr);
     tpch_load_sirius_extension(*gpu_db_);
     gpu_connection_ = std::make_unique<duckdb::Connection>(*gpu_db_);
+    auto context =
+      gpu_connection_->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    sirius::io::object_store_config object_store;
+    object_store.endpoint      = env_.endpoint;
+    object_store.region        = env_.region;
+    object_store.access_key    = env_.access_key;
+    object_store.secret_key    = env_.secret_key;
+    object_store.session_token = env_.session_token;
+    object_store.tls_verify    = false;
+    context->get_config().set_object_store_config(object_store);
+    context->get_scan_manager().install_s3_config("s3://" + env_.bucket, object_store);
     auto const root = "s3://" + env_.bucket + "/" + object_prefix_;
     create_views(*gpu_connection_, root, true);
     tpch_require_query_ok(*gpu_connection_, "SET gpu_execution = true;");
