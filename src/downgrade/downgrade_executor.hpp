@@ -40,6 +40,10 @@
 #include <thread>
 #include <vector>
 
+namespace sirius::io::cache {
+class prefetching_cache;
+}  // namespace sirius::io::cache
+
 namespace sirius {
 namespace parallel {
 
@@ -148,6 +152,18 @@ class downgrade_executor {
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
 
   /**
+   * @brief Wire the process-wide prefetching cache in for HOST->DISK reclaim.
+   *
+   * When this executor is bound to a HOST memory space, the processing loop consults the
+   * cache twice per request: an @c idle sweep before repository/pipeline downgrades to skim
+   * chunks with no future demand, and a @c forced sweep afterwards if the byte target is
+   * still short. Non-HOST executors ignore this pointer.
+   *
+   * May be nullptr; must be called before @ref start().
+   */
+  void set_prefetching_cache(sirius::io::cache::prefetching_cache* cache);
+
+  /**
    * @brief Asynchronously request a predicate-driven downgrade.
    *
    * Dispatches batch downgrades until the predicate returns true or candidates
@@ -216,6 +232,9 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  // Non-owning. SiriusContext outlives this executor and destroys the cache after stop().
+  // Only consulted when this executor is bound to a HOST source tier.
+  sirius::io::cache::prefetching_cache* _prefetching_cache{nullptr};
 };
 
 }  // namespace parallel

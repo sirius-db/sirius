@@ -60,6 +60,8 @@
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <io/cache/prefetching_cache.hpp>
+#include <io/io_context.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
@@ -952,6 +954,23 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // has been constructed.
   for (auto& executor : downgrade_executors_) {
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
+  }
+
+  // Wire the process-wide prefetching cache into HOST-tier downgrade executors so
+  // HOST->DISK reclaim can skim pinned cache chunks before spilling repositories.
+  // Only the local ioctx owns a prefetching_cache today; when it is absent (e.g.
+  // sirius_datasource disabled or an S3-only workload) the pointer stays null and
+  // downgrade_executor falls back to its pre-existing repository-only path.
+  {
+    sirius::io::cache::prefetching_cache* cache = nullptr;
+    if (auto* io_ctx = scan_manager_->io_ctx()) { cache = io_ctx->cache(); }
+    if (cache != nullptr) {
+      for (auto& executor : downgrade_executors_) {
+        if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+          executor->set_prefetching_cache(cache);
+        }
+      }
+    }
   }
 
   // Start everything -- downgrade executors deferred until now

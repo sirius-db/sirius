@@ -1235,6 +1235,48 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
   return true;
 }
 
+std::size_t prefetching_cache::evict(eviction::mode mode, std::size_t target_bytes)
+{
+  if (!_armed || target_bytes == 0) { return 0; }
+
+  std::size_t freed_bytes = 0;
+  // Reclaimed buffers grouped by their origin NUMA node so each group can be
+  // returned to the arena it came from (mirrors evict_loop()).
+  std::unordered_map<int, std::vector<std::byte*>> reclaim_by_numa;
+
+  // idle → mark_evicting(true): spare chunks a live request still names.
+  // forced → mark_evicting(false): reclaim any unpinned chunk, subscribers
+  //   or not. Both modes still short-circuit on pins, so an in-flight reader
+  //   is never yanked out from under.
+  bool const only_unsubscribed = (mode == eviction::mode::idle);
+
+  auto try_reclaim = [&](cached_chunk* c) {
+    if (c->state.mark_evicting(only_unsubscribed)) {
+      reclaim_by_numa[c->numa_node].push_back(reinterpret_cast<std::byte*>(c->data));
+      c->data = nullptr;
+      static_cast<void>(c->state.mark_empty());
+      freed_bytes += _chunk_size;
+      _counters.evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  std::shared_lock<std::shared_mutex> map_lock(_map_mtx);
+  for (auto& [_, fe] : _file_cache) {
+    if (freed_bytes >= target_bytes) { break; }
+    std::shared_lock<std::shared_mutex> fe_lock(fe->mtx);
+    for (cached_chunk* c : fe->slots) {
+      if (c == nullptr) { continue; }
+      if (freed_bytes >= target_bytes) { break; }
+      try_reclaim(c);
+    }
+  }
+
+  for (auto& [numa, buffers] : reclaim_by_numa) {
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
+  }
+  return freed_bytes;
+}
+
 void prefetching_cache::evict_loop(const std::stop_token& st)
 {
   std::stop_callback cb(st, [this]() {
