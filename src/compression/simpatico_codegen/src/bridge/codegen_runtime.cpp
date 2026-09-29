@@ -35,6 +35,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/cuda_check.hpp"
 #include "decode/decode_session.hpp"
 
 #include <cuda.h>
@@ -121,40 +122,20 @@ int simpatico_compact_raw_values(const void* d_padded_v,
     }                                                            \
   } while (0)
 
-#define SIMPATICO_CU_CHECK(call, ret, ...)                      \
-  do {                                                          \
-    if (CUresult _dr = (call); _dr != CUDA_SUCCESS) {           \
-      const char* _desc = nullptr;                              \
-      cuGetErrorString(_dr, &_desc);                            \
-      std::fprintf(stderr, "simpatico::codegen: " __VA_ARGS__); \
-      std::fprintf(stderr, ": %s\n", _desc ? _desc : "?");      \
-      return (ret);                                             \
-    }                                                           \
-  } while (0)
-
 namespace {
 
-// Raise MAX_DYNAMIC_SHARED_SIZE_BYTES if needed; return false and log on
-// failure (skipping cuLaunchKernel avoids CUDA_ERROR_INVALID_HANDLE cascade).
-bool maybe_raise_smem(CUfunction fn, int dynamic_bytes, const char* ctx)
+// Raise the kernel's dynamic shared-memory limit when its static plus dynamic use exceeds the
+// default 48 KiB.
+void raise_shared_memory_limit(CUfunction function, int dynamic_bytes)
 {
-  int static_smem = 0;
-  cuFuncGetAttribute(&static_smem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fn);
-  if (static_smem + dynamic_bytes <= 48 * 1024) return true;
-  if (CUresult r =
-        cuFuncSetAttribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_bytes);
-      r != CUDA_SUCCESS) {
-    const char* desc = nullptr;
-    cuGetErrorString(r, &desc);
-    std::fprintf(stderr,
-                 "simpatico::codegen: %s: "
-                 "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, %d) failed: %s\n",
-                 ctx,
-                 dynamic_bytes,
-                 desc ? desc : "?");
-    return false;
-  }
-  return true;
+  int static_bytes = 0;
+  simpatico::throw_if_cu_error(
+    cuFuncGetAttribute(&static_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function),
+    "cuFuncGetAttribute(SHARED_SIZE_BYTES)");
+  if (static_bytes + dynamic_bytes <= 48 * 1024) return;
+  simpatico::throw_if_cu_error(
+    cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic_bytes),
+    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)");
 }
 
 // Fill ``d_bp_off`` (int32[num_chunks+1]) with the exclusive-prefix scan of the
@@ -186,13 +167,11 @@ int compute_bp_offsets(const void* cc_p,
   return simpatico_compute_bp_offsets_tail(cc_p, cb_p, num_chunks, d_bp_off, stream_v);
 }
 
-// Render-side kernel compile: optionally dump the source (``dump_env`` names an
-// env var holding a path), then compile-or-warm-cache the rendered source.
-// The encode bridge keeps its existing nullptr-on-compilation-failure contract.
+// Optionally dump the rendered source to the path named by the `dump_env` variable, then compile it
+// or take it from the kernel cache. Compilation failures propagate as jit::CompileError.
 std::shared_ptr<jit::CompiledKernel const> compile_rendered(const std::string& source,
                                                             const std::string& entry_symbol,
-                                                            const char* dump_env,
-                                                            const char* ctx)
+                                                            const char* dump_env)
 {
   if (const char* dump = std::getenv(dump_env)) {
     if (FILE* fp = std::fopen(dump, "w")) {
@@ -202,30 +181,10 @@ std::shared_ptr<jit::CompiledKernel const> compile_rendered(const std::string& s
   }
   jit::CompileOptions opts;
   opts.arch_cc = jit::arch_cc_for_current_device();
-  try {
-    auto kernel = jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
-    if (kernel == nullptr || kernel->kern == nullptr) {
-      std::fprintf(stderr, "simpatico::codegen: %s: null kernel\n", ctx);
-      return nullptr;
-    }
-    return kernel;
-  } catch (const jit::CompileError& e) {
-    std::fprintf(stderr,
-                 "simpatico::codegen: %s: nvrtc rejected source: %s\n--- log ---\n%s\n",
-                 ctx,
-                 e.what(),
-                 e.log.c_str());
-    return nullptr;
-  }
-}
-
-void check_decode_driver(CUresult status, char const* operation)
-{
-  if (status == CUDA_SUCCESS) return;
-  char const* description = nullptr;
-  cuGetErrorString(status, &description);
-  throw std::runtime_error(std::string{"simpatico decode: "} + operation + ": " +
-                           (description ? description : "unknown CUDA driver error"));
+  auto kernel  = jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
+  if (!kernel || !kernel->kern)
+    throw std::runtime_error("simpatico::codegen: null compiled kernel");
+  return kernel;
 }
 
 // CUDA consumes the argument values during this call. The frame keeps the loaded module until the
@@ -236,41 +195,22 @@ void launch_decode_kernel(cdj::DecodeKernelSpec const& spec,
                           unsigned grid,
                           simpatico::decode_frame& frame)
 {
-  if (char const* dump = std::getenv("CODEGEN_JIT_DUMP_DECODE_SOURCE")) {
-    if (FILE* fp = std::fopen(dump, "w")) {
-      std::fwrite(spec.source.data(), 1, spec.source.size(), fp);
-      std::fclose(fp);
-    }
-  }
-  jit::CompileOptions options;
-  options.arch_cc = jit::arch_cc_for_current_device();
-  auto kernel =
-    jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, options);
-  if (!kernel || !kernel->kern) throw std::runtime_error("simpatico decode: null compiled kernel");
+  auto kernel = compile_rendered(spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE");
   frame.keep_kernel(kernel);
-  auto function    = kernel->func_for_current_device();
-  int static_bytes = 0;
-  check_decode_driver(
-    cuFuncGetAttribute(&static_bytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function),
-    "query shared-memory size");
-  if (static_bytes + spec.shared_bytes > 48 * 1024) {
-    check_decode_driver(cuFuncSetAttribute(function,
-                                           CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                           static_cast<int>(spec.shared_bytes)),
-                        "set dynamic shared-memory size");
-  }
-  check_decode_driver(cuLaunchKernel(function,
-                                     grid,
-                                     1,
-                                     1,
-                                     static_cast<unsigned>(spec.block_x),
-                                     1,
-                                     1,
-                                     static_cast<unsigned>(spec.shared_bytes),
-                                     reinterpret_cast<CUstream>(frame.stream().get()),
-                                     args,
-                                     nullptr),
-                      "launch kernel");
+  auto function = kernel->func_for_current_device();
+  raise_shared_memory_limit(function, static_cast<int>(spec.shared_bytes));
+  simpatico::throw_if_cu_error(cuLaunchKernel(function,
+                                              grid,
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(spec.block_x),
+                                              1,
+                                              1,
+                                              static_cast<unsigned>(spec.shared_bytes),
+                                              reinterpret_cast<CUstream>(frame.stream().get()),
+                                              args,
+                                              nullptr),
+                               "simpatico decode: cuLaunchKernel");
 }
 
 }  // namespace
@@ -1155,9 +1095,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     // same fused-tree shape and dtype hits the cached compile —
     // including different files / different num_rows.  Cache owns the
     // CompiledKernel; this handle retains it through this bridge call.
-    auto kernel = compile_rendered(
-      spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_ENCODE_SOURCE", "cpp encode");
-    if (kernel == nullptr) { return -1; }
+    auto kernel =
+      compile_rendered(spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_ENCODE_SOURCE");
 
     // Allocate one rmm::device_buffer per EncodeBufferSpec.  Buffers are moved
     // into cudf::columns during rep construction below — the vector
@@ -1199,22 +1138,20 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     for (auto& p : dev_ptrs)
       args.push_back(&p);
 
-    if (!maybe_raise_smem(
-          kernel->func_for_current_device(), static_cast<int>(spec.shared_bytes), "cpp encode"))
-      return -1;
-    SIMPATICO_CU_CHECK(cuLaunchKernel(kernel->func_for_current_device(),
-                                      static_cast<unsigned>(num_chunks),
-                                      1,
-                                      1,
-                                      static_cast<unsigned>(spec.block_x),
-                                      1,
-                                      1,
-                                      static_cast<unsigned>(spec.shared_bytes),
-                                      stream.get(),
-                                      args.data(),
-                                      nullptr),
-                       -1,
-                       "cpp encode: cuLaunchKernel failed");
+    auto function = kernel->func_for_current_device();
+    raise_shared_memory_limit(function, static_cast<int>(spec.shared_bytes));
+    simpatico::throw_if_cu_error(cuLaunchKernel(function,
+                                                static_cast<unsigned>(num_chunks),
+                                                1,
+                                                1,
+                                                static_cast<unsigned>(spec.block_x),
+                                                1,
+                                                1,
+                                                static_cast<unsigned>(spec.shared_bytes),
+                                                stream.get(),
+                                                args.data(),
+                                                nullptr),
+                                 "cpp encode: cuLaunchKernel");
 
     // Per-node post-processing + rep construction.
     //
@@ -1669,6 +1606,12 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     // region's boundary outputs are scheduled by the recursive compress walk
     // (CompressWalk::emit_fused_step), not here.
     return 1;
+  } catch (const jit::CompileError& e) {
+    std::fprintf(stderr,
+                 "simpatico::codegen: cpp encode: nvrtc rejected source: %s\n--- log ---\n%s\n",
+                 e.what(),
+                 e.log.c_str());
+    return -1;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "simpatico::codegen: cpp encode: exception: %s\n", e.what());
     return -1;
