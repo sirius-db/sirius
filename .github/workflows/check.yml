@@ -14,11 +14,9 @@
 name: Check
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -110,7 +108,7 @@ jobs:
             cudf-channel: nightly
             run-on-pr: false
         exclude:
-          # On PRs, drop rows marked merge/main-only; on merge_group/main, match nothing.
+          # On PRs, drop non-PR rows; otherwise, run the full matrix.
           - build:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
