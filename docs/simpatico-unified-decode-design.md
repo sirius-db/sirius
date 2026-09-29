@@ -8,7 +8,7 @@ Every decode entry point (single column, table, predicate, mask, selected rows, 
 
 `decode_frame` is one request's context: its stream (assigned in rotation; `next_stream` reports the next assignment), the memory resource, and the host state its queued work may still read (`host_array` uploads and compiled-kernel pins). It owns no device memory. The session keeps each frame and a copy of its request until the final drain, so predicate strings, descriptors and probe captures outlive pending work.
 
-`DecodeWalk` interprets the plan, owns the structural memo, and targets predicate and selection semantics at the final value producer. Codec leaves take the frame and return an owning column; they do not know whether the caller decodes one column or a table.
+`DecodeWalk` interprets the plan, owns the structural memo, and targets predicate and selection semantics at the final value producer. Codec leaves take the frame and return an owning column; they do not know whether the caller decodes one column or a table. A non-codegen node's representation is rebuilt from its decoded channels by `reconstruct_decode_representation`, which shares its validation with the loader's `reconstruct_representation`.
 
 ## Completed public boundaries
 
@@ -37,7 +37,7 @@ A call-time ledger such as cuCascade's `reservation_aware_resource_adaptor` cred
 
 ## Errors and semantic decline
 
-Semantic declines (an unsupported shape, an unselective batch, every membership probe declining) fall back to ordinary decoding. Submitted execution failures, including typed allocation (cuCascade OOM subtypes) and compilation failures, propagate unchanged after draining; they are never retried as ordinary decoding. Public compatibility functions keep their null/false plus `error_out` contract for host validation and explicit decline only.
+Semantic declines (an unsupported shape, an unselective batch, every membership probe declining, a null-masked `full` column that a selected decode reports as `unsupported_nullable_selection`) fall back to ordinary decoding. Submitted execution failures, including typed allocation (cuCascade OOM subtypes) and compilation failures, propagate unchanged after draining; they are never retried as ordinary decoding. Public compatibility functions keep their null/false plus `error_out` contract for host validation and explicit decline only.
 
 `finish` checks each distinct stream that received a request, including work queued there after the last request; it reports its first failure. A supplied stream that received no request is not waited for, so a phase that queues its own work on a lane completes that lane itself: the scan-filter phase joins only the lanes that produced wave-1 sources, orders only index-consuming lanes after the indices kernel, and synchronizes its own gather lanes. Append and finish failures make the session terminal and publish no results. Borrowed mask contents after a failed request are unspecified.
 
@@ -56,4 +56,4 @@ Decode waits only where the host needs data to size or publish something:
 
 ### Dictionary width publication
 
-The dictionary factory computes an immutable uniform key width (positive, or 0 for variable/empty keys) before publishing, with one CUB transform-reduction whose result is read back through the calling thread's pinned staging slab. A published `PlanTree` also carries it on the dictionary node as `PlanNode::dictionary_key_width_hint` (never serialized): the compress walk copies the prepared width and the reader derives it from the stored identity `keys_offsets` or self-stored representation. Decode publishes the hint on the representation it rebuilds and the gather specialization uses it instead of a readback; reconstructions without a hint measure it into local storage with one checked scalar observation.
+The dictionary factory computes an immutable uniform key width (positive, or 0 for variable/empty keys) before publishing, with one CUB transform-reduction whose result is read back through the calling thread's pinned staging slab. A published `PlanTree` also carries it on the dictionary node as `PlanNode::dictionary_key_width_hint` (never serialized): the compress walk copies the prepared width and the reader derives it from the stored identity `keys_offsets` or self-stored representation. Decode publishes the hint on the representation it rebuilds and the gather specialization uses it instead of a readback; reconstructions without a hint measure it with the same reduction.
