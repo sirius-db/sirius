@@ -371,7 +371,7 @@ TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sib
   if (device_count < 2) {
     WARN(
       "non-plan-GPU source skip requires >=2 GPUs; single-GPU host -- skipping "
-      "(per Catch2 v2 WARN+return convention)");
+      "(per Catch2 WARN+return convention)");
     return;
   }
 

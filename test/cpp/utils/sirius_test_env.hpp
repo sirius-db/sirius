@@ -109,7 +109,7 @@ extern shared_test_env* g_integration_env_2gpu;
  *
  * Caller is responsible for resume()/pause() lifecycle if not using the Catch2
  * listener's tag-based mechanism. On single-GPU hosts when num_gpus == 2, returns
- * nullptr (caller should WARN+return per Catch2 v2 convention).
+ * nullptr (caller should WARN+return per Catch2 convention).
  *
  * @param num_gpus 1 returns g_integration_env; 2 returns g_integration_env_2gpu
  *                 (or nullptr on single-GPU host); other values return nullptr.

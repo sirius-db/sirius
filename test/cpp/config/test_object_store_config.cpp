@@ -268,10 +268,11 @@ TEST_CASE("sirius_config rejects shadowed REST TLS YAML keys", "[config][s3][res
                  key + ": " + value + "\n");
 
     sirius::sirius_config cfg;
-    REQUIRE_THROWS_WITH(
-      cfg.load_from_file(path),
-      Catch::Contains("'sirius.executor.scan_manager.rest." + key + "': removed; configure '") &&
-        Catch::Contains("sirius.executor.scan_manager.object_store." + key + "' instead"));
+    REQUIRE_THROWS_WITH(cfg.load_from_file(path),
+                        Catch::Matchers::ContainsSubstring("'sirius.executor.scan_manager.rest." +
+                                                           key + "': removed; configure '") &&
+                          Catch::Matchers::ContainsSubstring(
+                            "sirius.executor.scan_manager.object_store." + key + "' instead"));
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -312,8 +313,9 @@ TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][
              "        max_connections: 7\n");
 
   sirius::sirius_config cfg;
-  REQUIRE_THROWS_WITH(cfg.load_from_file(path),
-                      Catch::Contains("unknown config key: 'max_connections' in rest"));
+  REQUIRE_THROWS_WITH(
+    cfg.load_from_file(path),
+    Catch::Matchers::ContainsSubstring("unknown config key: 'max_connections' in rest"));
   CHECK(cfg.get_scan_manager_config().rest.max_connections == 64);
 
   std::error_code ec;

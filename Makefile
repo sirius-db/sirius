@@ -83,7 +83,7 @@ clang-tsan: build/clang-tsan/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
 
 ci-release: build/ci-release/build.ninja
-	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(BUILD_TARGETS)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(MAIN_BUILD_TARGETS)
 
 configure_ci:
 	@echo "configure_ci step is skipped for this extension build..."
@@ -103,6 +103,7 @@ test_reldebug: relwithdebinfo
 	./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest
 
 test_ci-release: ci-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
 	./build/ci-release/extension/sirius/test/cpp/sirius_unittest
 
 clean:
