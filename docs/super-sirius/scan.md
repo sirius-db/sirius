@@ -291,6 +291,12 @@ folds appends and deletes into the image, and the superseded pin becomes an ordi
 served by a fresh read; a checkpoint taken *before* the recreate proves nothing. Either way
 `CALL unpin_table(...)` then `pin_table` again to cache the new table.
 
+Prepared `sirius_knn_search` statements also resolve the qualified table name in the executing
+transaction's catalog before accessing the pin or ANN cache. If its catalog/storage identity
+differs from the bound identity, execution fails with an instruction to re-pin and prepare again.
+Refreshing only the cache key would leave the prepared output types and vector dimension stale.
+A dropped table fails catalog lookup. This check applies to both exact and ANN searches.
+
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
 ### Re-pin semantics

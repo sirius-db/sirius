@@ -2425,6 +2425,21 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
   // non-owning. The slot also serializes the current-device-resource swap the build does.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
 
+  // A prepared table function can retain its bind data across DDL: the table
+  // name is a string argument, not a bound table scan dependency. Compare with
+  // the catalog visible to this execution before looking up either cache.
+  // Do not just refresh req's identity: its output types and vector dimension
+  // were also fixed at bind time and may no longer describe the current table.
+  auto const& req = bind_data.req;
+  auto& entry =
+    Catalog::GetEntry<TableCatalogEntry>(context, req.catalog, req.schema, req.table_name);
+  if (!entry.IsDuckTable() ||
+      !req.table_identity.matches({entry.oid, entry.GetStorage().GetRowGroupCollection()})) {
+    throw InvalidInputException(
+      "sirius_knn_search: table '" + req.table_name +
+      "' changed since the query was bound; re-pin the table and prepare the query again");
+  }
+
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
   state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(

@@ -1194,6 +1194,87 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("SELECT * FROM unpin_table('vs_stale');");
 }
 
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - prepared search rejects a replaced table",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  auto const use_index = GENERATE(false, true);
+  INFO("use_index = " << use_index);
+  run_ok(
+    "CREATE TABLE vs_prepared_identity AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec "
+    "FROM range(2000) t(i);");
+  run_ok("CHECKPOINT;");
+  auto pin_and_index = [&] {
+    run_ok(
+      "SELECT * FROM pin_table(name => 'vs_prepared_identity', tier => 'gpu', "
+      "format => 'duckdb');");
+    if (use_index) {
+      run_ok(
+        "SELECT * FROM sirius_create_ann_index('vs_prepared_identity', 'vec', "
+        "metric => 'l2', n_lists => 16);");
+    }
+  };
+  pin_and_index();
+  std::string const search =
+    "SELECT id FROM sirius_knn_search('vs_prepared_identity', 'vec', "
+    "[0.0, 0.0, 0.0]::FLOAT[3], k => 1, output_columns => ['id'], n_probes => 16, "
+    "use_index => " +
+    std::string(use_index ? "true" : "false") + ");";
+  run_ok("PREPARE vs_identity_search AS " + search);
+  REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+          std::vector<std::vector<std::string>>{{"0"}});
+  REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+          std::vector<std::vector<std::string>>{{"0"}});
+
+  // Keep the old storage alive, as an older transaction can. An expired weak
+  // reference must not accidentally hide the stale bind-data/cache-key bug.
+  auto const original = table_identity(*con, attach_alias, "vs_prepared_identity");
+  auto old_storage    = original.row_groups.lock();
+  REQUIRE(old_storage);
+  bool dropped_only = false;
+  SECTION("PREPARE then DROP and CREATE then EXECUTE")
+  {
+    run_ok("DROP TABLE vs_prepared_identity;");
+    run_ok(
+      "CREATE TABLE vs_prepared_identity AS SELECT i AS id, "
+      "[2000 - i, 0, 0]::FLOAT[3] AS vec FROM range(2000) t(i);");
+  }
+  SECTION("PREPARE then same-type ALTER then EXECUTE")
+  {
+    run_ok(
+      "ALTER TABLE vs_prepared_identity ALTER COLUMN vec TYPE FLOAT[3] "
+      "USING [2000 - id, 0, 0]::FLOAT[3];");
+  }
+  SECTION("PREPARE then DROP then EXECUTE")
+  {
+    run_ok("DROP TABLE vs_prepared_identity;");
+    dropped_only = true;
+  }
+
+  // The old pin (and ANN index, when enabled) is deliberately still present
+  // and still matches the prepared identity. Execution must consult the catalog.
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  REQUIRE(sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+            attach_alias, "main", "vs_prepared_identity", original) != nullptr);
+  expect_error(*con,
+               "EXECUTE vs_identity_search;",
+               dropped_only ? "does not exist" : "changed since the query was bound");
+
+  run_ok("SELECT * FROM unpin_table('vs_prepared_identity');");
+  if (!dropped_only) {
+    run_ok("CHECKPOINT;");
+    pin_and_index();
+    // Re-pinning cannot update a prepared query's bound schema/identity.
+    expect_error(*con, "EXECUTE vs_identity_search;", "changed since the query was bound");
+    run_ok("PREPARE vs_identity_search AS " + search);
+    REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+            std::vector<std::vector<std::string>>{{"1999"}});
+    run_ok("SELECT * FROM unpin_table('vs_prepared_identity');");
+  }
+  run_ok("DEALLOCATE vs_identity_search;");
+}
+
 // Re-pinning a recreated table without rebuilding its ANN index leaves the index
 // holding the dropped table's vectors and row positions. The search must refuse.
 TEST_CASE_METHOD(VectorSearchFixture,
