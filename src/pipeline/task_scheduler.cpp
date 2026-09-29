@@ -121,6 +121,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
       SIRIUS_LOG_ERROR("task_scheduler: refusing work for unknown query {}", query_id);
     }
     if (!submission) { return; }
+    task->retain_work(submission.take_work_lease());
   }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({
@@ -256,6 +257,8 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
   // queue before the gate refused its successor, so sweep this query once more.
   _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
+  if (_query_lifecycle) { _query_lifecycle->wait_for_work(query_id); }
+
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
 }
 
@@ -299,6 +302,7 @@ void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
     throw;
   }
   if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
+  if (_query_lifecycle) { _query_lifecycle->wait_for_work(query_id); }
 }
 
 void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
@@ -421,8 +425,10 @@ void task_scheduler::management_eventloop()
       // // load-bearing — verification greps depend on it.
       // SIRIUS_LOG_INFO(
       //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
-      _gpu_executors.at(device_id)->schedule(std::move(task));
-      it = _ready_devices.erase(it);
+      if (_gpu_executors.at(device_id)->schedule(std::move(task))) {
+        it = _ready_devices.erase(it);
+      }
+      // Refusal does not consume the parked executor's readiness. Try its next task.
     }
   }
 }

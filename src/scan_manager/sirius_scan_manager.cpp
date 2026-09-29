@@ -2063,6 +2063,11 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
   return it == _query_states.end() ? nullptr : it->second;
 }
 
+void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
+{
+  if (auto state = get_query_state(query_id)) { state->drain(); }
+}
+
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
 {
   std::shared_ptr<query_scan_manager_state> state;

@@ -124,7 +124,25 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
 {
 }
 
-sirius_engine::~sirius_engine() { query_handle_->exit(); }
+sirius_engine::~sirius_engine()
+{
+  // The engine is the execution owner of the physical plan. Retire asynchronous users here,
+  // including partially initialized executions, before member destruction can release operators.
+  cancel_dynamic_filter_publications();
+  if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      runtime && runtime->is_initialized()) {
+    try {
+      runtime->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
+      runtime->get_scan_manager().quiesce(query_id_);
+      runtime->get_task_scheduler().drain_after_error(query_id_);
+    } catch (...) {
+      // An unproven drain cannot be followed by freeing borrowed operators. This is a broken
+      // shared invariant, not an ordinary SQL error; terminating is preferable to a latent UAF.
+      std::terminate();
+    }
+  }
+  query_handle_->exit();
+}
 
 void sirius_engine::reset()
 {
@@ -232,11 +250,15 @@ void sirius_engine::execute()
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
+    sirius_ctx->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
+    sirius_ctx->get_scan_manager().quiesce(query_id_);
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
+    sirius_ctx->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
+    sirius_ctx->get_scan_manager().quiesce(query_id_);
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }

@@ -518,6 +518,9 @@ void gpu_pipeline_executor::process_task(
           pipeline_task->telemetry_handle().exit();
           pipeline_task->set_telemetry_finalized();
         }
+        // Destruction updates pipeline completion. Keep its lifetime claim through the
+        // epilogue, which still dereferences the pipeline and schedules its consumers.
+        auto completed_work = task->take_work_lease();
         task.reset();
 
         // Check if query is complete BEFORE scheduling downstream tasks.

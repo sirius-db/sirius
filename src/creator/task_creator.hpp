@@ -77,6 +77,8 @@ namespace sirius::creator {
  */
 
 struct task_creation_request {
+  // Lives from publication through the final creator callback, including the pop/attach gap.
+  exec::query_lifecycle_registry::work_lease work;
   op::sirius_physical_operator* node;
   request_type type = request_type::active;
   //! The query `node` belongs to. Indexes the request in the creation queue so a finished or

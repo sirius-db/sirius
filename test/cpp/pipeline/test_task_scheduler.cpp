@@ -547,3 +547,37 @@ TEST_CASE("scheduler error cleanup waits for publishers before its existing drai
   CHECK(publishers_at_destruction == 0);  // The drain happened after publication settled.
   lifecycle.close(q);
 }
+
+TEST_CASE("scheduler retirement waits for a task removed from its queue",
+          "[task_scheduler][query_lifecycle_gate][concurrency]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
+  scheduler.set_query_lifecycle_registry(&lifecycle);
+  const auto q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  auto global = std::make_shared<mock_gpu_pipeline_task_global_state>();
+  scheduler.schedule(std::make_unique<mock_gpu_pipeline_task>(
+    1, std::make_unique<mock_gpu_pipeline_task_local_state>(1, 0), global));
+  REQUIRE(lifecycle.activity(q).work == 1);
+  auto held = scheduler.get_pipeline_task_queue()->pop();
+  REQUIRE(held);
+  REQUIRE(lifecycle.activity(q).work == 1);
+
+  std::atomic<bool> drained{false};
+  std::thread cleanup([&] {
+    scheduler.drain_after_error(q);
+    drained.store(true);
+  });
+  // Wait for the observable gate transition, not a timing assumption about thread startup.
+  while (lifecycle.accepts_work(q)) {
+    std::this_thread::yield();
+  }
+  CHECK_FALSE(drained.load());
+  held.reset();
+  cleanup.join();
+  CHECK(drained.load());
+  CHECK(lifecycle.activity(q).work == 0);
+  lifecycle.close(q);
+}

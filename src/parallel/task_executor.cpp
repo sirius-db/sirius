@@ -48,7 +48,7 @@ itask_executor::itask_executor(
 
 itask_executor::~itask_executor() { stop(); }
 
-void itask_executor::schedule(std::unique_ptr<itask> input)
+bool itask_executor::schedule(std::unique_ptr<itask> input)
 {
   // Declared before task so an exception destroys unsubmitted work before settling its publisher.
   exec::query_lifecycle_registry::submission_guard submission;
@@ -67,7 +67,8 @@ void itask_executor::schedule(std::unique_ptr<itask> input)
         }
         SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
       }
-      if (!submission) { return; }
+      if (!submission) { return false; }
+      task->retain_work(submission.take_work_lease());
     }
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
@@ -78,7 +79,9 @@ void itask_executor::schedule(std::unique_ptr<itask> input)
   }
   if (!_task_queue.push(std::move(task))) {
     SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
+    return false;
   }
+  return true;
 }
 
 void itask_executor::start()
@@ -213,20 +216,14 @@ void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
 
 void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
 {
-  // Error-path counterpart of wait_and_validate_empty: let in-flight work finish so no thread is
-  // still touching the failing query's plan, then drop that query's queued tasks.
-  //
-  // This one KEEPS the quiesce bracket, deliberately. Unlike the success path, a failing query can
-  // still have tasks sitting in the queue that the manager is free to pop at any moment, and there
-  // is a window between pop() and slot::attach() where the task belongs to neither the queue nor
-  // the per-query slot count. Joining the manager is what closes it: after that, no task can be
-  // in-hand. The caller's next act is to let the plan be destroyed, so "almost certainly quiesced"
-  // is not good enough here.
-  //
-  // What did change: the drain in the middle is per-query. The original cleared the ENTIRE queue,
-  // destroying every co-tenant's queued work and leaving those queries waiting on completions that
-  // could never arrive. The residual cost is that co-tenant pushes are refused across the bracket
-  // — on the error path only, not on every successful completion as before.
+  // Production tasks carry leases from publication, including manager-local tasks. The
+  // scheduler drains every queue before waiting for those leases. No shared thread is stopped.
+  if (_query_lifecycle) {
+    drain_query_tasks(query_id);
+    if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
+    return;
+  }
+  // Standalone executors without lifecycle accounting still need the legacy join.
   if (!_bounded_pool) {
     drain_query_tasks(query_id);
     return;

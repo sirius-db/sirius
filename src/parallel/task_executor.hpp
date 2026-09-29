@@ -74,7 +74,7 @@ class itask_executor {
    * A no-op when the lifecycle gate reports that the task's query is tearing down: the OOM
    * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
-  void schedule(std::unique_ptr<itask> task);
+  bool schedule(std::unique_ptr<itask> task);
 
   /**
    * @brief Bind the per-query lifecycle gate consulted before enqueuing.

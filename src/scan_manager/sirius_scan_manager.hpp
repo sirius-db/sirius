@@ -536,6 +536,8 @@ class sirius_scan_manager {
   ///
   /// Blocking — waits out this query's in-flight reads. The wait happens OUTSIDE the state
   /// mutex, so another connection's prepare_for_query is never parked behind it.
+  // Stop producers while retaining providers/buffers until downstream retirement.
+  void quiesce(sirius::query_id_t query_id);
   void reset(sirius::query_id_t query_id);
 
   /// \brief Drop every query's state. Teardown only (stop(), the destructor, and the

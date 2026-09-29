@@ -411,28 +411,40 @@ class multi_index_priority_queue {
     _cv.notify_all();
   }
 
-  /// Drops every queued task (destroying them) and empties all indexes.
+  /// Detach under the mutex; destructors can publish callbacks or release query leases.
+  /// Never invoke them while holding a queue lock.
   void drain()
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _levels.clear();
-    _query_levels.clear();
-    _operator_levels.clear();
-    _by_device.clear();
-    _size = 0;
+    level_map discarded;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      discarded.swap(_levels);
+      _query_levels.clear();
+      _operator_levels.clear();
+      _by_device.clear();
+      _size = 0;
+    }
   }
 
-  /// Drops every queued task belonging to the given query, removing them from all
-  /// indexes. Tasks of other queries are untouched.
+  /// Drop only this query. Splicing nodes does not allocate and preserves callbacks until
+  /// after all indexes have been updated and the lock released.
   void drain(const query_index& idx)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    const auto qit = _query_levels.find(idx.value);
-    if (qit == _query_levels.end()) { return; }
-    // Snapshot the level set first: drop_level() mutates (and may erase) it.
-    const std::vector<queue_priority> levels(qit->second.begin(), qit->second.end());
-    for (const queue_priority prio : levels) {
-      drop_level(prio);
+    std::list<node> discarded;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto qit = _query_levels.find(idx.value);
+      while (qit != _query_levels.end()) {
+        const auto prio = *qit->second.begin();
+        auto lit        = _levels.find(prio);
+        for (auto& n : lit->second.tasks) {
+          erase_from_device(n.keys.device_id, prio, n.device_it);
+          --_size;
+        }
+        discarded.splice(discarded.end(), lit->second.tasks);
+        remove_level(lit);
+        qit = _query_levels.find(idx.value);
+      }
     }
   }
 
