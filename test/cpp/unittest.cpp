@@ -157,9 +157,7 @@ int main(int argc, char* argv[])
   scan_env.pause();
   sirius::test::g_shared_env = &scan_env;
 
-  auto integration_config_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
-                                 "integration" / "integration.yaml";
-  sirius::test::shared_test_env integration_env(integration_config_path);
+  sirius::test::shared_test_env integration_env(sirius::test::integration_config_path());
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
 

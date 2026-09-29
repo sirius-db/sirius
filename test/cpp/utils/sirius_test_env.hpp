@@ -25,6 +25,9 @@
 
 namespace sirius::test {
 
+// SIRIUS_TEST_INTEGRATION_CONFIG selects the config for shared and child-process fixtures.
+std::filesystem::path integration_config_path();
+
 /**
  * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
  *

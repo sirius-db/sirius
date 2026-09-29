@@ -178,7 +178,7 @@ jobs:
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
 
-      # One Catch2 shard per GPU. Each shard sees only its own GPU; [multi_gpu]
+      # Two Catch2 shards per GPU. Each shard sees only its assigned GPU; [multi_gpu]
       # tests run afterwards with all GPUs. Declaration order keeps tests using
       # the same shared environment together.
       - name: Run C++ unit tests
@@ -191,22 +191,24 @@ jobs:
             echo "::error::Expected at least 2 GPUs, found $gpus" >&2
             exit 1
           fi
-          for ((i = 0; i < gpus; i++)); do
+          shards=$((2 * gpus))
+          export SIRIUS_TEST_INTEGRATION_CONFIG="$PWD/test/cpp/integration/integration-shard.yaml"
+          for ((i = 0; i < shards; i++)); do
             mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
             # Stream each shard live with a prefix; keep its full log for the failure summary.
             {
               status=0
               started_at=$(date +%s)
-              CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_TEST_LOG_DIR="$log_root/shard-$i" \
+              CUDA_VISIBLE_DEVICES=$((i % gpus)) SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_TEST_LOG_DIR="$log_root/shard-$i" \
                 TMPDIR="/tmp/shard-$i" \
                 timeout 45m "$bin" --abort --order decl --durations yes \
-                  --shard-count "$gpus" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
+                  --shard-count "$shards" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
               echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
             } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
           done
           wait
           status=0
-          for ((i = 0; i < gpus; i++)); do
+          for ((i = 0; i < shards; i++)); do
             summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
             if ! read -r shard_status elapsed < "/tmp/shard-$i.status"; then
               shard_status=missing

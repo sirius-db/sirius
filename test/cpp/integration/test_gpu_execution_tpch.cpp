@@ -94,7 +94,7 @@ class GPUExecutionFixtureBase {
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
       // Fallback: create an isolated DuckDB (e.g. when running a single test directly)
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
+      auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 

@@ -24,6 +24,15 @@
 
 namespace sirius::test {
 
+std::filesystem::path integration_config_path()
+{
+  if (auto const* path = std::getenv("SIRIUS_TEST_INTEGRATION_CONFIG"); path && *path) {
+    return std::filesystem::absolute(path);
+  }
+  return std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" /
+         "integration.yaml";
+}
+
 namespace {
 
 void trim_cuda_memory_pools()
