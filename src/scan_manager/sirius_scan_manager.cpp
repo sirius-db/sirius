@@ -2001,7 +2001,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto* rest = rest_ioctx_for_list(s3_prefix_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2016,7 +2016,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto* rest = rest_ioctx_for_list(s3_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2026,50 +2026,91 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
-  // Normalize here so every caller (incl. the scan resolver, which forwards raw
-  // ingestible paths) routes `file://` the same way create_datasource does.
+  // Normalize raw ingestible paths before routing, including file:// URIs.
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type);
+  return ioctx_for_type(*type, file_path);
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type)
+  sirius::io::io_context_type type, std::string_view path)
 {
-  // The local default `_io_ctx` already serves uring/kvikio; only an off-default
-  // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
-  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
+  auto const file_path = path.empty() ? std::string{} : normalize_path(std::string(path));
+  std::uint64_t config_id = 0;
+  std::shared_ptr<const sirius::io::object_store_config> resolved_config;
+  if (type == sirius::io::io_context_type::restful && !file_path.empty()) {
+    if (auto snapshot = _s3_configs.resolve(file_path)) {
+      config_id       = snapshot->id;
+      resolved_config = std::move(snapshot->config);
+    }
+  }
+  // ID 0 denotes the manager's default config; installed snapshots have
+  // unique non-zero IDs, so a credential rotation cannot reuse an old ioctx.
+  auto const cache_key = routed_ioctx_key{type, config_id};
+  if (_io_ctx && _io_ctx->type() == type && !resolved_config) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
-  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
-  // park every concurrent lookup behind one long critical section. The build
-  // mutex serializes builders instead, so two first-touches of the same type
-  // never construct twice (a losing ioctx would need drain/stop teardown).
-  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  // Serialize construction, not ordinary lookups. A waiting builder rechecks
+  // the scope so it cannot publish an ioctx with superseded credentials.
+  std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
+  if (type == sirius::io::io_context_type::restful && !file_path.empty()) {
+    auto latest          = _s3_configs.resolve(file_path);
+    auto const latest_id = latest ? latest->id : 0;
+    if (latest_id != config_id) {
+      build_lk.unlock();
+      return ioctx_for_type(type, file_path);
+    }
+  }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  auto io_ctx = _ioctx_registry.make_ioctx(type);
+  auto backend_config = _config;
+  if (resolved_config) { backend_config.object_store = *resolved_config; }
+  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
-sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
+sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list(std::string_view path)
 {
-  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
+  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful, path);
   return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+}
+
+void sirius_scan_manager::install_s3_config(std::string_view path,
+                                            sirius::io::object_store_config config)
+{
+  auto scope = normalize_path(std::string(path));
+  std::shared_ptr<sirius::io::ioctx> retired;
+  {
+    // Existing in-flight users retain shared ownership of the old context.
+    std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+    auto superseded_id = _s3_configs.install(scope, std::move(config));
+    if (superseded_id) {
+      std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
+      auto it = _routed_io_ctxs.find(
+        routed_ioctx_key{sirius::io::io_context_type::restful, *superseded_id});
+      if (it != _routed_io_ctxs.end()) {
+        retired = std::move(it->second);
+        _routed_io_ctxs.erase(it);
+      }
+    }
+  }
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept

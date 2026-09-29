@@ -316,6 +316,16 @@ class sirius_config_env_guard {
                                    std::optional<std::string> ca_bundle    = std::nullopt,
                                    std::optional<bool> tls_verify          = std::nullopt)
   {
+    object_store_.endpoint       = endpoint.value_or(env.endpoint);
+    object_store_.region         = env.region;
+    object_store_.access_key     = env.access_key;
+    object_store_.secret_key     = env.secret_key;
+    object_store_.session_token  = env.session_token;
+    object_store_.ca_bundle_path = ca_bundle.value_or("");
+    object_store_.tls_verify     = tls_verify.value_or(false);
+    if (signing_mode.has_value()) {
+      REQUIRE(sirius::io::string_to_enum(*signing_mode, object_store_.s3_signing_mode));
+    }
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
       original_config_env_     = current;
@@ -331,7 +341,6 @@ class sirius_config_env_guard {
     fs::create_directories(dir_);
 
     std::ofstream out(config_path_);
-    auto const object_endpoint = endpoint.value_or(env.endpoint);
     out << "sirius:\n"
            "  space:\n"
            "    gpu:\n"
@@ -373,32 +382,6 @@ class sirius_config_env_guard {
       REQUIRE(sirius::scan_manager::enum_to_string(*limits.backend, backend_name));
       out << "      backend: " << backend_name << "\n";
     }
-    out << "      object_store:\n"
-           "        endpoint: "
-        << yaml_quote(object_endpoint)
-        << "\n"
-           "        region: "
-        << yaml_quote(env.region)
-        << "\n"
-           "        access_key: "
-        << yaml_quote(env.access_key)
-        << "\n"
-           "        secret_key: "
-        << yaml_quote(env.secret_key) << "\n";
-    if (!env.session_token.empty()) {
-      out << "        session_token: " << yaml_quote(env.session_token) << "\n";
-    }
-    if (signing_mode.has_value()) {
-      out << "        signing_mode: " << yaml_quote(*signing_mode) << "\n";
-    }
-    if (ca_bundle.has_value() && !ca_bundle->empty()) {
-      out << "        ca_bundle_path: " << yaml_quote(*ca_bundle) << "\n";
-    }
-    if (tls_verify.has_value()) {
-      out << "        tls_verify: " << (*tls_verify ? "true" : "false") << "\n";
-    } else {
-      out << "        tls_verify: false\n";
-    }
     out << "      rest:\n"
            "        request_timeout_s: 30\n";
     if (limits.rest_footer_probe_bytes.has_value()) {
@@ -431,10 +414,15 @@ class sirius_config_env_guard {
   }
 
   [[nodiscard]] fs::path const& config_path() const noexcept { return config_path_; }
+  [[nodiscard]] sirius::io::object_store_config const& object_store() const noexcept
+  {
+    return object_store_;
+  }
 
  private:
   fs::path dir_;
   fs::path config_path_;
+  sirius::io::object_store_config object_store_;
   std::string original_config_env_;
   std::string original_disable_env_;
   bool had_original_config_env_{false};
@@ -459,7 +447,10 @@ class s3_sql_fixture {
       con(db)
   {
     load_sirius_extension(db);
-    REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
+    auto context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(context);
+    context->get_config().set_object_store_config(config_env.object_store());
+    context->get_scan_manager().install_s3_config("s3://" + env.bucket, config_env.object_store());
     setenv("SIRIUS_DISABLE", "1", 1);
   }
 
@@ -1017,8 +1008,7 @@ TEST_CASE("internal sirius_read_parquet is registered as a one-argument table fu
   CHECK(result->GetValue(1, 0).ToString().find("VARCHAR") != std::string::npos);
 }
 
-TEST_CASE("S3 SQL config guard writes nested object_store options only when configured",
-          "[s3][config]")
+TEST_CASE("S3 SQL config guard keeps object-store credentials out of YAML", "[s3][config]")
 {
   s3_test_env env{"http://127.0.0.1:9000",
                   "",
@@ -1035,7 +1025,9 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
     auto const yaml = read_text_file(guard.config_path());
     CHECK(yaml.find("executor:") != std::string::npos);
     CHECK(yaml.find("scan_manager:") != std::string::npos);
-    CHECK(yaml.find("object_store:") != std::string::npos);
+    CHECK(yaml.find("object_store:") == std::string::npos);
+    CHECK(yaml.find("temporary-access-key") == std::string::npos);
+    CHECK(yaml.find("temporary-secret-key") == std::string::npos);
     CHECK(yaml.find("session_token:") == std::string::npos);
     CHECK(yaml.find("signing_mode:") == std::string::npos);
   }
@@ -1044,8 +1036,11 @@ TEST_CASE("S3 SQL config guard writes nested object_store options only when conf
   {
     sirius_config_env_guard guard(env, {}, std::string{"header"});
     auto const yaml = read_text_file(guard.config_path());
-    CHECK(yaml.find("session_token: 'temporary-session-token'") != std::string::npos);
-    CHECK(yaml.find("signing_mode: 'header'") != std::string::npos);
+    CHECK(yaml.find("session_token:") == std::string::npos);
+    CHECK(yaml.find("signing_mode:") == std::string::npos);
+    CHECK(guard.object_store().session_token == "temporary-session-token");
+    CHECK(guard.object_store().s3_signing_mode ==
+          sirius::io::object_store_config::signing_mode::header);
   }
 }
 
@@ -1236,6 +1231,57 @@ TEST_CASE("transparent read_parquet over S3 routes to kvikio when backend is kvi
   auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " +
                            local_parquet_scan(*env, "nation") + " ORDER BY n_nationkey";
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Sirius scans",
+          "[s3][integration][sql][gpu_execution][secret]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto fixture_env       = *env;
+  fixture_env.access_key = "invalid-fallback-key";
+  fixture_env.secret_key = "invalid-fallback-secret";
+  s3_sql_fixture fixture(fixture_env);
+  set_gpu_execution(fixture.con, true);
+  auto const uri           = s3_uri(env->bucket, "parquet/nation.parquet");
+  auto const scope         = sql_quote("s3://" + env->bucket + "/parquet/");
+  auto const outside_scope = sql_quote("s3://" + env->bucket + "/unrelated/");
+  auto create_secret       = [&](std::string const& name,
+                           std::string const& secret_scope,
+                           std::string const& key_id,
+                           std::string const& secret) {
+    return "CREATE OR REPLACE SECRET " + name + " (TYPE SIRIUS_S3, SCOPE " + secret_scope +
+           ", KEY_ID " + sql_quote(key_id) + ", SECRET " + sql_quote(secret) + ", REGION " +
+           sql_quote(env->region) + ", ENDPOINT " + sql_quote(env->endpoint) + ", USE_SSL " +
+           (env->endpoint.rfind("https://", 0) == 0 ? "true" : "false") + ")";
+  };
+
+  // An invalid credential scoped elsewhere must not shadow the matching
+  // secret. The successful GPU scan proves Sirius's own SIRIUS_S3 secret reaches
+  // its REST IO without relying on DuckDB's httpfs extension.
+  require_query_ok(
+    fixture.con, create_secret("s3_out_of_scope", outside_scope, "invalid-key", "invalid-secret"));
+  require_query_ok(fixture.con,
+                   create_secret("s3_matching", scope, env->access_key, env->secret_key));
+  auto const scan_sql = "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")";
+  auto scan           = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  REQUIRE(scan->RowCount() == 1);
+  CHECK(scan->GetValue(0, 0).GetValue<int64_t>() == 25);
+
+  // CREATE OR REPLACE changes future opens without requiring a new connection.
+  require_query_ok(
+    fixture.con,
+    create_secret("s3_matching", scope, "rotated-invalid-key", "rotated-invalid-secret"));
+  auto failed_scan = fixture.con.Query(gpu_execution_sql(scan_sql));
+  REQUIRE(failed_scan);
+  CHECK(failed_scan->HasError());
+  CHECK(failed_scan->GetError().find("rotated-invalid-secret") == std::string::npos);
+
+  require_query_ok(fixture.con,
+                   create_secret("s3_matching", scope, env->access_key, env->secret_key));
+  auto rescanned = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  CHECK(rescanned->GetValue(0, 0).GetValue<int64_t>() == 25);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",

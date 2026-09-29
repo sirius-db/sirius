@@ -137,6 +137,7 @@ set(TEST_SOURCES
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
+    test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
@@ -289,6 +290,7 @@ set(TEST_SOURCES
     test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
+    test/cpp/io/s3/test_duckdb_secret_config.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
