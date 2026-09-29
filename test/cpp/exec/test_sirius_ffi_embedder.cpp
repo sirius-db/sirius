@@ -311,3 +311,23 @@ TEST_CASE("FFI execute_substrait returns parquet rows", "[isolated_context][siri
   ctx->execute_substrait(local_files_plan(path), reinterpret_cast<std::uintptr_t>(&stream));
   REQUIRE(collect_i64_column(stream) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
+
+TEST_CASE("FFI a hash key on a single output is rejected at build()",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_hash_one_output");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const plan = local_files_plan(path);
+
+  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto routed = sirius::ffi::make_fragment(*ctx);
+  routed->declare_output(0);
+  routed->declare_output_hash_key(0);
+  REQUIRE_THROWS_WITH(routed->build(plan), Catch::Contains("at least two"));
+
+  auto next = sirius::ffi::make_fragment(*ctx);
+  next->build(plan);
+  next->run();
+  REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+}

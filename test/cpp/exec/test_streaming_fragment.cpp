@@ -720,3 +720,77 @@ TEST_CASE_METHOD(fragment_fixture,
     throw;
   }
 }
+
+// ============================================================================
+// FRAG-9: a hash-partitioned sink routes each key to one destination from every sender
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9: hash-partitioned senders agree on each key's destination",
+                 "[integration][streaming_fragment]")
+{
+  // Both senders emit the same INTEGER keys, so a key split across destinations means the
+  // senders hashed it differently (the INT32 -> INT64 key cast is what keeps them in step).
+  std::string values = "SELECT a FROM (VALUES ";
+  for (int k = 1; k <= 20; ++k) {
+    values += (k > 1 ? ", (" : "(") + std::to_string(k) + ")";
+  }
+  values += ") t(a)";
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&] {
+      fragment_spec spec;
+      spec.plan_source  = sirius::test::sql_plan_source(values);
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+    auto first  = make_sender();
+    auto second = make_sender();
+    for (auto* sender : {first.get(), second.get()}) {
+      sender->build();
+      sender->run();
+    }
+
+    std::vector<std::vector<std::int32_t>> per_destination;
+    for (stream_id_t destination : {0, 1}) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source("SELECT * FROM sirius_stream_source(0)");
+      spec.inputs[0]   = stream_input_spec{
+          {"a"},
+        sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+          {0, 1}};
+      spec.outputs = {1};
+      streaming_fragment receiver(*con->context, std::move(spec));
+      receiver.build();
+      receiver.relay_from(*first, destination, 0, 0);
+      receiver.relay_from(*second, destination, 0, 1);
+      receiver.run();
+      per_destination.push_back(drain_values(receiver, 1));
+    }
+
+    std::vector<std::int32_t> all;
+    for (const auto& received : per_destination) {
+      REQUIRE_FALSE(received.empty());
+      // Sorted, so each key's two copies are adjacent.
+      REQUIRE(received.size() % 2 == 0);
+      for (std::size_t i = 0; i < received.size(); i += 2) {
+        REQUIRE(received[i] == received[i + 1]);
+      }
+      all.insert(all.end(), received.begin(), received.end());
+    }
+    std::sort(all.begin(), all.end());
+    std::vector<std::int32_t> expected;
+    for (int k = 1; k <= 20; ++k) {
+      expected.push_back(k);
+      expected.push_back(k);
+    }
+    REQUIRE(all == expected);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
