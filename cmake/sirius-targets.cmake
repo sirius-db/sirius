@@ -9,6 +9,15 @@ build_static_extension(sirius src/sirius_extension_entry.cpp
 build_loadable_extension(sirius CPP src/sirius_extension_entry.cpp
                          $<TARGET_OBJECTS:sirius_objects>)
 
+# Scan reference resolution depends on the consuming target's DuckDB linkage.
+# Compile it per target so the loadable extension receives
+# DUCKDB_BUILD_LOADABLE_EXTENSION instead of reusing the static implementation.
+foreach(_target sirius_core sirius_shared sirius_extension
+                sirius_loadable_extension)
+  target_sources(${_target} PRIVATE src/planner/connector_registry.cpp)
+  set_target_properties(${_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endforeach()
+
 # The standalone FFI constructs an embedded DuckDB, which needs the no-op static
 # extension loader retained regardless of archive ordering.
 set_property(
