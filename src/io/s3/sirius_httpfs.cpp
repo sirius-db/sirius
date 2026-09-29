@@ -418,7 +418,7 @@ duckdb::vector<duckdb::OpenFileInfo> expand_glob(
   std::vector<std::string_view> key_segments;
   std::vector<std::int8_t> memo;
   scan_manager.list_objects_paged(
-    list_uri, /*page_size=*/1000, [&](sirius::io::s3::list_objects_v2_page const& page) {
+    list_uri, /*page_size=*/1000, [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
       for (auto const& entry : page.entries) {
         split_segments(entry.key, key_segments);
         bool matched;

@@ -1991,6 +1991,7 @@ struct throwing_probe_copy {
     if (*fail) throw request_copy_failure{};
   }
   std::unique_ptr<cudf::column> operator()(cudf::column_view,
+                                           std::uint32_t const*,
                                            ::cuda::stream_ref,
                                            rmm::device_async_resource_ref) const
   {
@@ -2573,8 +2574,10 @@ void test_selection_and_predicate_routes(rmm::device_async_resource_ref upstream
                         cudaMemcpyHostToDevice));
   auto const threshold_view = threshold_column->view();
   simpatico::membership_source const below_threshold{
-    [threshold_view](
-      cudf::column_view keys, ::cuda::stream_ref probe_stream, rmm::device_async_resource_ref mr) {
+    [threshold_view](cudf::column_view keys,
+                     std::uint32_t const*,
+                     ::cuda::stream_ref probe_stream,
+                     rmm::device_async_resource_ref mr) {
       return cudf::binary_operation(keys,
                                     threshold_view,
                                     cudf::binary_operator::LESS,

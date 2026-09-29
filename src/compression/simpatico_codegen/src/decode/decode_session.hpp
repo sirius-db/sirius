@@ -78,9 +78,18 @@ struct column_decode_request {
   std::optional<validated_selection> selection;
 };
 
+/**
+ * @brief A membership probe over the plan's decoded key column.
+ *
+ * `prior_mask_words` is handed to `probe` as its optional prior keep mask, letting rows it already
+ * excludes skip the lookup; it must stay valid until the probe's work on the request's stream
+ * completes. The destination receives only the probe's result, so the caller ANDs it with the
+ * prior.
+ */
 struct membership_source {
   decltype(sirius::codegen::membership_filter_directive::probe) probe;
   cudf::data_type stored_type;
+  std::uint32_t const* prior_mask_words = nullptr;
 };
 
 /**

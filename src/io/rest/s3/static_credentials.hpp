@@ -22,10 +22,10 @@
 #include <optional>
 #include <string>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 /**
- * @brief Credentials snapshot consumed by @c sirius_sigv4_presigned_authorizer's
+ * @brief Credentials snapshot consumed by @c sigv4_presigned_authorizer's
  *        constructor (and other static-creds-based authorizers).
  *
  * Long-lived creds (typical SET s3_access_key / s3_secret_key flow): leave
@@ -39,8 +39,8 @@ namespace sirius::io::s3 {
  * This is a pure POD by design: integration code constructs it from
  * @c object_store_config string fields, hands it to the authorizer's
  * constructor, and the authorizer holds an internal copy. There is no public
- * accessor on @c s3_request_authorizer to read these back — the seam exposes
- * only @c authorize() (see @c s3_request_authorizer.hpp).
+ * accessor on @c request_authorizer to read these back — the seam exposes
+ * only @c authorize() (see @c request_authorizer.hpp).
  */
 struct static_credentials {
   std::string access_key_id;
@@ -62,4 +62,4 @@ inline static_credentials static_credentials_from(object_store_config const& cfg
   return creds;
 }
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

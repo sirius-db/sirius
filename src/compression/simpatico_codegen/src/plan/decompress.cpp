@@ -1388,7 +1388,7 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
                                  key_view.null_count(),
                                  key_view.offset()};
   }
-  auto const flags = source.probe(key_view, frame.stream(), frame.mr());
+  auto const flags = source.probe(key_view, source.prior_mask_words, frame.stream(), frame.mr());
   if (!flags) {
     auto const bytes = static_cast<std::size_t>(
                          sirius::codegen::selection_mask::AllocWordsFor(destination.num_rows)) *

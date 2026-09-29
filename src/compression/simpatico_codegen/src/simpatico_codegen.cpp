@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -544,7 +545,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
         predicate_result{decode_predicate{directive.equals_any}, next_destination()},
         {}});
     }
-    for (size_t m = 0; m < k_member; ++m) {
+    // With another mask source to prime a prior from (a static range/bool8 strip or the
+    // positional keep mask), membership probes run sequentially on s0 after the combine, so dead
+    // rows skip the set/Bloom lookup. Otherwise they run concurrently here, prior-free.
+    bool const sequential_membership = k_member > 0 && (k_range + k_bool8 > 0 || has_keep_mask);
+    for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
       auto const& directive = request.membership_filters[m];
       auto const& column    = table.columns[selected[directive.column]];
       auto const status     = wave1.append(mask_decode_request{
@@ -552,38 +557,21 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       declined_members += status == mask_source_status::DECLINED;
     }
 
-    // An all-ones source is the AND identity only while a real source still
-    // zeroes the tail bits past num_rows, which CNT and the gather require. If
-    // every source declined there is nothing left to filter by anyway, so take
-    // the plain decode instead of counting a mask that is all ones.
-    if (declined_members == k_total) {
-      // Never count the padded all-ones masks: there is no real source to clear
-      // the tail. This is an explicit policy decline after completed work.
-      (void)wave1.finish();
-      reset_result(sc::scan_filter_status::refused);
-      return refuse("every membership source declined");
-    }
-
-    if (declined_members > 0 && sc::decompression_pushdown_diag_enabled()) {
-      std::fprintf(stderr,
-                   "simpatico: %zu of %zu membership probe(s) declined this chunk (rows=%lld); the "
-                   "decode carries the rest and the join filters the remainder\n",
-                   declined_members,
-                   k_member,
-                   static_cast<long long>(num_rows));
-    }
-
     // Order the combine on s0 after every other lane that produced a source.
     if (!producer_lanes.empty()) cudf::detail::join_streams(producer_lanes, s0);
 
-    // ── Keep mask, appended last. No ballot producer zeroes its tail (selection.hpp:52),
-    // so the gap between the host words and alloc_words is memset here. Upload on s0
-    // keeps the combine ordered behind it.
+    // ── Keep mask, uploaded before the combine so it primes the cascade's prior. No ballot
+    // producer zeroes its tail (selection.hpp:52), so the gap between the host words and
+    // alloc_words is memset here. Upload on s0 keeps the combine ordered behind it. When no source
+    // has written `combined` yet, the keep mask lands there directly.
     if (has_keep_mask) {
-      auto const host_words = static_cast<std::size_t>((num_rows + 31) / 32);
-      keep_mask_dev =
-        rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
-      auto* keep_dst = static_cast<std::uint32_t*>(keep_mask_dev.data());
+      auto const host_words   = static_cast<std::size_t>((num_rows + 31) / 32);
+      std::uint32_t* keep_dst = combined;
+      if (!mask_ptrs.empty()) {
+        keep_mask_dev =
+          rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+        keep_dst = static_cast<std::uint32_t*>(keep_mask_dev.data());
+      }
       if (static_cast<int64_t>(host_words) < alloc_words &&
           cudaMemsetAsync(
             keep_dst + host_words,
@@ -602,20 +590,70 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       mask_ptrs.push_back(keep_dst);
     }
 
-    // ── Combine + CNT on stream 0. run_selection_cnt host-syncs s0 once (the
-    // survivor count gates wave-2 allocations); after it returns, every wave-1
-    // kernel and the combine have completed, so per_filter teardown is safe.
-    auto const n_combine_sources = k_total + (has_keep_mask ? 1 : 0);
-    if (n_combine_sources > 1) {
+    // ── Combine on stream 0.
+    if (mask_ptrs.size() > 1) {
       sc::combine_masks_and(
-        combined, mask_ptrs.data(), static_cast<int>(n_combine_sources), alloc_words, s0);
+        combined, mask_ptrs.data(), static_cast<int>(mask_ptrs.size()), alloc_words, s0);
     }
+
+    // ── Sequential membership cascade, a single-lane session on s0 behind the combine. Each probe
+    // takes `combined` as its prior and its result is ANDed back in, so the next probe sees the
+    // tightened mask. A declining probe leaves `combined` untouched, the AND identity. The scratch
+    // strip is written and read only on s0, so its stream-ordered free cannot race a reader.
+    std::optional<decode_session> cascade;
+    if (sequential_membership) {
+      cascade.emplace(std::span{&s0, 1}, mr);
+      rmm::device_buffer membership_scratch(mask_bytes, s0, mr);
+      auto* member_words = static_cast<std::uint32_t*>(membership_scratch.data());
+      std::array<std::uint32_t const*, 2> const and_sources{combined, member_words};
+      for (size_t m = 0; m < k_member; ++m) {
+        auto const& directive = request.membership_filters[m];
+        auto const& column    = table.columns[selected[directive.column]];
+        if (cascade->append(
+              mask_decode_request{*column.plan_tree,
+                                  membership_source{directive.probe, column.dtype, combined},
+                                  {member_words, num_rows}}) == mask_source_status::DECLINED) {
+          ++declined_members;
+          continue;
+        }
+        sc::combine_masks_and(combined, and_sources.data(), 2, alloc_words, s0);
+      }
+    }
+
+    // An all-ones source is the AND identity only while a real source still
+    // zeroes the tail bits past num_rows, which CNT and the gather require. If
+    // every source declined there is nothing left to filter by anyway, so take
+    // the plain decode instead of counting a mask that is all ones. On a cascade
+    // primed only by the keep mask, the survivor rate is just the visible-row
+    // fraction, which the caller applies itself on the plain path.
+    if (declined_members == k_total) {
+      // Never count the padded all-ones masks: there is no real source to clear
+      // the tail. This is an explicit policy decline after completed work.
+      (void)wave1.finish();
+      if (cascade) (void)cascade->finish();
+      reset_result(sc::scan_filter_status::refused);
+      return refuse("every membership source declined");
+    }
+
+    if (declined_members > 0 && sc::decompression_pushdown_diag_enabled()) {
+      std::fprintf(stderr,
+                   "simpatico: %zu of %zu membership probe(s) declined this chunk (rows=%lld); the "
+                   "decode carries the rest and the join filters the remainder\n",
+                   declined_members,
+                   k_member,
+                   static_cast<long long>(num_rows));
+    }
+
+    // ── CNT on stream 0. run_selection_cnt host-syncs s0 once (the survivor
+    // count gates wave-2 allocations); after it returns, every wave-1 kernel,
+    // the combine and the cascade have completed, so per_filter teardown is safe.
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
     sc::run_selection_cnt(sel, s0, mr);
     // CNT is the genuine host observation. finish also checks external phase work after request
     // submission before publishing the dual-delivery BOOL8 owners.
-    bool8_full            = wave1.finish();
+    bool8_full = wave1.finish();
+    if (cascade) (void)cascade->finish();
     result.survivor_count = sel.survivor_count;
     per_filter.clear();
     keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0

@@ -30,3 +30,31 @@ pixi run cmake -S test/cmake/nvtx_injection -B build/nvtx-test -G Ninja
 pixi run cmake --build build/nvtx-test
 pixi run ctest --test-dir build/nvtx-test --output-on-failure
 ```
+
+## DuckDB dependency
+
+`cmake/sirius-duckdb-provider.cmake` owns the temporary source dependency. Its
+`sirius::duckdb_dependency` target carries DuckDB headers, compile definitions,
+and the core and Parquet libraries. `SIRIUS_DUCKDB_SOURCE_DIR` selects the source
+tree; use the revision pinned by this repository. This is a build-only contract,
+not an installed Sirius target or a stable DuckDB ABI.
+
+The intended replacement is `find_package(duckdb CONFIG REQUIRED)` using a conda
+package with the required headers and libraries. Decoupling the library's and
+extension's DuckDB versions requires a separate API/ABI change.
+
+## Installed CMake package
+
+Install the `sirius_library` component and consume `sirius::sirius` with
+`find_package(sirius CONFIG REQUIRED)`. Its public headers do not require CUDA or
+DuckDB headers. The shared library records its runtime dependencies.
+
+```bash
+pixi run cmake --install build/release --prefix "$PWD/build/stage" --component sirius_library
+mv build/stage build/relocated
+pixi run cmake -S test/cmake/installed_consumer -B build/consumer \
+  -DCMAKE_PREFIX_PATH="$PWD/build/relocated"
+pixi run cmake --build build/consumer
+```
+
+Consumers are responsible for DuckDB and C++ runtime ABI compatibility.

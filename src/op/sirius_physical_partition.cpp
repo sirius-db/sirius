@@ -269,22 +269,27 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   switch (_partition_type) {
     case PartitionType::HASH:
       // Narrow-passthrough observability: count input columns whose actual carrier is narrower
-      // than the native mapping of this operator's logical schema. The counter reads actual batch
+      // than the native mapping of this operator's logical schema. The event reports actual batch
       // types, so a regression anywhere in the narrow-carrier chain drops it to zero.
       if (has_physical_overrides() && _compressed_materialization_observer != nullptr) {
-        auto const view = get_cudf_table_view(input_batch_ro);
-        auto const width =
-          std::min<std::size_t>(static_cast<std::size_t>(view.num_columns()), types.size());
-        uint64_t narrow_columns = 0;
-        for (std::size_t column_idx = 0; column_idx < width; ++column_idx) {
-          if (view.column(static_cast<cudf::size_type>(column_idx)).type() !=
-              sirius::get_cudf_type(types[column_idx])) {
-            ++narrow_columns;
+        auto& publisher = _compressed_materialization_observer->get_event_publisher();
+        // Inspect columns only when someone observes this activity.
+        if (publisher.has_subscribers(sirius::event::event_type::compressed_materialization)) {
+          auto const view = get_cudf_table_view(input_batch_ro);
+          auto const width =
+            std::min<std::size_t>(static_cast<std::size_t>(view.num_columns()), types.size());
+          uint64_t narrow_columns = 0;
+          for (std::size_t column_idx = 0; column_idx < width; ++column_idx) {
+            if (view.column(static_cast<cudf::size_type>(column_idx)).type() !=
+                sirius::get_cudf_type(types[column_idx])) {
+              ++narrow_columns;
+            }
           }
-        }
-        if (narrow_columns > 0) {
-          _compressed_materialization_observer
-            ->record_compressed_materialization_partition_narrow_columns(narrow_columns);
+          if (narrow_columns > 0) {
+            publisher.publish_compressed_materialization(
+              sirius::event::compressed_materialization_activity::partition_narrow_columns,
+              narrow_columns);
+          }
         }
       }
       partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
