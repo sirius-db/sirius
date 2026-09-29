@@ -203,9 +203,9 @@ duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_stream
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> streaming_fragment::make_result_collector(
-  duckdb::unique_ptr<op::sirius_physical_operator> subtree)
+  duckdb::unique_ptr<op::sirius_physical_operator> subtree,
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared)
 {
-  auto prepared = _spec.prepared;
   if (!prepared) { prepared = synthesize_prepared(subtree->types); }
   // The collector decodes GPU output with prepared->types; a mismatch would misread it.
   _sink_types = sirius::from_duckdb_vec(prepared->types);
@@ -258,8 +258,8 @@ void streaming_fragment::build()
                                             nullptr});
     }
 
-    auto logical_plan = _spec.plan_source(_context);
-    if (!logical_plan) {
+    auto bound = _spec.plan_source(_context);
+    if (!bound.plan) {
       throw sirius::invalid_input_exception("streaming_fragment: plan source produced no plan");
     }
 
@@ -270,10 +270,10 @@ void streaming_fragment::build()
       duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
       _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
       subtree            = sirius::planner::sirius_physical_plan_generator(_context).create_plan(
-        std::move(logical_plan));
+        std::move(bound.plan));
     }
 
-    _plan_root = is_result() ? make_result_collector(std::move(subtree))
+    _plan_root = is_result() ? make_result_collector(std::move(subtree), std::move(bound.prepared))
                              : make_streaming_sink(std::move(subtree));
     register_sources();
   } catch (...) {

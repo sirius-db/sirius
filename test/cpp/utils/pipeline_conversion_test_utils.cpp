@@ -269,7 +269,7 @@ exec::logical_plan_source sql_plan_source(const std::string& query)
   return [query](duckdb::ClientContext& context) {
     optimizer_disable_guard guard(context);
     auto extracted = extract_logical_plan_sirius_order(context, query);
-    return std::move(extracted.logical_plan);
+    return exec::bound_plan{std::move(extracted.logical_plan), nullptr};
   };
 }
 

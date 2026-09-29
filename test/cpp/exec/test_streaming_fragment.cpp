@@ -191,6 +191,8 @@ TEST_CASE_METHOD(fragment_fixture,
     sender.run();
 
     receiver.build();
+    // The binding lives only for build(); a later fragment may declare the same id.
+    REQUIRE_FALSE(catalog->contains(0));
     auto const relayed_batches = receiver.relay_from(sender, 0, 0, 0);
     REQUIRE(relayed_batches > 0);
 
@@ -259,6 +261,7 @@ TEST_CASE_METHOD(fragment_fixture,
     con->BeginTransaction();
     streaming_fragment fragment(*con->context, std::move(spec));
     REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
+    REQUIRE_FALSE(catalog->contains(7));
     con->Rollback();
   }
 }
@@ -677,11 +680,15 @@ TEST_CASE_METHOD(fragment_fixture,
     SECTION("prepared types that do not match the plan")
     {
       fragment_spec spec;
-      spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
-      spec.prepared    = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
-        duckdb::StatementType::SELECT_STATEMENT);
-      spec.prepared->names = {"a", "b"};
-      spec.prepared->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR};
+      spec.plan_source =
+        [leaf = sirius::test::sql_plan_source(kLeafQuery)](duckdb::ClientContext& context) {
+          auto bound     = leaf(context);
+          bound.prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+            duckdb::StatementType::SELECT_STATEMENT);
+          bound.prepared->names = {"a", "b"};
+          bound.prepared->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR};
+          return bound;
+        };
       streaming_fragment fragment(*con->context, std::move(spec));
       REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
       // A failed build() is single-shot, rather than failing later on a half-registered session.

@@ -98,12 +98,8 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 }
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
-struct lowered_plan {
-  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
-  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
-};
-
-lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substrait_plan)
+sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
+                                         const std::string& substrait_plan)
 {
   auto& client = *conn.context;
 
@@ -129,23 +125,25 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
   duckdb::ColumnBindingResolver::Verify(*logical_plan);
   resolver.VisitOperator(*logical_plan);
 
-  return {std::move(prepared), std::move(logical_plan)};
+  return {std::move(logical_plan), std::move(prepared)};
 }
 
-// The part of a fragment_spec that comes from the Substrait plan. Its plan source may run once.
-sirius::exec::fragment_spec spec_from(lowered_plan lowered)
+// Run `body` in a DuckDB transaction: commit on success, roll back and rethrow on failure. A
+// failed rollback does not replace the original error.
+template <typename Body>
+void in_transaction(duckdb::Connection& conn, Body&& body)
 {
-  auto plan_holder =
-    std::make_shared<duckdb::unique_ptr<duckdb::LogicalOperator>>(std::move(lowered.plan));
-  sirius::exec::fragment_spec spec;
-  spec.plan_source = [plan_holder](duckdb::ClientContext&) {
-    if (!*plan_holder) {
-      throw sirius::invalid_input_exception("Fragment: plan source invoked twice");
+  conn.BeginTransaction();
+  try {
+    body();
+  } catch (...) {
+    try {
+      conn.Rollback();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
-    return std::move(*plan_holder);
-  };
-  spec.prepared = std::move(lowered.prepared);
-  return spec;
+    throw;
+  }
+  conn.Commit();
 }
 
 }  // namespace
@@ -156,8 +154,6 @@ struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
-  //! Also stored in registered_state. Held here so it outlives registered_state resets.
-  duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -191,8 +187,8 @@ struct Context::Impl {
                                     duckdb::make_shared_ptr<duckdb::SiriusConnectionState>());
 
     // Fragment bind path: register catalog + sirius_stream_source before any plan binds.
-    stream_catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
-    client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, stream_catalog);
+    client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey,
+                                    duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>());
     sirius::exec::register_stream_source_function(*db->instance);
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
@@ -230,36 +226,32 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
 {
   auto& client = *impl_->conn->context;
 
-  // Binding (catalog lookups), optimization, and GPU execution all require an
-  // active transaction. The transparent table-function path inherits one from the
-  // enclosing query; this standalone entry has none, so open one explicitly. GPU
-  // execution is eager (the result is materialized), so the transaction can close
-  // before the Arrow stream is consumed.
-  impl_->conn->BeginTransaction();
+  // Binding (catalog lookups), optimization, and GPU execution all need an active
+  // transaction: scans read DuckDB MVCC state through it. GPU execution is eager (the result
+  // is materialized), so the transaction can close before the Arrow stream is consumed.
   duckdb::unique_ptr<duckdb::QueryResult> result;
   // Phase timings (lowering / physical planning / GPU execution), logged per query: the host
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
-  try {
-    auto const lower_started = std::chrono::steady_clock::now();
-    auto lowered             = lower_substrait(*impl_->conn, plan);
-    lower_ms                 = elapsed_ms(lower_started);
-
+  in_transaction(*impl_->conn, [&] {
     // The same result path as a zero-output Fragment.
-    sirius::exec::streaming_fragment fragment(client, spec_from(std::move(lowered)));
+    sirius::exec::fragment_spec spec;
+    spec.plan_source = [&](duckdb::ClientContext&) {
+      auto const lower_started = std::chrono::steady_clock::now();
+      auto bound               = lower_substrait(*impl_->conn, plan);
+      lower_ms                 = elapsed_ms(lower_started);
+      return bound;
+    };
+    sirius::exec::streaming_fragment fragment(client, std::move(spec));
     auto const plan_started = std::chrono::steady_clock::now();
     fragment.build();
-    plan_ms = elapsed_ms(plan_started);
+    plan_ms = elapsed_ms(plan_started) - lower_ms;
 
     auto const execute_started = std::chrono::steady_clock::now();
     fragment.run();
     result     = fragment.take_result();
     execute_ms = elapsed_ms(execute_started);
-  } catch (...) {
-    impl_->conn->Rollback();
-    throw;
-  }
-  impl_->conn->Commit();
+  });
   SIRIUS_LOG_INFO(
     "[sirius_ffi] execute_substrait: lower {:.1f} ms, plan {:.1f} ms, execute {:.1f} ms",
     lower_ms,
@@ -287,13 +279,6 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
 struct Fragment::Impl {
   explicit Impl(Context::Impl& ctx) : ctx(ctx) {}
 
-  ~Impl()
-  {
-    // If the caller dropped a Fragment during an open setup or lowering transaction, roll
-    // it back. Destroying `fragment` closes the query window.
-    end_lifecycle();
-  }
-
   Context::Impl& ctx;
 
   // One column declared before build(). type_name is the DuckDB type string parsed at
@@ -311,8 +296,6 @@ struct Fragment::Impl {
 
   // One streaming_fragment for both terminals. Empty outputs is a RESULT_COLLECTOR.
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
-
-  bool transaction_open{false};
 
   void require_not_built(const char* what) const
   {
@@ -348,24 +331,10 @@ struct Fragment::Impl {
     return resolved;
   }
 
-  // Fill the bind catalog so DuckDB can bind a view of each declared input stream.
-  // These repositories are throwaways. streaming_fragment::build() erases the ids and
-  // redeclares them on its own repositories. Do not call catalog.clear(). This catalog is
-  // shared by every Fragment on the same Context.
-  void declare_streams(
-    const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
-  {
-    auto& catalog = *ctx.stream_catalog;
-    for (const auto& [id, spec] : resolved) {
-      auto repository = std::make_shared<cucascade::shared_data_repository>();
-      catalog.declare(id,
-                      sirius::exec::stream_input_binding{
-                        spec.names, spec.types, repository, spec.expected_senders, nullptr});
-    }
-  }
-
   // CREATE OR REPLACE VIEW sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)
-  // Needs an open transaction. Call after declare_streams so bind can resolve the schema.
+  // Needs an open transaction, and the ids declared in the stream_bind_catalog so the view's
+  // SELECT binds: call it from the plan source, which streaming_fragment::build() runs after
+  // declaring them.
   void create_stream_views()
   {
     for (const auto& [id, _] : inputs) {
@@ -375,22 +344,6 @@ struct Fragment::Impl {
                        std::to_string(id) + ")";
       auto res = ctx.conn->Query(sql);
       if (res->HasError()) { res->ThrowError(); }
-    }
-  }
-
-  // Idempotent. Called from build() catch blocks and ~Impl(). streaming_fragment owns the
-  // query window, so this only rolls back a still-open DuckDB transaction.
-  void end_lifecycle() noexcept
-  {
-    if (transaction_open) {
-      transaction_open = false;
-      // Reached only while the transaction is still open, which means setup or lowering
-      // failed. build() clears the flag after its own Commit succeeds. Committing here
-      // would keep a half-declared fragment, or throw from a noexcept path.
-      try {
-        ctx.conn->Rollback();
-      } catch (...) {  // NOLINT(bugprone-empty-catch)
-      }
     }
   }
 };
@@ -450,34 +403,23 @@ void Fragment::build(const std::string& substrait_plan)
 {
   impl_->require_not_built("build");
 
-  // Broadcast or hash with 0 or 1 outputs does not change where rows go. Reject it so a
-  // result fragment with a hash key is not treated as routed.
-  if (impl_->outputs.size() <= 1 &&
-      (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
-    throw sirius::invalid_input_exception(
-      "Fragment: a partition mode was declared but the fragment has " +
-      std::to_string(impl_->outputs.size()) +
-      " output stream(s); routing needs at least two destinations");
-  }
-
-  // Type-name parsing, CREATE VIEW, and Substrait lowering (which binds parquet_scan and the
-  // views) all need an active transaction. streaming_fragment::build() opens the query window
-  // while it is still open.
-  impl_->ctx.conn->BeginTransaction();
-  impl_->transaction_open = true;
-  try {
-    auto resolved = impl_->resolve_inputs();
-    impl_->declare_streams(resolved);
-    impl_->create_stream_views();
-
-    auto spec    = spec_from(lower_substrait(*impl_->ctx.conn, substrait_plan));
-    spec.inputs  = std::move(resolved);
-    spec.outputs = impl_->outputs;
-    if (impl_->broadcast_outputs && impl_->outputs.size() > 1) {
+  std::unique_ptr<sirius::exec::streaming_fragment> fragment;
+  // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
+  // failure rolls back the views, so a half-declared fragment leaves nothing behind.
+  in_transaction(*impl_->ctx.conn, [&] {
+    sirius::exec::fragment_spec spec;
+    spec.inputs      = impl_->resolve_inputs();
+    spec.outputs     = impl_->outputs;
+    spec.plan_source = [this, &substrait_plan](duckdb::ClientContext&) {
+      impl_->create_stream_views();
+      return lower_substrait(*impl_->ctx.conn, substrait_plan);
+    };
+    // streaming_fragment rejects a partition mode on fewer than two outputs.
+    if (impl_->broadcast_outputs) {
       sirius::op::partition_spec broadcast;
       broadcast.mode    = sirius::op::partition_mode::broadcast;
       spec.partitioning = std::move(broadcast);
-    } else if (!impl_->hash_key_columns.empty() && impl_->outputs.size() > 1) {
+    } else if (!impl_->hash_key_columns.empty()) {
       // key_cast_types left empty. streaming_fragment::build() fills them from output types.
       sirius::op::partition_spec hash;
       hash.mode         = sirius::op::partition_mode::hash;
@@ -485,18 +427,11 @@ void Fragment::build(const std::string& substrait_plan)
       spec.partitioning = std::move(hash);
     }
 
-    impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(*impl_->ctx.conn->context,
-                                                                         std::move(spec));
-    impl_->fragment->build();
-
-    impl_->ctx.conn->Commit();
-    impl_->transaction_open = false;
-  } catch (...) {
-    // Dropping the fragment closes its query window, including when only Commit() failed.
-    impl_->fragment.reset();
-    impl_->end_lifecycle();
-    throw;
-  }
+    fragment = std::make_unique<sirius::exec::streaming_fragment>(*impl_->ctx.conn->context,
+                                                                  std::move(spec));
+    fragment->build();
+  });
+  impl_->fragment = std::move(fragment);
 }
 
 std::size_t Fragment::relay_from(Fragment& source,
@@ -522,7 +457,8 @@ void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 void Fragment::run()
 {
   impl_->require_built("run()");
-  impl_->fragment->run();
+  // Scans read DuckDB MVCC state through the active transaction.
+  in_transaction(*impl_->ctx.conn, [&] { impl_->fragment->run(); });
 }
 
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)

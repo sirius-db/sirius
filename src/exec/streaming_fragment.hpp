@@ -53,8 +53,16 @@ struct stream_input_spec {
 };
 
 /// Bound, optimized DuckDB logical plan from Substrait bytes, SQL, or similar.
-using logical_plan_source =
-  std::function<duckdb::unique_ptr<duckdb::LogicalOperator>(duckdb::ClientContext&)>;
+struct bound_plan {
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+  /// Column names and types for a RESULT_COLLECTOR terminal. When null, build() synthesizes
+  /// names (`col_0`, `col_1`, ...) from the physical plan types. Ignored by a streaming sink.
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
+};
+
+/// Called once, by build(), after the fragment's input streams are declared in the connection's
+/// stream_bind_catalog, so the plan may bind `sirius_stream_source(<id>)` reads.
+using logical_plan_source = std::function<bound_plan(duckdb::ClientContext&)>;
 
 struct fragment_spec {
   logical_plan_source plan_source;
@@ -63,9 +71,6 @@ struct fragment_spec {
   std::vector<stream_id_t> outputs;
   /// Absent = gather (single destination, no partitioning). Illegal when outputs.size() < 2.
   std::optional<op::partition_spec> partitioning;
-  /// Optional DuckDB prepared metadata for a RESULT_COLLECTOR terminal (column names and types).
-  /// When unset, build() synthesizes names (`col_0`, `col_1`, ...) from the physical plan types.
-  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
 };
 
 /// Owns repositories, plan, engine, and session for one fragment. The query window exists only
@@ -90,7 +95,7 @@ class streaming_fragment {
   /// filled after this returns. A failed build() cannot be retried; create a new fragment.
   /// @throws sirius::invalid_input_exception when already built, after a failed build(), no
   ///         catalog, no Sirius state, null plan, a declared input the plan never reads, or
-  ///         spec.prepared types that do not match the plan's output types.
+  ///         bound_plan::prepared types that do not match the plan's output types.
   /// @throws whatever the plan source, binder, or plan generator raises.
   void build();
 
@@ -151,7 +156,8 @@ class streaming_fragment {
   duckdb::unique_ptr<op::sirius_physical_operator> make_streaming_sink(
     duckdb::unique_ptr<op::sirius_physical_operator> subtree);
   duckdb::unique_ptr<op::sirius_physical_operator> make_result_collector(
-    duckdb::unique_ptr<op::sirius_physical_operator> subtree);
+    duckdb::unique_ptr<op::sirius_physical_operator> subtree,
+    duckdb::shared_ptr<duckdb::PreparedStatementData> prepared);
   void register_sources();
   void poison_outputs(std::exception_ptr cause) noexcept;
 
