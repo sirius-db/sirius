@@ -152,3 +152,19 @@ Implementation entries will be added here as each buildable change is validated 
   separation, broader feature/pressure tests and final documentation. This commit alone is not
   the complete concurrency qualification.
 - Previous commit: `67dfcd671`.
+
+### 7. `fix(cuda): lease runtime streams and prefetch admitted devices`
+
+- A stream pool owned by each runtime memory manager provides exclusive operation leases for
+  pin materialization, memory prefetch and dynamic-filter publication/replication. Returning a
+  lease preserves the stream for buffers that later deallocate on it. Idle prefetch workers hold
+  no lease; acquisition grows rather than blocking while holding a batch or another GPU's lease.
+- GPU memory prefetch rotates over the query's admitted GPU subset. Each conversion uses that
+  device's guard, reservation and headroom check; existing exclusive batch locks and converter
+  fences publish the resulting residency before task creation reads its affinity.
+- String decoder CTA caching is thread-local, eliminating the shared device/count race.
+- Prefetch construction joins already-started workers if a later thread cannot be created.
+- Validation: full build; 312 prefetch/dynamic-filter/concurrent SQL cases, 11,451 assertions.
+  A new regression holds 40 exclusive streams simultaneously and verifies that returned streams
+  remain usable. Multi-GPU execution remains unqualified on this one-GPU host.
+- Previous commit: `c00a2d8bc`.

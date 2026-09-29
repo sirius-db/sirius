@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "memory/runtime_stream_pool.hpp"
+
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -248,7 +250,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   auto const& source_space = source_target->get_gpu_space();
 
   // Keep copies and streams alive until all peer transfers are queued and synchronized.
-  std::vector<std::pair<std::unique_ptr<bloom_replica>, ::cuda::stream_ref>> pending;
+  std::vector<std::pair<std::unique_ptr<bloom_replica>, cucascade::memory::borrowed_stream>>
+    pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -258,7 +261,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     std::size_t bytes = 0;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      auto const stream = target_space.acquire_stream();
+      auto stream_lease = sirius::memory::runtime_stream_pool::acquire(target_space);
+      auto const stream = stream_lease.get();
 
       auto replica = std::visit(
         [&](auto const& source_bloom) {
@@ -298,7 +302,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
           bytes);
         continue;
       }
-      pending.emplace_back(std::move(replica), stream);
+      pending.emplace_back(std::move(replica), std::move(stream_lease));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
@@ -314,7 +318,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
                      device_id);
   }
 
-  for (auto& [replica, stream] : pending) {
+  for (auto& [replica, stream_lease] : pending) {
+    auto const stream    = stream_lease.get();
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};

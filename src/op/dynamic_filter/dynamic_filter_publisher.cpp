@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -244,7 +245,8 @@ void dynamic_filter_publication_session::observe_whole_build(
     }
 
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-    ::cuda::stream_ref stream = space->acquire_stream();
+    auto stream_lease         = sirius::memory::runtime_stream_pool::acquire(*space);
+    ::cuda::stream_ref stream = stream_lease.get();
     auto const writer         = source.get_writer_event();
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();

@@ -81,6 +81,9 @@ class memory_prefetcher {
   memory_prefetcher(memory_prefetcher_config cfg,
                     std::vector<std::shared_ptr<split_connector>> connectors,
                     cucascade::memory::memory_space* gpu_space);
+  memory_prefetcher(memory_prefetcher_config cfg,
+                    std::vector<std::shared_ptr<split_connector>> connectors,
+                    std::vector<cucascade::memory::memory_space*> gpu_spaces);
 
   ~memory_prefetcher();
 
@@ -105,7 +108,7 @@ class memory_prefetcher {
   void worker_loop(std::size_t worker_index);
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
-  std::size_t sweep(::cuda::stream_ref stream);
+  std::size_t sweep(::cuda::stream_ref stream, cucascade::memory::memory_space* gpu_space);
 
   memory_prefetcher_config _config;
   std::vector<std::shared_ptr<split_connector>> _connectors;
@@ -114,11 +117,7 @@ class memory_prefetcher {
   /// stacks on top of the active scan's own conversion threads (regresses
   /// short scan-bound queries). Quiet connectors allow full parallelism.
   std::unique_ptr<std::atomic<bool>[]> _drain_claims;
-  cucascade::memory::memory_space* _gpu_space;
-
-  /// One stream per worker, borrowed (NOT owned): converted batches are
-  /// dealloc-bound to it and outlive the worker that made them.
-  std::vector<::cuda::stream_ref> _worker_streams;
+  std::vector<cucascade::memory::memory_space*> _gpu_spaces;
 
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};

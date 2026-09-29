@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
@@ -37,9 +38,19 @@ namespace sirius::scan_manager {
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
                                      cucascade::memory::memory_space* gpu_space)
-  : _config(cfg), _connectors(std::move(connectors)), _gpu_space(gpu_space)
+  : memory_prefetcher(
+      cfg,
+      std::move(connectors),
+      gpu_space ? std::vector{gpu_space} : std::vector<cucascade::memory::memory_space*>{})
 {
-  if (_gpu_space == nullptr || _connectors.empty()) {
+}
+
+memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
+                                     std::vector<std::shared_ptr<split_connector>> connectors,
+                                     std::vector<cucascade::memory::memory_space*> gpu_spaces)
+  : _config(cfg), _connectors(std::move(connectors)), _gpu_spaces(std::move(gpu_spaces))
+{
+  if (_gpu_spaces.empty() || _connectors.empty()) {
     _running.store(false);
     return;
   }
@@ -47,14 +58,14 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
   for (std::size_t i = 0; i < _connectors.size(); ++i) {
     _drain_claims[i].store(false, std::memory_order_relaxed);
   }
-  // Acquired before the workers start, so round-robin gives each a distinct stream.
-  _worker_streams.reserve(_config.num_threads);
-  for (std::size_t i = 0; i < _config.num_threads; ++i) {
-    _worker_streams.push_back(_gpu_space->acquire_stream());
-  }
-  _workers.reserve(_config.num_threads);
-  for (std::size_t i = 0; i < _config.num_threads; ++i) {
-    _workers.emplace_back([this, i] { worker_loop(i); });
+  try {
+    _workers.reserve(_config.num_threads);
+    for (std::size_t i = 0; i < _config.num_threads; ++i) {
+      _workers.emplace_back([this, i] { worker_loop(i); });
+    }
+  } catch (...) {
+    stop();
+    throw;
   }
   SIRIUS_LOG_INFO(
     "[memory_prefetcher] started: {} threads, {} connectors, min_free_fraction={:.2f}",
@@ -88,15 +99,14 @@ void memory_prefetcher::stop()
 
 void memory_prefetcher::worker_loop(std::size_t worker_index)
 {
-  // Bind this worker to the space's device: a fresh thread's current device is
-  // 0, and the compression converters allocate from the CURRENT device's
-  // resource rather than the target space's.
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
-  const ::cuda::stream_ref stream = _worker_streams[worker_index];
+  std::size_t round = worker_index;
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
     try {
-      converted = sweep(stream);
+      auto* space = _gpu_spaces[round++ % _gpu_spaces.size()];
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+      auto lease = sirius::memory::runtime_stream_pool::acquire(*space);
+      converted  = sweep(lease.get(), space);
     } catch (const std::exception& e) {
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }
@@ -120,11 +130,12 @@ void memory_prefetcher::worker_loop(std::size_t worker_index)
   }
 }
 
-std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream)
+std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
+                                     cucascade::memory::memory_space* gpu_space)
 {
   std::size_t converted = 0;
   const auto min_free_bytes =
-    static_cast<std::size_t>(_config.min_free_fraction * _gpu_space->get_max_memory());
+    static_cast<std::size_t>(_config.min_free_fraction * gpu_space->get_max_memory());
   auto& registry = sirius::converter_registry::get();
 
   // Walk connectors in scan (execution) order so the head-of-line pipeline's
@@ -206,13 +217,13 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream)
         continue;
       }
 
-      auto reservation = _gpu_space->make_reservation_or_null(peak_bytes);
+      auto reservation = gpu_space->make_reservation_or_null(peak_bytes);
       if (!reservation) {
         _stops_reservation.fetch_add(1, std::memory_order_relaxed);
         return converted;
       }
 
-      if (_gpu_space->get_available_memory() < min_free_bytes) {
+      if (gpu_space->get_available_memory() < min_free_bytes) {
         reservation.reset();
         _stops_headroom.fetch_add(1, std::memory_order_relaxed);
         return converted;
@@ -233,7 +244,7 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream)
       };
 
       try {
-        mut->convert_to<cucascade::gpu_table_representation>(registry, _gpu_space, stream);
+        mut->convert_to<cucascade::gpu_table_representation>(registry, gpu_space, stream);
       } catch (const rmm::out_of_memory&) {
         SIRIUS_LOG_DEBUG("[memory_prefetcher] OOM converting batch {}; backing off",
                          mut->get_batch_id());

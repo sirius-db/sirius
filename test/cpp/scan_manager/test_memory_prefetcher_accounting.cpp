@@ -428,3 +428,22 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
   REQUIRE(e.gpu_space->get_available_memory() == avail_before);
   REQUIRE(e.gpu_space->get_active_reservation_count() == 0);
 }
+
+TEST_CASE("runtime streams remain exclusive beyond the raw pool size",
+          "[memory_prefetcher][runtime_streams]")
+{
+  prefetcher_env e;
+  std::vector<cucascade::memory::borrowed_stream> leases;
+  std::vector<cudaStream_t> streams;
+  for (int i = 0; i < 40; ++i) {
+    auto lease  = sirius::memory::runtime_stream_pool::acquire(*e.gpu_space);
+    auto stream = lease.get().get();
+    REQUIRE(std::find(streams.begin(), streams.end(), stream) == streams.end());
+    streams.push_back(stream);
+    leases.push_back(std::move(lease));
+  }
+  leases.clear();
+  // Streams survive the borrowing operation for buffers that retain a deallocation stream.
+  for (auto stream : streams)
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}

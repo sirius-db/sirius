@@ -926,6 +926,7 @@ class sirius_scan_manager {
     //! Per-query snapshot of the serve-side pruning flag; the manager's _config is a
     //! construction-time copy, so SET changes arrive per query via prepare_for_query.
     bool pruning_enabled{true};
+    std::vector<int> active_gpu_ids;
 
     //! One mask computation per distinct pinned entry matched by THIS query (recorded by
     //! try_match_cached_entry, deduped by entry name); run block-in-prepare, then copied
