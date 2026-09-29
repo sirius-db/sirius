@@ -87,7 +87,9 @@ class streaming_fragment {
 
   /// Open the query window, declare inputs, lower to STREAMING_SOURCE plus STREAMING_SINK or
   /// RESULT_COLLECTOR, and register with the session. Callers can push after this returns. The
-  /// window stays open until run(), a failed build, or destruction.
+  /// window stays open until run(), a failed build, or destruction, and run() or destruction may
+  /// happen on another thread. Until then the engine's single query-lifecycle slot is held, so
+  /// any other GPU query or fragment build on this SiriusContext throws instead of waiting.
   /// @throws sirius::invalid_input_exception when already built, no catalog, no Sirius state,
   ///         null plan, or a declared input the plan never reads.
   /// @throws whatever the plan source, binder, or plan generator raises.

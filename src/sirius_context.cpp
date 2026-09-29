@@ -1615,8 +1615,8 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   // release (the check is advisory — correctness rests on the scope-bound
   // release).
   auto const my_hash = std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1;
-  // Same-thread reacquire would be a silent permanent wait (plain std::mutex).
-  // Only the CURRENT holder can observe its own hash here, so a match is a
+  // Same-thread reacquire would be a silent permanent wait (the holder cannot
+  // release while it waits). Only the CURRENT holder can observe its own hash here, so a match is a
   // definite programming error — surface it as a diagnosable error instead.
   if (holder_thread_hash_.load(std::memory_order_relaxed) == my_hash) {
     throw std::runtime_error(
@@ -1628,9 +1628,21 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
   if (context && context->IsInterrupted()) { throw InterruptException(); }
 
-  query_lifecycle_mutex_.lock();
-  holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
-  query_lifecycle_held_.store(true, std::memory_order_release);
+  {
+    std::unique_lock lock(query_lifecycle_mutex_);
+    query_lifecycle_cv_.wait(lock, [this] {
+      return !query_lifecycle_held_.load(std::memory_order_relaxed) || query_lifecycle_parked_;
+    });
+    // A parked holder only resumes when its owner calls run(), and that owner may be waiting
+    // on this caller. Waiting here could deadlock, so fail fast.
+    if (query_lifecycle_held_.load(std::memory_order_relaxed)) {
+      throw std::runtime_error(
+        "Sirius query-lifecycle slot is held by a built fragment that has not run; run() or "
+        "drop that fragment first");
+    }
+    holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
+    query_lifecycle_held_.store(true, std::memory_order_release);
+  }
 
   // Re-check AFTER acquiring, BEFORE any shared mutation: the previous holder
   // may have latched unavailability, and this waiter may have been cancelled,
@@ -1647,9 +1659,27 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
-  holder_thread_hash_.store(0, std::memory_order_relaxed);
-  query_lifecycle_held_.store(false, std::memory_order_release);
-  query_lifecycle_mutex_.unlock();
+  {
+    std::lock_guard lock(query_lifecycle_mutex_);
+    holder_thread_hash_.store(0, std::memory_order_relaxed);
+    query_lifecycle_parked_ = false;
+    query_lifecycle_held_.store(false, std::memory_order_release);
+  }
+  query_lifecycle_cv_.notify_all();
+}
+
+void SiriusContext::set_query_lifecycle_parked(bool parked) noexcept
+{
+  {
+    std::lock_guard lock(query_lifecycle_mutex_);
+    query_lifecycle_parked_ = parked;
+    if (!parked) {
+      holder_thread_hash_.store(std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1,
+                                std::memory_order_relaxed);
+    }
+  }
+  // Waiters re-check the predicate and throw instead of waiting on a parked holder.
+  if (parked) { query_lifecycle_cv_.notify_all(); }
 }
 
 // ================= Free Functions ================= //

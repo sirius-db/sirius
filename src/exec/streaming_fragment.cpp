@@ -294,6 +294,7 @@ void streaming_fragment::build()
       build_streaming_sink(std::move(subtree));
     }
     _built = true;
+    _lifecycle->scope.set_parked(true);
   } catch (...) {
     // Release the slot so a later fragment on this connection can build. The destructor
     // would do the same, but only when this object is dropped.
@@ -309,6 +310,11 @@ void streaming_fragment::run()
 {
   require_built("run()");
   if (_ran) { throw sirius::invalid_input_exception("streaming_fragment: already run"); }
+  if (!_lifecycle) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: query window is closed (a previous run() failed); rebuild the fragment");
+  }
+  _lifecycle->scope.set_parked(false);
 
   try {
     // Reuse the window build() opened. A second StandaloneQueryScope resets the task

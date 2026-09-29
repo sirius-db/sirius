@@ -16,9 +16,9 @@
 
 // Public sirius::ffi::Fragment methods only (host process, not GPU host memory).
 // Builds Substrait in the test because the FFI has no SQL helper.
-// Covers a result fragment, a relay_from chain, the one-window-at-a-time rule, and drop after
-// build(). Spec errors and failed-build rollback live in test_streaming_fragment.cpp and
-// test_sirius_ffi_fragment.cpp.
+// Covers a result fragment, a relay_from chain, the one-window-at-a-time rule on one and on two
+// threads, build() and run()/drop on different threads, and drop after build(). Spec errors and
+// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
@@ -34,6 +34,7 @@
 #include <memory>
 #include <source_location>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -188,7 +189,63 @@ TEST_CASE("FFI only one fragment may sit between build() and run()",
 
   auto receiver = sirius::ffi::make_fragment(*ctx);
   receiver->declare_input_column(0, "a", "BIGINT");
-  REQUIRE_THROWS(receiver->build(stream_read_plan(0)));
+  REQUIRE_THROWS_WITH(receiver->build(stream_read_plan(0)),
+                      Catch::Contains("nested execution window"));
+  sender->run();
+  REQUIRE(sender->output_batch_count(0) > 0);
+}
+
+TEST_CASE("FFI build() on another thread fails fast while a fragment is built but not run",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_host_cross_thread_window");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto sender = sirius::ffi::make_fragment(*ctx);
+  sender->declare_output(0);
+  sender->build(local_files_plan(path));
+
+  // Waiting here would deadlock whenever the sender's run() needs the receiver.
+  std::string error;
+  std::thread other([&] {
+    auto receiver = sirius::ffi::make_fragment(*ctx);
+    receiver->declare_input_column(0, "a", "BIGINT");
+    try {
+      receiver->build(stream_read_plan(0));
+    } catch (std::exception const& e) {
+      error = e.what();
+    }
+  });
+  other.join();
+  REQUIRE_THAT(error, Catch::Contains("built fragment that has not run"));
+
+  sender->run();
+  REQUIRE(sender->output_batch_count(0) > 0);
+}
+
+TEST_CASE("FFI build() and run() may happen on different threads", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_host_run_other_thread");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const plan = local_files_plan(path);
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto ran = sirius::ffi::make_fragment(*ctx);
+  ran->build(plan);
+  std::thread([&] { ran->run(); }).join();
+  REQUIRE(result_i64s(*ran) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
+
+  auto dropped = sirius::ffi::make_fragment(*ctx);
+  dropped->build(plan);
+  std::thread([&] { dropped.reset(); }).join();
+
+  auto next = sirius::ffi::make_fragment(*ctx);
+  next->build(plan);
+  next->run();
+  REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
 
 TEST_CASE("FFI drop after build releases the query window", "[isolated_context][sirius_ffi]")

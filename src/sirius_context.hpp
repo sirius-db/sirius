@@ -42,6 +42,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -452,9 +453,10 @@ class SiriusContext : public ClientContextState {
    * finish() did not complete — it attempts the cleanup once, marks the
    * runtime UNAVAILABLE if that fails, and always releases the slot.
    *
-   * Every acquire/release pair lives in one C++ scope on one thread, so
-   * release is exactly-once by construction and DuckDB's QueryEnd delivery
-   * (unreliable for abandoned results) plays no part in slot ownership.
+   * Release is exactly-once by construction and DuckDB's QueryEnd delivery
+   * (unreliable for abandoned results) plays no part in slot ownership. A
+   * streaming fragment keeps its scope across build() and run(), which may be
+   * on different threads, so release does not require the acquiring thread.
    */
   class StandaloneQueryScope {
    public:
@@ -476,6 +478,11 @@ class SiriusContext : public ClientContextState {
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
     /// query's manager rather than a shared one.
     [[nodiscard]] sirius::query_id_t query_id() const noexcept { return window_id_; }
+
+    /// \brief Mark the window as parked: built, but waiting for its owner to call run().
+    /// While parked, other acquirers throw instead of waiting, because the owner may need
+    /// them to finish before it runs. Unparking makes the calling thread the holder.
+    void set_parked(bool parked) noexcept { ctx_.set_query_lifecycle_parked(parked); }
 
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
@@ -645,6 +652,7 @@ class SiriusContext : public ClientContextState {
   /// window (it releases and throws instead of running any shared mutation).
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
+  void set_query_lifecycle_parked(bool parked) noexcept;
   /// The begin-of-window shared mutations (repository-manager registration,
   /// task_creator reset) — runs INSIDE the held slot, per the frozen
   /// "after acquire + health check, before final create_plan" placement.
@@ -673,11 +681,15 @@ class SiriusContext : public ClientContextState {
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation
   // and engine execution must be serialized (single-flight). The slot is
-  // scope-bound: held only inside StandaloneQueryScope / SlotGuard windows
-  // (acquire and release in the same scope on the same thread), never across
-  // DuckDB's user-visible result lifetime, so an abandoned stream or pending
-  // result holds nothing.
+  // scope-bound: held only inside StandaloneQueryScope / SlotGuard windows,
+  // never across DuckDB's user-visible result lifetime, so an abandoned stream
+  // or pending result holds nothing. A flag under a mutex rather than a held
+  // std::mutex, because a streaming fragment releases on the thread that
+  // calls run() or drops it, which need not be the one that acquired.
   std::mutex query_lifecycle_mutex_;
+  std::condition_variable query_lifecycle_cv_;
+  // Written under query_lifecycle_mutex_; see StandaloneQueryScope::set_parked.
+  bool query_lifecycle_parked_{false};
   // Pin and unpin take this exclusively; updates hold it from validation
   // through QueryEnd so neither operation can pass the other between checks.
   std::shared_mutex pinned_table_update_mutex_;
