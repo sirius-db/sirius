@@ -168,29 +168,24 @@ jobs:
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
 
-      # One shard per GPU, round-robin over test names (the vendored Catch2 v2 has no
-      # --shard-count). Each shard sees only its own GPU; [multi_gpu] tests run afterwards
-      # with all GPUs, and SIRIUS_TEST_SINGLE_GPU makes an untagged one fail rather than
-      # skip. Commas, quotes and brackets are escaped for `-f`.
+      # One Catch2 shard per GPU. Each shard sees only its own GPU; [multi_gpu]
+      # tests run afterwards with all GPUs. Declaration order keeps the same
+      # test-to-shard assignment in every process.
       - name: Run C++ unit tests
         run: |
           nvidia-smi
           bin=./build/release/extension/sirius/test/cpp/sirius_unittest
           log_root=$PWD/build/release/extension/sirius/test/cpp/log
           gpus=$(nvidia-smi -L | wc -l)
-          # List mode exits with the test count, so ignore the status and check the output.
-          "$bin" --list-test-names-only "~[.]~[multi_gpu]" > /tmp/test-names.txt || true
-          test -s /tmp/test-names.txt
           for ((i = 0; i < gpus; i++)); do
-            awk -v n="$gpus" -v i="$i" 'NR % n == i' /tmp/test-names.txt \
-              | sed -e 's/[\\,"[]/\\&/g' > "/tmp/shard-$i.txt"
             mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
             # Stream each shard live with a prefix; keep its full log for the failure summary.
             {
               status=0
               CUDA_VISIBLE_DEVICES=$i SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_LOG_DIR="$log_root/shard-$i" \
                 TMPDIR="/tmp/shard-$i" \
-                timeout 45m "$bin" --abort -f "/tmp/shard-$i.txt" 2>&1 || status=$?
+                timeout 60m "$bin" --abort --order decl --durations yes \
+                  --shard-count "$gpus" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
               echo "$status" > "/tmp/shard-$i.status"
             } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
           done
@@ -207,7 +202,7 @@ jobs:
       - name: Run multi-GPU C++ unit tests
         run: |
           set -o pipefail
-          timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
+          timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl --durations yes \
             "[multi_gpu]~[.]" 2>&1 | tee /tmp/unittest_multi_gpu.log
 
       # The late-materialization gate is read from the environment once per process, so the
@@ -218,7 +213,7 @@ jobs:
         run: |
           set -o pipefail
           SIRIUS_EXP_LATE_MAT=1 \
-            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
+            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl \
             "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
 
       - name: Iceberg conformance (correctness + connection liveness)

@@ -103,16 +103,12 @@ struct shared_env_listener : Catch::EventListenerBase {
 
 CATCH_REGISTER_LISTENER(shared_env_listener)
 
-/**
- * @brief Ends DuckDB Catch's "[n/N] test" progress line when stdout is not a terminal. Catch
- * leaves it open until the next test starts, so line-streamed CI logs would hide the running test.
- */
-struct progress_line_listener : Catch::TestEventListenerBase {
-  using TestEventListenerBase::TestEventListenerBase;
+struct progress_line_listener : Catch::EventListenerBase {
+  using EventListenerBase::EventListenerBase;
 
-  void testCaseStarting(Catch::TestCaseInfo const&) override
+  void testCaseStarting(Catch::TestCaseInfo const& info) override
   {
-    if (isatty(STDOUT_FILENO) == 0) { std::cout << std::endl; }
+    if (isatty(STDOUT_FILENO) == 0) { std::cout << "Running: " << info.name << std::endl; }
   }
 };
 
@@ -157,8 +153,7 @@ int main(int argc, char* argv[])
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
 
-  // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
-  // that parameterize on num_gpus via GENERATE(1, 2) pick this env up via
+  // 2-GPU integration env. Starts paused; multi-GPU TEST_CASE bodies use
   // sirius::test::acquire_integration_env_for(2) and call resume()/pause()
   // around each call to compare_gpu_vs_cpu.
   auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
