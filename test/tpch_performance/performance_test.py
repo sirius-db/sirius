@@ -1242,7 +1242,14 @@ def run_gdb(
         os.makedirs(sub_log_dir, exist_ok=True)
 
         sql_path = _build_precmd_temp_sql(
-            qnum, query_texts[f"q{qnum}"], source, iterations, pin, qdir, "gdb", data_source
+            qnum,
+            query_texts[f"q{qnum}"],
+            source,
+            iterations,
+            pin,
+            qdir,
+            "gdb",
+            data_source,
         )
         stdout_path = os.path.join(qdir, "gdb_stdout.txt")
 

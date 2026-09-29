@@ -592,6 +592,7 @@ def validation_worker(spec_path):
             vary_predicates=spec["vary_predicates"],
             query_dir=spec["query_dir"],
             sf=spec["sf"],
+            query_texts=queries_for_scale_factor(spec["sf"]),
         ),
     )
     scratch = spec["scratch"]

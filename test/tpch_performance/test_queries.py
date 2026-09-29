@@ -85,16 +85,18 @@ class TestScaleAwareQueries(unittest.TestCase):
         self.assertEqual(metadata["scale_factor"], 100)
         self.assertIn("* 0.0000010000", q11_sql)
 
-    def test_nsys_script_uses_rendered_query(self):
+    def test_external_runner_scripts_use_rendered_query(self):
         q11_sql = queries_for_scale_factor(500)["q11"]
         with tempfile.TemporaryDirectory() as qdir:
-            script_path = performance_test._build_nsys_temp_sql(
-                11, q11_sql, "unused.duckdb", 1, "none", qdir, "duckdb"
-            )
-            with open(script_path) as f:
-                script = f.read()
-        self.assertIn("* 0.0000002000", script)
-        self.assertNotIn("* 0.0001000000", script)
+            for precmd in ("nsys", "gdb"):
+                with self.subTest(precmd=precmd):
+                    script_path = performance_test._build_precmd_temp_sql(
+                        11, q11_sql, "unused.duckdb", 1, "none", qdir, precmd, "duckdb"
+                    )
+                    with open(script_path) as f:
+                        script = f.read()
+                    self.assertIn("* 0.0000002000", script)
+                    self.assertNotIn("* 0.0001000000", script)
 
     def test_power_throughput_fixed_queries_use_run_scale(self):
         args = SimpleNamespace(
@@ -104,6 +106,39 @@ class TestScaleAwareQueries(unittest.TestCase):
         stream = dict(tpch_power_throughput.stream_queries(0, args))
 
         self.assertIn("* 0.0000001000", stream[11][0])
+
+    def test_validation_worker_builds_fixed_queries_for_run_scale(self):
+        spec = {
+            "run_dir": "unused",
+            "vary_predicates": False,
+            "query_dir": "unused",
+            "sf": 1000,
+            "scratch": "unused.duckdb",
+            "input": "unused.duckdb",
+        }
+        with tempfile.TemporaryDirectory() as run_dir:
+            spec_path = os.path.join(run_dir, "spec.json")
+            with open(spec_path, "w") as f:
+                json.dump(spec, f)
+            with (
+                patch.object(
+                    tpch_power_throughput,
+                    "stream_queries",
+                    wraps=tpch_power_throughput.stream_queries,
+                ) as stream_queries,
+                patch.object(
+                    tpch_power_throughput,
+                    "copy_database",
+                    side_effect=RuntimeError("stop before opening database"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "stop before opening database"
+                ):
+                    tpch_power_throughput.validation_worker(spec_path)
+
+        worker_args = stream_queries.call_args.args[1]
+        self.assertIn("* 0.0000001000", worker_args.query_texts["q11"])
 
 
 if __name__ == "__main__":
