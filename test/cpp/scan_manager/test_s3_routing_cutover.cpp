@@ -28,6 +28,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -76,6 +77,8 @@ using sirius::io::rest::rest_ioctx;
 using sirius::io::rest::rest_reactor;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
+using sirius::test::s3::require_rest_ioctx;
+using sirius::test::s3::single_gpu_index;
 
 std::filesystem::path make_regular_file()
 {
@@ -153,23 +156,6 @@ bool is_local_backend(std::optional<io_context_type> type)
   return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
 }
 
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
-
 scan_manager_config make_s3_scan_config(std::string endpoint,
                                         sirius::scan_manager::io_backend backend)
 {
@@ -197,7 +183,8 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology =
+    single_gpu_index(/*numa_node=*/0);
 };
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
@@ -455,15 +442,6 @@ class range_s3_server {
   std::thread _thread;
 };
 
-rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
-{
-  REQUIRE(ds != nullptr);
-  REQUIRE(ds->io_ctx() != nullptr);
-  auto* ctx = dynamic_cast<rest_ioctx*>(ds->io_ctx().get());
-  REQUIRE(ctx != nullptr);
-  return ctx;
-}
-
 void read_one_host_range(sirius::io::sirius_datasource& ds)
 {
   std::array<std::uint8_t, 128> dst{};
@@ -510,23 +488,6 @@ TEST_CASE(
   // RemoteHandle serves them; LIST/glob still uses the REST ioctx, obtained by
   // type rather than by path.
   CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
-}
-
-TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
-          "[s3][routing][scan_manager]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
-  scan_manager_fixture fixture;
-  sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
-    *fixture.memory,
-    fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
 }
 
 TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
@@ -684,6 +645,7 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
   REQUIRE(datasource->io_ctx()->cache() == nullptr);
 
   auto q = make_empty_query();

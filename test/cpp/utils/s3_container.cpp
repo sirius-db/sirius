@@ -214,8 +214,14 @@ fs::path generate_fixtures(fs::path const& out_dir)
     env_or("SIRIUS_TEST_S3_PARQUET_SOURCE",
            (root / "test" / "cpp" / "integration" / "data" / "parquet").string());
   fs::create_directories(out_dir);
-  int rc = run_process(
-    {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
+  int rc = run_process({"python3",
+                        script.string(),
+                        "--out",
+                        out_dir.string(),
+                        "--parquet-source",
+                        parquet_src,
+                        "--manifest",
+                        (out_dir.parent_path() / "MANIFEST.sha256").string()});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
 }

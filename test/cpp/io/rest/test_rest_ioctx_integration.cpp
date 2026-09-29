@@ -24,6 +24,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/s3_test_env.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -75,42 +76,17 @@ using sirius::io::io_context_type;
 using sirius::io::rest::rest_ioctx;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
+using sirius::test::s3::env_or;
+using sirius::test::s3::require_env;
+using sirius::test::s3::require_rest_ioctx;
+using sirius::test::s3::single_gpu_index;
 using namespace std::chrono_literals;
-
-std::string env_or(std::string const& name, std::string fallback = {})
-{
-  if (auto* value = std::getenv(name.c_str()); value != nullptr) { return value; }
-  return fallback;
-}
-
-std::string require_env(std::string const& name)
-{
-  auto value = env_or(name);
-  REQUIRE_FALSE(value.empty());
-  return value;
-}
-
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
 
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology =
+    single_gpu_index(/*numa_node=*/0);
 };
 
 scan_manager_config make_minio_rest_config()
@@ -219,16 +195,6 @@ struct cuda_host_deleter {
 };
 
 using unique_cuda_host_buffer = std::unique_ptr<std::uint8_t, cuda_host_deleter>;
-
-rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
-{
-  REQUIRE(ds != nullptr);
-  REQUIRE(ds->io_ctx() != nullptr);
-  CHECK(ds->io_ctx()->type() == io_context_type::restful);
-  auto* rest_ctx = dynamic_cast<rest_ioctx*>(ds->io_ctx().get());
-  REQUIRE(rest_ctx != nullptr);
-  return rest_ctx;
-}
 
 std::uint32_t read_le32(std::span<std::uint8_t const> bytes)
 {
@@ -948,44 +914,37 @@ TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][list][watchdog_chil
           error.find("no entries") != std::string::npos)));
 }
 
-TEST_CASE("rest_ioctx terminates a repeated-token empty LIST loop", "[s3][integration][rest][list]")
-{
-  range_fault_policy fault;
-  fault.response_delay = 100ms;
-  range_http_server server(
-    deterministic_payload(16), fault, {}, scripted_list_mode::repeated_empty_token);
-
-  // This deadline starts when the server accepts the request, so it includes
-  // the injected delay, response handling, context shutdown, and child-process
-  // teardown. Keep it at least as long as the direct client's request timeout;
-  // the watchdog still bounds a pagination regression without becoming a CI
-  // scheduler-load test.
-  auto const result = run_list_watchdog(server, 10s, 5s);
-  INFO("LIST requests=" << server.list_count());
-  CHECK_FALSE(result.timed_out);
-  CHECK(result.exited_normally);
-  CHECK(result.exit_code == 0);
-  CHECK(server.list_count() <= 3);
-}
-
-TEST_CASE("rest_ioctx terminates an alternating-token empty LIST loop",
+TEST_CASE("rest_ioctx terminates empty LIST loops whose continuation token repeats or alternates",
           "[s3][integration][rest][list]")
 {
-  range_fault_policy fault;
-  fault.response_delay = 100ms;
-  range_http_server server(
-    deterministic_payload(16), fault, {}, scripted_list_mode::alternating_empty_tokens);
+  for (auto const& [label, mode] :
+       {std::pair{"repeated empty token", scripted_list_mode::repeated_empty_token},
+        std::pair{"alternating empty tokens", scripted_list_mode::alternating_empty_tokens}}) {
+    DYNAMIC_SECTION(label)
+    {
+      range_fault_policy fault;
+      fault.response_delay = 100ms;
+      range_http_server server(deterministic_payload(16), fault, {}, mode);
 
-  auto const result = run_list_watchdog(server, 10s, 5s);
-  INFO("LIST requests=" << server.list_count());
-  CHECK_FALSE(result.timed_out);
-  CHECK(result.exited_normally);
-  CHECK(result.exit_code == 0);
-  CHECK(server.list_count() <= 3);
+      // This deadline starts when the server accepts the request, so it includes
+      // the injected delay, response handling, context shutdown, and child-process
+      // teardown. Keep it at least as long as the direct client's request timeout;
+      // the watchdog still bounds a pagination regression without becoming a CI
+      // scheduler-load test.
+      auto const result = run_list_watchdog(server, 10s, 5s);
+      INFO("LIST requests=" << server.list_count());
+      CHECK_FALSE(result.timed_out);
+      CHECK(result.exited_normally);
+      CHECK(result.exit_code == 0);
+      CHECK(server.list_count() <= 3);
+    }
+  }
 }
 
-TEST_CASE("rest_ioctx accepts an empty final LIST page and rejects an empty continuation token",
-          "[s3][integration][rest][list]")
+TEST_CASE(
+  "rest_ioctx accepts an empty final LIST page and rejects a truncated page without a continuation "
+  "token",
+  "[s3][integration][rest][list]")
 {
   SECTION("empty final page")
   {
@@ -1359,6 +1318,7 @@ TEST_CASE("rest data GET on a stalled connection fails under the stall detector"
   config.request_timeout_s       = 0;  // only the stall detector may end this transfer
   config.stall_speed_limit_bytes = 1024;
   config.stall_time_s            = 1;
+  config.max_retry_attempts      = 2;
   auto ioctx                     = make_direct_rest_ioctx(server.endpoint(), config);
   auto datasource = ioctx->open_datasource("s3://stalled-bucket/object.bin", payload.size());
   std::vector<std::uint8_t> destination(payload.size());
@@ -1369,7 +1329,7 @@ TEST_CASE("rest data GET on a stalled connection fails under the stall detector"
   auto future        = ioctx->host_readv_async_io(datasource->get_io_object(), slices);
   CHECK_THROWS(std::move(future).get(60s));
   CHECK(std::chrono::steady_clock::now() - started < 15s);
-  CHECK(server.get_count() >= 1);
+  CHECK(server.get_count() == 2);
 }
 
 TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest][cache]")
@@ -1824,7 +1784,8 @@ TEST_CASE("footer suffix probe retries transient GET failures",
   }
 }
 
-TEST_CASE("HEAD object-size retries preserve retry behavior", "[s3][integration][rest][footerbind]")
+TEST_CASE("rest_reactor HEAD retries transient 503s and stops on exhaustion or a hard error",
+          "[s3][integration][rest][footerbind]")
 {
   auto const payload = deterministic_payload(4096);
 
@@ -2025,7 +1986,10 @@ TEST_CASE("concurrent footer probes each get an object-local suffix stash",
 TEST_CASE("rest_ioctx reads the MinIO hello fixture through scan_manager create_datasource",
           "[s3][integration][rest]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
@@ -2052,7 +2016,10 @@ TEST_CASE("rest_ioctx reads the MinIO hello fixture through scan_manager create_
 TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on MinIO fixtures",
           "[s3][integration][rest]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
@@ -2085,10 +2052,13 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on MinIO fixtures",
   CHECK(std::all_of(eof.begin(), eof.end(), [](std::uint8_t b) { return b == 0xcc; }));
 }
 
-TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture",
+TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the MinIO medium fixture",
           "[s3][integration][rest]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const medium = read_binary_file(local_fixture_path("medium.bin"));
@@ -2188,10 +2158,15 @@ TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes
   require_bytes_equal(got, payload);
 }
 
-TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chunk MinIO reads",
-          "[s3][integration][rest]")
+TEST_CASE(
+  "rest_ioctx stages device reads through the fixed-size host memory resource for single and multi "
+  "chunk MinIO reads",
+  "[s3][integration][rest]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -2368,7 +2343,10 @@ TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
 TEST_CASE("rest_ioctx reads through the TLS MinIO endpoint with the harness CA bundle",
           "[s3][integration][rest]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
@@ -2389,19 +2367,36 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
   auto payload = deterministic_payload(128 * 1024);
   range_fault_policy fault{};
   fault.response_delay = 100ms;
-  range_http_server server(payload, fault);
+  auto server          = std::make_shared<range_http_server>(payload, fault);
 
-  std::vector<std::uint8_t> got(4096);
-  std::future<std::size_t> future;
-  {
-    scan_manager_fixture fixture;
-    auto cfg                 = make_fake_rest_config(server.endpoint());
-    cfg.rest.max_connections = 1;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-    auto datasource = manager.create_datasource("s3://lifecycle-bucket/object.bin");
-    require_rest_ioctx(datasource);
-    future = datasource->host_read_async(0, got.size(), got.data());
+  auto buffer              = std::make_shared<std::vector<std::uint8_t>>(4096);
+  auto& got                = *buffer;
+  auto fixture             = std::make_unique<scan_manager_fixture>();
+  auto cfg                 = make_fake_rest_config(server->endpoint());
+  cfg.rest.max_connections = 1;
+  auto manager    = std::make_unique<sirius_scan_manager>(cfg, *fixture->memory, fixture->topology);
+  auto datasource = manager->create_datasource("s3://lifecycle-bucket/object.bin");
+  require_rest_ioctx(datasource);
+  auto future = datasource->host_read_async(0, got.size(), got.data());
+
+  std::promise<void> completed;
+  auto teardown = completed.get_future();
+  std::thread worker([datasource = std::move(datasource),
+                      manager    = std::move(manager),
+                      fixture    = std::move(fixture),
+                      server,
+                      buffer,
+                      completed = std::move(completed)]() mutable {
+    datasource.reset();
+    manager.reset();
+    fixture.reset();
+    completed.set_value();
+  });
+  if (teardown.wait_for(10s) != std::future_status::ready) {
+    worker.detach();
+    FAIL("scan manager teardown did not return within 10 s");
   }
+  worker.join();
 
   REQUIRE(future.valid());
   REQUIRE(future.wait_for(5s) == std::future_status::ready);

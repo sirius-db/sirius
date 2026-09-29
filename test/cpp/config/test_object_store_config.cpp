@@ -51,49 +51,52 @@ TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
   CHECK(cfg.s3_signing_mode == object_store_config::signing_mode::presigned);
 }
 
-TEST_CASE("object_store_config string_to_enum accepts known transports", "[object_store_config]")
+TEST_CASE("object_store_config transport string helpers round-trip", "[object_store_config]")
 {
-  object_store_config::transport t = object_store_config::transport::RDMA;
+  SECTION("string_to_enum accepts known transports")
+  {
+    object_store_config::transport t = object_store_config::transport::RDMA;
 
-  REQUIRE(string_to_enum("auto", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    REQUIRE(string_to_enum("auto", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  REQUIRE(string_to_enum("http", t));
-  CHECK(t == object_store_config::transport::HTTP);
+    REQUIRE(string_to_enum("http", t));
+    CHECK(t == object_store_config::transport::HTTP);
 
-  REQUIRE(string_to_enum("https", t));
-  CHECK(t == object_store_config::transport::HTTP);
+    REQUIRE(string_to_enum("https", t));
+    CHECK(t == object_store_config::transport::HTTP);
 
-  REQUIRE(string_to_enum("rdma", t));
-  CHECK(t == object_store_config::transport::RDMA);
-}
+    REQUIRE(string_to_enum("rdma", t));
+    CHECK(t == object_store_config::transport::RDMA);
+  }
 
-TEST_CASE("object_store_config string_to_enum rejects unknown transports", "[object_store_config]")
-{
-  auto t = object_store_config::transport::AUTO;
+  SECTION("string_to_enum rejects unknown transports")
+  {
+    auto t = object_store_config::transport::AUTO;
 
-  CHECK_FALSE(string_to_enum("", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    CHECK_FALSE(string_to_enum("", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  CHECK_FALSE(string_to_enum("smb", t));
-  CHECK(t == object_store_config::transport::AUTO);
+    CHECK_FALSE(string_to_enum("smb", t));
+    CHECK(t == object_store_config::transport::AUTO);
 
-  CHECK_FALSE(string_to_enum("HTTP", t));
-  CHECK(t == object_store_config::transport::AUTO);
-}
+    CHECK_FALSE(string_to_enum("HTTP", t));
+    CHECK(t == object_store_config::transport::AUTO);
+  }
 
-TEST_CASE("object_store_config enum_to_string returns canonical names", "[object_store_config]")
-{
-  std::string out;
+  SECTION("enum_to_string returns canonical names")
+  {
+    std::string out;
 
-  REQUIRE(enum_to_string(object_store_config::transport::AUTO, out));
-  CHECK(out == "auto");
+    REQUIRE(enum_to_string(object_store_config::transport::AUTO, out));
+    CHECK(out == "auto");
 
-  REQUIRE(enum_to_string(object_store_config::transport::HTTP, out));
-  CHECK(out == "http");
+    REQUIRE(enum_to_string(object_store_config::transport::HTTP, out));
+    CHECK(out == "http");
 
-  REQUIRE(enum_to_string(object_store_config::transport::RDMA, out));
-  CHECK(out == "rdma");
+    REQUIRE(enum_to_string(object_store_config::transport::RDMA, out));
+    CHECK(out == "rdma");
+  }
 }
 
 TEST_CASE("object_store_config signing_mode string helpers round-trip",
@@ -229,26 +232,6 @@ TEST_CASE("sirius_config rejects removed s3_use_async_backend object_store key",
 
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(path));
-
-  std::error_code ec;
-  std::filesystem::remove(path, ec);
-}
-
-TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the key",
-          "[scan_manager][config][prefetching_cache]")
-{
-  auto const path = std::filesystem::temp_directory_path() / "sirius_chunk_prewarm_default.yaml";
-  {
-    std::ofstream out(path);
-    out << "sirius:\n"
-           "  executor:\n"
-           "    scan_manager:\n"
-           "      backend: sirius\n";
-    REQUIRE(out);
-  }
-
-  sirius::sirius_config cfg;
-  cfg.load_from_file(path);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

@@ -12,7 +12,7 @@
 
 TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql][s3][rewrite]")
 {
-  SECTION("R1 rewrites a single s3 read_parquet call")
+  SECTION("rewrites a single s3 read_parquet call")
   {
     auto const input  = std::string{"SELECT * FROM read_parquet('s3://x/y.parquet')"};
     auto const output = sirius::rewrite_sirius_owned_remote_parquet_calls(input);
@@ -49,7 +49,7 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(input) == expected);
   }
 
-  SECTION("R1b matches the function name case-insensitively")
+  SECTION("matches the function name case-insensitively")
   {
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(
             "SELECT * FROM READ_PARQUET('s3://x/y.parquet')") ==
@@ -59,7 +59,7 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
           "SELECT * FROM sirius_read_parquet('s3://x/y.parquet')");
   }
 
-  SECTION("R1c leaves string literals and comments alone")
+  SECTION("leaves string literals and comments alone")
   {
     auto const input =
       "SELECT '/* read_parquet(''s3://literal/file.parquet'') */' AS txt "
@@ -74,7 +74,7 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(input) == expected);
   }
 
-  SECTION("R1c leaves double-quoted identifiers alone")
+  SECTION("leaves double-quoted identifiers alone")
   {
     auto const input =
       "SELECT \"read_parquet('s3://identifier/file.parquet')\" "
@@ -85,7 +85,7 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(input) == expected);
   }
 
-  SECTION("R1d does not rewrite adjacent parquet functions")
+  SECTION("does not rewrite adjacent parquet functions")
   {
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(
             "SELECT * FROM xread_parquet('s3://x/y.parquet')") ==
@@ -101,7 +101,7 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
           "SELECT * FROM parquet_metadata('s3://x/y.parquet')");
   }
 
-  SECTION("R2 leaves local paths untouched")
+  SECTION("leaves local paths untouched")
   {
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(
             "SELECT * FROM read_parquet('/tmp/a.parquet')") ==
@@ -127,12 +127,8 @@ TEST_CASE("S3 SQL rewrite targets only Sirius-owned remote parquet calls", "[sql
       "sirius_read_parquet('s3://b/k.parquet')"};
     CHECK(sirius::rewrite_sirius_owned_remote_parquet_calls(input) == expected);
   }
-}
 
-TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
-          "[s3][sql][rewrite]")
-{
-  SECTION("detects real s3 read_parquet calls")
+  SECTION("predicate detects real s3 read_parquet calls")
   {
     CHECK(
       sirius::references_sirius_owned_s3_parquet("SELECT * FROM read_parquet('s3://b/k.parquet')"));
@@ -144,7 +140,7 @@ TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
       "SELECT * FROM read_parquet('s3://b/k.parquet')"));
   }
 
-  SECTION("does not treat qualified read_parquet calls as Sirius-owned")
+  SECTION("predicate does not treat qualified read_parquet calls as Sirius-owned")
   {
     CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
       "SELECT * FROM main.read_parquet('s3://b/k.parquet')"));
@@ -154,7 +150,7 @@ TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
       sirius::references_sirius_owned_s3_parquet("SELECT * FROM read_parquet('s3://b/k.parquet')"));
   }
 
-  SECTION("ignores local paths and unrelated queries")
+  SECTION("predicate ignores local paths and unrelated queries")
   {
     CHECK_FALSE(
       sirius::references_sirius_owned_s3_parquet("SELECT * FROM read_parquet('/local/x.parquet')"));
@@ -163,7 +159,7 @@ TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
     CHECK_FALSE(sirius::references_sirius_owned_s3_parquet("SELECT 42"));
   }
 
-  SECTION("ignores comments and quoted strings")
+  SECTION("predicate ignores comments and quoted strings")
   {
     CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
       "-- read_parquet('s3://comment/file.parquet')\nSELECT 1"));
@@ -175,7 +171,7 @@ TEST_CASE("S3 SQL rewrite predicate detects Sirius-owned remote parquet calls",
       "SELECT \"read_parquet('s3://identifier/file.parquet')\""));
   }
 
-  SECTION("requires the bare read_parquet function name")
+  SECTION("predicate requires the bare read_parquet function name")
   {
     CHECK_FALSE(sirius::references_sirius_owned_s3_parquet(
       "SELECT * FROM my_read_parquet('s3://b/k.parquet')"));

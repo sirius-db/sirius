@@ -23,7 +23,6 @@
 #include "io/rest/s3/static_credentials.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -223,18 +222,21 @@ TEST_CASE("ListObjectsV2 parser rejects non-list bodies and malformed sizes", "[
 
 TEST_CASE("ListObjectsV2 parser rejects Contents without a Key", "[s3][list_parser]")
 {
-  CHECK_THROWS_WITH(
-    sirius::io::rest::s3::parse_list_objects_v2(
-      R"(<ListBucketResult><Contents><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("<Contents> without <Key>"));
-}
+  DYNAMIC_SECTION("missing Key")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::rest::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+      Catch::Contains("<Contents> without <Key>"));
+  }
 
-TEST_CASE("ListObjectsV2 parser rejects an unclosed Key", "[s3][list_parser]")
-{
-  CHECK_THROWS_WITH(
-    sirius::io::rest::s3::parse_list_objects_v2(
-      R"(<ListBucketResult><Contents><Key>a<Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("<Contents> without <Key>"));
+  DYNAMIC_SECTION("unclosed Key")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::rest::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Key>a<Size>5</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>)"),
+      Catch::Contains("<Contents> without <Key>"));
+  }
 }
 
 TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
@@ -247,10 +249,20 @@ TEST_CASE("ListObjectsV2 parser rejects an empty Key", "[s3][list_parser]")
 
 TEST_CASE("ListObjectsV2 parser requires IsTruncated", "[s3][list_parser]")
 {
-  CHECK_THROWS_WITH(
-    sirius::io::rest::s3::parse_list_objects_v2(
-      R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents></ListBucketResult>)"),
-    Catch::Contains("missing <IsTruncated>"));
+  DYNAMIC_SECTION("absent")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::rest::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents></ListBucketResult>)"),
+      Catch::Contains("missing <IsTruncated>"));
+  }
+
+  DYNAMIC_SECTION("outside the root")
+  {
+    CHECK_THROWS_WITH(sirius::io::rest::s3::parse_list_objects_v2(
+                        R"(<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>)"),
+                      Catch::Contains("missing <IsTruncated>"));
+  }
 }
 
 TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_parser]")
@@ -279,10 +291,21 @@ TEST_CASE("ListObjectsV2 parser rejects invalid IsTruncated values", "[s3][list_
 
 TEST_CASE("ListObjectsV2 parser requires a token for a truncated page", "[s3][list_parser]")
 {
-  CHECK_THROWS_WITH(
-    sirius::io::rest::s3::parse_list_objects_v2(
-      R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>)"),
-    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+  DYNAMIC_SECTION("absent")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::rest::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Key>a</Key><Size>5</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult>)"),
+      Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+  }
+
+  DYNAMIC_SECTION("outside the root")
+  {
+    CHECK_THROWS_WITH(
+      sirius::io::rest::s3::parse_list_objects_v2(
+        R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult><NextContinuationToken>outside</NextContinuationToken>)"),
+      Catch::Contains("without") && Catch::Contains("ContinuationToken"));
+  }
 }
 
 TEST_CASE("ListObjectsV2 parser trims a valid IsTruncated value", "[s3][list_parser]")
@@ -302,22 +325,6 @@ TEST_CASE("ListObjectsV2 parser rejects object entries after the root element", 
     Catch::Contains("after </ListBucketResult>"));
 }
 
-TEST_CASE("ListObjectsV2 parser does not read IsTruncated outside the root", "[s3][list_parser]")
-{
-  CHECK_THROWS_WITH(sirius::io::rest::s3::parse_list_objects_v2(
-                      R"(<ListBucketResult></ListBucketResult><IsTruncated>false</IsTruncated>)"),
-                    Catch::Contains("missing <IsTruncated>"));
-}
-
-TEST_CASE("ListObjectsV2 parser does not read a continuation token outside the root",
-          "[s3][list_parser]")
-{
-  CHECK_THROWS_WITH(
-    sirius::io::rest::s3::parse_list_objects_v2(
-      R"(<ListBucketResult><Contents><Key>a</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated></ListBucketResult><NextContinuationToken>outside</NextContinuationToken>)"),
-    Catch::Contains("without") && Catch::Contains("ContinuationToken"));
-}
-
 TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3][list_parser]")
 {
   CHECK_THROWS_AS(sirius::io::rest::s3::parse_list_objects_v2(
@@ -325,20 +332,34 @@ TEST_CASE("ListObjectsV2 parser rejects a root close before the root open", "[s3
                   std::runtime_error);
 }
 
-TEST_CASE("ListObjectsV2 parser accepts a prologue, root namespace, and trailing whitespace",
-          "[s3][list_parser]")
+TEST_CASE(
+  "ListObjectsV2 parser accepts an XML prologue, root namespace, and surrounding whitespace",
+  "[s3][list_parser]")
 {
-  auto const page = sirius::io::rest::s3::parse_list_objects_v2(
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-    "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-    "<Contents><Key>a</Key><Size>1</Size></Contents>"
-    "<IsTruncated>false</IsTruncated>"
-    "</ListBucketResult> \n\t");
+  SECTION("prologue, root namespace, and trailing whitespace")
+  {
+    auto const page = sirius::io::rest::s3::parse_list_objects_v2(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+      "<Contents><Key>a</Key><Size>1</Size></Contents>"
+      "<IsTruncated>false</IsTruncated>"
+      "</ListBucketResult> \n\t");
 
-  REQUIRE(page.entries.size() == 1);
-  CHECK(page.entries[0].key == "a");
-  CHECK(page.entries[0].size == 1);
-  CHECK_FALSE(page.is_truncated);
+    REQUIRE(page.entries.size() == 1);
+    CHECK(page.entries[0].key == "a");
+    CHECK(page.entries[0].size == 1);
+    CHECK_FALSE(page.is_truncated);
+  }
+
+  SECTION("prologue and newline before the root")
+  {
+    auto const page = sirius::io::rest::s3::parse_list_objects_v2(
+      "<?xml version=\"1.0\"?>\n "
+      "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
+
+    CHECK(page.entries.empty());
+    CHECK_FALSE(page.is_truncated);
+  }
 }
 
 TEST_CASE("ListObjectsV2 parser rejects a root-name prefix collision", "[s3][list_parser]")
@@ -355,17 +376,6 @@ TEST_CASE("ListObjectsV2 parser rejects content before the root element", "[s3][
     sirius::io::rest::s3::parse_list_objects_v2(
       R"(<Foo/><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>)"),
     Catch::Contains("before <ListBucketResult>"));
-}
-
-TEST_CASE("ListObjectsV2 parser accepts a prologue and newline before the root",
-          "[s3][list_parser]")
-{
-  auto const page = sirius::io::rest::s3::parse_list_objects_v2(
-    "<?xml version=\"1.0\"?>\n "
-    "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>");
-
-  CHECK(page.entries.empty());
-  CHECK_FALSE(page.is_truncated);
 }
 
 TEST_CASE("request_authorizer base rejects LIST until implementations opt in", "[s3][authorizer]")
@@ -553,7 +563,8 @@ TEST_CASE("sigv4_presigned_authorizer generates distinct GET and HEAD URLs", "[s
   CHECK(query_value(get_url, "X-Amz-Signature") != query_value(head_url, "X-Amz-Signature"));
 }
 
-TEST_CASE("sigv4_presigned_authorizer encodes bucket and key path components", "[s3][authorizer]")
+TEST_CASE("sigv4_presigned_authorizer percent-encodes object keys and keeps their slashes",
+          "[s3][authorizer]")
 {
   sigv4_presigned_authorizer provider(
     example_static_credentials(), "us-east-1", "https://s3.us-east-1.amazonaws.com");
@@ -582,20 +593,6 @@ TEST_CASE("sigv4_presigned_authorizer encodes bucket and key path components", "
                     "https://s3.us-east-1.amazonaws.com/bucket/%E4%B8%AD%E6%96%87.parquet?"));
 }
 
-TEST_CASE("sigv4_presigned_authorizer propagates session tokens", "[s3][authorizer]")
-{
-  auto creds          = example_static_credentials();
-  creds.session_token = "temporary/session+token=";
-  sigv4_presigned_authorizer provider(creds, "us-east-1", "https://s3.us-east-1.amazonaws.com");
-
-  auto request =
-    provider.authorize({"examplebucket", "test.txt"}, request_method::GET, k_presign_timeout);
-  CHECK(request.headers.empty());
-  auto const& url = request.url;
-
-  CHECK(contains(url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
-}
-
 TEST_CASE("static_credentials_from maps object_store_config session tokens into SigV4 URLs",
           "[s3][authorizer]")
 {
@@ -612,9 +609,10 @@ TEST_CASE("static_credentials_from maps object_store_config session tokens into 
   CHECK(creds.session_token == cfg.session_token);
 
   sigv4_presigned_authorizer token_provider(creds, cfg.region, cfg.endpoint);
-  auto token_url =
-    token_provider.authorize({"examplebucket", "test.txt"}, request_method::GET, k_presign_timeout)
-      .url;
+  auto token_request =
+    token_provider.authorize({"examplebucket", "test.txt"}, request_method::GET, k_presign_timeout);
+  CHECK(token_request.headers.empty());
+  auto const& token_url = token_request.url;
   CHECK(contains(token_url, "X-Amz-Security-Token=temporary%2Fsession%2Btoken%3D"));
 
   cfg.session_token.clear();
@@ -676,23 +674,20 @@ TEST_CASE("sigv4_presigned_authorizer is safe under concurrent presigning", "[s3
 
   constexpr int n_threads = 8;
   constexpr int n_iters   = 25;
-  std::atomic<int> malformed{0};
+  std::vector<std::vector<std::string>> urls(n_threads);
   std::vector<std::thread> threads;
   threads.reserve(n_threads);
 
   for (int t = 0; t < n_threads; ++t) {
-    threads.emplace_back([&provider, &malformed, t] {
+    urls[t].reserve(n_iters);
+    threads.emplace_back([&provider, &urls, t] {
       for (int i = 0; i < n_iters; ++i) {
         auto url = provider
                      .authorize({"bucket", "key-" + std::to_string(t) + ".parquet"},
                                 request_method::GET,
                                 k_presign_timeout)
                      .url;
-        if (!starts_with(url, "https://s3.us-east-1.amazonaws.com/bucket/key-") ||
-            query_value(url, "X-Amz-SignedHeaders") != "host" ||
-            !is_lower_hex_64(query_value(url, "X-Amz-Signature"))) {
-          ++malformed;
-        }
+        urls[t].push_back(std::move(url));
       }
     });
   }
@@ -701,7 +696,22 @@ TEST_CASE("sigv4_presigned_authorizer is safe under concurrent presigning", "[s3
     thread.join();
   }
 
-  CHECK(malformed.load() == 0);
+  std::size_t produced  = 0;
+  std::size_t malformed = 0;
+  std::string first_malformed;
+  for (auto const& thread_urls : urls) {
+    produced += thread_urls.size();
+    for (auto const& url : thread_urls) {
+      if (!starts_with(url, "https://s3.us-east-1.amazonaws.com/bucket/key-") ||
+          query_value(url, "X-Amz-SignedHeaders") != "host" ||
+          !is_lower_hex_64(query_value(url, "X-Amz-Signature"))) {
+        if (malformed++ == 0) { first_malformed = url; }
+      }
+    }
+  }
+  INFO(first_malformed);
+  CHECK(malformed == 0);
+  CHECK(produced == n_threads * n_iters);
 }
 
 TEST_CASE("mock_authorizer returns canned URLs and records calls", "[s3][authorizer]")
