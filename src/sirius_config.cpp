@@ -359,6 +359,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("use_hw_decompression", opt.use_hw_decompression);
   r.reject_unknown();
 }
 
@@ -664,7 +665,13 @@ operator_params operator_defaults_for(
 sirius_config::sirius_config()
 {
   cucascade::memory::topology_discovery discovery;
-  if (discovery.discover()) { _hw_topology = discovery.get_topology(); }
+  // Ask cucascade to populate per-GPU runtime attributes (e.g. hw_decomp) alongside the passive
+  // NVML/sysfs topology so downstream consumers (SiriusContext hw-decompression gating) can read
+  // them off the discovered topology instead of re-querying the CUDA driver on their own.
+  if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                         /*with_runtime_attributes=*/true)) {
+    _hw_topology = discovery.get_topology();
+  }
 }
 
 void sirius_config::apply_defaults()
