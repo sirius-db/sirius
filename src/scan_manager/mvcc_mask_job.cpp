@@ -43,7 +43,7 @@
 namespace sirius::scan_manager {
 
 void fan_out_and_join(exec::scoped_dispatcher& dispatcher,
-                      std::vector<absl::AnyInvocable<void()>> tasks,
+                      std::vector<sirius::exec::invocable<void()>> tasks,
                       std::string_view label)
 {
   if (tasks.empty()) { return; }

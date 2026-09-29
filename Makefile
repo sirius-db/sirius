@@ -25,7 +25,7 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-test s3-test-large s3-tpch \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench \
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker \
 	slot-gate-test
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
@@ -135,12 +135,10 @@ list-presets: $(PRESETS_LINK)
 # environment yourself first — including SIRIUS_TEST_S3_ENDPOINT — (regional S3
 # endpoint, real bucket, and assume-role TEMPORARY credentials including the
 # session token); keep usage bounded.
-# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint
-#                     ([s3][aws] minus [bench] — the aws perf benchmark is
-#                     selected by `SIRIUS_BENCH_BACKEND=aws-s3 make s3-bench`).
+# `make s3-test-aws`  runs the live [s3][aws] tests against a real S3 endpoint.
 # `make s3-test-aws-sigv4`
 #                     subset using Sirius's built-in SigV4 presigner only
-#                     ([s3][aws] minus [broker]/[bench]).
+#                     ([s3][aws] minus [broker]).
 # `make s3-test-aws-broker`
 #                     subset driven by an external presign broker
 #                     ([s3][aws][broker]).
@@ -198,7 +196,7 @@ s3-test-large:
 
 # TPC-H-over-S3 correctness tier (Q1-Q22 == local CPU oracle, GPU-only). Uploads
 # the SF1 TPC-H fixture (SIRIUS_TEST_S3_TPCH=1) and runs both the tiny and SF1
-# correctness cases; excludes the [bench] perf arm. MinIO auto-managed.
+# correctness cases. MinIO auto-managed.
 s3-tpch:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
@@ -206,7 +204,7 @@ s3-tpch:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
-	$(S3_TEST_BIN) "[s3][integration][sql][tpch]~[bench]"
+	$(S3_TEST_BIN) "[s3][integration][sql][tpch]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -220,7 +218,7 @@ s3-test-aws:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]~[bench]"
+	$(S3_TEST_BIN) "[s3][aws]"
 
 s3-test-aws-sigv4:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -229,7 +227,7 @@ s3-test-aws-sigv4:
 	fi
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][aws]~[broker]~[bench]"
+	$(S3_TEST_BIN) "[s3][aws]~[broker]"
 
 s3-test-aws-broker:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
@@ -239,41 +237,3 @@ s3-test-aws-broker:
 	@set -e; \
 	export SIRIUS_TEST_S3_STRICT=1; \
 	$(S3_TEST_BIN) "[s3][aws][broker]"
-
-# -----------------------------------------------------------------------------
-# S3 perf benchmarks. All S3 benchmarks share the hidden [.][s3][bench] tag
-# (real-AWS ones also [aws][live]); the selector follows SIRIUS_BENCH_BACKEND:
-# minio (default) runs [s3][bench]~[aws], aws-s3 runs [s3][bench][aws]. The tag
-# carries [.] (out of the default `make test`) and lacks [integration] (so the
-# [s3] integration gate `make s3-test` never pulls it in). Default backend = minio:
-# the harness auto-manages MinIO (SIRIUS_TEST_S3_AUTO=1), generates/uploads the
-# SF10 lineitem fixture (SIRIUS_TEST_S3_LARGE=1), and SIRIUS_TEST_S3_STRICT=1
-# makes a MinIO bring-up failure fail the benchmark loud instead of skipping to a
-# false green. The JSON baseline emits
-# build/release/extension/sirius/test/cpp/log/s3_rest_perf_<ts>.json and appends
-# per-run history under doc/s3support/perf-history-<backend>.jsonl.
-# Set SIRIUS_BENCH_BACKEND=aws-s3 to hit real AWS instead of MinIO (manual only —
-# export the SIRIUS_TEST_S3_* env yourself: regional endpoint, bucket, assume-role
-# TEMPORARY credentials incl. the session token; SIRIUS_BENCH_S3_KEY overrides the
-# object key); AUTO/STRICT stay off in that case and MinIO is never started.
-
-s3-bench:
-	@if [ ! -x $(S3_TEST_BIN) ]; then \
-	  echo "s3-bench: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
-	  exit 1; \
-	fi
-	@# The TPC-H query benchmark ([s3][bench][tpch]) is excluded from the routine
-	@# run and its SF1 fixture (SIRIUS_TEST_S3_TPCH) is not uploaded, unless the
-	@# caller opts in with SIRIUS_BENCH_S3_TPCH=1.
-	@set -e; \
-	tpch_excl="~[tpch]"; \
-	if [ -n "$${SIRIUS_BENCH_S3_TPCH:-}" ]; then tpch_excl=""; fi; \
-	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
-	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	  selector="[s3][bench]~[aws]$$tpch_excl"; \
-	else \
-	  selector="[s3][bench][aws]$$tpch_excl"; \
-	fi; \
-	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
-	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \
-	$(S3_TEST_BIN) "$$selector"

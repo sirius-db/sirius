@@ -70,12 +70,18 @@ class query_event_subscriber {
   /// Throws @c std::invalid_argument if @p publisher is not owned by a @c
   /// shared_ptr, since the subscriber holds the publisher by weak reference
   /// so it can never keep it alive.
-  query_event_subscriber(query_event_publisher& publisher, std::span<event_type const> events);
+  /// With @p drain_on_stop, a started worker processes every queued event before
+  /// exiting, whether stopped here or by the publisher. Defaults to discarding
+  /// queued events. Publishers enqueue synchronously, so no publisher flush is needed.
+  query_event_subscriber(query_event_publisher& publisher,
+                         std::span<event_type const> events,
+                         bool drain_on_stop = false);
 
   /// Delegating overload so callers can write @c {event_type::foo, ...} at the
   /// call site rather than forcing an array declaration.
   query_event_subscriber(query_event_publisher& publisher,
-                         std::initializer_list<event_type> events);
+                         std::initializer_list<event_type> events,
+                         bool drain_on_stop = false);
 
   virtual ~query_event_subscriber();
 
@@ -95,12 +101,13 @@ class query_event_subscriber {
   /// subsequent @ref start calls are no-ops, and the publisher routes nothing
   /// here from now on, so a stopped subscriber accumulates nothing.  Safe to
   /// call when not started, and safe to call twice.  Does not stop the
-  /// publisher.
+  /// publisher. With drain_on_stop, joining also waits for queued callbacks;
+  /// hooks must finish for this call to return. An unstarted worker is not drained.
   ///
   /// Callable from a hook, where it cannot join (that would be a self-join) and
   /// so returns with the worker still on its way out: it exits as soon as the
-  /// hook returns.  A caller that needs the worker down before it tears
-  /// anything else apart must therefore stop from somewhere other than a hook.
+  /// hook returns (after draining, if enabled). A caller that needs the worker
+  /// down before tearing anything apart must stop from outside a hook.
   void stop() noexcept;
 
   /// Whether the worker is up.  False once it has exited, including when the
@@ -202,7 +209,19 @@ class query_event_subscriber {
                                            int gpu_id,
                                            std::size_t bytes_needed) noexcept;
 
+  virtual void on_compressed_materialization(event_id_t,
+                                             timestamp_t,
+                                             compressed_materialization_activity,
+                                             std::uint64_t count) noexcept;
+
+ protected:
+  /// Inspect after stop() joins the worker to reject incomplete observations.
+  [[nodiscard]] bool delivery_failed() const noexcept { return _queue->failed(); }
+
  private:
+  /// Detach before interrupting so the final drain has no concurrent producers.
+  void close_mailbox() noexcept;
+
   /// Drain until the mailbox closes, replaying each event into its hook.
   ///
   /// Every teardown path --- @ref stop, the publisher's, and the destructor's
@@ -231,11 +250,13 @@ class query_event_subscriber {
   /// Lets @ref start refuse to spin up a worker once the publisher has
   /// already stopped.
   std::stop_token _stop_token;
+  bool const _drain_on_stop;
 
   /// Guards the whole of @ref start and @ref stop.  A flag per transition was
   /// not enough: the checks and the mutations to @c _worker have to happen
   /// together, or a @ref start racing a @ref stop leaves behind a worker the
-  /// stopper already decided was not there.  No hook runs under it.
+  /// stopper already decided was not there. A hook stopping itself bypasses
+  /// this lock and only closes the mailbox; an owner stop still joins it.
   mutable std::mutex _mtx;
   worker_state _state{worker_state::idle};  ///< guarded by @c _mtx
 
