@@ -743,8 +743,16 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
                                                                 right_col_views,
                                                                 "right");
 
-      left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
-      right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
+      // RIGHT is executed as a left join with the input tables swapped below. Keep
+      // each operand attached to its original table; swapping the result maps alone
+      // does not preserve an asymmetric predicate such as left.x < right.y.
+      const bool swap_sides = join_type == duckdb::JoinType::RIGHT;
+      left_refs.emplace_back(
+        left_join_input_index,
+        swap_sides ? cudf::ast::table_reference::RIGHT : cudf::ast::table_reference::LEFT);
+      right_refs.emplace_back(
+        right_join_input_index,
+        swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT);
       if (cond.comparison == sirius::comparison_type::distinct_from) {
         // IS DISTINCT FROM is null-safe (NULL vs 5 is TRUE, NULL vs NULL is FALSE) but cuDF's
         // NOT_EQUAL is null-propagating, so build NOT(NULL_EQUAL(l, r)) instead.
