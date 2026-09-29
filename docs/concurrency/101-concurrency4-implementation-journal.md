@@ -111,3 +111,20 @@ Implementation entries will be added here as each buildable change is validated 
 - Validation: full `pixi run make`; Iceberg and telemetry regressions passed (70 cases, 1,344 assertions), after installing
   the required official DuckDB avro/Iceberg test extensions.
 - Previous commit: `2b233ac6d`.
+
+### 5. `fix(config): snapshot connection-local query options`
+
+- Operator, expression and pin-compression SQL settings belong to the connection; runtime YAML
+  defaults remain unchanged. GLOBAL writes to these settings are rejected. RESET restores the
+  registered YAML default. Settings remain usable with the GPU runtime disabled.
+- An execution takes one immutable options snapshot before final physical planning. Planning,
+  GPU subset selection, pipeline construction and scan pruning consume that snapshot. GPU tasks
+  install the expression policy for their duration and restore the worker's prior policy.
+- Hardware decompression changes require startup configuration. Shared logging configuration
+  updates and sink installation serialize under one mutex.
+- Validation: full build; broad configuration/executor/regex suite passed 106 cases. One existing
+  configuration case requires two GPUs and cannot execute on this host. A disabled-runtime SET
+  regression found by that run was fixed; its focused rerun plus option isolation and regex
+  tests passed (3 cases, 244 assertions). The new isolation test also checks RESET and refused
+  GLOBAL writes.
+- Previous commit: `6b1384720`.

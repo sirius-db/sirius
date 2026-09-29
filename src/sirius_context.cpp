@@ -385,6 +385,11 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
+  auto connection_state = get_sirius_connection_state(context);
+  if (connection_state) {
+    connection_state->execution_options.reset();
+    connection_state->execution_options = query_operator_options(context);
+  }
   // Open the enqueue gate before anything can schedule. Every producer consults it, so this must
   // precede repository/task_creator registration.
   query_lifecycle_.open_query(query_id);
@@ -1171,9 +1176,12 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   task_creator_->prepare_for_query(*query, std::move(handler));
   // Reads this query's admitted subset back off task_creator, so this must run after
   // initialize_internal has set it — otherwise scan_manager gets an empty (unnarrowed) set.
-  scan_manager_->prepare_for_query(*query,
-                                   config_.get_operator_params().enable_pinned_zone_map_pruning,
-                                   task_creator_->get_active_gpu_ids(query_id));
+  scan_manager_->prepare_for_query(
+    *query,
+    query->get_pipelines().empty()
+      ? true
+      : query->get_pipelines().front()->get_operator_params().enable_pinned_zone_map_pruning,
+    task_creator_->get_active_gpu_ids(query_id));
   return query;
 }
 
@@ -1644,8 +1652,42 @@ void SiriusContext::release_query_lifecycle_slot() noexcept
 
 // ================= Free Functions ================= //
 
+sirius::operator_params& session_operator_params(ClientContext& context)
+{
+  auto state   = get_sirius_connection_state(context);
+  auto runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (!state)
+    state = context.registered_state->GetOrCreate<SiriusConnectionState>("sirius_connection_state");
+  if (!state->operator_overrides)
+    state->operator_overrides =
+      runtime ? runtime->get_config().get_operator_params() : sirius::operator_params{};
+  return *state->operator_overrides;
+}
+
+sirius::compression_config& session_compression_config(ClientContext& context)
+{
+  auto state   = get_sirius_connection_state(context);
+  auto runtime = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (!state)
+    state = context.registered_state->GetOrCreate<SiriusConnectionState>("sirius_connection_state");
+  if (!state->compression_overrides)
+    state->compression_overrides =
+      runtime ? runtime->get_config().get_compression_config() : sirius::compression_config{};
+  return *state->compression_overrides;
+}
+
+std::shared_ptr<const sirius::operator_params> query_operator_options(ClientContext& context)
+{
+  auto state = get_sirius_connection_state(context);
+  if (state && state->execution_options) return state->execution_options;
+  auto options = std::make_shared<sirius::operator_params>(session_operator_params(context));
+  options->like_swar_fastpath = like_swar_fastpath_enabled(context);
+  return options;
+}
+
 void install_configured_log_sink(DatabaseInstance* db)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
   auto lvl          = parsed_level.value_or(sirius::log::level::info);
 
@@ -1691,6 +1733,7 @@ void SiriusContextExtensionCallback::publish_configured_nvtx_injection()
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   : disabled_(sirius_disabled_by_env())
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   auto const previous_log_backend = Config::LOG_BACKEND;
   auto const previous_log_dir     = Config::LOG_DIR;
   auto const previous_log_level   = Config::LOG_LEVEL;

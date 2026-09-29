@@ -1156,7 +1156,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
+  if (sirius_ctx) { op_params = *duckdb::query_operator_options(context); }
   insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
 }
 

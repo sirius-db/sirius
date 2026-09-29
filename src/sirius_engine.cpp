@@ -57,10 +57,10 @@ namespace {
 /// bytes. With neither set, every active GPU is used.
 std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
                                            std::vector<int> gpu_ids,
-                                           const sirius_config& config)
+                                           const sirius_config& config,
+                                           const operator_params& op_params)
 {
-  auto const& op_params = config.get_operator_params();
-  auto const bpg        = op_params.admission_bytes_per_gpu;
+  auto const bpg = op_params.admission_bytes_per_gpu;
 
   gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
   auto const n_gpus = static_cast<int>(gpu_ids.size());
@@ -307,9 +307,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // Admit the query here, before anything downstream is built, so that the build context,
   // partition->GPU routing and the scan round-robin all derive from this one list. Order
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
-  auto const full_gpu_count = gpu_ids.size();
-  std::vector<int> active_gpu_ids =
-    compute_admission_gpu_ids(plan, std::move(gpu_ids), sirius_ctx_ptr->get_config());
+  auto query_operator_params      = duckdb::query_operator_options(context);
+  auto const full_gpu_count       = gpu_ids.size();
+  std::vector<int> active_gpu_ids = compute_admission_gpu_ids(
+    plan, std::move(gpu_ids), sirius_ctx_ptr->get_config(), *query_operator_params);
   sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;
@@ -320,10 +321,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
   } catch (...) {  // best-effort observability
   }
-
-  auto query_operator_params =
-    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
-  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
 
   // Create the plan-time context with one immutable snapshot of query policy.
   const pipeline::pipeline_build_context build_ctx{

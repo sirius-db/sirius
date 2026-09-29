@@ -102,7 +102,16 @@ class SiriusConnectionState : public ClientContextState {
   /// A new query on this connection invalidates any leftover capture.
   void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
 
-  void QueryEnd() final { pinned_update_guard_.reset(); }
+  void QueryEnd() final
+  {
+    pinned_update_guard_.reset();
+    execution_options.reset();
+  }
+
+  // Access is serialized by the owning ClientContext. Workers only see execution_options.
+  std::optional<sirius::operator_params> operator_overrides;
+  std::optional<sirius::compression_config> compression_overrides;
+  std::shared_ptr<const sirius::operator_params> execution_options;
 
   [[nodiscard]] bool has_pinned_update_guard() const noexcept
   {
@@ -264,6 +273,9 @@ class SiriusConnectionState : public ClientContextState {
 /// \brief Resolve the per-connection Sirius state, or nullptr when Sirius has
 /// not registered on this connection.
 shared_ptr<SiriusConnectionState> get_sirius_connection_state(ClientContext& context);
+sirius::operator_params& session_operator_params(ClientContext& context);
+sirius::compression_config& session_compression_config(ClientContext& context);
+std::shared_ptr<const sirius::operator_params> query_operator_options(ClientContext& context);
 
 /// \brief Thrown by the health check when the Sirius runtime was latched
 /// unavailable before this query touched it. An ExecutorException

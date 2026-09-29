@@ -455,7 +455,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
 
   auto sirius_context = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   bool const dynamic_filter_enabled =
-    sirius_context && sirius_context->get_config().get_operator_params().enable_dynamic_filter;
+    sirius_context && duckdb::query_operator_options(context)->enable_dynamic_filter;
 
   bool const build_filtered = dynamic_filter_enabled && build_subtree_is_filtering(*op.children[1]);
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
@@ -522,7 +522,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool is_supported_by_hash_join =
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions, op.join_type);
   if (is_supported_by_hash_join && !prefer_range_joins) {
-    const auto& op_params = sirius_context->get_config().get_operator_params();
+    auto options          = duckdb::query_operator_options(context);
+    const auto& op_params = *options;
 
     // Resolve placements before registering any producer channel.
     auto& memory_manager  = sirius_context->get_memory_manager();

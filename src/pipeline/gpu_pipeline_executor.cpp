@@ -20,6 +20,7 @@
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -296,6 +297,10 @@ void gpu_pipeline_executor::process_task(
             completion->report_error("GPU task retry or completion callback failed");
           }
         };
+        auto const& options =
+          pipeline ? pipeline->get_operator_params() : sirius::operator_params{};
+        sirius::scoped_expression_policy query_policy(
+          {options.expression_strategy, options.enable_regex_jit});
         try {
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);

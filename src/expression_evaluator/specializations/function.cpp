@@ -396,7 +396,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const& replace_str = std::get<std::string>(args[2]->get<sirius::ast::constant>().payload);
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
-      if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
+      if (query_regex_jit_enabled()) {
         if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
           return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
             input.get_column_view(), _stream, _mr);

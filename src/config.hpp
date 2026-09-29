@@ -19,6 +19,7 @@
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace duckdb {
@@ -47,6 +48,7 @@ struct Config {
   static uint64_t MAX_SORT_PARTITION_BYTES;
 
   // Logging configuration
+  inline static std::recursive_mutex logging_mutex;
   static std::string LOG_BACKEND;
   static std::string LOG_LEVEL;
   static std::string LOG_DIR;

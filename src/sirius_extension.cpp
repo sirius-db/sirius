@@ -20,6 +20,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "expression_evaluator/query_policy.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/io/parquet.hpp>
@@ -954,9 +955,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     }
   }
 
-  auto& scan_mgr = sirius_ctx->get_scan_manager();
-  std::size_t const batch_size =
-    sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
+  auto& scan_mgr               = sirius_ctx->get_scan_manager();
+  std::size_t const batch_size = duckdb::query_operator_options(context)->scan_task_batch_size;
 
   // materialize_all_batches round-robins reads across these GPUs and reports the
   // per-batch placement; insert_pinned_entry wants non-const memory_space*.
@@ -1029,7 +1029,10 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
 
-  auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
+  auto pin_options          = duckdb::query_operator_options(context);
+  auto const& pin_op_params = *pin_options;
+  sirius::scoped_expression_policy expression_policy(
+    {pin_op_params.expression_strategy, pin_op_params.enable_regex_jit});
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
   // Read from the connection running the CALL, so a table pins with the carriers that
   // connection asked for rather than whatever another connection set last.
@@ -1044,7 +1047,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
+  const auto& comp_cfg = duckdb::session_compression_config(context);
   bool const compression_requested =
     data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
   if (compression_requested && comp_cfg.input_plan_dir.empty()) {
@@ -2283,7 +2286,9 @@ static void throw_if_sirius_runtime_unavailable(ClientContext& context)
   }
 }
 
-static void ApplyExpressionEvaluatorStrategy(const std::string& value)
+static void ApplyExpressionEvaluatorStrategy(ClientContext& context,
+                                             SetScope scope,
+                                             const std::string& value)
 {
   sirius::expression_evaluator_strategy parsed;
   if (!sirius::string_to_strategy(value, parsed)) {
@@ -2292,17 +2297,18 @@ static void ApplyExpressionEvaluatorStrategy(const std::string& value)
       "ast_jit",
       value);
   }
-  Config::EXPRESSION_EVALUATOR_STRATEGY = parsed;
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("expression_evaluator_strategy is a session setting");
+  duckdb::session_operator_params(context).expression_strategy = parsed;
   SIRIUS_LOG_DEBUG("Updated config EXPRESSION_EVALUATOR_STRATEGY to {}",
-                   sirius::strategy_to_string(Config::EXPRESSION_EVALUATOR_STRATEGY));
+                   sirius::strategy_to_string(parsed));
 }
 
 static void SetExpressionEvaluatorStrategy(ClientContext& context, SetScope scope, Value& parameter)
 {
-  // Writes the process-global strategy Config — gated like every other
-  // process-global setter (the deprecated alias below carries its own gate).
+  // The connection owns this policy; execution takes an immutable snapshot.
   throw_if_sirius_runtime_unavailable(context);
-  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
+  ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
 // Deprecated alias for `expression_evaluator_strategy`. Kept so existing
@@ -2315,7 +2321,7 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   SIRIUS_LOG_WARN(
     "The 'expression_executor_strategy' setting is deprecated; use "
     "'expression_evaluator_strategy' instead.");
-  ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
+  ApplyExpressionEvaluatorStrategy(context, scope, StringValue::Get(parameter));
 }
 
 static void SetEnableDuckdbFallback(ClientContext& /*context*/,
@@ -2332,8 +2338,10 @@ static void SetEnableDuckdbFallback(ClientContext& /*context*/,
 static void SetEnableRegexJitImpl(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("enable_regex_jit_impl is a session setting");
+  duckdb::session_operator_params(context).enable_regex_jit = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated session ENABLE_REGEX_JIT_IMPL to {}", BooleanValue::Get(parameter));
 }
 
 static void SetEnableLikeSwarFastpath(ClientContext& /*context*/,
@@ -2350,46 +2358,28 @@ static void SetFuseMergePipelines(ClientContext& /*context*/,
   // DuckDB stores this setting in the client context.
 }
 
-static sirius::operator_params* get_operator_params(ClientContext& context)
+static sirius::operator_params* get_operator_params(ClientContext& context, SetScope scope)
 {
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (sirius_ctx == nullptr) {
-    SIRIUS_LOG_DEBUG("SiriusContext not available; operator_params SET ignored");
-    return nullptr;
-  }
-  return &sirius_ctx->get_config().get_operator_params();
-}
-
-// operator_params are read by plan generation and the engine inside held
-// execution windows, so each setter serializes its write by holding the slot
-// for its single callback body. The guard is taken here in the setters,
-// deliberately not inside get_operator_params(), which is also safe to call
-// from code already inside a window (a helper-held lock would trip the
-// same-thread reacquire check there).
-static duckdb::unique_ptr<duckdb::SiriusContext::SlotGuard> lock_operator_params_slot(
-  ClientContext& context)
-{
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) { return nullptr; }
-  return duckdb::make_uniq<duckdb::SiriusContext::SlotGuard>(*sirius_ctx, context);
+  throw_if_sirius_runtime_unavailable(context);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Sirius query options are session settings");
+  return &duckdb::session_operator_params(context);
 }
 
 static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
   if (bytes == 0) { throw InvalidInputException("scan_task_batch_size must be greater than zero"); }
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                    = lock_operator_params_slot(context);
   params->scan_task_batch_size = bytes;
   SIRIUS_LOG_DEBUG("Updated config SCAN_TASK_BATCH_SIZE to {}", params->scan_task_batch_size);
 }
 
 static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                        = lock_operator_params_slot(context);
   params->max_sort_partition_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
                    params->max_sort_partition_bytes);
@@ -2399,9 +2389,8 @@ static void SetMaxSortPartitionMemoryFraction(ClientContext& context,
                                               SetScope scope,
                                               Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot             = lock_operator_params_slot(context);
   const double fraction = parameter.GetValue<double>();
   if (fraction < 0.0 || fraction > 1.0) {
     throw InvalidInputException(
@@ -2416,33 +2405,31 @@ static void SetHashPartitionBytes(ClientContext& context, SetScope scope, Value&
 {
   auto const bytes = UBigIntValue::Get(parameter);
   if (bytes == 0) { throw InvalidInputException("hash_partition_bytes must be greater than zero"); }
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                    = lock_operator_params_slot(context);
   params->hash_partition_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config HASH_PARTITION_BYTES to {}", params->hash_partition_bytes);
 }
 
 static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                  = lock_operator_params_slot(context);
   params->concat_batch_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
 static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                 = lock_operator_params_slot(context);
   params->sort_sample_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config SORT_SAMPLE_BYTES to {}", params->sort_sample_bytes);
 }
 
 static void SetLogBackend(ClientContext& context, SetScope scope, Value& parameter)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   throw_if_sirius_runtime_unavailable(context);
   auto backend = StringValue::Get(parameter);
   if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
@@ -2462,6 +2449,7 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   throw_if_sirius_runtime_unavailable(context);
   auto level_name   = StringValue::Get(parameter);
   auto parsed_level = sirius::log::string_to_enum(level_name);
@@ -2478,6 +2466,7 @@ static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   throw_if_sirius_runtime_unavailable(context);
   auto const previous_log_dir = Config::LOG_DIR;
   Config::LOG_DIR             = StringValue::Get(parameter);
@@ -2493,6 +2482,7 @@ static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   throw_if_sirius_runtime_unavailable(context);
   auto const seconds = IntegerValue::Get(parameter);
   if (seconds < 0) {
@@ -2515,9 +2505,8 @@ static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& pa
 
 static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                          = lock_operator_params_slot(context);
   params->max_build_hash_table_bytes = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_BUILD_HASH_TABLE_BYTES to {}",
                    params->max_build_hash_table_bytes);
@@ -2525,18 +2514,16 @@ static void SetMaxBuildHashTableBytes(ClientContext& context, SetScope scope, Va
 
 static void SetMaxBroadcastJoinSize(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                       = lock_operator_params_slot(context);
   params->max_broadcast_join_size = UBigIntValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config MAX_BROADCAST_JOIN_SIZE to {}", params->max_broadcast_join_size);
 }
 
 static void SetMarkJoinBuildSwitchRatio(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot          = lock_operator_params_slot(context);
   const double ratio = parameter.GetValue<double>();
   if (!(ratio >= 0.0)) {
     throw InvalidInputException("mark_join_build_switch_ratio must be >= 0.0, got %f", ratio);
@@ -2553,9 +2540,12 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
 
 static void SetEnablePinTableCompression(ClientContext& context, SetScope scope, Value& parameter)
 {
+  throw_if_sirius_runtime_unavailable(context);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().enable_pin_table_compression =
+  duckdb::session_compression_config(context).enable_pin_table_compression =
     BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated pin_table_compression to {}", BooleanValue::Get(parameter));
 }
@@ -2564,9 +2554,12 @@ static void SetPinTableInputCompressionPlanDir(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
 {
+  throw_if_sirius_runtime_unavailable(context);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().input_plan_dir = StringValue::Get(parameter);
+  duckdb::session_compression_config(context).input_plan_dir = StringValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
 }
 
@@ -2574,9 +2567,12 @@ static void SetPinTableCompressionMinBatchSizeBytes(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
 {
+  throw_if_sirius_runtime_unavailable(context);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().min_batch_size_bytes =
+  duckdb::session_compression_config(context).min_batch_size_bytes =
     static_cast<std::size_t>(UBigIntValue::Get(parameter));
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_min_batch_size_bytes");
 }
@@ -2585,6 +2581,9 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
                                                         SetScope scope,
                                                         Value& parameter)
 {
+  throw_if_sirius_runtime_unavailable(context);
+  if (scope == SetScope::GLOBAL)
+    throw InvalidInputException("Pin compression options are session settings");
   const double fraction = DoubleValue::Get(parameter);
   if (!std::isfinite(fraction) || fraction < 0.0) {
     throw InvalidInputException(
@@ -2593,7 +2592,7 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   }
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction = fraction;
+  duckdb::session_compression_config(context).max_compressed_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
 }
 
@@ -2601,9 +2600,8 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                                                SetScope scope,
                                                Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                                   = lock_operator_params_slot(context);
   params->enable_runtime_distinct_build_probe = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_DISTINCT_BUILD_PROBE to {}",
                    params->enable_runtime_distinct_build_probe);
@@ -2611,9 +2609,8 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
 
 static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                       = lock_operator_params_slot(context);
   params->enable_dense_count_join = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
@@ -2622,9 +2619,8 @@ static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Va
 {
   // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
   auto const bytes = UBigIntValue::Get(parameter);
-  auto* params     = get_operator_params(context);
+  auto* params     = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                          = lock_operator_params_slot(context);
   params->dense_count_join_max_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
                    params->dense_count_join_max_bytes);
@@ -2639,9 +2635,8 @@ static void SetDenseCountJoinMemoryFraction(ClientContext& context,
     throw InvalidInputException("dense_count_join_memory_fraction must be in (0.0, 1.0], got %f",
                                 fraction);
   }
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                                = lock_operator_params_slot(context);
   params->dense_count_join_memory_fraction = fraction;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MEMORY_FRACTION to {}",
                    params->dense_count_join_memory_fraction);
@@ -2649,18 +2644,16 @@ static void SetDenseCountJoinMemoryFraction(ClientContext& context,
 
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                     = lock_operator_params_slot(context);
   params->enable_dynamic_filter = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
   params->enable_dynamic_zone_map_filter = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_ZONE_MAP_FILTER to {}",
                    params->enable_dynamic_zone_map_filter);
@@ -2670,9 +2663,8 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
   if (!sirius::config::valid_domain_coverage_threshold{}(threshold)) {
     throw InvalidInputException("dynamic_filter_domain_coverage_threshold %s, got %f",
@@ -2688,9 +2680,8 @@ static void SetDynamicFilterInlistMaxL2Fraction(ClientContext& context,
                                                 SetScope scope,
                                                 Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot             = lock_operator_params_slot(context);
   const double fraction = parameter.GetValue<double>();
   if (!(fraction >= 0.0 && fraction <= 1.0)) {
     throw InvalidInputException(
@@ -2703,9 +2694,8 @@ static void SetDynamicFilterInlistMaxL2Fraction(ClientContext& context,
 
 static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot              = lock_operator_params_slot(context);
   const double threshold = parameter.GetValue<double>();
   if (!(threshold >= 0.0 && threshold <= 1.0)) {
     throw InvalidInputException("dynamic_filter_keep_threshold must be in [0.0, 1.0], got %f",
@@ -2718,9 +2708,8 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
 
 static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
   params->enable_pinned_zone_map_pruning = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_PINNED_ZONE_MAP_PRUNING to {}",
                    params->enable_pinned_zone_map_pruning);
@@ -2728,18 +2717,21 @@ static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope
 
 static void SetUseHwDecompression(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  params->use_hw_decompression = BooleanValue::Get(parameter);
+  if (params->use_hw_decompression != BooleanValue::Get(parameter)) {
+    throw InvalidInputException(
+      "use_hw_decompression is startup-only; configure sirius.operator_params.use_hw_decompression "
+      "in YAML");
+  }
   SIRIUS_LOG_DEBUG("Updated config USE_HW_DECOMPRESSION to {}", params->use_hw_decompression);
 }
 
 static void SetAdmissionBytesPerGpu(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
-  auto* params     = get_operator_params(context);
+  auto* params     = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                       = lock_operator_params_slot(context);
   params->admission_bytes_per_gpu = bytes;
   SIRIUS_LOG_DEBUG("Updated config ADMISSION_BYTES_PER_GPU to {}", params->admission_bytes_per_gpu);
 }
@@ -2750,9 +2742,8 @@ static void SetAvgVariableColumnBytes(ClientContext& context, SetScope scope, Va
   if (bytes == 0) {
     throw InvalidInputException("avg_variable_column_bytes must be greater than zero");
   }
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                         = lock_operator_params_slot(context);
   params->avg_variable_column_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config AVG_VARIABLE_COLUMN_BYTES to {}",
                    params->avg_variable_column_bytes);
@@ -2772,9 +2763,8 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
 
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
 {
-  auto* params = get_operator_params(context);
+  auto* params = get_operator_params(context, scope);
   if (!params) { return; }
-  auto slot                              = lock_operator_params_slot(context);
   params->enable_runtime_size_estimation = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_SIZE_ESTIMATION to {}",
                    params->enable_runtime_size_estimation);
@@ -2782,6 +2772,7 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
 
 void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
+  std::lock_guard log_lock(Config::logging_mutex);
   auto const& operator_defaults    = defaults.get_operator_params();
   auto const& compression_defaults = defaults.get_compression_config();
 
