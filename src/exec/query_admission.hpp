@@ -38,6 +38,8 @@ class query_admission {
   struct counts {
     std::size_t queued_queries{}, active_queries{}, planners{}, maintenance_waiters{};
     bool maintenance_active{}, closing{};
+    std::uint64_t completed_queries{};
+    std::chrono::steady_clock::time_point last_queued{}, last_admitted{}, last_completed{};
   };
 
  private:
@@ -83,9 +85,11 @@ class query_admission {
       if (!s) return;
       {
         std::lock_guard lock(s->mutex);
-        if (_kind == access::query)
+        if (_kind == access::query) {
           --s->current.active_queries;
-        else if (_kind == access::planning)
+          ++s->current.completed_queries;
+          s->current.last_completed = std::chrono::steady_clock::now();
+        } else if (_kind == access::planning)
           --s->current.planners;
         else
           s->current.maintenance_active = false;
@@ -126,7 +130,10 @@ class query_admission {
     if (s->next_ticket > max_query_id)
       throw std::overflow_error("Sirius admission ID exhausted; restart the runtime");
     auto it = s->waiting.insert(s->waiting.end(), waiter{kind, s->next_ticket++});
-    if (kind == access::query) ++s->current.queued_queries;
+    if (kind == access::query) {
+      ++s->current.queued_queries;
+      s->current.last_queued = std::chrono::steady_clock::now();
+    }
     if (kind == access::maintenance) ++s->current.maintenance_waiters;
     auto remove = [&] {
       if (kind == access::query) --s->current.queued_queries;
@@ -158,9 +165,10 @@ class query_admission {
       }
       const auto ticket = it->ticket;
       remove();
-      if (kind == access::query)
+      if (kind == access::query) {
         ++s->current.active_queries;
-      else if (kind == access::planning)
+        s->current.last_admitted = std::chrono::steady_clock::now();
+      } else if (kind == access::planning)
         ++s->current.planners;
       else
         s->current.maintenance_active = true;

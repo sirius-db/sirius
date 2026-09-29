@@ -16,6 +16,7 @@
 
 #include "sirius_engine.hpp"
 
+#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
@@ -230,8 +231,16 @@ void sirius_engine::execute()
 
   // This query's completion signal. Owned here, shared down to every task via its pipeline's
   // global state, so no cross-query subsystem holds a "current query" handler.
-  completion_handler_ = std::make_shared<pipeline::completion_handler>();
-  auto future         = completion_handler_->get_awaitable();
+  auto* registry      = &sirius_ctx->get_query_lifecycle_registry();
+  completion_handler_ = std::make_shared<pipeline::completion_handler>(
+    [registry, id = query_id_](std::exception_ptr error) {
+      registry->record_error(id, error);
+      if (fatal_device_exception(error)) {
+        registry->mark_runtime_failed();
+        registry->quiesce_all();
+      }
+    });
+  auto future = completion_handler_->get_awaitable();
 
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   query_ = sirius_ctx->create_query(std::move(new_scheduled),
@@ -250,8 +259,15 @@ void sirius_engine::execute()
         sirius_ctx->throw_runtime_unavailable();
     }
     future.get();
+    if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+      sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
+    registry->record_error(query_id_, std::current_exception());
+    if (fatal_device_exception(std::current_exception())) {
+      registry->mark_runtime_failed();
+      registry->quiesce_all();
+    }
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
@@ -263,6 +279,7 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
+    registry->record_error(query_id_, std::current_exception());
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     sirius_ctx->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);

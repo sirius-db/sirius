@@ -25,6 +25,7 @@
  */
 
 #include "catch.hpp"
+#include "cuda/device_health.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -146,4 +147,31 @@ TEST_CASE("a global state built without a query carries no handler",
   // Reporting sites are all null-guarded, so a state built outside a query (tests) is inert
   // rather than a crash.
   CHECK(gs.get_completion_handler() == nullptr);
+}
+
+TEST_CASE("completion observer sees one error and respects string view bounds",
+          "[completion_handler][per_query]")
+{
+  unsigned errors = 0;
+  completion_handler handler([&](std::exception_ptr error) {
+    ++errors;
+    std::rethrow_exception(error);  // Observer failure cannot prevent completion.
+  });
+  auto result         = handler.get_awaitable();
+  std::string message = "first error followed by unrelated bytes";
+  handler.report_error(std::string_view(message.data(), 11));
+  handler.report_error("second error");
+  CHECK(errors == 1);
+  CHECK_THROWS_WITH(result.get(), "first error");
+}
+
+TEST_CASE("fatal device classification distinguishes recoverable query errors", "[device_health]")
+{
+  CHECK(sirius::fatal_cuda_status(cudaErrorIllegalAddress));
+  CHECK(sirius::fatal_cuda_status(cudaErrorAssert));
+  CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorMemoryAllocation));
+  CHECK_FALSE(sirius::fatal_cuda_status(cudaErrorInvalidValue));
+  CHECK(sirius::fatal_device_exception(
+    std::make_exception_ptr(std::runtime_error("CUDA failure: cudaErrorIllegalAddress"))));
+  CHECK_FALSE(sirius::fatal_device_exception(std::make_exception_ptr(std::bad_alloc())));
 }

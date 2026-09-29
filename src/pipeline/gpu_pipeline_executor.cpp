@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
+#include "cuda/device_health.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "expression_evaluator/query_policy.hpp"
@@ -219,6 +220,8 @@ void gpu_pipeline_executor::process_task(
       const auto now = std::chrono::steady_clock::now();
       if (pipeline_task->memory_wait_started == std::chrono::steady_clock::time_point{}) {
         pipeline_task->memory_wait_started = now;
+        if (_query_lifecycle)
+          pipeline_task->memory_wait = _query_lifecycle->begin_memory_wait(query_id);
         if (_query_event_publisher) {
           _query_event_publisher->publish_wait_for_memory_for_task(
             query_id,
@@ -239,7 +242,13 @@ void gpu_pipeline_executor::process_task(
           _pending_reclamation.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
           _pending_reclamation.get();
-        } catch (...) { /* Retry within the bounded budget. */
+        } catch (...) {
+          if (_query_lifecycle && fatal_device_exception(std::current_exception())) {
+            _query_lifecycle->mark_runtime_failed();
+            _query_lifecycle->quiesce_all();
+            if (iteration_completion) iteration_completion->report_error(std::current_exception());
+            return;
+          }
         }
       }
       if (_downgrade_executor && !_pending_reclamation.valid() && now >= _next_reclamation) {
@@ -259,6 +268,7 @@ void gpu_pipeline_executor::process_task(
       return;  // releases the reserved worker slot
     }
     pipeline_task->memory_wait_started = {};
+    pipeline_task->memory_wait.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -318,7 +328,15 @@ void gpu_pipeline_executor::process_task(
           }
 
           // Sync the stream to ensure all memory is released before the reschedule.
-          exc_stream->synchronize();
+          auto const status = cudaStreamSynchronize(exc_stream.get().get());
+          if (_query_lifecycle && fatal_cuda_status(status)) {
+            _query_lifecycle->mark_runtime_failed();
+            _query_lifecycle->quiesce_all();
+          }
+          check_cuda_health(status);
+          if (status != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA retry synchronization failed: ") +
+                                     cudaGetErrorName(status));
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -419,6 +437,10 @@ void gpu_pipeline_executor::process_task(
           }
           return;
         } catch (const std::exception& e) {
+          if (_query_lifecycle && fatal_device_exception(std::current_exception())) {
+            _query_lifecycle->mark_runtime_failed();
+            _query_lifecycle->quiesce_all();
+          }
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (completion) { completion->report_error(std::current_exception()); }
           return;

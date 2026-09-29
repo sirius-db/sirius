@@ -15,6 +15,7 @@
  */
 
 #include "config.hpp"
+#include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
@@ -911,315 +912,326 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // windows.
   duckdb::SiriusContext::StandaloneQueryScope window(
     *sirius_ctx, context, "pin_table", sirius::exec::query_admission::access::maintenance);
-  auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
+  try {
+    auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
 
-  // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
-  // round-robins the materialized batches across all GPU memory spaces so a pin
-  // distributes its chunks evenly. For tier='host' each materialized GPU table is
-  // then converted to a host_data_representation (via the GPU<->HOST converter) so
-  // the pinned data lives in pinned host memory.
-  auto& memory_manager = sirius_ctx->get_memory_manager();
-  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  if (gpu_spaces.empty()) {
-    throw InvalidInputException("pin_table: no GPU memory space available");
-  }
-
-  // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
-  // Each round-robin GPU's host conversion should pin its data on the host
-  // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
-  // when the GPU's NUMA node is unknown or no matching host space exists.
-  std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
-  if (data.args.tier == "host") {
-    auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    if (host_spaces.empty()) {
-      throw InvalidInputException("pin_table: no HOST memory space available");
+    // The read is driven by sirius::materialize_all_batches (pin_table.cpp), which
+    // round-robins the materialized batches across all GPU memory spaces so a pin
+    // distributes its chunks evenly. For tier='host' each materialized GPU table is
+    // then converted to a host_data_representation (via the GPU<->HOST converter) so
+    // the pinned data lives in pinned host memory.
+    auto& memory_manager = sirius_ctx->get_memory_manager();
+    auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpu_spaces.empty()) {
+      throw InvalidInputException("pin_table: no GPU memory space available");
     }
-    auto* fallback_host = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
-    auto const& topo    = sirius_ctx->get_config().get_hw_topology();
-    for (auto const* gpu_space : gpu_spaces) {
-      int const gpu_id = gpu_space->get_device_id();
-      int numa_node    = -1;
-      if (static_cast<size_t>(gpu_id) < topo.gpus.size()) {
-        numa_node = topo.gpus[gpu_id].numa_node;
+
+    // For host tier, build a target_gpu_id -> NUMA-local host memory_space map.
+    // Each round-robin GPU's host conversion should pin its data on the host
+    // memory_space whose NUMA node matches the GPU. Fall back to host_spaces[0]
+    // when the GPU's NUMA node is unknown or no matching host space exists.
+    std::unordered_map<int, cucascade::memory::memory_space*> host_space_by_gpu;
+    if (data.args.tier == "host") {
+      auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      if (host_spaces.empty()) {
+        throw InvalidInputException("pin_table: no HOST memory space available");
       }
-      cucascade::memory::memory_space* picked = fallback_host;
-      if (numa_node >= 0) {
-        for (auto* hs : host_spaces) {
-          if (hs->get_device_id() == numa_node) {
-            picked = const_cast<cucascade::memory::memory_space*>(hs);
-            break;
+      auto* fallback_host = const_cast<cucascade::memory::memory_space*>(host_spaces[0]);
+      auto const& topo    = sirius_ctx->get_config().get_hw_topology();
+      for (auto const* gpu_space : gpu_spaces) {
+        int const gpu_id = gpu_space->get_device_id();
+        int numa_node    = -1;
+        if (static_cast<size_t>(gpu_id) < topo.gpus.size()) {
+          numa_node = topo.gpus[gpu_id].numa_node;
+        }
+        cucascade::memory::memory_space* picked = fallback_host;
+        if (numa_node >= 0) {
+          for (auto* hs : host_spaces) {
+            if (hs->get_device_id() == numa_node) {
+              picked = const_cast<cucascade::memory::memory_space*>(hs);
+              break;
+            }
           }
         }
+        host_space_by_gpu[gpu_id] = picked;
       }
-      host_space_by_gpu[gpu_id] = picked;
-    }
-  }
-
-  auto& scan_mgr               = sirius_ctx->get_scan_manager();
-  std::size_t const batch_size = duckdb::query_operator_options(context)->scan_task_batch_size;
-
-  // materialize_all_batches round-robins reads across these GPUs and reports the
-  // per-batch placement; insert_pinned_entry wants non-const memory_space*.
-  std::vector<cucascade::memory::memory_space*> gpu_spaces_mut;
-  gpu_spaces_mut.reserve(gpu_spaces.size());
-  for (auto const* s : gpu_spaces) {
-    gpu_spaces_mut.push_back(const_cast<cucascade::memory::memory_space*>(s));
-  }
-
-  // Build the ingestible (drives the metadata walk + decode) from one table_info.
-  // duckdb-native has no standalone reader, so both formats go through their
-  // gpu_ingestible — one read path.
-  std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
-  // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
-  // order — the zone-map capture keys its type allowlist on these exact types.
-  vector<LogicalType> pinned_column_types;
-  // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
-  // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
-  transaction_t duckdb_pin_v_base               = 0;
-  std::uint64_t duckdb_pin_checkpoint_iteration = 0;
-
-  if (data.args.format == "duckdb") {
-    auto info = build_duckdb_pin_info(
-      context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
-    // After the catalog resolution (so a bad table name fails without side
-    // effects) but before make_ingestible snapshots the on-disk row groups.
-    suppress_auto_checkpoint_for_pin(context);
-    // Not the default database's counter: each AttachedDatabase has its own MVCC
-    // start_time domain, and pins usually target an ATTACHed .db (the catalog
-    // resolved by build_duckdb_pin_info), so read the fence off that catalog's
-    // DuckTransaction.
-    auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
-    duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
-    auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
-      &info->storage->GetAttached().GetStorageManager().GetBlockManager());
-    if (block_manager == nullptr) {
-      throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
-    }
-    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
-    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
-  } else {  // parquet
-    auto& fs   = FileSystem::GetFileSystem(context);
-    auto files = fs.GlobFiles(data.args.path);
-    std::vector<std::string> file_paths;
-    file_paths.reserve(files.size());
-    for (auto& f : files) {
-      file_paths.push_back(f.path);
-    }
-    if (file_paths.empty()) {
-      throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
     }
 
-    // tier='parquet' pins the undecoded bytes and stops there: there is no
-    // decode, no GPU materialisation and no pinned_entry, because the residency
-    // it creates lives in the IO cache and the ordinary scan path finds it by
-    // path and offset. Everything below this point is the decode-and-place
-    // machinery the other two tiers need, so this returns rather than falls
-    // through it.
-    if (data.args.tier == "parquet") {
-      scan_mgr.pin_parquet_ranges(data.args.name, file_paths, data.args.cols);
-      window.finish();
-      output.SetCardinality(1);
-      output.SetValue(0, 0, Value::BOOLEAN(true));
-      data.finished = true;
-      return;
+    auto& scan_mgr               = sirius_ctx->get_scan_manager();
+    std::size_t const batch_size = duckdb::query_operator_options(context)->scan_task_batch_size;
+
+    // materialize_all_batches round-robins reads across these GPUs and reports the
+    // per-batch placement; insert_pinned_entry wants non-const memory_space*.
+    std::vector<cucascade::memory::memory_space*> gpu_spaces_mut;
+    gpu_spaces_mut.reserve(gpu_spaces.size());
+    for (auto const* s : gpu_spaces) {
+      gpu_spaces_mut.push_back(const_cast<cucascade::memory::memory_space*>(s));
     }
 
-    auto info =
-      build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
-    ingestible = sirius::op::scan::make_ingestible(std::move(info));
-  }
+    // Build the ingestible (drives the metadata walk + decode) from one table_info.
+    // duckdb-native has no standalone reader, so both formats go through their
+    // gpu_ingestible — one read path.
+    std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible;
+    // Pin-time DuckDB types of the pinned columns, in column_ids (batch-column)
+    // order — the zone-map capture keys its type allowlist on these exact types.
+    vector<LogicalType> pinned_column_types;
+    // The pin transaction's MVCC fence on the pinned table's own AttachedDatabase;
+    // meaningful only for format == "duckdb" (see duckdb_mvcc_metadata::v_base).
+    transaction_t duckdb_pin_v_base               = 0;
+    std::uint64_t duckdb_pin_checkpoint_iteration = 0;
 
-  auto pin_options          = duckdb::query_operator_options(context);
-  auto const& pin_op_params = *pin_options;
-  sirius::scoped_expression_policy expression_policy(
-    {pin_op_params.expression_strategy, pin_op_params.enable_regex_jit});
-  bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
-  // Read from the connection running the CALL, so a table pins with the carriers that
-  // connection asked for rather than whatever another connection set last.
-  bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
-  if (!capture_chunk_stats && !compressed_pin) { pinned_column_types.clear(); }
+    if (data.args.format == "duckdb") {
+      auto info = build_duckdb_pin_info(
+        context, data.args.name, data.args.schema, data.args.cols, batch_size, pinned_column_types);
+      // After the catalog resolution (so a bad table name fails without side
+      // effects) but before make_ingestible snapshots the on-disk row groups.
+      suppress_auto_checkpoint_for_pin(context);
+      // Not the default database's counter: each AttachedDatabase has its own MVCC
+      // start_time domain, and pins usually target an ATTACHed .db (the catalog
+      // resolved by build_duckdb_pin_info), so read the fence off that catalog's
+      // DuckTransaction.
+      auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
+      duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
+      auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
+        &info->storage->GetAttached().GetStorageManager().GetBlockManager());
+      if (block_manager == nullptr) {
+        throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
+      }
+      duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
+      ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
+    } else {  // parquet
+      auto& fs   = FileSystem::GetFileSystem(context);
+      auto files = fs.GlobFiles(data.args.path);
+      std::vector<std::string> file_paths;
+      file_paths.reserve(files.size());
+      for (auto& f : files) {
+        file_paths.push_back(f.path);
+      }
+      if (file_paths.empty()) {
+        throw InvalidInputException("pin_table: no parquet files matched path: " + data.args.path);
+      }
 
-  // Build the cache descriptor (table identity + column layout) from the
-  // ingestible; it is stored on the pinned entry in place of the heavyweight
-  // ingestible_table_info and drives later cache-hit matching + the gather.
-  auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
+      // tier='parquet' pins the undecoded bytes and stops there: there is no
+      // decode, no GPU materialisation and no pinned_entry, because the residency
+      // it creates lives in the IO cache and the ordinary scan path finds it by
+      // path and offset. Everything below this point is the decode-and-place
+      // machinery the other two tiers need, so this returns rather than falls
+      // through it.
+      if (data.args.tier == "parquet") {
+        scan_mgr.pin_parquet_ranges(data.args.name, file_paths, data.args.cols);
+        window.finish();
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value::BOOLEAN(true));
+        data.finished = true;
+        return;
+      }
 
-  // Compression config (tier-agnostic): load the per-table plan DSL from the plan
-  // directory (if configured), then resolve it into a compression_pin_config. Both
-  // the host and GPU pin paths compress with this when enabled.
-  const auto& comp_cfg = duckdb::session_compression_config(context);
-  bool const compression_requested =
-    data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
-  if (compression_requested && comp_cfg.input_plan_dir.empty()) {
-    SIRIUS_LOG_WARN(
-      "[pin_table] '{}': compression was requested but "
-      "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
-      data.args.name);
-  }
-  const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
-  std::optional<std::string> plan_dsl;
-  if (compression_active) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-      if (!entry.is_regular_file() || entry.path().stem() != data.args.name) continue;
-      std::ifstream file(entry.path());
-      std::string dsl((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-      if (!dsl.empty()) plan_dsl = std::move(dsl);
-      break;
+      auto info = build_parquet_pin_info(
+        scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
+      ingestible = sirius::op::scan::make_ingestible(std::move(info));
     }
-    if (ec)
+
+    auto pin_options          = duckdb::query_operator_options(context);
+    auto const& pin_op_params = *pin_options;
+    sirius::scoped_expression_policy expression_policy(
+      {pin_op_params.expression_strategy, pin_op_params.enable_regex_jit});
+    bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
+    // Read from the connection running the CALL, so a table pins with the carriers that
+    // connection asked for rather than whatever another connection set last.
+    bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
+    if (!capture_chunk_stats && !compressed_pin) { pinned_column_types.clear(); }
+
+    // Build the cache descriptor (table identity + column layout) from the
+    // ingestible; it is stored on the pinned entry in place of the heavyweight
+    // ingestible_table_info and drives later cache-hit matching + the gather.
+    auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
+
+    // Compression config (tier-agnostic): load the per-table plan DSL from the plan
+    // directory (if configured), then resolve it into a compression_pin_config. Both
+    // the host and GPU pin paths compress with this when enabled.
+    const auto& comp_cfg = duckdb::session_compression_config(context);
+    bool const compression_requested =
+      data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
+    if (compression_requested && comp_cfg.input_plan_dir.empty()) {
       SIRIUS_LOG_WARN(
-        "[pin_table] cannot scan plan dir '{}': {}", comp_cfg.input_plan_dir, ec.message());
-  }
-
-  sirius::compression_pin_config pin_comp{};
-  if (compression_active) {
-    if (plan_dsl.has_value()) {
-      // The plan file carries one block per full-table column (schema order). A pin
-      // may cache only a subset, so select the blocks for the pinned columns by their
-      // full-table index (cache_info.column_ids, in pinned order) — the result lines
-      // up 1:1 with the pinned table that compress_with_plan sees.
-      std::vector<std::size_t> col_indices;
-      col_indices.reserve(cache_info.column_ids.size());
-      for (auto const& cid : cache_info.column_ids) {
-        col_indices.push_back(static_cast<std::size_t>(cid.GetPrimaryIndex()));
+        "[pin_table] '{}': compression was requested but "
+        "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
+        data.args.name);
+    }
+    const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
+    std::optional<std::string> plan_dsl;
+    if (compression_active) {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
+        if (!entry.is_regular_file() || entry.path().stem() != data.args.name) continue;
+        std::ifstream file(entry.path());
+        std::string dsl((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        if (!dsl.empty()) plan_dsl = std::move(dsl);
+        break;
       }
-      auto selected = sirius::compression::select_plan_blocks(*plan_dsl, col_indices);
-      if (selected.has_value()) {
-        pin_comp.enabled                 = true;
-        pin_comp.plan_dsl                = std::move(*selected);
-        pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
-        pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
-        pin_comp.column_names            = cache_info.column_names();
-        SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
-                        data.args.name,
-                        data.args.tier,
-                        pin_comp.column_names.size());
+      if (ec)
+        SIRIUS_LOG_WARN(
+          "[pin_table] cannot scan plan dir '{}': {}", comp_cfg.input_plan_dir, ec.message());
+    }
+
+    sirius::compression_pin_config pin_comp{};
+    if (compression_active) {
+      if (plan_dsl.has_value()) {
+        // The plan file carries one block per full-table column (schema order). A pin
+        // may cache only a subset, so select the blocks for the pinned columns by their
+        // full-table index (cache_info.column_ids, in pinned order) — the result lines
+        // up 1:1 with the pinned table that compress_with_plan sees.
+        std::vector<std::size_t> col_indices;
+        col_indices.reserve(cache_info.column_ids.size());
+        for (auto const& cid : cache_info.column_ids) {
+          col_indices.push_back(static_cast<std::size_t>(cid.GetPrimaryIndex()));
+        }
+        auto selected = sirius::compression::select_plan_blocks(*plan_dsl, col_indices);
+        if (selected.has_value()) {
+          pin_comp.enabled                 = true;
+          pin_comp.plan_dsl                = std::move(*selected);
+          pin_comp.min_batch_size_bytes    = comp_cfg.min_batch_size_bytes;
+          pin_comp.max_compressed_fraction = comp_cfg.max_compressed_fraction;
+          pin_comp.column_names            = cache_info.column_names();
+          SIRIUS_LOG_INFO("[pin_table] '{}' tier={}: compressing with plan for {} column(s)",
+                          data.args.name,
+                          data.args.tier,
+                          pin_comp.column_names.size());
+        } else {
+          SIRIUS_LOG_WARN(
+            "[pin_table] '{}': plan file does not cover all pinned columns; pinning uncompressed",
+            data.args.name);
+        }
       } else {
         SIRIUS_LOG_WARN(
-          "[pin_table] '{}': plan file does not cover all pinned columns; pinning uncompressed",
-          data.args.name);
+          "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
+          "pinning uncompressed",
+          data.args.name,
+          comp_cfg.input_plan_dir);
       }
-    } else {
-      SIRIUS_LOG_WARN(
-        "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
-        "pinning uncompressed",
+    }
+
+    // Late-mat uniqueness probe: which pinned columns to observe for whole-table
+    // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
+    // names outlive cache_info, which every insert path moves from.
+    auto const pinned_column_names = cache_info.column_names();
+    auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+
+    auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
+                            std::vector<std::size_t> row_counts) {
+      sirius::scan_manager::pinned_entry_metadata metadata;
+      if (verdicts.size() == pinned_column_names.size()) {
+        for (std::size_t i = 0; i < verdicts.size(); ++i) {
+          if (verdicts[i] == sirius::late_mat::unique_verdict::proven)
+            metadata.proven_unique_columns.push_back(pinned_column_names[i]);
+        }
+      }
+      if (data.args.format == "duckdb") {
+        metadata.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{
+          duckdb_pin_v_base, std::move(row_counts), duckdb_pin_checkpoint_iteration};
+      }
+      return metadata;
+    };
+
+    if (data.args.tier == "host") {
+      // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
+      // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
+      // host space, then free the GPU table before materializing the next. Peak GPU residency
+      // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
+      // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
+      // chunk back on a NUMA-local GPU.
+      auto host_result =
+        sirius::materialize_pin_to_host(*ingestible,
+                                        gpu_spaces_mut,
+                                        host_space_by_gpu,
+                                        *scan_mgr.io_ctx(),
+                                        pinned_column_types,
+                                        pin_comp,
+                                        {.capture_chunk_stats               = capture_chunk_stats,
+                                         .enable_compressed_materialization = compressed_pin,
+                                         .probe_unique_columns = probe_unique_columns});
+      sirius_ctx->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::pin_columns_narrowed,
+        count_narrowed_columns(host_result.column_storage));
+      // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
+      // NUMA-local memory_space. Pass a representative (the first GPU's host space).
+      int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
+      auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
+
+      scan_mgr.insert_pinned_entry_host(
         data.args.name,
-        comp_cfg.input_plan_dir);
+        std::move(cache_info),
+        std::move(host_result.chunks),
+        *representative_host_space,
+        std::move(pinned_column_types),
+        std::move(host_result.chunk_stats),
+        std::move(host_result.column_storage),
+        pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)));
+    } else if (pin_comp.enabled) {
+      // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
+      // on), then compress it when it qualifies, keeping the compressed payload in device
+      // memory; batches that do not qualify are pinned uncompressed. Both forms land in
+      // one ordered chunk vector, so a table that mixes them pins without special-casing.
+      auto dev_result = sirius::materialize_all_batches_compressed(
+        *ingestible,
+        gpu_spaces_mut,
+        *scan_mgr.io_ctx(),
+        pinned_column_types,
+        pin_comp,
+        {.capture_chunk_stats               = false,
+         .enable_compressed_materialization = compressed_pin,
+         .probe_unique_columns              = probe_unique_columns});
+      sirius_ctx->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::pin_columns_narrowed,
+        count_narrowed_columns(dev_result.column_storage));
+
+      scan_mgr.insert_pinned_entry_device(
+        data.args.name,
+        std::move(cache_info),
+        std::move(dev_result.chunks),
+        *gpu_spaces_mut[0],
+        std::move(dev_result.column_storage),
+        pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+    } else {
+      // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
+      // (with its GPU placement) and pin them in place.
+      auto mat =
+        sirius::materialize_all_batches(*ingestible,
+                                        gpu_spaces_mut,
+                                        *scan_mgr.io_ctx(),
+                                        pinned_column_types,
+                                        {.capture_chunk_stats               = capture_chunk_stats,
+                                         .enable_compressed_materialization = compressed_pin,
+                                         .probe_unique_columns = probe_unique_columns});
+      sirius_ctx->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::pin_columns_narrowed,
+        count_narrowed_columns(mat.column_storage));
+      auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+      std::ignore                   = scan_mgr.insert_pinned_entry(
+        data.args.name,
+        std::move(cache_info),
+        std::move(mat.tables),
+        std::move(mat.chunk_memory_spaces),
+        std::move(pinned_column_types),
+        std::move(mat.chunk_stats),
+        std::move(mat.column_storage),
+        pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
     }
+
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BOOLEAN(true));
+    data.finished = true;
+    window.finish();
+  } catch (...) {
+    auto error = std::current_exception();
+    sirius_ctx->get_query_lifecycle_registry().record_error(window.query_id(), error);
+    if (sirius::fatal_device_exception(error)) {
+      sirius_ctx->mark_runtime_unavailable();
+      sirius_ctx->get_query_lifecycle_registry().quiesce_all();
+    }
+    throw;
   }
-
-  // Late-mat uniqueness probe: which pinned columns to observe for whole-table
-  // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
-  // names outlive cache_info, which every insert path moves from.
-  auto const pinned_column_names = cache_info.column_names();
-  auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
-
-  auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
-                          std::vector<std::size_t> row_counts) {
-    sirius::scan_manager::pinned_entry_metadata metadata;
-    if (verdicts.size() == pinned_column_names.size()) {
-      for (std::size_t i = 0; i < verdicts.size(); ++i) {
-        if (verdicts[i] == sirius::late_mat::unique_verdict::proven)
-          metadata.proven_unique_columns.push_back(pinned_column_names[i]);
-      }
-    }
-    if (data.args.format == "duckdb") {
-      metadata.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{
-        duckdb_pin_v_base, std::move(row_counts), duckdb_pin_checkpoint_iteration};
-    }
-    return metadata;
-  };
-
-  if (data.args.tier == "host") {
-    // Stream each batch GPU->host: materialize one batch on its round-robin GPU, convert it
-    // to a pinned host representation (compressed when it qualifies) on that GPU's NUMA-local
-    // host space, then free the GPU table before materializing the next. Peak GPU residency
-    // stays at ~one batch, so the whole table never needs to fit in GPU memory. On multi-GPU
-    // the chunks land round-robin across NUMA nodes; the cached-serve path then reads each
-    // chunk back on a NUMA-local GPU.
-    auto host_result =
-      sirius::materialize_pin_to_host(*ingestible,
-                                      gpu_spaces_mut,
-                                      host_space_by_gpu,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      pin_comp,
-                                      {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(host_result.column_storage));
-    // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
-    // NUMA-local memory_space. Pass a representative (the first GPU's host space).
-    int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
-    auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
-
-    scan_mgr.insert_pinned_entry_host(
-      data.args.name,
-      std::move(cache_info),
-      std::move(host_result.chunks),
-      *representative_host_space,
-      std::move(pinned_column_types),
-      std::move(host_result.chunk_stats),
-      std::move(host_result.column_storage),
-      pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)));
-  } else if (pin_comp.enabled) {
-    // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
-    // on), then compress it when it qualifies, keeping the compressed payload in device
-    // memory; batches that do not qualify are pinned uncompressed. Both forms land in
-    // one ordered chunk vector, so a table that mixes them pins without special-casing.
-    auto dev_result = sirius::materialize_all_batches_compressed(
-      *ingestible,
-      gpu_spaces_mut,
-      *scan_mgr.io_ctx(),
-      pinned_column_types,
-      pin_comp,
-      {.capture_chunk_stats               = false,
-       .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(dev_result.column_storage));
-
-    scan_mgr.insert_pinned_entry_device(
-      data.args.name,
-      std::move(cache_info),
-      std::move(dev_result.chunks),
-      *gpu_spaces_mut[0],
-      std::move(dev_result.column_storage),
-      pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
-  } else {
-    // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
-    // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible,
-                                               gpu_spaces_mut,
-                                               *scan_mgr.io_ctx(),
-                                               pinned_column_types,
-                                               {.capture_chunk_stats = capture_chunk_stats,
-                                                .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
-    sirius_ctx->get_event_publisher().publish_compressed_materialization(
-      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
-      count_narrowed_columns(mat.column_storage));
-    auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
-    std::ignore                   = scan_mgr.insert_pinned_entry(
-      data.args.name,
-      std::move(cache_info),
-      std::move(mat.tables),
-      std::move(mat.chunk_memory_spaces),
-      std::move(pinned_column_types),
-      std::move(mat.chunk_stats),
-      std::move(mat.column_storage),
-      pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
-  }
-
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BOOLEAN(true));
-  data.finished = true;
-  window.finish();
 }
 
 struct UnpinTableFunctionData : public TableFunctionData {

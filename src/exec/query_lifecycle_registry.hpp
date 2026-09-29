@@ -18,15 +18,21 @@
 
 #include "query_id.hpp"
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace sirius::exec {
 
@@ -54,6 +60,15 @@ enum class query_submission_status : std::uint8_t { accepted, quiescing, unknown
  * scoped dispatcher join before providers are released. accepts_work() remains advisory.
  */
 class query_lifecycle_registry {
+ public:
+  struct diagnostic {
+    query_id_t query_id{};
+    std::chrono::steady_clock::time_point admitted{}, retiring{}, completed{}, first_memory_wait{};
+    std::size_t submissions{}, work{}, memory_waiters{};
+    std::string error;
+  };
+
+ private:
   struct query_control {
     std::mutex mutex;
     std::condition_variable idle;
@@ -61,6 +76,7 @@ class query_lifecycle_registry {
     std::size_t submissions{0};
     std::size_t work{0};
     std::shared_ptr<void> resources;
+    diagnostic status;
   };
 
  public:
@@ -180,6 +196,87 @@ class query_lifecycle_registry {
     query_submission_status status_{query_submission_status::unknown};
   };
 
+  /// Diagnostic accounting follows a parked task, without granting resource access.
+  class memory_wait_guard {
+   public:
+    memory_wait_guard() = default;
+    memory_wait_guard(memory_wait_guard&& other) noexcept : control_(std::move(other.control_)) {}
+    memory_wait_guard& operator=(memory_wait_guard&& other) noexcept
+    {
+      if (this != &other) {
+        reset();
+        control_ = std::move(other.control_);
+      }
+      return *this;
+    }
+    ~memory_wait_guard() { reset(); }
+    explicit operator bool() const noexcept { return bool(control_); }
+    void reset() noexcept
+    {
+      if (auto c = std::exchange(control_, nullptr)) {
+        std::lock_guard lock(c->mutex);
+        --c->status.memory_waiters;
+      }
+    }
+
+   private:
+    friend class query_lifecycle_registry;
+    explicit memory_wait_guard(std::shared_ptr<query_control> c) : control_(std::move(c)) {}
+    std::shared_ptr<query_control> control_;
+  };
+
+  memory_wait_guard begin_memory_wait(query_id_t id)
+  {
+    auto c = find(id);
+    if (!c) return {};
+    std::lock_guard lock(c->mutex);
+    ++c->status.memory_waiters;
+    if (c->status.first_memory_wait == std::chrono::steady_clock::time_point{})
+      c->status.first_memory_wait = std::chrono::steady_clock::now();
+    return memory_wait_guard(std::move(c));
+  }
+
+  void record_error(query_id_t id, std::exception_ptr error) noexcept
+  {
+    try {
+      auto c = find(id);
+      if (!c) return;
+      std::lock_guard lock(c->mutex);
+      if (!c->status.error.empty()) return;
+      try {
+        if (error) std::rethrow_exception(error);
+      } catch (std::exception const& e) {
+        c->status.error = e.what();
+      } catch (...) {
+        c->status.error = "non-standard query exception";
+      }
+    } catch (...) {
+    }  // Diagnostics must never interfere with completion/retirement.
+  }
+  void mark_runtime_failed() noexcept { runtime_failed_.store(true, std::memory_order_release); }
+  bool runtime_failed() const noexcept { return runtime_failed_.load(std::memory_order_acquire); }
+
+  /// Live owners plus the last 128 retired owners. No plans/buffers are retained by history.
+  std::vector<diagnostic> diagnostics() const
+  {
+    std::lock_guard registry_lock(mutex_);
+    std::vector<diagnostic> result;
+    for (auto const& d : history_)
+      if (d) result.push_back(*d);
+    for (auto const& [id, c] : queries_) {
+      std::lock_guard lock(c->mutex);
+      result.push_back(c->status);
+      result.back().submissions = c->submissions;
+      result.back().work        = c->work;
+    }
+    return result;
+  }
+  std::uint64_t completed_count() const
+  {
+    std::lock_guard lock(mutex_);
+    return completed_;
+  }
+
   struct query_activity {
     std::size_t submissions{0};
     std::size_t work{0};
@@ -195,10 +292,15 @@ class query_lifecycle_registry {
   void open_query(sirius::query_id_t query_id)
   {
     std::lock_guard lock(mutex_);
+    if (runtime_failed())
+      throw std::runtime_error("Sirius GPU runtime is unavailable after a fatal device error");
     if (queries_.contains(query_id)) {
       throw std::logic_error("query lifecycle already registered");
     }
-    queries_.emplace(query_id, std::make_shared<query_control>());
+    auto control             = std::make_shared<query_control>();
+    control->status.query_id = query_id;
+    control->status.admitted = std::chrono::steady_clock::now();
+    queries_.emplace(query_id, std::move(control));
   }
 
   [[nodiscard]] submission_guard try_begin_submission(sirius::query_id_t query_id)
@@ -231,7 +333,7 @@ class query_lifecycle_registry {
   {
     if (auto control = find(query_id)) {
       std::lock_guard lock(control->mutex);
-      control->state = query_lifecycle_state::quiescing;
+      mark_quiescing(*control);
     }
   }
 
@@ -241,7 +343,7 @@ class query_lifecycle_registry {
   {
     if (auto control = find(query_id)) {
       std::unique_lock lock(control->mutex);
-      control->state = query_lifecycle_state::quiescing;
+      mark_quiescing(*control);
       control->idle.wait(lock, [&] { return control->submissions == 0; });
     }
   }
@@ -305,7 +407,9 @@ class query_lifecycle_registry {
       retired = it->second;
       std::lock_guard lock(retired->mutex);
       require_idle(*retired);
-      retired->state = query_lifecycle_state::quiescing;
+      mark_quiescing(*retired);
+      retired->status.completed                = std::chrono::steady_clock::now();
+      history_[completed_++ % history_.size()] = std::move(retired->status);
       queries_.erase(it);
     }
   }
@@ -345,7 +449,7 @@ class query_lifecycle_registry {
     std::lock_guard registry_lock(mutex_);
     for (auto const& [id, control] : queries_) {
       std::lock_guard lock(control->mutex);
-      control->state = query_lifecycle_state::quiescing;
+      mark_quiescing(*control);
     }
   }
 
@@ -358,7 +462,7 @@ class query_lifecycle_registry {
       std::lock_guard registry_lock(mutex_);
       for (auto const& [id, control] : queries_) {
         std::lock_guard lock(control->mutex);
-        control->state = query_lifecycle_state::quiescing;
+        mark_quiescing(*control);
       }
       for (auto const& [id, control] : queries_) {
         std::lock_guard lock(control->mutex);
@@ -378,6 +482,13 @@ class query_lifecycle_registry {
     return it == queries_.end() ? nullptr : it->second;
   }
 
+  static void mark_quiescing(query_control& c)
+  {
+    c.state = query_lifecycle_state::quiescing;
+    if (c.status.retiring == std::chrono::steady_clock::time_point{})
+      c.status.retiring = std::chrono::steady_clock::now();
+  }
+
   static void require_quiescing(const query_control& control)
   {
     if (control.state != query_lifecycle_state::quiescing) {
@@ -394,6 +505,9 @@ class query_lifecycle_registry {
 
   // Lock order: registry -> query control. Handles only lock their control; no queue or callback
   // runs under either mutex. Waiters release the registry lock before waiting on a query's CV.
+  std::atomic<bool> runtime_failed_{false};
+  std::array<std::optional<diagnostic>, 128> history_;
+  std::uint64_t completed_{0};
   mutable std::mutex mutex_;
   std::map<sirius::query_id_t, std::shared_ptr<query_control>> queries_;
 };

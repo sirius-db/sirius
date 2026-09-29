@@ -430,8 +430,10 @@ class SiriusContext : public ClientContextState {
   enum class runtime_health : uint8_t { OK, UNAVAILABLE };
   [[nodiscard]] runtime_health get_runtime_health() const noexcept
   {
-    return runtime_unavailable_.load(std::memory_order_acquire) ? runtime_health::UNAVAILABLE
-                                                                : runtime_health::OK;
+    return (runtime_unavailable_.load(std::memory_order_acquire) ||
+            query_lifecycle_.runtime_failed())
+             ? runtime_health::UNAVAILABLE
+             : runtime_health::OK;
   }
   void mark_runtime_unavailable() noexcept
   {

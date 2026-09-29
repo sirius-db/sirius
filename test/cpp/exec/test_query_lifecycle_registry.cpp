@@ -507,3 +507,50 @@ TEST_CASE("query resources survive their engine and cannot retire while borrowed
   SECTION("shutdown") { registry.clear(); }
   CHECK(destroyed);
 }
+
+TEST_CASE("query diagnostics survive retirement without retaining work",
+          "[query_lifecycle_gate][concurrency]")
+{
+  query_lifecycle_registry registry;
+  auto id = make_query_id(42);
+  registry.open_query(id);
+  auto wait     = registry.begin_memory_wait(id);
+  auto snapshot = registry.diagnostics();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot[0].memory_waiters == 1);
+  CHECK(snapshot[0].first_memory_wait >= snapshot[0].admitted);
+  registry.record_error(id, std::make_exception_ptr(std::runtime_error("first failure")));
+  registry.record_error(id, std::make_exception_ptr(std::runtime_error("second failure")));
+  wait.reset();
+  registry.quiesce(id);
+  registry.close(id);
+  snapshot = registry.diagnostics();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot[0].error == "first failure");
+  CHECK(snapshot[0].memory_waiters == 0);
+  CHECK(snapshot[0].completed >= snapshot[0].retiring);
+  CHECK(registry.completed_count() == 1);
+  CHECK(registry.size() == 0);
+  for (unsigned i = 100; i < 300; ++i) {
+    registry.open_query(make_query_id(i));
+    registry.close(make_query_id(i));
+  }
+  CHECK(registry.diagnostics().size() == 128);
+  CHECK(registry.completed_count() == 201);
+}
+
+TEST_CASE("failed runtime closes existing publishers and refuses late initialization",
+          "[query_lifecycle_gate][device_health]")
+{
+  query_lifecycle_registry registry;
+  registry.open_query(make_query_id(1));
+  auto already_publishing = registry.try_begin_submission(make_query_id(1));
+  registry.mark_runtime_failed();
+  registry.quiesce_all();
+  CHECK_FALSE(registry.try_begin_submission(make_query_id(1)));
+  CHECK_THROWS(registry.open_query(make_query_id(2)));
+  already_publishing.finish();
+  registry.wait_for_work(make_query_id(1));
+  registry.close(make_query_id(1));
+  CHECK(registry.runtime_failed());
+}

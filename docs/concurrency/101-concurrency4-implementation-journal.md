@@ -206,3 +206,21 @@ Implementation entries will be added here as each buildable change is validated 
 - Validation: full build; 60 pin/MVCC/uniqueness/statistics cases, 610 assertions. Regressions
   check metadata on first lookup and preservation of the old entry after a malformed re-pin.
 - Previous commit: `df1f595de`.
+
+### 11. `feat(exec): expose query diagnostics and latch fatal device health`
+
+- Admission exposes occupancy, completion count and transition timestamps. Lifecycle diagnostics
+  include live publishers/work/memory waits, timestamps and first error, plus a bounded 128-owner
+  retirement history containing no resource references. Memory-wait accounting follows parked tasks.
+- Completion observers run once and cannot prevent promise completion. String-view errors preserve
+  their length. Execution, initialization, result-error and pin paths record query failures.
+- Fatal CUDA-context errors latch runtime health, quiesce all publication gates and refuse new
+  registration/admission. Ordinary allocation/input errors remain query-local. Retry synchronization
+  and pin materialization apply the same classification before releasing ownership. Already-admitted
+  initialization rechecks health. Clearing a sticky error is never treated as recovery.
+- Validation: clean full build; 59 diagnostic/lifecycle/completion/pin cases passed, 568 assertions.
+  The separately configured worker-pressure gate passed with the existing TPC-H fixture (6
+  assertions); its first invocation lacked SIRIUS_TEST_TPCH_DIR. CPU registry stress passed
+  ASan/UBSan and TSan across 2,000 concurrent register/retire cycles. Device status classification
+  and late-registration refusal are tested; actual destructive CUDA faults were not injected.
+- Previous commit: `152991276`.

@@ -368,7 +368,7 @@ void SiriusContext::throw_runtime_unavailable() const
   // would invalidate the whole DatabaseInstance and defeat "CPU queries
   // continue"). Typed so entry points can classify it without text matching.
   throw SiriusRuntimeUnavailableException(
-    "Sirius GPU runtime is unavailable after a mandatory cleanup failure; "
+    "Sirius GPU runtime is unavailable after a mandatory cleanup failure or fatal device error; "
     "CPU execution continues. Restart the process to restore GPU execution.");
 }
 
@@ -377,6 +377,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
+  if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
   // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
@@ -607,6 +608,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
     // Roll back this execution's registrations. Only a failed cleanup latches shared
     // unavailability; an ordinary setup failure does not poison another connection.
     state_ = scope_state::FAILED;
+    ctx_.query_lifecycle_.record_error(window_id_, std::current_exception());
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
@@ -614,6 +616,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(
       string("Sirius execution-window initialization failed: ") + e.what());
   } catch (...) {
     state_ = scope_state::FAILED;
+    ctx_.query_lifecycle_.record_error(window_id_, std::current_exception());
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     release();
@@ -1643,7 +1646,7 @@ sirius::exec::query_admission::permit SiriusContext::acquire_query_lifecycle_slo
         "separate execution contexts");
   }
   return admission_.acquire(kind, [&] {
-    if (runtime_unavailable_.load(std::memory_order_acquire)) throw_runtime_unavailable();
+    if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
     if (context && context->IsInterrupted()) throw InterruptException();
   });
 }

@@ -18,7 +18,10 @@
 
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <future>
+#include <string>
+#include <string_view>
 
 namespace sirius::pipeline {
 
@@ -31,7 +34,10 @@ namespace sirius::pipeline {
  */
 class completion_handler {
  public:
-  completion_handler()  = default;
+  explicit completion_handler(std::function<void(std::exception_ptr)> on_error = {})
+    : on_error_(std::move(on_error))
+  {
+  }
   ~completion_handler() = default;
 
   // Non-copyable and non-movable
@@ -54,6 +60,12 @@ class completion_handler {
     if (_completed.compare_exchange_strong(expected, true)) {
       try {
         _has_error.store(true);
+        if (on_error_) {
+          try {
+            on_error_(error);
+          } catch (...) {
+          }
+        }
         _promise.set_exception(error);
       } catch (...) {
         // Promise already satisfied or other error - ignore
@@ -71,14 +83,10 @@ class completion_handler {
    */
   void report_error(std::string_view error) noexcept
   {
-    bool expected = false;
-    if (_completed.compare_exchange_strong(expected, true)) {
-      try {
-        _has_error.store(true);
-        _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
-      } catch (...) {
-        // Promise already satisfied or other error - ignore
-      }
+    try {
+      report_error(std::make_exception_ptr(std::runtime_error(std::string(error))));
+    } catch (...) {
+      report_error(std::current_exception());
     }
   }
 
@@ -122,6 +130,7 @@ class completion_handler {
   [[nodiscard]] bool has_error() const noexcept { return _has_error.load(); }
 
  private:
+  std::function<void(std::exception_ptr)> on_error_;
   std::promise<void> _promise;
   std::atomic<bool> _completed{false};
   std::atomic<bool> _has_error{false};

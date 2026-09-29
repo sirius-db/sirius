@@ -114,6 +114,7 @@ class itask {
   // deadline prevents the oldest waiting task from monopolizing every dispatch opportunity.
   std::chrono::steady_clock::time_point retry_not_before{};
   std::chrono::steady_clock::time_point memory_wait_started{};
+  exec::query_lifecycle_registry::memory_wait_guard memory_wait;
 
   // Execution function.
   virtual void execute(::cuda::stream_ref stream) = 0;
