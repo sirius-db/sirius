@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "helper/numeric_carrier_rule.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -120,6 +121,18 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
 [[nodiscard]] narrow_domain narrow_domain_of(const logical_type& type) noexcept;
 
 /**
+ * @brief Returns the semantic domain of a physical cuDF carrier type.
+ *
+ * The physical counterpart of the logical overload, and the one list of which cuDF type ids are
+ * signed-integral, unsigned-integral, fixed-point, or `DATE` carriers. `TIMESTAMP_DAYS` is
+ * `DATE`; every other temporal type, and every non-numeric type, is `NONE`.
+ *
+ * @param type Physical carrier type to classify.
+ * @return Domain of @p type, or `narrow_domain::NONE` when it is not a numeric carrier.
+ */
+[[nodiscard]] narrow_domain narrow_domain_of(cudf::data_type type) noexcept;
+
+/**
  * @brief Returns whether a logical type has a narrower exact physical carrier.
  *
  * @param type Logical type to inspect.
@@ -130,7 +143,9 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
 /**
  * @brief Returns the physical representation used for carrier narrowing.
  *
- * Maps `TIMESTAMP_DAYS` to `INT32` and returns every other type unchanged.
+ * Maps `TIMESTAMP_DAYS` to `INT32` (its `integer_storage_type`) and returns every other type
+ * unchanged. Sub-day timestamps are integers underneath as well, but they have no narrowing domain,
+ * so they are not represented here; `integer_storage_type` documents the split.
  *
  * @param type Type to map.
  * @return Narrowing representation of @p type.
@@ -228,6 +243,26 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
  */
 [[nodiscard]] std::optional<cudf::data_type> choose_narrow_physical_type(
   const logical_type& type, const numeric_range& range);
+
+/**
+ * @brief Checks whether every non-null value of a column is representable by a numeric carrier
+ *
+ * Empty and all-null columns fit trivially. Otherwise the column's exact bounds are reduced on
+ * @p stream (`compute_exact_numeric_range`, synchronizing) and validated with `numeric_range_fits`,
+ * so the carrier domain, fixed-point scale, and width rules are the same ones compressed
+ * materialization applies. Nothing fits when the column's type or @p target is not a supported
+ * numeric carrier, or when the bounds cannot be established.
+ *
+ * @param column Non-owning column view whose values are checked
+ * @param target Candidate numeric carrier
+ * @param stream CUDA stream used for the reduction and scalar reads
+ * @param mr Memory resource used for reduction allocations
+ * @return `true` if every non-null value of @p column is exactly representable in @p target
+ */
+[[nodiscard]] bool column_values_fit(cudf::column_view const& column,
+                                     cudf::data_type target,
+                                     ::cuda::stream_ref stream,
+                                     rmm::device_async_resource_ref mr);
 
 /**
  * @brief Computes exact bounds for a column matching its declared logical type

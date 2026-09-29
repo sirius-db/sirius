@@ -31,6 +31,7 @@
 
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "utils/transparent_execution_test_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -149,7 +150,7 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
 
     auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
-    auto const stats_before = sirius_ctx->get_compressed_materialization_stats();
+    auto const stats_before = sirius::test::get_compressed_materialization_stats(con);
 
     // First pin: columns [k, v].
     auto pin1 = con.Query("CALL pin_table('" + parquet_path.string() +
@@ -165,7 +166,7 @@ TEST_CASE("pin_table - same-row-count merge extends cache_info to the column uni
     REQUIRE(pin2);
     if (pin2->HasError()) { UNSCOPED_INFO("pin_table 2 error: " << pin2->GetError()); }
     REQUIRE_FALSE(pin2->HasError());
-    auto const stats_after = sirius_ctx->get_compressed_materialization_stats();
+    auto const stats_after = sirius::test::get_compressed_materialization_stats(con);
     REQUIRE(stats_after.pin_columns_narrowed > stats_before.pin_columns_narrowed);
 
     auto const& mgr = sirius_ctx->get_scan_manager();

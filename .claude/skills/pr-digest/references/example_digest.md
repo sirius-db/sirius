@@ -14,7 +14,7 @@
 | **PR** | [sirius-db/sirius#1277](https://github.com/sirius-db/sirius/pull/1277) |
 | **Title** | dynamic filters: SIP |
 | **Author** | Kevin Kristensen ([@kevkrist](https://github.com/kevkrist)) |
-| **Branch** | `kk/issue-1010-dynamic-filter-sip` → `dev` |
+| **Branch** | `kk/issue-1010-dynamic-filter-sip` → `main` |
 | **Scope** | 59 commits, 100 files, +/- ~roughly evenly split between new planner/runtime code and tests |
 | **Closes** | #1010 ("extend pushdown to non-scan probes"), #1125 (SIP consumer roadmap C1a–C4) |
 | **Supersedes** | #1179 (design/delivery split), #1193 (abandoned planning-sidecar scaffold), #1244 (R1a — producer-key seam, now folded in), #1267 (R1b — live domain-coverage gate, now folded in) |
@@ -517,7 +517,7 @@ the YAML reader and the SQL `SET` handler.
 
 > One deliberate exception: the YAML surface now rejects a
 > `dynamic_filter_domain_coverage_threshold` that the SQL `SET` surface already rejected. On
-> `dev` that value was accepted from YAML and reached a constructor built for every GPU hash
+> `main` that value was accepted from YAML and reached a constructor built for every GPU hash
 > join, so a non-positive or NaN setting failed planning for every such query.
 
 I.e. this is a genuine bug fix bundled into the rename, not pure renaming — previously the two
@@ -590,7 +590,7 @@ prose). No behavioral difference.
 
 **Verification note on `dynamic_filter_replica_reservation.hpp`:** the moved version's docs gained
 `@throw std::invalid_argument if @p bytes is zero`, which reads like new behavior. It isn't —
-checking `dev` at [line 68](../src/include/op/dynamic_filter/dynamic_filter_replica_reservation.hpp#L68),
+checking `main` at [line 68](../src/include/op/dynamic_filter/dynamic_filter_replica_reservation.hpp#L68),
 the `if (bytes == 0) { throw std::invalid_argument(...) }` guard was already there and the PR only
 documented it. Worth stating explicitly, since a newly-appeared `@throw` in a moved file is exactly
 the kind of thing that looks like a silent behavior change.

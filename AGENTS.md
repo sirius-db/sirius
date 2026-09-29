@@ -7,7 +7,9 @@ on the GPU — no special syntax needed.
 
 ## Contributions & PRs
 
-**The default/main branch is `dev`** (not `main`/`master`) — branch and open PRs against it.
+**The default branch is `main`** — branch and open PRs against it. If your local clone or a
+stack still references `dev`, see `CONTRIBUTING.md`'s "Migrating your local clone" section.
+
 Before opening a PR, read `CONTRIBUTING.md`'s "PR branching strategy" section to determine which
 of the three approved paths applies — most work is **Self-contained** (push to a personal fork,
 not `origin`); dependent changes use **Stacked PRs**; CI/critical changes that need same-repo
@@ -43,10 +45,8 @@ pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test    #
 pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"  # by Catch2 tag/test name
 ```
 
-**Python API** (links against the repo's `duckdb/` submodule via `DUCKDB_SOURCE_PATH`):
-```bash
-pixi run -e duckdb-python build-duckdb-python
-```
+**Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
+Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-api).
 
 **Worktrees**: submodules are not auto-initialized — after creating one, run
 `git submodule update --init --recursive`.

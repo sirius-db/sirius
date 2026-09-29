@@ -14,17 +14,15 @@
  * limitations under the License.
  */
 
-// [late_mat][pin_lifecycle] — an origin must not outlive the pin it names.
+// [late_mat][pin_lifecycle] — an origin follows the exact entry its query owns.
 // GPU required.
 //
 // The benchmark harness pins the tables each query needs and unpins them after,
 // so a long run is a stream of pin/unpin/re-pin against the same names. Every
-// one of those transitions has to leave outstanding origins unable to resolve,
-// and the dangerous one is the quietest: assigning a new entry over an existing
-// name destroys the old entry in place, while a handle that was never
-// invalidated still points at that map slot — which now holds a DIFFERENT
-// table. Resolving then succeeds and returns the wrong data, which is the exact
-// failure the generation check exists to prevent.
+// registry transition must hide the old entry from new queries without revoking
+// a query already serving it. An origin therefore resolves the old exact object
+// while that query owns it, never redirects through the reused name, and expires
+// when the final owner releases it.
 //
 // These go through the scan manager's own insert and remove, because the bug
 // they cover is one of sequencing inside those calls, not of the handle.
@@ -106,6 +104,11 @@ column_origin capture_origin(sirius_scan_manager const& manager)
   return origin;
 }
 
+std::shared_ptr<pinned_entry const> capture_entry_owner(sirius_scan_manager const& manager)
+{
+  return manager.find_pinned_entry_for_duckdb_table("", "", kTable);
+}
+
 std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
 {
   cucascade::memory::system_topology_info topology;
@@ -123,7 +126,7 @@ struct manager_fixture {
 
 }  // namespace
 
-TEST_CASE("an origin does not survive the pin it names being replaced", "[late_mat][pin_lifecycle]")
+TEST_CASE("a replacing pin does not redirect an active query's origin", "[late_mat][pin_lifecycle]")
 {
   // The gate decides whether handles are published at all.
   if (!sirius::late_mat::late_mat_enabled()) { return; }
@@ -135,22 +138,27 @@ TEST_CASE("an origin does not survive the pin it names being replaced", "[late_m
 
   pin_once(manager, *space, 128, stream);
   auto const first = capture_origin(manager);
+  auto first_owner = capture_entry_owner(manager);
   REQUIRE(first.has_origin());
-  REQUIRE(first.resolve() != nullptr);
+  REQUIRE(first.resolve() == first_owner);
 
-  // Re-pin the same name without unpinning: the old entry is destroyed by the
-  // assignment, and the map slot now holds different data. An origin that still
-  // resolved here would be reading someone else's rows.
+  // Re-pin the same name without unpinning. New lookups see the replacement,
+  // while an already-running query continues against its old exact object.
   pin_once(manager, *space, 256, stream);
-  REQUIRE(first.resolve() == nullptr);
+  REQUIRE(first.resolve() == first_owner);
 
-  // The new pin is resolvable on its own terms.
   auto const second = capture_origin(manager);
-  REQUIRE(second.resolve() != nullptr);
+  auto second_owner = capture_entry_owner(manager);
+  REQUIRE(second.resolve() == second_owner);
+  REQUIRE(second_owner != first_owner);
   REQUIRE(second.generation != first.generation);
+
+  first_owner.reset();
+  REQUIRE(first.resolve() == nullptr);
 }
 
-TEST_CASE("an origin does not survive an unpin", "[late_mat][pin_lifecycle]")
+TEST_CASE("unpin keeps an active query's origin valid until its owner releases",
+          "[late_mat][pin_lifecycle]")
 {
   if (!sirius::late_mat::late_mat_enabled()) { return; }
 
@@ -161,13 +169,18 @@ TEST_CASE("an origin does not survive an unpin", "[late_mat][pin_lifecycle]")
 
   pin_once(manager, *space, 128, stream);
   auto const origin = capture_origin(manager);
-  REQUIRE(origin.resolve() != nullptr);
+  auto owner        = capture_entry_owner(manager);
+  REQUIRE(origin.resolve() == owner);
 
   manager.remove_pinned_entry(kTable);
+  REQUIRE(capture_entry_owner(manager) == nullptr);
+  REQUIRE(origin.resolve() == owner);
+
+  owner.reset();
   REQUIRE(origin.resolve() == nullptr);
 }
 
-TEST_CASE("pin, unpin, re-pin leaves the first origin unable to resolve",
+TEST_CASE("pin, unpin, re-pin keeps active origins on distinct entries",
           "[late_mat][pin_lifecycle]")
 {
   if (!sirius::late_mat::late_mat_enabled()) { return; }
@@ -181,12 +194,20 @@ TEST_CASE("pin, unpin, re-pin leaves the first origin unable to resolve",
 
   pin_once(manager, *space, 128, stream);
   auto const from_first_query = capture_origin(manager);
+  auto first_owner            = capture_entry_owner(manager);
   manager.remove_pinned_entry(kTable);
 
   pin_once(manager, *space, 128, stream);
   auto const from_second_query = capture_origin(manager);
+  auto second_owner            = capture_entry_owner(manager);
 
-  // Same name, same row count, same shape — and still a different pin.
+  // Same name, same row count and same shape, but each origin is permanently
+  // tied to the object its query acquired.
+  REQUIRE(from_first_query.resolve() == first_owner);
+  REQUIRE(from_second_query.resolve() == second_owner);
+  REQUIRE(first_owner != second_owner);
+
+  first_owner.reset();
   REQUIRE(from_first_query.resolve() == nullptr);
-  REQUIRE(from_second_query.resolve() != nullptr);
+  REQUIRE(from_second_query.resolve() == second_owner);
 }

@@ -36,7 +36,7 @@
 //      small to reliably produce 5 batches per GPU after round-robin split)
 //
 // Single-GPU hosts hit the WARN+return path via cudaGetDeviceCount<2 (per
-// Catch2 v2 convention; mirrors test/cpp/downgrade/test_downgrade_executor.cpp).
+// Catch2 convention; mirrors test/cpp/downgrade/test_downgrade_executor.cpp).
 
 #include <cuda_runtime.h>
 
@@ -150,7 +150,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   if (device_count < 2) {
     WARN(
       "[mgpu-audit] AUDIT-01/02/03 requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 v2 WARN+return convention)");
+      "(per Catch2 WARN+return convention)");
     return;
   }
 

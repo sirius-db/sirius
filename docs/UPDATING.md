@@ -5,7 +5,8 @@ as follows:
 
 - Bump submodules
   - `./duckdb` should be set to latest tagged release
-  - Keep related submodules such as `./duckdb-python`, `./substrait`, and `./vcpkg` aligned when the release requires it
+  - Keep related submodules such as `./substrait` and `./vcpkg` aligned when the release requires it
+- Update the DuckDB package in `pixi.toml` to the matching release for Python users
 - Bump versions in `.github/workflows`
   - `duckdb_version` input in `distribution.yml` should be set to latest tagged release
   - The reusable `sirius-db/extension-ci-tools` workflow ref and `ci_tools_version` input should be updated only when the remote CI tooling branch changes

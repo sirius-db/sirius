@@ -421,12 +421,10 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
 {
   auto const& admitted = build_ctx_.active_gpu_ids();
-  if (admitted.empty()) return;
+  std::unordered_set<op::sirius_physical_hash_join*> joins;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) {
-      join->restrict_dynamic_filter_replicas(admitted);
-    }
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) { joins.insert(join); }
   };
   for (auto& pipe : scheduled_) {
     if (!pipe) continue;
@@ -434,12 +432,16 @@ void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
     auto source = pipe->get_source();
     if (sink) apply_to_op(sink.get());
     if (source) apply_to_op(source.get());
-    // A join is not always a pipeline boundary — fusion can leave one among the intermediate
-    // operators, where source/sink alone would miss it. Restriction is idempotent, so an
-    // operator reached twice is harmless.
+    // Fusion can leave a join among intermediate operators rather than at a pipeline boundary.
     for (auto op_ref : pipe->get_operators()) {
       apply_to_op(&op_ref.get());
     }
+  }
+  for (auto* join : joins) {
+    join->restrict_dynamic_filter_replicas(admitted);
+  }
+  for (auto* join : joins) {
+    join->seal_dynamic_filter_plan();
   }
 }
 

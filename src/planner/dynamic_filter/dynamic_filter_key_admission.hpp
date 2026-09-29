@@ -62,7 +62,10 @@ namespace sirius::planner {
   std::optional<std::size_t> build_side_unique_column = std::nullopt);
 
 /**
- * @brief Tests for INNER or SEMI equality over direct, identical INT32 or INT64 storage
+ * @brief Tests for INNER or SEMI equality over direct, identical, membership-supported storage
+ *
+ * The type gate is `op::membership_key_supported`; the join-edge probe is an operator output at
+ * the key's native type, so build and probe storage types must be identical.
  */
 [[nodiscard]] bool direct_route_admissible(duckdb::JoinType join_type,
                                            sirius::comparison_type comparison,

@@ -141,8 +141,26 @@ void sirius_engine::reset()
 
 void sirius_engine::cancel_tasks()
 {
+  cancel_dynamic_filter_publications();
   sirius_pipelines.clear();
   sirius_root_pipelines.clear();
+}
+
+void sirius_engine::cancel_dynamic_filter_publications() noexcept
+{
+  if (!query_) { return; }
+  auto cancel = [](op::sirius_physical_operator* candidate) noexcept {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(candidate)) {
+      join->cancel_dynamic_filter_publication();
+    }
+  };
+  for (auto const& pipeline : query_->get_pipelines()) {
+    cancel(pipeline->get_source().get());
+    cancel(pipeline->get_sink().get());
+    for (auto const& op_ref : pipeline->operators) {
+      cancel(&op_ref.get());
+    }
+  }
 }
 
 bool sirius_engine::has_result_collector()
@@ -209,6 +227,7 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    cancel_dynamic_filter_publications();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
@@ -217,6 +236,7 @@ void sirius_engine::execute()
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    cancel_dynamic_filter_publications();
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }
