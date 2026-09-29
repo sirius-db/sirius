@@ -100,7 +100,6 @@ class SiriusRegistration {
                                                  vector<LogicalType>& return_types,
                                                  vector<string>& names);
 
-
   /// reset_sirius_cache(): drop every ioctx's prefetching cache and rebuild it
   /// empty, so the next query pays its own IO instead of reading what the last
   /// one left resident.  A no-op where the configuration or the backend gives
