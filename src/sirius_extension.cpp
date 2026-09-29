@@ -1116,53 +1116,20 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
 
-  // Record what the probe proved, by name (see attach_proven_unique_columns on
-  // why not by position). A no-op when the probe was off.
-  //
-  // @p stored_columns is what the insert actually cached. A verdict describes the
-  // values this materialization read, so it may only be attached to a column those
-  // values were stored as: the GPU merge path keeps an already-cached column's
-  // previous chunks and drops the incoming ones, and marking THOSE bytes unique on
-  // the strength of bytes that were discarded is how a non-unique column becomes a
-  // group key.
-  auto attach_proven_unique = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
-                                  std::span<std::string const> stored_columns) {
-    if (verdicts.size() != pinned_column_names.size()) { return; }
-    auto const was_stored = [&](std::string const& column) {
-      return std::find(stored_columns.begin(), stored_columns.end(), column) !=
-             stored_columns.end();
-    };
-    std::vector<std::string> proven_names;
-    for (std::size_t i = 0; i < verdicts.size(); ++i) {
-      switch (verdicts[i]) {
-        case sirius::late_mat::unique_verdict::proven:
-          if (was_stored(pinned_column_names[i])) {
-            proven_names.push_back(pinned_column_names[i]);
-          }
-          break;
-        // undecided/refused/not observed: materialize_pin_batches already ran the
-        // exact stage while the values were still uncompressed, so nothing here
-        // can add to what it concluded.
-        default: break;
+  auto pin_metadata = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
+                          std::vector<std::size_t> row_counts) {
+    sirius::scan_manager::pinned_entry_metadata metadata;
+    if (verdicts.size() == pinned_column_names.size()) {
+      for (std::size_t i = 0; i < verdicts.size(); ++i) {
+        if (verdicts[i] == sirius::late_mat::unique_verdict::proven)
+          metadata.proven_unique_columns.push_back(pinned_column_names[i]);
       }
     }
-    if (!proven_names.empty()) {
-      scan_mgr.attach_proven_unique_columns(data.args.name, proven_names);
+    if (data.args.format == "duckdb") {
+      metadata.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{
+        duckdb_pin_v_base, std::move(row_counts), duckdb_pin_checkpoint_iteration};
     }
-    for (auto const& n : proven_names) {
-      SIRIUS_LOG_INFO("[late-mat] pin '{}': column '{}' proven distinct table-wide (per-chunk)",
-                      data.args.name,
-                      n);
-    }
-  };
-
-  auto attach_duckdb_mvcc_metadata = [&](std::vector<std::size_t> base_row_count_per_chunk) {
-    if (data.args.format != "duckdb") { return; }
-    sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-    mvcc.v_base                   = duckdb_pin_v_base;
-    mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
-    mvcc.checkpoint_iteration     = duckdb_pin_checkpoint_iteration;
-    scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+    return metadata;
   };
 
   if (data.args.tier == "host") {
@@ -1190,17 +1157,15 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
 
-    scan_mgr.insert_pinned_entry_host(data.args.name,
-                                      std::move(cache_info),
-                                      std::move(host_result.chunks),
-                                      *representative_host_space,
-                                      std::move(pinned_column_types),
-                                      std::move(host_result.chunk_stats),
-                                      std::move(host_result.column_storage));
-    // The host path always REPLACES, so every pinned column holds this
-    // materialization's values.
-    attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
-    attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
+    scan_mgr.insert_pinned_entry_host(
+      data.args.name,
+      std::move(cache_info),
+      std::move(host_result.chunks),
+      *representative_host_space,
+      std::move(pinned_column_types),
+      std::move(host_result.chunk_stats),
+      std::move(host_result.column_storage),
+      pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)));
   } else if (pin_comp.enabled) {
     // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
     // on), then compress it when it qualifies, keeping the compressed payload in device
@@ -1219,14 +1184,13 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
 
-    scan_mgr.insert_pinned_entry_device(data.args.name,
-                                        std::move(cache_info),
-                                        std::move(dev_result.chunks),
-                                        *gpu_spaces_mut[0],
-                                        std::move(dev_result.column_storage));
-    // The compressed device path always REPLACES, as above.
-    attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
-    attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
+    scan_mgr.insert_pinned_entry_device(
+      data.args.name,
+      std::move(cache_info),
+      std::move(dev_result.chunks),
+      *gpu_spaces_mut[0],
+      std::move(dev_result.column_storage),
+      pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
@@ -1241,15 +1205,15 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
-    auto const stored             = scan_mgr.insert_pinned_entry(data.args.name,
-                                                     std::move(cache_info),
-                                                     std::move(mat.tables),
-                                                     std::move(mat.chunk_memory_spaces),
-                                                     std::move(pinned_column_types),
-                                                     std::move(mat.chunk_stats),
-                                                     std::move(mat.column_storage));
-    attach_proven_unique(mat.unique_verdicts, stored);
-    attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
+    std::ignore                   = scan_mgr.insert_pinned_entry(
+      data.args.name,
+      std::move(cache_info),
+      std::move(mat.tables),
+      std::move(mat.chunk_memory_spaces),
+      std::move(pinned_column_types),
+      std::move(mat.chunk_stats),
+      std::move(mat.column_storage),
+      pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
   }
 
   output.SetCardinality(1);

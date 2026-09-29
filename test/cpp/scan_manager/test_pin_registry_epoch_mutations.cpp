@@ -174,7 +174,7 @@ TEST_CASE("the same-row-count merge path moves the pin-registry epoch",
   CHECK(f.snapshot() != old_snapshot);
 }
 
-TEST_CASE("a throw after the stale entry is erased still moves the pin-registry epoch",
+TEST_CASE("a failed replacement preserves the previous pin generation",
           "[scan_manager][pin_registry_epoch]")
 {
   epoch_fixture f;
@@ -182,11 +182,11 @@ TEST_CASE("a throw after the stale entry is erased still moves the pin-registry 
   REQUIRE(f.has_entry());
 
   auto const before_failed_repin = f.epoch();
-  // A different row count skips the merge and erases the existing entry; the incoming table
-  // then declares two columns but carries one, so the rebuild throws before re-inserting.
-  // The registry has been mutated (the pin is gone) and the epoch must say so.
+  // The replacement declares two columns but carries one. Construction fails before
+  // publication, leaving the old generation available. The conservative epoch still advances.
   REQUIRE_THROWS_AS(f.insert({0, 1}, 4, 1), std::runtime_error);
-  CHECK_FALSE(f.has_entry());
+  CHECK(f.has_entry());
+  CHECK(f.entry_column_count() == 1);
   CHECK(f.epoch() > before_failed_repin);
 }
 

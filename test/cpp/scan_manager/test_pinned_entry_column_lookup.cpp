@@ -300,3 +300,23 @@ TEST_CASE("type match: when no covering entry still matches, one is returned any
                                                      &both,
                                                      &returned_types) != nullptr);
 }
+
+TEST_CASE("pin publication includes visibility and uniqueness facts",
+          "[pinned_lookup][scan_manager]")
+{
+  auto memory = initialize_memory_manager(1);
+  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::scan_manager::pinned_entry_metadata metadata;
+  metadata.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7};
+  metadata.proven_unique_columns = {"c0"};
+  std::ignore                    = manager.insert_pinned_entry(
+    "orders", make_cache_info({0, 1}), {}, {}, {}, {}, {}, std::move(metadata));
+  auto entry = manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable);
+  REQUIRE(entry);
+  REQUIRE(entry->mvcc);
+  CHECK(entry->mvcc->v_base == 42);
+  CHECK(entry->mvcc->checkpoint_iteration == 7);
+  REQUIRE(entry->proven_unique_columns.size() == 2);
+  CHECK(entry->proven_unique_columns[0]);
+  CHECK_FALSE(entry->proven_unique_columns[1]);
+}

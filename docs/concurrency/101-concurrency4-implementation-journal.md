@@ -194,3 +194,15 @@ Implementation entries will be added here as each buildable change is validated 
 - Validation: full build; 16 dispatcher/MVCC/concurrent SQL cases, 225 assertions, including a
   refused submission and a 10,000-task pending chain without recursive completion.
 - Previous commit: `cfb2c73d0`.
+
+### 10. `fix(pin): publish complete pin generations atomically`
+
+- SQL pinning passes MVCC snapshot/checkpoint facts and uniqueness proofs into insertion. Data,
+  placement, compression metadata, visibility and the late-materialization handle become visible
+  together; no post-publication attachment gap remains.
+- GPU column merges construct a private generation, sharing immutable columns and cloning zone
+  maps. Facts apply only to newly stored columns. Failed replacement leaves the previous pin
+  usable. SQL maintenance remains exclusive; direct API reader guards remain conservative.
+- Validation: full build; 60 pin/MVCC/uniqueness/statistics cases, 610 assertions. Regressions
+  check metadata on first lookup and preservation of the old entry after a malformed re-pin.
+- Previous commit: `df1f595de`.

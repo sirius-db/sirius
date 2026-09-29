@@ -2341,6 +2341,27 @@ std::vector<std::size_t> cache_entry_info::column_projection_for(
   return column_superset_projection(column_ids, requested_ids);
 }
 
+namespace {
+void apply_pin_metadata(pinned_entry& entry,
+                        pinned_entry_metadata metadata,
+                        std::span<const std::string> stored_columns)
+{
+  if (metadata.mvcc) {
+    entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(*metadata.mvcc));
+    entry.mvcc_mask_cache.reset();
+  }
+  if (metadata.proven_unique_columns.empty()) return;
+  entry.proven_unique_columns.resize(entry.cache_info.names.size(), false);
+  for (auto const& name : metadata.proven_unique_columns) {
+    if (std::find(stored_columns.begin(), stored_columns.end(), name) == stored_columns.end())
+      continue;
+    auto it = std::find(entry.cache_info.names.begin(), entry.cache_info.names.end(), name);
+    if (it != entry.cache_info.names.end())
+      entry.proven_unique_columns[it - entry.cache_info.names.begin()] = true;
+  }
+}
+}  // namespace
+
 std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
@@ -2348,7 +2369,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
   // chunk_memory_spaces is parallel to data_tables — the caller
@@ -2422,17 +2444,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
     // cannot distinguish equally sized tables.
     if (existing_it->second->cache_info.same_source_as(cache_info) &&
         existing_it->second->num_rows == new_num_rows) {
-      // The merge below mutates the existing entry IN PLACE, and appending a column rehashes
-      // data_batches_by_column while a cached provider may be calling .at() on it. Shared
-      // ownership tells us whether that can happen: use_count() == 1 means only this map holds
-      // the entry, so nobody is serving it. We hold _pinned_entries_mutex, and the only way to
-      // acquire a new reference is through try_match_cached_entry / find_pinned_entry_for_
-      // duckdb_table, both of which take that same lock — so no sharer can appear underneath
-      // this check. A sharer *releasing* concurrently only makes us over-reject, never
-      // under-accept, which is the safe direction.
-      //
-      // The replace path below needs no such guard: erasing the map slot leaves any serving
-      // provider reading its own shared_ptr, which is exactly what shared ownership buys.
+      // SQL re-pin holds exclusive maintenance. Preserve the direct API's existing
+      // refusal while readers borrow this generation; online replacement is not enabled.
       if (existing_it->second.use_count() > 1) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] cannot re-pin '" + name +
@@ -2446,7 +2459,17 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       // boundaries depend on the projected column set, so a re-pin can slice
       // the same files differently. Reject any mismatch loudly rather than
       // silently aliasing.
-      auto& entry = *existing_it->second;
+      // Build privately: validation/allocation failure leaves the published generation intact.
+      auto const& previous = *existing_it->second;
+      pinned_entry entry;
+      entry.cache_info             = previous.cache_info;
+      entry.data_batches_by_column = previous.data_batches_by_column;
+      entry.chunk_memory_spaces    = previous.chunk_memory_spaces;
+      entry.column_storage         = previous.column_storage;
+      entry.num_rows               = previous.num_rows;
+      entry.zone_maps              = previous.zone_maps.clone();
+      entry.proven_unique_columns  = previous.proven_unique_columns;
+      if (previous.mvcc) entry.mvcc = std::make_unique<duckdb_mvcc_metadata>(*previous.mvcc);
       if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
@@ -2577,12 +2600,6 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
             pinned_zone_maps::remap(std::move(pin_zone_maps), incoming_pos_by_entry_pos);
         }
       }
-      // Columns were merged in place: the entry survives, but its column
-      // positions no longer mean what an origin captured before now assumed.
-      if (entry.late_mat_handle) {
-        entry.late_mat_handle->bump_generation(
-          _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
-      }
       // Only the appended columns hold data from THIS materialization; the rest
       // kept the chunks they were already cached with.
       std::vector<std::string> stored;
@@ -2591,11 +2608,12 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
           stored.push_back(column_names[i]);
         }
       }
+      apply_pin_metadata(entry, std::move(metadata), stored);
+      publish_pinned_entry(name, std::move(entry));
       return stored;
     }
-    // Source, row count, or completeness contract differs → remove registry visibility and rebuild
-    // below. Queries already serving the old entry retain it (and its handle) by shared ownership.
-    _pinned_entries.erase(existing_it);
+    // A changed layout builds a replacement before changing registry visibility.
+    // Keep the previous generation until the replacement is fully constructed.
   }
 
   pinned_entry entry;
@@ -2621,8 +2639,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   // A new object gets a new handle. Any query still serving the old object keeps
   // that exact object alive; its origins never resolve through this name.
-  _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
-  publish_late_mat_handle(name);
+  apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
+  publish_pinned_entry(name, std::move(entry));
   // The replace path stored every column.
   return column_names;
 }
@@ -2653,7 +2671,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
@@ -2726,8 +2745,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   // keeps both its data and exact-object late-mat handle valid to completion. Only the map slot
   // is swapped here, all under one lock so a concurrent lookup sees either whole entry.
   std::lock_guard pin_lk{_pinned_entries_mutex};
-  _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
-  publish_late_mat_handle(name);
+  apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
+  publish_pinned_entry(name, std::move(entry));
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(
@@ -2735,7 +2754,8 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cache_entry_info cache_info,
   std::vector<sirius::device_pin_chunk> chunks,
   cucascade::memory::memory_space& memory_space,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  pinned_entry_metadata metadata)
 {
   pin_registry_mutation_scope const registry_mutation{*this};
   std::size_t new_num_rows = 0;
@@ -2782,8 +2802,8 @@ void sirius_scan_manager::insert_pinned_entry_device(
   // Replace, never mutate — see insert_pinned_entry_host. Existing query leases keep the old
   // entry and its handle alive without redirecting either through this registry name.
   std::lock_guard pin_lk{_pinned_entries_mutex};
-  _pinned_entries[name] = std::make_shared<pinned_entry>(std::move(entry));
-  publish_late_mat_handle(name);
+  apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
+  publish_pinned_entry(name, std::move(entry));
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -2849,20 +2869,17 @@ void sirius_scan_manager::remove_pinned_entry(const std::string& name)
   // the whole of unpinning a parquet-tier entry.
   _pinned_parquet_sources.erase(name);
 }
-void sirius_scan_manager::publish_late_mat_handle(const std::string& name)
+void sirius_scan_manager::publish_pinned_entry(const std::string& name, pinned_entry entry)
 {
-  if (!late_mat::late_mat_enabled()) { return; }
-  auto it = _pinned_entries.find(name);
-  if (it == _pinned_entries.end()) { return; }
-  // Republishing on the same object is an in-place lifecycle change, so revoke
-  // its prior generation before installing the new handle.
-  if (it->second->late_mat_handle) { it->second->late_mat_handle->invalidate(); }
-  auto handle = std::make_shared<late_mat::pin_entry_handle>(
-    name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
-  // The handle points weakly back at this exact object: entry -> handle -> weak entry avoids
-  // a cycle, while resolve() promotes it to an owning lease for each deferred gather.
-  handle->set_entry(it->second);
-  it->second->late_mat_handle = std::move(handle);
+  // Caller holds the registry lock. Allocate all fallible metadata before publication.
+  auto generation = std::make_shared<pinned_entry>(std::move(entry));
+  if (late_mat::late_mat_enabled()) {
+    auto handle = std::make_shared<late_mat::pin_entry_handle>(
+      name, _next_pin_generation.fetch_add(1, std::memory_order_relaxed));
+    handle->set_entry(generation);
+    generation->late_mat_handle = std::move(handle);
+  }
+  _pinned_entries.insert_or_assign(name, std::move(generation));
 }
 
 std::size_t sirius_scan_manager::pin_parquet_ranges(
