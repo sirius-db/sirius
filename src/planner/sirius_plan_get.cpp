@@ -1072,7 +1072,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =
       pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
-    if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
+    if (sirius_state) {
+      sirius_state->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::scan_sidecar_installed);
+    }
   }
   node->named_parameters     = std::move(op.named_parameters);
   node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;

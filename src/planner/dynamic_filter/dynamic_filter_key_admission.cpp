@@ -22,6 +22,7 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -168,8 +169,7 @@ bool direct_route_admissible(duckdb::JoinType join_type,
   bool const shapes_supported = shape.probe == op::dynamic_filter_key_shape::direct &&
                                 shape.build == op::dynamic_filter_key_shape::direct;
   bool const storage_type_supported =
-    probe_storage_type == build_storage_type && (build_storage_type.id() == cudf::type_id::INT32 ||
-                                                 build_storage_type.id() == cudf::type_id::INT64);
+    probe_storage_type == build_storage_type && op::membership_key_supported(build_storage_type);
   return join_type_supported && comparison == sirius::comparison_type::equal && shapes_supported &&
          storage_type_supported;
 }
