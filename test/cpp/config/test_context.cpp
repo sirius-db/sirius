@@ -646,6 +646,22 @@ TEST_CASE("Sirius configuration validates telemetry exporters before initializat
   }
 }
 
+TEST_CASE("Sirius configuration keeps NVTX capture off unless telemetry.enable_nvtx is set",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_FALSE(config.get_telemetry_config().enable_nvtx);
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_telemetry_exporter_ndjson.yaml"));
+  REQUIRE_FALSE(config.get_telemetry_config().enable_nvtx);
+
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_telemetry_enable_nvtx.yaml"));
+  REQUIRE(enabled.get_telemetry_config().enable_nvtx);
+}
+
 TEST_CASE("Sirius configuration rejects empty telemetry destination and identity",
           "[sirius][config]")
 {

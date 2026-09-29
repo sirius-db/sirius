@@ -235,6 +235,9 @@ struct telemetry_config {
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
   /// Roughly doubles telemetry volume; no-op when enable_quent is false.
   bool enable_batch_events{true};
+  /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
+  /// enable_quent is false.
+  bool enable_nvtx{false};
   std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
@@ -281,6 +284,12 @@ struct sirius_config {
 
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
+
+  /// Read only `sirius.telemetry` from @p config_path, without the hardware discovery a
+  /// sirius_config performs (which makes NVTX calls). Returns defaults when the file cannot
+  /// be read or parsed; load_from_file reports those errors.
+  [[nodiscard]] static telemetry_config read_telemetry_config(
+    const std::filesystem::path& config_path) noexcept;
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
