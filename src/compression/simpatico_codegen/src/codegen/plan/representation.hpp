@@ -164,7 +164,7 @@ struct compressed_representation {
 
 /// Independently decodable representation. All generic codec representations
 /// (identity, dictionary, nvCOMP, ALP, bitextract, str_split) derive from this
-/// subtype, which guarantees that decompress(stream, mr) reconstructs the
+/// subtype, which guarantees that decompress() reconstructs the
 /// original column without any PlanTree or JIT-bridge context.
 ///
 /// codegen_fused_representation does NOT derive from this type; use the
@@ -183,11 +183,6 @@ struct standalone_compressed_representation : compressed_representation {
    * @return An owning column whose writes may still be pending on the frame's stream
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> decompress(decode_frame& frame) const = 0;
-  /**
-   * @brief Decode through a single-request session and return a completed column.
-   */
-  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
-                                           rmm::device_async_resource_ref mr) const;
 };
 
 /// Identity / passthrough: stores a column as-is (e.g. keys_chars "stored as-is" in plan).
@@ -207,7 +202,6 @@ struct identity_compressed_representation : standalone_compressed_representation
     channels_.push_back(std::move(c));
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
   OpId kind() const override { return OpId::Identity; }
 };
@@ -283,7 +277,6 @@ struct dictionary_compressed_representation : standalone_compressed_representati
     num_rows      = dict_column ? dict_column->size() : 0;
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   /// Evaluate @p pred against the dictionary *keys* and map the result over the
@@ -439,7 +432,6 @@ struct str_split_compressed_representation : standalone_compressed_representatio
     if (null_mask) channels_.push_back(std::move(null_mask));
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   std::vector<std::string> required_channels() const override
@@ -526,7 +518,6 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
     return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override = 0;
 };
 
@@ -537,7 +528,6 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
 // Reconstructed generically via nvcomp_simple_from_outputs (representation_factory.cpp).
 struct ans_compressed_representation : nvcomp_simple_rep_base<OpId::Ans, leaf_meta::ans> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
@@ -578,7 +568,6 @@ struct bitcomp_compressed_representation : nvcomp_payload_rep {
   {
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   OpId kind() const override { return OpId::Bitcomp; }
@@ -649,7 +638,6 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
   {
   }
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   OpId kind() const override { return OpId::NvcompCascaded; }
@@ -688,20 +676,17 @@ struct cascaded_compressor : compressor {
 // snappy/lz4/deflate: reconstructed generically via nvcomp_simple_from_outputs.
 struct snappy_compressed_representation : nvcomp_simple_rep_base<OpId::Snappy, leaf_meta::snappy> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
 struct lz4_compressed_representation : nvcomp_simple_rep_base<OpId::Lz4, leaf_meta::lz4> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
 struct deflate_compressed_representation
   : nvcomp_simple_rep_base<OpId::Deflate, leaf_meta::deflate> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
@@ -746,7 +731,6 @@ struct alp_compressed_representation : standalone_compressed_representation {
                                 std::unique_ptr<cudf::column> exception_positions_in,
                                 std::unique_ptr<cudf::column> metadata_in);
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   // Named accessors for decompress impl (channels_ in registry order).
@@ -802,7 +786,6 @@ struct alp_rd_compressed_representation : standalone_compressed_representation {
                                    std::unique_ptr<cudf::column> exceptions_in,
                                    std::unique_ptr<cudf::column> exception_positions_in);
 
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 
   // Named accessors for decompress impl (channels_ in registry order).
@@ -889,7 +872,6 @@ struct bitextract_compressed_representation : standalone_compressed_representati
   }
 
   // Implemented in bitjoin_bitextract.cu
-  using standalone_compressed_representation::decompress;
   [[nodiscard]] std::unique_ptr<cudf::column> decompress(decode_frame& frame) const override;
 };
 
@@ -946,10 +928,10 @@ struct codegen_fused_representation : compressed_representation {
 
 /// Safely decompress a representation that must be standalone-decodable.
 ///
-/// Downcasts to standalone_compressed_representation; calls decompress() on
-/// success. Returns nullptr and writes a deterministic message to error_out
-/// when rep is a storage-only type such as codegen_fused_representation.
-/// Callers should use this instead of calling rep->decompress() directly.
+/// Downcasts to standalone_compressed_representation and decodes it through a
+/// single-request session, returning a completed column. Returns nullptr and
+/// writes a deterministic message to error_out when rep is null or a
+/// storage-only type such as codegen_fused_representation.
 std::unique_ptr<cudf::column> decompress_standalone_representation(
   compressed_representation const* rep,
   ::cuda::stream_ref stream,

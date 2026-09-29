@@ -262,28 +262,14 @@ mask_source_status decode_request(mask_decode_request const& request, decode_fra
                                                               decode_frame& frame);
 
 /**
- * @brief Rebuild a codec representation from channels decoded on the frame's stream.
+ * @brief Rebuild @p node's codec representation from channels decoded on the frame's stream,
+ * publishing `PlanNode::dictionary_key_width_hint` on a dictionary.
  *
  * Consumes @p channels. The result owns them and releases them on that stream, so it may be
  * destroyed as soon as the work that decodes from it has been queued.
  *
- * @throw std::invalid_argument if the channel names, count, or types do not match the codec
- */
-[[nodiscard]] std::unique_ptr<compressed_representation> reconstruct_decode_representation(
-  std::string const& compressor_name,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> channels,
-  leaf_meta_v const& meta,
-  decode_frame& frame);
-
-/**
- * @brief Rebuild @p node's codec representation from channels decoded on the frame's stream,
- * publishing `PlanNode::dictionary_key_width_hint` on a dictionary.
- *
- * Otherwise as the overload above, which leaves a dictionary's key width unknown.
- *
- * @throw std::invalid_argument also if the hint is below -1 or a positive hint disagrees with the
- * total key character size
+ * @throw std::invalid_argument if the channel names, count, or types do not match the codec, or if
+ * the hint is below -1 or a positive hint disagrees with the total key character size
  */
 [[nodiscard]] std::unique_ptr<compressed_representation> reconstruct_decode_representation(
   PlanNode const& node,

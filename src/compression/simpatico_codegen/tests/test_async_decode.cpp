@@ -655,6 +655,23 @@ std::vector<::cuda::stream_ref> stream_refs(simpatico::stream_pool const& pool)
   return {pool.streams.begin(), pool.streams.end()};
 }
 
+// A `dictionary` plan node carrying `hint` as its key width, for reconstruction fixtures.
+simpatico::PlanNode dictionary_plan_node(std::int64_t hint = -1)
+{
+  simpatico::PlanNode node;
+  node.op                        = "dictionary";
+  node.dictionary_key_width_hint = hint;
+  return node;
+}
+
+// A standalone representation decoded through the public single-request helper, completed.
+std::unique_ptr<cudf::column> decode_completed(simpatico::compressed_representation const& rep,
+                                               ::cuda::stream_ref stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  return simpatico::decompress_standalone_representation(&rep, stream, mr, nullptr);
+}
+
 simpatico::column_decode_request value_request(simpatico::compressed_column const& column)
 {
   return {.source = std::cref(*column.plan_tree), .result = simpatico::value_result{column.dtype}};
@@ -857,7 +874,7 @@ void test_completed_public_return(rmm::device_async_resource_ref upstream)
         auto const* rep = dynamic_cast<simpatico::standalone_compressed_representation const*>(
           compressed.columns[0].plan_tree->nodes[1].rep.get());
         expect(rep != nullptr, "standalone identity fixture missing");
-        column = rep->decompress(pool.streams.front(), upstream);
+        column = decode_completed(*rep, pool.streams.front(), upstream);
         break;
       }
     }
@@ -965,7 +982,7 @@ void test_identity_owned_children(rmm::device_async_resource_ref upstream)
     current_resource_guard current_guard(current);
     stream_gate gate(stream.value());
     gate.release_after_delay.store(true);
-    auto output = representation->decompress(stream.view(), supplied);
+    auto output = decode_completed(*representation, stream.view(), supplied);
     // Observe completed return before any verification readback can hide an unfinished copy.
     gate.expect_completed("owning identity copy returned before nested data completed");
     expect(cudaStreamQuery(stream.value()) == cudaSuccess,
@@ -1073,15 +1090,15 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       std::vector<std::unique_ptr<cudf::column>> decoded;
       for (auto const& channel : original->named_channels(stream.view()))
         decoded.push_back(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+      auto const node    = dictionary_plan_node();
       auto const rebuilt = simpatico::reconstruct_decode_representation(
-        "dictionary", channel_names, std::move(decoded), simpatico::leaf_meta::none{}, frame);
+        node, channel_names, std::move(decoded), frame);
       expect_failure(
         [&] {
           (void)simpatico::reconstruct_decode_representation(
-            "dictionary",
+            node,
             channel_names,
             std::vector<std::unique_ptr<cudf::column>>(channel_names.size()),
-            simpatico::leaf_meta::none{},
             frame);
         },
         "dictionary reconstruction accepted missing channels");
@@ -1112,7 +1129,7 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       expect(original->constant_key_width == fixture.width,
              "decode changed original dictionary width metadata");
 
-      auto rebuilt = reconstructed.decompress(stream.view(), mr);
+      auto rebuilt = decode_completed(reconstructed, stream.view(), mr);
       expect(rebuilt != nullptr && rebuilt->type() == input->type(),
              "unknown-width dictionary output type mismatch");
       expect(strings_equal_completed(input->view(), rebuilt->view(), stream.view()),
@@ -1120,7 +1137,7 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       expect(reconstructed.constant_key_width == -1,
              "decode cached reconstructed dictionary width metadata");
 
-      auto loaded = imported_dictionary->decompress(stream.view(), mr);
+      auto loaded = decode_completed(*imported_dictionary, stream.view(), mr);
       expect(loaded != nullptr && loaded->type() == input->type(),
              "imported dictionary output type mismatch");
       expect(strings_equal_completed(input->view(), loaded->view(), stream.view()),
@@ -1220,9 +1237,7 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
   stream.synchronize();
   std::array const streams{::cuda::stream_ref{stream}};
   for (std::int64_t const hint : {std::int64_t{1}, std::int64_t{-1}}) {
-    simpatico::PlanNode node;
-    node.op                        = "dictionary";
-    node.dictionary_key_width_hint = hint;
+    auto const node = dictionary_plan_node(hint);
     simpatico::decode_session session(streams, mr);
     auto& frame               = simpatico::decode_session_test_access::frame(session);
     auto const uploads_before = simpatico::decode_session_test_access::host_uploads(session);
@@ -1256,9 +1271,7 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
   }
   // A hint that does not describe the stored key chars is corrupt metadata, not a decline.
   for (std::int64_t const hint : {std::int64_t{3}, std::int64_t{-2}}) {
-    simpatico::PlanNode node;
-    node.op                        = "dictionary";
-    node.dictionary_key_width_hint = hint;
+    auto const node = dictionary_plan_node(hint);
     simpatico::decode_session session(streams, mr);
     auto& frame = simpatico::decode_session_test_access::frame(session);
     expect_failure(
@@ -1458,7 +1471,7 @@ void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
         bool accepted = false;
         try {
           auto const rebuilt = simpatico::reconstruct_decode_representation(
-            "dictionary", names, std::move(channels), simpatico::leaf_meta::none{}, frame);
+            dictionary_plan_node(), names, std::move(channels), frame);
           auto const& dictionary =
             dynamic_cast<simpatico::dictionary_compressed_representation const&>(*rebuilt);
           auto const keys = cudf::dictionary_column_view(dictionary.dict_column->view()).keys();
@@ -1494,7 +1507,7 @@ void test_dictionary_width_sliced_input(rmm::device_async_resource_ref mr)
     dynamic_cast<simpatico::dictionary_compressed_representation const*>(encoded.get());
   expect(dictionary != nullptr && dictionary->constant_key_width == 2,
          "dictionary width inspected the sliced input's prefix");
-  auto decoded = dictionary->decompress(stream.view(), mr);
+  auto decoded = decode_completed(*dictionary, stream.view(), mr);
   expect(strings_equal_completed(sliced, decoded->view(), stream.view()),
          "sliced dictionary roundtrip mismatch");
 }
@@ -1567,13 +1580,13 @@ void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
       expect(prepared->constant_key_width == expected_width,
              "dictionary width missed a key outside the first reduction block");
       auto expected = make_strings_column(expected_values, {}, stream.view());
-      auto decoded  = prepared->decompress(stream.view(), mr);
+      auto decoded  = decode_completed(*prepared, stream.view(), mr);
       expect(strings_equal_completed(expected->view(), decoded->view(), stream.view()),
              "large-key dictionary roundtrip mismatch");
 
       simpatico::dictionary_compressed_representation unknown(
         std::make_unique<cudf::column>(prepared->dict_column->view(), stream.view(), mr));
-      auto fallback = unknown.decompress(stream.view(), mr);
+      auto fallback = decode_completed(unknown, stream.view(), mr);
       expect(strings_equal_completed(expected->view(), fallback->view(), stream.view()),
              "large-key unknown-width dictionary roundtrip mismatch");
       expect(unknown.constant_key_width == -1, "large-key fallback mutated width metadata");
@@ -1644,7 +1657,7 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
     gate.release_after_delay.store(true);
     bool injected = false;
     try {
-      (void)unknown.decompress(stream, resource);
+      (void)decode_completed(unknown, stream, resource);
     } catch (injected_out_of_memory const& error) {
       injected = error.requested_bytes == resource.observations->failed_request_bytes &&
                  error.requested_bytes >= sizeof(int64_t);

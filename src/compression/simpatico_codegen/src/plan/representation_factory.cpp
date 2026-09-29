@@ -907,17 +907,6 @@ std::unique_ptr<compressed_representation> reconstruct_decode_representation_imp
 }  // namespace
 
 std::unique_ptr<compressed_representation> reconstruct_decode_representation(
-  std::string const& compressor_name,
-  std::vector<std::string> const& output_names,
-  std::vector<std::unique_ptr<cudf::column>> channels,
-  leaf_meta_v const& meta,
-  decode_frame& frame)
-{
-  return reconstruct_decode_representation_impl(
-    compressor_name, output_names, std::move(channels), meta, -1, frame);
-}
-
-std::unique_ptr<compressed_representation> reconstruct_decode_representation(
   PlanNode const& node,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> channels,
@@ -925,16 +914,6 @@ std::unique_ptr<compressed_representation> reconstruct_decode_representation(
 {
   return reconstruct_decode_representation_impl(
     node.op, output_names, std::move(channels), node.meta, node.dictionary_key_width_hint, frame);
-}
-
-std::unique_ptr<cudf::column> standalone_compressed_representation::decompress(
-  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
-{
-  std::array const streams{stream};
-  decode_session session{streams, mr};
-  session.append(column_decode_request{std::cref(*this)});
-  auto results = session.finish();
-  return std::move(results.front());
 }
 
 std::unique_ptr<cudf::column> identity_compressed_representation::decompress(
@@ -974,7 +953,10 @@ std::unique_ptr<cudf::column> decompress_standalone_representation(
                    " is storage-only and requires the PlanTree decode bridge (e.g. DecodeWalk)";
     return nullptr;
   }
-  return standalone->decompress(stream, mr);
+  std::array const streams{stream};
+  decode_session session{streams, mr};
+  session.append(column_decode_request{std::cref(*standalone)});
+  return std::move(session.finish().front());
 }
 
 }  // namespace simpatico
