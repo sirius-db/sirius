@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "api/simpatico_codegen.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "decode/decode_session.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -491,6 +492,77 @@ void bool8_delivery(simpatico::stream_pool& pool,
     expect((flags[i] != 0) == (i % 97 != 0), "unselected BOOL8 predicate value");
 }
 
+void nullable_bool8_declines(simpatico::stream_pool& pool,
+                             ::cuda::stream_ref stream,
+                             rmm::device_async_resource_ref mr)
+{
+  std::vector<std::string> strings(row_count, "other");
+  std::vector<bool> valid(row_count, true);
+  for (int i = 0; i < row_count; ++i) {
+    if (i % 97 == 0) strings[i] = "match";
+    if (i % 31 == 0) valid[i] = false;
+  }
+  auto nullable = make_strings_column(strings, valid, stream);
+  auto tree     = simpatico::plan_tree_from_dsl("input -> dictionary\n");
+  expect(tree.has_value(), "nullable dictionary fixture plan");
+  // The table compressor rejects nulls; install the nullable dictionary through its codec.
+  tree->nodes[1].rep = simpatico::dictionary_compressor{}.compress(nullable->view(), stream, mr);
+  simpatico::compressed_column column;
+  column.dtype     = nullable->type();
+  column.num_rows  = row_count;
+  column.plan_tree = std::make_unique<simpatico::PlanTree>(std::move(*tree));
+  auto compressed  = simpatico::compress_with_plan(
+    cudf::table_view{{sequence(0, stream, mr)->view()}}, "input -> identity\n", stream, mr);
+  compressed.columns.push_back(std::move(column));
+  stream.sync();
+
+  std::array<std::size_t, 2> selected{1, 0};
+  sc::scan_filter_request request;
+  request.routes = {sc::decode_route::dict_codes, sc::decode_route::full};
+  request.bool8_filters.push_back({0, {"match"}});
+  sc::scan_filter_result result;
+  auto output =
+    simpatico::decompress_scan_filter(compressed, selected, request, result, pool, stream, mr);
+  expect(!result.applied && result.status == sc::scan_filter_status::refused,
+         "nullable BOOL8 source declines the selection");
+  expect(output->num_columns() == 2 && output->num_rows() == row_count,
+         "nullable BOOL8 decline preserves the full row domain");
+  auto const predicate = output->view().column(0);
+  expect(predicate.type().id() == cudf::type_id::BOOL8,
+         "nullable BOOL8 decline preserves predicate substitution");
+  expect(predicate.null_count() == nullable->null_count() && host_validity_bits(predicate) == valid,
+         "nullable BOOL8 decline preserves exact predicate validity");
+  auto const flags = read<std::uint8_t>(predicate, stream);
+  for (int i = 0; i < row_count; ++i)
+    if (valid[i])
+      expect((flags[i] != 0) == (strings[i] == "match"), "nullable BOOL8 predicate value");
+  expect(read<std::int32_t>(output->view().column(1), stream) == first_rows(row_count),
+         "nullable BOOL8 decline preserves companion values and row order");
+
+  rmm::device_buffer ballot(cudf::bitmask_allocation_size_bytes(row_count), stream, mr);
+  std::array<simpatico::mask_destination, 2> const malformed{{
+    {static_cast<std::uint32_t*>(ballot.data()), row_count - 1},
+    {nullptr, row_count},
+  }};
+  auto const streams = pool.refs();
+  for (auto const destination : malformed) {
+    simpatico::decode_session session(streams, mr);
+    bool rejected = false;
+    try {
+      session.append(simpatico::column_decode_request{
+        .source = std::cref(*compressed.columns[1].plan_tree),
+        .result =
+          simpatico::predicate_result{simpatico::decode_predicate{{"match"}}, destination}});
+      (void)session.finish();
+    } catch (simpatico::unsupported_nullable_selection const&) {
+      expect(false, "malformed predicate ballot must fail before nullable selection decline");
+    } catch (std::invalid_argument const&) {
+      rejected = true;
+    }
+    expect(rejected, "malformed nullable predicate ballot must propagate invalid_argument");
+  }
+}
+
 // Row selection has no null model: a null-masked `full` column declines the batch after its decode
 // discovers the nulls, and the plain decode keeps the validity.
 void nullable_full_route_declines(simpatico::stream_pool& pool,
@@ -742,6 +814,7 @@ int main()
     numeric_sources(pool, stream.view(), resource);
     membership_cascade(pool, stream.view(), resource);
     bool8_delivery(pool, stream.view(), resource);
+    nullable_bool8_declines(pool, stream.view(), resource);
     dict_codes_gather(pool, stream.view(), resource);
     nullable_full_route_declines(pool, stream.view(), resource);
     aliased_borrowed_lanes(pool, stream.view(), resource);

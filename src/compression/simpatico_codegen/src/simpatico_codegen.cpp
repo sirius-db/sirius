@@ -807,9 +807,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     result.keep_mask_applied = has_keep_mask;
     return columns;
   } catch (unsupported_nullable_selection const&) {
-    // The existing row-selection policy excludes null-masked columns, which a full-route decode
-    // discovers only once it runs: an explicit decline after a clean drain, not an execution
-    // failure. A failed drain is a failure.
+    // Nulls in selected values or predicate ballots require a clean drain before declining row
+    // selection. A failed drain is a failure.
     if (auto const status = synchronize_distinct(streams); status != cudaSuccess) {
       reset_result(sc::scan_filter_status::failed);
       throw_if_cuda_error(status, "simpatico: filtered decode cleanup");

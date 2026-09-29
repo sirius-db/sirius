@@ -1167,10 +1167,12 @@ std::unique_ptr<cudf::column> decode_request(column_decode_request const& reques
       throw std::runtime_error("decode: predicate is not BOOL8");
     if (predicate->ballot) {
       auto const& destination = *predicate->ballot;
-      if (output->size() != destination.num_rows || output->null_count() != 0 ||
+      if (output->size() != destination.num_rows ||
           (destination.num_rows > 0 && !destination.words)) {
-        throw std::invalid_argument("decode: predicate ballot shape/null policy mismatch");
+        throw std::invalid_argument("decode: predicate ballot shape mismatch");
       }
+      if (output->null_count() != 0)
+        throw unsupported_nullable_selection("decode: nullable predicate ballot unsupported");
       sc::mask_from_bool8(output->view().data<std::uint8_t>(),
                           destination.num_rows,
                           destination.words,

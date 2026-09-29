@@ -288,8 +288,8 @@ mask_source_status decode_one(mask_decode_request const& request,
 mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame);
 
 /**
- * @brief Thrown by a selected decode whose full-width value column is null-masked. Row selection
- * has no null model, so a caller may decline the selection instead of failing.
+ * @brief Thrown when selected values or predicate ballots contain nulls. Row selection has no null
+ * model, so a caller may decline the selection instead of failing.
  */
 class unsupported_nullable_selection final : public std::invalid_argument {
  public:
