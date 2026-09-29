@@ -266,7 +266,7 @@ void streaming_fragment::build_result_collector(
   register_sources();
 }
 
-void streaming_fragment::build(bool park_window)
+void streaming_fragment::build()
 {
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
   if (_build_failed) {
@@ -305,7 +305,7 @@ void streaming_fragment::build(bool park_window)
       build_streaming_sink(std::move(subtree));
     }
     _built = true;
-    if (park_window) { _lifecycle->scope.set_parked(true); }
+    _lifecycle->scope.set_parked(true);
   } catch (...) {
     // The session and engine keep partial registrations, so the fragment is single-shot.
     _build_failed = true;
@@ -436,7 +436,9 @@ void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(stream_id_t id)
 {
   require_built("pull()");
-  if (!_ran) {
+  // An open window means run() has not started. After a failed run() the window is closed
+  // and the outputs are poisoned, so pulling rethrows the cause.
+  if (_lifecycle) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: pull() requires run() first, otherwise an empty stream is "
       "indistinguishable from a finished one");

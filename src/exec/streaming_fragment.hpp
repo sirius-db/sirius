@@ -96,9 +96,7 @@ class streaming_fragment {
   ///         spec.prepared types that do not match the plan's output types.
   /// @throws std::runtime_error when another fragment's window is open (see above).
   /// @throws whatever the plan source, binder, or plan generator raises.
-  /// @param park_window false for a caller that calls run() right away on the same thread: the
-  ///        window is not parked, so concurrent queries wait for it instead of failing.
-  void build(bool park_window = true);
+  void build();
 
   /// Submit and block. Closes the query window on success. On failure, poisons every output,
   /// then closes the window.
@@ -121,8 +119,8 @@ class streaming_fragment {
   void close_input(stream_id_t id, sender_id_t sender);
 
   /// nullopt means no batch is parked now. That is not EOS. Call drained(id) for EOS.
-  /// @throws sirius::invalid_input_exception before a successful run() or on an unknown id.
-  /// @throws the output's poison error.
+  /// @throws sirius::invalid_input_exception before run() or on an unknown id.
+  /// @throws the output's poison error, which after a failed run() is that run's cause.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
 
   /// False while batches remain, before EOS, and on a poisoned output.

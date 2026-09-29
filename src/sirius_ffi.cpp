@@ -245,11 +245,10 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     auto lowered             = lower_substrait(*impl_->conn, plan);
     lower_ms                 = elapsed_ms(lower_started);
 
-    // The same result path as a zero-output Fragment. run() follows build() on this thread,
-    // so the window is not parked and a concurrent execute_substrait waits rather than fails.
+    // The same result path as a zero-output Fragment.
     sirius::exec::streaming_fragment fragment(client, spec_from(std::move(lowered)));
     auto const plan_started = std::chrono::steady_clock::now();
-    fragment.build(/*park_window=*/false);
+    fragment.build();
     plan_ms = elapsed_ms(plan_started);
 
     auto const execute_started = std::chrono::steady_clock::now();

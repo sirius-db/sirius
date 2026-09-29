@@ -518,6 +518,24 @@ TEST_CASE_METHOD(fragment_fixture,
       require_receiver_still_open(*receiver);
     }
 
+    SECTION("source's run() failed")
+    {
+      // The scan reads the file during run(), so deleting it after build() fails execution.
+      auto const copy = fs::temp_directory_path() / "sirius_frag7_lineitem.parquet";
+      fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
+      auto failed = make_fragment(
+        *con->context, "SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
+      failed->build();
+      fs::remove(copy);
+      REQUIRE_THROWS(failed->run());
+
+      auto receiver = make_receiver({{"a"}, integer_type, {0}});
+      receiver->build();
+      REQUIRE_THROWS_WITH(receiver->relay_from(*failed, 0, 0, 0),
+                          Catch::Contains("requires the source fragment to have run"));
+      require_receiver_still_open(*receiver);
+    }
+
     SECTION("source is a result fragment")
     {
       auto result = make_fragment(*con->context, kLeafQuery, {});
@@ -682,7 +700,15 @@ TEST_CASE_METHOD(fragment_fixture,
       fragment->build();
       fs::remove(copy);
 
-      REQUIRE_THROWS(fragment->run());
+      std::string cause;
+      try {
+        fragment->run();
+      } catch (std::exception const& e) {
+        cause = e.what();
+      }
+      REQUIRE_FALSE(cause.empty());
+      // The poisoned output surfaces the run's cause, not an empty or finished stream.
+      REQUIRE_THROWS_WITH(fragment->pull(0), cause);
       REQUIRE_FALSE(fragment->drained(0));
       REQUIRE_THROWS_WITH(fragment->run(), Catch::Contains("query window is closed"));
       require_window_free();

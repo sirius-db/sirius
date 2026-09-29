@@ -190,8 +190,7 @@ to a physical plan, and roots the plan in `sirius_physical_streaming_sink` or
   one query-lifecycle slot per `SiriusContext`. While a built fragment waits for `run()`, its
   window is parked, and any other query or fragment build on that `SiriusContext` throws instead
   of waiting. Waiting could deadlock: the parked fragment's owner may itself be waiting on the
-  caller. `build(/*park_window=*/false)` skips parking for a caller that runs right away on the
-  same thread, so concurrent callers wait as usual. `Context::execute_substrait` uses it.
+  caller.
 - **A failed `build()` is single-shot.** It closes the window, and the session and engine keep
   partial registrations, so a second `build()` throws "cannot be retried". Create a new fragment.
 - **Caller-supplied `prepared` metadata must match the plan.** For a result fragment,
