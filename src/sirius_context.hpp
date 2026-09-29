@@ -645,9 +645,10 @@ class SiriusContext : public ClientContextState {
   /// window (it releases and throws instead of running any shared mutation).
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
-  /// The begin-of-window shared mutations (repository-manager registration,
-  /// task_creator reset) — runs INSIDE the held slot, per the frozen
-  /// "after acquire + health check, before final create_plan" placement.
+  /// The begin-of-window shared mutations (repository-manager registration and
+  /// the query's task_creator state) — runs INSIDE the held slot, right after
+  /// acquire and the health check. A streaming fragment has already generated
+  /// its plan by then; the transparent path plans after this.
   /// GPU admission happens later, in sirius_engine::initialize_internal().
   void begin_execution_window(ClientContext& context,
                               sirius::query_id_t query_id,

@@ -305,7 +305,6 @@ Construction invariants:
 ```
 push(stream_id, batch)              // → source.push
 close_input(stream_id, sender_id)   // → source.close_input(sender)
-fail_input(stream_id, error)        // → source.fail_input(error)   — poison an input stream
 pull(stream_id) -> optional         // → sink.pull(partition)
 wait(stream_id)                     // → sink.wait(partition)
 drained(stream_id) -> bool          // → sink.drained(partition)

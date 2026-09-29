@@ -45,12 +45,6 @@ void stream_bind_catalog::declare(stream_id_t id, stream_input_binding binding)
   _entries[id] = std::move(binding);
 }
 
-void stream_bind_catalog::clear()
-{
-  std::lock_guard<std::mutex> guard(_mutex);
-  _entries.clear();
-}
-
 void stream_bind_catalog::erase(stream_id_t id)
 {
   std::lock_guard<std::mutex> guard(_mutex);

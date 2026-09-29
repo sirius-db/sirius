@@ -82,10 +82,6 @@ class stream_session {
   /// True once every expected sender has closed the input. @throws on unknown input id.
   [[nodiscard]] bool input_closed(stream_id_t id) const;
 
-  /// Poison an input stream (S2/P1–P4). Rethrown from the engine's next pull on that stream.
-  /// @throws on unknown input id.
-  void fail_input(stream_id_t id, std::exception_ptr error);
-
   // -----------------------------------------------------------------------
   // Consumer side — output streams
   // -----------------------------------------------------------------------

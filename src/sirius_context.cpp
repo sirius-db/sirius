@@ -398,8 +398,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
-  // Runs inside the held slot, after acquire and the health check and before
-  // the final create_plan.
+  // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
   // throwing steps that matter; a throw here is handled by the scope ctor's

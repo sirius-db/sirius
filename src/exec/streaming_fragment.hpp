@@ -129,9 +129,6 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   [[nodiscard]] bool drained(stream_id_t id) const;
 
-  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
-  void fail_output(stream_id_t id, std::exception_ptr error);
-
   /// Take the materialized QueryResult of a result fragment. Valid once, after a successful run.
   /// @throws sirius::invalid_input_exception on a streaming fragment, before a successful run(),
   ///         or when the result was already taken.

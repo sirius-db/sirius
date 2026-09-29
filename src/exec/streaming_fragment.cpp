@@ -445,12 +445,6 @@ bool streaming_fragment::drained(stream_id_t id) const
   return _session.drained(id);
 }
 
-void streaming_fragment::fail_output(stream_id_t id, std::exception_ptr error)
-{
-  require_built("fail_output()");
-  _session.fail_output(id, std::move(error));
-}
-
 duckdb::unique_ptr<duckdb::QueryResult> streaming_fragment::take_result()
 {
   if (!is_result()) {
