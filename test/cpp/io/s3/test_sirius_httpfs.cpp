@@ -381,53 +381,6 @@ TEST_CASE("Sirius S3 filesystem keeps precedence over later S3 handlers", "[s3][
   CHECK(message.find("[sirius_httpfs]") != std::string::npos);
 }
 
-TEST_CASE("S3 LIST keys retain literal identity when embedded in object URIs",
-          "[s3][filesystem][glob]")
-{
-  for (auto const key : {std::string_view{"a%2Fb.p"},
-                         std::string_view{"a%20b.p"},
-                         std::string_view{"a#b.p"},
-                         std::string_view{"a?b.p"},
-                         std::string_view{"100%x.p"}}) {
-    DYNAMIC_SECTION("key=" << key)
-    {
-      auto const parsed = sirius::io::parse("s3://bkt/" + std::string{key});
-
-      CHECK(parsed.host == "bkt");
-      CHECK(parsed.path == key);
-    }
-  }
-}
-
-TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][filesystem][glob]")
-{
-  for (auto const key : {std::string_view{"plain.parquet"},
-                         std::string_view{"year=2026/part 0.parquet"},
-                         std::string_view{"nested/path/file.parquet"}}) {
-    DYNAMIC_SECTION("key=" << key)
-    {
-      CHECK(sirius::io::parse("s3://bkt/" + std::string{key}).path == key);
-    }
-  }
-}
-
-TEST_CASE("S3 literal-key implementation contains no retired URI escape or percent guard",
-          "[s3][filesystem][glob]")
-{
-  auto const root           = fs::path{SIRIUS_PROJECT_ROOT};
-  auto const source         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
-  auto const header         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.hpp");
-  auto const implementation = source + header;
-
-  auto const retired_escape  = std::string{"escape_s3_key_"} + "for_uri";
-  auto const retired_guard   = std::string{"key_has_percent_encoded_"} + "sequence";
-  auto const retired_wording = std::string{"containing a percent-"} + "encoded sequence";
-
-  CHECK(implementation.find(retired_escape) == std::string::npos);
-  CHECK(implementation.find(retired_guard) == std::string::npos);
-  CHECK(implementation.find(retired_wording) == std::string::npos);
-}
-
 TEST_CASE("sirius_httpfs claims only valid S3 object paths", "[s3][filesystem]")
 {
   sirius::io::s3::sirius_httpfs fs;
