@@ -11,6 +11,7 @@
     },
     "cccl",
     "cuco",
+    "curand",
     "cusolver",
     "fmt",
     "nvtx3",

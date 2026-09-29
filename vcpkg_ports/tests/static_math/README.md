@@ -1,9 +1,8 @@
 # Static CUDA math link probe
 
-The cuBLAS, cuSOLVER, cuSPARSE, and culibos overlay ports install NVIDIA static
+The cuBLAS, cuSOLVER, cuSPARSE, cuRAND, and culibos overlay ports install NVIDIA static
 archives and expose explicit CMake targets. RAFT and cuVS patches select these
-targets, with `CUDA_STATIC_MATH_LIBRARIES=ON` also selecting static cuRAND from
-the CUDA toolkit. A matching CUDA toolkit is still required to compile Sirius.
+targets. A matching CUDA toolkit is still required to compile Sirius.
 
 `VCPKG_CUDA_VERSION=12` selects the CUDA 12.9.1 redistributables; `13` selects
 CUDA 13.3.0. Each port's `redistrib.json` pins component versions and archive
@@ -26,7 +25,7 @@ cmake --build build/static-math-probe
 ctest --test-dir build/static-math-probe --output-on-failure
 ```
 
-This links real cuBLAS, cuSOLVER, cuSPARSE, and nvJitLink entry points into a
+This links real cuBLAS, cuSOLVER, cuSPARSE, cuRAND, and nvJitLink entry points into a
 shared library with unresolved symbols forbidden, then checks its ELF dynamic
 dependencies. It does not execute GPU calls and needs no GPU or driver.
 Run it against both CUDA 12 and CUDA 13 prefixes. Full Sirius loading and GPU

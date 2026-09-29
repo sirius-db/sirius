@@ -77,7 +77,7 @@ vcpkg_cmake_config_fixup(PACKAGE_NAME raft CONFIG_PATH lib/cmake/raft)
 file(READ "${CURRENT_PACKAGES_DIR}/share/raft/raft-config.cmake" RAFT_CONFIG)
 file(
   WRITE "${CURRENT_PACKAGES_DIR}/share/raft/raft-config.cmake"
-  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\n${RAFT_CONFIG}"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\nfind_dependency(curand CONFIG)\n${RAFT_CONFIG}"
 )
 
 # rmm is the port that owns rapids_logger in this vcpkg layout. raft's build

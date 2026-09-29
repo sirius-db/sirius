@@ -132,7 +132,7 @@ vcpkg_replace_string(
 file(READ "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake" CUVS_CONFIG)
 file(
   WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake"
-  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\nfind_dependency(nvjitlink CONFIG)\nfind_dependency(nvrtc CONFIG)\n${CUVS_CONFIG}"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\nfind_dependency(curand CONFIG)\nfind_dependency(nvjitlink CONFIG)\nfind_dependency(nvrtc CONFIG)\n${CUVS_CONFIG}"
 )
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")

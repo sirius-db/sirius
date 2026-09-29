@@ -2,10 +2,12 @@ cmake_minimum_required(VERSION 3.30)
 project(static_cuda_math_probe LANGUAGES CXX)
 
 find_package(cusolver CONFIG REQUIRED)
+find_package(curand CONFIG REQUIRED)
 
 add_library(static_cuda_math_probe SHARED link_probe.cpp)
 target_compile_features(static_cuda_math_probe PRIVATE cxx_std_17)
-target_link_libraries(static_cuda_math_probe PRIVATE cusolver::cusolver_static)
+target_link_libraries(static_cuda_math_probe PRIVATE cusolver::cusolver_static
+                                                     curand::curand_static)
 target_link_options(static_cuda_math_probe PRIVATE "LINKER:--no-undefined")
 
 enable_testing()
