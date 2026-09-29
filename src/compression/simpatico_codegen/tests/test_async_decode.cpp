@@ -132,23 +132,6 @@ struct stream_observation_scope {
   }
 };
 
-void cuda_check(cudaError_t status)
-{
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-
-template <typename F>
-void expect_failure(F&& action, char const* message)
-{
-  bool failed = false;
-  try {
-    action();
-  } catch (std::exception const&) {
-    failed = true;
-  }
-  expect(failed, message);
-}
-
 class event_markers {
  public:
   explicit event_markers(simpatico::stream_pool const& pool) : event_markers(pool.streams) {}
@@ -208,10 +191,8 @@ class checked_resource {
     std::size_t bytes;
     cudaStream_t stream;
   };
-  struct state {
-    std::mutex mutex;
-    std::thread::id owner = std::this_thread::get_id();
-    std::map<void*, allocation> live;
+  // Everything reset() clears between cases.
+  struct counters {
     std::vector<cudaStream_t> attempts;
     std::optional<std::size_t> fail_at;
     std::size_t failed_request_bytes                 = 0;
@@ -226,6 +207,11 @@ class checked_resource {
     bool wrong_stream                       = false;
     bool early_release                      = false;
     bool synchronous_access                 = false;
+  };
+  struct state : counters {
+    std::mutex mutex;
+    std::thread::id owner = std::this_thread::get_id();
+    std::map<void*, allocation> live;
   };
 
   explicit checked_resource(rmm::device_async_resource_ref upstream)
@@ -308,19 +294,7 @@ class checked_resource {
   void reset()
   {
     expect(observations->live.empty(), "resource reset with live allocations");
-    observations->attempts.clear();
-    observations->fail_at.reset();
-    observations->failed_request_bytes    = 0;
-    observations->failure_markers         = nullptr;
-    observations->release_required        = nullptr;
-    observations->second_release_required = nullptr;
-    observations->signal_on_deallocate    = nullptr;
-    observations->live_bytes              = 0;
-    observations->peak_live_bytes         = 0;
-    observations->wrong_thread            = false;
-    observations->wrong_stream            = false;
-    observations->early_release           = false;
-    observations->synchronous_access      = false;
+    static_cast<counters&>(*observations) = counters{};
   }
   void check() const
   {
@@ -340,21 +314,6 @@ class checked_resource {
 };
 
 static_assert(cuda::mr::resource_with<checked_resource, cuda::mr::device_accessible>);
-
-class current_resource_guard {
- public:
-  explicit current_resource_guard(rmm::device_async_resource_ref resource)
-    : previous_(rmm::mr::set_current_device_resource(
-        cuda::mr::any_resource<cuda::mr::device_accessible>{resource}))
-  {
-  }
-  ~current_resource_guard() { rmm::mr::set_current_device_resource(std::move(previous_)); }
-  current_resource_guard(current_resource_guard const&)            = delete;
-  current_resource_guard& operator=(current_resource_guard const&) = delete;
-
- private:
-  cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
-};
 
 // The deadlock watchdog's budget. SIMPATICO_TEST_GATE_TIMEOUT_MS overrides the default for slow
 // machines; the variable is read once.
@@ -582,6 +541,39 @@ std::unique_ptr<cudf::column> decode_completed(simpatico::compressed_representat
   return simpatico::decompress_standalone_representation(&rep, stream, mr, nullptr);
 }
 
+// An int32 table of `columns` columns compressed with `plan` each, with `lanes` streams and a
+// checked resource to decode it.
+struct decode_fixture {
+  decode_fixture(rmm::device_async_resource_ref upstream,
+                 std::string const& plan,
+                 int columns,
+                 int rows,
+                 int seed,
+                 int lanes)
+    : input(make_int32_table(columns, rows, seed)),
+      compressed(simpatico::compress_with_plan(
+        input->view(), repeated_plan(plan, columns), cudf::get_default_stream(), upstream)),
+      resource(upstream)
+  {
+    expect(pool.init(lanes), "decode fixture lanes");
+  }
+
+  // Decode once, so kernels are compiled before a test observes waits, and check the resource.
+  void warm()
+  {
+    {
+      auto warm = simpatico::decompress(compressed, pool, resource);
+    }
+    cuda_check(pool.sync_all());
+    resource.check();
+  }
+
+  std::unique_ptr<cudf::table> input;
+  simpatico::compressed_table compressed;
+  simpatico::stream_pool pool;
+  checked_resource resource;
+};
+
 simpatico::column_decode_request value_request(simpatico::compressed_column const& column)
 {
   return {.source = std::cref(*column.plan_tree), .result = simpatico::value_result{column.dtype}};
@@ -701,18 +693,18 @@ void test_table_contracts(rmm::device_async_resource_ref mr)
       auto empty = simpatico::decompress(compressed, std::span<std::size_t const>{}, pool, mr);
       expect(empty->num_columns() == 0, "empty projection not empty");
       std::array<std::size_t, 2> const invalid{0, 8};
-      expect_failure([&] { simpatico::decompress(compressed, invalid, pool, mr); },
-                     "invalid projection accepted");
+      expect(throws([&] { simpatico::decompress(compressed, invalid, pool, mr); }),
+             "invalid projection accepted");
       simpatico::stream_pool empty_pool;
-      expect_failure([&] { simpatico::decompress(compressed, empty_pool, mr); },
-                     "empty pool accepted");
+      expect(throws([&] { simpatico::decompress(compressed, empty_pool, mr); }),
+             "empty pool accepted");
       auto saved = std::move(compressed.columns[7].plan_tree);
-      expect_failure([&] { simpatico::decompress(compressed, pool, mr); }, "null plan accepted");
+      expect(throws([&] { simpatico::decompress(compressed, pool, mr); }), "null plan accepted");
       compressed.columns[7].plan_tree = std::move(saved);
       auto edge = compressed.columns[7].plan_tree->nodes.front().children.front();
       compressed.columns[7].plan_tree->nodes.front().children.front().child = 99999;
-      expect_failure([&] { simpatico::decompress(compressed, pool, mr); },
-                     "malformed later plan accepted");
+      expect(throws([&] { simpatico::decompress(compressed, pool, mr); }),
+             "malformed later plan accepted");
       compressed.columns[7].plan_tree->nodes.front().children.front() = edge;
       auto recovered = simpatico::decompress(compressed, pool, mr);
       compressed.columns.clear();
@@ -1003,15 +995,14 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
       auto const node    = dictionary_plan_node();
       auto const rebuilt = simpatico::reconstruct_decode_representation(
         node, channel_names, std::move(decoded), frame);
-      expect_failure(
-        [&] {
-          (void)simpatico::reconstruct_decode_representation(
-            node,
-            channel_names,
-            std::vector<std::unique_ptr<cudf::column>>(channel_names.size()),
-            frame);
-        },
-        "dictionary reconstruction accepted missing channels");
+      expect(throws([&] {
+               (void)simpatico::reconstruct_decode_representation(
+                 node,
+                 channel_names,
+                 std::vector<std::unique_ptr<cudf::column>>(channel_names.size()),
+                 frame);
+             }),
+             "dictionary reconstruction accepted missing channels");
       auto const output = simpatico::decode_standalone(*rebuilt, frame);
       stream.synchronize();
       expect(strings_equal_completed(input->view(), output->view(), stream.view()),
@@ -1067,71 +1058,19 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
   }
 }
 
-constexpr std::string_view kDictionaryIdentityOffsetsPlan =
-  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
-  "dictionary.indices -> bitpack\n";
-constexpr std::string_view kDictionaryBitpackedOffsetsPlan =
-  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
-  "dictionary.keys_offsets -> bitpack\n"
-  "dictionary.indices -> bitpack\n";
-constexpr std::string_view kDictionarySelfPlan = "input -> dictionary\n";
-
-simpatico::PlanNode const& dictionary_node(simpatico::compressed_table const& table)
-{
-  auto const& nodes = table.columns.front().plan_tree->nodes;
-  auto const node   = std::find_if(
-    nodes.begin(), nodes.end(), [](simpatico::PlanNode const& n) { return n.op == "dictionary"; });
-  expect(node != nodes.end(), "dictionary plan has no dictionary node");
-  return *node;
-}
-
-// The compress walk publishes the key width on the plan node wherever the stored tree fixes it. The
-// hint reaches the frame-local representation at construction, so a hinted decode observes nothing
-// on the host, while a reconstruction without a hint still measures through the frame; a hint that
-// contradicts the key channels is rejected as corrupt metadata.
+// The hint reaches the frame-local representation at construction, so a hinted decode observes
+// nothing on the host, while a reconstruction without a hint still measures through the frame; a
+// hint that contradicts the key channels is rejected as corrupt metadata. What the compress walk
+// and the readers publish is covered by test_compressed_table_io.
 void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
 {
-  struct fixture {
-    std::vector<std::string> keys;
-    std::int64_t width;
-  };
-  std::array<fixture, 3> const fixtures{{
-    {{"A", "N", "R"}, 1},
-    {{"aaaa", "bbbb"}, 4},
-    {{"a", "bbb", "cc"}, 0},
-  }};
-  struct shape {
-    std::string_view plan;
-    bool published;  ///< The stored tree fixes the width: self rep or identity keys_offsets.
-  };
-  std::array<shape, 3> const shapes{{
-    {kDictionaryIdentityOffsetsPlan, true},
-    {kDictionarySelfPlan, true},
-    {kDictionaryBitpackedOffsetsPlan, false},
-  }};
   rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
   constexpr cudf::size_type rows = 1037;
-  auto const make_input          = [&](std::vector<std::string> const& keys) {
-    std::vector<std::string> values(rows);
-    for (std::size_t i = 0; i < values.size(); ++i)
-      values[i] = keys[(i * 7 + i / 3) % keys.size()];
-    return make_strings_column(values, {}, stream.view());
-  };
-  for (auto const& fixture : fixtures) {
-    auto input = make_input(fixture.keys);
-    for (auto const& shape : shapes) {
-      auto const expected = shape.published ? fixture.width : -1;
-      auto compressed     = simpatico::compress_with_plan(
-        cudf::table_view{{input->view()}}, shape.plan, stream.view(), mr);
-      expect(dictionary_node(compressed).dictionary_key_width_hint == expected,
-             "encode published an unexpected dictionary key width hint");
-      auto output = simpatico::decompress(compressed, stream.view(), mr);
-      expect(strings_equal_completed(input->view(), output->view().column(0), stream.view()),
-             "hinted dictionary roundtrip mismatch");
-    }
-  }
-
-  auto input   = make_input(fixtures.front().keys);
+  std::vector<std::string> const keys{"A", "N", "R"};
+  std::vector<std::string> values(rows);
+  for (std::size_t i = 0; i < values.size(); ++i)
+    values[i] = keys[(i * 7 + i / 3) % keys.size()];
+  auto input   = make_strings_column(values, {}, stream.view());
   auto encoded = simpatico::dictionary_compressor{}.compress(input->view(), stream.view(), mr);
   auto const& original =
     dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded);
@@ -1184,11 +1123,11 @@ void test_dictionary_key_width_hint(rmm::device_async_resource_ref mr)
     auto const node = dictionary_plan_node(hint);
     simpatico::decode_session session(streams, mr);
     auto& frame = simpatico::decode_session_test_access::frame(session);
-    expect_failure(
-      [&] {
-        (void)simpatico::reconstruct_decode_representation(node, names, copy_channels(), frame);
-      },
-      "inconsistent dictionary key width hint was accepted");
+    expect(throws([&] {
+             (void)simpatico::reconstruct_decode_representation(
+               node, names, copy_channels(), frame);
+           }),
+           "inconsistent dictionary key width hint was accepted");
     expect(session.finish().empty(), "rejected hint fixture published a session result");
   }
 }
@@ -1695,19 +1634,11 @@ void test_dictionary_width_across_streams(rmm::device_async_resource_ref upstrea
 
 void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(2, 65549, 59);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), repeated_plan("input -> bitpack\n", 2), cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(2), "gate pool init");
-  checked_resource resource(upstream);
-  auto& cache = codegen::jit::KernelCache::instance();
+  decode_fixture fixture(upstream, "input -> bitpack\n", 2, 65549, 59, 2);
+  auto& [input, compressed, pool, resource] = fixture;
+  auto& cache                               = codegen::jit::KernelCache::instance();
   cache.clear();
-  {
-    auto warm = simpatico::decompress(compressed, pool, resource);
-  }
-  cuda_check(pool.sync_all());
-  resource.check();
+  fixture.warm();
 
   auto shape = codegen::jit::FusedTree::make(codegen::OpKind::Bitpack);
   auto spec =
@@ -1752,17 +1683,9 @@ void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream
 
 void test_abandoned_session(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 65549, 67);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> bitpack\n", cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(1), "abandon pool init");
-  checked_resource resource(upstream);
-  {
-    auto warm = simpatico::decompress(compressed, pool, resource);
-  }
-  cuda_check(pool.sync_all());
-  resource.check();
+  decode_fixture fixture(upstream, "input -> bitpack\n", 1, 65549, 67, 1);
+  auto& [input, compressed, pool, resource] = fixture;
+  fixture.warm();
   auto streams = pool.refs();
   std::optional<simpatico::decode_session> session(std::in_place, streams, resource);
   event_markers markers(pool);
@@ -1787,31 +1710,28 @@ void test_session_state_contracts(rmm::device_async_resource_ref upstream)
   std::array const streams{::cuda::stream_ref{stream}};
   simpatico::decode_session empty(streams, upstream);
   expect(empty.finish().empty(), "empty session produced output");
-  expect_failure([&] { empty.finish(); }, "second session finish accepted");
-  expect_failure([&] { empty.append(value_request(compressed.columns[0])); },
-                 "append after finish accepted");
+  expect(throws([&] { empty.finish(); }), "second session finish accepted");
+  expect(throws([&] { empty.append(value_request(compressed.columns[0])); }),
+         "append after finish accepted");
 
   simpatico::PlanTree malformed;
   simpatico::decode_session failed(streams, upstream);
   failed.append(value_request(compressed.columns[0]));
-  expect_failure(
-    [&] { failed.append(simpatico::column_decode_request{.source = std::cref(malformed)}); },
-    "malformed request accepted");
+  expect(throws([&] {
+           failed.append(simpatico::column_decode_request{.source = std::cref(malformed)});
+         }),
+         "malformed request accepted");
   expect(cudaStreamQuery(stream.value()) == cudaSuccess,
          "failed append returned before prior work completed");
-  expect_failure([&] { failed.finish(); }, "failed session published partial outputs");
-  expect_failure([&] { failed.append(value_request(compressed.columns[0])); },
-                 "failed session accepted another request");
+  expect(throws([&] { failed.finish(); }), "failed session published partial outputs");
+  expect(throws([&] { failed.append(value_request(compressed.columns[0])); }),
+         "failed session accepted another request");
 }
 
 void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 1037, 83);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(3), "stream failure pool init");
-  checked_resource resource(upstream);
+  decode_fixture fixture(upstream, "input -> identity\n", 1, 1037, 83, 3);
+  auto& [input, compressed, pool, resource] = fixture;
   // The third supplied handle receives no request, so completion leaves its work alone.
   std::array const streams{::cuda::stream_ref{pool.streams[0]},
                            ::cuda::stream_ref{pool.streams[1]},
@@ -1856,9 +1776,9 @@ void test_stream_completion_failures(rmm::device_async_resource_ref upstream)
     expect(markers.complete(), "stream failure escaped before its request lanes completed");
     first_gate.expect_if_armed(!resource.observations->early_release,
                                "stream failure released an output before all lanes completed");
-    expect_failure([&] { session->finish(); }, "failed session published partial output");
-    expect_failure([&] { session->append(value_request(compressed.columns[0])); },
-                   "stream failure left a reusable session");
+    expect(throws([&] { session->finish(); }), "failed session published partial output");
+    expect(throws([&] { session->append(value_request(compressed.columns[0])); }),
+           "stream failure left a reusable session");
     session.reset();
     resource.check();
     first_gate.expect_not_timed_out("stream failure watchdog expired");
@@ -1996,13 +1916,9 @@ void test_duplicate_stream_handles(rmm::device_async_resource_ref upstream)
 
 void test_external_phase_tail(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 1037, 89);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(1), "phase-tail pool init");
-  checked_resource resource(upstream);
-  auto streams = pool.refs();
+  decode_fixture fixture(upstream, "input -> identity\n", 1, 1037, 89, 1);
+  auto& [input, compressed, pool, resource] = fixture;
+  auto streams                              = pool.refs();
   simpatico::decode_session session(streams, resource);
   session.append(value_request(compressed.columns[0]));
   // The request's own work is complete before this external tail starts. Final completion must
@@ -2045,14 +1961,10 @@ struct throwing_probe_copy {
 
 void test_request_copy_failure(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(1, 1037, 97);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(1), "request-copy pool init");
-  checked_resource resource(upstream);
-  auto streams = pool.refs();
-  auto fail    = std::make_shared<bool>(false);
+  decode_fixture fixture(upstream, "input -> identity\n", 1, 1037, 97, 1);
+  auto& [input, compressed, pool, resource] = fixture;
+  auto streams                              = pool.refs();
+  auto fail                                 = std::make_shared<bool>(false);
   auto const mask_bytes =
     sirius::codegen::selection_mask::AllocWordsFor(input->num_rows()) * sizeof(std::uint32_t);
   rmm::device_buffer mask(mask_bytes, streams.front(), upstream);
@@ -2079,7 +1991,7 @@ void test_request_copy_failure(rmm::device_async_resource_ref upstream)
   expect(propagated, "request copy failure subtype was lost");
   gate.expect_completed("host bookkeeping failure escaped before prior work completed");
   expect(markers.complete(), "host bookkeeping failure escaped before prior work completed");
-  expect_failure([&] { session->finish(); }, "request copy failure published partial results");
+  expect(throws([&] { session->finish(); }), "request copy failure published partial results");
   session.reset();
   resource.check();
   gate.expect_not_timed_out("request copy failure watchdog expired");
@@ -2469,9 +2381,9 @@ void test_failure_after_enqueue_unwinds_stream_ordered(rmm::device_async_resourc
          "failure after enqueue kept device storage past the throwing append");
   expect(!resource.observations->wrong_stream && !resource.observations->wrong_thread,
          "failure after enqueue released a temporary on another stream or thread");
-  expect_failure([&] { session->finish(); }, "failed session published a result");
-  expect_failure([&] { session->append(probe_request(representation)); },
-                 "failed session accepted another request");
+  expect(throws([&] { session->finish(); }), "failed session published a result");
+  expect(throws([&] { session->append(probe_request(representation)); }),
+         "failed session accepted another request");
   session.reset();
   expect(resource.observations->live.empty(), "failed session leaked device storage");
   gate.expect_not_timed_out("failure-unwind watchdog expired");
@@ -2532,26 +2444,29 @@ class host_selection {
   sirius::codegen::selection_mask mask_;
 };
 
-template <typename Error>
-bool offsets_rejected(cudf::size_type rows, std::int32_t width, rmm::device_async_resource_ref mr)
-{
-  try {
-    (void)simpatico::make_constant_width_offsets(rows, width, cudf::get_default_stream(), mr);
-  } catch (Error const&) {
-    return true;
-  }
-  return false;
-}
-
 // Out-of-range arguments are rejected on the host, before any allocation or device work.
 void test_constant_width_offsets_bounds(rmm::device_async_resource_ref upstream)
 {
   constexpr auto max_rows = std::numeric_limits<cudf::size_type>::max();
-  expect(offsets_rejected<std::invalid_argument>(-1, 4, upstream), "negative row count accepted");
-  expect(offsets_rejected<std::invalid_argument>(4, -1, upstream), "negative width accepted");
-  expect(offsets_rejected<std::overflow_error>(max_rows / 2 + 1, 2, upstream),
+  expect(throws<std::invalid_argument>([&] {
+           (void)simpatico::make_constant_width_offsets(
+             -1, 4, cudf::get_default_stream(), upstream);
+         }),
+         "negative row count accepted");
+  expect(throws<std::invalid_argument>([&] {
+           (void)simpatico::make_constant_width_offsets(
+             4, -1, cudf::get_default_stream(), upstream);
+         }),
+         "negative width accepted");
+  expect(throws<std::overflow_error>([&] {
+           (void)simpatico::make_constant_width_offsets(
+             max_rows / 2 + 1, 2, cudf::get_default_stream(), upstream);
+         }),
          "total bytes beyond INT32 accepted");
-  expect(offsets_rejected<std::overflow_error>(max_rows, 0, upstream),
+  expect(throws<std::overflow_error>([&] {
+           (void)simpatico::make_constant_width_offsets(
+             max_rows, 0, cudf::get_default_stream(), upstream);
+         }),
          "offset count beyond INT32 accepted");
 }
 
@@ -2781,12 +2696,8 @@ void test_selection_and_predicate_routes(rmm::device_async_resource_ref upstream
 
 void test_resources_and_failures(rmm::device_async_resource_ref upstream)
 {
-  auto input      = make_int32_table(8, 65549, 71);
-  auto compressed = simpatico::compress_with_plan(
-    input->view(), repeated_plan("input -> bitpack\n", 8), cudf::get_default_stream(), upstream);
-  simpatico::stream_pool pool;
-  expect(pool.init(4), "failure pool init");
-  checked_resource explicit_resource(upstream);
+  decode_fixture fixture(upstream, "input -> bitpack\n", 8, 65549, 71, 4);
+  auto& [input, compressed, pool, explicit_resource] = fixture;
   checked_resource default_resource(upstream);
   current_resource_guard current(default_resource);
   std::array<std::size_t, 8> const all{0, 1, 2, 3, 4, 5, 6, 7};

@@ -359,6 +359,8 @@ void test_dictionary_key_width_hint()
   std::vector<std::string> const variable{"A", "BB", "CCC"};
   shape const shapes[] = {
     {"self", make_input(uniform), "input -> dictionary\n", 2, 2},
+    {"one-byte keys", make_input({"A", "N", "R"}), identity_offsets_plan, 1, 1},
+    {"variable width self", make_input(variable), "input -> dictionary\n", 0, 0},
     {"identity offsets", make_input(uniform), identity_offsets_plan, 2, 2},
     {"bitpacked offsets",
      make_input(uniform),

@@ -24,28 +24,6 @@ namespace {
 namespace sc                        = sirius::codegen;
 constexpr cudf::size_type row_count = 1037;  // partial mask word and partial chunk
 
-void check(cudaError_t status)
-{
-  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-}
-
-class resource_guard {
- public:
-  explicit resource_guard(rmm::mr::cuda_async_memory_resource const& resource)
-    : previous_(rmm::mr::set_current_device_resource(
-        cuda::mr::any_resource<cuda::mr::device_accessible>{resource}))
-  {
-  }
-  ~resource_guard()
-  {
-    cudaDeviceSynchronize();
-    rmm::mr::set_current_device_resource(std::move(previous_));
-  }
-
- private:
-  cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
-};
-
 std::unique_ptr<cudf::column> sequence(int base,
                                        ::cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
@@ -54,11 +32,11 @@ std::unique_ptr<cudf::column> sequence(int base,
   std::iota(values.begin(), values.end(), base);
   auto column = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, row_count, cudf::mask_state::UNALLOCATED, stream, mr);
-  check(cudaMemcpyAsync(column->mutable_view().head<std::int32_t>(),
-                        values.data(),
-                        values.size() * sizeof(values[0]),
-                        cudaMemcpyHostToDevice,
-                        stream.get()));
+  cuda_check(cudaMemcpyAsync(column->mutable_view().head<std::int32_t>(),
+                             values.data(),
+                             values.size() * sizeof(values[0]),
+                             cudaMemcpyHostToDevice,
+                             stream.get()));
   stream.sync();
   return column;
 }
@@ -69,11 +47,11 @@ std::vector<T> read(cudf::column_view column, ::cuda::stream_ref stream)
   std::vector<T> values(column.size());
   // No producer wait/event here: completed public results must be readable on
   // this unrelated stream. Finish the verification copy before output teardown.
-  check(cudaMemcpyAsync(values.data(),
-                        column.head<T>(),
-                        values.size() * sizeof(T),
-                        cudaMemcpyDeviceToHost,
-                        stream.get()));
+  cuda_check(cudaMemcpyAsync(values.data(),
+                             column.head<T>(),
+                             values.size() * sizeof(T),
+                             cudaMemcpyDeviceToHost,
+                             stream.get()));
   stream.sync();
   return values;
 }
@@ -202,13 +180,10 @@ void numeric_sources(simpatico::stream_pool& pool,
     [](cudf::column_view,
        ::cuda::stream_ref,
        rmm::device_async_resource_ref) -> std::unique_ptr<cudf::column> { throw probe_failure{}; };
-  bool propagated = false;
-  try {
+  bool const propagated = throws<probe_failure>([&] {
     (void)simpatico::decompress_scan_filter(
       compressed, selected, request, result, pool, stream, mr);
-  } catch (probe_failure const&) {
-    propagated = true;
-  }
+  });
   expect(propagated && result.status == sc::scan_filter_status::failed,
          "probe execution failure is not converted to plain decode");
 
@@ -220,14 +195,11 @@ void numeric_sources(simpatico::stream_pool& pool,
                                        lane,
                                        resource);
     };
-  bool malformed = false;
-  try {
-    (void)simpatico::decompress_scan_filter(
-      compressed, selected, request, result, pool, stream, mr);
-  } catch (std::invalid_argument const&) {
-    malformed = true;
-  }
-  expect(malformed, "non-BOOL8 membership result is an error, not semantic decline");
+  expect(throws<std::invalid_argument>([&] {
+           (void)simpatico::decompress_scan_filter(
+             compressed, selected, request, result, pool, stream, mr);
+         }),
+         "non-BOOL8 membership result is an error, not semantic decline");
   output = simpatico::decompress(compressed, selected, pool, mr);
   verify_values(output->view(), all, stream);
 }
@@ -460,8 +432,8 @@ void aliased_borrowed_lanes(simpatico::stream_pool& pool,
   rmm::device_buffer probe(sizeof(std::uint32_t), stream, mr);
   stream.sync();
   for (auto const borrowed : lanes) {
-    check(cudaMemsetAsync(probe.data(), 0, probe.size(), borrowed.get()));
-    check(cudaStreamSynchronize(borrowed.get()));
+    cuda_check(cudaMemsetAsync(probe.data(), 0, probe.size(), borrowed.get()));
+    cuda_check(cudaStreamSynchronize(borrowed.get()));
   }
 }
 
@@ -555,7 +527,7 @@ int main()
     expect(cudf::config_default_pinned_memory_resource({.pool_size = 0}),
            "pinned resource was initialized before test configuration");
     rmm::mr::cuda_async_memory_resource resource{64U << 20};
-    resource_guard current{resource};
+    current_resource_guard current{resource};
     rmm::cuda_stream stream;
     simpatico::stream_pool pool;
     expect(pool.init(4), "stream pool initialization");
@@ -564,8 +536,9 @@ int main()
     dict_codes_gather(pool, stream.view(), resource);
     nullable_full_route_declines(pool, stream.view(), resource);
     aliased_borrowed_lanes(pool, stream.view(), resource);
-    check(pool.sync_all());
+    cuda_check(pool.sync_all());
     stream.synchronize();
+    cuda_check(cudaDeviceSynchronize());
     std::puts("test_scan_filter_session: OK");
     return 0;
   } catch (std::exception const& error) {

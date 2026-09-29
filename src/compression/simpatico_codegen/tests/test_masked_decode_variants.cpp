@@ -79,17 +79,6 @@ bool completed_decode(::cuda::stream_ref stream, Args&&... args)
   return true;
 }
 
-template <auto Launch, typename... Args>
-bool rejects_decode_input(::cuda::stream_ref stream, Args&&... args)
-{
-  try {
-    completed_decode<Launch>(stream, std::forward<Args>(args)...);
-  } catch (std::invalid_argument const&) {
-    return true;
-  }
-  return false;
-}
-
 #define REQUIRE_MSG(cond, ...)                    \
   do {                                            \
     if (!(cond)) {                                \
@@ -276,15 +265,17 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 
     // mask_consume before CNT ran (no chunk_offsets) must fail cleanly.
     if (p == 0) {
-      REQUIRE_MSG(rejects_decode_input<simpatico::launch_decode_fused_tree_compacted>(
-                    stream,
-                    *tree,
-                    enc.buffers,
-                    dtype.c_str(),
-                    n,
-                    sm,
-                    simpatico::row_enumeration{},
-                    reinterpret_cast<void*>(d_plain)),
+      REQUIRE_MSG(throws<std::invalid_argument>([&] {
+                    completed_decode<simpatico::launch_decode_fused_tree_compacted>(
+                      stream,
+                      *tree,
+                      enc.buffers,
+                      dtype.c_str(),
+                      n,
+                      sm,
+                      simpatico::row_enumeration{},
+                      reinterpret_cast<void*>(d_plain));
+                  }),
                   "[%s] mask_consume without chunk_offsets should fail",
                   dtype.c_str());
     }
@@ -1056,12 +1047,8 @@ bool selection_validation_checks()
   selection.survivor_indices =
     cudf::column_view{cudf::data_type{cudf::type_id::INT32}, 2, device_indices.data(), nullptr, 0};
   auto rejects = [&](simpatico::decode_selection const& candidate) {
-    try {
-      (void)simpatico::validated_selection(tree, candidate);
-    } catch (std::invalid_argument const&) {
-      return true;
-    }
-    return false;
+    return throws<std::invalid_argument>(
+      [&] { (void)simpatico::validated_selection(tree, candidate); });
   };
   REQUIRE_MSG(!rejects(selection), "valid compacted INT32 index map rejected");
   auto malformed = selection;
@@ -1103,16 +1090,13 @@ bool selection_validation_checks()
 
   auto rejects_decode = [&](simpatico::PlanTree const& plan,
                             simpatico::decode_selection const& candidate) {
-    std::array const streams{stream};
-    simpatico::decode_session session(streams, mr);
-    try {
-      session.append(simpatico::column_decode_request{
-        .source = std::cref(plan), .selection = simpatico::validated_selection(plan, candidate)});
-      session.finish();
-    } catch (std::invalid_argument const&) {
-      return true;
-    }
-    return false;
+    return throws<std::invalid_argument>([&] {
+      (void)simpatico::decode_one(
+        simpatico::column_decode_request{
+          .source = std::cref(plan), .selection = simpatico::validated_selection(plan, candidate)},
+        stream,
+        mr);
+    });
   };
   malformed       = selection;
   malformed.route = sirius::codegen::decode_route::full;
