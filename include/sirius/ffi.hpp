@@ -90,9 +90,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// drain via relay_from or result_to_arrow.
 ///
 /// Any number of fragments may be built before any runs, and run in any order that respects
-/// relay_from (a source runs before its receiver's relay). run() executes one query at a time
-/// per Context: a second run() waits for the first. run() and destruction may happen on a
-/// thread other than the one that called build().
+/// relay_from (a source runs before its receiver's relay). build(), run() and
+/// Context::execute_substrait execute one at a time per Context: a concurrent call waits for
+/// the one in progress. run() and destruction may happen on a thread other than the one that
+/// called build().
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();

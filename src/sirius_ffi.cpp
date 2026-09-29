@@ -49,6 +49,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 
 namespace sirius::ffi {
@@ -129,10 +130,13 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
 }
 
 // Run `body` in a DuckDB transaction: commit on success, roll back and rethrow on failure. A
-// failed rollback does not replace the original error.
+// failed rollback does not replace the original error. `serial` is held for the whole
+// transaction: every Fragment of a Context shares its one connection, and a second BEGIN on
+// it would fail (and invalidate the open transaction) instead of waiting.
 template <typename Body>
-void in_transaction(duckdb::Connection& conn, Body&& body)
+void in_transaction(std::mutex& serial, duckdb::Connection& conn, Body&& body)
 {
+  std::lock_guard<std::mutex> lock(serial);
   conn.BeginTransaction();
   try {
     body();
@@ -154,6 +158,8 @@ struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
+  // Serializes transactions on `conn`; see in_transaction().
+  std::mutex conn_mutex;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -233,7 +239,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // Phase timings (lowering / physical planning / GPU execution), logged per query: the host
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
-  in_transaction(*impl_->conn, [&] {
+  in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
     // The same result path as a zero-output Fragment.
     sirius::exec::fragment_spec spec;
     spec.plan_source = [&](duckdb::ClientContext&) {
@@ -406,7 +412,7 @@ void Fragment::build(const std::string& substrait_plan)
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
   // Type-name parsing, CREATE VIEW, and Substrait lowering all need an active transaction. A
   // failure rolls back the views, so a half-declared fragment leaves nothing behind.
-  in_transaction(*impl_->ctx.conn, [&] {
+  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] {
     sirius::exec::fragment_spec spec;
     spec.inputs      = impl_->resolve_inputs();
     spec.outputs     = impl_->outputs;
@@ -458,7 +464,7 @@ void Fragment::run()
 {
   impl_->require_built("run()");
   // Scans read DuckDB MVCC state through the active transaction.
-  in_transaction(*impl_->ctx.conn, [&] { impl_->fragment->run(); });
+  in_transaction(impl_->ctx.conn_mutex, *impl_->ctx.conn, [&] { impl_->fragment->run(); });
 }
 
 void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)

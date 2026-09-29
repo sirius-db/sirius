@@ -329,3 +329,48 @@ TEST_CASE("FFI a hash key on a single output is rejected at build()",
   next->run();
   REQUIRE(result_i64s(*next) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
 }
+
+TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for each other",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_concurrent_calls");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const plan = local_files_plan(path);
+
+  // Every Fragment shares the Context's one DuckDB connection, so overlapping transactions
+  // would fail with "cannot start a transaction within a transaction" if not serialized.
+  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto first  = sirius::ffi::make_fragment(*ctx);
+  auto second = sirius::ffi::make_fragment(*ctx);
+  first->build(plan);
+  second->build(plan);
+
+  std::exception_ptr errors[3];
+  ArrowArrayStream direct{};
+  auto capture = [&](int slot, auto&& call) {
+    return std::thread([&errors, slot, call] {
+      try {
+        call();
+      } catch (...) {
+        errors[slot] = std::current_exception();
+      }
+    });
+  };
+  std::thread runs[] = {
+    capture(0, [&] { first->run(); }),
+    capture(1, [&] { second->run(); }),
+    capture(2, [&] { ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&direct)); }),
+  };
+  for (auto& run : runs) {
+    run.join();
+  }
+  for (auto const& error : errors) {
+    if (error) { std::rethrow_exception(error); }
+  }
+
+  auto const expected = std::vector<std::int64_t>{1, 2, 3, 4, 5};
+  REQUIRE(result_i64s(*first) == expected);
+  REQUIRE(result_i64s(*second) == expected);
+  REQUIRE(collect_i64_column(direct) == expected);
+}
