@@ -1,6 +1,6 @@
 name: Feature request
 description: Submit an idea for Sirius
-labels: ["enhancement"]
+labels: ["feat"]
 title: "feat: "
 body:
   - type: markdown
