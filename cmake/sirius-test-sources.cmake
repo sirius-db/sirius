@@ -70,6 +70,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
@@ -103,8 +104,7 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/cuda/test_device_copy_batch.cpp
     test/cpp/io/s3/test_sigv4.cpp
-    test/cpp/io/s3/test_s3_default_visibility_guard.cpp
-    test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
+    test/cpp/io/s3/test_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/cache/test_cache_read_arbitration.cpp
     test/cpp/io/cache/test_chunk_state.cpp
@@ -123,6 +123,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_pin_parquet.cpp
@@ -278,7 +279,6 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/utils/s3_container.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
-    test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)

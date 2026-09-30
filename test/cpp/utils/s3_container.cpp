@@ -214,8 +214,14 @@ fs::path generate_fixtures(fs::path const& out_dir)
     env_or("SIRIUS_TEST_S3_PARQUET_SOURCE",
            (root / "test" / "cpp" / "integration" / "data" / "parquet").string());
   fs::create_directories(out_dir);
-  int rc = run_process(
-    {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
+  int rc = run_process({"python3",
+                        script.string(),
+                        "--out",
+                        out_dir.string(),
+                        "--parquet-source",
+                        parquet_src,
+                        "--manifest",
+                        (out_dir.parent_path() / "MANIFEST.sha256").string()});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
 }
@@ -456,8 +462,8 @@ void maybe_upload_large_fixture(minio_instance const& http,
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
 
   // The SF10 generation costs minutes, so cache the parquet at a stable path and
-  // reuse it across the separate-process invocations the large gate runs (each
-  // prewarm/no-prewarm case needs its own process). Only the first generates.
+  // reuse it across the two processes that make s3-test-large runs. Only the
+  // first generates.
   fs::path parquet = work / "lineitem_sf10.parquet";
   std::error_code ec;
   if (!(fs::exists(parquet, ec) && fs::file_size(parquet, ec) > 0)) {

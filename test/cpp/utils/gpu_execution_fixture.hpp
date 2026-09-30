@@ -103,10 +103,7 @@ class GpuExecutionFixture {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      // integration.yaml lives in test/cpp/integration/; this header is in
-      // test/cpp/utils/, so step up to test/cpp and back down.
-      auto cfg_path =
-        fs::path(__FILE__).parent_path().parent_path() / "integration" / "integration.yaml";
+      auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
       db           = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB

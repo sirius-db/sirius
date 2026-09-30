@@ -324,8 +324,9 @@ TEST_CASE("gpu_decode_strings DICT_FSST rejects invalid host metadata before pre
   CHECK_THROWS_AS(sirius::cuda::scan::prepare_dict_fsst(run, stream, mr.resource),
                   std::runtime_error);
   if (malformed >= 14) {
-    CHECK_THROWS_WITH(sirius::cuda::scan::prepare_dict_fsst(run, stream, mr.resource),
-                      Catch::Contains("is shorter than the FSST symbol table header"));
+    CHECK_THROWS_WITH(
+      sirius::cuda::scan::prepare_dict_fsst(run, stream, mr.resource),
+      Catch::Matchers::ContainsSubstring("is shorter than the FSST symbol table header"));
   }
   CHECK(mr.allocations == 0);
 }
@@ -349,7 +350,7 @@ TEST_CASE("gpu_decode_strings FSST rejects a symbol table shorter than its fixed
                              0}}};
   CHECK_THROWS_AS(sirius::cuda::scan::prepare_fsst(run, stream), std::runtime_error);
   CHECK_THROWS_WITH(sirius::cuda::scan::prepare_fsst(run, stream),
-                    Catch::Contains("symbol table header"));
+                    Catch::Matchers::ContainsSubstring("symbol table header"));
 }
 
 TEST_CASE("gpu_decode_strings FSST admits exactly the fixed symbol table header",
@@ -623,7 +624,7 @@ TEST_CASE("gpu_decode_strings DICTIONARY rejects whole-word selection padding",
                              0,
                              8}}};
   REQUIRE_THROWS_WITH(sirius::cuda::scan::prepare_dict(run, stream),
-                      Catch::Contains("reaches into the index buffer"));
+                      Catch::Matchers::ContainsSubstring("reaches into the index buffer"));
 }
 
 TEST_CASE("gpu_decode_strings DICTIONARY - empty dict, all NULL",
@@ -723,7 +724,7 @@ TEST_CASE("gpu_decode_strings - unsupported codec throws", "[scan][decode][strin
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_CONSTANT, {seg}});
   REQUIRE_THROWS_WITH(gpu_decode_strings_column(col, stream, mr),
-                      Catch::Contains("viability invariant violated"));
+                      Catch::Matchers::ContainsSubstring("viability invariant violated"));
 }
 
 // --- FSST happy path (synthetic segments via libduckdb FSST encoder) ---
@@ -798,7 +799,7 @@ TEST_CASE("gpu_decode_strings FSST rejects whole-word length padding",
                              0,
                              512}}};
   REQUIRE_THROWS_WITH(sirius::cuda::scan::prepare_fsst(run, stream),
-                      Catch::Contains("reach into the symbol table"));
+                      Catch::Matchers::ContainsSubstring("reach into the symbol table"));
 }
 
 // --- DICT_FSST happy path: modes 0 (raw dict), 1 (FSST dict), 2 (no dict) ---

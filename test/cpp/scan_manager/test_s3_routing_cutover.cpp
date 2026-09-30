@@ -28,6 +28,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "utils/s3_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -76,6 +77,8 @@ using sirius::io::rest::rest_ioctx;
 using sirius::io::rest::rest_reactor;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
+using sirius::test::s3::require_rest_ioctx;
+using sirius::test::s3::single_gpu_index;
 
 std::filesystem::path make_regular_file()
 {
@@ -153,23 +156,6 @@ bool is_local_backend(std::optional<io_context_type> type)
   return type.has_value() && (*type == io_context_type::uring || *type == io_context_type::kvikio);
 }
 
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
-
 scan_manager_config make_s3_scan_config(std::string endpoint,
                                         sirius::scan_manager::io_backend backend)
 {
@@ -197,7 +183,8 @@ scan_manager_config make_s3_scan_config(std::string endpoint,
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology =
+    single_gpu_index(/*numa_node=*/0);
 };
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> make_nation_table_info(
@@ -257,10 +244,9 @@ sirius::io::ioctx_resolver make_datasource_resolver(sirius_scan_manager& manager
   };
 }
 
-sirius::planner::query make_empty_query()
+sirius::planner::query make_empty_query(sirius::query_id_t query_id = sirius::make_query_id(1))
 {
-  auto tctx           = sirius::test::make_test_telemetry_context();
-  const auto query_id = sirius::make_query_id(1);
+  auto tctx = sirius::test::make_test_telemetry_context();
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
   return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                                 tctx->context(),
@@ -456,15 +442,6 @@ class range_s3_server {
   std::thread _thread;
 };
 
-rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
-{
-  REQUIRE(ds != nullptr);
-  REQUIRE(ds->io_ctx() != nullptr);
-  auto* ctx = dynamic_cast<rest_ioctx*>(ds->io_ctx().get());
-  REQUIRE(ctx != nullptr);
-  return ctx;
-}
-
 void read_one_host_range(sirius::io::sirius_datasource& ds)
 {
   std::array<std::uint8_t, 128> dst{};
@@ -491,7 +468,7 @@ TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "
 }
 
 TEST_CASE(
-  "io_context_registry keeps local paths on kvikio when Sirius local datasource is disabled",
+  "io_context_registry routes local paths by backend and S3 reads to kvikio under backend=kvikio",
   "[s3][routing]")
 {
   scan_manager_fixture fixture;
@@ -513,25 +490,7 @@ TEST_CASE(
   CHECK(fallback_registry.lookup_path("s3://bucket/key.parquet") == io_context_type::kvikio);
 }
 
-TEST_CASE("scan_manager create_datasource resolves s3 paths to restful ioctx",
-          "[s3][routing][scan_manager]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
-  scan_manager_fixture fixture;
-  sirius_scan_manager manager{
-    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::sirius),
-    *fixture.memory,
-    fixture.topology};
-
-  auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
-
-  REQUIRE(datasource != nullptr);
-  REQUIRE(datasource->io_ctx() != nullptr);
-  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
-}
-
-TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
-          "[s3][routing][scan_manager]")
+TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -599,7 +558,7 @@ TEST_CASE("scan_manager concurrent first-touch reuses one routed S3 ioctx",
 }
 
 TEST_CASE("scan_manager create_datasource normalizes file URI paths before routing",
-          "[s3][routing][scan_manager]")
+          "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -616,8 +575,7 @@ TEST_CASE("scan_manager create_datasource normalizes file URI paths before routi
   CHECK(datasource->io_ctx()->type() == io_context_type::uring);
 }
 
-TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio",
-          "[s3][routing][scan_manager]")
+TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -637,8 +595,7 @@ TEST_CASE("scan_manager serves S3 reads from kvikio when backend=kvikio",
   CHECK(datasource->host_read(0, buffer.size(), buffer.data()) == buffer.size());
 }
 
-TEST_CASE("scan_manager re-primes routed S3 cache on every query",
-          "[s3][routing][scan_manager][cache]")
+TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -657,20 +614,23 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query",
   REQUIRE(default_cache != nullptr);
   REQUIRE(default_cache->query_epoch() == 0);
 
-  auto q = make_empty_query();
-  // The query intentionally has no scan operators: routed caches must still
+  // The queries intentionally have no scan operators: routed caches must still
   // advance once per query, matching the default ioctx's query-wide refresh.
-  manager.prepare_for_query(q, true, {});
+  // Distinct query ids because per-query state is keyed by id — the epoch bump is per
+  // prepare_for_query call, and using one id twice would exercise the stale-state replacement
+  // path rather than the two-queries case this gate is about.
+  auto q1 = make_empty_query(sirius::make_query_id(1));
+  manager.prepare_for_query(q1, true, {});
   REQUIRE(routed_cache->query_epoch() == 1);
   REQUIRE(default_cache->query_epoch() == 1);
 
-  manager.prepare_for_query(q, true, {});
+  auto q2 = make_empty_query(sirius::make_query_id(2));
+  manager.prepare_for_query(q2, true, {});
   REQUIRE(routed_cache->query_epoch() == 2);
   REQUIRE(default_cache->query_epoch() == 2);
 }
 
-TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
-          "[s3][routing][scan_manager][cache]")
+TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{0}));
   scan_manager_fixture fixture;
@@ -681,14 +641,14 @@ TEST_CASE("scan_manager tolerates routed S3 ioctx without a prefetch cache",
   auto datasource = manager.create_datasource("s3://routing-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
   REQUIRE(datasource->io_ctx() != nullptr);
+  CHECK(datasource->io_ctx()->type() == io_context_type::restful);
   REQUIRE(datasource->io_ctx()->cache() == nullptr);
 
   auto q = make_empty_query();
   REQUIRE_NOTHROW(manager.prepare_for_query(q, true, {}));
 }
 
-TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket",
-          "[s3][routing][scan_manager][warmup]")
+TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
@@ -734,8 +694,7 @@ TEST_CASE("warmup opens every reactor's connection pool, and only once per bucke
   CHECK(server.request_count() == after_warm);
 }
 
-TEST_CASE("warmup is a no-op for backends with nothing to connect",
-          "[s3][routing][scan_manager][warmup]")
+TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
@@ -750,8 +709,7 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect",
   CHECK(server.request_count() == 0);
 }
 
-TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle",
-          "[s3][rest][dispatch]")
+TEST_CASE("rest dispatch spreads a request over two reactors and rotates when idle", "[s3][rest]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
   scan_manager_fixture fixture;
@@ -786,8 +744,7 @@ TEST_CASE("rest dispatch spreads a request over two reactors and rotates when id
   }
 }
 
-TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently",
-          "[s3][routing][scan_manager][parquet_gpu_ingestible]")
+TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently", "[s3][routing]")
 {
   auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
   auto parquet_bytes      = read_binary_file(fixture_path);
@@ -827,8 +784,7 @@ TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independentl
   CHECK(is_local_backend(routed.at(local_path)));
 }
 
-TEST_CASE("split_provider resolver routes mixed parquet files independently",
-          "[s3][routing][scan_manager][split_provider]")
+TEST_CASE("split_provider resolver routes mixed parquet files independently", "[s3][routing]")
 {
   auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
   auto parquet_bytes      = read_binary_file(fixture_path);

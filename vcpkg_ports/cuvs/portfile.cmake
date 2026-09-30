@@ -12,6 +12,8 @@ vcpkg_from_github(
   # NVCC 13.2 miscompiles kernel pointers with std::optional parameters.
   PATCHES
   fix-pq-kernel-optional.patch
+  static-cuda-math.patch
+  disable-openmp.patch
   HEAD_REF
   main)
 
@@ -50,6 +52,8 @@ vcpkg_from_github(
   v26.08.00
   SHA512
   cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
+  PATCHES
+  "${CMAKE_CURRENT_LIST_DIR}/../raft/static-cuda-math.patch"
   HEAD_REF
   main)
 
@@ -90,8 +94,7 @@ vcpkg_replace_string(
 
 # Static link forces BUILD_TESTS/BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
 # gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
-# path. Only cuvs::neighbors::brute_force + cuvs::distance are consumed by
-# Sirius, but libcuvs still compiles the full kernel set.
+# path. Sirius uses GPU brute-force and IVF-Flat; disable CPU OpenMP support.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
@@ -102,10 +105,12 @@ vcpkg_cmake_configure(
   -DCPM_NvidiaCutlass_SOURCE=${CUTLASS_PATH}
   -DCPM_cuco_SOURCE=${CUCO_PATH}
   -DBUILD_SHARED_LIBS=OFF
+  -DCUDA_STATIC_MATH_LIBRARIES=ON
   -DBUILD_TESTS=OFF
   -DBUILD_C_LIBRARY=OFF
   -DBUILD_CAGRA_HNSWLIB=OFF
   -DBUILD_MG_ALGOS=OFF
+  -DDISABLE_OPENMP=ON
   -DCUVS_NVTX=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
@@ -127,7 +132,7 @@ vcpkg_replace_string(
 file(READ "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake" CUVS_CONFIG)
 file(
   WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake"
-  "include(CMakeFindDependencyMacro)\nfind_dependency(nvjitlink CONFIG)\nfind_dependency(nvrtc CONFIG)\n${CUVS_CONFIG}"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\nfind_dependency(curand CONFIG)\nfind_dependency(nvjitlink CONFIG)\nfind_dependency(nvrtc CONFIG)\n${CUVS_CONFIG}"
 )
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")

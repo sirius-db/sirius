@@ -324,9 +324,10 @@ TEST_CASE("io_uring staging failure names the reactor and the requested bytes", 
   auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
   uring_reactor reactor{ctx, ""};
 
-  REQUIRE_THROWS_WITH(reactor.start(),
-                      Catch::Contains("uring_reactor: cannot reserve 134217728 bytes of "
-                                      "pinned staging (1 x 134217728)"));
+  REQUIRE_THROWS_WITH(
+    reactor.start(),
+    Catch::Matchers::ContainsSubstring(
+      "uring_reactor: cannot reserve 134217728 bytes of pinned staging (1 x 134217728)"));
 }
 
 TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[uring_readv]")

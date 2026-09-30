@@ -1,3 +1,5 @@
+find_package(Catch2 3 REQUIRED CONFIG)
+
 add_executable(sirius_unittest ${TEST_SOURCES})
 
 if(VCPKG_BUILD)
@@ -14,7 +16,8 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
 )
 
-target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB
+                      Catch2::Catch2)
 link_extension_libraries(sirius_unittest "")
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for

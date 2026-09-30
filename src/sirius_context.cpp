@@ -462,10 +462,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     }
   }
 
-  // Drop scan-manager providers for this query. Repositories are already
-  // cleared above, so downstream data_batches that referenced sliced
-  // host_data_representation are gone before the providers go away.
-  if (scan_manager_) { scan_manager_->reset(); }
+  // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
+  // Repositories are already cleared above, so downstream data_batches that referenced
+  // sliced host_data_representation are gone before the providers go away.
+  if (scan_manager_) { scan_manager_->reset(query_id); }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
@@ -522,6 +522,14 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
   try {
     if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+  } catch (...) {
+  }
+  // The scan manager needs the same backstop. prepare_for_query no longer performs a global
+  // reset (it would tear down concurrently-running queries), so nothing else will ever drop
+  // this query's scan state: without this, a failed query leaks its dispatcher, coalescer and
+  // split providers until terminate().
+  try {
+    if (scan_manager_) { scan_manager_->reset(query_id); }
   } catch (...) {
   }
 }
@@ -799,6 +807,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // cucascade topology exposes hw-decompression availability as a runtime attribute populated
+  // only when discovery is asked to touch the CUDA driver. sirius_config seeds topology with
+  // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
+  auto enable_hw_decompression =
+    config_.get_operator_params().use_hw_decompression && topo.num_gpus > 0 &&
+    std::all_of(topo.gpus.begin(), topo.gpus.end(), [](auto const& gpu) {
+      return gpu.runtime_attributes.has_value() && gpu.runtime_attributes->hw_decomp;
+    });
+  if (enable_hw_decompression) {
+    hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
+    SIRIUS_LOG_INFO(
+      "SiriusContext: hardware decompression supported on all {} GPU(s); "
+      "exported LIBCUDF_HW_DECOMPRESSION=ON",
+      topo.num_gpus);
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -924,6 +948,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+
+  // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
+  // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
+  // here keeps the variable scoped to the initialized lifetime so a re-initialize starts clean.
+  hw_decompression_env_guard_.reset();
 
   // Before the reporters, so nothing published during teardown reaches a
   // subscriber whose subject is already half gone; the publish_* calls below this

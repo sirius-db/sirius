@@ -134,22 +134,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
 }
 
 /**
- * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible.
- * Matches the Catch2 v2 WARN+return convention used by the other MGPU tests.
+ * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible
+ * (see sirius::test::has_gpus). Callers must be tagged [multi_gpu].
  *
  * @return true if the host has >=2 GPUs; the caller MUST still `return;`
  *         when this returns false.
  */
-inline bool require_two_gpus()
-{
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("MGPU operator test requires >=2 GPUs; single-GPU host — skipping");
-    return false;
-  }
-  return true;
-}
+inline bool require_two_gpus() { return sirius::test::has_gpus(2); }
 
 /**
  * @brief RAII wrapper that pauses any active shared test env (so our local

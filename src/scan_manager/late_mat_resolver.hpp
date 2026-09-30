@@ -32,8 +32,9 @@
 // carrier width. A deferral that cannot be resolved must degrade to the
 // ordinary path, not to an error.
 //
-// The views are NON-OWNING and valid for the query's lifetime, which pin/unpin
-// serialization against query execution is what guarantees.
+// The column views themselves are non-owning. The returned wrapper retains an
+// owning lease on their exact pinned entry, so a concurrent unpin cannot make
+// them dangle while the gather is running.
 
 #include "late_mat/column_origin.hpp"
 #include "late_mat/materialize.hpp"
@@ -42,6 +43,13 @@
 #include <optional>
 
 namespace sirius::scan_manager {
+
+/// One resolved column plus the ownership that keeps every pointer in its view
+/// alive. Publicly derives from the view so materialize() and existing callers
+/// can consume it without peeling a second wrapper.
+struct resolved_pinned_column : late_mat::pinned_column_view {
+  std::shared_ptr<pinned_entry const> entry_owner;
+};
 
 /// The origin table's batch layout, in pin order — how many rows each chunk
 /// holds, which is all a selection needs to be split across them.
@@ -65,7 +73,7 @@ namespace sirius::scan_manager {
 /// different carrier widths — the view carries one dtype and the gather reads
 /// every batch at it. An uncompressed origin MAY be nullable: every such gather
 /// shape propagates validity.
-[[nodiscard]] std::optional<late_mat::pinned_column_view> resolve_pinned_column(
+[[nodiscard]] std::optional<resolved_pinned_column> resolve_pinned_column(
   late_mat::column_origin const& origin);
 
 }  // namespace sirius::scan_manager

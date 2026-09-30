@@ -49,11 +49,12 @@ croaring = "*"
 rumdl = "==0.2.44"
 
 [feature.dev-libs.dependencies]
+catch2 = "3.*"
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.5"
+duckdb = "=1.5.6"
 spdlog = "1.8.*"
 sqlite = "3.*"
 rust-src = "*"

@@ -449,6 +449,7 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
 /// A GPU-tier pin of one INT32 column, row i holding i, in a single chunk.
 struct deferral_test_pin {
   sirius::scan_manager::pinned_entry entry;
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> entry_owner;
   std::shared_ptr<sirius::late_mat::pin_entry_handle> handle;
 
   deferral_test_pin(std::size_t rows, ::cuda::stream_ref stream)
@@ -473,8 +474,10 @@ struct deferral_test_pin {
       entry.data_batches_by_column.emplace(name, std::move(chunks));
     }
     entry.num_rows = rows;
-    handle         = std::make_shared<sirius::late_mat::pin_entry_handle>("deferral_pin", 1);
-    handle->set_entry(&entry);
+    entry_owner    = std::shared_ptr<sirius::scan_manager::pinned_entry const>(
+      &entry, [](sirius::scan_manager::pinned_entry const*) {});
+    handle = std::make_shared<sirius::late_mat::pin_entry_handle>("deferral_pin", 1);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] sirius::late_mat::column_origin origin(std::uint32_t pos) const

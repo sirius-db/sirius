@@ -25,6 +25,7 @@
 #include <io/sirius_datasource.hpp>
 #include <unistd.h>  // getpid
 #include <utils/s3_container.hpp>
+#include <utils/s3_test_env.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -70,18 +71,8 @@ class scoped_temp_file {
 };
 
 #ifdef SIRIUS_HAVE_TESTCONTAINERS
-std::string env_or(char const* name, std::string fallback = {})
-{
-  auto const* value = std::getenv(name);
-  return value != nullptr ? std::string{value} : std::move(fallback);
-}
-
-std::string require_env(char const* name)
-{
-  auto value = env_or(name);
-  REQUIRE_FALSE(value.empty());
-  return value;
-}
+using sirius::test::s3::env_or;
+using sirius::test::s3::require_env;
 
 /// Credentials for the managed MinIO instance brought up by
 /// ensure_s3_container_env(); TLS verification is off for its self-signed cert.
@@ -114,7 +105,7 @@ TEST_CASE("kvikio_context rejects s3 URIs when the object store is unconfigured"
   auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, io::object_store_config{});
 
   REQUIRE_THROWS_WITH(ctx->open_datasource("s3://bucket/key.parquet"),
-                      Catch::Contains("object store not configured"));
+                      Catch::Matchers::ContainsSubstring("object store not configured"));
 }
 
 TEST_CASE("kvikio_context rejects malformed s3 URIs before any network call", "[kvikio]")
@@ -164,7 +155,10 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
 {
   using namespace std::chrono_literals;
 
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {

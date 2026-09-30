@@ -25,20 +25,24 @@ endif()
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
 # Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
-# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
-# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
-# The pixi build has no such target and links the conda shared libnvrtc.so.
+# the nvrtc::nvrtc_static target, which simpatico links instead of CUDA::nvrtc
+# (see src/compression/simpatico_codegen/CMakeLists.txt). The pixi build uses
+# CUDA::nvrtc for the toolkit's shared library.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
   find_package(nvjitlink CONFIG REQUIRED)
   # FindCUDAToolkit also adds nvJitLink through cuSPARSE's link interface.
-  get_target_property(_cusparse_links CUDA::cusparse INTERFACE_LINK_LIBRARIES)
-  if(_cusparse_links)
-    list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink$"
-                                           "nvjitlink::nvjitlink_static")
-    set_target_properties(CUDA::cusparse PROPERTIES INTERFACE_LINK_LIBRARIES
-                                                    "${_cusparse_links}")
-  endif()
+  foreach(target CUDA::cusparse CUDA::cusparse_static)
+    if(TARGET ${target})
+      get_target_property(_cusparse_links ${target} INTERFACE_LINK_LIBRARIES)
+      if(_cusparse_links)
+        list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink(_static)?$"
+                                               "nvjitlink::nvjitlink_static")
+        set_target_properties(${target} PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                   "${_cusparse_links}")
+      endif()
+    endif()
+  endforeach()
 endif()
 
 # --- cuCollections (cuco) --- #
