@@ -179,7 +179,7 @@ void write_compression_yaml(const fs::path& yaml_path, std::size_t scan_batch_by
        "    num_gpus: 1\n"
        "  memory:\n"
        "    gpu:\n"
-       "      usage_limit_fraction: 0.4\n"
+       "      usage_limit_fraction: 0.2\n"
        "      reservation_limit_fraction: 1.0\n"
        "    host:\n"
        "      capacity_bytes: 2000000000\n"

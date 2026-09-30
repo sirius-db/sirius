@@ -78,7 +78,7 @@ fs::path make_tmp_dir(std::string const& tag)
 }  // namespace
 
 TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes across both GPUs",
-          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution]")
+          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -131,7 +131,7 @@ TEST_CASE("grouped_aggregate_merge - group by with high cardinality distributes 
 }
 
 TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU path",
-          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution]")
+          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -171,7 +171,7 @@ TEST_CASE("grouped_aggregate_merge - group by with single key forces single-GPU 
 }
 
 TEST_CASE("grouped_aggregate_merge - count(*)-only aggregate across two GPUs",
-          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution]")
+          "[mgpu][operator-mgpu][grouped_aggregate_merge][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 

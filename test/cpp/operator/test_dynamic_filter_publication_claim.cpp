@@ -30,6 +30,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
 
@@ -364,16 +365,9 @@ TEST_CASE("device memory exhaustion during a claimed publication fails open",
 }
 
 TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sibling delivery",
-          "[dynamic_filter][publication_claim][gpu_execution]")
+          "[dynamic_filter][publication_claim][gpu_execution][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN(
-      "non-plan-GPU source skip requires >=2 GPUs; single-GPU host -- skipping "
-      "(per Catch2 WARN+return convention)");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // Two GPU spaces exist, but the plan holds a replica space on GPU 0 only.
   claim_fixture fixture{duckdb::JoinType::INNER, /*num_gpus=*/2};
