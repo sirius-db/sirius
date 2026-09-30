@@ -132,6 +132,12 @@ class batch_telemetry_registry {
   /// Retire one query; omitted ID drains everything at runtime shutdown.
   void on_query_end(std::optional<query_id_t> query_id = std::nullopt);
 
+  struct query_record_counts {
+    std::size_t ports{}, placements{};
+  };
+  /// Diagnostic snapshot; retirement of another query must leave these records intact.
+  [[nodiscard]] query_record_counts records_for_query(query_id_t query_id) const;
+
   /// The MemoryTier resource for (tier, device); nil when not installed.
   [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;
 

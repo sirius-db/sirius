@@ -164,7 +164,7 @@ downgrade_executor make_monitoring_executor(
 // Tests
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_disk]")
+TEST_CASE("Downgrade handles full HOST with available or full DISK", "[downgrade_disk]")
 {
   // Set HOST capacity small (2MB, limit = 1.5MB after 0.75 fraction).
   // Pre-exhaust HOST so make_reservation_or_null returns null gracefully.
@@ -212,10 +212,23 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
   for (auto* ds : disk_spaces) {
     target_spaces.push_back(ds);
   }
+  bool const full_disk = GENERATE(false, true);
+  std::unique_ptr<cucascade::memory::reservation> held_disk;
+  if (full_disk) {
+    auto* disk = const_cast<cucascade::memory::memory_space*>(disk_spaces.front());
+    held_disk  = disk->make_reservation_or_null(disk->get_available_memory());
+    REQUIRE(held_disk != nullptr);
+  }
   sirius::convertible_data_batch batch_converter(batch);
   auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr, false);
-  REQUIRE(converted.has_value());
-
+  REQUIRE(converted.has_value() == !full_disk);
+  if (full_disk) {
+    REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
+    held_disk.reset();
+    // Refusal preserves the source and releases temporary HOST/DISK claims.
+    converted = batch_converter.convert(target_spaces, stream, *mem_mgr, false);
+    REQUIRE(converted.has_value());
+  }
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
 }
 

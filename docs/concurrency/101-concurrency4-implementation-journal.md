@@ -241,3 +241,14 @@ Implementation entries will be added here as each buildable change is validated 
   passed 50 cases, 483 assertions. This includes HOST-full/no-DISK and spill-to-DISK component
   regressions. These are one-GPU results, not a multi-GPU qualification claim.
 - Previous commit: `2b2f4de31`.
+
+### 13. `test(exec): verify telemetry ownership and exhausted spill capacity`
+
+- Batch telemetry exposes diagnostic port/placement counts per query. A regression publishes the
+  same batch to two queries, retires one, and verifies the other query can consume and publish
+  through its retained port.
+- Spill tests now exhaust configured HOST and DISK reservation capacity together. Refused
+  conversion preserves the GPU source; releasing DISK capacity allows the same conversion to
+  succeed. This simulates capacity exhaustion without filling the host filesystem.
+- Validation: full build; 8 telemetry/spill cases, 57 assertions.
+- Previous commit: `75251e166`.

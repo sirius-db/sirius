@@ -478,6 +478,24 @@ uuid::UUID batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
   return impl_->tier_resource_id(tier, device_id);
 }
 
+batch_telemetry_registry::query_record_counts batch_telemetry_registry::records_for_query(
+  query_id_t id) const
+{
+  query_record_counts counts;
+  {
+    std::shared_lock lock(impl_->ports_mutex);
+    for (auto const& [repo, port] : impl_->ports)
+      if (port.query_id == id) ++counts.ports;
+  }
+  for (auto& shard : impl_->shards) {
+    std::lock_guard lock(shard.mutex);
+    for (auto const& [batch, placements] : shard.placements)
+      for (auto const& placement : placements)
+        if (placement.query_id == id) ++counts.placements;
+  }
+  return counts;
+}
+
 void batch_telemetry_registry::on_query_end(std::optional<query_id_t> query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
