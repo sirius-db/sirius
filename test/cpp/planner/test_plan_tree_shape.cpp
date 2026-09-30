@@ -1147,6 +1147,25 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
           planned);
   }
 
+  SECTION("DISTINCT ON reordering over a narrowed aggregate types the projection from the child")
+  {
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT ON (s, k) k, s FROM (SELECT val AS k, sum(id) AS s FROM big_left GROUP BY "
+      "val)");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{1, 0});
+
+    REQUIRE(plan->type == SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(plan->children.size() == 1);
+    CHECK(plan->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    CHECK(plan->get_types() == duckdb::vector<sirius::logical_type>{
+                                 sirius::logical_type::make(sirius::type_id::INTEGER),
+                                 sirius::logical_type::make(sirius::type_id::BIGINT)});
+  }
+
   SECTION("DISTINCT over nested materialized CTEs checks the innermost body's schema")
   {
     // `d` is read twice and joined on `other`, so it keeps both columns and is wider than the
