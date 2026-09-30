@@ -30,6 +30,8 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "sirius_config.hpp"
+#include "sirius_context.hpp"
 #include "utils/plan_shape_test_utils.hpp"
 
 #include <catch.hpp>
@@ -78,6 +80,14 @@ struct eager_agg_pushdown_fixture {
     db = std::make_unique<DuckDB>(_db_path.path());
     setenv("SIRIUS_DISABLE", "1", 1);
     con = std::make_unique<Connection>(*db);
+
+    // The dense count-join fusion rewrites COUNT-grouped-by-join-key outer
+    // joins into a single DENSE_COUNT_JOIN operator, which would swallow the
+    // HASH_GROUP_BY these shape assertions count. Keep the plain shape so a
+    // refusal is observable as "aggregate count unchanged".
+    auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    REQUIRE(sirius_ctx != nullptr);
+    sirius_ctx->get_config().get_operator_params().enable_dense_count_join = false;
 
     // cust is the preserved / non-pushed side (bare, unfiltered scan); ord is
     // the pushed side with duplicate keys so the pre-aggregation actually
