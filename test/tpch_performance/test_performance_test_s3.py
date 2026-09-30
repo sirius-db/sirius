@@ -165,21 +165,23 @@ class PerformanceTestS3Tests(unittest.TestCase):
             )
 
         self.assertTrue(events[0].startswith("LOAD "))
-        self.assertEqual(events[1], "SET gpu_execution = false;")
-        self.assertEqual(events[2], ("secret", con, True))
-        self.assertTrue(events[3].startswith("CREATE OR REPLACE VIEW customer"))
+        self.assertEqual(events[1], ("secret", con, True))
+        self.assertTrue(events[2].startswith("CREATE OR REPLACE VIEW customer"))
 
     def test_s3_profiler_child_writes_timings_but_no_secret_sql(self):
         source = Mock()
         source.pin_globs.return_value = {"lineitem": "s3://bucket/lineitem.parquet"}
         con = Mock()
         con.execute.return_value.fetchall.return_value = [(1,)]
+        query_sql = "SELECT 42"
 
         with tempfile.TemporaryDirectory() as qdir:
             with patch.object(benchmark, "S3Input", return_value=source), patch.object(
                 benchmark, "open_connection", return_value=con
             ):
-                benchmark._run_nsys_s3_child("s3://bucket/tpch", 1, 2, "none", qdir)
+                benchmark._run_nsys_s3_child(
+                    "s3://bucket/tpch", 1, 2, "none", qdir, query_sql
+                )
             self.assertFalse(os.path.exists(os.path.join(qdir, "nsys.sql")))
             with open(os.path.join(qdir, "timings.csv"), newline="") as f:
                 rows = list(csv.reader(f))
@@ -187,6 +189,7 @@ class PerformanceTestS3Tests(unittest.TestCase):
                 [row[0] for row in rows], ["step", "views", "iter_1", "iter_2"]
             )
             source.refresh_secret.assert_called()
+            con.execute.assert_any_call(query_sql)
 
 
 if __name__ == "__main__":
