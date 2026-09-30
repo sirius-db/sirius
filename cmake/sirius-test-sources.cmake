@@ -88,6 +88,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_type_drift.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_plan_estimates.cpp
     test/cpp/integration/test_transparent_provider_isolation.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/late_mat/test_column_origin.cpp
@@ -185,6 +186,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
+    test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_build_key_domain.cpp
     test/cpp/planner/test_dynamic_filter_discovery_parity.cpp
     test/cpp/planner/test_dynamic_filter_key_admission.cpp
