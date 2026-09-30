@@ -101,7 +101,7 @@ class MultiFormatFixtureBase {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      auto cfg_path = fs::path(__FILE__).parent_path() / "integration.yaml";
+      auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
       db           = std::make_unique<duckdb::DuckDB>(nullptr);
@@ -648,11 +648,10 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
   //
   // What the pin is really protecting is the CPU oracle for EQUALITY deletes: the 1.4.4-era
   // build ignored them silently, so an oracle on that build would agree with a GPU path that
-  // dropped them too. 45163a28 (the build INSTALL resolves for DuckDB v1.5.5) was checked by
-  // hand against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3
-  // surviving rows, not all 5. Re-run that check when bumping this, rather than assuming a
-  // newer build only improves.
-  static constexpr const char* kVerifiedIcebergVersion = "45163a28";
+  // dropped them too. 890b78a9c (the build INSTALL resolves for DuckDB v1.5.6) was checked
+  // against test/cpp/integration/data/iceberg_v2_equality_delete and returns the 3 surviving
+  // rows, not all 5. Re-run that check when bumping this.
+  static constexpr const char* kVerifiedIcebergVersion = "890b78a9c";
 
   // Which delete kinds the GPU scan path applies itself. Positional deletes and V3 deletion
   // vectors are applied by iceberg_gpu_ingestible (they share one per-file position map), so
@@ -889,7 +888,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
    * processes, the runtime default differs per build:
    *
    *     iceberg 75726455 (DuckDB v1.5.4) -> false
-   *     iceberg 45163a28 (DuckDB v1.5.5) -> true     <- kVerifiedIcebergVersion
+   *     iceberg 45163a28 (DuckDB v1.5.5) -> true
    *
    * while duckdb-iceberg's source registers `Value::BOOLEAN(false)` at BOTH `45163a28` and on
    * `main`. The shipped binary therefore does not match the commit whose version it reports, so

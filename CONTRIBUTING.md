@@ -23,8 +23,8 @@ git submodule update --init --recursive
 build/release/extension/sirius/test/cpp/sirius_unittest
 
 # Run a specific tag or test name
-build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
-build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
+build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 
 # SQL logic tests (end-to-end)
 make test
@@ -51,7 +51,7 @@ Tools enforced: `clang-format` (C++/CUDA), `black` (Python), `cmake-format`, `co
 
 ## Submodules
 
-The `duckdb/`, `duckdb-python/`, and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
+The `duckdb/` and `vcpkg/` directories are third-party submodules. Their `CONTRIBUTING.md` files apply to contributing to those upstream projects, not to Sirius. Do not modify submodule contents directly.
 
 ## Migrating your local clone from `dev` to `main`
 

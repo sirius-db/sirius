@@ -25,7 +25,6 @@ The cuDF core type system defines fundamental types used throughout the library.
 - `STRUCT`, `EMPTY` — structural types
 
 **Our usage**:
-- `src/gpu_columns.cpp` — Maps DuckDB `LogicalTypeId` to `cudf::type_id` for column construction
 - `src/expression_executor/gpu_expression_translator.cpp` — Type dispatch for expression evaluation
 
 ### `cudf::data_type`
@@ -41,7 +40,6 @@ class data_type {
 ```
 
 **Our usage**:
-- `src/expression_executor/specializations/gpu_execute_operator.cpp` — Constructing target types for `binary_operation`
 - `src/op/sirius_physical_ungrouped_aggregate.cpp` — Type construction for reduction results
 
 ### `cudf::size_type`
@@ -61,8 +59,6 @@ Fundamental row-count and index type. Limits cuDF to ~2 billion rows per column.
 Used for null validity bitmasks. Each bit represents one row's validity.
 
 **Our usage**:
-- `src/operator/gpu_materialize.cpp` — Validity mask construction
-- `src/operator/gpu_physical_result_collector.cpp` — Null mask handling during result collection
 
 ### `cudf::null_equality` (enum)
 

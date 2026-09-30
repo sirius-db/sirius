@@ -696,6 +696,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
+  // The GPU aggregates compute a single grouping set and have no GROUPING() support.
+  // See https://github.com/sirius-db/sirius/pull/1928.
+  if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+    throw duckdb::NotImplementedException(
+      "ROLLUP, CUBE, GROUPING SETS and GROUPING() are not supported in GPU aggregates");
+  }
+
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);

@@ -658,7 +658,7 @@ void check_lake_rows(duckdb::Connection& con)
   REQUIRE(aggregates->GetValue(2, 0).GetValue<int64_t>() == 917);
 }
 
-auto lake_config() { return std::filesystem::path(__FILE__).parent_path() / "integration.yaml"; }
+auto lake_config() { return sirius::test::integration_config_path(); }
 
 }  // namespace
 

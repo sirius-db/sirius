@@ -66,10 +66,10 @@ row_group_slice slice_of(std::string path,
                          file_index};
 }
 
-parquet_split_info split_of(std::vector<row_group_slice> slices)
+std::shared_ptr<parquet_split_info> split_of(std::vector<row_group_slice> slices)
 {
-  parquet_split_info split;
-  split.rg_slices = std::move(slices);
+  auto split       = std::make_shared<parquet_split_info>(std::vector<scan_info::fadvise_entry>{});
+  split->rg_slices = std::move(slices);
   return split;
 }
 
@@ -78,7 +78,7 @@ parquet_split_info split_of(std::vector<row_group_slice> slices)
 TEST_CASE("build_batch_layout maps a single whole file", "[scan][iceberg]")
 {
   auto const split  = split_of({slice_of("a.parquet", {3, 4}, {0, 1})});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 2);
   CHECK(layout[0].data_file_path == "a.parquet");
@@ -98,7 +98,7 @@ TEST_CASE("build_batch_layout keeps file offsets across a pruned row group", "[s
   // file row 9 belongs to row group 2, and treating batch row 9 as file row 9 would delete a
   // row from the wrong place.
   auto const split  = split_of({slice_of("a.parquet", {3, 5, 4}, {0, 2})});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 2);
   CHECK(layout[0].file_row_offset == 0);
@@ -116,7 +116,7 @@ TEST_CASE("build_batch_layout restarts file offsets per file", "[scan][iceberg]"
   // not express at all.
   auto const split =
     split_of({slice_of("a.parquet", {2, 2}, {0, 1}), slice_of("b.parquet", {5}, {0})});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 3);
   CHECK(layout[1].data_file_path == "a.parquet");
@@ -133,7 +133,7 @@ TEST_CASE("build_batch_layout skips fully pruned files", "[scan][iceberg]")
   // A slice with no selected row groups is the coalescer's all-pruned fallback: it contributes
   // no rows, so it must contribute no runs either (an empty run would offset everything after).
   auto const split  = split_of({slice_of("a.parquet", {4}, {}), slice_of("b.parquet", {6}, {0})});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 1);
   CHECK(layout[0].data_file_path == "b.parquet");
@@ -144,14 +144,14 @@ TEST_CASE("build_batch_layout skips fully pruned files", "[scan][iceberg]")
 TEST_CASE("build_batch_layout of an entirely pruned split is empty", "[scan][iceberg]")
 {
   auto const split = split_of({slice_of("a.parquet", {4}, {})});
-  CHECK(build_batch_layout(split).empty());
+  CHECK(build_batch_layout(*split).empty());
 }
 
 TEST_CASE("build_batch_layout rejects a row group index outside the footer", "[scan][iceberg]")
 {
   // Better to fail than to read past the row-group list and compute a nonsense file offset.
   auto const split = split_of({slice_of("a.parquet", {4}, {3})});
-  CHECK_THROWS(build_batch_layout(split));
+  CHECK_THROWS(build_batch_layout(*split));
 }
 
 TEST_CASE("build_batch_layout preserves bound file indexes independently of slice order",
@@ -159,7 +159,7 @@ TEST_CASE("build_batch_layout preserves bound file indexes independently of slic
 {
   auto const split =
     split_of({slice_of("b.parquet", {2}, {0}, 5), slice_of("a.parquet", {2, 3, 2}, {1}, 2)});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 2);
   CHECK(layout[0].data_file_path == "b.parquet");
@@ -181,8 +181,8 @@ TEST_CASE("build_batch_layout retains file offsets when one file spans multiple 
   first.file_metadata = footer;
   last.file_metadata  = footer;
 
-  auto const first_layout = build_batch_layout(split_of({std::move(first)}));
-  auto const last_layout  = build_batch_layout(split_of({std::move(last)}));
+  auto const first_layout = build_batch_layout(*split_of({std::move(first)}));
+  auto const last_layout  = build_batch_layout(*split_of({std::move(last)}));
   REQUIRE(first_layout.size() == 1);
   REQUIRE(last_layout.size() == 1);
   CHECK(first_layout.front().file_index == 7);
@@ -198,28 +198,28 @@ TEST_CASE("build_batch_layout rejects incomplete or inconsistent provenance meta
 {
   SECTION("missing bound file index")
   {
-    auto split                    = split_of({slice_of("a.parquet", {1}, {0})});
-    split.rg_slices[0].file_index = invalid_parquet_file_index;
-    CHECK_THROWS(build_batch_layout(split));
+    auto split                     = split_of({slice_of("a.parquet", {1}, {0})});
+    split->rg_slices[0].file_index = invalid_parquet_file_index;
+    CHECK_THROWS(build_batch_layout(*split));
   }
   SECTION("missing footer")
   {
     auto split = split_of({slice_of("a.parquet", {1}, {0})});
-    split.rg_slices[0].file_metadata.reset();
-    CHECK_THROWS(build_batch_layout(split));
+    split->rg_slices[0].file_metadata.reset();
+    CHECK_THROWS(build_batch_layout(*split));
   }
   SECTION("negative row count")
   {
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {-1}, {0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {-1}, {0})})));
   }
   SECTION("file offset overflow")
   {
     auto const max = std::numeric_limits<int64_t>::max();
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {max, 1}, {0, 1})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {max, 1}, {0, 1})})));
   }
   SECTION("duplicate or reversed row groups")
   {
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {0, 0})})));
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {1, 0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {1, 1}, {0, 0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {1, 1}, {1, 0})})));
   }
 }

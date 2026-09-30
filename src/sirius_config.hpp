@@ -194,6 +194,14 @@ struct operator_params {
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
 
+  /// Enable cuDF hardware (on-GPU) decompression for compressed parquet scans. Off by default:
+  /// opt-in because the driver-only support probe returns true on GPUs (e.g. Turing/T4) whose
+  /// runtime path actually fails. When explicitly enabled, and every GPU reports support via
+  /// cucascade topology's runtime_properties, SiriusContext exports LIBCUDF_HW_DECOMPRESSION=ON
+  /// for the lifetime of the context so cuDF's parquet reader routes supported codecs through
+  /// the hardware decompression engine.
+  bool use_hw_decompression = false;
+
   /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
   /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
@@ -286,6 +294,15 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// The read path's caching configuration (the
+  /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
+  /// scan_manager config, which is its only consumer, so the two can never
+  /// disagree.
+  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  {
+    return _scan_manager_config.cache;
+  }
+
   /// Overwrite the stored scan_manager_config. Allows callers (e.g.
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.
@@ -324,11 +341,32 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  /// Apply the knobs derived from the rest of the configuration: the readahead
+  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
+  /// override, in that order. Called from the end of both @ref load_from_file
+  /// and @ref apply_defaults so a missing config file derives the same values
+  /// an empty one does; each step is idempotent.
+  void finalize_derived_config();
+
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
-  /// datasource is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from the end of @ref load_from_file.
-  void enforce_sirius_datasource_for_multi_gpu();
+  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
+  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// the override takes effect. Called from @ref finalize_derived_config.
+  void enforce_sirius_backend_for_multi_gpu();
+
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// CONFIGURED pipeline pool size. The struct default can only use the
+  /// compile-time thread count, so resizing the pipeline in config would
+  /// otherwise leave the readahead budget behind. Called from
+  /// @ref finalize_derived_config; an explicit config value is left alone.
+  void derive_uring_scan_budget();
+
+  /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
+  /// multiple of the configured pipeline pool size. Object-store reads are
+  /// latency-bound, so the readahead needs several splits in flight per pipeline
+  /// thread to stay ahead of demand. Called from
+  /// @ref finalize_derived_config; an explicit config value is left alone.
+  void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   int _gpus_per_query = 0;
