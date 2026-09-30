@@ -303,6 +303,8 @@ void duckdb_native_gpu_ingestible::ensure_metadata_prepared()
     _info->context->registered_state
       ? _info->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
       : nullptr;
+  // This database-wide check relies on the single-query concurrency limit.
+  // Before allowing concurrent queries, also check that the current query owns the key.
   if (!sirius_context ||
       !sirius_context->get_scan_manager().holds_checkpoint_key(attached_database())) {
     throw std::logic_error("native metadata preparation requires a held shared checkpoint key");
