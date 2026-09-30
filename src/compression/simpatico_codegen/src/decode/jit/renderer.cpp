@@ -540,9 +540,9 @@ __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
 namespace {
 
 // Packed field of element `idx` for a chunk with 1 <= bits <= 32.
-__device__ __forceinline__ uint32_t simpatico_bp_field32(const uint32_t* __restrict__ packed, 
-                                                         int32_t bits, 
-                                                         uint32_t vmask, 
+__device__ __forceinline__ uint32_t simpatico_bp_field32(const uint32_t* __restrict__ packed,
+                                                         int32_t bits,
+                                                         uint32_t vmask,
                                                          int32_t idx) {
     const uint32_t bp = static_cast<uint32_t>(idx) * static_cast<uint32_t>(bits);
     const uint32_t w0 = packed[bp >> 5];
@@ -550,13 +550,13 @@ __device__ __forceinline__ uint32_t simpatico_bp_field32(const uint32_t* __restr
     return __funnelshift_r(w0, w1, bp & 31) & vmask;
 }
 
-// simpatico_bp_at for a chunk with bits <= 32, including the constant-chunk (bits == 0) 
+// simpatico_bp_at for a chunk with bits <= 32, including the constant-chunk (bits == 0)
 // short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at32(const uint32_t* __restrict__ packed_base,
-                                               int32_t bits, 
-                                               uint32_t vmask, 
-                                               T minv, 
+                                               int32_t bits,
+                                               uint32_t vmask,
+                                               T minv,
                                                int32_t idx) {
     using U = typename ::cuda::std::make_unsigned<T>::type;
     if (bits == 0) return minv;

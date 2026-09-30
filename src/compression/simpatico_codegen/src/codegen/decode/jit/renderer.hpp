@@ -92,7 +92,7 @@ namespace codegen::decode::jit {
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank
-  index_list, ///< an ascending survivor row-id list, compacted by slot
+  index_list,    ///< an ascending survivor row-id list, compacted by slot
   /// A chunk-bucketed CSR row set (codegen/selection/chunk_row_set.hpp): the
   /// grid covers only TOUCHED chunks, and block b serves chunk_ids[b]. For a
   /// selection that arrives after the scan and touches few chunks, this is the
