@@ -2477,7 +2477,7 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
 }
 
 TEST_CASE("transparent S3 read-view mismatch preserves the source veto",
-          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+          "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2513,7 +2513,7 @@ TEST_CASE("transparent S3 read-view mismatch preserves the source veto",
 }
 
 TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence",
-          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+          "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2584,7 +2584,7 @@ TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence"
 }
 
 TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
-          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+          "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -2704,7 +2704,7 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
 }
 
 TEST_CASE("Sirius S3 capture uses the fresh schema from a name-only rebind",
-          "[s3][integration][sql][planner-metadata][scan][contracts]")
+          "[s3][integration][sql][footerbind]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -3052,7 +3052,7 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU with cache.mod
 }
 
 TEST_CASE("native walk failure in a mixed S3 plan preserves execution-time source veto",
-          "[s3][integration][sql][native][checkpoint]")
+          "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -3096,7 +3096,7 @@ TEST_CASE("native walk failure in a mixed S3 plan preserves execution-time sourc
 }
 
 TEST_CASE("never-entered native and S3 windows preserve the runtime-unavailable error",
-          "[s3][integration][sql][native][checkpoint]")
+          "[s3][integration][sql][transparent][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) { return; }
@@ -3141,7 +3141,7 @@ TEST_CASE("never-entered native and S3 windows preserve the runtime-unavailable 
 }
 
 TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
-          "[s3][integration][sql][gpu_execution][fallback][explicit_replay]")
+          "[s3][integration][sql][fallback]")
 {
   auto env = load_s3_test_env();
   if (should_skip_s3_env(env)) return;
