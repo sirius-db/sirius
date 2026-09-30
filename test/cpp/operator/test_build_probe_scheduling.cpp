@@ -451,7 +451,8 @@ TEST_CASE("compute_hash_join_partition_strategy - no GPU list plans one GPU, unp
 TEST_CASE("compute_hash_join_partition_strategy - broadcast places one partition per GPU",
           "[hash_join][build_probe][unit]")
 {
-  auto const s = strategy(k100MB, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
+  // 1 MB is below the 4-GPU small-table threshold (64 MB), so the build is replicated.
+  auto const s = strategy(1024ull * 1024, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
   REQUIRE(s.broadcast);
   REQUIRE(s.placement == partition_placement::one_per_device({0, 1, 2, 3}));
 }
