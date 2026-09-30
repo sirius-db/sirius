@@ -1281,11 +1281,11 @@ void sirius_physical_plan_generator::adopt_state_from(sirius_physical_plan_gener
 {
   // create_plan(unique_ptr) is the single entry point and runs once per
   // generator, so `this` is still pristine here and a move is exactly right.
-  dependencies            = std::move(other.dependencies);
-  recursive_cte_tables    = std::move(other.recursive_cte_tables);
-  recurring_cte_tables    = std::move(other.recurring_cte_tables);
-  materialized_ctes       = std::move(other.materialized_ctes);
-  delim_index             = other.delim_index;
+  dependencies         = std::move(other.dependencies);
+  recursive_cte_tables = std::move(other.recursive_cte_tables);
+  recurring_cte_tables = std::move(other.recurring_cte_tables);
+  materialized_ctes    = std::move(other.materialized_ctes);
+  delim_index          = other.delim_index;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
