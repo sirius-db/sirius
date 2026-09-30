@@ -32,6 +32,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
@@ -1183,7 +1184,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       auto offsets     = cudf::sequence(total_rows + 1, init_scalar, step_scalar, stream, mr_ref);
 
       // Decode array-level validity from staged.validity segments
-      rmm::device_buffer parent_null_mask(0, stream, mr_ref);
+      auto parent_null_mask =
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr_ref);
       cudf::size_type parent_null_count = 0;
       if (staged.has_nulls && !staged.validity.empty()) {
         // Temporary decode input for the array validity mask

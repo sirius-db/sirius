@@ -211,7 +211,7 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
   // Clear bits 1 and 3 to mark them null
   host_mask[0] = 0b00010101;  // bits 0,2,4 set; bits 1,3 clear
 
-  rmm::device_buffer dev_mask(mask_size, stream, mr);
+  auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   cudaMemcpyAsync(
     dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
   stream.sync();
@@ -264,7 +264,7 @@ TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils
   std::vector<uint8_t> host_mask(mask_size, 0x00);
   host_mask[0] = 0x55;  // 0b01010101: bits 0,2,4,6 set (valid), bits 1,3,5,7 clear (null)
 
-  rmm::device_buffer dev_mask(mask_size, stream, mr);
+  auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   cudaMemcpyAsync(
     dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
   stream.sync();
@@ -479,7 +479,7 @@ TEST_CASE("debug_head shows NULL for null positions", "[debug_utils]")
   auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
   std::vector<uint8_t> host_mask(mask_size, 0xFF);
   host_mask[0] = 0b00010101;  // bits 0,2,4 set; bits 1,3 clear
-  rmm::device_buffer dev_mask(mask_size, stream, mr);
+  auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   cudaMemcpyAsync(
     dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
   stream.sync();
@@ -837,7 +837,7 @@ TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
   std::vector<uint8_t> host_mask(mask_size, 0xFF);
   host_mask[0] = 0b00000101;  // bits 0,2 set (valid); bit 1 clear (null)
 
-  rmm::device_buffer dev_mask(mask_size, stream, mr);
+  auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
   cudaMemcpyAsync(
     dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
   stream.sync();
@@ -1193,7 +1193,7 @@ TEST_CASE("debug_diff with null differences detects null position diffs", "[debu
     auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
     std::vector<uint8_t> host_mask(mask_size, 0xFF);
     host_mask[0] = 0b00011101;
-    rmm::device_buffer dev_mask(mask_size, stream, mr);
+    auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
     cudaMemcpyAsync(
       dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
     stream.sync();
@@ -1215,7 +1215,7 @@ TEST_CASE("debug_diff with null differences detects null position diffs", "[debu
     auto mask_size = cudf::bitmask_allocation_size_bytes(num_rows);
     std::vector<uint8_t> host_mask(mask_size, 0xFF);
     host_mask[0] = 0b00010111;
-    rmm::device_buffer dev_mask(mask_size, stream, mr);
+    auto dev_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
     cudaMemcpyAsync(
       dev_mask.data(), host_mask.data(), mask_size, cudaMemcpyHostToDevice, stream.get());
     stream.sync();

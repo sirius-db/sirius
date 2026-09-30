@@ -1773,7 +1773,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   // Apply SQL three-valued logic by attaching a null mask: unmatched rows become NULL when the
   // build side has a NULL key (valid == matched) or when the probe key is NULL (valid == probe key
   // validity). See the function doc comment for the derivation.
-  rmm::device_buffer null_mask;
+  auto null_mask             = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream);
   cudf::size_type null_count = 0;
   if (build_has_null) {
     auto [mask, count] = cudf::bools_to_mask(mark_column->view(), stream);

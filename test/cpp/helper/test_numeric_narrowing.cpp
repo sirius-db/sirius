@@ -69,7 +69,7 @@ std::unique_ptr<cudf::column> make_test_column(cudf::data_type type,
     column = cudf::make_fixed_width_column(type, size, cudf::mask_state::UNALLOCATED, stream, mr);
   } else {
     auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-    auto* mask     = static_cast<cudf::bitmask_type*>(null_mask.data());
+    auto* mask                 = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
     cudf::size_type null_count = 0;
     for (cudf::size_type row = 0; row < size; ++row) {
       if (!valid[static_cast<std::size_t>(row)]) {

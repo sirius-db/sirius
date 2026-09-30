@@ -34,6 +34,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/combine.hpp>
@@ -438,8 +439,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       }
     }
     auto const num_rows = child_cols[0]->size();
-    return cudf::make_structs_column(
-      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
+    return cudf::make_structs_column(num_rows,
+                                     std::move(child_cols),
+                                     0,
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                     _stream,
+                                     _mr);
   }
 
   // `error()` is a runtime-error-raising function. We deliberately do not
