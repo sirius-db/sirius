@@ -22,6 +22,30 @@ set_property(
 # Harmless for the single-DSO static vcpkg build.
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
+if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(_sirius_cuda_link_script
+      "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld")
+  set(_sirius_cuda_link_interface
+      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/cmake/sirius/sirius-cuda-fatbin.ld>"
+  )
+  foreach(_target sirius_core sirius_extension)
+    target_link_options(${_target} INTERFACE
+                        "$<HOST_LINK:LINKER:-T,${_sirius_cuda_link_interface}>")
+    set_property(
+      TARGET ${_target}
+      APPEND
+      PROPERTY INTERFACE_LINK_DEPENDS "${_sirius_cuda_link_interface}")
+  endforeach()
+  foreach(_target sirius_shared sirius_loadable_extension)
+    target_link_options(${_target} PRIVATE
+                        "$<HOST_LINK:LINKER:-T,${_sirius_cuda_link_script}>")
+    set_property(
+      TARGET ${_target}
+      APPEND
+      PROPERTY LINK_DEPENDS "${_sirius_cuda_link_script}")
+  endforeach()
+endif()
+
 # Shared configuration for both extension targets
 set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
                                      -Wrange-loop-analysis -Wnull-dereference)
