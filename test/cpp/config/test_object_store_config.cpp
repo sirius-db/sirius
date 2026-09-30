@@ -156,10 +156,20 @@ TEST_CASE("sirius_config accepts object_store_config through its setter",
              "  executor:\n"
              "    scan_manager:\n"
              "      rest:\n"
-             "        max_connections: 8\n");
-  cfg.load_from_file(path);
-  CHECK(cfg.get_scan_manager_config().object_store.access_key == input.access_key);
-  CHECK(cfg.get_scan_manager_config().object_store.s3_signing_mode == input.s3_signing_mode);
+             "        request_timeout_s: 8\n");
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK(cfg.get_scan_manager_config().rest.request_timeout_s == 8);
+
+  auto const& retained = cfg.get_scan_manager_config().object_store;
+  CHECK(retained.endpoint == input.endpoint);
+  CHECK(retained.region == input.region);
+  CHECK(retained.access_key == input.access_key);
+  CHECK(retained.secret_key == input.secret_key);
+  CHECK(retained.session_token == input.session_token);
+  CHECK(retained.s3_signing_mode == input.s3_signing_mode);
+  CHECK(retained.s3_transport == input.s3_transport);
+  CHECK(retained.ca_bundle_path == input.ca_bundle_path);
+  CHECK(retained.tls_verify == input.tls_verify);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
