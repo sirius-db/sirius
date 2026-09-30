@@ -214,9 +214,9 @@ TEST_CASE("deferred walk: unsupported projected type still refuses at constructi
 
   // Eager in both modes: an undecodable type must refuse at plan time.
   REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true)),
-                      Catch::Contains("128-bit"));
+                      Catch::Matchers::ContainsSubstring("128-bit"));
   REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false)),
-                      Catch::Contains("128-bit"));
+                      Catch::Matchers::ContainsSubstring("128-bit"));
 }
 
 TEST_CASE("deferred walk: overflow-string refusal moves from construction to ensure",
@@ -232,16 +232,18 @@ TEST_CASE("deferred walk: overflow-string refusal moves from construction to ens
     std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::VARCHAR)};
 
   REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false)),
-                      Catch::Contains("overflow"));
+                      Catch::Matchers::ContainsSubstring("overflow"));
 
   // Deferred: construction succeeds and the refusal moves to the walk. The plan-time,
   // table-level overflow probe in sirius_plan_get still refuses these before this point.
   auto deferred = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true));
   REQUIRE(deferred.metadata_walk_pending());
-  REQUIRE_THROWS_WITH(deferred.ensure_metadata_prepared(), Catch::Contains("overflow"));
+  REQUIRE_THROWS_WITH(deferred.ensure_metadata_prepared(),
+                      Catch::Matchers::ContainsSubstring("overflow"));
   // The failed walk is not latched: still pending, and a retry throws again.
   REQUIRE(deferred.metadata_walk_pending());
-  REQUIRE_THROWS_WITH(deferred.ensure_metadata_prepared(), Catch::Contains("overflow"));
+  REQUIRE_THROWS_WITH(deferred.ensure_metadata_prepared(),
+                      Catch::Matchers::ContainsSubstring("overflow"));
 }
 
 TEST_CASE("deferred walk: split claims see the walk's row-group count",

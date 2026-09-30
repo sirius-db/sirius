@@ -57,14 +57,24 @@ LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
 Either way, all DuckDB queries are automatically intercepted by the optimizer hook and run on GPU — no query rewrites required. Queries with unsupported operators fall back silently to CPU.
 
 ```sql
+-- Load the TPC-H extension and generate data (scale factor 10 = ~10 GB)
+INSTALL tpch;
+LOAD tpch;
+CALL dbgen(sf=10);
+
 -- Plain SQL runs on GPU automatically
 SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
 
+-- TPC-H data is exported as Parquet for use in later examples
+COPY lineitem TO '/path/to/lineitem.parquet' (FORMAT PARQUET);
+
 -- Disable transparent GPU execution for this connection
 SET gpu_execution = false;
+-- ... or for every connection of this database instance without a session value
+SET GLOBAL gpu_execution = false;
 ```
 
 Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
@@ -74,13 +84,9 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
-After building Sirius above, run these commands from the repository root to build the Python
-package against the same DuckDB source as the extension:
-
-```bash
-git submodule update --init duckdb-python
-pixi run -e duckdb-python build-duckdb-python
-```
+The default Pixi environment includes DuckDB's Python package. Its DuckDB version must match
+the version used to build the Sirius extension. Forked or nightly DuckDB builds may also require
+a Python package built from compatible source.
 
 Save this example as `example.py` in the repository root and replace `/path/to/lineitem.parquet`
 with your TPC-H Parquet file. `allow_unsigned_extensions` allows loading the locally built
@@ -110,7 +116,7 @@ con.close()
 Run it from the repository root:
 
 ```bash
-pixi run -e duckdb-python python example.py
+pixi run python example.py
 ```
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
@@ -236,7 +242,7 @@ exporter, per-query labeling, generating telemetry (using a TPC-H helper), and v
 Sirius is under active development. Notable current limitations include:
 
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types.
-- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc.
+- **Operator Coverage:** At present, Sirius supports `FILTER`, `PROJECTION`, `JOIN` (Hash/Nested Loop/Delim), `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 

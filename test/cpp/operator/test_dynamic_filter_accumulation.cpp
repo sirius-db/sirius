@@ -18,16 +18,24 @@
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
 
+#include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
+
 #include <rmm/cuda_device.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <catch.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -59,6 +67,93 @@ void require_no_tracker(acc::fixture const& fixture)
     REQUIRE_FALSE(allocator.is_stream_tracked(fixture.task_stream(static_cast<int>(device))));
     REQUIRE(allocator.get_active_reservation_count() == 0);
   }
+}
+
+/**
+ * @brief A GPU 0 batch whose first column is the fixture's INT32 key reinterpreted as @p first (a
+ * `TIMESTAMP_DAYS` bit cast or a `STRING` rendering) and whose second is the fixture's INT64 key.
+ */
+acc::batch_ptr make_mixed_batch(acc::fixture const& fixture,
+                                cudf::type_id first,
+                                std::int64_t start,
+                                cudf::size_type rows)
+{
+  auto const base   = fixture.make_batch(0, start, rows);
+  auto const view   = sirius::get_cudf_table_view(*base);
+  auto& space       = fixture.gpu(0);
+  auto const stream = space.acquire_stream();
+  auto const mr     = space.get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  if (first == cudf::type_id::STRING) {
+    columns.push_back(cudf::strings::from_integers(view.column(0), stream, mr));
+  } else {
+    columns.push_back(std::make_unique<cudf::column>(
+      cudf::bit_cast(view.column(0), cudf::data_type{first}), stream, mr));
+  }
+  columns.push_back(std::make_unique<cudf::column>(view.column(1), stream, mr));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+  stream.sync();
+  return sirius::make_data_batch(
+    std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+/// The accumulated Bloom filter @p fixture published for key @p key.
+op::sirius_dynamic_bloom_filter const& published_bloom(acc::fixture const& fixture, std::size_t key)
+{
+  auto const filters = acc::filters_on_column(*fixture.channel, key);
+  REQUIRE(filters.size() == 1);
+  auto const* bloom = dynamic_cast<op::sirius_dynamic_bloom_filter const*>(filters.front().get());
+  REQUIRE(bloom != nullptr);
+  return *bloom;
+}
+
+/// A column of @p values on the current GPU, with row `i` null iff `valid[i]` is false.
+template <class T>
+std::unique_ptr<cudf::column> make_probe(std::vector<T> const& values,
+                                         ::cuda::stream_ref stream,
+                                         std::vector<bool> const& valid = {})
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_to_id<T>()},
+                                          static_cast<cudf::size_type>(values.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream);
+  REQUIRE(cudaMemcpyAsync(column->mutable_view().data<T>(),
+                          values.data(),
+                          values.size() * sizeof(T),
+                          cudaMemcpyHostToDevice,
+                          stream.get()) == cudaSuccess);
+  if (!valid.empty()) {
+    std::vector<cudf::bitmask_type> words(
+      cudf::bitmask_allocation_size_bytes(column->size()) / sizeof(cudf::bitmask_type), 0);
+    for (std::size_t row = 0; row < valid.size(); ++row) {
+      if (valid[row]) { words[row / 32] |= cudf::bitmask_type{1} << (row % 32); }
+    }
+    auto const nulls = static_cast<cudf::size_type>(std::ranges::count(valid, false));
+    column->set_null_mask(
+      rmm::device_buffer{words.data(), words.size() * sizeof(cudf::bitmask_type), stream}, nulls);
+  }
+  stream.sync();
+  return column;
+}
+
+/// Runs @p bloom's GPU 0 probe over @p probe and returns the mask; the mask must have no nulls.
+std::vector<bool> probe_mask(op::sirius_dynamic_bloom_filter const& bloom,
+                             cudf::column_view const& probe,
+                             ::cuda::stream_ref stream,
+                             std::uint32_t const* prior_mask_words = nullptr)
+{
+  auto const mask =
+    bloom.compute_mask(probe, prior_mask_words, 0, stream, cudf::get_current_device_resource_ref());
+  REQUIRE(mask);
+  REQUIRE(mask->type().id() == cudf::type_id::BOOL8);
+  REQUIRE_FALSE(mask->nullable());
+  std::vector<std::uint8_t> host(static_cast<std::size_t>(mask->size()));
+  REQUIRE(
+    cudaMemcpyAsync(
+      host.data(), mask->view().data<bool>(), host.size(), cudaMemcpyDeviceToHost, stream.get()) ==
+    cudaSuccess);
+  stream.sync();
+  return std::vector<bool>(host.begin(), host.end());
 }
 
 }  // namespace
@@ -226,7 +321,7 @@ TEST_CASE("publication waits for contributions still queued on every GPU",
 {
   auto const gpus = std::min(acc::visible_gpus(), 3);
   if (gpus < 2 || !acc::peer_dma_between_first(gpus)) {
-    SKIP_TEST("needs at least two GPUs with working peer DMA between every pair");
+    WARN("needs at least two GPUs with working peer DMA between every pair");
     return;
   }
   // "sources": GPU 1 contributes, so the root merges it (fold, source-ready wait, merge, egress).
@@ -264,7 +359,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 {
   auto const gpus = std::min(acc::visible_gpus(), 4);
   if (gpus < 2 || !acc::peer_dma_between_first(gpus)) {
-    SKIP_TEST("needs at least two GPUs with working peer DMA between every pair");
+    WARN("needs at least two GPUs with working peer DMA between every pair");
     return;
   }
   // 4'718'593 rows give 9'437'216-byte arrays: five 2 MiB chunks per key with a short last chunk,
@@ -317,7 +412,7 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 
   // Visible only after every replica is ready.
   for (std::size_t key = 0; key < 2; ++key) {
-    auto filters = fixture.channel->filters_for_column(key);
+    auto filters = acc::filters_on_column(*fixture.channel, key);
     REQUIRE(filters.size() == 1);
     REQUIRE(
       dynamic_cast<op::sirius_dynamic_bloom_filter const&>(*filters.front()).replica_count() ==
@@ -343,7 +438,7 @@ TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
           "[dynamic_filter][multi_partition][mgpu]")
 {
   if (!acc::peer_dma_between_first(2)) {
-    SKIP_TEST("needs two GPUs with working peer DMA");
+    WARN("needs two GPUs with working peer DMA");
     return;
   }
   struct case_shape {
@@ -422,7 +517,7 @@ TEST_CASE("a refused scratch lease skips publication before enqueueing anything"
           "[dynamic_filter][multi_partition][mgpu]")
 {
   if (!acc::peer_dma_between_first(2)) {
-    SKIP_TEST("needs two GPUs with working peer DMA");
+    WARN("needs two GPUs with working peer DMA");
     return;
   }
   acc::fixture fixture(2);
@@ -446,7 +541,7 @@ TEST_CASE("a refused scratch lease skips publication before enqueueing anything"
   REQUIRE(counters.accumulation_publications_finished == 0);
   REQUIRE(counters.filters_pushed == 0);
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("cancel while collecting never waits for queued inserts",
@@ -518,7 +613,7 @@ TEST_CASE("input closed before every batch contributed ends without a filter",
   fixture.session->finish_input();
   REQUIRE_FALSE(fixture.contribute(second));
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
   REQUIRE(fixture.allocated_bytes() == baseline);
   REQUIRE(fixture.stats.snapshot().accumulations_incomplete == 1);
 }
@@ -527,7 +622,7 @@ TEST_CASE("a contribution that does not match its partial's GPU fails the attemp
           "[dynamic_filter][multi_partition][mgpu]")
 {
   if (acc::visible_gpus() < 2) {
-    SKIP_TEST("needs two GPUs");
+    WARN("needs two GPUs");
     return;
   }
   acc::fixture fixture(2);
@@ -552,7 +647,7 @@ TEST_CASE("a contribution that does not match its partial's GPU fails the attemp
   REQUIRE(counters.accumulations_skipped_error == 1);
   REQUIRE(counters.accumulation_publications_finished == 0);
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("a late batch without rows is ignored by contributions",
@@ -602,7 +697,7 @@ TEST_CASE("a mismatched planned key type is omitted without losing its sibling",
   fixture.run(fixture.contribute(second), 0);
   REQUIRE(fixture.stats.snapshot().keys_skipped_type_mismatch == 1);
   REQUIRE(fixture.channel->filter_count() == 1);
-  REQUIRE(fixture.channel->filters_for_column(0).empty());
+  REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
   for (auto const& batch : {first, second}) {
     REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
   }
@@ -648,7 +743,7 @@ TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
           "[dynamic_filter][multi_partition][mgpu]")
 {
   if (!acc::peer_dma_between_first(2)) {
-    SKIP_TEST("needs two GPUs with working peer DMA");
+    WARN("needs two GPUs with working peer DMA");
     return;
   }
   acc::fixture fixture(2);
@@ -666,14 +761,14 @@ TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
   REQUIRE(fixture.stats.snapshot().accumulations_skipped_admission == 1);
   fixture.session->finish_input();
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("a failing publishing job is masked, counted, and settles",
           "[dynamic_filter][multi_partition][mgpu]")
 {
   if (acc::visible_gpus() < 2) {
-    SKIP_TEST("needs two GPUs");
+    WARN("needs two GPUs");
     return;
   }
   acc::fixture fixture(2);
@@ -694,7 +789,7 @@ TEST_CASE("a failing publishing job is masked, counted, and settles",
   REQUIRE(counters.accumulations_skipped_error == 1);
   REQUIRE(counters.filters_pushed == 0);
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
   REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
@@ -727,7 +822,7 @@ TEST_CASE("an uninvoked publishing job ends the attempt without a filter",
     REQUIRE(counters.publications_failed == 1);
   }
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
   REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
@@ -763,5 +858,127 @@ TEST_CASE("cancellation during the late wait prevents fan-out", "[dynamic_filter
   REQUIRE(counters.publications_failed == 1);
   REQUIRE(counters.accumulations_skipped_error == 0);
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->empty());
+  REQUIRE(fixture.channel->snapshot().empty());
+}
+
+TEST_CASE("accumulation declines admitted key types it cannot insert",
+          "[dynamic_filter][multi_partition]")
+{
+  auto const key_type = GENERATE(cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::STRING);
+  CAPTURE(key_type);
+  acc::fixture fixture;
+  auto const first  = make_mixed_batch(fixture, key_type, 0, 300);
+  auto const second = make_mixed_batch(fixture, key_type, 900, 300);
+  auto const before = fixture.allocated_bytes();
+  // The whole-build Bloom filter admits both types; accumulation inserts only INT32 and INT64.
+  REQUIRE(op::sirius_dynamic_bloom_filter::supports(cudf::data_type{key_type}));
+  REQUIRE_FALSE(op::detail::accumulated_bloom_builder::supports(cudf::data_type{key_type}));
+
+  SECTION("as the only key, nothing starts or allocates")
+  {
+    REQUIRE_FALSE(
+      fixture.begin({first, second}, fixture.make_plan(256 * mib, {cudf::data_type{key_type}})));
+    REQUIRE_FALSE(fixture.session->accumulation_claimed());
+    REQUIRE(fixture.allocated_bytes() == before);
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.keys_skipped_bloom_unsupported == 1);
+    REQUIRE(counters.accumulations_started == 0);
+  }
+  SECTION("beside an INT64 key, only the INT64 key accumulates")
+  {
+    REQUIRE(fixture.begin(
+      {first, second},
+      fixture.make_plan(256 * mib,
+                        {cudf::data_type{key_type}, cudf::data_type{cudf::type_id::INT64}})));
+    REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 1));
+    REQUIRE_FALSE(fixture.contribute(first));
+    fixture.run(fixture.contribute(second), 0);
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.keys_skipped_bloom_unsupported == 1);
+    REQUIRE(counters.accumulation_publications_finished == 1);
+    REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
+    for (auto const& batch : {first, second}) {
+      REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
+    }
+  }
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+}
+
+TEST_CASE("an accumulated filter probes like every other membership filter",
+          "[dynamic_filter][multi_partition]")
+{
+  acc::fixture fixture;
+  // Key 0 (INT32) holds 0..299 and 900..1199; key 1 (INT64) holds 3k + 1 for the same k.
+  auto const first  = fixture.make_batch(0, 0, 300);
+  auto const second = fixture.make_batch(0, 900, 300);
+  REQUIRE(fixture.begin({first, second}));
+  REQUIRE_FALSE(fixture.contribute(first));
+  fixture.run(fixture.contribute(second), 0);
+  REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 1);
+  auto const& int32_key = published_bloom(fixture, 0);
+  auto const& int64_key = published_bloom(fixture, 1);
+
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+  auto const stream = fixture.task_stream(0);
+
+  SECTION("an INT64 key reads an INT32 probe")
+  {
+    auto const probe = make_probe<std::int32_t>({1, 4, 898, 2701, 3598}, stream);
+    REQUIRE(probe_mask(int64_key, probe->view(), stream) ==
+            std::vector<bool>{true, true, true, true, true});
+  }
+  SECTION("an INT32 key reads an INT64 probe and rejects values outside INT32")
+  {
+    constexpr auto above = std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1;
+    constexpr auto below = std::int64_t{std::numeric_limits<std::int32_t>::min()} - 1;
+    auto const probe =
+      make_probe<std::int64_t>({0, 299, 900, 1199, above, below, std::int64_t{1} << 40}, stream);
+    REQUIRE(probe_mask(int32_key, probe->view(), stream) ==
+            std::vector<bool>{true, true, true, true, false, false, false});
+  }
+  SECTION("rows the prior mask dropped stay dropped")
+  {
+    auto const probe         = make_probe<std::int32_t>({0, 1, 2, 3}, stream);
+    std::uint32_t const keep = 0b0101;
+    rmm::device_buffer const words{&keep, sizeof(keep), stream};
+    REQUIRE(probe_mask(
+              int32_key, probe->view(), stream, static_cast<std::uint32_t const*>(words.data())) ==
+            std::vector<bool>{true, false, true, false});
+  }
+  SECTION("null probe rows are non-members in a mask without nulls")
+  {
+    auto const probe =
+      make_probe<std::int32_t>({0, 1, 2, 3}, stream, std::vector<bool>{true, false, true, false});
+    REQUIRE(probe_mask(int32_key, probe->view(), stream) ==
+            std::vector<bool>{true, false, true, false});
+  }
+}
+
+TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot read",
+          "[dynamic_filter][multi_partition]")
+{
+  acc::fixture fixture;
+  auto const first  = fixture.make_batch(0, 0, 300);
+  auto const second = fixture.make_batch(0, 900, 300);
+  // Key 0 is probed at FLOAT64, which no integer key domain reads; key 1 is probed at a narrower
+  // integer carrier, which its domain reads.
+  REQUIRE(fixture.begin(
+    {first, second},
+    fixture.make_plan(
+      256 * mib,
+      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}},
+      {},
+      {cudf::data_type{cudf::type_id::FLOAT64}, cudf::data_type{cudf::type_id::INT32}})));
+  REQUIRE_FALSE(fixture.contribute(first));
+  fixture.run(fixture.contribute(second), 0);
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.bindings_skipped_incompatible_probe == 1);
+  REQUIRE(counters.filters_pushed == 1);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.accumulations_skipped_error == 0);
+  REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
+  for (auto const& batch : {first, second}) {
+    REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
+  }
+  REQUIRE(fixture.channel->snapshot().terminal());
 }

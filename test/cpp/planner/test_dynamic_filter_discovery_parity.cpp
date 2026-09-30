@@ -605,6 +605,38 @@ TEST_CASE_METHOD(discovery_parity_fixture,
 }
 
 TEST_CASE_METHOD(discovery_parity_fixture,
+                 "discovery parity - a UNION ALL probe fans into every arm",
+                 "[dynamic_filter][parity][isolated_context]")
+{
+  // Both walks descend a union positionally into every child, so one scan binds per arm. Every
+  // other case in this file follows a single spine.
+  dynamic_filter_on_guard filter_on(*con);
+  auto c = plan_parity_case(*con,
+                            "SELECT * FROM (SELECT id FROM big_left UNION ALL "
+                            "SELECT ckey FROM small_c) t "
+                            "JOIN small_right r ON t.id = r.rid WHERE r.other > 0");
+
+  auto joins = comparison_joins_of(*c.oracle_plan);
+  REQUIRE(joins.size() == 1);
+  auto const oracle = oracle_targets_for_join(*joins[0]);
+  REQUIRE(oracle.size() == 2);
+  REQUIRE(oracle[0].condition_index == 0);
+  REQUIRE(oracle[1].condition_index == 0);
+  REQUIRE(oracle[0].table_name == "big_left");
+  REQUIRE(oracle[1].table_name == "small_c");
+
+  auto physical_joins = hash_joins_of(c.physical.get());
+  REQUIRE(physical_joins.size() == 1);
+  REQUIRE(scan_bindings_of(*physical_joins[0], c.physical.get()) ==
+          std::vector<sirius_scan_binding>{{.condition_index = 0,
+                                            .table_name      = oracle[0].table_name,
+                                            .push_ordinal    = oracle[0].output_ordinal},
+                                           {.condition_index = 0,
+                                            .table_name      = oracle[1].table_name,
+                                            .push_ordinal    = oracle[1].output_ordinal}});
+}
+
+TEST_CASE_METHOD(discovery_parity_fixture,
                  "discovery parity - a cast projection: DuckDB crosses it, Sirius refuses",
                  "[dynamic_filter][parity][isolated_context]")
 {

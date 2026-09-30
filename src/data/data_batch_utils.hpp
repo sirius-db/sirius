@@ -113,7 +113,8 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
  * cucascade::convert_gpu_to_gpu() can call
  * cudaStreamWaitEvent(reader_stream, writer_event, 0) before peer-copying
  * source buffers. This closes the cross-mempool stream-ordered race in
- * multi-GPU runs.
+ * multi-GPU runs. Record on the producing thread/device, including when the actual writer
+ * is the default stream: cuCascade's constructor treats its null handle as a legacy sentinel.
  *
  * @param table The cudf table (will be moved from).
  * @param memory_space The memory space where the table resides.
@@ -134,6 +135,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::make_unique<cudf::table>(std::move(table)), memory_space, writer_stream);
+  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
@@ -156,6 +158,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
+  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,
@@ -174,7 +177,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  *
  * STREAM-LINEAGE: @p writer_stream must be a stream that is ordered after every write to the
  * memory referenced by @p view (the caller is responsible for inserting any cudaStreamWaitEvent
- * needed to establish that ordering before calling this helper).
+ * needed to establish that ordering before calling this helper). Call on the producing
+ * thread/device so default-stream writers are recorded in the correct context.
  *
  * @tparam Owner Copy-constructible type that keeps @p view's device memory alive.
  * @param view The table view to expose (data ownership lives in @p owner).
@@ -198,6 +202,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     view, std::forward<Owner>(owner), alloc_size, memory_space, writer_stream);
+  if (gpu_repr->get_writer_event() == nullptr) { gpu_repr->record_writer_event(writer_stream); }
   const auto batch_id = get_next_batch_id();
   return cucascade::data_batch::make(
     batch_id,

@@ -96,9 +96,13 @@ struct build_probe_decision {
 /// Decide the next BUILD_PROBE action from a per-partition snapshot. Prefers scheduling a build for
 /// the first NOT_BUILT partition that has both its build and a probe batch, then probing the first
 /// BUILT partition with probe data; otherwise reports whether it is waiting on build or probe
-/// input.
+/// input, or (once @p probe_finished is true and nothing else is outstanding) that the operator is
+/// complete. A slot only counts as "waiting on probe" while the probe side could still deliver more
+/// data for it -- once probe_finished, a NOT_BUILT build-only orphan or a BUILT-and-drained slot
+/// has nothing left to do, whether or not it has been torn down yet (teardown is a resource-release
+/// side effect, not a precondition for completion).
 [[nodiscard]] build_probe_decision select_build_probe_action(
-  std::vector<build_probe_slot_view> const& slots);
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
 
 /// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
 /// the natural-count, broadcast-candidacy, and BUILD_PROBE-eligibility logic into one place.
@@ -464,6 +468,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Atomic: the size estimator polls probe_bytes_are_unweighted() without op_state_mutex.
   std::atomic<HASH_JOIN_MODE> _join_mode{HASH_JOIN_MODE::STANDARD};
+  // Set when a MARK build pipeline finishes without publishing a batch. Probe tasks then emit
+  // definite false marks directly, including for NULL probe keys (NULL IN empty is false).
+  std::atomic<bool> _mark_build_empty{false};
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.

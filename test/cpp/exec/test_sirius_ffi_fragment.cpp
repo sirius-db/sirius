@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-// Regression coverage for Fragment::Impl::end_lifecycle() (src/sirius_ffi.cpp): a build()
-// failure while the transaction is still open must roll it back, not commit it (a7bb47e2).
+// Regression coverage for the public FFI Context and Fragment lifecycle (src/sirius_ffi.cpp).
+// Fragment::Impl::end_lifecycle() must roll back a build() failure while the transaction is
+// still open, not commit it (a7bb47e2).
 //
 // The public FFI surface links only DuckDB's substrait consumer (no substrait-plan-from-SQL
 // helper, no raw-SQL passthrough), so no test here can construct a valid Fragment or inspect
@@ -25,15 +26,23 @@
 // through the public API: that end_lifecycle() leaves the connection able to start and fail a
 // second, independent Fragment cleanly.
 
+#include "config.hpp"
+#include "log/sink.hpp"
 #include "sirius/ffi.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <memory>
+#include <optional>
 #include <source_location>
 #include <string>
+#include <system_error>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -45,6 +54,47 @@ fs::path isolated_memory_config_path()
   std::source_location loc = std::source_location::current();
   return fs::path(loc.file_name()).parent_path().parent_path() / "scan" / "memory.yaml";
 }
+
+std::optional<std::string> saved_env(const char* name)
+{
+  if (auto const* value = std::getenv(name)) { return value; }
+  return std::nullopt;
+}
+
+void restore_env(const char* name, std::optional<std::string> const& value)
+{
+  if (value) {
+    setenv(name, value->c_str(), 1);
+  } else {
+    unsetenv(name);
+  }
+}
+
+struct logging_state_guard {
+  explicit logging_state_guard(fs::path root) : test_root(std::move(root)) {}
+
+  ~logging_state_guard()
+  {
+    duckdb::Config::LOG_BACKEND.swap(backend);
+    duckdb::Config::LOG_DIR.swap(log_dir);
+    duckdb::Config::LOG_LEVEL.swap(level);
+    if (sirius::log::get_sink() != sink) { sirius::log::set_sink(sink); }
+    restore_env("SIRIUS_LOG_BACKEND", env_backend);
+    restore_env("SIRIUS_LOG_DIR", env_log_dir);
+    restore_env("SIRIUS_LOG_LEVEL", env_level);
+    std::error_code error;
+    fs::remove_all(test_root, error);
+  }
+
+  std::string backend{duckdb::Config::LOG_BACKEND};
+  std::string log_dir{duckdb::Config::LOG_DIR};
+  std::string level{duckdb::Config::LOG_LEVEL};
+  std::shared_ptr<sirius::log::sink> sink{sirius::log::get_sink()};
+  std::optional<std::string> env_backend{saved_env("SIRIUS_LOG_BACKEND")};
+  std::optional<std::string> env_log_dir{saved_env("SIRIUS_LOG_DIR")};
+  std::optional<std::string> env_level{saved_env("SIRIUS_LOG_LEVEL")};
+  fs::path test_root;
+};
 
 void declare_unresolvable_column(sirius::ffi::Fragment& fragment, const std::string& type_name)
 {
@@ -104,4 +154,30 @@ TEST_CASE("Fragment destroyed between a failed build() and reuse also closes the
   auto second = sirius::ffi::make_fragment(*context);
   declare_unresolvable_column(*second, "also_not_a_real_type_xyz");
   require_build_fails_without_transaction_exception(*second);
+}
+
+TEST_CASE("FFI context restores logging settings when sink construction fails",
+          "[isolated_context][sirius_ffi]")
+{
+  auto const test_root = fs::temp_directory_path() / "sirius-ffi-log-dir-rollback-test";
+  logging_state_guard restore{test_root};
+  fs::remove_all(test_root);
+  fs::create_directories(test_root);
+  auto const blocker = test_root / "not-a-directory";
+  std::ofstream(blocker) << "file";
+  REQUIRE(fs::is_regular_file(blocker));
+  auto const invalid_dir = blocker / "child";
+
+  duckdb::Config::LOG_BACKEND = "noop";
+  duckdb::Config::LOG_DIR     = (test_root / "previous").string();
+  duckdb::Config::LOG_LEVEL   = "warn";
+  setenv("SIRIUS_LOG_BACKEND", "spdlog", 1);
+  setenv("SIRIUS_LOG_DIR", invalid_dir.string().c_str(), 1);
+  setenv("SIRIUS_LOG_LEVEL", "debug", 1);
+
+  REQUIRE_THROWS(sirius::ffi::make_context_from_config(isolated_memory_config_path().string()));
+  REQUIRE(duckdb::Config::LOG_BACKEND == "noop");
+  REQUIRE(duckdb::Config::LOG_DIR == (test_root / "previous").string());
+  REQUIRE(duckdb::Config::LOG_LEVEL == "warn");
+  REQUIRE(sirius::log::get_sink() == restore.sink);
 }

@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/null_mask.hpp>
-#include <cudf/stream_compaction.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -27,6 +23,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/bloom_filter_ref.cuh>
+#include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
 #include <cuda/std/limits>
@@ -86,8 +83,11 @@ using sirius_bloom = cuco::bloom_filter<KeyT,
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
 
-using bloom_storage =
-  std::variant<bloom_owner<sirius_bloom<std::int32_t>>, bloom_owner<sirius_bloom<std::int64_t>>>;
+// One alternative per membership_key_rep.
+using bloom_storage = std::variant<bloom_owner<sirius_bloom<std::int32_t>>,
+                                   bloom_owner<sirius_bloom<std::int64_t>>,
+                                   bloom_owner<sirius_bloom<std::uint32_t>>,
+                                   bloom_owner<sirius_bloom<std::uint64_t>>>;
 
 template <class Filter>
 bloom_owner<Filter> make_bloom(std::size_t num_blocks,
@@ -122,29 +122,41 @@ void copy_filter_storage(Filter const& source,
 }
 
 template <class Filter>
-bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
+bloom_owner<Filter> build_bloom(membership_key_domain const& domain,
+                                cudf::column_view const& keys,
                                 std::size_t num_blocks,
                                 rmm::device_async_resource_ref mr,
                                 cuda::stream_ref stream)
 {
   using key_type = typename Filter::key_type;
   auto result    = make_bloom<Filter>(num_blocks, mr, stream);
-  auto const* d  = keys.data<key_type>();
-  auto const n   = keys.size();
-  result->add_async(d, d + n, stream);
+  if (keys.size() > 0) {
+    // The build column may sit at a same-family carrier other than the rep; the iterator converts
+    // per element instead of materializing a rep-typed copy.
+    bool const added = detail::with_build_key_iterator<key_type>(
+      domain, keys, stream, mr, [&](auto first, auto last) {
+        result->add_async(first, last, stream);
+      });
+    if (!added) {
+      throw std::logic_error("[sirius_dynamic_bloom_filter] build carrier does not fit its rep.");
+    }
+  }
   return result;
 }
 
-template <class KeyT>
-constexpr cudf::type_id key_type_id() noexcept
-{
-  static_assert(std::is_same_v<KeyT, std::int32_t> || std::is_same_v<KeyT, std::int64_t>);
-  if constexpr (std::is_same_v<KeyT, std::int32_t>) {
-    return cudf::type_id::INT32;
-  } else {
-    return cudf::type_id::INT64;
+/// @brief The Bloom half of detail::membership_probe_functor: a converted key passes when the
+/// filter reports it. An inserted key always fits the key domain, so the adapter's rejection of a
+/// non-representable value preserves the no-false-negative contract.
+template <class FilterRef>
+struct bloom_lookup {
+  using key_type = typename FilterRef::key_type;
+  FilterRef ref;
+  __device__ __forceinline__ bool operator()(key_type key) const noexcept
+  {
+    return ref.contains(key);
   }
-}
+};
+
 }  // namespace
 
 struct bloom_replica {
@@ -173,13 +185,14 @@ struct bloom_replica {
 namespace {
 template <class KeyT>
 std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
+                                                   membership_key_domain const& domain,
                                                    cudf::column_view const& keys,
                                                    std::size_t num_blocks,
                                                    rmm::device_async_resource_ref mr,
                                                    cuda::stream_ref stream)
 {
   return std::make_unique<bloom_replica>(
-    device_id, build_bloom<sirius_bloom<KeyT>>(keys, num_blocks, mr, stream));
+    device_id, build_bloom<sirius_bloom<KeyT>>(domain, keys, num_blocks, mr, stream));
 }
 }  // namespace
 
@@ -362,7 +375,7 @@ struct sirius_dynamic_bloom_filter::impl {
 
 bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
 {
-  return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64;
+  return membership_key_supported(t);
 }
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
@@ -374,55 +387,38 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
                                                          ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
-  if (!supports(keys.type())) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
-  }
-  // Keep compacted storage alive until add_async is queued on stream.
-  std::unique_ptr<cudf::table> compacted;
-  cudf::column_view build_keys = keys;
-  if (keys.null_count() > 0) {
-    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
-    build_keys = compacted->view().column(0);
-  }
-  auto const n = build_keys.size();
+  // Classifies, checks the DECIMAL128 fit, compacts null build keys out, and names the source
+  // device; `build.compacted` stays alive until add_async is queued on `stream`.
+  auto const build = prepare_membership_build("[sirius_dynamic_bloom_filter]", keys, stream, mr);
+  _domain          = build.domain;
+  auto const n     = build.keys.size();
   cuda::stream_ref const s{stream.get()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
-  if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
-    throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
-  }
+  _impl->source_device  = build.source_device;
 
-  std::unique_ptr<bloom_replica> source;
-  switch (keys.type().id()) {
-    case cudf::type_id::INT32:
-      source =
-        build_bloom_replica<std::int32_t>(_impl->source_device, build_keys, num_blocks, mr, s);
-      break;
-    case cudf::type_id::INT64:
-      source =
-        build_bloom_replica<std::int64_t>(_impl->source_device, build_keys, num_blocks, mr, s);
-      break;
-    default:
-      throw std::logic_error(
-        "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
-  }
+  auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    return build_bloom_replica<key_type>(
+      _impl->source_device, _domain, build.keys, num_blocks, mr, s);
+  });
   _impl->replicas.push_back(std::move(source));
 }
 
 sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
 
-sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(std::unique_ptr<impl> completed)
-  : _impl{std::move(completed)}
+sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(membership_key_domain domain,
+                                                         std::unique_ptr<impl> completed)
+  : _domain{domain}, _impl{std::move(completed)}
 {
 }
 
 std::shared_ptr<sirius_dynamic_bloom_filter> sirius_dynamic_bloom_filter::make_accumulated(
-  std::unique_ptr<impl> completed)
+  membership_key_domain domain, std::unique_ptr<impl> completed)
 {
   // The constructor is private, so std::make_shared cannot reach it; ownership is taken at once.
   return std::shared_ptr<sirius_dynamic_bloom_filter>{
-    new sirius_dynamic_bloom_filter{std::move(completed)}};
+    new sirius_dynamic_bloom_filter{domain, std::move(completed)}};
 }
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(
@@ -541,76 +537,35 @@ std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
 
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
   int device_id,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   auto const resolved = detail::resolve_dynamic_filter_device_id(device_id);
   if (auto const* accumulated = _impl ? _impl->find_accumulated(resolved) : nullptr) {
-    auto const restored = detail::restore_probe_to(probe, accumulated->type, stream, mr);
-    auto const keys     = restored ? restored->view() : probe;
-    if (keys.type() != accumulated->type) { return nullptr; }
-    auto out = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
-                                         keys.size(),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         mr);
-    if (keys.size() != 0) {
-      auto* result = out->mutable_view().data<bool>();
-      if (keys.type().id() == cudf::type_id::INT32) {
-        auto const* begin = keys.data<std::int32_t>();
-        accumulated_ref<std::int32_t>(accumulated->bits->data(), accumulated->blocks)
-          .contains_async(begin, begin + keys.size(), result, stream);
-      } else {
-        // INT64
-        auto const* begin = keys.data<std::int64_t>();
-        accumulated_ref<std::int64_t>(accumulated->bits->data(), accumulated->blocks)
-          .contains_async(begin, begin + keys.size(), result, stream);
-      }
-    }
-    if (probe.nullable() && probe.null_count() > 0) {
-      out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
-    }
-    return out;
+    auto probe_with = [&]<class Key>(Key) {
+      auto const ref = accumulated_ref<Key>(accumulated->bits->data(), accumulated->blocks);
+      return detail::run_membership_probe<Key>(
+        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
+    };
+    // accumulated_bloom_builder::supports admits only INT32 and INT64 keys.
+    return accumulated->type.id() == cudf::type_id::INT32 ? probe_with(std::int32_t{})
+                                                          : probe_with(std::int64_t{});
   }
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  auto const want = std::visit(
-    [](auto const& bloom) {
-      using owner_type = std::decay_t<decltype(bloom)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      return cudf::data_type{key_type_id<key_type>()};
-    },
-    replica->bloom);
-  // A pinned chunk may store this key narrowed while the filter was published at
-  // the native carrier; restore rather than decline (see restore_probe_to). The
-  // equality below subsumes the old supports() guard: it admits exactly the two
-  // types the bloom is instantiated for.
-  auto const restored = detail::restore_probe_to(probe, want, stream, mr);
-  auto const keys     = restored ? restored->view() : probe;
-  if (keys.type() != want) { return nullptr; }
-
-  auto const n = keys.size();
-  auto out     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cuda::stream_ref const s{stream.get()};
-  auto* const outp = out->mutable_view().data<bool>();
-
-  std::visit(
+  return std::visit(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = keys.data<key_type>();
-      bloom->contains_async(d, d + n, outp, s);
+      auto ref         = bloom->ref();
+      return detail::run_membership_probe<key_type>(
+        _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
     },
     replica->bloom);
-
-  if (probe.nullable() && probe.null_count() > 0) {
-    out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
-  }
-  return out;
 }
 
 namespace detail {
@@ -908,7 +863,7 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
   std::span<dynamic_filter_replica_space const> targets)
 {
   for (auto const& active : keys) {
-    if (!sirius_dynamic_bloom_filter::supports(active.type)) {
+    if (!supports(active.type)) {
       throw std::invalid_argument("[accumulated_bloom_builder] unsupported accumulated key type");
     }
   }
@@ -1087,6 +1042,10 @@ std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> accumulated_bloom_buil
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
   filters.reserve(_impl->keys.size());
   for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
+    auto const domain = classify_membership_key(_impl->keys[key_index].type);
+    if (!domain) {
+      throw std::logic_error("[accumulated_bloom_builder] accumulated key type has no key domain");
+    }
     auto filter           = std::make_unique<sirius_dynamic_bloom_filter::impl>();
     filter->source_device = root_device;
     filter->accumulated_replicas.reserve(_impl->partials.size());
@@ -1098,7 +1057,7 @@ std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> accumulated_bloom_buil
                                                     entry->stream,
                                                     std::move(entry->arrays[key_index])));
     }
-    filters.push_back(sirius_dynamic_bloom_filter::make_accumulated(std::move(filter)));
+    filters.push_back(sirius_dynamic_bloom_filter::make_accumulated(*domain, std::move(filter)));
   }
   return filters;
 }

@@ -201,6 +201,7 @@ struct harness {
   std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<hook_operator> source        = std::make_unique<hook_operator>();
   std::unique_ptr<hook_operator> hook          = std::make_unique<hook_operator>();
+  std::unique_ptr<hook_operator> second_hook   = std::make_unique<hook_operator>();
   std::unique_ptr<hook_operator> consumer      = std::make_unique<hook_operator>();
   std::unique_ptr<hook_operator> consumer_sink = std::make_unique<hook_operator>();
   std::shared_ptr<sirius::pipeline::sirius_pipeline> downstream;
@@ -208,7 +209,11 @@ struct harness {
   std::atomic<std::uint64_t> next_task_id{1};
   std::atomic<int> executed{0};
 
-  explicit harness(bool per_stream = false) : memory(1, per_stream)
+  /**
+   * @param per_stream Whether the memory manager tracks reservations per stream
+   * @param two_hooks Whether `second_hook` follows `hook` in the pipeline, as its sink
+   */
+  explicit harness(bool per_stream = false, bool two_hooks = false) : memory(1, per_stream)
   {
     sirius::pipeline::pipeline_build_context const build{nullptr, true};
     pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build);
@@ -216,7 +221,8 @@ struct harness {
     sirius::pipeline::sirius_pipeline_build_state state;
     state.set_pipeline_source(*pipeline, *source);
     state.add_pipeline_operator(*pipeline, *hook);
-    state.set_pipeline_sink(*pipeline, *hook, 1);
+    if (two_hooks) { state.add_pipeline_operator(*pipeline, *second_hook); }
+    state.set_pipeline_sink(*pipeline, two_hooks ? *second_hook : *hook, 1);
     std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{pipeline};
     sirius::pipeline::assign_operator_ids(pipelines);
     global = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
@@ -327,6 +333,32 @@ std::function<after_work(sirius::op::operator_data const&, ::cuda::stream_ref)> 
     auto job = session.contribute(data.original_batch_ids().front(), batches.front(), stream);
     return job ? after_work{std::move(job)} : after_work{};
   };
+}
+
+/**
+ * @brief Enqueues a slow host callback on @p stream that stores into @p alive whether @p input
+ * still exists once the stream reaches the callback (1) or not (0).
+ */
+void enqueue_input_probe(::cuda::stream_ref stream,
+                         std::weak_ptr<cucascade::data_batch> input,
+                         std::shared_ptr<std::atomic<int>> alive)
+{
+  struct probe {
+    std::weak_ptr<cucascade::data_batch> input;
+    std::shared_ptr<std::atomic<int>> alive;
+  };
+  auto owned = std::make_unique<probe>(std::move(input), std::move(alive));
+  acc::announce_host_callback_handoff(owned.get());
+  REQUIRE(cudaLaunchHostFunc(
+            stream.get(),
+            [](void* argument) {
+              acc::observe_host_callback_handoff(argument);
+              std::unique_ptr<probe> const state{static_cast<probe*>(argument)};
+              std::this_thread::sleep_for(std::chrono::milliseconds{200});
+              state->alive->store(state->input.expired() ? 0 : 1);
+            },
+            owned.get()) == cudaSuccess);
+  (void)owned.release();  // The host callback owns it from here on.
 }
 
 static_assert(noexcept(sirius::pipeline::gpu_pipeline_executor::run_after_task_work(
@@ -459,6 +491,41 @@ TEST_CASE("a throwing after-task work is logged and the retry still runs",
   std::scoped_lock lock(record->mutex);
   REQUIRE(record->invocations == 1);
   REQUIRE_FALSE(test.completion->has_error());
+}
+
+TEST_CASE("a second operator returning after-task work fails the task once its stream is idle",
+          "[pipeline][after_task_work]")
+{
+  harness test(false, true);
+  auto const noop       = [](::cuda::stream_ref) {};
+  test.hook->on_observe = [noop](sirius::op::operator_data const&, ::cuda::stream_ref) {
+    return after_work{noop};
+  };
+  std::weak_ptr<cucascade::data_batch> input;
+  auto const alive             = std::make_shared<std::atomic<int>>(-1);
+  test.second_hook->on_observe = [noop, &input, alive](sirius::op::operator_data const&,
+                                                       ::cuda::stream_ref stream) {
+    // Stands in for GPU work the hook enqueued that still reads the task's input.
+    enqueue_input_probe(stream, input, alive);
+    return after_work{noop};
+  };
+
+  auto batch       = test.memory.make_batch(0, 0, 100);
+  input            = batch;
+  auto task        = test.make_task(std::move(batch));
+  auto info        = task->get_estimated_reservation_size_info(&test.memory.gpu(0));
+  auto reservation = test.memory.gpu(0).make_reservation_or_null(64 * acc::mib);
+  REQUIRE(reservation);
+  auto* local =
+    dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+  REQUIRE(local != nullptr);
+  local->set_reservation(std::move(reservation), info);
+  auto const stream = test.memory.task_stream(0);
+  REQUIRE_THROWS_AS(task->execute(stream), std::logic_error);
+  // The task synchronized its stream before releasing the input it had passed to the hooks.
+  REQUIRE(cudaStreamQuery(stream.get()) == cudaSuccess);
+  REQUIRE(alive->load() == 1);
+  REQUIRE(input.expired());
 }
 
 TEST_CASE("query completion while after-task work runs waits for it without validation errors",

@@ -66,6 +66,7 @@ namespace {
 /// A plain GPU pin of one column, chunked as asked, whose row i holds i.
 struct fake_entry {
   pinned_entry entry;
+  std::shared_ptr<pinned_entry const> entry_owner;
   std::shared_ptr<pin_entry_handle> handle;
 
   fake_entry(std::vector<std::int64_t> const& batch_rows,
@@ -97,8 +98,9 @@ struct fake_entry {
     cudaStreamSynchronize(stream.get());
     entry.data_batches_by_column.emplace(name, std::move(chunks));
 
-    handle = std::make_shared<pin_entry_handle>(name, 5);
-    handle->set_entry(&entry);
+    entry_owner = std::shared_ptr<pinned_entry const>(&entry, [](pinned_entry const*) {});
+    handle      = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const
@@ -309,6 +311,7 @@ namespace {
 /// the "this batch has no nulls" shape a multi-batch gather must also treat as valid.
 struct fake_nullable_entry {
   pinned_entry entry;
+  std::shared_ptr<pinned_entry const> entry_owner;
   std::shared_ptr<pin_entry_handle> handle;
 
   fake_nullable_entry(std::vector<std::int64_t> const& batch_rows,
@@ -357,8 +360,9 @@ struct fake_nullable_entry {
     cudaStreamSynchronize(stream.get());
     entry.data_batches_by_column.emplace(name, std::move(chunks));
 
-    handle = std::make_shared<pin_entry_handle>(name, 5);
-    handle->set_entry(&entry);
+    entry_owner = std::shared_ptr<pinned_entry const>(&entry, [](pinned_entry const*) {});
+    handle      = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const

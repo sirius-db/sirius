@@ -165,6 +165,17 @@ class accumulated_bloom_builder final {
   };
 
   /**
+   * @brief Whether keys of type @p type can be accumulated: INT32 and INT64 only.
+   *
+   * Narrower than `sirius_dynamic_bloom_filter::supports`: every other key type publishes only from
+   * a whole build.
+   */
+  [[nodiscard]] static constexpr bool supports(cudf::data_type type) noexcept
+  {
+    return type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::INT64;
+  }
+
+  /**
    * @brief Allocates zeroed arrays on every GPU of @p targets without waiting on the host.
    *
    * Each GPU's arrays are allocated under their own lease, attached to a new exclusive stream of

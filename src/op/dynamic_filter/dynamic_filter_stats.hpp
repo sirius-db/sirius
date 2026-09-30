@@ -59,6 +59,8 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t publications_skipped_build_not_whole     = 0;
   std::uint64_t publications_skipped_targets_drained     = 0;
   std::uint64_t filters_pushed                           = 0;
+
+  std::uint64_t bindings_skipped_incompatible_probe = 0;
 };
 
 /**
@@ -116,6 +118,9 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};
 
+  // Bindings whose recorded probe type no membership adapter can read (would decline every batch).
+  std::atomic<std::uint64_t> bindings_skipped_incompatible_probe{0};
+
   // Snapshot loads are relaxed and are not atomic across fields.
   [[nodiscard]] dynamic_filter_stats_snapshot snapshot() const noexcept
   {
@@ -161,7 +166,9 @@ struct dynamic_filter_stats {
         publications_skipped_build_not_whole.load(std::memory_order_relaxed),
       .publications_skipped_targets_drained =
         publications_skipped_targets_drained.load(std::memory_order_relaxed),
-      .filters_pushed = filters_pushed.load(std::memory_order_relaxed)};
+      .filters_pushed = filters_pushed.load(std::memory_order_relaxed),
+      .bindings_skipped_incompatible_probe =
+        bindings_skipped_incompatible_probe.load(std::memory_order_relaxed)};
   }
 };
 

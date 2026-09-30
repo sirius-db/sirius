@@ -83,6 +83,18 @@ using job       = sirius::op::dynamic_filter_publication_session::accumulation_j
 
 inline constexpr std::size_t mib = std::size_t{1} << 20;
 
+/// The filters @p channel currently holds for target column @p column.
+[[nodiscard]] inline std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter const>>
+filters_on_column(sirius::op::sirius_dynamic_filter_set const& channel, std::size_t column)
+{
+  auto const snapshot = channel.snapshot();
+  std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter const>> out;
+  for (auto const& entry : snapshot.entries()) {
+    if (entry.column_index == column) { out.push_back(entry.filter); }
+  }
+  return out;
+}
+
 /**
  * @brief Tells ThreadSanitizer that everything the calling thread did so far happens before the
  * host callback that receives @p handoff.
@@ -337,13 +349,17 @@ struct fixture {
 
   /**
    * @brief A plan whose one scan target binds key `i` of @p planned to build column `i`.
+   *
+   * @param probe_types The recorded probe type of each binding; empty means the planned key types
    */
   [[nodiscard]] sirius::op::dynamic_filter_publish_plan make_plan(
     std::uint64_t cap,
-    std::vector<cudf::data_type> planned = {cudf::data_type{cudf::type_id::INT32},
-                                            cudf::data_type{cudf::type_id::INT64}},
-    std::vector<int> replica_devices     = {}) const
+    std::vector<cudf::data_type> planned     = {cudf::data_type{cudf::type_id::INT32},
+                                                cudf::data_type{cudf::type_id::INT64}},
+    std::vector<int> replica_devices         = {},
+    std::vector<cudf::data_type> probe_types = {}) const
   {
+    if (probe_types.empty()) { probe_types = planned; }
     using plan_type = sirius::op::dynamic_filter_publish_plan;
     std::vector<plan_type::admitted_key> keys;
     std::vector<plan_type::key_binding> bindings;
@@ -351,7 +367,7 @@ struct fixture {
       keys.push_back({.planner_condition_index = index,
                       .build_key_ordinal       = static_cast<cudf::size_type>(index),
                       .storage_type            = planned[index]});
-      bindings.push_back({index, index, planned[index]});
+      bindings.push_back({index, index, probe_types.at(index)});
     }
     std::vector<sirius::op::dynamic_filter_replica_space> replicas;
     for (std::size_t index = 0; index < devices; ++index) {
@@ -420,7 +436,7 @@ struct fixture {
                                            batch_ptr const& probe,
                                            int device) const
   {
-    auto filters = channel->filters_for_column(key);
+    auto filters = filters_on_column(*channel, key);
     REQUIRE(filters.size() == 1);
     REQUIRE(filters.front()->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM);
     REQUIRE(filters.front()->is_available_on_device(device));
@@ -453,7 +469,7 @@ struct fixture {
                 stream.get()) == cudaSuccess);
     }
     auto mask = bloom->compute_mask(
-      local ? local->view() : column, device, stream, space.get_default_allocator());
+      local ? local->view() : column, nullptr, device, stream, space.get_default_allocator());
     REQUIRE(mask);
     auto count        = cudf::reduce(mask->view(),
                               *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
@@ -470,7 +486,7 @@ struct fixture {
   [[nodiscard]] sirius::op::detail::accumulated_bloom_builder::replica_contents replica(
     std::size_t key, int device) const
   {
-    auto filters = channel->filters_for_column(key);
+    auto filters = filters_on_column(*channel, key);
     REQUIRE(filters.size() == 1);
     auto const* bloom =
       dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(filters.front().get());

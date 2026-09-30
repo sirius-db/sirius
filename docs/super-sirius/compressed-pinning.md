@@ -41,7 +41,7 @@ that omit the `compression` argument; an explicit argument always wins.
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
 The tier decides whether compression helps at all. Measured against a 20.74 s all-host
-uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
+uncompressed baseline (main `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
 note the shipped TPC-H plans were rewritten onto `bitpack` after this measurement, so
 per-column throughput/ratio figures below predate the current plans):
 

@@ -573,7 +573,25 @@ matching-type control verifies that an unchanged pin still serves.
 
 Integration tests compare GPU and CPU results for a non-key decimal payload used both as a direct
 projection and in arithmetic, and discriminate the residency-gate states through the
-observability counters: beside
+test-side event counts. Producers publish `compressed_materialization` events through the context's
+`query_event_publisher`; the activity and count preserve the column/scan-node units below.
+`SiriusContext` owns no compressed-materialization counters or test snapshot methods. Test helpers
+subscribe before the measured operation with `drain_on_stop` enabled. Between operations, once
+all measured reporters have finished publishing, each snapshot stops and joins the subscriber,
+processing every queued event before reading the cumulative counters. It then installs a fresh
+subscription for the next operation. Snapshot calls must not overlap measured publications.
+Draining needs no per-event completion tracking; the publisher already enqueues synchronously.
+A stopped observer or delivery failure rejects the snapshot. Query completion alone does not imply
+subscriber completion.
+
+The publisher exposes an advisory atomic subscriber-interest check. Hash partitions use it
+before inspecting batch column types for these observations; without a subscriber, that
+inspection is skipped. Publishing also checks interest before acquiring the routing lock, then
+rechecks the subscriber list under the lock before delivery. Register observers before starting
+the measured operation: a concurrent registration may miss an event whose interest check has
+already returned false.
+
+Among these observations, beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
 after the residency gate (a later pass may still clear or prune it), a plan-time

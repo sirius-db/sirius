@@ -24,6 +24,7 @@
 #include <catch.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@
 #include <vector>
 
 using sirius::op::column_ref_resolver_fn;
+using sirius::op::dynamic_filter_snapshot;
 using sirius::op::merge_ast_dynamic_filters_into_tree;
 using sirius::op::sirius_ast_lowerable;
 using sirius::op::sirius_dynamic_filter;
@@ -43,6 +45,27 @@ using sirius::op::sirius_dynamic_zone_map_filter;
 using sirius::op::zone_map_entry;
 
 namespace {
+
+std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters_on_column(
+  dynamic_filter_snapshot const& snapshot, std::size_t col_idx)
+{
+  std::vector<std::shared_ptr<sirius_dynamic_filter const>> out;
+  for (auto const& entry : snapshot.entries()) {
+    if (entry.column_index == col_idx) { out.push_back(entry.filter); }
+  }
+  return out;
+}
+
+std::vector<std::size_t> filtered_columns(dynamic_filter_snapshot const& snapshot)
+{
+  std::vector<std::size_t> cols;
+  for (auto const& entry : snapshot.entries()) {
+    if (std::find(cols.begin(), cols.end(), entry.column_index) == cols.end()) {
+      cols.push_back(entry.column_index);
+    }
+  }
+  return cols;
+}
 
 std::unique_ptr<cudf::scalar> make_int32_scalar(int32_t v)
 {
@@ -93,9 +116,11 @@ static_assert(std::is_nothrow_move_assignable_v<sirius_dynamic_filter_set::produ
 TEST_CASE("sirius_dynamic_filter_set is empty after construction", "[dynamic_filter]")
 {
   sirius_dynamic_filter_set set;
-  REQUIRE(set.empty());
-  REQUIRE(set.filtered_columns().empty());
-  REQUIRE(set.filters_for_column(0).empty());
+  auto const snapshot = set.snapshot();
+  REQUIRE_FALSE(set.has_filters());
+  REQUIRE(snapshot.empty());
+  REQUIRE(filtered_columns(snapshot).empty());
+  REQUIRE(filters_on_column(snapshot, 0).empty());
 }
 
 TEST_CASE("dynamic filter registration freezes before terminal observations",
@@ -127,7 +152,7 @@ TEST_CASE("dynamic filter snapshots distinguish pending and terminal with and wi
 
   SECTION("skipped input terminates without a filter")
   {
-    producer.finish(sirius_dynamic_filter_set::completion::skipped);
+    producer.finish(sirius_dynamic_filter_set::completion::SKIPPED);
     REQUIRE(set.snapshot().empty());
     REQUIRE(set.snapshot().terminal());
   }
@@ -140,7 +165,7 @@ TEST_CASE("dynamic filter snapshots distinguish pending and terminal with and wi
     REQUIRE_FALSE(pending_filter.empty());
     REQUIRE_FALSE(pending_filter.terminal());
     REQUIRE(pending_filter.entries().front().filter == filter);
-    producer.finish(sirius_dynamic_filter_set::completion::published);
+    producer.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
     auto const terminal_filter = set.snapshot();
     REQUIRE(terminal_filter.terminal());
     REQUIRE(terminal_filter.generation() == 1);
@@ -154,14 +179,14 @@ TEST_CASE("each dynamic filter producer completes exactly once for every outcome
 {
   using completion = sirius_dynamic_filter_set::completion;
   for (auto outcome :
-       {completion::published, completion::skipped, completion::failed, completion::cancelled}) {
+       {completion::PUBLISHED, completion::SKIPPED, completion::FAILED, completion::CANCELLED}) {
     sirius_dynamic_filter_set set;
     auto remaining = set.register_producer({1});
     {
       auto first = set.register_producer({0});
       set.freeze_registration();
       first.finish(outcome);
-      first.finish(completion::cancelled);
+      first.finish(completion::CANCELLED);
       REQUIRE_FALSE(first.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
       REQUIRE_FALSE(set.snapshot().terminal());
     }
@@ -206,7 +231,7 @@ TEST_CASE("moving producer rights transfers completion and resolves overwritten 
   moved.finish();
   REQUIRE_FALSE(first.snapshot().terminal());
   REQUIRE(overwritten.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
-  overwritten.finish(sirius_dynamic_filter_set::completion::published);
+  overwritten.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
   REQUIRE(first.snapshot().terminal());
   REQUIRE(first.snapshot().generation() == 1);
 }
@@ -223,7 +248,7 @@ TEST_CASE("consumer closure rejects pushes without pretending producer work has 
   auto const closed = set.snapshot();
   REQUIRE_FALSE(closed.terminal());
   REQUIRE(closed.generation() == 1);
-  producer.finish(sirius_dynamic_filter_set::completion::cancelled);
+  producer.finish(sirius_dynamic_filter_set::completion::CANCELLED);
   REQUIRE(set.snapshot().terminal());
   REQUIRE(set.snapshot().generation() == closed.generation());
 }
@@ -245,7 +270,7 @@ TEST_CASE("producer finish and push expose one coherent terminal snapshot",
     });
     std::jthread finish([&] {
       start.arrive_and_wait();
-      producer.finish(sirius_dynamic_filter_set::completion::published);
+      producer.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
       terminal = set.snapshot();
     });
     start.arrive_and_wait();
@@ -280,7 +305,7 @@ TEST_CASE("snapshot and producer owners outlive the channel wrapper independentl
     REQUIRE(set.snapshot().generation() == 2);
   }
   REQUIRE(producer->push_filter(2, std::make_shared<stub_runtime_only_filter>()));
-  producer->finish(sirius_dynamic_filter_set::completion::published);
+  producer->finish(sirius_dynamic_filter_set::completion::PUBLISHED);
   producer.reset();
   REQUIRE_FALSE(filter_lifetime.expired());
   REQUIRE(captured.entries().front().column_index == 2);
@@ -293,42 +318,43 @@ TEST_CASE("sirius_dynamic_filter_set::push_filter ignores null filters", "[dynam
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0});
-  set_producer.push_filter(0, nullptr);
-  REQUIRE(set.empty());
+  REQUIRE_FALSE(set_producer.push_filter(0, nullptr));
+  REQUIRE_FALSE(set.has_filters());
 }
 
 TEST_CASE("sirius_dynamic_filter_set retains and exposes pushed filters", "[dynamic_filter]")
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({3, 7});
-  set_producer.push_filter(3, make_single_zone_filter(0, 100));
-  set_producer.push_filter(3, make_single_zone_filter(50, 150));
-  set_producer.push_filter(7, make_single_zone_filter(-1, 1));
+  REQUIRE(set_producer.push_filter(3, make_single_zone_filter(0, 100)));
+  REQUIRE(set_producer.push_filter(3, make_single_zone_filter(50, 150)));
+  REQUIRE(set_producer.push_filter(7, make_single_zone_filter(-1, 1)));
 
-  REQUIRE_FALSE(set.empty());
+  auto const snapshot = set.snapshot();
+  REQUIRE_FALSE(snapshot.empty());
 
-  auto cols = set.filtered_columns();
+  auto cols = filtered_columns(snapshot);
   std::sort(cols.begin(), cols.end());
   REQUIRE(cols == std::vector<std::size_t>{3, 7});
 
-  REQUIRE(set.filters_for_column(3).size() == 2);
-  REQUIRE(set.filters_for_column(7).size() == 1);
-  REQUIRE(set.filters_for_column(99).empty());
+  REQUIRE(filters_on_column(snapshot, 3).size() == 2);
+  REQUIRE(filters_on_column(snapshot, 7).size() == 1);
+  REQUIRE(filters_on_column(snapshot, 99).empty());
 
-  REQUIRE(set.filters_for_column(3)[0]->kind() == sirius_dynamic_filter_kind::ZONE_MAP);
+  REQUIRE(filters_on_column(snapshot, 3)[0]->kind() == sirius_dynamic_filter_kind::ZONE_MAP);
 }
 
-TEST_CASE("filters_for_column snapshot survives the set's destruction", "[dynamic_filter]")
+TEST_CASE("dynamic filter snapshot survives the set's destruction", "[dynamic_filter]")
 {
-  std::vector<std::shared_ptr<sirius_dynamic_filter const>> snapshot;
+  dynamic_filter_snapshot snapshot;
   {
     sirius_dynamic_filter_set set;
     auto set_producer = set.register_producer({0});
-    set_producer.push_filter(0, make_single_zone_filter(0, 100));
-    snapshot = set.filters_for_column(0);
+    REQUIRE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
+    snapshot = set.snapshot();
   }
-  REQUIRE(snapshot.size() == 1);
-  REQUIRE(snapshot[0]->kind() == sirius_dynamic_filter_kind::ZONE_MAP);
+  REQUIRE(snapshot.entries().size() == 1);
+  REQUIRE(snapshot.entries()[0].filter->kind() == sirius_dynamic_filter_kind::ZONE_MAP);
 }
 
 TEST_CASE("the same filter can be co-owned by multiple channels (fan-out)", "[dynamic_filter]")
@@ -339,15 +365,15 @@ TEST_CASE("the same filter can be co-owned by multiple channels (fan-out)", "[dy
   auto set_a_producer = set_a.register_producer({0});
   sirius_dynamic_filter_set set_b;
   auto set_b_producer = set_b.register_producer({5});
-  set_a_producer.push_filter(0, shared_filter);
-  set_b_producer.push_filter(5, shared_filter);
+  REQUIRE(set_a_producer.push_filter(0, shared_filter));
+  REQUIRE(set_b_producer.push_filter(5, shared_filter));
 
-  auto const a_snapshot = set_a.filters_for_column(0);
-  auto const b_snapshot = set_b.filters_for_column(5);
+  auto const a_snapshot = set_a.snapshot();
+  auto const b_snapshot = set_b.snapshot();
 
-  REQUIRE(a_snapshot.size() == 1);
-  REQUIRE(b_snapshot.size() == 1);
-  REQUIRE(a_snapshot[0].get() == b_snapshot[0].get());
+  REQUIRE(filters_on_column(a_snapshot, 0).size() == 1);
+  REQUIRE(filters_on_column(b_snapshot, 5).size() == 1);
+  REQUIRE(filters_on_column(a_snapshot, 0)[0].get() == filters_on_column(b_snapshot, 5)[0].get());
 }
 
 TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_filter]")
@@ -359,25 +385,25 @@ TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_fil
   constexpr int kPushesPerThread     = 32;
   constexpr std::size_t kColumnCount = 4;
 
+  std::atomic<int> rejected{0};
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int t = 0; t < kThreads; ++t) {
-    threads.emplace_back([&producer, t]() {
+    threads.emplace_back([&producer, &rejected, t]() {
       for (int i = 0; i < kPushesPerThread; ++i) {
         auto col = static_cast<std::size_t>((t + i) % kColumnCount);
-        producer.push_filter(col, make_single_zone_filter(t * 1000 + i, t * 1000 + i + 1));
+        if (!producer.push_filter(col, make_single_zone_filter(t * 1000 + i, t * 1000 + i + 1))) {
+          rejected.fetch_add(1, std::memory_order_relaxed);
+        }
       }
     });
   }
   for (auto& th : threads) {
     th.join();
   }
+  REQUIRE(rejected.load(std::memory_order_relaxed) == 0);
 
-  std::size_t total = 0;
-  for (std::size_t col = 0; col < kColumnCount; ++col) {
-    total += set.filters_for_column(col).size();
-  }
-  REQUIRE(total == static_cast<std::size_t>(kThreads) * kPushesPerThread);
+  REQUIRE(set.snapshot().generation() == static_cast<std::size_t>(kThreads) * kPushesPerThread);
 }
 
 //===----------------------------------------------------------------------===//
@@ -389,9 +415,9 @@ TEST_CASE("has_filters reflects pushed filters and ignores null", "[dynamic_filt
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0});
   REQUIRE_FALSE(set.has_filters());
-  set_producer.push_filter(0, nullptr);
+  REQUIRE_FALSE(set_producer.push_filter(0, nullptr));
   REQUIRE_FALSE(set.has_filters());
-  set_producer.push_filter(0, make_single_zone_filter(0, 100));
+  REQUIRE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
   REQUIRE(set.has_filters());
 }
 
@@ -405,7 +431,6 @@ TEST_CASE("sirius_dynamic_filter_set rejects pushes after consumer close", "[dyn
 
   REQUIRE_FALSE(set.accepting_filters());
   REQUIRE_FALSE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
-  REQUIRE(set.empty());
   REQUIRE_FALSE(set.has_filters());
 }
 
@@ -452,7 +477,7 @@ TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic
 
   REQUIRE_FALSE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
   REQUIRE(set_producer.push_filter(1, make_single_zone_filter(0, 100)));
-  REQUIRE(set.filtered_columns() == std::vector<std::size_t>{1});
+  REQUIRE(filtered_columns(set.snapshot()) == std::vector<std::size_t>{1});
 }
 
 TEST_CASE("sirius_dynamic_zone_map_filter rejects empty zones", "[dynamic_filter]")
@@ -601,8 +626,8 @@ TEST_CASE(
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0, 1});
-  set_producer.push_filter(0, make_single_zone_filter(0, 100));
-  set_producer.push_filter(1, make_single_zone_filter(-5, 5));
+  REQUIRE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set_producer.push_filter(1, make_single_zone_filter(-5, 5)));
 
   auto const snapshot = set.snapshot();
   cudf::ast::tree tree;
@@ -634,8 +659,8 @@ TEST_CASE("merge_ast_dynamic_filters_into_tree AND-conjoins multiple filters per
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0});
-  set_producer.push_filter(0, make_single_zone_filter(0, 100));
-  set_producer.push_filter(0, make_single_zone_filter(10, 200));
+  REQUIRE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
+  REQUIRE(set_producer.push_filter(0, make_single_zone_filter(10, 200)));
 
   auto const snapshot = set.snapshot();
   cudf::ast::tree tree;
@@ -657,7 +682,7 @@ TEST_CASE("merge_ast_dynamic_filters_into_tree skips filters lacking the AST cap
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0});
-  set_producer.push_filter(0, std::make_unique<stub_runtime_only_filter>());
+  REQUIRE(set_producer.push_filter(0, std::make_unique<stub_runtime_only_filter>()));
 
   auto const snapshot = set.snapshot();
   cudf::ast::tree tree;
@@ -684,8 +709,8 @@ TEST_CASE(
 {
   sirius_dynamic_filter_set set;
   auto set_producer = set.register_producer({0});
-  set_producer.push_filter(0, std::make_unique<stub_runtime_only_filter>());
-  set_producer.push_filter(0, make_single_zone_filter(0, 100));
+  REQUIRE(set_producer.push_filter(0, std::make_unique<stub_runtime_only_filter>()));
+  REQUIRE(set_producer.push_filter(0, make_single_zone_filter(0, 100)));
 
   auto const snapshot = set.snapshot();
   cudf::ast::tree tree;

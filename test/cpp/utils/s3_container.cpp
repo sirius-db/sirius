@@ -214,8 +214,14 @@ fs::path generate_fixtures(fs::path const& out_dir)
     env_or("SIRIUS_TEST_S3_PARQUET_SOURCE",
            (root / "test" / "cpp" / "integration" / "data" / "parquet").string());
   fs::create_directories(out_dir);
-  int rc = run_process(
-    {"python3", script.string(), "--out", out_dir.string(), "--parquet-source", parquet_src});
+  int rc = run_process({"python3",
+                        script.string(),
+                        "--out",
+                        out_dir.string(),
+                        "--parquet-source",
+                        parquet_src,
+                        "--manifest",
+                        (out_dir.parent_path() / "MANIFEST.sha256").string()});
   if (rc != 0) throw std::runtime_error("generate_fixtures.py failed");
   return out_dir;
 }
@@ -333,7 +339,7 @@ long s3_put(minio_instance const& inst,
             std::int64_t body_len,
             std::optional<fs::path> const& ca_bundle)
 {
-  sirius::io::s3::sigv4_signer_config creds;
+  sirius::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
   creds.secret_key = kSecretKey;
   creds.region     = kRegion;
@@ -341,14 +347,14 @@ long s3_put(minio_instance const& inst,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; MinIO accepts it.
-  auto signed_req = sirius::io::s3::sign_request("PUT",
-                                                 inst.authority,
-                                                 canonical_uri,
-                                                 /*query=*/"",
-                                                 "UNSIGNED-PAYLOAD",
-                                                 /*extra_headers=*/{},
-                                                 creds,
-                                                 std::time(nullptr));
+  auto signed_req = sirius::io::rest::s3::sign_request("PUT",
+                                                       inst.authority,
+                                                       canonical_uri,
+                                                       /*query=*/"",
+                                                       "UNSIGNED-PAYLOAD",
+                                                       /*extra_headers=*/{},
+                                                       creds,
+                                                       std::time(nullptr));
 
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;
@@ -385,8 +391,8 @@ long s3_put(minio_instance const& inst,
 
 std::string uri_path_for(std::string const& bucket, std::string const& key)
 {
-  std::string p = "/" + sirius::io::s3::uri_encode(bucket, false);
-  if (!key.empty()) p += "/" + sirius::io::s3::uri_encode(key, false);
+  std::string p = "/" + sirius::io::rest::s3::uri_encode(bucket, false);
+  if (!key.empty()) p += "/" + sirius::io::rest::s3::uri_encode(key, false);
   return p;
 }
 
@@ -456,8 +462,8 @@ void maybe_upload_large_fixture(minio_instance const& http,
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
 
   // The SF10 generation costs minutes, so cache the parquet at a stable path and
-  // reuse it across the separate-process invocations the large gate runs (each
-  // prewarm/no-prewarm case needs its own process). Only the first generates.
+  // reuse it across the two processes that make s3-test-large runs. Only the
+  // first generates.
   fs::path parquet = work / "lineitem_sf10.parquet";
   std::error_code ec;
   if (!(fs::exists(parquet, ec) && fs::file_size(parquet, ec) > 0)) {

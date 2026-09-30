@@ -14,8 +14,8 @@ resolver = "2"
 anyhow = "1"
 # Pinned to the arrow version `parquet` already pulls in, so the engine→CN result interchange
 # (Arrow C Data Interface) and the parquet schema reader share one arrow build.
-arrow-array = "59"
-arrow-schema = "59"
+arrow-array = "60"
+arrow-schema = "60"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
@@ -23,7 +23,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.9"
-parquet = { version = "59", default-features = false, features = ["arrow", "async"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "async"] }
 heck = "0.5"
 prettyplease = "0.3.0"
 proc-macro2 = "1"

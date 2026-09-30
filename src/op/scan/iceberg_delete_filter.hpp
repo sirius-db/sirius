@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "op/scan/parquet_batch_layout.hpp"
+
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -34,27 +36,6 @@
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
-/**
- * @brief One contiguous run of decoded rows, mapped back to its source file rows.
- *
- * Positional deletes are keyed on @c (data_file_path, row_position_within_that_file). A batch is
- * the concatenation of the selected row groups of the split's files, so the mapping is a LIST of
- * runs, not one @c (path, first_row) pair: a split can span files, and pruning leaves gaps.
- *
- * Only valid while nothing drops rows between decode and here — which is why the iceberg path
- * disables reader-side pushdown. A row removed in the reader shifts every later position.
- */
-struct batch_row_run {
-  /// Data file these rows came from; the key into IcebergDeleteData::positional_deletes.
-  std::string data_file_path;
-  /// Row index within that data file of the first row of this run.
-  int64_t file_row_offset{0};
-  /// Row index within the decoded batch of the first row of this run.
-  int64_t batch_row_offset{0};
-  /// Number of rows in the run.
-  int64_t num_rows{0};
-};
-
 /// The row provenance of one decoded batch, in batch row order.
 using batch_layout = std::span<batch_row_run const>;
 

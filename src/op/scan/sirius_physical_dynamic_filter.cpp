@@ -67,7 +67,7 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   output_batches.reserve(ro_batches.size());
 
   for (std::size_t i = 0; i < ro_batches.size(); ++i) {
-    if (i != 0) { snapshot = _filters->snapshot(); }
+    if (i != 0 && !snapshot.terminal()) { snapshot = _filters->snapshot(); }
     auto const& ro = ro_batches[i];
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).

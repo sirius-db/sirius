@@ -39,6 +39,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
+#include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
@@ -225,7 +226,10 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (!is_initialized_) { return; }
+  if (!is_initialized_) {
+    event_publisher_->stop();
+    return;
+  }
 
   try {
     terminate();
@@ -240,6 +244,7 @@ SiriusContext::~SiriusContext() noexcept
     } catch (...) {
     }
   }
+  event_publisher_->stop();
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -477,10 +482,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     }
   }
 
-  // Drop scan-manager providers for this query. Repositories are already
-  // cleared above, so downstream data_batches that referenced sliced
-  // host_data_representation are gone before the providers go away.
-  if (scan_manager_) { scan_manager_->reset(); }
+  // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
+  // Repositories are already cleared above, so downstream data_batches that referenced
+  // sliced host_data_representation are gone before the providers go away.
+  if (scan_manager_) { scan_manager_->reset(query_id); }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
@@ -537,6 +542,14 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
   try {
     if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+  } catch (...) {
+  }
+  // The scan manager needs the same backstop. prepare_for_query no longer performs a global
+  // reset (it would tear down concurrently-running queries), so nothing else will ever drop
+  // this query's scan state: without this, a failed query leaks its dispatcher, coalescer and
+  // split providers until terminate().
+  try {
+    if (scan_manager_) { scan_manager_->reset(query_id); }
   } catch (...) {
   }
 }
@@ -814,6 +827,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // cucascade topology exposes hw-decompression availability as a runtime attribute populated
+  // only when discovery is asked to touch the CUDA driver. sirius_config seeds topology with
+  // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
+  auto enable_hw_decompression =
+    config_.get_operator_params().use_hw_decompression && topo.num_gpus > 0 &&
+    std::all_of(topo.gpus.begin(), topo.gpus.end(), [](auto const& gpu) {
+      return gpu.runtime_attributes.has_value() && gpu.runtime_attributes->hw_decomp;
+    });
+  if (enable_hw_decompression) {
+    hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
+    SIRIUS_LOG_INFO(
+      "SiriusContext: hardware decompression supported on all {} GPU(s); "
+      "exported LIBCUDF_HW_DECOMPRESSION=ON",
+      topo.num_gpus);
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -867,7 +896,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
   //
-  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto dev PR #579 shape):
+  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto main PR #579 shape):
   // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
   // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
   // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the
@@ -911,8 +940,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  query_event_publisher_ = std::make_shared<sirius::event::query_event_publisher>();
+  task_creator_->set_query_event_publisher(*query_event_publisher_);
+  task_scheduler_->set_query_event_publisher(*query_event_publisher_);
+
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
+  scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -934,6 +968,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+
+  // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
+  // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
+  // here keeps the variable scoped to the initialized lifetime so a re-initialize starts clean.
+  hw_decompression_env_guard_.reset();
+
+  // Before the reporters, so nothing published during teardown reaches a
+  // subscriber whose subject is already half gone; the publish_* calls below this
+  // point are no-ops.
+  if (query_event_publisher_) { query_event_publisher_->stop(); }
 
   // task_creator_ and downgrade_executors_ hold non-owning pointers into task_scheduler_. Stop and
   // join every borrower before destroying the scheduler and its task queue.
@@ -1178,7 +1222,29 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
     .runtime_fallbacks  = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .provider_internal_skips =
+      transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
+    .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
+    .classification_failures =
+      transparent_classification_failure_count_.load(std::memory_order_relaxed),
   };
+}
+
+void SiriusContext::record_transparent_decline(sirius::transparent::decline_reason reason) noexcept
+{
+  using sirius::transparent::decline_reason;
+  switch (reason) {
+    case decline_reason::provider_internal:
+      transparent_provider_internal_skip_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::hidden_catalog:
+      transparent_hidden_catalog_skip_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::classification_failed:
+      transparent_classification_failure_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::none: break;
+  }
 }
 
 void SiriusContext::record_transparent_rebind_success() noexcept
@@ -1199,63 +1265,6 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-SiriusContext::compressed_materialization_stats
-SiriusContext::get_compressed_materialization_stats() const noexcept
-{
-  return compressed_materialization_stats{
-    .scan_columns_narrowed =
-      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
-    .scan_columns_restored =
-      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
-    .pin_columns_narrowed =
-      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
-    .scan_sidecars_installed =
-      compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
-    .partition_narrow_columns =
-      compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
-    .scan_narrow_targets_retracted =
-      compressed_materialization_scan_narrow_targets_retracted_count_.load(
-        std::memory_order_relaxed),
-  };
-}
-
-void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
-{
-  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
-                                                                    std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
-{
-  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
-                                                                    std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
-{
-  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
-                                                                   std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_sidecar_installed() noexcept
-{
-  compressed_materialization_scan_sidecars_installed_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_partition_narrow_columns(
-  uint64_t count) noexcept
-{
-  compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
-                                                                       std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
-  uint64_t count) noexcept
-{
-  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
-    count, std::memory_order_relaxed);
 }
 
 namespace {
@@ -1369,27 +1378,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
-  // Mirror the optimizer hook's gpu_execution gate: when transparent execution
-  // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
-  // never rewrite the physical plan even if we could.
-  {
-    duckdb::Value setting;
-    auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
-    if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
-      if (conn_state) { conn_state->clear_captured_plan(); }
-      return RebindQueryInfo::DO_NOT_REBIND;
-    }
-  }
-  if (!is_initialized_) {
-    if (conn_state) { conn_state->clear_captured_plan(); }
-    return RebindQueryInfo::DO_NOT_REBIND;
-  }
-
-  // Only intercept SELECT statements.
-  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
-    if (conn_state) { conn_state->clear_captured_plan(); }
-    return RebindQueryInfo::DO_NOT_REBIND;
-  }
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1399,8 +1387,34 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // whose bind_data isn't serializable so plan->Copy() failed), re-plan from
   // the unbound SQL statement — this is what gpu_execution(...) does
   // internally and it works even when LogicalGet::Copy can't.
+  //
+  // Consume the capture before deciding so a declined attempt leaves none behind.
+  // Binder properties retain hidden catalog references even when hooks are disabled
+  // or optimization removes scans. Decide before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
-  if (conn_state) { logical_plan = conn_state->take_captured_plan_if_current(); }
+  if (conn_state) {
+    logical_plan = conn_state->take_captured_plan_if_current();
+    if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
+        sirius::transparent::decline_reason::none) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+  }
+  // Mirror the optimizer hook's gpu_execution gate: when transparent execution
+  // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
+  // never rewrite the physical plan even if we could.
+  {
+    duckdb::Value setting;
+    auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
+    if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+  }
+  if (!is_initialized_) { return RebindQueryInfo::DO_NOT_REBIND; }
+
+  // Only intercept SELECT statements.
+  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).

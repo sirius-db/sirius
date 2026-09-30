@@ -168,7 +168,7 @@ bi: "1.5Gi")");
     std::uint64_t size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -178,7 +178,7 @@ bi: "1.5Gi")");
     std::uint64_t size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.required("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -188,7 +188,7 @@ bi: "1.5Gi")");
     std::optional<std::uint64_t> size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 
@@ -198,7 +198,7 @@ bi: "1.5Gi")");
     std::optional<std::uint64_t> size = 4096;
     yaml::reader r(node);
     REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
-                        Catch::Contains("byte value must be non-negative"));
+                        Catch::Matchers::ContainsSubstring("byte value must be non-negative"));
     REQUIRE(size == 4096);
   }
 

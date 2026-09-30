@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "event/query_event_publisher.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -28,6 +29,8 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "transparent/connection_provenance.hpp"
+#include "util/env_guard.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -114,12 +117,51 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t next_query_ordinal() noexcept { return ++query_ordinal_; }
   [[nodiscard]] uint64_t current_query_ordinal() const noexcept { return query_ordinal_; }
 
-  /// \brief Start a new planning attempt: advance the generation and clear any
-  /// stale capture from a previous attempt.
+  /// \brief Start a planning generation, discarding the previous capture and decline.
   void begin_planning_attempt() noexcept
   {
     ++planning_generation_;
     captured_plan_.reset();
+    decline_reason_ = sirius::transparent::decline_reason::none;
+  }
+
+  /// \brief Current classification; provider_internal remains latched.
+  [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
+  {
+    return provenance_;
+  }
+  void latch_provider_internal() noexcept
+  {
+    provenance_ = sirius::transparent::connection_provenance::provider_internal;
+  }
+  void mark_user_provenance() noexcept
+  {
+    if (provenance_ != sirius::transparent::connection_provenance::provider_internal) {
+      provenance_ = sirius::transparent::connection_provenance::user;
+    }
+  }
+
+  /// \brief Whether this planning generation has already classified the connection.
+  [[nodiscard]] bool classified_this_attempt() const noexcept
+  {
+    return classified_generation_ == planning_generation_;
+  }
+  void mark_classified() noexcept { classified_generation_ = planning_generation_; }
+
+  /// \brief Decline all remaining stages of this planning generation.
+  void decline_attempt(sirius::transparent::decline_reason reason) noexcept
+  {
+    decline_reason_      = reason;
+    declined_generation_ = planning_generation_;
+  }
+  [[nodiscard]] bool attempt_declined() const noexcept
+  {
+    return decline_reason_ != sirius::transparent::decline_reason::none &&
+           declined_generation_ == planning_generation_;
+  }
+  [[nodiscard]] sirius::transparent::decline_reason attempt_decline_reason() const noexcept
+  {
+    return attempt_declined() ? decline_reason_ : sirius::transparent::decline_reason::none;
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
@@ -196,10 +238,15 @@ class SiriusConnectionState : public ClientContextState {
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
  private:
-  uint64_t planning_generation_ = 0;
-  uint64_t captured_generation_ = 0;
+  uint64_t planning_generation_   = 0;
+  uint64_t captured_generation_   = 0;
+  uint64_t declined_generation_   = 0;
+  uint64_t classified_generation_ = ~uint64_t{0};  ///< sentinel: no attempt classified yet
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  sirius::transparent::connection_provenance provenance_ =
+    sirius::transparent::connection_provenance::unclassified;
+  sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
@@ -246,28 +293,10 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
-  };
-
-  /// Monotonic counters describing compressed-materialization activity.
-  ///
-  /// These counters intentionally describe columns rather than queries: a
-  /// single scan or pinned chunk can narrow or restore several columns.
-  struct compressed_materialization_stats {
-    uint64_t scan_columns_narrowed = 0;
-    uint64_t scan_columns_restored = 0;
-    uint64_t pin_columns_narrowed  = 0;
-    /// Plan-time count of TABLE_SCAN nodes that received a narrow physical
-    /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
-    /// still clear or prune it).
-    uint64_t scan_sidecars_installed = 0;
-    /// Runtime count of input-batch columns that crossed an engaged hash
-    /// PARTITION with a carrier narrower than their native mapping. Derived
-    /// from actual batch types, so a regression anywhere in the narrow-carrier
-    /// chain drops it to zero.
-    uint64_t partition_narrow_columns = 0;
-    /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
-    /// is `apply_tier_narrowing_policy`'s.
-    uint64_t scan_narrow_targets_retracted = 0;
+    // One count per declined planning attempt, including when gpu_execution is off.
+    uint64_t provider_internal_skips = 0;
+    uint64_t hidden_catalog_skips    = 0;
+    uint64_t classification_failures = 0;
   };
 
   SiriusContext();
@@ -598,27 +627,14 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
-  /// \brief Snapshot counters for compressed-materialization observability.
-  [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
-    const noexcept;
+  /// \brief Record a planning attempt declined before the gpu_execution gate.
+  void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
-  /// \brief Record columns narrowed while materializing a scan batch.
-  void record_compressed_materialization_scan_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns restored to their native type at a scan boundary.
-  void record_compressed_materialization_scan_columns_restored(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns narrowed while materializing a pinned chunk.
-  void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
-  void record_compressed_materialization_scan_sidecar_installed() noexcept;
-
-  /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
-  void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
-
-  /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
-  void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
+  /// Shared event source for planning, pinning, and execution observations.
+  [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
+  {
+    return *event_publisher_;
+  }
 
  private:
   void throw_if_not_initialized() const;
@@ -679,6 +695,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
+  // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
+  // operator_params.use_hw_decompression is set and every GPU's CUDA driver
+  // supports hardware decompression. Emplaced in initialize(), reset in
+  // terminate(); RAII restores the variable's prior state on destruction.
+  std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
   // after memory_manager_ so it is destroyed before it: each entry holds a
@@ -688,7 +709,7 @@ class SiriusContext : public ClientContextState {
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
   // the small-pinned allocator, downgrade executors, task_creator, and
-  // scan_manager so every NUMA-aware routing decision reads one consistent
+  // scan_publisher so every NUMA-aware routing decision reads one consistent
   // index instead of rebuilding ad-hoc device<->NUMA maps. Owns a copy of the
   // topology and holds no device resources, so teardown order is unconstrained.
   std::shared_ptr<const sirius::memory::topology_index> topology_index_;
@@ -723,6 +744,9 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  /// Observes where a query is in its execution.  Declared before the creator
+  /// and scheduler that report into it so it outlives them on teardown.
+  std::shared_ptr<sirius::event::query_event_publisher> query_event_publisher_;
   // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
   // before reset; reverse member destruction also preserves that order if initialize() throws.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
@@ -730,17 +754,16 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
+  std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
+    std::make_shared<sirius::event::query_event_publisher>()};
   sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
-  std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
+  std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
+  std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::atomic<uint64_t> transparent_classification_failure_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

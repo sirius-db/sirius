@@ -14,14 +14,20 @@
  * limitations under the License.
  */
 
+#include <cuda_runtime_api.h>
+
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <unistd.h>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,7 +105,119 @@ void require_complete_publication(observed_run const& run, result_rows const& cp
           run.before.publications_skipped_build_not_whole);
 }
 
+void run_ok(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("query failed: " << sql << ": " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+}
+
+result_rows run_on_cpu(duckdb::Connection& con, std::string const& query)
+{
+  scoped_boolean_setting cpu_only(con, "gpu_execution", false);
+  auto result = con.Query(query);
+  REQUIRE(result);
+  REQUIRE_FALSE(result->HasError());
+  return sirius::test::collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+}
+
+/**
+ * @brief Checks accumulation through `UNION ALL`: every arm of a build-side union feeds its own
+ * port of the union operator, so the build PARTITION still has one finished source pipeline, and a
+ * probe-side union exposes one scan target per arm.
+ */
+void check_union_all_accumulation(duckdb::Connection& con)
+{
+  scoped_boolean_setting gpu_on(con, "gpu_execution", true);
+  scoped_boolean_setting master_on(con, "enable_dynamic_filter", true);
+  scoped_boolean_setting accumulation_on(con, "enable_dynamic_filter_multi_partition", true);
+  scoped_boolean_setting native_keys(con, "enable_compressed_materialization", false);
+  sirius::test::disabled_optimizers_guard shape(
+    con, "statistics_propagation,join_order,build_side_probe_side");
+  sirius::test::coverage_gate_disable_guard gate_off(con);
+  sirius::test::scoped_setting no_broadcast(con, "max_broadcast_join_size", 1);
+  sirius::test::scoped_setting small_partitions(con, "hash_partition_bytes", 1024 * 1024);
+  sirius::test::scoped_setting small_build(con, "max_build_hash_table_bytes", 512 * 1024);
+  sirius::test::scoped_setting small_batches(con, "scan_task_batch_size", 256 * 1024);
+  {
+    scoped_boolean_setting cpu_only(con, "gpu_execution", false);
+    run_ok(con,
+           "CREATE TABLE df_union_build AS SELECT (i * 17)::BIGINT AS k, (i * 31 + 5)::BIGINT AS "
+           "payload, (i % 5)::INTEGER AS marker FROM range(262144) AS t(i);");
+    run_ok(con,
+           "CREATE TABLE df_union_probe AS SELECT (i * 17)::BIGINT AS k FROM range(524288) AS "
+           "t(i);");
+    run_ok(con, "CHECKPOINT;");
+  }
+
+  SECTION("a build side that is a UNION ALL of two scans accumulates once")
+  {
+    std::string const query =
+      "SELECT count(*), sum(p.k), max(p.k), sum(b.payload) FROM df_union_probe p JOIN "
+      "(SELECT k, payload, marker FROM df_union_build WHERE marker < 2 UNION ALL "
+      "SELECT k, payload, marker FROM df_union_build WHERE marker >= 2) b "
+      "ON p.k = b.k WHERE b.marker <> 0";
+    auto const cpu_rows = run_on_cpu(con, query);
+    require_complete_publication(run_on_gpu(con, query), cpu_rows);
+  }
+  SECTION("a probe side that is a UNION ALL of two scans receives the filter in both arms")
+  {
+    std::string const query =
+      "SELECT count(*), sum(p.k), max(p.k), sum(b.payload) FROM "
+      "(SELECT k FROM df_union_probe WHERE k % 2 = 0 UNION ALL "
+      "SELECT k FROM df_union_probe WHERE k % 2 <> 0) p "
+      "JOIN df_union_build b ON p.k = b.k WHERE b.marker <> 0";
+    auto const cpu_rows = run_on_cpu(con, query);
+    auto const run      = run_on_gpu(con, query);
+    require_complete_publication(run, cpu_rows);
+    REQUIRE(run.after.filters_pushed - run.before.filters_pushed >= 2);
+  }
+}
+
 }  // namespace
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "gpu_execution - multi-partition accumulation through UNION ALL matches the CPU",
+                 "[integration][gpu_execution][dynamic_filter][multi_partition]")
+{
+  check_union_all_accumulation(*con);
+}
+
+TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two GPUs",
+          "[integration][gpu_execution][dynamic_filter][multi_partition][mgpu]")
+{
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
+    (void)cudaGetLastError();
+    WARN("needs two GPUs");
+    return;
+  }
+  auto* env = sirius::test::acquire_integration_env_for(2);
+  REQUIRE(env != nullptr);
+  // Only one integration environment may be active at a time.
+  if (sirius::test::g_integration_env != nullptr && sirius::test::g_integration_env->is_active()) {
+    sirius::test::g_integration_env->pause();
+  }
+  env->resume();
+  absl::Cleanup pause_env = [env] { env->pause(); };
+
+  auto const database = std::filesystem::temp_directory_path() /
+                        ("sirius_df_union_mgpu_" + std::to_string(::getpid()) + ".db");
+  absl::Cleanup remove_database = [&database] {
+    std::error_code ignored;
+    std::filesystem::remove(database, ignored);
+    std::filesystem::remove(database.string() + ".wal", ignored);
+  };
+  {
+    auto con = std::make_unique<duckdb::Connection>(env->make_connection());
+    run_ok(*con, "ATTACH '" + database.string() + "' AS df_union_mgpu;");
+    run_ok(*con, "USE df_union_mgpu;");
+    check_union_all_accumulation(*con);
+    con->Query("USE memory;");
+    con->Query("DETACH df_union_mgpu;");
+  }
+}
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
                  "gpu_execution - complete multi-partition dynamic filters match the CPU",
