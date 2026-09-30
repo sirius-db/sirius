@@ -38,4 +38,14 @@ cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metr
  */
 std::string_view ann_metric_name(cuvs::distance::DistanceType metric);
 
+/**
+ * @brief Map a user metric string to the cuVS DistanceType for the vector join's select pass.
+ *
+ * L2 with @p exact_unexpanded true uses the Unexpanded form (no GEMM); false uses the Expanded
+ * form so the pairwise distances ride the GEMM/tensor-core path. Cosine always uses
+ * CosineExpanded, so @p exact_unexpanded has no effect.
+ */
+cuvs::distance::DistanceType join_selection_distance_type_from_metric(std::string_view metric,
+                                                                      bool exact_unexpanded);
+
 }  // namespace sirius::vss

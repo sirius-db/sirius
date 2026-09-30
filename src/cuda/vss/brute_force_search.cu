@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "vss/brute_force_search.hpp"
+#include "cuda/vss/brute_force_search.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>

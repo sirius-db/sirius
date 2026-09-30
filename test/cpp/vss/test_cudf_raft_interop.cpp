@@ -18,7 +18,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <vss/cudf_raft_interop.hpp>
+#include <cuda/vss/cudf_raft_interop.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>

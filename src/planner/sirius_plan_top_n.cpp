@@ -31,7 +31,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
     reject_nested_column_operation(*order.expression, "ORDER BY");
   }
 
-  auto plan = create_plan(*op.children[0]);
+  auto plan = try_plan_vector_global_topk_join(op);
+  if (!plan) { plan = create_plan(*op.children[0]); }
 
   auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
     sirius::from_duckdb_vec(op.types),

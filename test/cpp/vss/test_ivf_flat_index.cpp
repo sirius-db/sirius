@@ -18,7 +18,7 @@
 #include <catch.hpp>
 
 // sirius
-#include <vss/ivf_flat_index.hpp>
+#include <../../../src/cuda/vss/ivf_flat_index.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>

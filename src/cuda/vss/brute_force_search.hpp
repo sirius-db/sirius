@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "vss/cudf_raft_interop.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/utilities/memory_resource.hpp>

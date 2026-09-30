@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "vss/cudf_raft_interop.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
 
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/types.hpp>
