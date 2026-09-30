@@ -273,10 +273,14 @@ class Walker {
         }
         break;
       case Consumer::ballot_range:
-        // One seam: value_source() routes a Bitpack leaf to the same
-        // closed-form bitpack_value_source the dedicated emitter used, so the
-        // emitted body is identical for every root shape.
-        emit_generic_mask_out(tree);
+        // The same tuned-vs-generic split as write_column: a Bitpack leaf has its own emitter
+        // because only it can compare in the packed domain; every staged root (Delta, FOR, ...)
+        // reconstructs the chunk through value_source and compares decoded values.
+        if (tree.op == ::codegen::OpKind::Bitpack && tree.children.empty()) {
+          emit_bitpack_mask_out(tree);
+        } else {
+          emit_generic_mask_out(tree);
+        }
         break;
       case Consumer::dict_gather: emit_bitpack_mask_dict_gather(tree); break;
       case Consumer::offsets_meta: emit_str_split_meta(tree); break;
@@ -293,6 +297,10 @@ class Walker {
   std::vector<DecodeBufferSpec> buffers_;
   SharedMemAllocator sm_;
   std::unordered_map<const ::codegen::jit::FusedTree*, std::int32_t> ids_;
+  // Set by an emitter that reads packed fields through the two-word helpers. kNarrowUnpackPrelude
+  // joins the rendered source only then, so the source (and with it the JIT cache key) of every
+  // kernel that does not use the helpers is untouched.
+  bool narrow_unpack_ = false;
 
   // DFS-preorder, lex-sorted children (std::map iteration) — must match
   // jit::assign_ids and the decode binder (bind_fused_subtree) so
@@ -362,7 +370,9 @@ class Walker {
   void emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node);
   void emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node);
   void emit_generic_mask_consume(const ::codegen::jit::FusedTree& node);
+  void emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node);
   void emit_generic_mask_out(const ::codegen::jit::FusedTree& node);
+  void emit_range_ballot_loop(const std::string& pass_stmts, const std::string& indent);
   void emit_str_split_meta(const ::codegen::jit::FusedTree& node);
   void emit_delta_producer(const ::codegen::jit::FusedTree& node,
                            const std::string& dst,
@@ -423,6 +433,7 @@ class Walker {
 
     std::ostringstream src;
     src << kPrelude;
+    if (narrow_unpack_) src << kNarrowUnpackPrelude;
     src << "\nextern \"C\" __global__\n"
         << "void " << spec.entry_symbol << "(\n";
     if (params_.tellp() > 0) src << params_.str() << ",\n";
@@ -495,6 +506,26 @@ __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
     if (bits == 0) return minv;
     const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
     return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+}
+
+}  // namespace
+)src";
+
+  // Helpers for chunks whose packed width is at most 32 bits: such an element spans at most two
+  // consecutive words, so one funnel shift replaces the three-word 64-bit stitch of
+  // simpatico_bitunpack_one. `vmask` is the per-chunk (1 << bits) - 1 (all ones for bits == 32),
+  // hoisted by the emitter. Wider chunks (int64 lanes only) stay on simpatico_bp_at; the emitters
+  // branch on the chunk's width, which is uniform across the block.
+  static constexpr const char* kNarrowUnpackPrelude = R"src(
+namespace {
+
+// Packed field of element `idx` for a chunk with 1 <= bits <= 32.
+__device__ __forceinline__ uint32_t simpatico_bp_field32(
+    const uint32_t* __restrict__ packed, int32_t bits, uint32_t vmask, int32_t idx) {
+    const uint32_t bp = static_cast<uint32_t>(idx) * static_cast<uint32_t>(bits);
+    const uint32_t w0 = packed[bp >> 5];
+    const uint32_t w1 = packed[(bp >> 5) + 1];
+    return __funnelshift_r(w0, w1, bp & 31) & vmask;
 }
 
 }  // namespace
@@ -887,6 +918,124 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
   sm_.release_to(mark);
 }
 
+// The range ballot's row loop, shared by the packed-domain and the decoded-domain emitters: eight
+// strips of `tbs_` rows, `pass_stmts` (one or more lines) sets `pass` for in-chunk row `i` once the
+// row is inside the chunk, and each strip's ballot lands in the mask word its 32 lanes map to.
+// Every emitted line is prefixed with `indent`.
+void Walker::emit_range_ballot_loop(const std::string& pass_stmts, const std::string& indent)
+{
+  body_ << indent << "#pragma unroll\n"
+        << indent << "for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
+        << indent << "    const int32_t i = j * " << tbs_ << " + tid;\n"
+        << indent << "    bool pass = false;\n"
+        << indent << "    if (i < len) {\n";
+  for (std::size_t at = 0; at < pass_stmts.size();) {
+    const std::size_t eol = pass_stmts.find('\n', at);
+    const std::size_t end = eol == std::string::npos ? pass_stmts.size() : eol + 1;
+    body_ << indent << "        " << pass_stmts.substr(at, end - at);
+    at = end;
+  }
+  body_ << indent << "    }\n"
+        << indent << "    const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
+        << indent << "    if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
+        << indent << "}\n";
+}
+
+// Pass statements of a decoded-domain ballot: widen the row's value and test the inclusive
+// predicate.
+std::string decoded_range_pass(const std::string& value_expr)
+{
+  return "const int64_t v = static_cast<int64_t>(" + value_expr +
+         ");\n"
+         "pass = (v >= pred_lo) && (v <= pred_hi);\n";
+}
+
+// =====================================================================
+// Bitpack mask_out -- the range ballot for a Bitpack leaf, evaluated in the
+// packed domain.
+//
+// Inputs: chunk_min[c] (lane type T), chunk_bits[c] (uint8, 0..8*sizeof(T)), packed (dense Compact
+// words plus 3 guard words), bp_offsets[c] (int32), n, sel_mask (WordsFor(n) words) and the
+// inclusive decoded-domain bounds pred_lo/pred_hi (int64). Grid = C blocks x 128 threads, no
+// dynamic shared memory, no barriers.
+//
+// Output: every one of the chunk's 32 mask words is written; bit r % 32 of word r / 32 is pass(r),
+// and bits and words for rows >= n are zero (the CNT and combine waves rely on that).
+//
+// Semantics: pass(r) <=> pred_lo <= int64(x_r) <= pred_hi with x_r = T(min + u_r), identical to the
+// decoded-domain compare for every encoder-valid chunk (min + u is representable in T for every
+// stored u). On malformed data the decoded compare wraps in T and the packed compare does not;
+// irrelevant for valid inputs.
+//
+// Mechanism: the predicate is translated once per chunk into bounds on the stored residual (the
+// value minus the chunk minimum), so a row costs one two-word funnel-shift extraction and one
+// unsigned compare instead of the three-word stitch, the 64-bit add of the minimum and two 64-bit
+// compares. A chunk the predicate wholly accepts or rejects writes its 32 words directly.
+//
+// Saturation: the engine emits INT64_MIN / INT64_MAX for one-sided conjuncts
+// (clamp_to_decode_range) and {0, -1} for an empty range, and pred_lo - min on those overflows
+// int64. Clamping both bounds into the chunk's domain [min, min + maxu] first (with the upper end
+// of the domain itself saturated) keeps both differences in [0, maxu] for any int64 bound, where
+// uint32 arithmetic is exact; a bound outside the domain becomes the domain edge, so a predicate
+// that misses or covers the whole domain takes the direct paths and every other one takes the loop.
+//
+// Widths: bits == 0 (constant chunk) gives maxu = 0, so the chunk is accept-all iff min is in range
+// and reject-all otherwise. bits == 32 (full int32 lane, or int64) gives an all-ones vmask, and the
+// two-word funnel shift still yields the exact field. bits > 32 (int64 lanes only) takes the
+// decoded-domain loop through simpatico_bp_at, chosen by a block-uniform branch on the chunk's
+// width.
+//
+// Reads packed[bp >> 5] and packed[(bp >> 5) + 1]: one word less past the chunk than the three-word
+// gather, so the persisted guard words stay sufficient.
+// =====================================================================
+void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
+{
+  const std::int32_t id   = id_of(node);
+  const std::string idstr = std::to_string(id);
+  body_ << "    // --- node " << id
+        << ": Bitpack fused range predicate -> selection mask (packed domain) ---\n";
+  ValueSource vs = bitpack_value_source(node, dtype_);
+  narrow_unpack_ = true;
+
+  const std::string bits = "bpbits_" + idstr;
+  const std::string base = "packed_" + idstr + " + bpbase_" + idstr;
+  body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n";
+  if (dtype_elem_size(dtype_) == 8) {
+    body_ << "    if (" << bits << " > 32) {  // wider than two words: decoded-domain compare\n";
+    emit_range_ballot_loop(decoded_range_pass(at_pos(vs.read_expr, "i")), "        ");
+    body_ << "        return;\n"
+          << "    }\n";
+  }
+  body_ << "    constexpr int64_t kInt64Max = 0x7FFFFFFFFFFFFFFFll;\n"
+        << "    const int64_t minv   = static_cast<int64_t>(bpmin_" << idstr << ");\n"
+        << "    const int64_t maxu   = (" << bits << " >= 32) ? 0xFFFFFFFFll : ((1ll << " << bits
+        << ") - 1);\n"
+        << "    const int64_t dom_hi = (minv > kInt64Max - maxu) ? kInt64Max : minv + maxu;\n"
+        << "    const int64_t lo_eff = pred_lo > minv ? pred_lo : minv;\n"
+        << "    const int64_t hi_eff = pred_hi < dom_hi ? pred_hi : dom_hi;\n"
+        << "    if (lo_eff > hi_eff) {  // predicate misses the chunk's domain\n"
+        << "        if (tid < CHUNK / 32) mask_words[tid] = 0u;\n"
+        << "        return;\n"
+        << "    }\n"
+        << "    const uint32_t lo_u = static_cast<uint32_t>(lo_eff - minv);\n"
+        << "    const uint32_t hi_u = static_cast<uint32_t>(hi_eff - minv);\n"
+        << "    if (lo_u == 0u && hi_u == static_cast<uint32_t>(maxu)) {  // covers the domain\n"
+        << "        if (tid < CHUNK / 32) {\n"
+        << "            const int32_t rows_in_word = len - tid * 32;\n"
+        << "            mask_words[tid] = rows_in_word >= 32   ? 0xFFFFFFFFu\n"
+        << "                              : rows_in_word <= 0 ? 0u\n"
+        << "                                                  : ((1u << rows_in_word) - 1u);\n"
+        << "        }\n"
+        << "        return;\n"
+        << "    }\n"
+        << "    const uint32_t span  = hi_u - lo_u;\n"
+        << "    const uint32_t vmask = (" << bits << " >= 32) ? 0xFFFFFFFFu : ((1u << " << bits
+        << ") - 1u);\n";
+  emit_range_ballot_loop(
+    "pass = (simpatico_bp_field32(" + base + ", " + bits + ", vmask, i) - lo_u) <= span;\n",
+    "    ");
+}
+
 // =====================================================================
 // Generic mask_out — the compositional ballot for
 // non-closed-form roots, primarily delta->bitpack shapes: the
@@ -905,19 +1054,8 @@ void Walker::emit_generic_mask_out(const ::codegen::jit::FusedTree& node)
         << " fused range predicate -> selection mask (generic) ---\n";
   const auto mark = sm_.mark();
   ValueSource vs  = value_source(node, dtype_, "len");
-  body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n"
-        << "    #pragma unroll\n"
-        << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
-        << "        const int32_t i = j * " << tbs_ << " + tid;\n"
-        << "        bool pass = false;\n"
-        << "        if (i < len) {\n"
-        << "            const int64_t v = static_cast<int64_t>(" << at_pos(vs.read_expr, "i")
-        << ");\n"
-        << "            pass = (v >= pred_lo) && (v <= pred_hi);\n"
-        << "        }\n"
-        << "        const uint32_t ballot = __ballot_sync(0xFFFFFFFFu, pass);\n"
-        << "        if ((tid & 31) == 0) mask_words[i >> 5] = ballot;\n"
-        << "    }\n";
+  body_ << "    uint32_t* mask_words = sel_mask + (chunk_start >> 5);\n";
+  emit_range_ballot_loop(decoded_range_pass(at_pos(vs.read_expr, "i")), "    ");
   sm_.release_to(mark);
 }
 

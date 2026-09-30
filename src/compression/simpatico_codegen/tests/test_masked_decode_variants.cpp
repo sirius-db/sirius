@@ -21,6 +21,12 @@
 //      exercises the in-kernel early return; a constant (bits==0) chunk
 //      exercises the chunk_min short-circuit.
 //   4. mask_consume without chunk_offsets (CNT not run) fails cleanly.
+//   5. the ballot at the predicate boundaries the engine actually emits:
+//      one-sided conjuncts arrive as INT64_MIN / INT64_MAX and an empty range
+//      as {0, -1}, so the packed-domain bound arithmetic must saturate; checked
+//      on every lane width with negative chunk minima, a full-width (32-bit)
+//      int32 chunk, a 40-bit int64 chunk (the decoded-domain path), constant
+//      chunks among packed ones and a partial tail.
 //
 // GPU required (encode/decode kernels + NVRTC). Same standalone-main harness
 // as the other tests in this directory.
@@ -36,9 +42,12 @@
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace jit = codegen::jit;
@@ -483,6 +492,110 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 dtype.c_str());
     std::printf("PASS: %s k4-singleton (row=%lld)\n", dtype.c_str(), static_cast<long long>(row));
   }
+  return true;
+}
+
+// Saturating int64 arithmetic for predicate construction: a fixture whose base
+// sits near the int64 limits must still be able to state "below the domain".
+std::int64_t sat64(__int128 v)
+{
+  constexpr __int128 lo = std::numeric_limits<std::int64_t>::min();
+  constexpr __int128 hi = std::numeric_limits<std::int64_t>::max();
+  return static_cast<std::int64_t>(v < lo ? lo : (v > hi ? hi : v));
+}
+
+// The range ballot at the boundaries the roundtrip's finite predicates never
+// reach. The engine emits INT64_MIN / INT64_MAX for one-sided conjuncts and
+// {0, -1} for an empty range, so the ballot's per-chunk bound arithmetic must
+// saturate rather than overflow; lane-typed extremes, a predicate that misses
+// the domain on either side, one that straddles the chunk minimum and a point
+// predicate on the constant (bits==0) chunk's value cover the accept-all /
+// reject-all / packed-compare branches. The data keeps gen_data's constant
+// chunk and partial tail; the (base, range) pair picks the lane width, the
+// sign of the chunk minima and the bit width (32 on int32 = the full lane,
+// 40 on int64 = the decoded-domain path). Masks are compared bit-for-bit
+// against the host reference from a 0xFF-filled buffer, proving the tail
+// words are written zero.
+template <typename Element>
+bool run_ballot_edges(
+  const std::string& dtype, const char* label, std::int64_t base, std::int64_t range, int arch)
+{
+  const std::int64_t n  = 5 * kChunk + 700;
+  const std::int64_t nc = codegen::num_chunks_for(n);
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+
+  const std::vector<Element> data = gen_data<Element>(n, base, range);
+  auto tree                       = jit::FusedTree::make(OpKind::Bitpack);
+  GpuEncoded enc = codegen_test::gpu_encode_tree<Element>(*tree, dtype, data.data(), n, arch);
+  if (!compact_packed_on_host(enc, nc)) return false;
+
+  constexpr std::int64_t kMin64 = std::numeric_limits<std::int64_t>::min();
+  constexpr std::int64_t kMax64 = std::numeric_limits<std::int64_t>::max();
+  const auto t_min              = static_cast<std::int64_t>(std::numeric_limits<Element>::min());
+  const auto t_max              = static_cast<std::int64_t>(std::numeric_limits<Element>::max());
+  const __int128 b              = base;
+  const __int128 r              = range;
+  const std::int64_t mid        = sat64(b + r / 2);
+  const std::int64_t constant   = base + range / 3;  // gen_data's chunk 2
+  // The straddle case brackets chunk 0's ACTUAL minimum: on a 2^32 range `base` itself is almost
+  // never drawn, so a straddle around it would have no survivors and pin nothing new.
+  const __int128 chunk0_min = *std::min_element(data.begin(), data.begin() + kChunk);
+  struct Case {
+    const char* name;
+    range_predicate pred;
+  };
+  const Case cases[] = {
+    {"two_sided", {sat64(b + r / 4), mid}},
+    {"open_low_INT64_MIN", {kMin64, mid}},
+    {"open_high_INT64_MAX", {mid, kMax64}},
+    {"all_INT64", {kMin64, kMax64}},
+    {"disjoint_above", {sat64(b + r + 100), sat64(b + r + 200)}},
+    {"disjoint_below", {kMin64, sat64(b - 1)}},
+    {"lane_typed_open_low", {t_min, mid}},
+    {"lane_typed_open_high", {mid, t_max}},
+    {"straddle_minimum", {sat64(chunk0_min - 100), sat64(chunk0_min + 3)}},
+    {"point_on_constant_chunk", {constant, constant}},
+    {"empty_range", {mid, mid - 1}},
+    {"empty_range_canonical", {0, -1}},  // clamp_to_decode_range's empty range
+  };
+
+  const std::size_t nwords = static_cast<std::size_t>(nc) * kWordsPerChunk;
+  std::string survivors_report;
+  for (const Case& c : cases) {
+    CUdeviceptr d_mask = enc.alloc(nwords * 4);
+    cudaMemset(reinterpret_cast<void*>(d_mask), 0xFF, nwords * 4);
+    selection_mask sm;
+    sm.words    = reinterpret_cast<std::uint32_t*>(d_mask);
+    sm.num_rows = n;
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_mask_out(
+                  *tree, enc.buffers, dtype.c_str(), n, c.pred, sm, stream),
+                "[ballot-edges/%s/%s] mask_out launch failed",
+                label,
+                c.name);
+    std::vector<std::uint32_t> got(nwords);
+    cudaMemcpy(
+      got.data(), reinterpret_cast<const void*>(d_mask), nwords * 4, cudaMemcpyDeviceToHost);
+    const std::vector<std::uint32_t> ref = host_mask(data, nc, c.pred);
+    std::size_t survivors                = 0;
+    for (const auto w : ref)
+      survivors += static_cast<std::size_t>(__builtin_popcount(w));
+    REQUIRE_MSG(
+      got == ref,
+      "[ballot-edges/%s/%s] ballot mask != host reference for [%lld, %lld] (%zu survivors)",
+      label,
+      c.name,
+      static_cast<long long>(c.pred.lo),
+      static_cast<long long>(c.pred.hi),
+      survivors);
+    REQUIRE_MSG(std::string_view{c.name} != "straddle_minimum" || survivors > 0,
+                "[ballot-edges/%s] straddle_minimum fixture has no survivors",
+                label);
+    survivors_report += std::string(" ") + c.name + "=" + std::to_string(survivors);
+  }
+  std::printf("PASS: ballot-edges/%s (of %lld rows:%s)\n",
+              label,
+              static_cast<long long>(n),
+              survivors_report.c_str());
   return true;
 }
 
@@ -983,6 +1096,32 @@ bool render_checks()
                 kfor.source.find("compacted output (generic)") != std::string::npos,
               "FOR-rooted mask_consume must render via the generic seam");
 
+  // 8. The Bitpack ballot compares in the packed domain; only the int64 lane
+  //    can pack more than 32 bits and so only it carries the decoded-domain
+  //    path. The Delta ballot stays on the generic seam, and no other render
+  //    carries the two-word helpers (their JIT keys must not move).
+  const cdj::DecodeKernelSpec k1_32 = cdj::render(*bp, "int32_t", 8, cdj::kShapeMaskOut);
+  REQUIRE_MSG(k1.source.find("(packed domain)") != std::string::npos &&
+                k1.source.find("simpatico_bp_field32") != std::string::npos &&
+                k1_32.source.find("(packed domain)") != std::string::npos &&
+                k1_32.source.find("simpatico_bp_field32") != std::string::npos,
+              "bitpack ballot must compare in the packed domain");
+  REQUIRE_MSG(k1.source.find("bpbits_0 > 32") != std::string::npos &&
+                k1_32.source.find("bpbits_0 > 32") == std::string::npos,
+              "only the int64 ballot needs a path for widths above 32 bits");
+  const auto carries_narrow_prelude = [](const cdj::DecodeKernelSpec& k) {
+    return k.source.find("simpatico_bp_field32") != std::string::npos ||
+           k.source.find("simpatico_bp_at32") != std::string::npos;
+  };
+  REQUIRE_MSG(dk1.source.find("selection mask (generic)") != std::string::npos &&
+                !carries_narrow_prelude(dk1),
+              "the delta ballot must stay on the generic seam without the two-word helpers");
+  REQUIRE_MSG(!carries_narrow_prelude(s3) && !carries_narrow_prelude(k3) &&
+                !carries_narrow_prelude(k5) && !carries_narrow_prelude(k6) &&
+                !carries_narrow_prelude(kfor) &&
+                !carries_narrow_prelude(cdj::render(*bp, "int64_t", 8, cdj::kShapeSparseConsume)),
+              "the two-word prelude must join only the kernels that use it");
+
   std::printf("PASS: render contract checks\n");
   return true;
 }
@@ -1008,6 +1147,22 @@ int main()
     // int64 compare path is exercised on genuinely 64-bit decoded values.
     run_roundtrip<std::int32_t>("int32_t", 8035, 2526, arch);
     run_roundtrip<std::int64_t>("int64_t", 3'000'000'000LL, 5052, arch);
+    // The ballot at open-ended / lane-typed bounds: engine lanes (int16 dates,
+    // int32 decimals), negative minima, the full 32-bit int32 width, a 40-bit
+    // int64 chunk and an int64 minimum next to INT64_MIN.
+    run_ballot_edges<std::int8_t>("int8_t", "int8/7b/neg-min", -64, 120, arch);
+    run_ballot_edges<std::int16_t>("int16_t", "int16/12b", 8035, 2526, arch);
+    run_ballot_edges<std::int16_t>("int16_t", "int16/12b/neg-min", -3000, 4000, arch);
+    run_ballot_edges<std::int32_t>("int32_t", "int32/13b", 8035, 4885, arch);
+    run_ballot_edges<std::int32_t>(
+      "int32_t", "int32/32b", std::numeric_limits<std::int32_t>::min(), (1LL << 32) - 1, arch);
+    run_ballot_edges<std::int32_t>("int32_t", "int32/24b/neg-min", -5'000'000, 1LL << 24, arch);
+    run_ballot_edges<std::int64_t>("int64_t", "int64/40b", 8035, 1LL << 40, arch);
+    run_ballot_edges<std::int64_t>("int64_t",
+                                   "int64/13b/INT64_MIN+5",
+                                   std::numeric_limits<std::int64_t>::min() + 5,
+                                   1LL << 13,
+                                   arch);
     // The delta mask walk and the dictionary gather.
     run_delta_masked<std::int64_t>("int64_t", arch);
     run_delta_masked<std::int32_t>("int32_t", arch);
