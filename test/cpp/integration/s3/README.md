@@ -77,8 +77,8 @@ even in strict mode.
 
 Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
 still runs when it matches an explicit positive name or tag selector,
-subject to that selector's exclusions. Catch2 also adds `[!hide]` to
-hidden cases. These 15 hidden cases run in `make s3-test`:
+subject to that selector's exclusions. These 15 hidden cases run in
+`make s3-test`:
 
 - `DuckDB external file cache invalidates an overwritten S3 range by ETag`
 - `gpu_execution rejects operations on nested S3 parquet columns cleanly`
@@ -113,7 +113,7 @@ spec='[s3][integration]~[large]~[aws]'
 
 The gate lists contain 98, 5, 3 and 3 cases respectively; the deprecated
 TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
-plus `[.]` and `[!hide]`.
+plus `[.]`.
 
 ## MinIO lifecycle
 
