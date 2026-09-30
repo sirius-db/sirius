@@ -211,7 +211,6 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_per_query_completion_handler.cpp
-    test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_index_keys.cpp
@@ -270,10 +269,6 @@ set(TEST_SOURCES
     test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
-
-if(SIRIUS_LEGACY_TEST_SOURCES)
-  list(APPEND TEST_SOURCES ${SIRIUS_LEGACY_TEST_SOURCES})
-endif()
 
 # The testcontainers-backed S3 harness only compiles when its dependency is
 # built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.

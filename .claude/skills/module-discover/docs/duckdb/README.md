@@ -40,11 +40,7 @@ We use **10 of 13** modules. Primary integration points:
 |-------------|-------------|----------|
 | `src/sirius_extension.cpp` | main, parser, optimizer, planner, execution, function, catalog | `ClientContext`, `Parser`, `Planner`, `Optimizer`, `TableFunction`, `Connection` |
 | `src/sirius_interface.cpp` | main, common, function | `ClientContext`, `TableFunction`, `DataChunk` |
-| `src/gpu_physical_plan_generator.cpp` | execution, planner, common | `PhysicalOperator`, `LogicalOperator`, `LogicalType` |
 | `src/planner/sirius_physical_plan_generator.cpp` | execution, planner, common | `PhysicalOperator`, `LogicalOperator`, `PhysicalOperatorType` |
 | `src/expression_executor/gpu_expression_translator.cpp` | planner, common | `BoundReferenceExpression`, `BoundComparisonExpression`, `BoundFunctionExpression` |
 | `src/op/scan/duckdb_scan_task.cpp` | execution, parallel, function, common | `ExecutionContext`, `ThreadContext`, `TableFunction`, `DataChunk` |
 | `src/op/result/host_table_chunk_reader.cpp` | common | `DataChunk`, `Vector`, `FlatVector`, `ValidityMask` |
-| `src/gpu_columns.cpp` | common | `LogicalType`, `Value`, `DecimalType` |
-| `src/plan/gpu_plan_aggregate.cpp` | execution, function, main, planner | `PhysicalHashAggregate`, `FunctionBinder`, `BoundAggregateExpression` |
-| `src/operator/gpu_physical_table_scan.cpp` | execution, parallel, planner, common | `ExecutionContext`, `ThreadContext`, `TaskScheduler`, `TableFilterSet` |

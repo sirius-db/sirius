@@ -85,10 +85,9 @@ namespace duckdb {
 
 namespace {
 
-static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
-static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
-static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
-static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
+static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
+static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
 
 optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
 {
@@ -193,25 +192,6 @@ std::optional<std::string> get_config_file_path()
   if (home_dir != nullptr) {
     auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
                      std::string(CONFIG_FILE_NAME);
-    if (std::filesystem::exists(home_path)) { return home_path.string(); }
-  }
-
-  return std::nullopt;
-}
-
-/// Check whether a legacy sirius.cfg file exists in any of the search locations.
-/// Returns the path if found, std::nullopt otherwise.
-std::optional<std::string> find_legacy_config_file()
-{
-  // Current working directory
-  auto cwd_path = std::filesystem::current_path() / std::string(LEGACY_CONFIG_FILE_NAME);
-  if (std::filesystem::exists(cwd_path)) { return cwd_path.string(); }
-
-  // Home directory
-  const char* home_dir = std::getenv("HOME");
-  if (home_dir != nullptr) {
-    auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
-                     std::string(LEGACY_CONFIG_FILE_NAME);
     if (std::filesystem::exists(home_path)) { return home_path.string(); }
   }
 
@@ -1797,21 +1777,9 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_ERROR("{}", msg);
     throw std::runtime_error(msg);
   } else {
-    // Check if the user has a legacy .cfg file they may need to migrate
-    if (auto legacy_path = find_legacy_config_file()) {
-      SIRIUS_LOG_WARN(
-        "Found legacy config file '{}'. Sirius now uses YAML configuration "
-        "(sirius.yaml). Please migrate your settings to the new format. "
-        "See docs/super-sirius/configuration.md for details.",
-        *legacy_path);
-    }
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    SIRIUS_LOG_WARN(
-      "Super Sirius will allocate most GPU and pinned host memory on startup. "
-      "If you are using the legacy code path (gpu_buffer_init / gpu_processing), "
-      "set SIRIUS_DISABLE=1 to prevent this.");
     config_.apply_defaults();
   }
 }
