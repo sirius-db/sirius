@@ -52,6 +52,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -780,6 +781,17 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
             SIRIUS_LOG_INFO("SiriusContext: no P2P access {} -> {} -- falling back to host staging",
                             source_device,
                             target_device);
+            continue;
+          }
+          // cucascade probes whether peer copies actually move data and disables peer access
+          // for the pairs where they do not. Enabling it again would let peer copies outside
+          // cucascade's converters silently skip the transfer.
+          if (!cucascade::memory::probe_peer_dma_works(source_device, target_device)) {
+            SIRIUS_LOG_INFO(
+              "SiriusContext: peer DMA {} -> {} does not work on this host -- falling back to "
+              "host staging",
+              source_device,
+              target_device);
             continue;
           }
           cudaError_t enable_err = cudaDeviceEnablePeerAccess(target_device, 0);
