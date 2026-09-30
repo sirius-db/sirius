@@ -281,10 +281,16 @@ TEST_CASE_METHOD(DistinctFixture,
 {
   SECTION("empty table") { compare_gpu_vs_cpu("SELECT DISTINCT a, b FROM dist_empty"); }
 
-  // A constant outside the column's min/max folds the plan to EMPTY_RESULT; 15 lies inside.
+  // 15 lies inside x's min/max, so the scan and its filter survive planning.
   SECTION("filter that keeps no row")
   {
     compare_gpu_vs_cpu("SELECT DISTINCT a, x FROM dist_r WHERE x = 15");
+  }
+
+  // Outside a's min/max, statistics fold the scan (not the DISTINCT) to EMPTY_RESULT.
+  SECTION("scan folded to an empty result")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT a, b FROM dist_t WHERE a > 1000");
   }
 }
 
