@@ -36,6 +36,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -689,6 +690,17 @@ parallel::after_task_work sirius_physical_partition::observe_task_input(operator
   } catch (std::bad_alloc const&) {
     return join->decline_dynamic_filter_accumulation(
       accumulation_decline::CONTRIBUTION_UNACCOUNTABLE);
+  } catch (std::exception const& e) {
+    // The read serves only the optional filter, so its failure ends the accumulation, not the task.
+    auto work = join->decline_dynamic_filter_accumulation(accumulation_decline::INPUT_UNREADABLE);
+    try {
+      SIRIUS_LOG_WARN(
+        "sirius_physical_partition id {} cannot read its task input for the accumulated Bloom: {}",
+        get_operator_id(),
+        e.what());
+    } catch (...) {  // The decline stands without its log line.
+    }
+    return work;
   }
 }
 

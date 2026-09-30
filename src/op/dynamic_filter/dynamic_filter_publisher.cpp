@@ -113,8 +113,20 @@ char const* describe(accumulation_decline reason) noexcept
   switch (reason) {
     case accumulation_decline::CONTRIBUTION_UNACCOUNTABLE:
       return "a task input is not exactly one certified batch";
+    case accumulation_decline::INPUT_UNREADABLE: return "a task input's batch cannot be read";
   }
   return "unknown reason";
+}
+
+void count_decline(dynamic_filter_publication_outcome& outcome,
+                   accumulation_decline reason) noexcept
+{
+  switch (reason) {
+    case accumulation_decline::CONTRIBUTION_UNACCOUNTABLE:
+      outcome.accumulations_skipped_inventory = 1;
+      break;
+    case accumulation_decline::INPUT_UNREADABLE: outcome.accumulations_skipped_error = 1; break;
+  }
 }
 
 }  // namespace
@@ -308,6 +320,18 @@ struct dynamic_filter_publication_session::state {
         (void)cudaGetLastError();
         throw std::runtime_error(std::string{"cudaGetDevice: "} + cudaGetErrorString(status));
       }
+      // The reduction runs on the job's stream, so that stream must belong to the root.
+      int stream_device = -1;
+      if (auto const status = cudaStreamGetDevice(stream.get(), &stream_device);
+          status != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error(std::string{"cudaStreamGetDevice: "} + cudaGetErrorString(status));
+      }
+      if (stream_device != device) {
+        throw std::logic_error("the publishing job's stream is on GPU " +
+                               std::to_string(stream_device) + ", not on the root GPU " +
+                               std::to_string(device));
+      }
       auto filters = builder->finish(rmm::cuda_device_id{device}, stream);
       if (!filters) {
         SIRIUS_LOG_DEBUG(
@@ -444,7 +468,7 @@ dynamic_filter_publication_session::decline_accumulation(accumulation_decline re
   {
     std::scoped_lock lock(operation->mutex);
     if (operation->current == state::phase::COLLECTING && !operation->accumulation_result) {
-      operation->outcome.accumulations_skipped_inventory = 1;
+      count_decline(operation->outcome, reason);
       operation->end_attempt(sirius_dynamic_filter_set::completion::SKIPPED);
       declined = true;
     }

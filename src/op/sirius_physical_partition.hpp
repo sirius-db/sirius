@@ -126,7 +126,8 @@ class sirius_physical_partition : public sirius_physical_operator {
    *
    * Active only on the build side of a HASH partition with more than one partition whose join
    * accumulates dynamic filters. An input that is not exactly one batch with one original ID, or
-   * that carries a late-materialization directive, ends the accumulation instead.
+   * that carries a late-materialization directive, ends the accumulation instead, as does a failure
+   * to read the input batch.
    *
    * @return The join's after-task work, or empty work
    */

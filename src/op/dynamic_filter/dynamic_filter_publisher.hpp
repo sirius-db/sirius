@@ -47,6 +47,7 @@ struct dynamic_filter_stats;
  */
 enum class accumulation_decline : std::uint8_t {
   CONTRIBUTION_UNACCOUNTABLE,  ///< A task input cannot be matched to exactly one certified batch
+  INPUT_UNREADABLE,            ///< Reading a task input's batch failed; counted as a masked error
 };
 
 /**

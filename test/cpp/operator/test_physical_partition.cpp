@@ -799,6 +799,30 @@ TEST_CASE("build PARTITION declines inputs it cannot account for",
   REQUIRE(fixture.channel->snapshot().empty());
 }
 
+TEST_CASE("a build input that cannot be read ends the accumulation, not the task",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture;
+  auto const first  = fixture.push({1, 3});
+  auto const second = fixture.push({7, 9});
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+  {
+    // A thread holding a batch's exclusive lock cannot also read it: the read lock throws.
+    auto const held = first->try_to_mutable();
+    REQUIRE(held);
+    REQUIRE_NOTHROW(fixture.contribute(pipelineable_operator_data({first})));
+  }
+  REQUIRE_FALSE(fixture.tree.build_partition->observe_task_input(
+    pipelineable_operator_data({second}), fixture.gpu->acquire_stream()));
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_skipped_error == 1);
+  REQUIRE(counters.accumulations_skipped_inventory == 0);
+  REQUIRE(counters.accumulation_completed_contributions == 0);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.channel->snapshot().empty());
+}
+
 TEST_CASE("a non-FULL build input never accumulates and never blocks",
           "[physical_partition][dynamic_filter][multi_partition]")
 {

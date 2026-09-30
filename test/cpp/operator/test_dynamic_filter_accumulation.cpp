@@ -796,6 +796,37 @@ TEST_CASE("a failing publishing job is masked, counted, and settles",
   REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
+TEST_CASE("a publishing job on another GPU's stream is masked before it enqueues anything",
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  acc::fixture fixture(2);
+  auto const first    = fixture.make_batch(0, 0, 300);
+  auto const second   = fixture.make_batch(0, 900, 300);
+  auto const baseline = fixture.allocated_bytes();
+  REQUIRE(fixture.begin({first, second},
+                        fixture.make_plan(256 * mib,
+                                          {cudf::data_type{cudf::type_id::INT32},
+                                           cudf::data_type{cudf::type_id::INT64}},
+                                          {0})));
+  REQUIRE_FALSE(fixture.contribute(first));
+  auto publishing = fixture.contribute(second);
+  REQUIRE(publishing);
+  {
+    // GPU 0, the root, is current, but the stream belongs to GPU 1.
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+    std::move(publishing)(fixture.publication_stream(1));
+  }
+  REQUIRE(cudaStreamQuery(fixture.publication_stream(1).get()) == cudaSuccess);
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_skipped_error == 1);
+  REQUIRE(counters.accumulations_skipped_admission == 0);
+  REQUIRE(counters.filters_pushed == 0);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.channel->snapshot().empty());
+  REQUIRE(fixture.allocated_bytes() == baseline);
+}
+
 TEST_CASE("an uninvoked publishing job ends the attempt without a filter",
           "[dynamic_filter][multi_partition]")
 {
