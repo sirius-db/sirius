@@ -3,10 +3,19 @@ name: Validate
 on:
   pull_request_target:
     types: [opened, reopened, edited, synchronize]
+  pull_request:
+    paths:
+      - .github/workflows/validate.yml
+  merge_group:
 
 jobs:
+  # Checks the PR title to ensure it follows Conventional Commits guidelines. Skipped entirely
+  # under merge_group, which has no `pull_request` payload for the action to validate — the
+  # `validate` job below treats a skip here as satisfied, since the title was already required
+  # to pass before the PR became mergeable.
   semantic-pr:
     name: pr-title
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-slim
     permissions:
       pull-requests: read
@@ -14,3 +23,49 @@ jobs:
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Removes HTML comments from our PR template to keep our commits clean; #1609. Skipped
+  # entirely under merge_group for the same reason as pr-title above — no `pull_request`
+  # payload to clean, and the body was already cleaned when the PR itself was opened/edited.
+  clean-pr-body:
+    name: pr-body
+    if: >
+      github.event_name != 'merge_group' &&
+      github.event.action != 'synchronize' &&
+      (github.event.action != 'edited' || github.event.changes.body)
+    runs-on: ubuntu-slim
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            const stripped = body.replace(/[ \t]*<!--[\s\S]*?-->[ \t]*\r?\n?/g, '').trim();
+            if (stripped !== body) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                body: stripped,
+              });
+            }
+
+  # Single required status check for this workflow. Consolidates pr-title and pr-body so branch
+  # protection only needs to list `validate`, not every job here — matching the check/test
+  # workflows' own aggregator pattern. A `skipped` result (both jobs skip under merge_group) is
+  # treated the same as `success`, since skipping there is expected, not a failure.
+  validate:
+    name: validate
+    needs: [semantic-pr, clean-pr-body]
+    if: always()
+    runs-on: ubuntu-slim
+    steps:
+      - if: >
+          (needs['semantic-pr'].result == 'success' || needs['semantic-pr'].result == 'skipped') &&
+          (needs['clean-pr-body'].result == 'success' || needs['clean-pr-body'].result == 'skipped')
+        run: exit 0
+      - if: >
+          !((needs['semantic-pr'].result == 'success' || needs['semantic-pr'].result == 'skipped') &&
+            (needs['clean-pr-body'].result == 'success' || needs['clean-pr-body'].result == 'skipped'))
+        run: exit 1

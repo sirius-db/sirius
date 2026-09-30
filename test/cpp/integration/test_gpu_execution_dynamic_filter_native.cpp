@@ -16,57 +16,41 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
-#include <algorithm>
-#include <cstdlib>
-#include <filesystem>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
-
 namespace {
 
-fs::path get_tpch_db_path()
-{
-  const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH");
-  auto db_path =
-    env ? fs::path(env) : fs::path(__FILE__).parent_path() / "data/duckdb/integration.duckdb";
-  REQUIRE(fs::exists(db_path));
-  return db_path;
-}
+using sirius::test::coverage_gate_disable_guard;
 
-//! RAII toggle for the opt-in zone-map kind (default off). The SET mutates the shared
-//! SiriusContext, so restoring the default is mandatory for later tests.
+// Enable zone-map filters for one scope and restore the previous setting.
 struct zone_map_switch_guard {
-  explicit zone_map_switch_guard(duckdb::Connection& c) : con(c)
+  explicit zone_map_switch_guard(duckdb::Connection& c)
+    : con(c),
+      original(sirius::test::get_registered_sirius_context(c)
+                 ->get_config()
+                 .get_operator_params()
+                 .enable_dynamic_zone_map_filter)
   {
     con.Query("SET enable_dynamic_zone_map_filter = true;");
   }
-  ~zone_map_switch_guard() { con.Query("SET enable_dynamic_zone_map_filter = false;"); }
+  ~zone_map_switch_guard()
+  {
+    con.Query(std::string{"SET enable_dynamic_zone_map_filter = "} + (original ? "true" : "false") +
+              ";");
+  }
 
   zone_map_switch_guard(const zone_map_switch_guard&)            = delete;
   zone_map_switch_guard& operator=(const zone_map_switch_guard&) = delete;
 
   duckdb::Connection& con;
+  bool original;
 };
-
-std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQueryResult& result)
-{
-  std::vector<std::vector<std::string>> rows;
-  for (duckdb::idx_t r = 0; r < result.RowCount(); r++) {
-    std::vector<std::string> row;
-    row.reserve(result.ColumnCount());
-    for (duckdb::idx_t c = 0; c < result.ColumnCount(); c++) {
-      row.push_back(result.GetValue(c, r).ToString());
-    }
-    rows.push_back(std::move(row));
-  }
-  std::sort(rows.begin(), rows.end());
-  return rows;
-}
 
 //! Transparent GPU run (asserted to actually execute on GPU) vs CPU run, exact row-set
 //! equality. All queries below aggregate to integer/decimal values, so no float tolerance.
@@ -93,8 +77,8 @@ void compare_gpu_vs_cpu(duckdb::Connection& con, const std::string& query)
   REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
   REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
 
-  auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto gpu_rows = sirius::test::collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>());
+  auto cpu_rows = sirius::test::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
   REQUIRE(gpu_rows == cpu_rows);
 }
 
@@ -111,7 +95,7 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
   if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
   auto con = sirius::test::g_integration_env->make_connection();
 
-  auto db_path = get_tpch_db_path();
+  auto db_path = sirius::test::integration_tpch_db_path();
   auto r       = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
   REQUIRE(r);
   REQUIRE_FALSE(r->HasError());
@@ -151,5 +135,90 @@ TEST_CASE("gpu_execution - dynamic filters over duckdb-native tables",
                        "FROM lineitem l "
                        "JOIN (SELECT o_orderkey FROM orders WHERE o_orderkey / 100 = 50) o "
                        "ON l.l_orderkey = o.o_orderkey");
+  }
+}
+
+TEST_CASE("gpu_execution - dynamic-filter domain-coverage gate",
+          "[integration][gpu_execution][dynamic_filter]")
+{
+  REQUIRE(sirius::test::g_integration_env != nullptr);
+  if (!sirius::test::g_integration_env->is_active()) { sirius::test::g_integration_env->resume(); }
+  auto con = sirius::test::g_integration_env->make_connection();
+
+  auto db_path = sirius::test::integration_tpch_db_path();
+  auto r       = con.Query("ATTACH IF NOT EXISTS '" + db_path.string() + "' AS tpch (READ_ONLY);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  r = con.Query("USE tpch;");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+
+  // `p_partkey > 1` drops one row while remaining a real table filter; an always-true predicate
+  // would be removed before it could provide build-filter evidence.
+  std::string const covering_query =
+    "SELECT count(*) "
+    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_partkey > 1 GROUP BY p_partkey) p "
+    "ON l_partkey = p_partkey";
+  std::string const selective_query =
+    "SELECT count(*) "
+    "FROM lineitem JOIN (SELECT p_partkey FROM part WHERE p_size = 15 "
+    "AND p_container = 'SM BOX' GROUP BY p_partkey) p "
+    "ON l_partkey = p_partkey";
+
+  SECTION("a domain-covering build publishes nothing")
+  {
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate > before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed == before.filters_pushed);
+    REQUIRE(after.publications_failed == before.publications_failed);
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
+  }
+
+  SECTION("a selective build publishes normally")
+  {
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, selective_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate == before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed > before.filters_pushed);
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
+  }
+
+  SECTION("threshold 2.0 disables the gate and restores publish-always behavior")
+  {
+    coverage_gate_disable_guard gate_off(con);
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_with_known_domain > before.keys_with_known_domain);
+    REQUIRE(after.keys_skipped_domain_gate == before.keys_skipped_domain_gate);
+    REQUIRE(after.filters_pushed > before.filters_pushed);
+  }
+
+  SECTION("Invariant N holds across the suite's join shapes at the default threshold")
+  {
+    // Any increment means lineage admitted an amplifying shape or supplied an invalid upper bound.
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(con);
+    compare_gpu_vs_cpu(con, covering_query);
+    compare_gpu_vs_cpu(con, selective_query);
+    compare_gpu_vs_cpu(con,
+                       "SELECT count(*), min(l_orderkey), max(l_orderkey) "
+                       "FROM lineitem JOIN part ON l_partkey = p_partkey "
+                       "WHERE p_size = 15 AND p_container = 'SM BOX'");
+    compare_gpu_vs_cpu(con,
+                       "SELECT count(*), sum(l.l_orderkey) "
+                       "FROM lineitem l "
+                       "JOIN (SELECT o_orderkey FROM orders WHERE o_orderkey / 100 = 50) o "
+                       "ON l.l_orderkey = o.o_orderkey");
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(con);
+
+    REQUIRE(after.keys_build_exceeded_domain == before.keys_build_exceeded_domain);
   }
 }

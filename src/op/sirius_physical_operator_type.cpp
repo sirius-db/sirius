@@ -105,6 +105,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::UPDATE_EXTENSIONS: return "UPDATE_EXTENSIONS";
     case SiriusPhysicalOperatorType::PARTITION: return "PARTITION";
     case SiriusPhysicalOperatorType::CONCAT: return "CONCAT";
+    case SiriusPhysicalOperatorType::PASSTHROUGH_SINK: return "PASSTHROUGH_SINK";
     case SiriusPhysicalOperatorType::MERGE_SORT: return "MERGE_SORT";
     case SiriusPhysicalOperatorType::MERGE_GROUP_BY: return "MERGE_GROUP_BY";
     case SiriusPhysicalOperatorType::MERGE_TOP_N: return "MERGE_TOP_N";
@@ -115,6 +116,8 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";
+    case SiriusPhysicalOperatorType::STREAMING_SINK: return "STREAMING_SINK";
+    case SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: return "DENSE_COUNT_JOIN";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";

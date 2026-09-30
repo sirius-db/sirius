@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
-# Reproduce the TPC-H SF1000 result: 9.139 s suite, 22/22 byte-identical.
+# Reproduce the TPC-H SF1000 result: 7.00 s suite best-of-3, 22/22 byte-identical (unpatched
+# libcudf, late-materialization + fused decode-time filtering on).
 # Run from the repo root:  pixi run bash bench/sf1000-repro/run.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
 DATA="${DATA:-$HOME/tpch_parquet_sf1000}"          # SF1000 parquet, one dir per table
-CUDF_SO="${CUDF_SO:-$HOME/cudf-src/cpp/build/libcudf.so}"
+CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-provided libcudf
 PLANS="${PLANS:-$HERE/plans}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
 NAME="${NAME:-sf1000_repro}"
 
-[ -d "$DATA" ]     || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
-[ -f "$CUDF_SO" ]  || { echo "ERROR: no patched libcudf at $CUDF_SO -- run build-libcudf.sh first"; exit 1; }
+# Late materialization (group-by-rowid ride) and fused decode-time filtering. Both off by
+# default; both are worth real suite time here and are safe to leave on for a repro run.
+# PIN_UNIQUE_COLS must cover every rider's key, not just the ride's own — dropping n_name/
+# n_nationkey still gets a correct answer (nation just stops riding) but costs real time.
+# See docs/super-sirius/late-materialization.md.
+export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
+export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
+export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 
-# LD_PRELOAD, not LD_LIBRARY_PATH. The Sirius extension .so carries DT_RPATH, which the loader
-# searches BEFORE LD_LIBRARY_PATH, so LD_LIBRARY_PATH silently loses to the pixi-provided libcudf.
-# Verify with LD_DEBUG=libs that only $CUDF_SO is initialised.
-export LD_PRELOAD="$CUDF_SO"
+[ -d "$DATA" ] || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
+
+# LD_PRELOAD the patched libcudf only when explicitly provided. When unset the loader finds
+# libcudf via the extension's DT_RPATH (pixi env). Do NOT use LD_LIBRARY_PATH — DT_RPATH
+# wins over it, so it silently loads the wrong lib. Verify with LD_DEBUG=libs if unsure.
+if [ -n "$CUDF_SO" ]; then
+  [ -f "$CUDF_SO" ] || { echo "ERROR: CUDF_SO set but not found at $CUDF_SO"; exit 1; }
+  export LD_PRELOAD="$CUDF_SO"
+fi
 
 # Two settings do the work here:
 #   pin_table_input_compression_plan_dir -> simpatico plans; l_shipinstruct MUST stay `dictionary`
@@ -38,9 +50,11 @@ done
 # That cache persists across processes, so run twice if you want warm numbers; steady-state
 # per-iteration timings are unaffected either way because we report best-of-3.
 echo "data      : $DATA"
-echo "libcudf   : $CUDF_SO"
+echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "config    : $CFG"
+echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=$SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS"
+echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
 echo
 
 cd "$REPO"

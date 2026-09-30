@@ -32,7 +32,7 @@
 #include <cudf/wrappers/timestamps.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 // standard library
 #include <string>

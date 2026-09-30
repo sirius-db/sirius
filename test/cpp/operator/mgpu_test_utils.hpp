@@ -106,7 +106,7 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      block_size: 1048576\n"
        "  executor:\n"
        "    scan_manager:\n"
-       "      use_sirius_datasource: true\n"
+       "      backend: sirius\n"
        "    pipeline:\n"
        "      num_threads: "
     << params.pipeline_num_threads
@@ -134,22 +134,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
 }
 
 /**
- * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible.
- * Matches the Catch2 v2 WARN+return convention used by the other MGPU tests.
+ * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible
+ * (see sirius::test::has_gpus). Callers must be tagged [multi_gpu].
  *
  * @return true if the host has >=2 GPUs; the caller MUST still `return;`
  *         when this returns false.
  */
-inline bool require_two_gpus()
-{
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("MGPU operator test requires >=2 GPUs; single-GPU host — skipping");
-    return false;
-  }
-  return true;
-}
+inline bool require_two_gpus() { return sirius::test::has_gpus(2); }
 
 /**
  * @brief RAII wrapper that pauses any active shared test env (so our local
@@ -183,10 +174,9 @@ class scoped_mgpu_env {
    * @brief Test-only accessor for the underlying task_scheduler.
    *
    * Returns a non-owning reference to the task_scheduler instance owned
-   * by the SiriusContext that this fixture wraps. Intended for tests
-   * that need to call test-only mutators (e.g.,
-   * `set_no_pref_rr_counter_for_testing`) between query setup and
-   * execution. Lifetime: the returned reference is valid for the
+   * by the SiriusContext that this fixture wraps. Intended for tests that
+   * need to reach the scheduler between query setup and execution.
+   * Lifetime: the returned reference is valid for the
    * lifetime of the scoped_mgpu_env instance (the SiriusContext is
    * shared across every connection opened against this env via the
    * extension callback's `OnConnectionOpened`).
@@ -345,10 +335,11 @@ class scoped_log_dir {
 };
 
 /**
- * @brief Run @p inner_query through gpu_execution on @p con. Returns
- * whether both GPU and CPU reference execution produced identical row
- * sets (string-compare after ORDER BY). Disables fallback so GPU errors
- * are not silently hidden.
+ * @brief Compare @p inner_query through `gpu_execution` with a reference execution.
+ *
+ * The reference may be transparently intercepted by Sirius unless
+ * @p force_cpu_reference is true. Disables fallback so GPU errors are not
+ * silently hidden.
  *
  * The comparison mirrors the one in test_gpu_execution_tpch.cpp's
  * compare_gpu_vs_cpu but stripped down to what the operator MGPU tests

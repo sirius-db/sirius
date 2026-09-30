@@ -5,6 +5,7 @@
 // fewer than two GPUs are visible.
 
 #include "api/simpatico_codegen.hpp"
+#include "codegen/util/stream_pool.hpp"
 #include "test_utils.hpp"
 
 #include <cudf/table/table.hpp>
@@ -18,6 +19,8 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -48,9 +51,8 @@ void decode_on_current_device(int device)
   auto input = make_int32_table(kNumColumns, kNumRows, 13 + device);
 
   // Keep compression off the internal stream cache.
-  auto compressed =
-    simpatico::compress_with_plan(input->view(), kPlanDsl, serial_stream.view(), mr);
-  serial_stream.synchronize();
+  auto compressed = simpatico::compress_with_plan(input->view(), kPlanDsl, serial_stream, mr);
+  serial_stream.sync();
 
   expect(compressed.num_columns() == static_cast<std::size_t>(kNumColumns),
          (label + ": compressed column count").c_str());
@@ -81,6 +83,42 @@ void decode_on_device(int device)
 
 }  // namespace
 
+// thread_device_stream_pool's two contracts, both checkable on one GPU:
+// the same (thread, device) gets the SAME streams back — callers rely on the
+// handles outliving the buffers recorded against them — and a second thread
+// gets its own, since a stream is not safe to share across threads submitting
+// concurrently.
+bool check_thread_device_pool()
+{
+  auto& first  = simpatico::thread_device_stream_pool(4);
+  auto& second = simpatico::thread_device_stream_pool(4);
+  if (&first != &second || first.streams.size() != 4) {
+    std::fprintf(stderr, "FAIL: thread_device_stream_pool did not reuse the thread's pool\n");
+    return false;
+  }
+  if (second.streams != first.streams) {
+    std::fprintf(stderr, "FAIL: thread_device_stream_pool returned different handles\n");
+    return false;
+  }
+
+  std::vector<cudaStream_t> other_thread_streams;
+  std::thread worker([&] {
+    cudaSetDevice(0);
+    other_thread_streams = simpatico::thread_device_stream_pool(4).streams;
+  });
+  worker.join();
+  for (auto const s : other_thread_streams) {
+    for (auto const mine : first.streams) {
+      if (s == mine) {
+        std::fprintf(stderr, "FAIL: two threads share a stream handle\n");
+        return false;
+      }
+    }
+  }
+  std::printf("PASS: thread_device_stream_pool reuse and per-thread isolation\n");
+  return true;
+}
+
 int main()
 {
   int device_count       = 0;
@@ -91,8 +129,14 @@ int main()
                  cudaGetErrorString(count_error));
     return 1;
   }
+  // Checkable on one GPU, so it runs before the multi-device skip below.
+  if (device_count >= 1 && !check_thread_device_pool()) { return 1; }
+
   if (device_count < 2) {
-    std::printf("test_multi_gpu_stream_affinity: SKIP (needs >= 2 GPUs, found %d)\n", device_count);
+    std::printf(
+      "test_multi_gpu_stream_affinity: SKIP multi-device part (needs >= 2 GPUs, found "
+      "%d)\n",
+      device_count);
     return 0;
   }
 

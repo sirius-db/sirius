@@ -95,3 +95,31 @@ TEST_CASE("sirius_config rejects a negative gpus_per_query", "[topology_config][
   sirius::sirius_config cfg;
   CHECK_THROWS(cfg.load_from_file(yaml.path));
 }
+
+TEST_CASE("sirius_config rejects a zero avg_variable_column_bytes", "[topology_config][config]")
+{
+  // Zero would make variable-width columns contribute nothing to the per-row width, so a
+  // mixed schema is under-estimated and the query admitted onto too few GPUs. Unlike
+  // admission_bytes_per_gpu, where 0 is the documented off switch, there is no reading of
+  // zero here that means anything.
+  scoped_yaml yaml("sirius_avg_var_zero.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    avg_variable_column_bytes: 0\n");
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS(cfg.load_from_file(yaml.path));
+}
+
+TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_config][config]")
+{
+  // 0 is the off switch: it disables the estimate and leaves sizing to gpus_per_query.
+  scoped_yaml yaml("sirius_admission_bytes_zero.yaml",
+                   "sirius:\n"
+                   "  operator_params:\n"
+                   "    admission_bytes_per_gpu: 0\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
+}

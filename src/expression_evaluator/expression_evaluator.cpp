@@ -20,18 +20,21 @@
 #include <expression/ast/aggregate.hpp>  // sirius::ast::aggregate
 #include <expression/ast/node.hpp>       // sirius::ast::node alternatives
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <memory>
@@ -136,10 +139,17 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_result::release_col
 expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
-  std::size_t min_ast_size)
-  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+  std::size_t min_ast_size,
+  bool like_swar_fastpath,
+  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  : _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath),
+    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
 {
   _ast_expressions.reserve(expressions.size());
   for (auto const& expr : expressions) {
@@ -147,35 +157,57 @@ expression_evaluator::expression_evaluator(
   }
 }
 
-expression_evaluator::expression_evaluator(sirius::ast::node const& expression,
-                                           rmm::device_async_resource_ref resource_ref,
-                                           rmm::cuda_stream_view stream,
-                                           expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
-  : expression_evaluator(&expression, resource_ref, stream, strategy, min_ast_size)
+expression_evaluator::expression_evaluator(
+  sirius::ast::node const& expression,
+  rmm::device_async_resource_ref resource_ref,
+  ::cuda::stream_ref stream,
+  expression_evaluator_strategy strategy,
+  std::size_t min_ast_size,
+  bool like_swar_fastpath,
+  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  : expression_evaluator(&expression,
+                         resource_ref,
+                         stream,
+                         strategy,
+                         min_ast_size,
+                         like_swar_fastpath,
+                         std::move(like_cache))
 {
 }
 
-expression_evaluator::expression_evaluator(sirius::ast::node const* expression,
-                                           rmm::device_async_resource_ref resource_ref,
-                                           rmm::cuda_stream_view stream,
-                                           expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
-  : _strategy(strategy), _mr(resource_ref), _stream(stream), _min_ast_size(min_ast_size)
+expression_evaluator::expression_evaluator(
+  sirius::ast::node const* expression,
+  rmm::device_async_resource_ref resource_ref,
+  ::cuda::stream_ref stream,
+  expression_evaluator_strategy strategy,
+  std::size_t min_ast_size,
+  bool like_swar_fastpath,
+  std::shared_ptr<like_multiliteral_cache const> like_cache)
+  : _strategy(strategy),
+    _mr(resource_ref),
+    _stream(stream),
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath),
+    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
 {
   _ast_expressions.push_back(expression);
 }
 
-expression_evaluator::expression_evaluator(std::vector<sirius::ast::node const*> expressions,
-                                           rmm::device_async_resource_ref resource_ref,
-                                           rmm::cuda_stream_view stream,
-                                           expression_evaluator_strategy strategy,
-                                           std::size_t min_ast_size)
+expression_evaluator::expression_evaluator(
+  std::vector<sirius::ast::node const*> expressions,
+  rmm::device_async_resource_ref resource_ref,
+  ::cuda::stream_ref stream,
+  expression_evaluator_strategy strategy,
+  std::size_t min_ast_size,
+  bool like_swar_fastpath,
+  std::shared_ptr<like_multiliteral_cache const> like_cache)
   : _ast_expressions(std::move(expressions)),
     _strategy(strategy),
     _mr(resource_ref),
     _stream(stream),
-    _min_ast_size(min_ast_size)
+    _min_ast_size(min_ast_size),
+    _like_swar_fastpath(like_swar_fastpath),
+    _like_cache(like_cache ? std::move(like_cache) : std::make_shared<like_multiliteral_cache>())
 {
 }
 
@@ -281,7 +313,10 @@ std::unique_ptr<cudf::table> expression_evaluator::evaluate(cudf::table_view inp
       if (result_column->type() != cudf_return_type) {
         // Cast is only valid for fixed-width types (no STRING/LIST/STRUCT/etc.).
         if (IsFixedWidth(result_column->type()) && IsFixedWidth(cudf_return_type)) {
-          result_column = cudf::cast(result_column->view(), cudf_return_type, _stream, _mr);
+          // Final result-type reconciliation is a physical schema restore. The declared output
+          // type provides the provenance needed to restore a narrowed DATE representation.
+          result_column =
+            sirius::cast_through_rep(result_column->view(), cudf_return_type, _stream, _mr);
         } else {
           throw internal_exception("[expression_evaluator] Unsupported type conversion: {} to {}",
                                    cudf::type_to_name(result_column->type()),
@@ -334,14 +369,41 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
   auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(
+  return ApplyRetentionMask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+}
+
+std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
+  cudf::table_view input,
+  std::span<cudf::size_type const> output_indices,
+  std::unique_ptr<cudf::column>& survivors)
+{
+  if (output_indices.empty()) {
+    throw internal_exception(
+      "[expression_evaluator] select_with_survivors(): output_indices must be non-empty");
+  }
+  // ONE mask, used twice: the survivors must be exactly the rows the output
+  // holds, so computing the predicate a second time would risk two answers.
+  auto mask     = compute_mask(input);
+  auto selected = ApplyRetentionMask(
+    input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
+
+  auto const rows = input.num_rows();
+  auto positions  = cudf::sequence(rows,
+                                  cudf::numeric_scalar<std::int32_t>(0, true, _stream, _mr),
+                                  cudf::numeric_scalar<std::int32_t>(1, true, _stream, _mr),
+                                  _stream,
+                                  _mr);
+  auto surviving =
+    ApplyRetentionMask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+  survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
+  return selected;
 }
 
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
   auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(input, mask->view(), _stream, _mr);
+  return ApplyRetentionMask(input, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

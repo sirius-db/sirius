@@ -30,7 +30,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
 
-## Step 1b: Explicit Table Function Path (Legacy)
+## Step 1b: Explicit Table Function Path
 
 **File:** `src/sirius_extension.cpp`
 
@@ -118,18 +118,14 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 **File:** `src/sirius_engine.cpp` — `execute()`
 
-1. Creates a `query` object from `new_scheduled` pipelines with a pipeline hashmap
-2. Calls `task_scheduler.start_query(query)` which:
-   - Creates a `completion_handler` with promise/future
-   - Distributes the handler to all sub-executors
-   - Schedules the initial GPU scan tasks
-   - Returns the future
-
-3. The main thread blocks on `future.get()` until the query completes
+1. Calls `SiriusContext::create_query()` with the finalized pipelines
+2. Query preparation creates a `completion_handler` and installs it on the GPU executors and query-terminal pipelines
+3. Calls `task_scheduler::start_query()`, which schedules the initial scan operator and returns the completion future
+4. The main thread blocks on `future.get()` and then drains in-flight work before returning
 
 ## Step 6: Scan Execution
 
-**Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
+**Files:** `src/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 
@@ -155,6 +151,9 @@ The GPU executor's manager loop:
    - On success: check if query is complete (RESULT_COLLECTOR sink + pipeline finished)
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`
+
+The GPU epilogue usually signals completion. A query-terminal pipeline also signals from
+`sirius_pipeline::update_pipeline_status()`, covering finish transitions driven by other threads.
 
 ## Step 8: Task Creation Cycle
 

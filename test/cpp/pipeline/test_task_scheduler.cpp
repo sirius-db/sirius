@@ -20,10 +20,10 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -81,7 +81,7 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
   {
   }
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<mock_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<mock_gpu_pipeline_task_local_state>();
@@ -108,6 +108,31 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
+}
+
+TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_scheduler][config]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+  gpu_config.cpu_affinity_list = {999};
+
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.cpu_cores = {3, 7};
+  topology.gpus.push_back(std::move(gpu));
+
+  task_scheduler executor(
+    gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+
+  std::size_t visited = 0;
+  executor.visit_executors([&](int device_id, auto const& gpu_executor) {
+    REQUIRE(device_id == 0);
+    REQUIRE(gpu_executor.get_effective_config().cpu_affinity_list == std::vector<int>{3, 7});
+    ++visited;
+  });
+  REQUIRE(visited == 1);
 }
 
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
@@ -225,17 +250,12 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   sched.stop();
 }
 
-TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")
+TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler][multi_gpu]")
 {
   // Multi-GPU device-preference dispatch needs a real 2-GPU host; skip on
   // single-GPU machines (mirrors the require_two_gpus() convention used by the
   // MGPU operator tests in mgpu_test_utils.hpp).
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("Task scheduler device-preference test requires >=2 GPUs; single-GPU host — skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   auto manager = initialize_memory_manager(2);
   sirius::exec::thread_pool_config gpu_config{2};

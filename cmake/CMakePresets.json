@@ -33,10 +33,6 @@
       "name": "clang-tsan"
     },
     {
-      "configurePreset": "legacy-release",
-      "name": "legacy-release"
-    },
-    {
       "configurePreset": "vcpkg-debug",
       "name": "vcpkg-debug"
     },
@@ -70,7 +66,7 @@
         "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
         "EXPORT_DYNAMIC_SYMBOLS": "ON",
         "EXTENSION_STATIC_BUILD": "ON",
-        "OVERRIDE_GIT_DESCRIBE": "v1.5.5"
+        "OVERRIDE_GIT_DESCRIBE": "v1.5.6"
       },
       "generator": "Ninja",
       "hidden": true,
@@ -94,7 +90,9 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CUDA_FLAGS_DEBUG": "-g -lineinfo -O0",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
-        "CMAKE_C_FLAGS_DEBUG": "-g -O0"
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "ENABLE_SANITIZER": "FALSE",
+        "ENABLE_UBSAN": "0"
       },
       "displayName": "GCC Debug",
       "inherits": "base",
@@ -183,15 +181,8 @@
       "name": "clang-tsan"
     },
     {
-      "binaryDir": "${sourceDir}/../build/legacy-release",
       "cacheVariables": {
-        "ENABLE_LEGACY_SIRIUS": "ON"
-      },
-      "inherits": "release",
-      "name": "legacy-release"
-    },
-    {
-      "cacheVariables": {
+        "CMAKE_LINKER_TYPE": "BFD",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
         "SIRIUS_BUILD_S3_TESTS": "OFF",

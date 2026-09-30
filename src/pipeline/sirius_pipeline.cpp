@@ -26,8 +26,7 @@
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <format>
 
@@ -147,12 +146,11 @@ void sirius_pipeline::is_ready()
   }
 }
 
-void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline)
+void sirius_pipeline::add_dependency(std::shared_ptr<sirius_pipeline>& pipeline)
 {
   D_ASSERT(pipeline);
-  // dependencies.push_back(std::weak_ptr<sirius_pipeline>(pipeline));
   dependencies.push_back(pipeline);
-  pipeline->parents.push_back(duckdb::weak_ptr<sirius_pipeline>(shared_from_this()));
+  pipeline->parents.push_back(std::weak_ptr<sirius_pipeline>(shared_from_this()));
 }
 
 // std::string sirius_pipeline::to_string() const {
@@ -170,42 +168,15 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 // 	}
 // }
 
-// duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
-// sirius_pipeline::get_all_operators()
-// {
-//   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
-//   D_ASSERT(source);
-//   result.push_back(*source);
-//   for (auto& op : operators) {
-//     result.push_back(op.get());
-//   }
-//   if (sink) { result.push_back(*sink); }
-//   return result;
-// }
-
-// duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
-// sirius_pipeline::get_all_operators() const
-// {
-//   duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
-//   D_ASSERT(source);
-//   result.push_back(*source);
-//   for (auto& op : operators) {
-//     result.push_back(op.get());
-//   }
-//   if (sink) { result.push_back(*sink); }
-//   return result;
-// }
-
-duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
-sirius_pipeline::get_operators()
+std::vector<std::reference_wrapper<op::sirius_physical_operator>> sirius_pipeline::get_operators()
 {
   return operators;
 }
 
-duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>>
+std::vector<std::reference_wrapper<const op::sirius_physical_operator>>
 sirius_pipeline::get_operators() const
 {
-  duckdb::vector<std::reference_wrapper<const op::sirius_physical_operator>> result;
+  std::vector<std::reference_wrapper<const op::sirius_physical_operator>> result;
   result.reserve(operators.size());
   for (const auto& ref : operators) {
     result.push_back(ref.get());
@@ -299,19 +270,19 @@ sirius::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::
 
 void sirius_pipeline_build_state::set_pipeline_operators(
   sirius_pipeline& pipeline,
-  duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
+  std::vector<std::reference_wrapper<op::sirius_physical_operator>> operators)
 {
   pipeline.operators = std::move(operators);
 }
 
-duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
+std::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
   const pipeline_build_context& ctx, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
 {
   D_ASSERT(!pipeline.operators.empty());
   D_ASSERT(op.is_source());
   // found another operator that is a source, schedule a child pipeline
   // 'op' is the source, and the sink is the same
-  auto child_pipeline    = duckdb::make_shared_ptr<sirius_pipeline>(ctx);
+  auto child_pipeline    = std::make_shared<sirius_pipeline>(ctx);
   child_pipeline->sink   = pipeline.get_sink();
   child_pipeline->source = &op;
 
@@ -324,7 +295,7 @@ duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pi
   return child_pipeline;
 }
 
-duckdb::vector<std::reference_wrapper<op::sirius_physical_operator>>
+std::vector<std::reference_wrapper<op::sirius_physical_operator>>
 sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
 {
   return pipeline.operators;
@@ -337,28 +308,43 @@ bool sirius_pipeline::is_pipeline_finished() const
   return pipeline_finished.load();
 }
 
+bool sirius_pipeline::is_query_terminal() const
+{
+  auto s = get_sink();
+  if (!s) { return false; }
+  return s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR ||
+         s->type == op::SiriusPhysicalOperatorType::STREAMING_SINK;
+}
+
 void sirius_pipeline::set_task_creator(sirius::creator::task_creator* tc) { _task_creator = tc; }
+
+void sirius_pipeline::set_completion_handler(std::weak_ptr<completion_handler> handler)
+{
+  std::lock_guard<std::mutex> lock(_status_mutex);
+  _completion_handler = std::move(handler);
+}
 
 void sirius_pipeline::notify_downstream_pipelines(bool original_pipeline)
 {
-  // If this pipeline's sink is the RESULT_COLLECTOR, it is the terminal
-  // pipeline of the query — there is no downstream consumer to schedule and
-  // no parent pipeline whose status needs updating. Returning early avoids
-  // racing with engine teardown after mark_completed() signals the future.
-  if (auto s = get_sink(); s && s->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    return;
-  }
+  // Query-terminal: no downstream; early return avoids teardown race after mark_completed().
+  if (is_query_terminal()) { return; }
 
   // Schedule output consumers via the task_creator so downstream pipelines
   // whose FULL-barrier ports are now unblocked will get tasks created.
   // If this is the original pipeline, we dont want to schedule tasks for its consumers, that will
   // be done later.
   if (_task_creator && !original_pipeline) {
-    for (auto* consumer : get_output_consumers()) {
-      // If is possible to have a race condition here where one task finished and here it does to
-      // schedule a task right when the last task finished and marks the operator as finalized. That
-      // is ok. This check here is to minimize unnecessary scheduling of task creation.
-      if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
+    try {
+      for (auto* consumer : get_output_consumers()) {
+        // If is possible to have a race condition here where one task finished and here it does to
+        // schedule a task right when the last task finished and marks the operator as finalized.
+        // That is ok. This check here is to minimize unnecessary scheduling of task creation.
+        if (!consumer->finalized.load()) { _task_creator->schedule(consumer); }
+      }
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "Pipeline {}: failed to schedule downstream consumers: {}", pipeline_id, e.what());
+      _task_creator->report_fatal_error(get_query_id(), std::current_exception());
     }
   }
 
@@ -375,12 +361,17 @@ std::unique_lock<std::mutex> sirius_pipeline::get_task_creation_lock()
 void sirius_pipeline::update_pipeline_status(bool original_pipeline)
 {
   bool should_notify = false;
+  // Snapshot under the lock; signal only after all pipeline access is complete.
+  std::shared_ptr<completion_handler> completion;
+  // Distinct from should_notify, which is also set on the already-finished path:
+  // this marks the one-shot transition, so the closure is reported exactly once.
+  bool just_closed = false;
   {
     std::lock_guard<std::mutex> lock(_status_mutex);
 
     auto end_nvtx_range_if_finished = [this]() {
       if (pipeline_finished.load() && _nvtx_range_started.load()) {
-        nvtxRangeEnd(_nvtx_pipeline_range_id);
+        nvtxDomainRangeEnd(nvtx3::domain::get<sirius::nvtx_domain>(), _nvtx_pipeline_range_id);
       }
     };
 
@@ -414,6 +405,7 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
                               first_node->all_ports_empty())) {
         if (tasks_created.load() == tasks_completed.load()) {
           pipeline_finished.store(true);
+          just_closed = true;
           for (auto& op : get_operators()) {
             op.get().finalize_operator();
           }
@@ -423,10 +415,30 @@ void sirius_pipeline::update_pipeline_status(bool original_pipeline)
       }
       if (!pipeline_finished.load()) { end_nvtx_range_if_finished(); }
     }
+
+    // Signal from the transition so non-epilogue finish paths cannot strand execute() (#1486).
+    // Sampling under the lock pairs with set_completion_handler().
+    if (should_notify && is_query_terminal()) { completion = _completion_handler.lock(); }
   }  // _status_mutex released here — notify_downstream_pipelines must run outside the lock
      // to avoid holding the child pipeline mutex while acquiring a parent's
 
+  // Outside _status_mutex: an observer must not run under the pipeline lock.
+  if (just_closed && _task_creator != nullptr) {
+    // Observation only, so an unnumbered source is reported as the sentinel
+    // rather than throwing out of pipeline teardown: plans that never ran
+    // assign_operator_ids still close their pipelines. 0 would not do — it is a
+    // valid operator id, so it would name operator 0 as the source.
+    auto const source_id = source != nullptr && source->has_operator_id()
+                             ? source->get_operator_id()
+                             : op::sirius_physical_operator::invalid_operator_id;
+    _task_creator->publish_pipeline_closure(get_query_id(), get_pipeline_id(), source_id);
+  }
+
   if (should_notify) { notify_downstream_pipelines(original_pipeline); }
+
+  // Keep this last: waking execute() permits teardown. The epilogue may also signal, but
+  // completion_handler makes duplicate calls no-ops.
+  if (completion) { completion->mark_completed(); }
 }
 
 void sirius_pipeline::mark_task_created()
@@ -436,15 +448,16 @@ void sirius_pipeline::mark_task_created()
   bool expected = false;
   if (_nvtx_range_started.compare_exchange_strong(expected, true)) {
     nvtxEventAttributes_t attr{};
-    attr.version            = NVTX_VERSION;
-    attr.size               = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-    attr.messageType        = NVTX_MESSAGE_TYPE_ASCII;
-    auto label              = std::format("Pipeline {}: {} -> {}",
+    attr.version       = NVTX_VERSION;
+    attr.size          = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.messageType   = NVTX_MESSAGE_TYPE_ASCII;
+    auto label         = std::format("Pipeline {}: {} -> {}",
                              pipeline_id,
                              source ? source->get_name() : "?",
                              sink ? sink->get_name() : "?");
-    attr.message.ascii      = label.c_str();
-    _nvtx_pipeline_range_id = nvtxRangeStartEx(&attr);
+    attr.message.ascii = label.c_str();
+    _nvtx_pipeline_range_id =
+      nvtxDomainRangeStartEx(nvtx3::domain::get<sirius::nvtx_domain>(), &attr);
   }
 }
 

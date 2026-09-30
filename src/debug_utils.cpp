@@ -46,7 +46,7 @@ bool host_column_nulls::is_null(int row) const
 // copy_null_mask_to_host
 // ---------------------------------------------------------------------------
 
-host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, rmm::cuda_stream_view stream)
+host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, ::cuda::stream_ref stream)
 {
   host_column_nulls result;
   result.has_nulls = col.has_nulls();
@@ -59,8 +59,8 @@ host_column_nulls copy_null_mask_to_host(cudf::column_view const& col, rmm::cuda
                   col.null_mask(),
                   word_count * sizeof(cudf::bitmask_type),
                   cudaMemcpyDeviceToHost,
-                  stream.value());
-  stream.synchronize();
+                  stream.get());
+  stream.sync();
   return result;
 }
 
@@ -122,9 +122,7 @@ cudf::data_type sum_output_type(cudf::type_id id)
 }
 
 // Extract a cudf scalar value as a formatted string, dispatching on the data type.
-std::string scalar_to_string(cudf::scalar const& s,
-                             cudf::data_type dt,
-                             rmm::cuda_stream_view stream)
+std::string scalar_to_string(cudf::scalar const& s, cudf::data_type dt, ::cuda::stream_ref stream)
 {
   if (!s.is_valid(stream)) { return "NULL"; }  // D-10
 
@@ -367,7 +365,7 @@ std::string format_date_days(int32_t raw_days)
 // ---------------------------------------------------------------------------
 void format_rows_to_output(std::string& output,
                            cudf::table_view const& sliced_tv,
-                           rmm::cuda_stream_view stream,
+                           ::cuda::stream_ref stream,
                            DebugFormat format,
                            std::vector<std::string> const& names,
                            cudf::size_type max_string_len)
@@ -391,8 +389,8 @@ void format_rows_to_output(std::string& output,
                       col.data<T>(),
                       sizeof(T) * num_rows,
                       cudaMemcpyDeviceToHost,
-                      stream.value());
-      stream.synchronize();
+                      stream.get());
+      stream.sync();
       for (cudf::size_type r = 0; r < num_rows; ++r) {
         if (nulls.is_null(col.offset() + r)) {
           cells[c][r] = "NULL";
@@ -415,8 +413,8 @@ void format_rows_to_output(std::string& output,
                       col.data<int8_t>(),
                       sizeof(int8_t) * num_rows,
                       cudaMemcpyDeviceToHost,
-                      stream.value());
-      stream.synchronize();
+                      stream.get());
+      stream.sync();
       for (cudf::size_type r = 0; r < num_rows; ++r) {
         if (nulls.is_null(col.offset() + r)) {
           cells[c][r] = "NULL";
@@ -447,8 +445,8 @@ void format_rows_to_output(std::string& output,
                         scv.offsets().data<int32_t>() + col.offset(),
                         num_offsets * sizeof(int32_t),
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         auto const chars_start = host_offsets[0];
         auto const chars_end   = host_offsets[num_rows];
         auto const chars_bytes = chars_end - chars_start;
@@ -458,8 +456,8 @@ void format_rows_to_output(std::string& output,
                           scv.chars_begin(stream) + chars_start,
                           chars_bytes,
                           cudaMemcpyDeviceToHost,
-                          stream.value());
-          stream.synchronize();
+                          stream.get());
+          stream.sync();
         }
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
@@ -486,8 +484,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int32_t>(),
                         sizeof(int32_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -505,8 +503,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int64_t>(),
                         sizeof(int64_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -524,8 +522,8 @@ void format_rows_to_output(std::string& output,
                         col.data<__int128_t>(),
                         sizeof(__int128_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -542,8 +540,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int64_t>(),
                         sizeof(int64_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -559,8 +557,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int64_t>(),
                         sizeof(int64_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -576,8 +574,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int64_t>(),
                         sizeof(int64_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -593,8 +591,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int64_t>(),
                         sizeof(int64_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -611,8 +609,8 @@ void format_rows_to_output(std::string& output,
                         col.data<int32_t>(),
                         sizeof(int32_t) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           if (nulls.is_null(col.offset() + r)) {
             cells[c][r] = "NULL";
@@ -690,14 +688,14 @@ void format_rows_to_output(std::string& output,
 // ---------------------------------------------------------------------------
 
 void debug_schema(cucascade::data_batch& batch,
-                  rmm::cuda_stream_view stream,
+                  ::cuda::stream_ref stream,
                   std::vector<std::string> const& col_names)
 {
   try {
     if (!is_gpu_tier(batch, "debug_schema")) { return; }
 
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     std::string output;
     output += std::format("[SIRIUS_DIAG] schema: batch_id={} rows={} cols={}\n",
@@ -743,14 +741,14 @@ void debug_schema(cucascade::data_batch& batch,
 // ---------------------------------------------------------------------------
 
 void debug_nulls(cucascade::data_batch& batch,
-                 rmm::cuda_stream_view stream,
+                 ::cuda::stream_ref stream,
                  std::vector<std::string> const& col_names)
 {
   try {
     if (!is_gpu_tier(batch, "debug_nulls")) { return; }
 
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     std::string output;
     output += std::format("[SIRIUS_DIAG] nulls: batch_id={} rows={} cols={}\n",
@@ -791,7 +789,7 @@ void debug_nulls(cucascade::data_batch& batch,
 
 void debug_head(cucascade::data_batch& batch,
                 cudf::size_type n,
-                rmm::cuda_stream_view stream,
+                ::cuda::stream_ref stream,
                 DebugFormat format,
                 std::vector<std::string> const& col_names,
                 cudf::size_type max_string_len)
@@ -799,7 +797,7 @@ void debug_head(cucascade::data_batch& batch,
   try {
     if (!is_gpu_tier(batch, "debug_head")) { return; }
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     auto num_cols = tv.num_columns();
 
@@ -854,13 +852,13 @@ void debug_head(cucascade::data_batch& batch,
 // ---------------------------------------------------------------------------
 
 void debug_stats(cucascade::data_batch& batch,
-                 rmm::cuda_stream_view stream,
+                 ::cuda::stream_ref stream,
                  std::vector<std::string> const& col_names)
 {
   try {
     if (!is_gpu_tier(batch, "debug_stats")) { return; }
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     auto num_cols = tv.num_columns();
 
@@ -948,13 +946,13 @@ void debug_stats(cucascade::data_batch& batch,
 // ---------------------------------------------------------------------------
 
 void debug_checksum(cucascade::data_batch& batch,
-                    rmm::cuda_stream_view stream,
+                    ::cuda::stream_ref stream,
                     std::vector<std::string> const& col_names)
 {
   try {
     if (!is_gpu_tier(batch, "debug_checksum")) { return; }
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     auto mr       = cudf::get_current_device_resource_ref();
     auto num_cols = tv.num_columns();
@@ -1023,7 +1021,7 @@ void debug_checksum(cucascade::data_batch& batch,
 
 void debug_diff(cucascade::data_batch& batch_a,
                 cucascade::data_batch& batch_b,
-                rmm::cuda_stream_view stream,
+                ::cuda::stream_ref stream,
                 cudf::size_type max_diff_rows,
                 cudf::size_type max_rows,
                 std::vector<std::string> const& col_names)
@@ -1034,7 +1032,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
     cudf::table_view tv_a = get_cudf_table_view(batch_a);
     cudf::table_view tv_b = get_cudf_table_view(batch_b);
-    stream.synchronize();
+    stream.sync();
 
     std::string output;
     output += std::format(
@@ -1124,13 +1122,13 @@ void debug_diff(cucascade::data_batch& batch_a,
                         col_a.data<T>(),
                         sizeof(T) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
+                        stream.get());
         cudaMemcpyAsync(host_b.data(),
                         col_b.data<T>(),
                         sizeof(T) * num_rows,
                         cudaMemcpyDeviceToHost,
-                        stream.value());
-        stream.synchronize();
+                        stream.get());
+        stream.sync();
         for (cudf::size_type r = 0; r < num_rows; ++r) {
           bool null_a = nulls_a.is_null(col_a.offset() + r);
           bool null_b = nulls_b.is_null(col_b.offset() + r);
@@ -1178,8 +1176,8 @@ void debug_diff(cucascade::data_batch& batch_a,
                             scv.offsets().data<int32_t>() + col.offset(),
                             num_offsets * sizeof(int32_t),
                             cudaMemcpyDeviceToHost,
-                            stream.value());
-            stream.synchronize();
+                            stream.get());
+            stream.sync();
             auto const chars_start = host_offsets[0];
             auto const chars_end   = host_offsets[num_rows];
             auto const chars_bytes = chars_end - chars_start;
@@ -1189,8 +1187,8 @@ void debug_diff(cucascade::data_batch& batch_a,
                               scv.chars_begin(stream) + chars_start,
                               chars_bytes,
                               cudaMemcpyDeviceToHost,
-                              stream.value());
-              stream.synchronize();
+                              stream.get());
+              stream.sync();
             }
             for (cudf::size_type r = 0; r < num_rows; ++r) {
               if (nulls.is_null(col.offset() + r)) {
@@ -1277,7 +1275,7 @@ void debug_diff(cucascade::data_batch& batch_a,
 
 void debug_sample(cucascade::data_batch& batch,
                   cudf::size_type n,
-                  rmm::cuda_stream_view stream,
+                  ::cuda::stream_ref stream,
                   DebugFormat format,
                   std::vector<std::string> const& col_names,
                   cudf::size_type max_string_len,
@@ -1286,7 +1284,7 @@ void debug_sample(cucascade::data_batch& batch,
   try {
     if (!is_gpu_tier(batch, "debug_sample")) { return; }
     cudf::table_view tv = get_cudf_table_view(batch);
-    stream.synchronize();
+    stream.sync();
 
     auto num_cols = tv.num_columns();
 
@@ -1341,7 +1339,7 @@ void debug_sample(cucascade::data_batch& batch,
                                    static_cast<std::size_t>(keep) * sizeof(cudf::size_type),
                                    stream,
                                    cudf::get_current_device_resource_ref());
-    stream.synchronize();
+    stream.sync();
 
     cudf::column_view indices_col(
       cudf::data_type{cudf::type_id::INT32}, keep, dev_indices.data(), nullptr, 0);

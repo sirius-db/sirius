@@ -80,6 +80,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::comparison const& al
   // identical, and the full-column restoration cast is skipped.
   auto narrow_carrier = narrow_domain_carrier(*alt.left, {alt.right.get()});
   if (!narrow_carrier) { narrow_carrier = narrow_domain_carrier(*alt.right, {alt.left.get()}); }
+  // Column-vs-column at one shared carrier: both operands pass through as their raw narrow
+  // columns, so neither is widened. Without this a pair like `l_commitdate < l_receiptdate`
+  // restores both sides and the narrowing is pure cost.
+  if (!narrow_carrier) {
+    narrow_carrier = narrow_domain_reference_pair_carrier(*alt.left, *alt.right);
+  }
   if (narrow_carrier) { ++_narrow_domain_comparison_count; }
 
   auto const ast_op_count = alt.cudf_ast_op_count();

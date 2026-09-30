@@ -164,7 +164,7 @@ __constant__ uint8_t d_alp_combos_f64[host_consts_f64::kComboCount];
 // One-shot initialisation of both __constant__ table sets. Idempotent.
 // Uploads run async on the caller's stream and are bounded by a single
 // stream sync, avoiding the legacy default stream entirely.
-void alp_upload_constants(rmm::cuda_stream_view stream)
+void alp_upload_constants(::cuda::stream_ref stream)
 {
   // Build packed combo tables on the host then upload.
   uint8_t combos_f32[host_consts_f32::kComboCount];
@@ -196,7 +196,7 @@ void alp_upload_constants(rmm::cuda_stream_view stream)
     }
   }
 
-  auto const s = stream.value();
+  auto const s = stream.get();
   cudaMemcpyToSymbolAsync(d_alp_exp_f32,
                           host_consts_f32::kExp,
                           sizeof(host_consts_f32::kExp),
@@ -250,7 +250,7 @@ void alp_upload_constants(rmm::cuda_stream_view stream)
 // host-staged, then decoded on GPU 1 -- must upload to each device separately. A
 // single process-wide once_flag would leave every device but the first with
 // uninitialized constants, silently decoding garbage.
-void ensure_constants_initialized(rmm::cuda_stream_view stream)
+void ensure_constants_initialized(::cuda::stream_ref stream)
 {
   int device = 0;
   throw_if_cuda_error(cudaGetDevice(&device), "alp: cudaGetDevice");
@@ -539,7 +539,7 @@ __global__ void alp_scatter_exceptions_kernel(const T* __restrict__ exceptions,
 
 template <typename T>
 std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_view const& col,
-                                                                 rmm::cuda_stream_view stream,
+                                                                 ::cuda::stream_ref stream,
                                                                  rmm::device_async_resource_ref mr)
 {
   using traits = alp_traits<T>;
@@ -577,7 +577,7 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
   // Per-element exception flag buffer. Lives only inside compress().
   rmm::device_uvector<uint8_t> d_flags(n, stream, mr);
 
-  alp_encode_kernel<T><<<num_vectors, kAlpVectorSize, 0, stream.value()>>>(
+  alp_encode_kernel<T><<<num_vectors, kAlpVectorSize, 0, stream.get()>>>(
     col.data<T>(),
     n,
     integers_col->mutable_view().data<int_t>(),
@@ -588,7 +588,7 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
   auto exc =
     compact_exceptions<T>(d_flags.data(), n, col.data<T>(), traits::value_type_id, stream, mr);
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_compress_impl sync");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_compress_impl sync");
 
   return std::make_unique<alp_compressed_representation>(col.type(),
                                                          n,
@@ -601,7 +601,7 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
 
 template <typename T>
 std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation const& repr,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   using traits = alp_traits<T>;
@@ -619,22 +619,22 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
 
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
-  alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers()->view().data<int_t>(),
-                                                           repr.metadata()->view().data<uint16_t>(),
-                                                           repr.num_rows,
-                                                           out->mutable_view().data<T>());
+  alp_decode_kernel<T><<<grid, block, 0, stream.get()>>>(repr.integers()->view().data<int_t>(),
+                                                         repr.metadata()->view().data<uint16_t>(),
+                                                         repr.num_rows,
+                                                         out->mutable_view().data<T>());
 
   cudf::size_type exc_n = repr.exceptions() ? repr.exceptions()->size() : 0;
   if (exc_n > 0) {
     int egrid = (exc_n + block - 1) / block;
     alp_scatter_exceptions_kernel<T>
-      <<<egrid, block, 0, stream.value()>>>(repr.exceptions()->view().data<T>(),
-                                            repr.exception_positions()->view().data<int32_t>(),
-                                            exc_n,
-                                            out->mutable_view().data<T>());
+      <<<egrid, block, 0, stream.get()>>>(repr.exceptions()->view().data<T>(),
+                                          repr.exception_positions()->view().data<int32_t>(),
+                                          exc_n,
+                                          out->mutable_view().data<T>());
   }
 
-  throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_decompress sync");
+  throw_if_cuda_error(cudaStreamSynchronize(stream.get()), "alp_decompress sync");
   return out;
 }
 
@@ -661,7 +661,7 @@ alp_compressed_representation::alp_compressed_representation(
 }
 
 std::unique_ptr<cudf::column> alp_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
   switch (original_type.id()) {
     case cudf::type_id::FLOAT32: return alp_decompress_impl<float>(*this, stream, mr);
@@ -678,7 +678,7 @@ std::unique_ptr<cudf::column> alp_compressed_representation::decompress(
 
 std::unique_ptr<compressed_representation> alp_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const dt = column_to_compress.type();

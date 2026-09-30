@@ -64,24 +64,50 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
 - `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
 
-**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+**Policy:** Sirius applies eligible merge fusion automatically. See
+[physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape
+details.
+
+### Task Creator Look-Ahead (PR #1174)
+
+**Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
+
+**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+
+**Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/creator/config.hpp` — `request_type`
+
+**Policy:** internal. The current shipped policy is active and demand-driven;
+look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
+
+### Multi-Literal LIKE SWAR Fast Path (PR #1610)
+
+**Motivation:** cuDF's thread-per-row, byte-at-a-time LIKE matcher is load-instruction-bound on wide text columns. The TPC-H q13 predicate `%special%requests%` measured about 6x faster in the specialized kernel, reducing the query's LIKE work without changing SQL semantics.
+
+**Mechanism:** Constant patterns of the form `%lit1%lit2%...%litN%` are classified and compiled once per query and pattern value, then shared immutably across task-local evaluators. The CUDA kernel scans aligned 64-bit words, uses SWAR digram masks to find candidates, and verifies complete literals in order. Unsupported pattern shapes and ineligible column layouts fall back to `cudf::strings::like`; NOT LIKE is fused into the output write.
+
+**Code path:**
+- `src/expression_evaluator/specializations/function.cpp` — query-cache lookup and dispatch
+- `src/cuda/sirius_like_multiliteral.cu` — classifier, query-cache implementation, compiled descriptors, and SWAR kernel
+- `src/expression_evaluator/like_multiliteral.hpp` — launcher and input contracts
+
+**Config:** `like_swar_fastpath` (default: `true`, connection-local). The query snapshots this setting at engine initialization. Supported Sirius ingestion must supply valid UTF-8 for DuckDB VARCHAR/cuDF STRING input; the hot path treats that as a precondition and does not add a redundant validation scan.
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
 **Motivation:** For small build-side datasets, building the hash table once and probing many times is more efficient than the standard multi-partition Cartesian product approach.
 
-**Mechanism:** `update_join_exec_mode()` switches to BUILD_PROBE mode when:
+**Mechanism:** `compute_hash_join_partition_strategy()` selects BUILD_PROBE mode when:
 - `num_partitions <= num_gpus` (one hash table per partition, at most one partition per GPU; reduces to a single partition when `num_gpus == 1`)
 - per-partition average build side < `max_build_hash_table_bytes`, foldable to a single batch per partition
 - the join is neither RIGHT-family nor `MIXED_JOIN`
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
-**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes. Pure decision: `make_broadcast_partition_decision()`.
+**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes.
 
-**Code path:** `src/op/sirius_physical_hash_join.cpp` — `update_join_exec_mode()`, `build_probe_mode_eligible()`; `src/op/sirius_physical_partition.cpp` — `make_broadcast_partition_decision()`
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB)
 
@@ -92,8 +118,38 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 **Mechanism:** Uses cuDF's `COLLECT_SET` aggregation for distinct value collection, with `MERGE_SETS` in the merge phase. For multi-column DISTINCT, synthesizes struct columns from multiple input columns.
 
 **Code path:**
-- `src/op/aggregate/gpu_aggregate_impl.cpp` — `cudf::approx_distinct_count` usage
-- `src/op/aggregate/aggregate_op_util.cpp` — `has_count_distinct` flag
+- `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()` COLLECT_SET handling
+
+### Label-Encoded Group Keys for COUNT DISTINCT (PR #1375)
+
+**Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes the radix fast path only for a single key column. A multi-column group key falls to lexicographic merge sort — on TPC-H q16 at SF1000, 308.7 ms for 118.8M rows, 92% of the aggregate. The pre-existing dictionary-encode path narrows the comparators but leaves multiple key columns, so the single-column gate is never reached.
+
+**Mechanism:** the key table collapses into one dense INT32 label; the groupby sorts on that label, and representative keys are recovered with a gather at group cardinality. Sirius first computes distinct keys with equal nulls and all NaNs equal, then sorts those keys lexicographically with nulls last. The sorted distinct table is the unique build side of a `cudf::distinct_hash_join`; probing the original rows returns one build-row index per input row, which is already the required dense label. Gated on: a COLLECT_SET aggregation, at least 1,048,576 input rows, a non-nested key that is not already a single null-free fixed-width column, and an HLL estimate below 1% of rows. A single nullable or variable-width key can qualify. Non-fatal label construction failures fall back to the original key columns; an active label path bypasses STRING dictionary encoding.
+
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` -- `gpu_aggregate_impl::local_grouped_aggregate()`, label path (`use_label_keys`)
+
+**Config:** none (thresholds are internal). TPC-H SF1000 GB300 measured workload: q16 0.490 s -> 0.298 s.
+
+### Fused Dense Count Join (PR #1606)
+
+**Motivation:** A `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join on the same key materializes the whole join result only to collapse it again. The count is a pure cardinality product, so the joined rows never have to exist.
+
+**Mechanism:** `sirius_physical_dense_count_join` replaces the join-plus-aggregate fragment with two direct-address histograms over the preserved key domain: one holding each key's preserved-side multiplicity `P`, one holding its counted-side match count `M`. For a key with `V` matches whose COUNT argument is non-NULL, the emitted value is `P * max(M, 1)` for COUNT(*) and `P * V` for COUNT(col) — the rule `sirius::op::dense_count_semantics` states once for both strategies. Preserved-side NULL keys form a single group carrying the same formula at `M == 0`.
+
+The dense path is taken only when `dense_count_layout::plan` succeeds — the domain must be non-empty and not the full 64-bit range, `2 * slots * slot_bytes` must fit `size_t`, and `slots` must fit `int64_t` — and the domain is then dense enough to be worth direct addressing: `total_bytes() <= min(max_bins_bytes, 4 x input bytes)`, `slots <= 8 x non-NULL preserved rows`, and `slots <= 2 x total input rows`. Every term is measured over the one partition a task holds, and the budget is not divided by the partition count: hash partitioning gives every task the full key domain, so tasks replicate a full-width histogram rather than splitting one — a domain worth direct addressing over the whole input is rejected once it would have to be replicated per partition. Otherwise the operator falls back to exact sparse aggregation (per-batch groupby, balanced partial merge, left join, multiply).
+
+Slots are 32-bit unless either side has at least `UINT32_MAX` rows, in which case they widen to 64-bit. Narrow slots halve the per-key footprint and so double the key range admitted under the same `max_bins_bytes` budget.
+
+**Why this is not a group-by strategy:** direct addressing needs the key domain of everything a task will accumulate before the first row lands, which is why both inputs take FULL barriers. Both inputs are also hash-partitioned on the join key, so equal keys — NULL keys included — land in one partition: each task sizes its histogram from its own partition's preserved min/max, and the per-task outputs concatenate with no merge step. `sirius_physical_dense_count_join::execute` asserts that co-location at runtime, rejecting a second partition that arrives carrying NULL preserved keys. `gpu_aggregate_impl::local_grouped_aggregate` sees one batch of one table and has no min/max at all to size a histogram against.
+
+Two fast paths live inside the dense path. When every slot in the domain is occupied, the selected-group list is the identity permutation, so no gather map is built and the histogram reads stream instead of gathering; otherwise the map is sized from the exact group count, which a duplicate-heavy preserved side keeps far below both the domain and the row count. Below a 48 KiB shared-memory budget, and with at least eight rows per slot, accumulation privatizes the histogram per block to keep a low-cardinality domain off a handful of global atomic addresses.
+
+**Code path:**
+- `src/op/sirius_physical_dense_count_join.cpp` — strategy gate (`dense_admits`, `max_admitted_histogram_bytes`), sparse fallback
+- `src/cuda/dense_count_join_impl.cu` — histogram accumulation and emit kernels
+- `src/op/aggregate/dense_count_join_impl.hpp` — `dense_count_layout`, `dense_count_semantics`, `dense_count_bounds`, `dense_count_state`
+
+**Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
 ### Distinct Hash Join (PR #558)
 
@@ -131,7 +187,7 @@ Only applies to INNER and LEFT joins with pure equality conditions (excludes IS 
 
 Only the entries needing evaluation are handed to the evaluator (its `std::vector<sirius::ast::node const*>` constructor), so passthrough columns are never materialized.
 
-**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/include/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/include/expression_evaluator/expression_evaluator.hpp` — subset constructor.
+**Code path:** `src/op/sirius_physical_projection.cpp` — `execute()`; `src/data/data_batch_utils.hpp` — `make_data_batch_from_view()`; `src/expression_evaluator/expression_evaluator.hpp` — subset constructor.
 
 ### Adaptive MARK Join Build Side (PR #924)
 
@@ -232,7 +288,7 @@ Data is moved from GPU to HOST tier via converter registry.
 3. Retries up to 10 times with 5ms backoff
 
 **Code path:**
-- `src/include/pipeline/oom_reschedule_exception.hpp` — exception class
+- `src/pipeline/oom_reschedule_exception.hpp` — exception class
 - `src/pipeline/gpu_pipeline_executor.cpp` — retry logic in `manager_loop()`
 
 ### Memory Pool Defragmentation (PR #378, #452)
@@ -254,7 +310,7 @@ Data is moved from GPU to HOST tier via converter registry.
 **Mechanism:** Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring buffer of up to 64 `task_memory_record` entries recording `estimated_bytes`, `peak_memory_bytes`, and `output_bytes`. `estimate_peak_memory()` computes a weighted average of historical `peak/estimated` ratios, where records with similar estimation bases are weighted higher using a log-ratio distance function. Failed tasks (OOM) ratchet up the estimate by keeping the maximum observed peak for a given input size.
 
 **Code path:**
-- `src/include/pipeline/pipeline_memory_history.hpp` — history ring buffer and estimation
+- `src/pipeline/pipeline_memory_history.hpp` — history ring buffer and estimation
 - `src/pipeline/gpu_pipeline_task.cpp` — `get_estimated_reservation_size()`
 
 ### Downgrade Request Pattern (PR #579)
@@ -271,13 +327,13 @@ Data is moved from GPU to HOST tier via converter registry.
 
 **Mechanism:** `small_pinned_host_memory_resource` maintains pre-allocated pinned memory pools with NUMA affinity. Used for GPU↔CPU transfers and scan output caching.
 
-**Code path:** cuCascade `cucascade/src/memory/small_pinned_host_memory_resource.cpp`, integrated in `src/include/sirius_context.hpp`
+**Code path:** cuCascade `cucascade/src/memory/small_pinned_host_memory_resource.cpp`, integrated in `src/sirius_context.hpp`
 
 **Config:** Memory manager settings in `sirius.yaml` (see [Configuration](configuration.md))
 
 ## Scan Optimizations
 
-### Compressed Materialization (unreleased)
+### Compressed Materialization (PR #1260)
 
 **Motivation:** Integer and fixed-point DECIMAL columns often use only a fraction of their declared
 range. Carrying their native width through every GPU batch increases memory traffic and cache
@@ -306,6 +362,43 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Late Materialization (unreleased, experimental)
+
+**Motivation:** A query that selects wide columns carries them from the scan to whatever finally
+reads them — through joins that copy them beside their keys, partitions that write them to a
+repository and read them back, and aggregates that group on them. Nothing in that stretch reads
+what is IN them. On TPC-H q10 at SF1000 the five wide `customer` columns are 158 B/row and cross
+eleven port boundaries before anything needs their values.
+
+**Mechanism:** For a PINNED table, the scan emits a pin-order rowid (UINT32 where the table's rows
+fit 32 bits, UINT64 otherwise) in place of the deferred columns plus 1-byte placeholders, so arity
+and positions are unchanged and every operator in between is unaffected. A directive on the
+consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
+schema. Both halves install together or not at all. A plan pass reports how far each column travels
+and how many port crossings it survives; a policy with measured floors decides whether the ride
+repays the rowid. Where the deferred columns are GROUP BY keys, the ride can continue past the
+aggregate to materialize one row per group instead of one per join match, subject to a pin-time
+distinctness proof.
+
+**Code path:**
+- `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
+- `src/late_mat/defer_directive.hpp` — the pair, the substituted schemas, rowid widths
+- `src/late_mat/defer_policy.hpp` — value/boundary floors and their measurements
+- `src/late_mat/pin_uniqueness.cpp` — the pin-time distinctness proof
+- `src/scan_manager/sirius_scan_manager.cpp` — admission, the port hop, riders
+- `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
+
+**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+(default on) — a deferred column riding through a carrier-restore cast is carried past it rather
+than suppressing the deferral.
+
+**Measured:** GB300 SF1000, default `enable_compressed_materialization`. See
+[Late Materialization](late-materialization.md) for the full results table.
+
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
@@ -320,6 +413,26 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Code path:**
 - `src/op/scan/scan_utils.cpp` — `convert_table_filters_to_expression()`, `filter_row_groups_with_stats()`
 - `src/op/scan/parquet_gpu_ingestible.cpp` — filter translation + row-group pruning in the per-file metadata task
+
+### Null-Count Row-Group Pruning (PR #1430)
+
+**Motivation:** Null-test predicates cannot be handed to cuDF's min/max stats filter (it faults on them — see PR #1417), so `WHERE v IS NULL` read every row group even though the parquet footer's `null_count` statistic answers the test directly.
+
+**Mechanism:** A second pruning pass over each footer applies null tests from the `TableFilterSet`: `IS NULL` cannot match a row group with `null_count == 0`; `IS NOT NULL` cannot match one where every row is null (`null_count == num_rows`). An absent `null_count` (it is optional in the spec) keeps the row group. Applies only to scalar leaf columns (nested-column leaf stats describe repeated/leaf-level nullness; legacy top-level `REPEATED` primitives are excluded) and only to conjunctive predicate positions — null tests inside `OR` cannot prune. Only provably non-matching row groups are skipped; the full predicate still runs at read/post-decode time.
+
+**Code path:** `src/op/scan/parquet_gpu_ingestible.cpp` — `collect_null_prune_predicates()` and the null-count pruning loop; `src/op/scan/parquet_gpu_ingestible.hpp` — `null_prune_predicate`
+
+**Config:** none
+
+### Pure-Filter Column Elision (PRs #1019, #1027)
+
+**Motivation:** The scan's post-decode filter path gathered every decoded column and then dropped pure-filter columns (read only for the predicate) during projection — materializing data just to throw it away. The standalone `FILTER` operator had the same waste for columns not needed downstream.
+
+**Mechanism:** `expression_evaluator::select(input, output_indices)` evaluates the predicate over the full input (pure-filter columns stay visible to it) but gathers only the requested output columns. Because `scan_plan::data_columns` is laid out output-first, the kept columns are the contiguous prefix `[0, K)`, so existing assembly and prefix projection apply unchanged. For the FILTER operator, `sirius_plan_filter` translates DuckDB's `LogicalFilter::projection_map` into `output_indices` on `sirius_physical_filter` (empty means keep all). `count(*)`-style filters with no output columns use the all-columns overload, since a 0-column/N-row gather result is unrepresentable.
+
+**Code path:** `src/expression_evaluator/expression_evaluator.hpp` — `select()` overloads, `compute_mask()`; `src/op/scan/scan_plan.hpp` — `output_data_positions()`; `src/op/scan/parquet_gpu_ingestible.cpp`, `duckdb_native_gpu_ingestible.cpp`; `src/planner/sirius_plan_filter.cpp`
+
+**Config:** none
 
 ### Batch Coalescing for Small Files (PR #503)
 
@@ -356,13 +469,13 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
 
-**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache hit path issues `cudaMemcpyAsync` from pinned host memory directly to device; the miss path falls through to backend I/O, which uses `O_DIRECT` reads through pinned bounce slots and round-robin dispatch across reactor threads. A packed atomic state machine (4-bit state + 28-bit pin count in one `atomic<uint32_t>`) eliminates TOCTOU between readability checks and pin acquisition. Eviction is driven by a tiered LRU score; admission control caps concurrent in-flight chunks to keep memory bounded.
+**Mechanism:** `sirius::io` provides a `cudf::io::datasource` (`sirius_datasource`) backed by io_uring reactors and an optional pinned-memory `prefetching_cache`. The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; `templated_ioctx` balances that batch across the two least-busy reactors with one shared coordinator. The worker chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. Eviction is driven by a tiered LRU score; read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
 
 **Code path:**
 - `src/io/sirius_datasource.cpp` — `cudf::io::datasource` implementation
 - `src/io/cache/prefetching_cache.cpp` — chunk cache, worker, evictor, buffer pool
 - `src/io/uring/uring_reactor.cpp` — io_uring backend reactor
-- `src/exec/admission_control.cpp` — RAII budget enforcement
+- `src/include/io/io_request.hpp` — prepared request grouping and exact completion fan-in
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
 
@@ -371,21 +484,19 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
 1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
 2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
-3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
 - `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
 
-**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
-
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 
 **Motivation:** The DuckDB-native decoder issues many small segment reads. Synchronous `host_read()` calls bypass the datasource backend in favor of direct `pread()`, serializing I/O and inflating the request count per split.
 
-**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_ioctx::host_read_ranges_async_io()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
+**Mechanism:** The decoder coalesces file-adjacent segment reads — bridging the small per-block header gaps up to a `coalesce_max_gap` derived from the block header size — into large sequential ranges, then issues them as one batch via `sirius_datasource::host_read_ranges_async()` into pinned host blocks. Each coalesced range maps to a contiguous destination span, and the decoder issues bulk asynchronous H2D memcpy into aligned device memory. This cuts read requests per split several-fold and raises read throughput, especially on warm runs.
 
-**Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async_io()` dispatch
+**Code path:** `src/op/scan/duckdb_native_decoder.cpp` — range coalescing and `host_read_ranges_async()` dispatch
 
 ### Async S3 / REST Reactor Backend (PR #859)
 
@@ -395,9 +506,19 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Code path:**
 - `src/io/rest/rest_reactor.cpp`, `src/io/rest/rest_ioctx.cpp` — async REST/S3 reactor over the shared `templated_ioctx` base
-- `src/include/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
+- `src/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
 
 **Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
+
+### Single-Request S3 Parquet Footer Bind (PR #1087)
+
+**Motivation:** A cold S3 parquet bind issued a HEAD for the object size plus separate trailer and footer GETs — three round-trips per file over high-RTT links.
+
+**Mechanism:** Opening with `open_hint::parquet_footer_probe` makes the REST backend issue one suffix-range GET (`Range: bytes=-N`), which returns the object size (from `Content-Range`) and stashes the trailing N bytes on the open object; the reactor then serves cuDF's trailer/footer reads from that per-open stash. `describe_parquet` is metadata-aware: a cold bind probes, while a warm re-bind opens `generic` (one HEAD) and reuses the parsed footer from the metadata store. Unusable suffix responses (a 200 full-body reply, 416, or a missing `Content-Range`) abort the body mid-stream and fall back to a plain HEAD. See the scan doc's S3 backend section for the open-path details.
+
+**Code path:** `src/io/io_context.hpp` — `open_hint`; `src/io/rest/rest_ioctx.cpp`, `src/io/rest/rest_reactor.cpp`; `src/io/cache/metadata_store.cpp`; `src/scan_manager/sirius_scan_manager.cpp`
+
+**Config:** `scan_manager.rest.footer_probe_bytes` (default 512 KiB) — must cover the footer or the probe falls back to a body re-GET
 
 ### Zero-Copy from Pinned and Cached Tables (PR #881)
 
@@ -421,10 +542,10 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Code path:**
 - `src/io/cache/prefetching_cache.cpp` — `device_read_async()`, partial-read + populate-on-read, evictor
-- `src/io/io_context.cpp` — `sirius_ioctx` cache integration and coverage policy
-- `src/include/exec/semi_future.hpp` — async I/O completion primitive
+- `src/io/io_context.cpp` — `ioctx` cache integration and coverage policy
+- `src/exec/semi_future.hpp` — async I/O completion primitive
 
-**Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`
+**Config:** the `cache` block under `executor.scan_manager` — `mode: sirius` arms it, `eviction` (`lru` / `idle`) picks what retires an idle chunk, and `eviction_threshold_fraction` / `min_prefetching_budget_fraction` size it
 
 ### Load-Balanced Scan Batch Coalescing (PR #997)
 
@@ -434,8 +555,8 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Code path:**
 - `src/scan_manager/load_balancing_scan_batch_coalescer.cpp` — per-pipeline slots, sequencer loop, coalesce + place + push
-- `src/include/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
-- `src/include/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
+- `src/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
+- `src/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
 **Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and reactor counts
 

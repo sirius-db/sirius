@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -25,11 +26,10 @@
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <nvtx3/nvtx3.hpp>
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
@@ -142,13 +142,13 @@ void stage_null_row(column_staging& s, const sirius::logical_type& type)
 
 rmm::device_buffer to_device(const void* host_data,
                              std::size_t bytes,
-                             rmm::cuda_stream_view stream,
+                             ::cuda::stream_ref stream,
                              rmm::device_async_resource_ref mr)
 {
   rmm::device_buffer buf(bytes, stream, mr);
   if (bytes > 0) {
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(buf.data(), host_data, bytes, cudaMemcpyHostToDevice, stream.value()));
+      cudaMemcpyAsync(buf.data(), host_data, bytes, cudaMemcpyHostToDevice, stream.get()));
   }
   return buf;
 }
@@ -156,7 +156,7 @@ rmm::device_buffer to_device(const void* host_data,
 std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
                                                  const sirius::logical_type& type,
                                                  cudf::size_type num_rows,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
   rmm::device_buffer null_mask{};
@@ -190,7 +190,7 @@ std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
 std::unique_ptr<cudf::table> staging_to_table(const std::vector<column_staging>& staging,
                                               const duckdb::vector<sirius::logical_type>& types,
                                               cudf::size_type num_rows,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -200,7 +200,7 @@ std::unique_ptr<cudf::table> staging_to_table(const std::vector<column_staging>&
   }
   // The host staging vectors are destroyed when this call chain returns;
   // the async H2D copies above must complete before then.
-  stream.synchronize();
+  stream.sync();
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
@@ -208,7 +208,7 @@ std::unique_ptr<cudf::table> staging_to_table(const std::vector<column_staging>&
 /// zero-column DuckDB source needs a private sentinel column. Downstream
 /// operators use only num_rows() and never expose the sentinel in their output.
 std::unique_ptr<cudf::table> make_row_count_sentinel_table(cudf::size_type num_rows,
-                                                           rmm::cuda_stream_view stream,
+                                                           ::cuda::stream_ref stream,
                                                            rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -268,9 +268,9 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::get_next_task_input_d
 // Execution
 //===----------------------------------------------------------------------===//
 std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view stream)
+                                                                   ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
 
   auto const* values_input = dynamic_cast<const gpu_values_input*>(&input_data);
   if (!values_input) {

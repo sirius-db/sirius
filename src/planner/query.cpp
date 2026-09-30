@@ -22,7 +22,7 @@
 
 namespace sirius::planner {
 
-query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+query::query(std::vector<std::shared_ptr<pipeline::sirius_pipeline>> pipelines,
              const quent::Context& context,
              sirius::query_id_t query_id,
              telemetry::query_telemetry_info telemetry_info)
@@ -35,6 +35,9 @@ query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipel
 void query::build_indices()
 {
   for (const auto& pipeline : _pipelines) {
+    // Stamp the query id so the task queues can derive their per-query index key from a
+    // pipeline without recovering it from the (31-bit-masked) scheduling priority.
+    pipeline->set_query_id(_query_id);
     for (auto& op : pipeline->get_operators()) {
       op.get().set_pipeline(pipeline);
     }
@@ -72,14 +75,14 @@ std::span<op::sirius_physical_operator* const> query::get_scan_operators() const
   return {_scan_operators.data(), _scan_operators.size()};
 }
 
-duckdb::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
+std::shared_ptr<pipeline::sirius_pipeline> query::get_pipeline(op::sirius_physical_operator* op)
 {
   auto it = _operator_to_pipeline.find(op);
   if (it != _operator_to_pipeline.end()) { return it->second; }
   return nullptr;
 }
 
-const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
+const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& query::get_pipelines() const
 {
   return _pipelines;
 }

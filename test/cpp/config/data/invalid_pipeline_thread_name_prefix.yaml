@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    pipeline:
+      thread_name_prefix: custom_pipeline

@@ -25,6 +25,9 @@
 
 namespace sirius::test {
 
+// SIRIUS_TEST_INTEGRATION_CONFIG selects the config for shared and child-process fixtures.
+std::filesystem::path integration_config_path();
+
 /**
  * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
  *
@@ -109,11 +112,19 @@ extern shared_test_env* g_integration_env_2gpu;
  *
  * Caller is responsible for resume()/pause() lifecycle if not using the Catch2
  * listener's tag-based mechanism. On single-GPU hosts when num_gpus == 2, returns
- * nullptr (caller should WARN+return per Catch2 v2 convention).
+ * nullptr (caller should WARN+return per Catch2 convention).
  *
  * @param num_gpus 1 returns g_integration_env; 2 returns g_integration_env_2gpu
  *                 (or nullptr on single-GPU host); other values return nullptr.
  */
 shared_test_env* acquire_integration_env_for(int num_gpus);
+
+/**
+ * @brief Returns whether at least @p n GPUs are visible, WARNing when not so the caller can skip.
+ *
+ * Tests that need more than one GPU must be tagged [multi_gpu]: CI runs the rest in per-GPU
+ * shards with SIRIUS_TEST_SINGLE_GPU set, under which a shortfall FAILs instead of skipping.
+ */
+bool has_gpus(int n);
 
 }  // namespace sirius::test

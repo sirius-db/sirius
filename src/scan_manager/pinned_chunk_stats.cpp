@@ -59,7 +59,7 @@ std::optional<cudf::type_id> expected_cudf_type(duckdb::LogicalType const& type)
   }
 }
 
-duckdb::Value scalar_to_value(cudf::scalar const& s, rmm::cuda_stream_view stream)
+duckdb::Value scalar_to_value(cudf::scalar const& s, ::cuda::stream_ref stream)
 {
   switch (s.type().id()) {
     case cudf::type_id::INT8:
@@ -111,7 +111,7 @@ duckdb::Value scalar_to_value(cudf::scalar const& s, rmm::cuda_stream_view strea
 std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_stats(
   cudf::table_view const& chunk,
   duckdb::vector<duckdb::LogicalType> const& column_types,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const n_columns = static_cast<std::size_t>(chunk.num_columns());

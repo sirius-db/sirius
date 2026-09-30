@@ -141,7 +141,7 @@ bool log_dir_contains(fs::path const& log_dir, std::string const& needle)
 // SCHEDULED state, which is exactly the window the SF100 Q11 race exercises.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
-          "[mgpu][operator-mgpu][hash_join][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -208,7 +208,7 @@ TEST_CASE("physical_hash_join - BUILD_PROBE probe-heavy join across two GPUs",
 // a 2-GPU run with >=2 partitions should see pipeline work on both GPUs.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes partitions",
-          "[mgpu][operator-mgpu][hash_join][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -279,7 +279,7 @@ TEST_CASE("physical_hash_join - MIXED_JOIN large-vs-large join distributes parti
 // across queries would surface here even if the first call passes.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - repeated BUILD_PROBE queries don't wedge on leftover state",
-          "[mgpu][operator-mgpu][hash_join][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -417,7 +417,7 @@ bisect_surface make_bisect_surface(std::string const& tag, std::string const& ca
 }  // namespace
 
 TEST_CASE("hash_join bisect 1 - simple JOIN+GROUP BY+ORDER BY, cache=none",
-          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("1", "none");
@@ -447,7 +447,7 @@ TEST_CASE("hash_join bisect 1 - simple JOIN+GROUP BY+ORDER BY, cache=none",
 }
 
 TEST_CASE("hash_join bisect 2 - simple JOIN+GROUP BY+ORDER BY, cache=table_gpu",
-          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("2", "table_gpu");
@@ -477,7 +477,7 @@ TEST_CASE("hash_join bisect 2 - simple JOIN+GROUP BY+ORDER BY, cache=table_gpu",
 }
 
 TEST_CASE("hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none",
-          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][bisect-cold][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
   auto s = make_bisect_surface("3", "none");
@@ -538,7 +538,7 @@ TEST_CASE("hash_join bisect 3 - Q11 shape with HAVING subquery, cache=none",
 // follow-up-17 runs.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE with table_gpu cache",
-          "[mgpu][operator-mgpu][hash_join][stress][followup-17][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][stress][followup-17][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -670,7 +670,7 @@ TEST_CASE("physical_hash_join - follow-up #17 scale-up: Q11-like BUILD_PROBE wit
 // ... dynamic filter(s)" from the publisher). They are 2-GPU-gated.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates across two GPUs",
-          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -733,12 +733,14 @@ TEST_CASE("physical_hash_join - broadcast small-build BUILD_PROBE replicates acr
 // A broadcast join publishes dynamic filters: every partition holds the full
 // replicated build, so the first GPU to arrive wins the OPEN->PUBLISHING race
 // and publishes the membership filter (exactly once). Before the broadcast
-// fix, >1 partition disabled publication entirely. The selective build (5000
-// keys) vs the large probe domain (500000 keys) guarantees a membership filter
-// is emitted. 2-GPU-gated.
+// fix, >1 partition disabled publication entirely. The build-side predicate
+// supplies the filter evidence discovery requires to wire a producer, and the
+// filtered build (2500 keys) vs the large probe domain (500000 keys)
+// guarantees a membership filter is emitted. 2-GPU-gated.
 //===----------------------------------------------------------------------===//
 TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters across two GPUs",
-          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][dynamic_filter][gpu_execution]")
+          "[mgpu][operator-mgpu][hash_join][build_probe][broadcast][dynamic_filter][gpu_execution]["
+          "multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -760,6 +762,9 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   write_mgpu_yaml(yaml_path, params);
   scoped_mgpu_env env(yaml_path);
 
+  // The build-side predicate is required evidence: discovery refuses an unfiltered base-relation
+  // build (its filter would keep every probe row), so a bare read_parquet build never wires a
+  // producer and this test would assert against a query that cannot publish.
   auto inner_query =
     "SELECT probe.k, probe.v, build.v AS build_v "
     "FROM read_parquet('" +
@@ -769,6 +774,7 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
     parquet_glob(build_dir) +
     "') AS build "
     "  ON probe.k = build.k "
+    "WHERE build.k % 2 = 0 "
     "ORDER BY probe.k, probe.v "
     "LIMIT 100";
 
@@ -779,9 +785,11 @@ TEST_CASE("physical_hash_join - broadcast BUILD_PROBE publishes dynamic filters 
   }
 
   INFO("log dir: " << log_dir.path());
-  // Broadcast engaged AND the publisher ran (exactly one GPU won the publication race).
+  // Broadcast engaged AND the publication winner's success summary appears; no delivery may log
+  // the not-published diagnostic.
   REQUIRE(log_dir_contains(log_dir.path(), "[broadcast]"));
-  REQUIRE(log_dir_contains(log_dir.path(), "dynamic filter"));
+  REQUIRE(log_dir_contains(log_dir.path(), "dynamic-filter publication:"));
+  REQUIRE_FALSE(log_dir_contains(log_dir.path(), "build is not one whole delivery"));
 
   fs::remove_all(tmp, ec);
 }

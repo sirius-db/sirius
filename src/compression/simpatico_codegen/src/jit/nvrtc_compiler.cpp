@@ -186,14 +186,10 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  // Plain CUDA by default — no -default-device. Some rendered sources include
-  // shared headers that use c++20 and unannotated constexpr accessors; those
-  // opt into -default-device + c++20 via opts.default_device. The leaner path
-  // keeps the c++17/no-default-device setup.
   const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
 
   std::vector<const char*> nvrtc_opts = {
-    opts.default_device ? "-std=c++20" : "-std=c++17",
+    "-std=c++20",
     arch_opt.c_str(),
   };
   // No -I is required (headers are embedded); the env override, when set, adds
@@ -203,7 +199,7 @@ CompiledKernel compile_plain_kernel(const std::string& source,
     cccl_inc = std::string("-I") + ov;
     nvrtc_opts.push_back(cccl_inc.c_str());
   }
-  if (opts.default_device) { nvrtc_opts.push_back("-default-device"); }
+  nvrtc_opts.push_back("-default-device");
 
   nvrtcResult compile_result =
     nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());

@@ -26,6 +26,7 @@
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -38,11 +39,10 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
-#include <nvtx3/nvtx3.hpp>
+#include <cuda/stream>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -586,6 +586,9 @@ staged_column stage_one_array_column(staging_state& s,
 
       if (vseg.all_null) {
         stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
+        // Host-backed (transient) array-level validity staged by the insert delta.
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
@@ -610,7 +613,11 @@ staged_column stage_one_array_column(staging_state& s,
       ss.row_count   = static_cast<uint32_t>(seg.segment_count);
       ss.compression = seg.compression;
 
-      if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+      if (seg.host_ptr != nullptr) {
+        // Host-backed (transient) child element bytes staged by the insert
+        // delta; read from host memory rather than the .db file.
+        stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
+      } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
         // The child segment's own stats are child-typed numeric stats, so
         // they extract directly — no ArrayStats unwrap.
         auto const& child_stats = constant_segment_stats(seg, col_md.column_id);
@@ -632,6 +639,9 @@ staged_column stage_one_array_column(staging_state& s,
 
       if (vseg.all_null) {
         stage_host_copy(s, make_all_null_validity_bytes(vseg.segment_count), vs);
+      } else if (vseg.host_ptr != nullptr) {
+        // Host-backed (transient) child validity staged by the insert delta.
+        stage_host_copy(s, {{}, vseg.host_ptr, vseg.bytes_size}, vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
         stage_host_copy(s, decode_roaring_validity(db, block_manager, vseg), vs);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
@@ -662,7 +672,7 @@ staged_column stage_one_array_column(staging_state& s,
 // Issue staged reads into a pinned host buffer, then copy them to the device.
 //
 // File-near segment reads are coalesced into large sequential reads (bridging the
-// per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
+// per-block header gaps) and dispatched as one batch via the datasource,
 // packed into a pinned multiple_blocks_allocation; the 16B device alignment the decode kernels need
 // is imposed by the per-segment H2D scatter instead.
 //===----------------------------------------------------------------------===//
@@ -675,7 +685,7 @@ using multiple_blocks_allocation =
 void batched_h2d(std::vector<void*> const& dst,
                  std::vector<void const*> const& src,
                  std::vector<std::size_t> const& size,
-                 rmm::cuda_stream_view stream)
+                 ::cuda::stream_ref stream)
 {
   if (dst.empty()) { return; }
 #if CUDART_VERSION >= 12080
@@ -697,25 +707,25 @@ void batched_h2d(std::vector<void*> const& dst,
                                     &attrs_idx,
                                     1,
                                     &fail_idx,
-                                    stream.value()));
+                                    stream.get()));
 #else
   RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.value()));
+    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.get()));
 #endif
 #else
   for (std::size_t i = 0; i < dst.size(); ++i) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.value()));
+    RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.get()));
   }
 #endif
 }
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      const sirius::io::sirius_datasource& datasource,
+                      sirius::io::sirius_datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
-                      rmm::cuda_stream_view stream)
+                      ::cuda::stream_ref stream)
 {
   namespace ccm = cucascade::memory;
 
@@ -802,7 +812,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<io::io_object_segment> ranges;
+  std::vector<io::slice> ranges;
   ranges.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
@@ -816,9 +826,8 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   // Issue the coalesced reads as one batch and await completion.
   {
-    nvtx3::scoped_range nvtx_reads{"native_reads"};
-    auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    nvtx_scoped_range nvtx_reads{"native_reads"};
+    auto fut              = datasource.host_read_ranges_async(ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
@@ -830,13 +839,13 @@ void submit_and_await(rmm::device_buffer& device_buf,
   // overwrite hazard since each segment owns a disjoint device range.
   for (auto const& h : s.host_copies) {
     RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.get()));
   }
 
   // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
   // host_alloc / reservation drop so the copies finish reading pinned memory first.
   {
-    nvtx3::scoped_range nvtx_h2d{"native_h2d"};
+    nvtx_scoped_range nvtx_h2d{"native_h2d"};
     std::vector<void*> h2d_dst;
     std::vector<void const*> h2d_src;
     std::vector<std::size_t> h2d_size;
@@ -850,7 +859,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
       h2d_size.push_back(c.size);
     }
     batched_h2d(h2d_dst, h2d_src, h2d_size, stream);
-    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   }
 }
 
@@ -859,14 +868,14 @@ void submit_and_await(rmm::device_buffer& device_buf,
 /// source buffers' owners, same as submit_and_await.
 void submit_host_only_and_await(rmm::device_buffer& device_buf,
                                 staging_state const& s,
-                                rmm::cuda_stream_view stream)
+                                ::cuda::stream_ref stream)
 {
   auto* device_base = static_cast<uint8_t*>(device_buf.data());
   for (auto const& h : s.host_copies) {
     RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.get()));
   }
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -924,7 +933,7 @@ void fill_string_runs(std::vector<staged_segment> const& staged,
 std::unique_ptr<cudf::column> build_rowid_column(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   cudf::size_type total_rows,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> per_rg;
@@ -946,6 +955,18 @@ std::unique_ptr<cudf::column> build_rowid_column(
     views.push_back(c->view());
   }
   return cudf::concatenate(views, stream, mr);
+}
+
+// Zero-row column carrying the projected schema of column @p type / @p pcol. Mirrors the
+// non-empty decode outputs: rowid synthesizes INT64 (build_rowid_column), ARRAY becomes a cuDF
+// LIST of its fixed-width element (make_empty_column rejects nested types), everything else maps
+// through sirius_to_cudf_type. A rowid slot's declared type is arbitrary and never read.
+std::unique_ptr<cudf::column> empty_column_for(projected_column const& pcol,
+                                               sirius::logical_type const& type)
+{
+  if (pcol.is_rowid) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}); }
+  return type.is_array() ? cudf::make_empty_lists_column(sirius_to_cudf_type(type.array_child()))
+                         : cudf::make_empty_column(sirius_to_cudf_type(type));
 }
 
 }  // namespace
@@ -974,20 +995,16 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   duckdb_native_ingestible_table_info const& table_info,
   sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (row_groups.empty()) {
-    // Empty / fully-pruned split: emit a schema-correct 0-row table (one empty
-    // column per projected column) rather than a 0-column table, so it flows
-    // through post_filter_and_project and downstream concat like any decoded
-    // batch. Rowid columns decode as INT64 (see the fixed-width path below).
+    // Preserve the projected schema so an empty or fully pruned split follows
+    // the normal filter/project/concat path.
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
     empty_cols.reserve(table_info.projected_cols.size());
     for (std::size_t ci = 0; ci < table_info.projected_cols.size(); ++ci) {
-      auto const dt = table_info.projected_cols[ci].is_rowid
-                        ? cudf::data_type{cudf::type_id::INT64}
-                        : sirius_to_cudf_type(table_info.projected_types[ci]);
-      empty_cols.push_back(cudf::make_empty_column(dt));
+      empty_cols.push_back(
+        empty_column_for(table_info.projected_cols[ci], table_info.projected_types[ci]));
     }
     return std::make_unique<cudf::table>(std::move(empty_cols));
   }

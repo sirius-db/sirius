@@ -14,15 +14,13 @@
 name: Test
 
 on:
-  push:
-    branches:
-      - dev
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
   build:
@@ -46,7 +44,7 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
@@ -58,7 +56,7 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
           pixi-version: v0.71.1
@@ -78,6 +76,8 @@ jobs:
           echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - name: Build
         env:
@@ -85,6 +85,18 @@ jobs:
         run: |
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Check installed Sirius package
+        run: |
+          sirius_test_dir="$(mktemp -d)"
+          trap 'rm -rf "$sirius_test_dir"' EXIT
+          cmake --install build/release --prefix "$sirius_test_dir/install" --component sirius_library
+          cmake -E rename "$sirius_test_dir/install" "$sirius_test_dir/relocated"
+          cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
+          cmake --build "$sirius_test_dir/consumer"
 
       - name: Surface build errors
         if: failure()
@@ -119,19 +131,19 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
           pixi-version: v0.71.1
@@ -145,18 +157,118 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build.tar
 
+      - name: Provision DuckDB extensions the tests load
+        # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
+        # and an INSTALL inside the test would silently paper over an unprovisioned runner
+        # instead of failing with the install command. So provisioning happens here, out of
+        # band. avro comes in as an iceberg dependency but is named explicitly so a failure
+        # says which extension is missing.
+        #
+        # This resolves only because OVERRIDE_GIT_DESCRIBE (cmake/CMakePresets.json) gives the
+        # build a real DuckDB version. Against the dummy v0.0.1 a shallow submodule would
+        # otherwise produce, there is no extension repository to install from.
+        run: |
+          for attempt in 1 2 3; do
+            if ./build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"; then
+              exit 0
+            fi
+            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
+          exit 1
+
+      # Two Catch2 shards per GPU. Each shard sees only its assigned GPU; [multi_gpu]
+      # tests run afterwards with all GPUs. Declaration order keeps tests using
+      # the same shared environment together.
       - name: Run C++ unit tests
         run: |
-          set -o pipefail
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
+          bin=./build/release/extension/sirius/test/cpp/sirius_unittest
+          log_root=$PWD/build/release/extension/sirius/test/cpp/log
+          gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+          if ((gpus < 2)); then
+            echo "::error::Expected at least 2 GPUs, found $gpus" >&2
+            exit 1
+          fi
+          shards=$((2 * gpus))
+          export SIRIUS_TEST_INTEGRATION_CONFIG="$PWD/test/cpp/integration/integration-shard.yaml"
+          for ((i = 0; i < shards; i++)); do
+            mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
+            # Stream each shard live with a prefix; keep its full log for the failure summary.
+            {
+              status=0
+              started_at=$(date +%s)
+              CUDA_VISIBLE_DEVICES=$((i % gpus)) SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_TEST_LOG_DIR="$log_root/shard-$i" \
+                TMPDIR="/tmp/shard-$i" \
+                timeout 45m "$bin" --abort --order decl --durations yes \
+                  --shard-count "$shards" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
+              echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
+            } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
+          done
+          wait
+          status=0
+          for ((i = 0; i < shards; i++)); do
+            summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
+            if ! read -r shard_status elapsed < "/tmp/shard-$i.status"; then
+              shard_status=missing
+              elapsed=unknown
+            fi
+            echo "Shard $i (exit $shard_status, ${elapsed}s): $summary"
+            [ "$shard_status" = 0 ] || status=1
+          done
+          cat /tmp/unittest-*.log > /tmp/unittest.log
+          exit $status
+
+      - name: Run multi-GPU C++ unit tests
+        run: |
+          set -o pipefail
+          gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+          if ((gpus < 2)); then
+            echo "::error::Expected at least 2 GPUs for multi-GPU tests, found $gpus" >&2
+            exit 1
+          fi
+          timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl --durations yes \
+            "[multi_gpu]~[.]" 2>&1 | tee /tmp/unittest_multi_gpu.log
+
+      # The late-materialization gate is read from the environment once per process, so the
+      # feature is entirely absent from the run above. Without this step the end-to-end case
+      # (planning -> scan substitution -> transport -> restoration) returns successfully without
+      # executing, and a green suite says nothing about the feature.
+      - name: Run late-materialization tests with the gate on
+        run: |
+          set -o pipefail
+          SIRIUS_EXP_LATE_MAT=1 \
+            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl \
+            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
+
+      - name: Iceberg conformance (correctness + connection liveness)
+        timeout-minutes: 20
+        # The C++ suite asserts routes and rows, but every case shares one in-process
+        # connection, so it cannot observe the failure mode this guards: a RUNTIME GPU fallback
+        # poisons the connection and the NEXT GPU query on it deadlocks forever. This harness
+        # runs each case in its own duckdb process and issues a second query on the same
+        # connection, which is the only automated check that a decline happened at plan time
+        # rather than at execution. It also compares rows against pyiceberg's own recorded
+        # output -- an external oracle, where the in-tree fixtures only agree with themselves.
+        run: |
+          set -o pipefail
+          python3 test/cpp/integration/data/iceberg_conformance/run_conformance.py \
+            test/cpp/integration/data/iceberg_conformance \
+            --duckdb ./build/release/duckdb 2>&1 | tee /tmp/conformance.log
 
       - name: Surface test failures
         if: failure()
         run: |
+          echo '## Iceberg conformance failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -60 /tmp/conformance.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -B 5 -A 10 'FAILED:' /tmp/unittest_late_mat.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -B 5 -A 10 'FAILED:' /tmp/unittest_multi_gpu.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs

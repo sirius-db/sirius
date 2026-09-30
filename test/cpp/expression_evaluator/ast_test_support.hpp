@@ -27,8 +27,6 @@
 // are `inline`/templates so the header can be included into multiple translation
 // units that are linked into the same sirius_unittest binary.
 
-// duckdb — defines the duckdb_base_std alias that the vendored catch.hpp relies on;
-// consumers that include this header before <catch.hpp> need it set up first.
 #include <duckdb/common/unique_ptr.hpp>
 
 // sirius — AST node construction surface

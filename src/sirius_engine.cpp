@@ -39,8 +39,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -52,6 +51,45 @@
 namespace sirius {
 
 namespace {
+
+/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
+/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
+/// bytes. With neither set, every active GPU is used.
+std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
+                                           std::vector<int> gpu_ids,
+                                           const sirius_config& config)
+{
+  auto const& op_params = config.get_operator_params();
+  auto const bpg        = op_params.admission_bytes_per_gpu;
+
+  gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
+  auto const n_gpus = static_cast<int>(gpu_ids.size());
+  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+
+  std::vector<const op::sirius_physical_operator*> scans;
+  planner::collect_gpu_scans(plan, scans);
+  std::vector<planner::scan_estimate> estimates;
+  estimates.reserve(scans.size());
+  for (auto const* scan : scans) {
+    estimates.push_back(
+      {static_cast<uint64_t>(scan->estimated_cardinality),
+       planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes)});
+  }
+
+  // nullopt means at least one scan carried no usable row estimate; admit the full capped
+  // fleet rather than size the query from what is left.
+  auto const total_bytes = planner::total_scan_bytes(estimates);
+  if (!total_bytes.has_value()) { return gpu_ids; }
+
+  auto const k = planner::gpu_count_for_bytes(*total_bytes, bpg, n_gpus);
+  SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                  *total_bytes / (1024 * 1024),
+                  scans.size(),
+                  k,
+                  n_gpus);
+  gpu_ids.resize(static_cast<size_t>(k));
+  return gpu_ids;
+}
 
 std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
   duckdb::ClientContext& context)
@@ -77,21 +115,21 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
     sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_handle_(
-      quent::query::create(telemetry_context_->context(),
-                           quent::query::Init{
-                             .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-                             .query_group_id = telemetry_context_->query_group_id(),
-                           }))
+    query_handle_(quent::query::create(
+      telemetry_context_->context(),
+      quent::query::Init{
+        .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+        .query_group_id = telemetry_context_->query_group_id_for(sirius_iface.session_label),
+      }))
 {
-  // The query group is session-scoped and owned by telemetry_context; every query in this
-  // context is reported under it (see telemetry_context::query_group_id).
 }
 
 sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
 void sirius_engine::reset()
 {
+  // Before the plan: the query indexes it, so it must not outlive a plan swap.
+  query_.reset();
   sirius_physical_plan = nullptr;
   sirius_owned_plan.reset();
   sirius_root_pipelines.clear();
@@ -103,8 +141,26 @@ void sirius_engine::reset()
 
 void sirius_engine::cancel_tasks()
 {
+  cancel_dynamic_filter_publications();
   sirius_pipelines.clear();
   sirius_root_pipelines.clear();
+}
+
+void sirius_engine::cancel_dynamic_filter_publications() noexcept
+{
+  if (!query_) { return; }
+  auto cancel = [](op::sirius_physical_operator* candidate) noexcept {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(candidate)) {
+      join->cancel_dynamic_filter_publication();
+    }
+  };
+  for (auto const& pipeline : query_->get_pipelines()) {
+    cancel(pipeline->get_source().get());
+    cancel(pipeline->get_sink().get());
+    for (auto const& op_ref : pipeline->operators) {
+      cancel(&op_ref.get());
+    }
+  }
 }
 
 bool sirius_engine::has_result_collector()
@@ -134,7 +190,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
-  nvtx3::scoped_range nvtx_range{"sirius::query"};
+  nvtx_scoped_range nvtx_range{"sirius::query"};
   query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -151,36 +207,44 @@ void sirius_engine::execute()
                   telemetry_uuid.high_bits,
                   telemetry_uuid.low_bits);
 
-  // Create the query with the pipelines
-  sirius_ctx->create_query(std::move(new_scheduled),
-                           query_id_,
-                           telemetry::query_telemetry_info{
-                             .telemetry_query_id = telemetry_uuid,
-                             .worker_id          = telemetry_context_->worker_id(),
-                             .query_id           = query_id_,
-                           });
-  auto future = sirius_ctx->get_task_scheduler().start_query();
+  // This query's completion signal. Owned here, shared down to every task via its pipeline's
+  // global state, so no cross-query subsystem holds a "current query" handler.
+  completion_handler_ = std::make_shared<pipeline::completion_handler>();
+  auto future         = completion_handler_->get_awaitable();
+
+  // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
+  query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                    query_id_,
+                                    completion_handler_,
+                                    telemetry::query_telemetry_info{
+                                      .telemetry_query_id = telemetry_uuid,
+                                      .worker_id          = telemetry_context_->worker_id(),
+                                      .query_id           = query_id_,
+                                    });
+  sirius_ctx->get_task_scheduler().start_query(*query_);
   try {
     future.get();
-    sirius_ctx->get_task_scheduler().wait_for_completion();
+    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    cancel_dynamic_filter_publications();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    cancel_dynamic_filter_publications();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
-  if (auto query = sirius_ctx->get_query()) {
-    for (const auto& pipeline : query->get_pipelines()) {
+  if (query_) {
+    for (const auto& pipeline : query_->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
         if (!op.finalized.load()) {
@@ -201,7 +265,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
-  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
   sirius_physical_plan = &plan;
 
@@ -218,8 +281,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   // matters: task_creator holds it, and create_query later reads it back for scan_manager.
   auto const full_gpu_count = gpu_ids.size();
   std::vector<int> active_gpu_ids =
-    planner::apply_gpu_cap(std::move(gpu_ids), sirius_ctx_ptr->get_config().gpus_per_query());
-  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(active_gpu_ids, full_gpu_count);
+    compute_admission_gpu_ids(plan, std::move(gpu_ids), sirius_ctx_ptr->get_config());
+  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
   try {
     std::string gpu_list;
     for (auto id : active_gpu_ids) {
@@ -230,13 +293,17 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   } catch (...) {  // best-effort observability
   }
 
-  // Create plan-time build context (decoupled from engine).
+  auto query_operator_params =
+    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
+  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
+
+  // Create the plan-time context with one immutable snapshot of query policy.
   const pipeline::pipeline_build_context build_ctx{
     sirius_ctx_ptr->get_telemetry_context(),
     duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
-    std::move(active_gpu_ids)};
+    std::move(active_gpu_ids),
+    std::move(query_operator_params)};
 
-  // The collector is added after planning, so refresh parent pointers before marking fusion.
   sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
                                                                   /*parent=*/nullptr);
   sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
@@ -244,15 +311,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
-  auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+  auto root_pipeline = std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
   root_pipeline->build(*sirius_physical_plan);
   root_pipeline->ready();
   root_pipeline->get_pipelines(sirius_root_pipelines, false);
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(build_ctx, op_params);
+  pipeline::sirius_pipeline_converter converter(build_ctx);
   auto result = converter.convert(*root_pipeline);
 
   auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);

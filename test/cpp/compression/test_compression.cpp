@@ -25,6 +25,7 @@
 
 #include <catch.hpp>
 #include <compression/plan_register.hpp>
+#include <utils/log_test_utils.hpp>
 
 // standard library
 #include <string>
@@ -178,7 +179,7 @@ void write_compression_yaml(const fs::path& yaml_path, std::size_t scan_batch_by
        "    num_gpus: 1\n"
        "  memory:\n"
        "    gpu:\n"
-       "      usage_limit_fraction: 0.4\n"
+       "      usage_limit_fraction: 0.2\n"
        "      reservation_limit_fraction: 1.0\n"
        "    host:\n"
        "      capacity_bytes: 2000000000\n"
@@ -333,6 +334,77 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   REQUIRE(sum_comp->GetValue(1, 0) == duckdb::Value::BIGINT(149985000LL));
 
   run_ok(con, "CALL unpin_table('t_comp');", "unpin");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - compression parameter overrides session setting",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("param");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(20000)", /*num_files=*/1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_param_on", bitpack_plan(1));
+  write_plan_file(plan_dir, "t_param_off", bitpack_plan(1));
+
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "plan dir");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "min batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "fraction");
+
+  run_ok(con, "SET pin_table_compression = false;", "existing compression default off");
+  auto pin_on = con.Query("CALL pin_table('" + glob +
+                          "', tier => 'host', name => 't_param_on', compression => true);");
+  require_ok(pin_on, "pin parameter on");
+  auto const on = sirius::test::census_entry(con, "t_param_on");
+  REQUIRE(on.chunks > 0);
+  REQUIRE(on.compressed_chunks == on.chunks);
+  run_ok(con, "CALL unpin_table('t_param_on');", "unpin parameter on");
+
+  run_ok(con, "SET pin_table_compression = true;", "existing compression default on");
+  auto pin_off = con.Query("CALL pin_table('" + glob +
+                           "', tier => 'host', name => 't_param_off', compression => false);");
+  require_ok(pin_off, "pin parameter off");
+  auto const off = sirius::test::census_entry(con, "t_param_off");
+  REQUIRE(off.chunks > 0);
+  REQUIRE(off.compressed_chunks == 0);
+  run_ok(con, "CALL unpin_table('t_param_off');", "unpin parameter off");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - empty plan dir pins uncompressed",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("emptydir");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(20000)", /*num_files=*/1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "min batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "fraction");
+
+  auto pin = con.Query("CALL pin_table('" + glob +
+                       "', tier => 'host', name => 't_emptydir', compression => true);");
+  require_ok(pin, "pin with empty plan dir");
+  auto const census = sirius::test::census_entry(con, "t_emptydir");
+  REQUIRE(census.chunks > 0);
+  REQUIRE(census.compressed_chunks == 0);
+
+  run_ok(con, "CALL unpin_table('t_emptydir');", "unpin empty plan dir");
 
   fs::remove_all(tmp);
 }
@@ -1697,6 +1769,30 @@ TEST_CASE("pin_table compression - no plan file for the table pins uncompressed"
   run_ok(con, "SET pin_table_compression = true;", "set compression");
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
   run_ok(con, "SET enable_compressed_materialization = true;", "set narrowing");
+
+  // Runtime settings may be staged in either order, so setting the enable flag before the plan
+  // directory is valid. The final pin must nevertheless make the inactive state visible rather
+  // than silently accepting a compression request it cannot honor.
+  {
+    sirius::test::scoped_recording_log_sink logs{"warn"};
+    auto pin_without_plan_source =
+      con.Query("CALL pin_table('" + glob + "', tier='host', name='t_noplan');");
+    require_ok(pin_without_plan_source, "pin without plan source");
+
+    std::size_t missing_plan_source_warnings = 0;
+    for (auto const& record : logs.records()) {
+      if (record.message.find("pin_table_input_compression_plan_dir is empty") !=
+          std::string::npos) {
+        ++missing_plan_source_warnings;
+        REQUIRE(record.level == sirius::log::level::warn);
+        REQUIRE(record.message.find("pinning uncompressed") != std::string::npos);
+      }
+    }
+    REQUIRE(missing_plan_source_warnings == 1);
+  }
+  REQUIRE(sirius::test::census_entry(con, "t_noplan").compressed_chunks == 0);
+  run_ok(con, "CALL unpin_table('t_noplan');", "unpin without plan source");
+
   // A plan directory holding a plan for some OTHER table: the resolver finds no plan for this
   // one, so compression never engages.
   auto plan_dir = tmp / "plans";
@@ -1782,5 +1878,80 @@ TEST_CASE("pin_table compression - width-explicit op on a narrowed column fails 
   REQUIRE(after.scan_columns_restored == before.scan_columns_restored);
 
   run_ok(con, "CALL unpin_table('t_widthop');", "unpin");
+  fs::remove_all(tmp);
+}
+
+namespace {
+
+// The pinned entry's proven-unique markers, positional with its column names.
+std::vector<bool> proven_columns_of(duckdb::Connection& con, std::string const& name)
+{
+  std::vector<bool> out;
+  auto ctx = sirius::test::get_registered_sirius_context(con);
+  REQUIRE(ctx);
+  ctx->get_scan_manager().visit_pinned_entries(
+    [&](std::string_view entry_name, sirius::scan_manager::pinned_entry const& entry) {
+      if (entry_name != name) { return true; }
+      out = entry.proven_unique_columns;
+      return false;
+    });
+  return out;
+}
+
+}  // namespace
+
+// A uniqueness verdict proven at pin time must survive the compressed GPU driver and
+// reach pinned_entry::proven_unique_columns. The table is set up to actually compress:
+// a plan covers every column, and the fraction is loosened so an identity-ish block
+// still keeps its chunk compressed.
+TEST_CASE("pin_table compression - device tier driver returns uniqueness verdicts",
+          "[compression][pin_table][late_mat][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("uniqcompressed");
+
+  // k is strictly increasing (unique table-wide); d repeats (range % 10, not unique).
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT range AS k, range % 10 AS d FROM range(5000)", 1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression = true;", "set compression");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "set min_batch");
+  // Loosen the savings gate so a chunk stays compressed regardless of how well
+  // either block actually shrinks it — the point here is exercising the
+  // compressed driver's verdict wiring, not compression ratio.
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "set fraction");
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(
+    plan_dir, "t_uniqcompressed", "input -> delta -> differences\n---\ninput -> identity\n");
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "set plan_dir");
+
+  // Only k is asked for: the probe selection is by name, so d is never observed
+  // and must come back not-proven regardless of whether it happens to repeat.
+  ::setenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "k", 1);
+
+  auto pin = con.Query("CALL pin_table('" + glob + "', tier='gpu', name='t_uniqcompressed');");
+  require_ok(pin, "pin uniqcompressed");
+
+  ::unsetenv("SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS");
+
+  // The driver actually took the compressed path — otherwise this would be
+  // indistinguishable from the uncompressed GPU driver, which already had
+  // coverage.
+  auto const census = sirius::test::census_entry(con, "t_uniqcompressed");
+  REQUIRE(census.compressed_chunks > 0);
+
+  auto const proven = proven_columns_of(con, "t_uniqcompressed");
+  REQUIRE(proven.size() == 2);
+  REQUIRE(proven[0]);        // k: selected and distinct table-wide
+  REQUIRE_FALSE(proven[1]);  // d: never observed
+
+  run_ok(con, "CALL unpin_table('t_uniqcompressed');", "unpin");
   fs::remove_all(tmp);
 }

@@ -4,3 +4,4 @@ sirius:
   operator_params:
     dynamic_filter_domain_coverage_threshold: 1.5
     dynamic_filter_keep_threshold: 0.0
+    dynamic_filter_inlist_max_l2_fraction: 0.0

@@ -27,6 +27,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -139,19 +140,24 @@ static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
 {
   yaml::reader r(node, "thread_pool");
   r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_name_prefix);
-  r.optional("cpu_affinity", opt.cpu_affinity_list);
   r.reject_unknown();
 }
 
 static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
 {
   yaml::reader r(node, "task_creator");
+  if (r.has("strategy")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.strategy': removed; task creation policy is internal and "
+      "currently demand-driven; remove this key");
+  }
+  if (r.has("priority_order")) {
+    throw std::runtime_error(
+      "'sirius.executor.task_creator.priority_order': removed; scheduling priority is internal "
+      "and currently source-first; remove this key");
+  }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("strategy", opt.strategy);
-  r.optional("priority_order", opt.priority);
   r.reject_unknown();
 }
 
@@ -180,11 +186,20 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
                                key + "' instead");
     }
   }
+  {
+    // Read through an optional so "set to the struct default" is distinguishable
+    // from "not set" -- see config::n_max_concurrent_scans_explicit.
+    std::optional<std::size_t> n_max;
+    r.optional("n_max_concurrent_scans", n_max);
+    if (n_max.has_value()) {
+      opt.n_max_concurrent_scans          = *n_max;
+      opt.n_max_concurrent_scans_explicit = true;
+    }
+  }
   r.optional("request_timeout_s", opt.request_timeout_s);
-  r.optional("max_connections", opt.max_connections);
-  r.optional("chunk_size", yaml::bytes(opt.chunk_size));
-  r.optional("max_n_chunks", opt.max_n_chunks);
-  r.optional("max_read_split", opt.max_read_split);
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
+  r.optional("stall_time_s", opt.stall_time_s);
+  r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
   r.optional("retry_backoff_base_ms", opt.retry_backoff_base);
@@ -192,7 +207,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("max_retry_attempts", opt.max_retry_attempts);
   r.optional("max_auth_retry_attempts", opt.max_auth_retry_attempts);
   r.optional("honor_retry_after", opt.honor_retry_after);
-  r.optional("perf_instrumentation", opt.perf_instrumentation);
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
@@ -201,24 +215,59 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
-  yaml::reader r(node, "local");
-  r.optional("use_odirect", opt.use_odirect);
-  r.optional("max_n_chunks", opt.max_n_chunks);
+  yaml::reader r(node, "uring");
+  {
+    // Preserve whether the value was named: an explicit value may equal the
+    // struct default and must not be replaced by the pipeline-derived default.
+    std::optional<std::size_t> n_max;
+    r.optional("n_max_concurrent_scans", n_max);
+    if (n_max.has_value()) {
+      opt.n_max_concurrent_scans          = *n_max;
+      opt.n_max_concurrent_scans_explicit = true;
+    }
+  }
+  r.reject_unknown();
+}
+
+static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
+{
+  yaml::reader r(node, "kvikio");
+  r.optional("nthreads", opt.nthreads);
+  r.optional("task_size", yaml::bytes(opt.task_size));
+  r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
+  r.optional("bounce_buffer_size", yaml::bytes(opt.bounce_buffer_size));
+  r.optional("auto_direct_io_read", opt.auto_direct_io_read);
+  r.optional("auto_direct_io_read_overread", opt.auto_direct_io_read_overread);
+  r.optional("thread_pool_per_block_device", opt.thread_pool_per_block_device);
+  std::string compat;
+  r.optional("compat_mode", compat);
+  if (!compat.empty()) {
+    if (compat == "auto") {
+      opt.compat_mode = kvikio::CompatMode::AUTO;
+    } else if (compat == "on") {
+      opt.compat_mode = kvikio::CompatMode::ON;
+    } else if (compat == "off") {
+      opt.compat_mode = kvikio::CompatMode::OFF;
+    } else {
+      throw std::runtime_error("'kvikio.compat_mode': invalid enum value '" + compat +
+                               "' (expected auto, on or off)");
+    }
+  }
   r.reject_unknown();
 }
 
 static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
-  r.optional(
-    "inflight_io_chunk_budget", opt.inflight_io_chunk_budget, yaml::greater_than<std::size_t>{0});
-  r.optional("dispose_after_use", opt.dispose_after_use);
+  r.optional("mode", opt.mode);
+  r.optional("eviction", opt.eviction);
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
              yaml::fraction<double>{});
   r.optional(
     "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
   r.reject_unknown();
+  opt.apply_mode();
 }
 
 static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_config& opt)
@@ -236,24 +285,31 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
 {
   yaml::reader r(node, "scan_manager");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
-  r.optional("use_sirius_datasource", opt.use_sirius_datasource);
+  r.optional("backend", opt.backend);
   r.optional("uring_n_reactors", opt.uring_n_reactors, yaml::greater_than<std::size_t>{0});
   r.optional("rest_n_reactors", opt.rest_n_reactors, yaml::greater_than<std::size_t>{0});
-  r.optional("enable_prefetch_cache", opt.enable_prefetch_cache);
-  if (auto n = r.optional_node("local")) sirius::from_yaml(*n, opt.local);
+  r.optional("max_readahead_scans", opt.max_readahead_scans);
+  r.optional("readahead_strategy", opt.readahead_strategy);
+  if (auto n = r.optional_node("uring")) sirius::from_yaml(*n, opt.uring);
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
+  if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();
+  // Stamped here rather than by the caller: `cache` and the `uring` sub-config
+  // it overrides have both been read by now.
+  opt.apply_cache_mode();
 }
 
 static void from_yaml(const YAML::Node& node, operator_params& opt)
 {
   yaml::reader r(node, "operator_params");
   r.optional("scan_task_batch_size", yaml::bytes(opt.scan_task_batch_size));
+  if (opt.scan_task_batch_size == 0) {
+    throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
+  }
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,
@@ -269,18 +325,44 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio",
              opt.mark_join_build_switch_ratio,
              yaml::between<double>{0.0, std::numeric_limits<double>::infinity()});
-  r.optional("enable_runtime_distinct_build_probe", opt.enable_runtime_distinct_build_probe);
-  r.optional("enable_dynamic_filter_pushdown", opt.enable_dynamic_filter_pushdown);
+  if (r.has("enable_runtime_distinct_build_probe")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.enable_runtime_distinct_build_probe': removed; runtime distinct "
+      "build probing is an internal join policy (temporarily disabled pending issue #1600); "
+      "remove this key");
+  }
+  r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,
-             yaml::greater_than<double>{0.0});
+             config::valid_domain_coverage_threshold{});
+  r.optional("dynamic_filter_inlist_max_l2_fraction",
+             opt.dynamic_filter_inlist_max_l2_fraction,
+             yaml::fraction<double>{});
   r.optional(
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_eager_agg_pushdown", opt.enable_eager_agg_pushdown);
   r.optional("eager_agg_pushdown_force", opt.eager_agg_pushdown_force);
+
+  r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  if (r.has("dense_count_join_max_bytes")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
+      "sizing is an internal engine policy; remove this key");
+  }
+  // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
+  r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
+  r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));
+  // 0 is not meaningful here: variable-width columns would contribute nothing to the per-row
+  // width, so a mixed schema is under-estimated and the query admitted onto too few GPUs.
+  if (opt.avg_variable_column_bytes == 0) {
+    throw std::runtime_error(
+      "'operator_params.avg_variable_column_bytes': must be greater than zero");
+  }
+  r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("use_hw_decompression", opt.use_hw_decompression);
   r.reject_unknown();
 }
 
@@ -289,9 +371,19 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_batch_events", opt.enable_batch_events);
-  r.optional("exporter", opt.exporter);
-  r.optional("output_directory", opt.output_directory);
-  r.optional("engine_name", opt.engine_name);
+  r.optional("exporter", opt.exporter, [](std::string const& value) {
+    if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
+    throw std::runtime_error("must be one of ndjson, msgpack, postcard");
+  });
+  r.optional("output_directory", opt.output_directory, [](std::string const& value) {
+    if (!value.empty()) return true;
+    throw std::runtime_error("must not be empty");
+  });
+  r.optional("engine_name", opt.engine_name, [](std::string const& value) {
+    if (!value.empty()) return true;
+    throw std::runtime_error("must not be empty");
+  });
+  r.optional("nvtx_injection_lib", opt.nvtx_injection_lib);
   r.reject_unknown();
 }
 
@@ -300,7 +392,9 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   yaml::reader r(node, "compression");
   r.optional("enable_pin_table_compression", opt.enable_pin_table_compression);
   r.optional("min_batch_size_bytes", yaml::bytes(opt.min_batch_size_bytes));
-  r.optional("max_compressed_fraction", opt.max_compressed_fraction);
+  r.optional("max_compressed_fraction", opt.max_compressed_fraction, [](double value) {
+    return std::isfinite(value) && value >= 0.0;
+  });
   r.optional("input_plan_dir", opt.input_plan_dir);
   r.reject_unknown();
 }
@@ -309,9 +403,9 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
 {
   yaml::reader r(node, "downgrade");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
-  r.optional("thread_name_prefix", opt.thread_pool.thread_name_prefix);
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
+  r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
   r.reject_unknown();
 }
 
@@ -327,15 +421,28 @@ struct topology {
   static void from_yaml(const YAML::Node& node, topology& opt)
   {
     yaml::reader r(node, "topology");
-    // gpu_ids and num_gpus are mutually exclusive; try gpu_ids first
-    std::vector<int> ids;
-    r.optional("gpu_ids", ids);
-    if (!ids.empty()) {
+    reject_mutually_exclusive(r, "topology", "gpu_ids", "num_gpus");
+
+    if (r.has_value("gpu_ids")) {
+      std::vector<int> ids;
+      r.optional("gpu_ids", ids);
+      if (ids.empty()) {
+        throw std::runtime_error("topology.gpu_ids must contain at least one device id");
+      }
+      if (std::ranges::any_of(ids, [](int id) { return id < 0; })) {
+        throw std::runtime_error("topology.gpu_ids must contain only non-negative device ids");
+      }
+      auto sorted_ids = ids;
+      std::ranges::sort(sorted_ids);
+      if (std::ranges::adjacent_find(sorted_ids) != sorted_ids.end()) {
+        throw std::runtime_error("topology.gpu_ids must not contain duplicate device ids");
+      }
       opt.num_gpus_or_gpu_ids = std::move(ids);
     } else {
-      size_t n = 0;
+      long long n = 0;
       r.optional("num_gpus", n);
-      opt.num_gpus_or_gpu_ids = n;
+      if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
+      opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
     // greater_than{-1} is >= 0: a negative count would otherwise silently read as "use all",
     // since the admission path treats any non-positive value as unset.
@@ -357,11 +464,9 @@ struct gpu_mem_config {
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   double downgrade_trigger_fraction{0.8};
   double downgrade_stop_fraction{0.6};
-  bool track_per_stream_reservation{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
-    opt.track_per_stream_reservation = false;
     yaml::reader r(node, "memory.gpu");
     // usage_limit: fraction (double) or absolute bytes — mutually exclusive keys
     std::optional<std::uint64_t> usage_bytes;
@@ -383,7 +488,6 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
-    r.optional("track_per_stream_reservation", opt.track_per_stream_reservation);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -402,7 +506,9 @@ struct gpu_mem_config {
       builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
-    builder.track_reservation_per_stream(track_per_stream_reservation);
+    // Keep the high-level path on Sirius's default. The low-level
+    // space.gpu[] replacement surface retains the diagnostic per-stream control.
+    builder.track_reservation_per_stream(false);
   }
 };
 
@@ -562,7 +668,13 @@ operator_params operator_defaults_for(
 sirius_config::sirius_config()
 {
   cucascade::memory::topology_discovery discovery;
-  if (discovery.discover()) { _hw_topology = discovery.get_topology(); }
+  // Ask cucascade to populate per-GPU runtime attributes (e.g. hw_decomp) alongside the passive
+  // NVML/sysfs topology so downstream consumers (SiriusContext hw-decompression gating) can read
+  // them off the discovered topology instead of re-querying the CUDA driver on their own.
+  if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                         /*with_runtime_attributes=*/true)) {
+    _hw_topology = discovery.get_topology();
+  }
 }
 
 void sirius_config::apply_defaults()
@@ -581,6 +693,8 @@ void sirius_config::apply_defaults()
   disk_cfg.setup_configurator(builder);
   _memory_space_configs = builder.build(_hw_topology);
   _operator_params      = operator_params{};
+
+  finalize_derived_config();
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -715,7 +829,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
     _operator_params = std::move(resolved_operator_params);
 
-    enforce_sirius_datasource_for_multi_gpu();
+    finalize_derived_config();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
@@ -723,18 +837,81 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   }
 }
 
-void sirius_config::enforce_sirius_datasource_for_multi_gpu()
+void sirius_config::finalize_derived_config()
+{
+  derive_uring_scan_budget();
+  // The opportunistic strategy schedules against what the executor can run,
+  // not what the device can queue, so it needs the pipeline pool's width.
+  _scan_manager_config.pipeline_width =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  derive_rest_scan_budget();
+  enforce_sirius_backend_for_multi_gpu();
+}
+
+void sirius_config::derive_uring_scan_budget()
+{
+  // The uring backend wants one concurrent scan per pipeline executor thread.
+  // io::uring::config can only spell that as the COMPILE-TIME thread count, so
+  // a config that resizes the pipeline pool would otherwise leave the readahead
+  // budget pinned to the old default and unable to keep the pool fed.
+  //
+  // Only an omitted value is derived, so every explicit
+  // uring.n_max_concurrent_scans value still wins -- including one numerically
+  // equal to the struct default.
+  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
+
+  auto const pipeline_threads =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  if (pipeline_threads == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
+    "({} threads), replacing the built-in default of {}",
+    pipeline_threads,
+    _scan_manager_config.uring.n_max_concurrent_scans);
+  _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
+}
+
+void sirius_config::derive_rest_scan_budget()
+{
+  // An object-store read is latency-bound, not bandwidth-bound: a ranged GET
+  // spends most of its life waiting for the first byte.  At one outstanding scan
+  // per pipeline thread the readahead has no lead — every split a thread picks
+  // up is the split whose prefetch only just started, so the read blocks on it.
+  // Several splits per thread give the prefetch time to land.  Local disk has no
+  // such round trip to hide, so uring stays at one per thread.
+  //
+  // Only the untouched default is replaced, so an explicit
+  // rest.n_max_concurrent_scans in the config still wins.
+  constexpr std::size_t scans_per_thread = 4;
+  if (_scan_manager_config.rest.n_max_concurrent_scans_explicit) { return; }
+
+  auto const derived =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
+    scans_per_thread;
+  if (derived == _scan_manager_config.rest.n_max_concurrent_scans) { return; }
+
+  SIRIUS_LOG_INFO(
+    "sirius_config: rest.n_max_concurrent_scans defaulted to {}x the configured pipeline pool size "
+    "({}), replacing the built-in default of {}",
+    scans_per_thread,
+    derived,
+    _scan_manager_config.rest.n_max_concurrent_scans);
+  _scan_manager_config.rest.n_max_concurrent_scans = derived;
+}
+
+void sirius_config::enforce_sirius_backend_for_multi_gpu()
 {
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
-  if (num_gpus > 1 && !_scan_manager_config.use_sirius_datasource) {
+  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
     SIRIUS_LOG_WARN(
-      "sirius_config: use_sirius_datasource was false but {} GPUs are configured; "
-      "the sirius datasource is required for multi-GPU IO routing. Overriding "
-      "use_sirius_datasource to true.",
+      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
+      "the sirius backend is required for multi-GPU IO routing. Overriding "
+      "backend to 'sirius'.",
       num_gpus);
-    _scan_manager_config.use_sirius_datasource = true;
+    _scan_manager_config.backend = scan_manager::io_backend::sirius;
   }
 }
 

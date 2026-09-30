@@ -18,6 +18,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cuda_runtime_api.h>
@@ -218,10 +219,7 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
   // This test requires actual multi-GPU hardware
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("requires 2+ GPUs for scan distribution test -- skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // Verify that the system actually has multiple GPU devices accessible
   for (int i = 0; i < device_count; ++i) {
@@ -254,12 +252,7 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
 TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
           "[data_locality][multi_gpu][mgpu_07_adaptive_scan]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("requires 2+ GPUs for MGPU-07 adaptive scan + P2P scenario -- skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // 2-GPU memory manager + peer access already enabled at SiriusContext
   // initialize() level (Plan 07-01 MGPU-06). This TEST_CASE runs outside the

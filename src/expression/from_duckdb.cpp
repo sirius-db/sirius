@@ -166,12 +166,21 @@ std::unique_ptr<node> translate_case(duckdb::BoundCaseExpression const& expr)
 
 std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
 {
+  // cuDF does not implement DuckDB's temporal-numeric cast semantics. Decline the expression
+  // before a same-shaped DATE carrier conversion can reach the representation tunnel; planning
+  // then applies the configured fallback policy. Planner-generated restores bypass translation.
+  auto const& source_type = expr.child->return_type;
+  auto const& target_type = expr.return_type;
+  if ((source_type.IsTemporal() && target_type.IsNumeric()) ||
+      (source_type.IsNumeric() && target_type.IsTemporal())) {
+    return nullptr;
+  }
+
   auto child = from_duckdb(*expr.child);
   if (!child) { return nullptr; }
-  auto target_type = sirius::from_duckdb(expr.return_type);
   return std::make_unique<node>(cast{
     /*child=*/std::move(child),
-    /*target_type=*/std::move(target_type),
+    /*target_type=*/sirius::from_duckdb(target_type),
     /*try_cast=*/expr.try_cast,
   });
 }

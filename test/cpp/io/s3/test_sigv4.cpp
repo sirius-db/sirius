@@ -15,7 +15,7 @@
  */
 
 #include "catch.hpp"
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -24,11 +24,11 @@
 #include <string>
 #include <string_view>
 
-using sirius::io::s3::presign_url;
-using sirius::io::s3::sha256_hex;
-using sirius::io::s3::sign_request;
-using sirius::io::s3::sigv4_signer_config;
-using sirius::io::s3::uri_encode;
+using sirius::io::rest::s3::presign_url;
+using sirius::io::rest::s3::sha256_hex;
+using sirius::io::rest::s3::sign_request;
+using sirius::io::rest::s3::sigv4_signer_config;
+using sirius::io::rest::s3::uri_encode;
 
 namespace {
 
@@ -42,7 +42,7 @@ sigv4_signer_config aws_example_creds()
   return creds;
 }
 
-std::string authorization_header(sirius::io::s3::sigv4_signed_request const& req)
+std::string authorization_header(sirius::io::rest::s3::sigv4_signed_request const& req)
 {
   for (auto const& [key, value] : req.headers) {
     if (key == "Authorization") { return value; }
@@ -50,7 +50,8 @@ std::string authorization_header(sirius::io::s3::sigv4_signed_request const& req
   return {};
 }
 
-std::string header_value(sirius::io::s3::sigv4_signed_request const& req, std::string_view wanted)
+std::string header_value(sirius::io::rest::s3::sigv4_signed_request const& req,
+                         std::string_view wanted)
 {
   for (auto const& [key, value] : req.headers) {
     if (key == wanted) { return value; }
@@ -304,19 +305,6 @@ TEST_CASE("presign_url keeps canonical query ordering deterministic", "[s3][sigv
   CHECK(signed_headers < signature);
 }
 
-TEST_CASE("presign_url signs only the host header", "[s3][sigv4]")
-{
-  auto url = presign_url("GET",
-                         "https",
-                         "examplebucket.s3.amazonaws.com",
-                         "/test.txt",
-                         aws_example_creds(),
-                         1369353600,
-                         std::chrono::seconds{300});
-
-  CHECK(query_value(url, "X-Amz-SignedHeaders") == "host");
-}
-
 TEST_CASE("presign_url propagates ttl into X-Amz-Expires", "[s3][sigv4]")
 {
   auto url_300   = presign_url("GET",
@@ -335,6 +323,7 @@ TEST_CASE("presign_url propagates ttl into X-Amz-Expires", "[s3][sigv4]")
                                std::chrono::seconds{86400});
 
   CHECK(query_value(url_300, "X-Amz-Expires") == "300");
+  CHECK(query_value(url_300, "X-Amz-SignedHeaders") == "host");
   CHECK(query_value(url_86400, "X-Amz-Expires") == "86400");
 }
 

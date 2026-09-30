@@ -18,27 +18,28 @@
 
 #include "compression/compressed_representation.hpp"
 #include "compression/device_compressed_blob.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "io/io_context.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/table/table.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -148,6 +149,14 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
   }
 }
 
+cudf::data_type pin_native_type(cudf::data_type decoded_type,
+                                duckdb::LogicalType const* declared_type)
+{
+  if (declared_type == nullptr) { return decoded_type; }
+  auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
+  return native.value_or(decoded_type);
+}
+
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
@@ -159,7 +168,7 @@ namespace {
 using pin_batch_sink =
   std::function<void(std::unique_ptr<cudf::table>,
                      cucascade::memory::memory_space* target,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      std::vector<pinned_column_storage_meta> column_storage,
                      std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
 
@@ -170,7 +179,7 @@ struct narrowed_pin_chunk {
 
 narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
                                     duckdb::vector<duckdb::LogicalType> const& column_types,
-                                    rmm::cuda_stream_view stream,
+                                    ::cuda::stream_ref stream,
                                     rmm::device_async_resource_ref mr)
 {
   if (column_types.size() != static_cast<std::size_t>(table->num_columns())) {
@@ -187,8 +196,8 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
     if (!range) { continue; }
     auto target = choose_narrow_physical_type(logical, *range);
     if (!target || columns[column_idx]->type() == *target) { continue; }
-    auto const actual            = columns[column_idx]->type();
-    columns[column_idx]          = cudf::cast(columns[column_idx]->view(), *target, stream, mr);
+    auto const actual   = columns[column_idx]->type();
+    columns[column_idx] = cast_through_rep(columns[column_idx]->view(), *target, stream, mr);
     narrowed_columns[column_idx] = true;
     SIRIUS_LOG_DEBUG("[compressed_materialization] pin column {} narrowed: {} -> {}",
                      column_idx,
@@ -205,12 +214,15 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 /// placement means re-pinning the same source yields identical placement (required by
 /// insert_pinned_entry's merge path on the GPU tier) and bounds peak GPU residency to ~one batch
 /// (the host tier frees each table in @p on_batch before the next is materialized).
-void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
-                             std::span<cucascade::memory::memory_space* const> gpu_spaces,
-                             io::sirius_ioctx& io_ctx,
-                             duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
-                             pin_materialization_options options,
-                             const pin_batch_sink& on_batch)
+/// @return the late-mat uniqueness verdicts, positional with the pinned columns
+///         (empty when the probe was not asked for).
+std::vector<late_mat::unique_verdict> materialize_pin_batches(
+  op::scan::gpu_ingestible& ingestible,
+  std::span<cucascade::memory::memory_space* const> gpu_spaces,
+  io::ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
+  pin_materialization_options options,
+  const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
     throw std::invalid_argument("[materialize_pin_batches] gpu_spaces must be non-empty");
@@ -230,7 +242,7 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   }
   scan_manager::round_robin_strategy placement(std::move(device_ids));
 
-  // next_split_provider takes the io_ctx by shared_ptr; sirius_ioctx derives
+  // next_split_provider takes the io_ctx by shared_ptr; ioctx derives
   // std::enable_shared_from_this and the scan manager owns it via a shared_ptr, so
   // this hands the metadata reads a valid owning reference for the read's duration.
   auto io_ctx_sp = io_ctx.shared_from_this();
@@ -240,6 +252,32 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   // Rows materialized so far, in emission order — feeds the chunk-contiguity
   // validation (duckdb-native pins only).
   std::size_t rows_materialized = 0;
+
+  // Whole-table distinctness proof, accumulated chunk by chunk. Inactive (and
+  // free) unless the caller selected columns to observe.
+  late_mat::unique_probe unique_probe{options.probe_unique_columns};
+
+  // The cheap per-chunk pass usually leaves a key UNDECIDED: chunk ranges
+  // overlap, because the coalescer interleaves row groups rather than
+  // partitioning the key space. Settling that needs every chunk at once, which
+  // only exists HERE -- once a compressed pin has been encoded, the values are
+  // gone, and the deferred exact check at query time skips a compressed chunk
+  // outright. So retain the observed columns as they pass and finish the proof
+  // before returning. Retention is bounded by the same row cap the query-time
+  // stage uses and abandoned outright if the pin spreads across devices.
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> exact_chunks(
+    options.probe_unique_columns.size());
+  bool exact_retaining         = unique_probe.active();
+  std::size_t exact_rows       = 0;
+  std::optional<int> exact_gpu = std::nullopt;
+  auto abandon_exact           = [&](char const* why) {
+    if (!exact_retaining) { return; }
+    exact_retaining = false;
+    for (auto& col : exact_chunks) {
+      col.clear();
+    }
+    SIRIUS_LOG_DEBUG("[late-mat] pin-time exact uniqueness check abandoned: {}", why);
+  };
 
   // Materialize one coalesced batch into a GPU-resident cudf::table and hand it to on_batch
   // together with its GPU placement + the decode stream. Mirrors
@@ -286,6 +324,44 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
     }
+    // Observe BEFORE narrowing: the proof is about values, and same-family
+    // narrowing preserves them, so the native carriers are both cheaper to
+    // reduce and equally conclusive.
+    if (unique_probe.active()) {
+      nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
+      unique_probe.observe(tbl->view(), stream);
+    }
+    if (exact_retaining) {
+      if (exact_gpu.has_value() && *exact_gpu != gpu_id) {
+        abandon_exact("the pin spans devices");
+      } else if (exact_rows + static_cast<std::size_t>(tbl->num_rows()) >
+                 late_mat::exact_uniqueness_row_cap()) {
+        abandon_exact("the pin is past the exact-stage row cap");
+      } else if (static_cast<std::size_t>(tbl->num_columns()) !=
+                 options.probe_unique_columns.size()) {
+        abandon_exact("a chunk's width disagrees with the selection");
+      } else {
+        exact_gpu = gpu_id;
+        exact_rows += static_cast<std::size_t>(tbl->num_rows());
+        for (std::size_t i = 0; i < options.probe_unique_columns.size(); ++i) {
+          if (!options.probe_unique_columns[i]) { continue; }
+          exact_chunks[i].push_back(
+            std::make_unique<cudf::column>(tbl->view().column(static_cast<cudf::size_type>(i)),
+                                           stream,
+                                           target->get_default_allocator()));
+        }
+      }
+    }
+    // Record declared-native identity before narrowing; decoder type is only the fallback when no
+    // declared mapping is available.
+    std::vector<cudf::data_type> native_types;
+    native_types.reserve(static_cast<std::size_t>(tbl->num_columns()));
+    for (cudf::size_type i = 0; i < tbl->num_columns(); ++i) {
+      auto const idx = static_cast<std::size_t>(i);
+      native_types.push_back(
+        pin_native_type(tbl->get_column(i).type(),
+                        idx < pinned_column_types.size() ? &pinned_column_types[idx] : nullptr));
+    }
     if (options.enable_compressed_materialization) {
       auto narrowed = narrow_pin_chunk(
         std::move(tbl), pinned_column_types, stream, target->get_default_allocator());
@@ -298,8 +374,9 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     std::vector<pinned_column_storage_meta> column_storage;
     column_storage.reserve(static_cast<std::size_t>(tbl->num_columns()));
     for (cudf::size_type i = 0; i < tbl->num_columns(); ++i) {
-      column_storage.push_back(
-        {tbl->get_column(i).type(), narrowed_columns[static_cast<std::size_t>(i)]});
+      column_storage.push_back({tbl->get_column(i).type(),
+                                narrowed_columns[static_cast<std::size_t>(i)],
+                                native_types[static_cast<std::size_t>(i)]});
     }
     on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
   };
@@ -317,18 +394,51 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
   for (auto& b : coalescer->flush()) {
     handle_batch(std::move(b));
   }
+
+  if (std::any_of(options.probe_unique_columns.begin(),
+                  options.probe_unique_columns.end(),
+                  [](bool selected) { return selected; })) {
+    auto verdicts = unique_probe.verdicts();
+    // Only what the cheap pass left open: `proven` needs nothing more and
+    // `refused` cannot be helped (the column repeats a value, or is nullable).
+    if (exact_retaining) {
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{exact_gpu.value_or(0)}};
+      for (std::size_t i = 0; i < verdicts.size(); ++i) {
+        if (verdicts[i] != late_mat::unique_verdict::undecided || exact_chunks[i].empty()) {
+          continue;
+        }
+        std::vector<cudf::column_view> views;
+        views.reserve(exact_chunks[i].size());
+        for (auto const& col : exact_chunks[i]) {
+          views.push_back(col->view());
+        }
+        try {
+          auto const unique =
+            late_mat::exact_distinct_over_chunks(views, ::cuda::stream_ref{cudaStream_t{}});
+          if (!unique.has_value()) { continue; }  // undecidable stays UNKNOWN
+          verdicts[i] =
+            *unique ? late_mat::unique_verdict::proven : late_mat::unique_verdict::refused;
+        } catch (std::exception const& e) {
+          // A failed check must cost the optimization, never the pin.
+          SIRIUS_LOG_WARN("[late-mat] pin-time exact uniqueness check failed: {}", e.what());
+        }
+      }
+    }
+    abandon_exact("done");
+    SIRIUS_LOG_DEBUG(
+      "[late-mat] pin uniqueness probe: {} proven, {} undecided (exact check pending), {} refused",
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::proven),
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::undecided),
+      std::count(verdicts.begin(), verdicts.end(), late_mat::unique_verdict::refused));
+    return verdicts;
+  }
+  return {};
 }
 
-// Thread-local pool of 4 CUDA streams for cross-column encode parallelism,
-// matching the decompress path in compression_converters.cpp.
-simpatico::stream_pool& compress_pool()
-{
-  thread_local simpatico::stream_pool pool;
-  if (pool.streams.empty()) {
-    if (!pool.init(4)) throw std::runtime_error("[pin_table] compress stream_pool init failed");
-  }
-  return pool;
-}
+// Streams for cross-column encode parallelism, one pool per thread and device —
+// the same accessor the decode path uses, so a thread that both pins and
+// decodes holds one pool rather than two.
+simpatico::stream_pool& compress_pool() { return simpatico::thread_device_stream_pool(4); }
 
 // Diagnostic for a compression failure inside a pin sink, shared by both drivers. Reports the real
 // blast radius: the sink latches compression off for every remaining chunk of the pin, not only the
@@ -361,6 +471,34 @@ std::string compression_failure_warning(std::string_view what,
   return message;
 }
 
+/// Per-pin compression coverage, always at INFO. Skipped when compression wasn't
+/// requested for this pin (else "0/N compressed" would misreport by-design
+/// uncompressed pinning as a fallback). Points at "warnings above" only when a
+/// chunk actually WARNed (@p compression_failed) — a chunk can also land
+/// uncompressed silently (below min_batch_size_bytes, or under
+/// max_compressed_fraction), which gets a different reason instead.
+void log_pin_compression_coverage(std::string_view log_tag,
+                                  op::scan::gpu_ingestible& ingestible,
+                                  compression_pin_config const& compression,
+                                  std::size_t compressed_count,
+                                  std::size_t total_chunks,
+                                  bool compression_failed)
+{
+  if (!compression.enabled) { return; }
+  std::string_view suffix;
+  if (compressed_count != total_chunks) {
+    suffix = compression_failed ? " — remainder pinned UNCOMPRESSED (see warnings above)"
+                                : " — remainder pinned UNCOMPRESSED (below the compression "
+                                  "size/ratio threshold)";
+  }
+  SIRIUS_LOG_INFO("[{}] pin '{}': {}/{} chunk(s) compressed{}",
+                  log_tag,
+                  ingestible.table_info().display_name(),
+                  compressed_count,
+                  total_chunks,
+                  suffix);
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -377,11 +515,11 @@ std::string compression_failure_warning(std::string_view what,
 template <typename StageFn>
 bool compress_and_stage_batch(cudf::table const& tbl,
                               compression_pin_config const& compression,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               std::string_view log_tag,
                               StageFn&& stage)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
+  nvtx_scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
   if (tbl.num_columns() == 0) { return false; }
   // Total device footprint of the batch (includes string chars/offsets and null
   // masks), so string columns count toward the threshold.
@@ -392,7 +530,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   // streams are NOT ordered after `stream`, so synchronize first to ensure the
   // table is fully resident before the pool streams read it — mirrors the
   // parallel decompress path in compression_converters.cpp.
-  stream.synchronize();
+  stream.sync();
   auto ct = simpatico::compress_with_plan(tbl.view(),
                                           compression.plan_dsl,
                                           compress_pool(),
@@ -436,7 +574,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   }
 
   {
-    nvtx3::scoped_range stage_range{"sirius::compression::stage_payload"};
+    nvtx_scoped_range stage_range{"sirius::compression::stage_payload"};
     stage(std::move(ct),
           std::move(header),
           buffers,
@@ -452,12 +590,12 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options)
 {
   materialized_pin out;
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -465,12 +603,12 @@ materialized_pin materialize_all_batches(
     options,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* target,
-        rmm::cuda_stream_view stream,
+        ::cuda::stream_ref stream,
         std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
-      stream.synchronize();
+      stream.sync();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
@@ -484,7 +622,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -493,7 +631,7 @@ host_pin_result materialize_pin_to_host(
   host_pin_result out;
   bool compression_failed = false;
 
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -501,7 +639,7 @@ host_pin_result materialize_pin_to_host(
     options,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream,
+        ::cuda::stream_ref stream,
         std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
@@ -548,7 +686,7 @@ host_pin_result materialize_pin_to_host(
                                                        stream);
                 }
               }
-              stream.synchronize();
+              stream.sync();
 
               out.chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
                 *target_host_space,
@@ -582,10 +720,25 @@ host_pin_result materialize_pin_to_host(
                                gpu_repr, *host_reservation, stream)
                            : registry.convert<cucascade::host_data_representation>(
                                gpu_repr, target_host_space, stream);
-        stream.synchronize();
+        stream.sync();
         out.chunks.emplace_back(std::move(host_repr));
       }
     });
+
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (dynamic_cast<sirius::compressed_host_representation const*>(chunk.get()) != nullptr) {
+        ++compressed_count;
+      }
+    }
+    log_pin_compression_coverage("materialize_pin_to_host",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
 
   return out;
 }
@@ -593,7 +746,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -605,7 +758,7 @@ device_pin_result materialize_all_batches_compressed(
   // capture would be computed and dropped — force it off.
   options.capture_chunk_stats = false;
 
-  materialize_pin_batches(
+  out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
@@ -613,7 +766,7 @@ device_pin_result materialize_all_batches_compressed(
     options,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream,
+        ::cuda::stream_ref stream,
         std::vector<pinned_column_storage_meta> column_storage,
         std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
@@ -686,7 +839,7 @@ device_pin_result materialize_all_batches_compressed(
               // written by the copies below, and a bitpacked decode reads a few bytes
               // past a leaf's logical end — zeros keep those reads benign.
               CUCASCADE_CUDA_TRY(
-                cudaMemsetAsync(blob->payload.data(), 0, payload_capacity, stream.value()));
+                cudaMemsetAsync(blob->payload.data(), 0, payload_capacity, stream.get()));
               for (std::size_t k = 0; k < blob->offsets.size(); ++k) {
                 auto const& b = buffers[slot_src[k]];
                 if (b.size_bytes > 0 && b.device_ptr != nullptr) {
@@ -695,13 +848,13 @@ device_pin_result materialize_all_batches_compressed(
                     b.device_ptr,
                     static_cast<std::size_t>(b.size_bytes),
                     cudaMemcpyDeviceToDevice,
-                    stream.value()));
+                    stream.get()));
                 }
               }
               blob->slab_mr = sirius::slab_memory_resource{
                 static_cast<std::byte*>(blob->payload.data()), &blob->offsets, &blob->slab_cursor};
 
-              auto noop_fetch = [](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) {};
+              auto noop_fetch = [](std::uint64_t, std::size_t, void*, ::cuda::stream_ref) {};
               std::string read_err;
               // Leaf buffers come from the slab (placed as views into the contiguous
               // payload — zero copy). Codec decode scratch comes from the source GPU
@@ -717,7 +870,7 @@ device_pin_result materialize_all_batches_compressed(
               if (!read_err.empty()) {
                 throw std::runtime_error("[materialize_all_batches_compressed] " + read_err);
               }
-              stream.synchronize();
+              stream.sync();
 
               compressed_chunk = std::make_shared<sirius::compressed_device_representation>(
                 *src_space,
@@ -746,7 +899,7 @@ device_pin_result materialize_all_batches_compressed(
         // before it is stored (its writer stream is not tracked downstream), then
         // split it into per-column device columns so a mixed pin stores every
         // chunk — compressed or not — in one ordered vector.
-        stream.synchronize();
+        stream.sync();
         auto cols = tbl->release();
         std::vector<std::shared_ptr<cudf::column>> shared_cols;
         shared_cols.reserve(cols.size());
@@ -757,6 +910,19 @@ device_pin_result materialize_all_batches_compressed(
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
     });
+
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (chunk.compressed) { ++compressed_count; }
+    }
+    log_pin_compression_coverage("materialize_all_batches_compressed",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
 
   return out;
 }

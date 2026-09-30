@@ -125,7 +125,7 @@ insert_delta_workset prepare_insert_delta_tasks(
         range_works.push_back(std::move(work));
       }
     }
-    std::vector<absl::AnyInvocable<void()>> range_tasks;
+    std::vector<sirius::exec::invocable<void()>> range_tasks;
     range_tasks.reserve(range_works.size());
     for (auto& work : range_works) {
       range_tasks.push_back([work_ptr = work.get()] {
@@ -372,9 +372,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   std::vector<insert_delta_split> out;
   out.reserve(request.bundles.size());
   for (auto const& bundle : request.bundles) {
-    auto info           = std::make_unique<op::scan::duckdb_native_scan_info>();
-    info->block_manager = block_manager;
-    if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
+    std::vector<op::scan::duckdb_row_group_metadata> row_groups;
+    row_groups.reserve(bundle.rg_indices.size());
 
     bool any_file_read = false;
     for (std::size_t bi = 0; bi < bundle.rg_indices.size(); ++bi) {
@@ -394,6 +393,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         md.varchar_bytes_per_col.push_back(rgp.varchar_bytes_per_col[ui]);
         op::scan::duckdb_column_metadata cm;
         cm.column_id = src.column_id;
+        cm.is_array  = src.is_array;
         cm.data_segments.reserve(src.data_segments.size());
         for (auto const& s : src.data_segments) {
           cm.data_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
@@ -402,15 +402,27 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         for (auto const& s : src.validity_segments) {
           cm.validity_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
         }
+        cm.array_child_data_segments.reserve(src.array_child_data_segments.size());
+        for (auto const& s : src.array_child_data_segments) {
+          cm.array_child_data_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
+        }
+        cm.array_child_validity_segments.reserve(src.array_child_validity_segments.size());
+        for (auto const& s : src.array_child_validity_segments) {
+          cm.array_child_validity_segments.push_back(to_descriptor(s, rg_slab, any_file_read));
+        }
         md.columns.push_back(std::move(cm));
       }
-      info->row_groups.push_back(std::move(md));
+      row_groups.push_back(std::move(md));
     }
-    info->host_backed_only = !any_file_read;
     // The prefetch handle inside a datasource is per-scan mutable state, so
     // every file-backed split owns a fresh duplicate (matching the native-scan
     // coalescer); splits that read no file carry none.
-    if (any_file_read && datasource) { info->datasource = datasource->duplicate(); }
+    auto split_datasource = any_file_read && datasource ? datasource->duplicate()
+                                                        : std::shared_ptr<io::sirius_datasource>{};
+    auto info             = std::make_unique<op::scan::duckdb_native_scan_info>(
+      std::move(row_groups), std::move(split_datasource), block_manager);
+    info->host_backed_only = !any_file_read;
+    if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }

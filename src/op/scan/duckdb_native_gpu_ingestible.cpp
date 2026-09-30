@@ -23,12 +23,12 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 // duckdb
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -121,10 +121,9 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     // turns an empty row-group list into a schema-correct 0-row table. Without this,
     // zero splits mean zero tasks and the pipeline-completion signal never fires.
     if (!_produced_any && _have_template) {
-      auto split           = std::make_unique<duckdb_native_scan_info>();
-      split->datasource    = _datasource->duplicate();
-      split->block_manager = _block_manager;
-      _produced_any        = true;
+      auto split = std::make_unique<duckdb_native_scan_info>(
+        std::vector<duckdb_row_group_metadata>{}, _datasource->duplicate(), _block_manager);
+      _produced_any = true;
       out.push_back(std::move(split));
     }
     return out;
@@ -133,10 +132,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(_acc);
-    split->datasource    = _datasource->duplicate();
-    split->block_manager = _block_manager;
+    auto split = std::make_unique<duckdb_native_scan_info>(
+      std::move(_acc), _datasource->duplicate(), _block_manager);
     _acc.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
@@ -181,23 +178,10 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
-  // Phase 1 (serial): PartitionStatistics,
-  //                   projected-type gate, and
-  //                   filter-stat row-group pruning.
-  // Unsupported types / invalid partitions refuse -> CPU fallback before any per-segment IO.
-  // PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so it must stay
-  // serial.
-  _plan = prepare_duckdb_native_walk(*bind.storage,
-                                     *bind.context,
-                                     bind.projected_cols,
-                                     bind.projected_types,
-                                     bind.table_filters.get(),
-                                     &bind.column_ids);
-  if (!_plan.viable) {
-    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
-                     _plan.viability_failure_reason);
-    throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _plan.viability_failure_reason);
+  // Eager even when the walk is deferred, so an undecodable type still refuses at plan time.
+  if (auto reason = unsupported_projected_type_reason(bind.projected_cols, bind.projected_types)) {
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", *reason);
+    throw std::runtime_error("duckdb-native scan rejected query: " + *reason);
   }
 
   auto& sm          = bind.storage->GetAttached().GetStorageManager();
@@ -209,9 +193,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
   _block_manager = sf_bm;
 
-  // Emission order: the k-th decoded column is column_ids[source_ids[k]]. Computed outside the
-  // static-filter guard — the dynamic-filter remap below needs it even when the scan carries no
-  // static filters.
   duckdb::vector<duckdb::idx_t> source_ids_fallback;
   if (bind.projection_ids.empty()) {
     source_ids_fallback.reserve(bind.column_ids.size());
@@ -235,27 +216,57 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     }
   }
 
-  // Producers push dynamic filters keyed in DuckDB's column_ids space; the post-decode operator
-  // applies them by output position. Install the translation now — the ctor runs at plan time,
-  // before any producing join can publish. Decode positions at or past the output arity are
-  // pure-filter columns that post_filter_and_project drops; they map to the sentinel so
-  // push_filter rejects filters nothing downstream could apply.
-  if (bind.sirius_dynamic_filters) {
-    std::vector<std::size_t> output_position_by_column_id(bind.column_ids.size(),
-                                                          scan_plan::no_output_position);
-    auto const output_arity = bind.output_types.size();
-    for (std::size_t k = 0; k < source_ids.size() && k < output_arity; ++k) {
-      output_position_by_column_id[source_ids[k]] = k;
-    }
-    bind.sirius_dynamic_filters->set_consumer_column_remap(std::move(output_position_by_column_id));
+  _chunk_row_groups = metadata_parse_chunk();
+  if (bind.defer_metadata_walk) {
+    // Seed _num_ranges in case the split provider is consulted first; the walk rewrites it.
+    _walk_deferred = true;
+    _num_ranges.store(std::max<std::size_t>(
+                        1,
+                        utils::ceil_div(bind.storage->GetRowGroupCollection()->GetRowGroupCount(),
+                                        _chunk_row_groups)),
+                      std::memory_order_relaxed);
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_gpu_ingestible] deferring metadata walk for pin-served scan of '{}'",
+      bind.table_name);
+  } else {
+    run_metadata_walk();
   }
+}
 
+//! PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so this must stay
+//! serial; the deferred path runs it from prepare_for_query on the query thread.
+void duckdb_native_gpu_ingestible::run_metadata_walk()
+{
+  auto const& bind = *_info;
+  _plan            = prepare_duckdb_native_walk(*bind.storage,
+                                     *bind.context,
+                                     bind.projected_cols,
+                                     bind.projected_types,
+                                     bind.table_filters.get(),
+                                     &bind.column_ids);
+  if (!_plan.viable) {
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
+                     _plan.viability_failure_reason);
+    throw std::runtime_error("duckdb-native scan rejected query: " +
+                             _plan.viability_failure_reason);
+  }
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
   // Always at least one range: a zero-row-group table must still push one (empty)
   // scan_info so the coalescer seeds its template and emits the empty split —
   // zero splits would mean zero tasks and the query never completes.
-  _chunk_row_groups = metadata_parse_chunk();
-  _num_ranges = std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups));
+  _num_ranges.store(
+    std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups)),
+    std::memory_order_relaxed);
+}
+
+void duckdb_native_gpu_ingestible::ensure_metadata_prepared()
+{
+  if (!_walk_deferred || _walk_ready.load(std::memory_order_acquire)) { return; }
+  // call_once re-arms after an exception, so a failed walk is retried rather than latched.
+  std::call_once(_walk_once, [this] {
+    run_metadata_walk();
+    _walk_ready.store(true, std::memory_order_release);
+  });
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
@@ -265,14 +276,26 @@ duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_range_idx.load(std::memory_order_relaxed) >= _num_ranges;
+  return _next_range_idx.load(std::memory_order_relaxed) >=
+         _num_ranges.load(std::memory_order_relaxed);
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
+  // Backstop: the scan manager already ran the walk on the query thread, so this is a no-op.
+  if (metadata_walk_pending()) {
+    SIRIUS_LOG_WARN(
+      "[duckdb_native_gpu_ingestible] deferred metadata walk still pending at "
+      "next_split_provider for '{}'; running it now (off the query thread)",
+      _info->table_name);
+    ensure_metadata_prepared();
+  }
+
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
+  if (idx >= _num_ranges.load(std::memory_order_relaxed)) {
+    return nullptr;  // lost the race for the final range
+  }
 
   auto const rg_begin = idx * _chunk_row_groups;
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
@@ -288,10 +311,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                ")): " + range.viability_failure_reason);
     }
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(range.row_groups);
-    split->datasource    = io_ctx->open_datasource(_info->db_path);
-    split->block_manager = _block_manager;
+    auto split = std::make_unique<duckdb_native_scan_info>(
+      std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     return split;
   };
 }
@@ -302,7 +323,9 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream,
+  bool /*like_swar_fastpath*/,
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (!split.datasource && !split.host_backed_only) {
@@ -340,10 +363,32 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 //===----------------------------------------------------------------------===//
 // post_filter_and_project — filter eval + projection to output arity
 //===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::unique_ptr<cudf::column>* /*survivors*/,
+  std::span<std::size_t const> elided)
 {
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
@@ -353,10 +398,18 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   //===----------Filter Evaluation----------===//
+  // A ROW_FILTERED state means the decode already applied the whole conjunction
+  // and compacted to the survivors, so only the projection below is left.
   owning_table_view final_table;
-  if (_filter_expression) {
+  if (_filter_expression && input.state != filter_state::ROW_FILTERED) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                      mr_ref,
+                                      stream,
+                                      strategy_from_config(),
+                                      sirius::expression_evaluator::default_min_ast_size,
+                                      like_swar_fastpath,
+                                      std::move(like_cache));
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);
@@ -366,6 +419,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
       // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
       final_table = owning_table_view{exec.select(input.table.view())};
     }
+    // The select only enqueued its reads; record before input.table's read-lock owner is dropped.
+    input.table.record_reader_event(stream);
   } else {
     final_table = std::move(input.table);
   }
@@ -381,6 +436,11 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
     final_table.select_columns(selected_cols);
   }
 
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(final_table.view().num_columns()), elided);
+      !kept.empty()) {
+    final_table.select_columns(kept);
+  }
   return final_table.release(stream, mr_ref);
 }
 
