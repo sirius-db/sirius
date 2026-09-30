@@ -252,8 +252,8 @@ completes, with the refresh functions replayed on a fresh copy — it cannot sha
 process, since the host pool does not return memory to the OS on unpin. In `--mode both` the
 throughput streams are validated too: the child re-runs the N throughput RF1/RF2 pairs and
 snapshots the CPU results after the baseline and each commit, and every stream's GPU rows must
-match one of those 2N+1 snapshots — which committed refresh state a concurrent query observed is
-a scheduling accident, but it must be one of them),
+match a nondecreasing sequence of those 2N+1 snapshots consistent with recorded query and
+refresh-commit timing; overlapping commits allow either state),
 `--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
@@ -345,9 +345,10 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
    phases finish, with the refreshes replayed on a fresh copy. In `--mode both` it also covers
    the throughput streams: the child builds a knowledge base of the 2N+1 refresh states a
    concurrent query could have observed (baseline + each throughput RF1/RF2 commit) and each
-   stream's GPU rows must match one of them; `--mode throughput` alone skips this (no power
-   baseline). It adds one base-DB copy and an untimed CPU pass (2N+1 passes when the throughput
-   streams are covered), but does not compete with the pin for memory. With varied predicates
+   stream's GPU rows must match a nondecreasing sequence consistent with query/commit timing;
+   `--mode throughput` alone skips this (no power baseline). It adds one base-DB copy and two
+   untimed CPU query passes for power validation, plus 2N+1 passes for throughput validation
+   (2N+3 total), but does not compete with the pin for memory. With varied predicates
    skip the question — the runner rejects `--validation` — and tell the user the run is
    timing-only.
 

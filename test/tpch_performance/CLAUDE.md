@@ -529,19 +529,24 @@ sqrt(Power · Throughput)`.
   state, since RF1/RF2 are committed but never checkpointed, so the child **replays the refresh
   functions** on its own copy of the base database to reproduce the states the GPU was measured
   against. It runs after the pinned phases delete their scratch copy, so peak disk is unchanged;
-  the cost is one extra copy of the base DB and an untimed CPU pass. q2/q11/q16 touch neither
+  the cost is one extra copy of the base DB and two untimed CPU query passes. q2/q11/q16 touch neither
   table and are skipped. Row-count movement across RF1/RF2 is also checked. Any mismatch exits
   non-zero.
 - Throughput validation (`--mode both` only): each throughput stream's GPU rows are stashed
   during the run, and the same extension-free child process then builds a **knowledge base** —
-  after replaying the power run's RF1/RF2 it snapshots the Q1-Q22 CPU results at the post-power
+  after replaying the power run's RF1/RF2 it snapshots the 19 refresh-sensitive CPU query results
+  (Q1-Q22 excluding q2/q11/q16) at the post-power
   baseline and after each of the N throughput RF1/RF2 commits (2N+1 in-memory snapshots, update
-  sets 2..N+1). A stream's result for a query is validated iff it matches at least one snapshot:
-  the query streams run concurrently with the refresh stream, so which committed refresh state a
-  given query observed is a scheduling accident, but it must be one of them. q2/q11/q16 are
-  skipped as refresh-invariant. `--mode throughput` alone skips this with a warning (no validated
+  sets 2..N+1). Each stream must have a nondecreasing assignment to matching snapshots in its
+  actual query order. Query transactions and refresh commits are bracketed with a monotonic
+  clock: a commit finished before a query starts excludes older states, and a commit started
+  after a query finishes excludes newer states. Overlapping windows conservatively allow either
+  state. Throughput validation adds 2N+1 untimed CPU query passes, for 2N+3 total including the
+  two power checks. `--mode throughput` alone skips this with a warning (no validated
   power baseline to anchor snapshot 0); mismatches list the per-snapshot diffs in `metrics.json`
-  under `throughput.validation` and exit non-zero like power validation.
+  under `throughput.validation` and exit non-zero like power validation. Worker verdicts are
+  saved after each completed stage; a crash marks incomplete stages as failed instead of
+  reporting an unwritten stage as PASS.
 - Concurrency caveat: the engine serializes queries across all connections on one query-lifecycle
   lock, so the throughput run measures throughput of concurrent submission on one GPU, not
   overlapped execution. Every result is fetched fully before the next query; an open cursor would

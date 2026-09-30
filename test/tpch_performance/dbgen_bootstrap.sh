@@ -28,7 +28,11 @@ ensure_tpch_tools() {
     for tool in "$@"; do
         if [ ! -x "$dbgen_dir/$tool" ] && [ -f "$dbgen_dir/makefile" ]; then
             echo "Building $tool in $dbgen_dir"
-            make -C "$dbgen_dir" "$tool" >/dev/null
+            # The classic tools use declarations like int (*loader)(). Under
+            # C23 these mean zero arguments; the code needs pre-C23 semantics.
+            # GCC 15 defaults to C23, so select C17 while retaining the active
+            # compiler and the bundled makefile's platform defines.
+            make -C "$dbgen_dir" CC="${CC:-gcc} -std=gnu17" "$tool" >/dev/null
         fi
         if [ ! -x "$dbgen_dir/$tool" ]; then
             echo "ERROR: $tool not found or not executable at $dbgen_dir/$tool"
