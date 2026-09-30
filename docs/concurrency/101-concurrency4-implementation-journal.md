@@ -224,3 +224,20 @@ Implementation entries will be added here as each buildable change is validated 
   ASan/UBSan and TSan across 2,000 concurrent register/retire cycles. Device status classification
   and late-registration refusal are tested; actual destructive CUDA faults were not injected.
 - Previous commit: `152991276`.
+
+### 12. `test(concurrency): qualify overlapping SQL and memory pressure`
+
+- Watchdog children now exercise 20 concurrent SQL scenarios: N=2/N=4, queued and active
+  cancellation, simultaneous failures, maintenance/unpin, scan-pool oversubscription, mixed
+  join/aggregate/sort CPU comparisons, different MVCC snapshots, GPU/HOST/compressed pins,
+  shared parquet cache, prepared re-execution and 80-query prepared-statement reuse.
+- Pressure children reserve GPU capacity externally, observe both queries parked for memory,
+  then verify prompt cancellation or the 30-second terminal timeout. Peers and subsequent queries
+  complete after capacity returns, and all query registrations retire.
+- The existing concurrent logging scenario is now invoked. GPU prefetch forwards fatal context
+  failures to runtime health; recoverable speculative conversion failures still yield to demand.
+  Fatal status classification also covers illegal instructions, misalignment and invalid PCs.
+- Validation: clean full build; final concurrency/prefetch/downgrade/lifecycle/completion suite
+  passed 50 cases, 483 assertions. This includes HOST-full/no-DISK and spill-to-DISK component
+  regressions. These are one-GPU results, not a multi-GPU qualification claim.
+- Previous commit: `2b2f4de31`.

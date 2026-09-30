@@ -1716,8 +1716,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // pointers straight to a gather that runs on the consumer's current GPU, with no per-device
   // tag and no P2P check, clone, or host-staging fallback. On more than one GPU space a chunk's
   // owning device need not be the consumer's, which can dereference a remote pointer outright.
-  // Fail closed here — matching the memory prefetcher's single-GPU prototype gate
-  // (maybe_start_memory_prefetcher, above) — until materialization is device-aware.
+  // Keep late materialization single-GPU. Memory prefetch separately uses the admitted
+  // device set with conversion and residency fencing.
   bool const single_gpu_pin =
     _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1;
   for (auto& assignment : cached_assignments) {
@@ -1901,8 +1901,8 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     connectors.push_back(scan.op->get_shared_split_connector());
   }
 
-  state.prefetcher =
-    std::make_unique<memory_prefetcher>(cfg, std::move(connectors), std::move(gpu_spaces));
+  state.prefetcher = std::make_unique<memory_prefetcher>(
+    cfg, std::move(connectors), std::move(gpu_spaces), _query_lifecycle);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(

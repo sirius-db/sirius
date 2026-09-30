@@ -16,6 +16,7 @@
 
 #include "scan_manager/memory_prefetcher.hpp"
 
+#include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -37,18 +38,24 @@ namespace sirius::scan_manager {
 
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
-                                     cucascade::memory::memory_space* gpu_space)
+                                     cucascade::memory::memory_space* gpu_space,
+                                     exec::query_lifecycle_registry* lifecycle)
   : memory_prefetcher(
       cfg,
       std::move(connectors),
-      gpu_space ? std::vector{gpu_space} : std::vector<cucascade::memory::memory_space*>{})
+      gpu_space ? std::vector{gpu_space} : std::vector<cucascade::memory::memory_space*>{},
+      lifecycle)
 {
 }
 
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
-                                     std::vector<cucascade::memory::memory_space*> gpu_spaces)
-  : _config(cfg), _connectors(std::move(connectors)), _gpu_spaces(std::move(gpu_spaces))
+                                     std::vector<cucascade::memory::memory_space*> gpu_spaces,
+                                     exec::query_lifecycle_registry* lifecycle)
+  : _lifecycle(lifecycle),
+    _config(cfg),
+    _connectors(std::move(connectors)),
+    _gpu_spaces(std::move(gpu_spaces))
 {
   if (_gpu_spaces.empty() || _connectors.empty()) {
     _running.store(false);
@@ -97,6 +104,19 @@ void memory_prefetcher::stop()
   _workers.clear();
 }
 
+void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
+{
+  if (!fatal_device_exception(error)) return;
+  _running.store(false, std::memory_order_relaxed);
+  if (_lifecycle) {
+    _lifecycle->mark_runtime_failed();
+    try {
+      _lifecycle->quiesce_all();
+    } catch (...) {
+    }
+  }
+}
+
 void memory_prefetcher::worker_loop(std::size_t worker_index)
 {
   std::size_t round = worker_index;
@@ -108,6 +128,7 @@ void memory_prefetcher::worker_loop(std::size_t worker_index)
       auto lease = sirius::memory::runtime_stream_pool::acquire(*space);
       converted  = sweep(lease.get(), space);
     } catch (const std::exception& e) {
+      handle_error(std::current_exception());
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }
 
@@ -250,6 +271,7 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
                          mut->get_batch_id());
         return converted;
       } catch (const std::exception& e) {
+        handle_error(std::current_exception());
         // Conversion is more than data movement (compressed batches decode
         // here), so non-OOM failures are possible. Skip the batch: the scan
         // task converts it itself on the authoritative path and surfaces the

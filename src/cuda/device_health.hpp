@@ -28,6 +28,11 @@ namespace sirius {
 inline bool fatal_cuda_status(cudaError_t status) noexcept
 {
   switch (status) {
+    case cudaErrorIllegalInstruction:
+    case cudaErrorMisalignedAddress:
+    case cudaErrorInvalidAddressSpace:
+    case cudaErrorInvalidPc:
+    case cudaErrorHardwareStackError:
     case cudaErrorIllegalAddress:
     case cudaErrorAssert:
     case cudaErrorLaunchFailure:
@@ -60,7 +65,12 @@ inline bool fatal_device_exception(std::exception_ptr error) noexcept
     // cuDF/RMM wrap CUDA statuses in exceptions after consuming the sticky error.
     // Their error names preserve the fatal classification even after that reset.
     std::string_view message(e.what());
-    for (auto name : {"cudaErrorIllegalAddress",
+    for (auto name : {"cudaErrorIllegalInstruction",
+                      "cudaErrorMisalignedAddress",
+                      "cudaErrorInvalidAddressSpace",
+                      "cudaErrorInvalidPc",
+                      "cudaErrorHardwareStackError",
+                      "cudaErrorIllegalAddress",
                       "cudaErrorAssert",
                       "cudaErrorLaunchFailure",
                       "cudaErrorLaunchTimeout",

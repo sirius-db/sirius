@@ -967,6 +967,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
+  scan_manager_->set_query_lifecycle_registry(&query_lifecycle_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
