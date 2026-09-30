@@ -92,10 +92,7 @@ namespace codegen::decode::jit {
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank
-  /// An ascending survivor row-id list, compacted by slot. A chunk's list is short (tens of rows at
-  /// the selectivities this walk is chosen for), so one WARP serves a chunk and a block serves
-  /// chunks_per_block(shape) consecutive chunks.
-  index_list,
+  index_list, ///< an ascending survivor row-id list, compacted by slot
   /// A chunk-bucketed CSR row set (codegen/selection/chunk_row_set.hpp): the
   /// grid covers only TOUCHED chunks, and block b serves chunk_ids[b]. For a
   /// selection that arrives after the scan and touches few chunks, this is the
@@ -130,8 +127,7 @@ inline constexpr DecodeShape kShapeSparseStrSplitMeta{Enumerator::chunk_csr,
                                                       Consumer::offsets_meta};
 
 /// Chunks one block of the rendered kernel serves: kTBSize / 32 (one chunk per warp) for the index
-/// walk, 1 for every other enumerator. The launcher sizes a dense grid as the batch's chunk count
-/// divided by this, rounded up; a chunk_csr grid (one block per touched chunk) does not use it.
+/// walk, 1 for every other enumerator.
 [[nodiscard]] constexpr int chunks_per_block(DecodeShape shape) noexcept
 {
   return shape.enumerator == Enumerator::index_list ? ::codegen::kTBSize / 32 : 1;

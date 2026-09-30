@@ -173,9 +173,7 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
 }
 
 // Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Each byte's bits
-// are folded down into its bit 0 (the `>> 4` step leaks across byte boundaries, but only into
-// bits 4..7, which the final select ignores), then the four bit-0 positions of each 32-bit lane are
-// gathered.
+// are folded down into its bit 0, then the four bit-0 positions of each 32-bit lane are gathered.
 __device__ __forceinline__ uint32_t pack16_nonzero(uint4 v)
 {
   auto const nonzero_bit0 = [](uint32_t x) {
@@ -201,22 +199,10 @@ __device__ __forceinline__ uint32_t pack_bytes_nonzero(uint8_t const* p, int cou
 }
 
 // BOOL8 flags -> packed mask words.
-//
-// Inputs: `flags` (uint8, `num_rows` entries, any non-zero byte is true, no null mask -- the
-// callers enforce that), `num_rows > 0`, `words` with WordsFor(num_rows) entries; `flags` may have
-// any alignment.
-//
-// Output: every word of the strip is written; bit k of word w is `flags[32w + k] != 0` when that
-// row is below num_rows and 0 otherwise (the tail-zero invariant), and no byte at or past num_rows
-// is read.
-//
-// One THREAD per word: a full word's 32 flags arrive as two 16-byte loads and are packed in
-// registers, so a warp instruction moves 512 bytes rather than the 32 a byte-per-lane ballot moves.
-// The 16-byte path needs a 16-byte aligned base and a misaligned vector load is a sticky
-// cudaErrorMisalignedAddress that kills the context, so the base alignment is tested once
-// (block-uniform, hoisted out of the loop) and an unaligned base takes the byte-wise path instead.
-// The tail word -- the one holding num_rows -- packs its live bytes only; words wholly past it are
-// written 0. Grid-stride over the FULL padded strip.
+// One thread per word: a full word's 32 flags arrive as two 16-byte loads packed in registers. The
+// 16-byte path needs a 16-byte aligned base and a misaligned vector load is a sticky
+// cudaErrorMisalignedAddress that kills the context, so the base alignment is tested once and an
+// unaligned base takes the byte-wise path instead.
 __global__ void mask_from_bool8_kernel(uint8_t const* __restrict__ flags,
                                        int64_t num_rows,
                                        int64_t num_words,

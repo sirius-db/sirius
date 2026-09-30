@@ -740,10 +740,10 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
     return -1;
 
   // A dense grid follows the renderer's block-to-chunk mapping; a row set brings its own.
-  const auto cpb        = cdj::chunks_per_block(va.shape);
-  const auto dense_grid = (num_chunks + cpb - 1) / cpb;
-  CUstream stream       = reinterpret_cast<CUstream>(stream_ptr);
-  CUfunction fn_dec     = kernel.func_for_current_device();
+  auto const cpb        = cdj::chunks_per_block(va.shape);
+  auto const dense_grid = cuda::ceil_div(num_chunks, cpb);
+  auto stream           = reinterpret_cast<CUstream>(stream_ptr);
+  auto fn_dec           = kernel.func_for_current_device();
   SIMPATICO_CU_CHECK(
     cuLaunchKernel(fn_dec,
                    static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
@@ -966,7 +966,7 @@ void report_enumeration(char const* what,
   char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
   auto const cpb    = cdj::chunks_per_block(va.shape);
   auto const blocks =
-    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : (chunks + cpb - 1) / cpb);
+    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : cuda::ceil_div(chunks, cpb));
   if (survivors < 0) {
     // Before the CNT wave the count is not known yet; printing the -1 sentinel
     // as a survivor count (and dividing by it) is how a trace misleads.

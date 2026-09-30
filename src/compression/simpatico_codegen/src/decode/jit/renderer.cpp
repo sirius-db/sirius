@@ -273,9 +273,6 @@ class Walker {
         }
         break;
       case Consumer::ballot_range:
-        // The same tuned-vs-generic split as write_column: a Bitpack leaf has its own emitter
-        // because only it can compare in the packed domain; every staged root (Delta, FOR, ...)
-        // reconstructs the chunk through value_source and compares decoded values.
         if (tree.op == ::codegen::OpKind::Bitpack && tree.children.empty()) {
           emit_bitpack_mask_out(tree);
         } else {
@@ -297,10 +294,8 @@ class Walker {
   std::vector<DecodeBufferSpec> buffers_;
   SharedMemAllocator sm_;
   std::unordered_map<const ::codegen::jit::FusedTree*, std::int32_t> ids_;
-  // Set by an emitter that reads packed fields through the two-word helpers. kNarrowUnpackPrelude
-  // joins the rendered source only then, so the source (and with it the JIT cache key) of every
-  // kernel that does not use the helpers is untouched.
-  bool narrow_unpack_ = false;
+  bool narrow_unpack_ =
+    false;  ///< Whether to include the narrow unpack prelude in the source string
 
   // DFS-preorder, lex-sorted children (std::map iteration) — must match
   // jit::assign_ids and the decode binder (bind_fused_subtree) so
@@ -536,28 +531,33 @@ __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
 }  // namespace
 )src";
 
-  // Helpers for chunks whose packed width is at most 32 bits: such an element spans at most two
-  // consecutive words, so one funnel shift replaces the three-word 64-bit stitch of
-  // simpatico_bitunpack_one. `vmask` is the per-chunk (1 << bits) - 1 (all ones for bits == 32),
-  // hoisted by the emitter. Wider chunks (int64 lanes only) stay on simpatico_bp_at; the emitters
-  // branch on the chunk's width, which is uniform across the block.
+  // A chunk whose packed width is at most 32 bits spans at most 2 consecute words, so one funnel
+  // shift replaces the three-word 64-bit stitch of simpatico_bitunpack_one.
+  //  - `vmask` is the per-chunk (1 << bits) - 1 (all ones for bits == 32)
+  //  - Wider chunks (int64 lanes) stay on simpatico_bp_at; the emitters branch on the chunk's
+  //    width, which is uniform across the block.
   static constexpr const char* kNarrowUnpackPrelude = R"src(
 namespace {
 
 // Packed field of element `idx` for a chunk with 1 <= bits <= 32.
-__device__ __forceinline__ uint32_t simpatico_bp_field32(
-    const uint32_t* __restrict__ packed, int32_t bits, uint32_t vmask, int32_t idx) {
+__device__ __forceinline__ uint32_t simpatico_bp_field32(const uint32_t* __restrict__ packed, 
+                                                         int32_t bits, 
+                                                         uint32_t vmask, 
+                                                         int32_t idx) {
     const uint32_t bp = static_cast<uint32_t>(idx) * static_cast<uint32_t>(bits);
     const uint32_t w0 = packed[bp >> 5];
     const uint32_t w1 = packed[(bp >> 5) + 1];
     return __funnelshift_r(w0, w1, bp & 31) & vmask;
 }
 
-// simpatico_bp_at for a chunk with bits <= 32, including the constant-chunk
-// (bits == 0) short-circuit returning the chunk minimum.
+// simpatico_bp_at for a chunk with bits <= 32, including the constant-chunk (bits == 0) 
+// short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at32(const uint32_t* __restrict__ packed_base,
-                                            int32_t bits, uint32_t vmask, T minv, int32_t idx) {
+                                               int32_t bits, 
+                                               uint32_t vmask, 
+                                               T minv, 
+                                               int32_t idx) {
     using U = typename ::cuda::std::make_unsigned<T>::type;
     if (bits == 0) return minv;
     return static_cast<T>(static_cast<U>(minv) +
@@ -842,26 +842,19 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
 // =====================================================================
 // Index-list-consuming decode -- the low-selectivity sibling of the mask walk.
 //
-// Inputs: the Bitpack channels, `out` (survivor-sized), `n`, `row_indices` (ascending global int32
-// row ids, chunk-partitioned) and `chunk_offsets` (C + 1 exclusive survivor bases).
+// For each chunk c and slot in [0, cnt), out[chunk_offsets[c] + slot] is the value of row
+// row_indices[chunk_offsets[c] + slot] (ascending global int32 row ids, chunk-partitioned;
+// chunk_offsets has C + 1 exclusive survivor bases). Above the ~15% crossover the mask walk wins
+// and the caller picks from the survivor count.
 //
-// Mapping: one warp per chunk, chunks_per_block(shape) chunks per block: block b, warp w serves
-// chunk_id = b * chunks_per_block + w, and the launcher's grid is the chunk count divided by
-// chunks_per_block, rounded up. A warp whose chunk lies past the batch returns at `len <= 0` before
-// any per-chunk load; a chunk with no survivors returns per warp at `cnt == 0`. For slot in [0,
-// cnt), lane-strided, out[chunk_offsets[c] + slot] = value(row_indices[chunk_offsets[c] + slot] -
-// chunk_start). No mask staging, no ballot: the loop runs `cnt` iterations instead of 8 full
-// 128-wide strips, so runtime scales with survivors; the mask walk wins again above the ~15%
-// crossover, and the caller picks from the survivor count. A chunk holds tens of survivors at those
-// selectivities, so packing several chunks into a block keeps every warp slot busy through the
-// per-chunk dependent round trips instead of leaving all but one warp idle.
+// Mapping: one warp per chunk, chunks_per_block(shape) chunks per block (chunk_id = blockIdx.x *
+// chunks_per_block + warp). A chunk holds only tens of survivors here, so one warp is enough and
+// the other warps of the block serve other chunks. A warp past the batch returns at `len <= 0`;
+// a chunk with no survivors returns at `cnt == 0`. The loop over slots is lane-strided.
 //
-// Unpack: bits <= 32 through simpatico_bp_at32 (bits == 0 yields the chunk minimum); bits > 32
-// (int64 lanes only) through simpatico_bp_at, selected by a warp-uniform branch. Values are
-// bit-identical to the plain decode.
-//
-// This shape has no shared memory and no __syncthreads(), ever: the per-warp early returns depend
-// on it. Delta roots cannot row-skip and are rejected.
+// Unpack: bits <= 32 via simpatico_bp_at32 (bits == 0 yields the chunk minimum); bits > 32 (int64
+// lanes only) via simpatico_bp_at, chosen by a warp-uniform branch. Output is bit-identical to
+// the plain decode.
 // =====================================================================
 void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 {
@@ -1011,42 +1004,15 @@ std::string decoded_range_pass(const std::string& value_expr)
 }
 
 // =====================================================================
-// Bitpack mask_out -- the range ballot for a Bitpack leaf, evaluated in the
-// packed domain.
+// Bitpack mask_out -- range ballot for a Bitpack leaf, compared in the packed domain.
 //
-// Inputs: chunk_min[c] (lane type T), chunk_bits[c] (uint8, 0..8*sizeof(T)), packed (dense Compact
-// words plus 3 guard words), bp_offsets[c] (int32), n, sel_mask (WordsFor(n) words) and the
-// inclusive decoded-domain bounds pred_lo/pred_hi (int64). Grid = C blocks x 128 threads, no
-// dynamic shared memory, no barriers.
+// Sets bit r % 32 of mask word r / 32 when pred_lo <= x_r <= pred_hi (inclusive, int64). All 32
+// words of the chunk are written; bits for rows >= n are zero (the CNT and combine waves rely on
+// that). Grid = C blocks x 128 threads, no dynamic shared memory, no barriers.
 //
-// Output: every one of the chunk's 32 mask words is written; bit r % 32 of word r / 32 is pass(r),
-// and bits and words for rows >= n are zero (the CNT and combine waves rely on that).
-//
-// Semantics: pass(r) <=> pred_lo <= int64(x_r) <= pred_hi with x_r = T(min + u_r), identical to the
-// decoded-domain compare for every encoder-valid chunk (min + u is representable in T for every
-// stored u). On malformed data the decoded compare wraps in T and the packed compare does not;
-// irrelevant for valid inputs.
-//
-// Mechanism: the predicate is translated once per chunk into bounds on the stored residual (the
-// value minus the chunk minimum), so a row costs one two-word funnel-shift extraction and one
-// unsigned compare instead of the three-word stitch, the 64-bit add of the minimum and two 64-bit
-// compares. A chunk the predicate wholly accepts or rejects writes its 32 words directly.
-//
-// Saturation: the engine emits INT64_MIN / INT64_MAX for one-sided conjuncts
-// (clamp_to_decode_range) and {0, -1} for an empty range, and pred_lo - min on those overflows
-// int64. Clamping both bounds into the chunk's domain [min, min + maxu] first (with the upper end
-// of the domain itself saturated) keeps both differences in [0, maxu] for any int64 bound, where
-// uint32 arithmetic is exact; a bound outside the domain becomes the domain edge, so a predicate
-// that misses or covers the whole domain takes the direct paths and every other one takes the loop.
-//
-// Widths: bits == 0 (constant chunk) gives maxu = 0, so the chunk is accept-all iff min is in range
-// and reject-all otherwise. bits == 32 (full int32 lane, or int64) gives an all-ones vmask, and the
-// two-word funnel shift still yields the exact field. bits > 32 (int64 lanes only) takes the
-// decoded-domain loop through simpatico_bp_at, chosen by a block-uniform branch on the chunk's
-// width.
-//
-// Reads packed[bp >> 5] and packed[(bp >> 5) + 1]: one word less past the chunk than the three-word
-// gather, so the persisted guard words stay sufficient.
+// The predicate is translated once per chunk into bounds [lo_u, hi_u] on the stored residual u, so
+// a row costs one two-word funnel-shift extraction and one unsigned compare: pass = (u - lo_u) <=
+// hi_u - lo_u.
 // =====================================================================
 void Walker::emit_bitpack_mask_out(const ::codegen::jit::FusedTree& node)
 {
