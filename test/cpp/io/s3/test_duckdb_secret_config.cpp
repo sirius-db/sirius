@@ -70,7 +70,6 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
 {
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
-  sirius::io::s3::register_sirius_s3_secret(duckdb::SecretManager::Get(*db.instance));
 
   require_sql_ok(con,
                  "CREATE OR REPLACE SECRET unrelated (TYPE SIRIUS_S3, PROVIDER CONFIG, "
@@ -150,7 +149,6 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
   auto& manager = duckdb::SecretManager::Get(*db.instance);
-  sirius::io::s3::register_sirius_s3_secret(manager);
   register_test_httpfs_s3_secret(manager);
 
   require_sql_ok(con,
