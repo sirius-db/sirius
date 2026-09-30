@@ -39,6 +39,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
@@ -216,6 +217,12 @@ std::optional<std::string> find_legacy_config_file()
   }
 
   return std::nullopt;
+}
+
+bool sirius_disabled_by_env()
+{
+  auto const* value = std::getenv("SIRIUS_DISABLE");
+  return value != nullptr && std::string_view{value} != "0";
 }
 
 }  // namespace
@@ -1685,11 +1692,21 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
+void publish_nvtx_injection(const std::filesystem::path& config_path)
+{
+  auto const telemetry = sirius::sirius_config::read_telemetry_config(config_path);
+  sirius::telemetry::detail::configure_nvtx_injection(
+    telemetry.enable_quent && telemetry.enable_nvtx, telemetry.nvtx_injection_lib);
+}
+
+void SiriusContextExtensionCallback::publish_configured_nvtx_injection()
+{
+  if (sirius_disabled_by_env()) { return; }
+  if (auto const config_path = get_config_file_path()) { publish_nvtx_injection(*config_path); }
+}
+
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
-  : disabled_([] {
-      auto const* value = std::getenv("SIRIUS_DISABLE");
-      return value != nullptr && std::string_view{value} != "0";
-    }())
+  : disabled_(sirius_disabled_by_env())
 {
   auto const previous_log_backend = Config::LOG_BACKEND;
   auto const previous_log_dir     = Config::LOG_DIR;
