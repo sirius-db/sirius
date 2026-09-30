@@ -1233,7 +1233,7 @@ def _build_precmd_temp_sql(
     return sql_path
 
 
-def _run_nsys_s3_child(source, qnum, iterations, pin, qdir):
+def _run_nsys_s3_child(source, qnum, iterations, pin, qdir, query_sql):
     """Profile S3 in Python so credentials can be bound, never written to SQL files."""
     s3_input = S3Input(source)
     con = open_connection(source, gpu_execution=True, s3_input=s3_input)
@@ -1247,7 +1247,7 @@ def _run_nsys_s3_child(source, qnum, iterations, pin, qdir):
         try:
             for _ in range(iterations):
                 start = time.perf_counter()
-                con.execute(QUERIES[f"q{qnum}"]).fetchall()
+                con.execute(query_sql).fetchall()
                 runtimes.append(time.perf_counter() - start)
         finally:
             con.execute("CALL profiler_stop();")
@@ -1349,6 +1349,7 @@ def run_nsys_profile(
                 pin,
                 qdir,
                 PIN_COMPRESSION_PLAN_DIR or "",
+                query_texts[f"q{qnum}"],
             ]
         else:
             duckdb_invocation = [DUCKDB_BIN]
@@ -2034,12 +2035,14 @@ def _resolve_duckdb_results_dir(path):
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--_nsys-s3-child":
-        if len(sys.argv) != 8:
+        if len(sys.argv) != 9:
             raise SystemExit("Invalid internal nsys S3 invocation")
-        _, _, source, qnum, iterations, pin, qdir, compression_plan_dir = sys.argv
+        _, _, source, qnum, iterations, pin, qdir, compression_plan_dir, query_sql = (
+            sys.argv
+        )
         global PIN_COMPRESSION_PLAN_DIR
         PIN_COMPRESSION_PLAN_DIR = compression_plan_dir or None
-        _run_nsys_s3_child(source, int(qnum), int(iterations), pin, qdir)
+        _run_nsys_s3_child(source, int(qnum), int(iterations), pin, qdir, query_sql)
         return
 
     args = parse_args()
