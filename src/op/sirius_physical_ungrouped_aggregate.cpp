@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/aggregate.hpp"
 #include "expression/ast/node.hpp"
@@ -199,13 +200,17 @@ aggregate_layout build_aggregate_layout(
         spec.input_idx     = child_ref_index();
         spec.local_sum_idx = local_idx++;
         // AVG's local carrier is the input type, not AVG's final return type. Execution widens
-        // signed 8/16/32-bit inputs to INT64 before reducing so partial sums merge without a
-        // cross-type reduction; keep the declared local schema on the same rule.
+        // signed 8/16/32-bit inputs to INT64 and DECIMAL inputs to DECIMAL(38, scale) before
+        // reducing, so partial sums cannot overflow and merge without a cross-type reduction;
+        // keep the declared local schema on the same rule.
         auto local_sum_type = sirius::to_duckdb(children[0]->return_type());
         if (local_sum_type.id() == duckdb::LogicalTypeId::TINYINT ||
             local_sum_type.id() == duckdb::LogicalTypeId::SMALLINT ||
             local_sum_type.id() == duckdb::LogicalTypeId::INTEGER) {
           local_sum_type = duckdb::LogicalType::BIGINT;
+        } else if (local_sum_type.id() == duckdb::LogicalTypeId::DECIMAL) {
+          local_sum_type = duckdb::LogicalType::DECIMAL(
+            duckdb::Decimal::MAX_WIDTH_DECIMAL, duckdb::DecimalType::GetScale(local_sum_type));
         }
         layout.local_types.push_back(std::move(local_sum_type));
         layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
@@ -365,12 +370,12 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
             agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
-          // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
-          // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
+          // For AVG we apply the return type in the merge step (SUM/COUNT).
+          // For SUM and AVG we widen decimals before the aggregation to avoid overflow.
           bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
-          if (spec.kind == aggregate_kind::SUM) {
+          if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
             if (col.type().id() == cudf::type_id::DECIMAL32) {
               casted_col = cudf::cast(
                 col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);

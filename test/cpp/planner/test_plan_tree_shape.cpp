@@ -1011,7 +1011,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types() == expected_local_types);
   }
 
-  SECTION("AVG preserves its DECIMAL local sum carrier below MERGE_AGGREGATE")
+  SECTION("AVG widens its DECIMAL local sum carrier to DECIMAL(38, scale) below MERGE_AGGREGATE")
   {
     auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
     INFO(tree_to_string(plan.get()));
@@ -1024,7 +1024,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     REQUIRE(local->get_types().size() == 2);
-    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
+    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(38, 2));
     CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
   }
 }
