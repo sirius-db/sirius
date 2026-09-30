@@ -35,43 +35,15 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace {
-
-/// Sets a session/global setting for the enclosing scope and resets it on the way out, including
-/// when a REQUIRE fails and unwinds. Every `[integration]` fixture borrows its connection from the
-/// shared `g_integration_env`, which outlives the case, and `default_collation` is
-/// GLOBAL_DEFAULT-scoped -- so a setting left behind by a failed assertion would reach every later
-/// integration case in the binary.
-class scoped_setting {
- public:
-  /// @p literal is spliced into the SET statement verbatim, so string values carry their quotes.
-  scoped_setting(sirius::test::GpuExecutionFixture& fixture,
-                 std::string name,
-                 std::string const& literal)
-    : fixture_(fixture), name_(std::move(name))
-  {
-    fixture_.run_ok("SET " + name_ + " = " + literal + ";");
-  }
-
-  /// Resets through the raw connection rather than run_ok(): a Catch2 assertion during unwinding
-  /// terminates, and a poisoned connection here is already being reported by the failure above.
-  ~scoped_setting() { fixture_.con->Query("RESET " + name_ + ";"); }
-
-  scoped_setting(scoped_setting const&)            = delete;
-  scoped_setting& operator=(scoped_setting const&) = delete;
-  scoped_setting(scoped_setting&&)                 = delete;
-  scoped_setting& operator=(scoped_setting&&)      = delete;
-
- private:
-  sirius::test::GpuExecutionFixture& fixture_;
-  std::string name_;
-};
 
 /// NaN and -NaN, and 0.0 and -0.0, are one group to both engines and print differently, so either
 /// engine may report either member. Maps each pair to one spelling.
@@ -396,7 +368,8 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // The default batch size scans dist_dup in one batch, leaving the merge nothing to combine.
   SECTION("many scan batches")
   {
-    scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+    sirius::test::scoped_sirius_setting batch_size{
+      *con, "scan_task_batch_size", std::uint64_t{1048576}};
     compare_gpu_vs_cpu("SELECT DISTINCT k FROM dist_dup");
   }
 }
@@ -440,8 +413,16 @@ TEST_CASE_METHOD(DistinctFixture,
   // default_collation the key arrives as a call rather than as a bare reference and the builder's
   // uncovered-output guard refuses it. Every `s_short` value is already lower case, so each nocase
   // group holds one original value and the two CPU runs cannot disagree about which row it is.
-  scoped_setting collation(*this, "default_collation", "'nocase'");
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
+  auto const prior_result = con->Query("SELECT current_setting('default_collation');");
+  REQUIRE(prior_result);
+  REQUIRE_FALSE(prior_result->HasError());
+  auto const prior = prior_result->GetValue(0, 0);
+  {
+    sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
+    expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
+  }
+  // A failed restore would leak nocase into every later integration case.
+  REQUIRE(con->Query("SELECT current_setting('default_collation');")->GetValue(0, 0) == prior);
 }
 
 TEST_CASE_METHOD(DistinctFixture,
