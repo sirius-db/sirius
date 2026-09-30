@@ -24,7 +24,9 @@ Scan contracts validate GPU scan inputs, split ownership, checkpoint protection,
 
 Sirius verifies supported scan functions against trusted definitions and the current catalog. A matching function name is insufficient.
 
-Loadable builds require compatible DuckDB native and Parquet factory exports. Without them, affected GPU scans are declined; CPU fallback remains subject to source policy. Iceberg definitions are established when its extension loads.
+Loadable builds require ABI-compatible exports of `duckdb::TableScanFunction::GetFunction()` and `duckdb::ParquetScanFunction::GetFunctionSet()` from the host DuckDB module. Sirius checks that each resolved factory belongs to that module. Both `RTLD_LOCAL` and `RTLD_GLOBAL` loading are supported.
+
+If a trusted definition is unavailable, Sirius warns once per source and declines its GPU scans. CPU fallback still depends on fallback settings and source policy. Iceberg definitions are established when its extension loads and also require the host Parquet factory.
 
 ## Matching the bound input
 
@@ -56,7 +58,9 @@ Cached batches use pin identity and visibility checks. Streaming inputs do not p
 
 Native scans and pinning acquire a shared checkpoint lease before inspecting storage layouts. Stored ranges are revalidated before decoding. The lease lasts through cleanup; idle prepared statements hold none.
 
-An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint can also delay new writes. Failed cleanup may retain the lease and prevents CPU fallback.
+An active lease makes `CHECKPOINT` fail and `FORCE CHECKPOINT` wait. A waiting forced checkpoint blocks new transactions except read-only ones until it is interrupted or the checkpoint keys are released.
+
+Failed cleanup retains checkpoint keys until the Sirius runtime is destroyed and prevents CPU fallback. Interrupting `FORCE CHECKPOINT` ends its wait but does not release Sirius's keys.
 
 ## CPU replay policy
 
