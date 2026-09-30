@@ -122,6 +122,10 @@ inline void observe_host_callback_handoff([[maybe_unused]] void* handoff) noexce
 /**
  * @brief Holds a stream at a host callback until `open()` runs, so tests can observe whether later
  * work waited on the host.
+ *
+ * The gate also opens by itself after `timeout`, so a caller that waits on the gated stream before
+ * opening it (for example `cudaStreamDestroy` under compute-sanitizer) fails the test through
+ * `timed_out()` instead of hanging.
  */
 class stream_gate {
  public:
@@ -132,6 +136,8 @@ class stream_gate {
    *
    * @throw std::runtime_error if the host callback cannot be enqueued
    */
+  static constexpr std::chrono::seconds timeout{10};
+
   explicit stream_gate(::cuda::stream_ref stream) : _state{std::make_shared<state>()}
   {
     auto retained = std::make_unique<std::shared_ptr<state>>(_state);
@@ -153,11 +159,19 @@ class stream_gate {
     _state->changed.notify_all();
   }
 
+  /// Whether the gate had to open itself because `open()` did not run within `timeout`.
+  [[nodiscard]] bool timed_out() const
+  {
+    std::scoped_lock lock(_state->mutex);
+    return _state->timed_out;
+  }
+
  private:
   struct state {
     std::mutex mutex;
     std::condition_variable changed;
-    bool opened = false;
+    bool opened    = false;
+    bool timed_out = false;
   };
 
   static void CUDART_CB hold(void* argument)
@@ -167,7 +181,9 @@ class stream_gate {
       static_cast<std::shared_ptr<state>*>(argument)};
     auto& gate = **retained;
     std::unique_lock lock(gate.mutex);
-    gate.changed.wait(lock, [&] { return gate.opened; });
+    if (!gate.changed.wait_for(lock, timeout, [&] { return gate.opened; })) {
+      gate.timed_out = true;
+    }
   }
 
   std::shared_ptr<state> _state;

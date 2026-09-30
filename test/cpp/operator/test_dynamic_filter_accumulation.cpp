@@ -566,6 +566,9 @@ TEST_CASE("cancel while collecting never waits for queued inserts",
   REQUIRE(cudaEventRecord(after, stream.get()) == cudaSuccess);
   fixture.session->cancel();
   // cancel() retired the partials (stream-ordered after the queued inserts) without a host wait.
+  // Under compute-sanitizer cudaStreamDestroy waits for queued work, so cancel() returns only after
+  // the gate times out; report that instead of hanging.
+  REQUIRE_FALSE(gate.timed_out());
   REQUIRE(cudaEventQuery(after) == cudaErrorNotReady);
   REQUIRE(fixture.allocated_bytes() == baseline);
   gate.open();
