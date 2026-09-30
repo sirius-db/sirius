@@ -45,6 +45,7 @@
 // — but it is the one worth revisiting if cudf promotes it.
 
 #include "codegen/selection/selection.hpp"
+#include "util/host_observation.hpp"
 
 #include <rmm/device_buffer.hpp>
 
@@ -259,14 +260,11 @@ int64_t run_selection_cnt(selection_mask& mask,
   chunk_offsets_tail_kernel<<<1, 1, 0, stream.get()>>>(counts, nc, mask.chunk_offsets);
   throw_on_cuda(cudaPeekAtLastError(), "chunk_offsets tail launch");
 
-  // The one host sync of the selection wave: survivor_count gates wave-2
-  // allocations (compacted TierA columns, the TierB gather map).
-  uint32_t total = 0;
-  throw_on_cuda(
-    cudaMemcpyAsync(
-      &total, mask.chunk_offsets + nc, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream.get()),
-    "survivor_count D2H");
-  throw_on_cuda(cudaStreamSynchronize(stream.get()), "survivor_count sync");
+  // The one host sync of the selection wave: survivor_count gates wave-2 allocations (compacted
+  // TierA columns, the TierB gather map). Staged through the thread's pinned slab, see
+  // read_device_bytes_completed.
+  std::uint32_t total = 0;
+  simpatico::read_device_bytes_completed(&total, mask.chunk_offsets + nc, sizeof total, stream);
 
   mask.survivor_count = static_cast<int64_t>(total);
   return mask.survivor_count;

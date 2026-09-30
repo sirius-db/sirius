@@ -31,7 +31,6 @@
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
-#include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -52,11 +51,10 @@ namespace sirius {
 
 namespace {
 
-// Rebind a column's buffers (recursively) to `s` for ordered teardown.
-// The decode's stream pool is long-lived (thread-local), but the caller's
-// pipeline stream `s` is what orders the rest of the work downstream —
-// re-pointing frees here ensures deallocation is not racing concurrent pipeline
-// operations on `s`.
+// Rebind a column's buffers (recursively) to `s` for ordered teardown. The decode runs on streams
+// of the target memory space's shared pool, which other engine work also uses, while the caller's
+// pipeline stream `s` orders the rest of the work downstream; re-pointing frees here keeps them
+// ordered with that work instead of with whatever runs next on a shared stream.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
                                                    ::cuda::stream_ref s)
 {
@@ -78,6 +76,18 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
+// The GPU memory space a decode lands in. Decode takes its streams from this space's pool, so a
+// missing or non-GPU space is rejected before any device work.
+const cucascade::memory::memory_space& gpu_decode_space(
+  const cucascade::memory::memory_space* space, char const* conversion)
+{
+  if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+    throw std::invalid_argument(std::string{"[compression_converters] "} + conversion +
+                                " needs a GPU target memory space");
+  }
+  return *space;
+}
+
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
 // the byte transport (how `fetch` pulls the payload) differs between them.
@@ -87,8 +97,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   const std::optional<std::vector<std::size_t>>& selected_indices,
   decompression_pushdown_scan const* scan,
   decode_visibility_mask const& keep_mask,
-  cucascade::idata_representation& source,
-  const cucascade::memory::memory_space* target_memory_space,
+  const cucascade::memory::memory_space& space,
   ::cuda::stream_ref stream)
 {
   // Reconstruct only the requested columns. read_compressed_table_subset_from_memory
@@ -112,7 +121,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     throw std::runtime_error("[compression_converters] reconstruct failed: " + read_error);
   }
 
-  // Decode across 4 pool streams, submitted from the calling thread — no worker
+  // Decode across up to 4 memory-space streams, submitted from the calling thread — no worker
   // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
   // pool-stream reads are ordered after all fetched bytes are resident.
   stream.sync();
@@ -121,7 +130,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // which is indexed by projected position — lines up with 0..num_columns.
   std::vector<std::size_t> selection(subset.num_columns());
   std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto decoded      = decompress_chunk(subset, selection, scan, keep_mask, stream, mr);
+  auto decoded      = decompress_chunk(subset, selection, scan, keep_mask, space, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
@@ -130,13 +139,10 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
     c = rebind_column_stream(std::move(c), stream);
   decompressed = std::make_unique<cudf::table>(std::move(cols));
 
-  const cucascade::memory::memory_space* space =
-    (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
-
   SIRIUS_LOG_DEBUG("[compression_converters] decompressed cols={} rows={} → GPU device={}",
                    decompressed->num_columns(),
                    decompressed->num_rows(),
-                   space->get_device_id());
+                   space.get_device_id());
 
   // What the decode did is a value on the representation when there is
   // anything to report; the plain type is used otherwise, so an unfiltered
@@ -145,12 +151,12 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   if (outcome.any()) {
     return std::make_unique<decompression_pushdown_batch_representation>(
       std::move(decompressed),
-      *const_cast<cucascade::memory::memory_space*>(space),
+      const_cast<cucascade::memory::memory_space&>(space),
       stream,
       outcome);
   }
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    std::move(decompressed), const_cast<cucascade::memory::memory_space&>(space), stream);
 }
 
 // compressed_host_representation (pinned host) → GPU.
@@ -161,7 +167,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
-  auto& rep = source.cast<compressed_host_representation>();
+  auto& rep         = source.cast<compressed_host_representation>();
+  auto const& space = gpu_decode_space(target_memory_space, "host-to-GPU decompression");
 
   // Pull each compressed leaf buffer straight from the pinned host payload into
   // device memory (block-aware, since the payload is a multi-block allocation).
@@ -176,8 +183,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            rep.selected_indices(),
                                            rep.pushdown_scan().get(),
                                            rep.visibility_mask(),
-                                           source,
-                                           target_memory_space,
+                                           space,
                                            stream);
 }
 
@@ -191,7 +197,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
   nvtx_scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
-  auto& rep           = source.cast<compressed_device_representation>();
+  auto& rep         = source.cast<compressed_device_representation>();
+  auto const& space = gpu_decode_space(
+    target_memory_space != nullptr ? target_memory_space : &source.get_memory_space(),
+    "device-to-GPU decompression");
   auto const& indices = rep.selected_indices();
   auto const& ct      = rep.table();
   auto const mr       = rmm::mr::get_current_device_resource_ref();
@@ -209,8 +218,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     selected = identity_selection;
   }
 
-  auto decoded =
-    decompress_chunk(ct, selected, rep.pushdown_scan().get(), rep.visibility_mask(), stream, mr);
+  auto decoded = decompress_chunk(
+    ct, selected, rep.pushdown_scan().get(), rep.visibility_mask(), space, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   auto cols = decompressed->release();
@@ -218,13 +227,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     c = rebind_column_stream(std::move(c), stream);
   decompressed = std::make_unique<cudf::table>(std::move(cols));
 
-  const cucascade::memory::memory_space* space =
-    (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
-
   SIRIUS_LOG_DEBUG("[compression_converters] decompressed cols={} rows={} → GPU device={}",
                    decompressed->num_columns(),
                    decompressed->num_rows(),
-                   space->get_device_id());
+                   space.get_device_id());
 
   // What the decode did is a value on the representation when there is
   // anything to report; the plain type is used otherwise.
@@ -232,12 +238,12 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   if (outcome.any()) {
     return std::make_unique<decompression_pushdown_batch_representation>(
       std::move(decompressed),
-      *const_cast<cucascade::memory::memory_space*>(space),
+      const_cast<cucascade::memory::memory_space&>(space),
       stream,
       outcome);
   }
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    std::move(decompressed), const_cast<cucascade::memory::memory_space&>(space), stream);
 }
 
 }  // namespace

@@ -5,13 +5,16 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/cuda_check.hpp"
 #include "codegen/util/nvtx.hpp"
 #include "codegen/util/stream_pool.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -27,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -185,8 +189,8 @@ struct leased_pool {
 
   ~leased_pool()
   {
-    // Destructors cannot throw; run_column_workers' own sync_all already
-    // surfaced any async error before this cleanup sync runs.
+    // Completed compression/decode scopes already surfaced asynchronous errors.
+    // A lease destructor cannot throw.
     (void)pool.sync_all();
     global_stream_cache().check_in(
       device, pool.streams);  // leaves pool.streams empty; ~stream_pool is a no-op
@@ -248,74 +252,35 @@ compressed_table compress_columns_parallel(cudf::table_view table,
   return out;
 }
 
-// Restore a decoded column's logical type when it differs from the stored column
-// dtype only in interpretation of identical bits (same physical width) — e.g. the
-// INT64 storage a codec produced for a DECIMAL64 column back to DECIMAL64 with its
-// scale. The codecs run on the underlying integer storage of fixed-point columns,
-// so the bytes are already correct; this only re-tags the column. A no-op when the
-// types already match.
-std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> col,
-                                                 cudf::data_type stored)
+// Every table facade submits the same typed requests to one session. Streams and the explicit
+// allocator are borrowed by the session.
+std::unique_ptr<cudf::table> decode_table_columns(compressed_table const& table,
+                                                  std::span<std::size_t const> selected,
+                                                  std::span<decode_predicate const> predicates,
+                                                  std::span<const ::cuda::stream_ref> streams,
+                                                  rmm::device_async_resource_ref mr)
 {
-  if (!col || col->type() == stored) return col;
-  if (!cudf::is_fixed_width(col->type()) || !cudf::is_fixed_width(stored) ||
-      cudf::size_of(col->type()) != cudf::size_of(stored)) {
-    return col;
+  for (auto index : selected) {
+    if (index >= table.columns.size()) throw plan_error("selected column index out of range");
+    if (!table.columns[index].plan_tree) throw plan_error("decompress: column missing plan tree");
   }
-  auto const n  = col->size();
-  auto const nc = col->null_count();
-  auto contents = col->release();
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
-  return std::make_unique<cudf::column>(
-    stored, n, std::move(*contents.data), std::move(null_mask), nc, std::move(contents.children));
+  decode_session session{streams, mr};
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    auto const& column = table.columns[selected[i]];
+    column_decode_request request{std::cref(*column.plan_tree), value_result{column.dtype}, {}};
+    if (!predicates.empty() && predicates[i].active()) {
+      request.result = predicate_result{predicates[i], {}};
+    }
+    session.append(std::move(request));
+  }
+  return std::make_unique<cudf::table>(session.finish());
 }
 
-std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
-                                                         stream_pool& pool,
-                                                         rmm::device_async_resource_ref mr)
+std::vector<std::size_t> all_columns(compressed_table const& table)
 {
-  std::vector<std::unique_ptr<cudf::column>> cols(table.num_columns());
-  run_column_workers(
-    static_cast<size_t>(table.num_columns()), pool, [&](size_t i, ::cuda::stream_ref stream) {
-      std::string err;
-      auto col = decompress_column(*table.columns[i].plan_tree, stream, mr, &err);
-      if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-      cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
-    });
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
-std::unique_ptr<cudf::table> decompress_columns_parallel(
-  compressed_table const& table,
-  std::span<const std::size_t> selected,
-  std::span<const decode_predicate> predicates,
-  stream_pool& pool,
-  rmm::device_async_resource_ref mr)
-{
-  std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
-  run_column_workers(selected.size(), pool, [&](size_t i, ::cuda::stream_ref stream) {
-    auto const idx = selected[i];
-    if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
-    decode_predicate const* pred =
-      (i < predicates.size() && predicates[i].active()) ? &predicates[i] : nullptr;
-    std::string err;
-    auto col = decompress_column(*table.columns[idx].plan_tree, stream, mr, &err, pred);
-    if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
-    // A predicate result is BOOL8 by contract; re-tagging it with the column's
-    // stored dtype would be a lie (and, for a same-width stored type, a silent
-    // one), so the type restore only applies to a reconstructed column.
-    cols[i] = pred ? std::move(col) : apply_stored_dtype(std::move(col), table.columns[idx].dtype);
-  });
-  return std::make_unique<cudf::table>(std::move(cols));
-}
-
-std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
-                                                         std::span<const std::size_t> selected,
-                                                         stream_pool& pool,
-                                                         rmm::device_async_resource_ref mr)
-{
-  return decompress_columns_parallel(table, selected, {}, pool, mr);
+  std::vector<std::size_t> selected(table.num_columns());
+  std::iota(selected.begin(), selected.end(), std::size_t{0});
+  return selected;
 }
 
 // ── Filtering while decoding (env gate SIRIUS_EXP_FUSED_SCAN_FILTER) ────────
@@ -325,12 +290,17 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 //           streams; stream 0 waits on the others (events, no host sync),
 //           AND-combines, counts (per-chunk popcount + CUB scan -> chunk_offsets)
 //           and D2H's the survivor count — the one added host sync, and it
-//           gates wave-2 allocations.
-//   wave 2: compactable columns decode straight to survivor width, the rest
-//           decode plainly, in parallel; the full-width columns' gather map
-//           (mask -> int32 row indices) is built on stream 0 concurrently.
-// Any missing precondition => std::nullopt and the caller runs the unfiltered
-// path byte-identically.
+//           gates wave-2 allocations. Membership probes are wave-1 sources
+//           only when there is no range, BOOL8, or keep-mask source;
+//           otherwise they run after the combine and before the count, one
+//           at a time on stream 0, each given the running combined mask as
+//           its prior.
+//   wave 2: compactable columns decode straight to survivor width; the rest
+//           decode full width and gather to survivor rows on their own
+//           streams, in parallel, each waiting first for the gather map
+//           (mask -> int32 row indices) built once on stream 0.
+// Semantic preconditions and selectivity policy may decline to ordinary decode.
+// Execution failures propagate after checked cleanup, preserving engine OOM recovery.
 //
 // Enable policy, in two stages:
 //   Statically, before any device work: a column asking for a compacted route
@@ -351,43 +321,18 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
 // switch: set SIRIUS_EXP_FUSED_SCAN_K4_MAX_SEL to a tiny value (the parse
 // requires > 0).
 
-// Wave 1 and the compact-capability probe come from the entry points published
-// in plan/decompress.cpp: probe_column + decompress_column_selection_mask. Wave 2 calls
-// decompress_column(..., decode_selection const* sel) — compact_capable decodes to survivor width,
-// and everything else decodes full width and is gathered inside the call.
+// Both waves submit typed session requests through the same plan interpreter.
+// probe_column describes row-route semantics, never asynchronous eligibility.
 
-// RAII CUDA events for the wave-1 -> combine cross-stream join.
-struct event_set {
-  std::vector<cudaEvent_t> events;
-
-  cudaEvent_t make()
-  {
-    cudaEvent_t ev{};
-    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess)
-      throw plan_error("filtered decode: cudaEventCreate failed");
-    events.push_back(ev);
-    return ev;
-  }
-
-  ~event_set()
-  {
-    for (auto ev : events)
-      cudaEventDestroy(ev);
-  }
-};
-
-// The two-wave filtered decode. Returns std::nullopt in two cases:
-//   (a) a precondition fails BEFORE any device work — nothing was issued;
-//   (b) anything fails mid-flight — the pool is synchronized, `result` is
-//       reset, and the WHOLE batch is retried unfiltered by the caller (the
-//       required fallback semantics; per-column errors from decompress_column
-//       surface here as plan_error).
+// A semantic precondition or completed selectivity decision may decline this
+// optimization. Execution failures drain the phase and propagate unchanged;
+// allocation, compilation, and device errors never become ordinary-decode retries.
 std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   compressed_table const& table,
   std::span<const std::size_t> selected,
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
-  stream_pool& pool,
+  std::span<const ::cuda::stream_ref> streams,
   rmm::device_async_resource_ref mr)
 {
   namespace sc = sirius::codegen;
@@ -439,7 +384,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   if (k_total + (has_keep_mask ? 1 : 0) > 8) return refuse("more than 8 mask sources");
   if (request.routes.size() != selected.size())
     return refuse("request.routes not parallel to selected");
-  if (pool.streams.empty()) return refuse("stream pool empty");
+  if (streams.empty()) return refuse("no streams supplied");
   int64_t const num_rows = table.num_rows();
   if (num_rows <= 0) return refuse("num_rows <= 0");
   if (num_rows > std::numeric_limits<std::int32_t>::max())
@@ -505,9 +450,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     routes[f.column] = sc::decode_route::bitpack_mask;
   for (size_t i = 0; i < selected.size(); ++i) {
     if (is_bool8_slot[i]) continue;  // the slot's output is the compacted BOOL8 answer
-    // `full` is always available — every plan decodes full width, and the
-    // gather guards null-masked columns with a loud error rather than
-    // corrupting. Any other requested route must be the one this plan
+    // `full` is always available — every plan decodes full width, and a
+    // null-masked column declines the batch rather than corrupting it. Any
+    // other requested route must be the one this plan
     // supports; one probe answers that, so a route and a capability cannot
     // disagree.
     if (routes[i] == sc::decode_route::full) { continue; }
@@ -535,167 +480,101 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     std::fprintf(stderr, "%s\n", line.c_str());
   }
 
-  // Declared before the try so the mid-flight catch can pool.sync_all() BEFORE
-  // these buffers/events unwind (their stream-ordered frees must not race the
-  // combine's cross-stream reads).
+  // Declared before the try so the mid-flight catch can synchronize the streams BEFORE these
+  // buffers unwind (their stream-ordered frees must not race the combine's cross-stream reads).
   std::vector<rmm::device_buffer> per_filter;
-  // Declared before the try, like per_filter, so the catch's sync_all() precedes its
-  // destruction.
   rmm::device_buffer keep_mask_dev;
-  // Full-width BOOL8 per bool8 source, retained for the wave-2 dual-delivery
-  // gather; declared before the try so the catch's pool.sync_all() runs
-  // before any cross-stream consumer unwinds them.
+  // Full-width BOOL8 per bool8 source, retained for the wave-2 dual-delivery gather on the wave-1
+  // lane that allocated it.
   std::vector<std::unique_ptr<cudf::column>> bool8_full(request.bool8_filters.size());
-  event_set join_events;
-  bool unselective = false;  // distinguishes giving compaction up from a real failure
+  std::vector<::cuda::stream_ref> bool8_lanes;
   // Probes that declined this chunk and were stood down to the AND identity.
   size_t declined_members = 0;
-
+  auto reset_result       = [&](sc::scan_filter_status status) {
+    result                   = sc::scan_filter_result{};
+    result.status            = status;
+    result.source_generation = request.source_generation;
+  };
   try {
     int64_t const nc          = sc::selection_mask::ChunksFor(num_rows);
     int64_t const alloc_words = sc::selection_mask::AllocWordsFor(num_rows);
-    size_t const n_streams    = pool.streams.size();
-    ::cuda::stream_ref s0{pool.streams[0]};
+    auto const mask_bytes     = static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t);
+    ::cuda::stream_ref s0     = streams.front();
+    auto const same_stream    = [](::cuda::stream_ref stream) {
+      return [stream](::cuda::stream_ref other) { return other.get() == stream.get(); };
+    };
 
-    result.num_rows = num_rows;
-    result.mask_words =
-      rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+    result.num_rows   = num_rows;
+    result.mask_words = rmm::device_buffer(mask_bytes, s0, mr);
     result.chunk_offsets =
       rmm::device_buffer(static_cast<std::size_t>(nc + 1) * sizeof(std::uint32_t), s0, mr);
     auto* combined = static_cast<std::uint32_t*>(result.mask_words.data());
 
-    // ── Wave 1: mask sources round-robin on the pool streams. Source 0 writes
-    // straight into the combined buffer on stream 0 (its allocation stream);
-    // sources 1..k-1 into per-filter buffers allocated on the stream that
-    // writes them. Range conjuncts run the range ballot; equality conjuncts run
-    // the shipped BOOL8 pushdown then the packed-mask adapter.
+    // ── Wave 1: one mask source per request, on the session's lanes in rotation. The first
+    // request's lane is s0, so source 0 writes straight into the combined buffer (allocated on s0);
+    // later sources write per-filter buffers allocated on the lane their request is assigned. Range
+    // conjuncts run the range ballot; equality conjuncts run the BOOL8 pushdown and ballot it.
     per_filter.reserve(k_total > 1 ? k_total - 1 : 0);
     std::vector<std::uint32_t const*> mask_ptrs;
     mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
-    mask_ptrs.push_back(combined);
-
-    auto submit_mask_source = [&](size_t s, auto&& produce) {
-      ::cuda::stream_ref stream = (s == 0) ? s0 : ::cuda::stream_ref{pool.streams[s % n_streams]};
-      std::uint32_t* dst        = combined;
-      if (s > 0) {
-        per_filter.emplace_back(
-          static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), stream, mr);
-        dst = static_cast<std::uint32_t*>(per_filter.back().data());
-        mask_ptrs.push_back(dst);
-      }
-      produce(dst, stream);
-      if (s > 0 && stream.get() != s0.get()) {
-        // Publish this stream's mask to stream 0 without a host sync.
-        cudaEvent_t ev = join_events.make();
-        if (cudaEventRecord(ev, stream.get()) != cudaSuccess ||
-            cudaStreamWaitEvent(s0.get(), ev, 0) != cudaSuccess) {
-          throw plan_error("filtered decode: wave-1 stream join failed");
-        }
-      }
+    // Lanes other than s0 that produced a source, which the combine on s0 must wait for.
+    std::vector<rmm::cuda_stream_view> producer_lanes;
+    decode_session wave1{streams, mr};
+    auto next_destination = [&] {
+      auto const lane = wave1.next_stream();
+      if (lane.get() != s0.get() &&
+          std::none_of(producer_lanes.begin(), producer_lanes.end(), [&](auto other) {
+            return other.value() == lane.get();
+          }))
+        producer_lanes.emplace_back(lane);
+      auto* words =
+        mask_ptrs.empty()
+          ? combined
+          : static_cast<std::uint32_t*>(per_filter.emplace_back(mask_bytes, lane, mr).data());
+      mask_ptrs.push_back(words);
+      return mask_destination{words, num_rows};
     };
 
-    for (size_t f = 0; f < k_range; ++f) {
-      submit_mask_source(f, [&](std::uint32_t* dst, ::cuda::stream_ref stream) {
-        auto const& directive = request.filters[f];
-        auto const& col       = table.columns[selected[directive.column]];
-        std::string err;
-        if (!decompress_column_selection_mask(
-              *col.plan_tree, directive.pred, dst, stream, mr, &err)) {
-          throw plan_error(err.empty() ? "filtered decode: range ballot failed" : err);
-        }
-      });
+    for (auto const& directive : request.filters) {
+      auto const& column = table.columns[selected[directive.column]];
+      if (wave1.append(mask_decode_request{
+            *column.plan_tree, directive.pred, next_destination()}) != mask_source_status::ACCEPTED)
+        throw plan_error("filtered decode: preflighted range source declined");
     }
-    for (size_t b = 0; b < k_bool8; ++b) {
-      submit_mask_source(k_range + b, [&](std::uint32_t* dst, ::cuda::stream_ref stream) {
-        auto const& directive = request.bool8_filters[b];
-        auto const& col       = table.columns[selected[directive.column]];
-        decode_predicate pred;
-        pred.equals_any = directive.equals_any;
-        std::string err;
-        auto flags = decompress_column(*col.plan_tree, stream, mr, &err, &pred);
-        if (!flags)
-          throw plan_error(err.empty() ? "filtered decode: bool8 predicate decode failed" : err);
-        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-          throw plan_error("filtered decode: bool8 predicate result shape mismatch");
-        if (flags->null_count() != 0)
-          throw plan_error("filtered decode: null-masked bool8 predicate result");
-        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
-        // Keep the full-width BOOL8 alive — wave 2 gathers it at this
-        // directive's slot (compacted BOOL8, 1 B/row) instead of decoding the
-        // column's values. Contents are settled before wave-2
-        // submission (the adapter kernel follows the fill on this stream, and
-        // the CNT host sync transitively covers it via the join event).
-        bool8_full[b] = std::move(flags);
-      });
+    for (auto const& directive : request.bool8_filters) {
+      auto const& column = table.columns[selected[directive.column]];
+      bool8_lanes.push_back(wave1.next_stream());
+      wave1.append(column_decode_request{
+        std::cref(*column.plan_tree),
+        predicate_result{decode_predicate{directive.equals_any}, next_destination()},
+        {}});
     }
     // With another mask source to prime a prior from (a static range/bool8 strip or the
-    // positional keep mask), membership probes run sequentially on s0 after the combine instead
-    // of here, so dead rows skip the set/Bloom lookup. Otherwise they keep the concurrent
-    // round-robin submission below, prior-free.
-    size_t const k_static            = k_range + k_bool8;
-    bool const sequential_membership = k_member > 0 && (k_static > 0 || has_keep_mask);
+    // positional keep mask), membership probes run sequentially on s0 after the combine, so dead
+    // rows skip the set/Bloom lookup. Otherwise they run concurrently here, prior-free.
+    bool const sequential_membership = k_member > 0 && (k_range + k_bool8 > 0 || has_keep_mask);
     for (size_t m = 0; !sequential_membership && m < k_member; ++m) {
-      submit_mask_source(k_static + m, [&](std::uint32_t* dst, ::cuda::stream_ref stream) {
-        auto const& directive = request.membership_filters[m];
-        auto const& col       = table.columns[selected[directive.column]];
-        std::string err;
-        // Full-width key decode (any plan shape), then the type-erased
-        // device probe (in_list / cuco set / Bloom) -> BOOL8, then the
-        // packed-mask adapter. Probe contract: all work on `stream`.
-        auto keys = decompress_column(*col.plan_tree, stream, mr, &err);
-        if (!keys)
-          throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
-        auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
-        auto flags = directive.probe(keys_typed->view(), /*prior_mask_words=*/nullptr, stream, mr);
-        // A null result is the probe DECLINING this column (the documented "caller skips it"
-        // answer — e.g. incompatible signedness/family, decimal scale, timestamp unit, or an
-        // unavailable device replica). A join filter is never the whole filter, so dropping one
-        // only under-filters and the authoritative join still runs. Stand the source down to
-        // all-ones, the identity for the AND-combine, rather than abandoning the batch's whole
-        // filtered decode.
-        if (!flags) {
-          if (cudaMemsetAsync(dst,
-                              0xFF,
-                              static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t),
-                              stream.get()) != cudaSuccess) {
-            throw plan_error("filtered decode: declined-probe mask fill failed");
-          }
-          ++declined_members;
-          return;
-        }
-        // A non-null result with the wrong type or row count is NOT a decline — it breaks the
-        // probe contract, so it stays fatal and names which side broke.
-        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-          throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
-                           std::to_string(selected[directive.column]) +
-                           " got=type_id=" + std::to_string(static_cast<int>(flags->type().id())) +
-                           " size=" + std::to_string(flags->size()) + " want=type_id=" +
-                           std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
-                           " size=" + std::to_string(num_rows) + ")");
-        // The probe contract is a non-nullable BOOL8: a null probe key is a definite non-member
-        // and the filters write `false` for it in-kernel, so a null-masked result is a broken
-        // probe, not a nullable key chunk.
-        if (flags->null_count() != 0)
-          throw plan_error("filtered decode: null-masked membership probe result");
-        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
-        // keys/flags die here: stream-ordered frees behind the adapter
-        // kernel on the same stream.
-      });
+      auto const& directive = request.membership_filters[m];
+      auto const& column    = table.columns[selected[directive.column]];
+      auto const status     = wave1.append(mask_decode_request{
+        *column.plan_tree, membership_source{directive.probe, column.dtype}, next_destination()});
+      declined_members += status == mask_source_status::DECLINED;
     }
 
-    // ── Keep mask, uploaded before the combine so it primes the cascade's prior. Unlike device
-    // ballot producers, the host keep mask supplies only ceil(num_rows / 32) words, so the gap to
-    // the full 1024-row strip allocation is memset here. Upload on s0 keeps the combine ordered
-    // behind it. With no static source nothing has written `combined` yet (the cascade owns the
-    // membership sources), so the keep mask lands there directly and is the whole prior.
+    // Order the combine on s0 after every other lane that produced a source.
+    if (!producer_lanes.empty()) cudf::detail::join_streams(producer_lanes, s0);
+
+    // ── Keep mask, uploaded before the combine so it primes the cascade's prior. No ballot
+    // producer zeroes its tail (selection.hpp:52), so the gap between the host words and
+    // alloc_words is memset here. Upload on s0 keeps the combine ordered behind it. When no source
+    // has written `combined` yet, the keep mask lands there directly.
     if (has_keep_mask) {
       auto const host_words   = static_cast<std::size_t>((num_rows + 31) / 32);
       std::uint32_t* keep_dst = combined;
-      if (k_static > 0) {
+      if (!mask_ptrs.empty()) {
         keep_mask_dev =
           rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
         keep_dst = static_cast<std::uint32_t*>(keep_mask_dev.data());
-        mask_ptrs.push_back(keep_dst);
       }
       if (static_cast<int64_t>(host_words) < alloc_words &&
           cudaMemsetAsync(
@@ -712,64 +591,52 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                           s0.get()) != cudaSuccess) {
         throw plan_error("fused scan-filter: keep-mask upload failed");
       }
+      mask_ptrs.push_back(keep_dst);
     }
 
-    // ── Combine on stream 0. mask_ptrs holds exactly the sources that wrote a strip (plus the
-    // keep mask when it has its own strip), so its size is the combine count on both paths.
+    // ── Combine on stream 0.
     if (mask_ptrs.size() > 1) {
       sc::combine_masks_and(
         combined, mask_ptrs.data(), static_cast<int>(mask_ptrs.size()), alloc_words, s0);
     }
 
-    // ── Sequential membership cascade. Each probe takes `combined` as its prior and ANDs its
-    // result back in, so the next probe sees the tightened mask. All on s0 behind the combine;
-    // the scratch strip's stream-ordered free is s0-local, so unwinding cannot race a
-    // cross-stream reader. A declining probe leaves `combined` untouched — the AND identity.
+    // ── Sequential membership cascade, a single-lane session on s0 behind the combine. Each probe
+    // takes `combined` as its prior and its result is ANDed back in, so the next probe sees the
+    // tightened mask. A declining probe leaves `combined` untouched, the AND identity. The scratch
+    // strip is written and read only on s0, so its stream-ordered free cannot race a reader.
+    std::optional<decode_session> cascade;
     if (sequential_membership) {
-      rmm::device_buffer membership_scratch(
-        static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
-      auto* member_dst = static_cast<std::uint32_t*>(membership_scratch.data());
-      std::array<std::uint32_t const*, 2> and_srcs{combined, member_dst};
+      cascade.emplace(std::span{&s0, 1}, mr);
+      rmm::device_buffer membership_scratch(mask_bytes, s0, mr);
+      auto* member_words = static_cast<std::uint32_t*>(membership_scratch.data());
+      std::array<std::uint32_t const*, 2> const and_sources{combined, member_words};
       for (size_t m = 0; m < k_member; ++m) {
         auto const& directive = request.membership_filters[m];
-        auto const& col       = table.columns[selected[directive.column]];
-        std::string err;
-        auto keys = decompress_column(*col.plan_tree, s0, mr, &err);
-        if (!keys)
-          throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
-        auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
-        auto flags      = directive.probe(keys_typed->view(), combined, s0, mr);
-        if (!flags) {
+        auto const& column    = table.columns[selected[directive.column]];
+        if (cascade->append(
+              mask_decode_request{*column.plan_tree,
+                                  membership_source{directive.probe, column.dtype, combined},
+                                  {member_words, num_rows}}) == mask_source_status::DECLINED) {
           ++declined_members;
           continue;
         }
-        if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-          throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
-                           std::to_string(selected[directive.column]) +
-                           " got=type_id=" + std::to_string(static_cast<int>(flags->type().id())) +
-                           " size=" + std::to_string(flags->size()) + " want=type_id=" +
-                           std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
-                           " size=" + std::to_string(num_rows) + ")");
-        // Non-nullable BOOL8 is the probe contract (see the concurrent arm above).
-        if (flags->null_count() != 0)
-          throw plan_error("filtered decode: null-masked membership probe result");
-        sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, member_dst, s0);
-        sc::combine_masks_and(combined, and_srcs.data(), 2, alloc_words, s0);
-        // keys/flags die here: stream-ordered frees behind the combine on s0.
+        sc::combine_masks_and(combined, and_sources.data(), 2, alloc_words, s0);
       }
     }
 
     // An all-ones source is the AND identity only while a real source still
     // zeroes the tail bits past num_rows, which CNT and the gather require. If
     // every source declined there is nothing left to filter by anyway, so take
-    // the plain decode instead of counting a mask that is all ones. Reachable on the
-    // concurrent path, or on a cascade primed only by the keep mask: with no real filter
-    // left the survivor rate is just the visible-row fraction, which the caller applies
-    // itself on the plain path.
+    // the plain decode instead of counting a mask that is all ones. On a cascade
+    // primed only by the keep mask, the survivor rate is just the visible-row
+    // fraction, which the caller applies itself on the plain path.
     if (declined_members == k_total) {
-      throw plan_error("filtered decode: every membership probe declined (" +
-                       std::to_string(declined_members) + " of " + std::to_string(k_total) +
-                       " source(s)); nothing left to select by");
+      // Never count the padded all-ones masks: there is no real source to clear
+      // the tail. This is an explicit policy decline after completed work.
+      (void)wave1.finish();
+      if (cascade) (void)cascade->finish();
+      reset_result(sc::scan_filter_status::refused);
+      return refuse("every membership source declined");
     }
 
     if (declined_members > 0 && sc::decompression_pushdown_diag_enabled()) {
@@ -787,6 +654,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
     sc::run_selection_cnt(sel, s0, mr);
+    // CNT is the genuine host observation. finish also checks external phase work after request
+    // submission before publishing the dual-delivery BOOL8 owners.
+    bool8_full = wave1.finish();
+    if (cascade) (void)cascade->finish();
     result.survivor_count = sel.survivor_count;
     per_filter.clear();
     keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0
@@ -802,9 +673,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     //    say otherwise), with only a dict_codes output
     //    exempting the batch (it wins 2.1-2.6x at ALL selectivities — the
     //    string-materialization savings are survivor-count-independent).
-    // Both regimes give up through the mid-flight machinery below, reporting
-    // declined_unselective so the caller can remember it for the rest of the
-    // scan (sync, drop masks, ordinary decode; batch NOT tagged ROW_FILTERED).
+    // Both regimes explicitly decline after completed wave-1 work, reporting
+    // declined_unselective for the rest of this scan/filter generation.
     bool any_dict_gather = false;
     bool any_full        = false;
     for (size_t i = 0; i < routes.size(); ++i) {
@@ -833,9 +703,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                      static_cast<long long>(sel.survivor_count),
                      static_cast<long long>(num_rows));
       }
-      unselective = true;
-      throw plan_error("selectivity " + std::to_string(sel_frac) + " above " + env_name + " " +
-                       std::to_string(threshold));
+      reset_result(sc::scan_filter_status::declined_unselective);
+      return std::nullopt;
     }
 
     // Per-batch enumeration pick for bitpack_mask outputs: walk the survivor
@@ -855,15 +724,15 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    sc::decompression_pushdown_index_walk_max_selectivity());
     }
 
-    // ── Survivor index map on stream 0, overlapping wave 2 (column 0's wave-2
-    // work serializes behind it on s0; the other streams run free). Built ONCE
-    // per batch and SHARED by every consumer: the full-width gathers and the
-    // index-list decodes (the same int32 buffer).
+    // ── Survivor index map on s0, built once per batch and shared by every consumer: the
+    // full-route gathers, the BOOL8 gathers and the index-list decodes.
     result.routes        = routes;
-    bool const any_bool8 = k_bool8 > 0;  // dual-delivery gathers need the indices too
+    bool const any_bool8 = k_bool8 > 0;
+    bool const indices_needed =
+      (any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0;
     cudf::column_view survivor_indices{
       cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
-    if ((any_full || index_walk_pick || any_bool8) && sel.survivor_count > 0) {
+    if (indices_needed) {
       result.row_indices = rmm::device_buffer(
         static_cast<std::size_t>(sel.survivor_count) * sizeof(std::int32_t), s0, mr);
       sc::mask_to_row_indices(sel, static_cast<std::int32_t*>(result.row_indices.data()), s0);
@@ -872,89 +741,86 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                                            result.row_indices.data(),
                                            nullptr,
                                            0};
-      // Index consumers (the full-width gathers, the index-list decodes) run on the other pool
-      // streams; order them after the
-      // indices kernel on s0 with a device-side wait (streams are FIFO, so one
-      // up-front wait per stream covers every wave-2 launch on it).
-      cudaEvent_t ev_idx = join_events.make();
-      if (cudaEventRecord(ev_idx, s0.get()) != cudaSuccess)
-        throw plan_error("filtered decode: indices event record failed");
-      for (size_t si = 1; si < n_streams; ++si) {
-        if (cudaStreamWaitEvent(pool.streams[si], ev_idx, 0) != cudaSuccess)
-          throw plan_error("filtered decode: indices stream wait failed");
-      }
     }
-
-    // ── Wave 2: the compactable columns decode to survivor width and the rest
-    // decode full width and are gathered, round-robin on the pool streams via
-    // the published
-    // decompress_column(..., decode_selection const*) contract. Everything
-    // wave 2 consumes (mask, chunk_offsets) completed before the CNT host sync
-    // above, so no cross-stream waits are needed.
-    std::vector<std::unique_ptr<cudf::column>> cols(selected.size());
-    run_column_workers(selected.size(), pool, [&](size_t i, ::cuda::stream_ref stream) {
-      auto const& col = table.columns[selected[i]];
-      if (is_bool8_slot[i]) {
-        // The slot's output is the wave-1 BOOL8 gathered to survivor rows
-        // (1 B/row) — the column's values are never decoded and the downstream
-        // residual sees the substitution column pre-compacted. No
-        // apply_stored_dtype (BOOL8 by contract, like the unfiltered predicate
-        // path).
-        auto const& full = bool8_full[static_cast<size_t>(bool8_of_slot[i])];
-        if (sel.survivor_count == 0) {
-          cols[i] = cudf::make_fixed_width_column(
-            cudf::data_type{cudf::type_id::BOOL8}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
-          return;
-        }
-        auto gathered = cudf::gather(cudf::table_view{{full->view()}},
-                                     survivor_indices,
-                                     cudf::out_of_bounds_policy::DONT_CHECK,
-                                     stream,
-                                     mr);
-        cols[i]       = std::move(gathered->release()[0]);
+    // Order a consuming lane after the indices kernel with one device-side wait; streams are FIFO,
+    // so it covers every later launch on that lane.
+    std::vector<::cuda::stream_ref> index_lanes{s0};
+    auto const wait_for_indices = [&](::cuda::stream_ref lane) {
+      if (!indices_needed || std::any_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
         return;
+      rmm::cuda_stream_view const producer{s0};
+      cudf::detail::join_streams({&producer, 1}, lane);
+      index_lanes.push_back(lane);
+    };
+
+    // ── Wave 2: every column decodes to survivor rows on its own lane. Compacted routes decode
+    // compacted in the kernel; `full` routes decode full width and gather in the same request, so
+    // the full-width column is released on its lane once the gather is queued. A slot answered off
+    // a dictionary gathers its wave-1 BOOL8 on the lane that allocated it, never decoding values.
+    std::vector<std::unique_ptr<cudf::column>> columns(selected.size());
+    std::vector<std::size_t> decoded_positions;
+    decoded_positions.reserve(selected.size());
+    decode_session wave2{streams, mr};
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+      if (is_bool8_slot[i]) {
+        auto const slot = static_cast<std::size_t>(bool8_of_slot[i]);
+        auto const lane = bool8_lanes[slot];
+        wait_for_indices(lane);
+        columns[i] = std::move(cudf::gather(cudf::table_view{{bool8_full[slot]->view()}},
+                                            survivor_indices,
+                                            cudf::out_of_bounds_policy::DONT_CHECK,
+                                            lane,
+                                            mr)
+                                 ->release()
+                                 .front());
+        if (std::none_of(index_lanes.begin(), index_lanes.end(), same_stream(lane)))
+          index_lanes.push_back(lane);
+        // BOOL8 was excluded from full-value selectivity policy above; it is survivor-sized.
+        result.routes[i] = sc::decode_route::full;
+        continue;
       }
-      decode_selection dsel;
-      dsel.mask             = &sel;
-      dsel.survivor_count   = sel.survivor_count;
-      dsel.survivor_indices = survivor_indices;
-      // One route value, so the modes cannot contradict each other: the
-      // bitpack/delta roots consume the mask in-kernel, the dictionary route
-      // decodes codes under the mask and gathers surviving keys, and `full`
-      // takes the gather path.
-      dsel.route = result.routes[i];
-      // Below the crossover, bitpack roots decode from the survivor
-      // index list (populated above whenever index_walk_pick, per the
-      // decode_selection contract); the dispatch silently keeps the mask walk
-      // on any anomaly, delta roots ignore it, a dictionary gather is
-      // unchanged.
-      dsel.enumerate_by_index = index_walk_pick &&
-                                result.routes[i] == sc::decode_route::bitpack_mask &&
-                                sel.survivor_count > 0;
-      std::string err;
-      auto out = decompress_column(*col.plan_tree, stream, mr, &err, nullptr, &dsel);
-      if (!out) throw plan_error(err.empty() ? "filtered decode: decompress failed" : err);
-      cols[i] = apply_stored_dtype(std::move(out), col.dtype);
-    });
-    // run_column_workers ended with pool.sync_all(), which also covers the
-    // mask_to_row_indices launch on s0.
+      auto const& column = table.columns[selected[i]];
+      decode_selection selection;
+      selection.mask               = &sel;
+      selection.survivor_count     = sel.survivor_count;
+      selection.survivor_indices   = survivor_indices;
+      selection.route              = result.routes[i];
+      selection.enumerate_by_index = index_walk_pick &&
+                                     selection.route == sc::decode_route::bitpack_mask &&
+                                     sel.survivor_count > 0;
+      if (selection.route == sc::decode_route::full || selection.enumerate_by_index)
+        wait_for_indices(wave2.next_stream());
+      decoded_positions.push_back(i);
+      wave2.append(column_decode_request{std::cref(*column.plan_tree),
+                                         value_result{column.dtype},
+                                         validated_selection(*column.plan_tree, selection)});
+    }
+    auto decoded = wave2.finish();
+    for (std::size_t i = 0; i < decoded.size(); ++i)
+      columns[decoded_positions[i]] = std::move(decoded[i]);
+    // The session completed its own lanes; the indices kernel and the BOOL8 gathers are this
+    // phase's work on s0 and the lanes in index_lanes.
+    throw_if_cuda_error(synchronize_distinct(index_lanes), "filtered decode: gather completion");
 
     result.applied           = true;
     result.status            = sc::scan_filter_status::applied;
     result.keep_mask_applied = has_keep_mask;
-    return cols;
-  } catch (std::exception const& e) {
-    std::fprintf(
-      stderr, "simpatico: filtered decode fell back to the ordinary decode (%s)\n", e.what());
-    pool.sync_all();  // quiesce in-flight wave kernels before buffers unwind
-    result = sirius::codegen::scan_filter_result{};
-    // A distinguishable outcome for the caller to remember: one batch too
-    // unselective to compact predicts the scan's remaining batches — latched
-    // per {operator, source_generation} (a newer filter set clears it).
-    result.status =
-      unselective ? sc::scan_filter_status::declined_unselective : sc::scan_filter_status::failed;
-    result.source_generation = request.source_generation;
-    return std::nullopt;
+    return columns;
+  } catch (unsupported_nullable_selection const&) {
+    // Nulls in selected values or predicate ballots require a clean drain before declining row
+    // selection. A failed drain is a failure.
+    if (auto const status = synchronize_distinct(streams); status != cudaSuccess) {
+      reset_result(sc::scan_filter_status::failed);
+      throw_if_cuda_error(status, "simpatico: filtered decode cleanup");
+    }
+    reset_result(sc::scan_filter_status::refused);
+    return refuse("row selection on a null-masked column is not supported");
+  } catch (...) {
+    // Phase-owned masks outlive this drain, including work queued after session-owned decode
+    // work. Preserve the original exception and OOM subtype.
+    synchronize_distinct_or_log(streams, "simpatico: filtered decode cleanup failed");
+    reset_result(sc::scan_filter_status::failed);
+    throw;
   }
 }
 
@@ -1055,16 +921,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(table.num_columns());
-  for (auto const& col : table.columns) {
-    if (!col.plan_tree) throw plan_error("compressed_table column missing plan_tree");
-    std::string err;
-    auto c = decompress_column(*col.plan_tree, stream, mr, &err);
-    if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
-    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
+  return decode_table_columns(table, all_columns(table), {}, {&stream, 1}, mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1073,7 +930,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
   leased_pool lp(column_threads);
-  return decompress_columns_parallel(table, lp.pool, mr);
+  return decode_table_columns(table, all_columns(table), {}, lp.pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1081,7 +938,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
-  return decompress_columns_parallel(table, pool, mr);
+  return decode_table_columns(table, all_columns(table), {}, pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1090,18 +947,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,serial]"};
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(selected_columns.size());
-  for (auto const idx : selected_columns) {
-    if (idx >= table.columns.size()) throw plan_error("selected column index out of range");
-    auto const& col = table.columns[idx];
-    if (!col.plan_tree) throw plan_error("compressed_table column missing plan_tree");
-    std::string err;
-    auto c = decompress_column(*col.plan_tree, stream, mr, &err);
-    if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
-    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
-  }
-  return std::make_unique<cudf::table>(std::move(cols));
+  return decode_table_columns(table, selected_columns, {}, {&stream, 1}, mr);
 }
 
 namespace {
@@ -1124,6 +970,25 @@ PlanTree const* column_plan(const compressed_table& table,
   return col.plan_tree.get();
 }
 
+std::unique_ptr<cudf::column> decode_complete_column(PlanTree const& plan,
+                                                     cudf::data_type stored_type,
+                                                     ::cuda::stream_ref stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     decode_selection const* selection,
+                                                     std::string* error_out)
+{
+  column_decode_request request{std::cref(plan), value_result{stored_type}, {}};
+  if (selection) {
+    try {
+      request.selection.emplace(plan, *selection);
+    } catch (std::invalid_argument const& error) {
+      if (error_out) *error_out = error.what();
+      return nullptr;
+    }
+  }
+  return decode_one(request, stream, mr);
+}
+
 }  // namespace
 
 std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& table,
@@ -1135,7 +1000,8 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_rows");
   if (tree == nullptr) { return nullptr; }
-  if (!rows.valid()) {
+  if (rows.num_rows < 0 || rows.num_rows > std::numeric_limits<cudf::size_type>::max() ||
+      !rows.valid()) {
     if (error_out) { *error_out = "decompress_column_rows: the row set is not valid"; }
     return nullptr;
   }
@@ -1153,9 +1019,8 @@ std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& tab
   sel.survivor_count = rows.num_survivors;
   sel.route          = sirius::codegen::decode_route::bitpack_mask;
 
-  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
-  if (!col) { return nullptr; }
-  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+  return decode_complete_column(
+    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
 }
 
 std::unique_ptr<cudf::column> decompress_column_compacted(
@@ -1185,9 +1050,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   sel.survivor_count = mask.survivor_count;
   sel.route          = route;
 
-  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
-  if (!col) { return nullptr; }
-  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+  return decode_complete_column(
+    *tree, table.columns[column_index].dtype, stream, mr, &sel, error_out);
 }
 
 std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& table,
@@ -1198,9 +1062,8 @@ std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& tab
 {
   auto const* tree = column_plan(table, column_index, error_out, "decompress_column_full");
   if (tree == nullptr) { return nullptr; }
-  auto col = decompress_column(*tree, stream, mr, error_out);
-  if (!col) { return nullptr; }
-  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+  return decode_complete_column(
+    *tree, table.columns[column_index].dtype, stream, mr, nullptr, error_out);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1210,7 +1073,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
 {
   nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
   leased_pool lp(column_threads);
-  return decompress_columns_parallel(table, selected_columns, lp.pool, mr);
+  return decode_table_columns(table, selected_columns, {}, lp.pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1218,8 +1081,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
-  return decompress_columns_parallel(table, selected_columns, pool, mr);
+  return decompress(table, selected_columns, pool.refs(), mr);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,
@@ -1228,11 +1090,29 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
+  return decompress(table, selected_columns, predicates, pool.refs(), mr);
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        std::span<const ::cuda::stream_ref> streams,
+                                        rmm::device_async_resource_ref mr)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,streams]"};
+  return decode_table_columns(table, selected_columns, {}, streams, mr);
+}
+
+std::unique_ptr<cudf::table> decompress(const compressed_table& table,
+                                        std::span<const std::size_t> selected_columns,
+                                        std::span<const decode_predicate> predicates,
+                                        std::span<const ::cuda::stream_ref> streams,
+                                        rmm::device_async_resource_ref mr)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,streams]"};
   if (predicates.size() != selected_columns.size()) {
     throw plan_error("decompress: predicates and selected_columns must be the same length");
   }
-  return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
+  return decode_table_columns(table, selected_columns, predicates, streams, mr);
 }
 
 std::unique_ptr<cudf::table> decompress_scan_filter(
@@ -1240,14 +1120,13 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   std::span<const std::size_t> selected_columns,
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
-  simpatico::stream_pool& pool,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out)
+  std::span<const ::cuda::stream_ref> streams,
+  ::cuda::stream_ref /*stream*/,
+  rmm::device_async_resource_ref mr)
 {
-  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,streams]"};
   result = sirius::codegen::scan_filter_result{};
-  if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
+  if (auto cols = try_decompress_fused(table, selected_columns, request, result, streams, mr)) {
     if (sirius::codegen::decompression_pushdown_diag_enabled()) {
       int n_a = 0, n_delta = 0, n_dict = 0, n_str_split = 0, n_b = 0;
       for (auto const t : result.routes) {
@@ -1269,18 +1148,11 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
                    n_b,
                    request.filters.size() + request.bool8_filters.size());
     }
-    // Reconcile the wave's ragged output into one uniformly survivor-sized
-    // table before it leaves: the compacted routes came back survivor-sized and
-    // the `full` ones full width, and nothing outside knows which is which.
-    auto reconciled = compact_scan_filter_output(std::move(*cols), result, stream, mr, error_out);
-    if (reconciled) { return reconciled; }
-    // The assembly refused (a null-masked column, a mis-sized output). Fall
-    // through to the unfiltered decode below and report nothing applied — the
-    // caller must not see a half-filtered batch.
-    result        = sirius::codegen::scan_filter_result{};
-    result.status = sirius::codegen::scan_filter_status::failed;
+    // Every route, including `full` and the dictionary-answered BOOL8 slots, came back
+    // survivor-sized and completed.
+    return std::make_unique<cudf::table>(std::move(*cols));
   }
-  // Gate off / nothing requested / policy refusal / mid-flight fallback:
+  // Gate off / nothing requested / explicit completed policy refusal:
   // exactly the unfiltered path — with one obligation: when the request routed
   // dictionary-answered equalities (bool8_filters) into the mask, the fallback
   // must NOT be a plain decode, or every declined batch would silently lose the
@@ -1292,9 +1164,22 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
     for (auto const& b : request.bool8_filters) {
       if (b.column < predicates.size()) predicates[b.column].equals_any = b.equals_any;
     }
-    return decompress_columns_parallel(table, selected_columns, predicates, pool, mr);
+    return decode_table_columns(table, selected_columns, predicates, streams, mr);
   }
-  return decompress_columns_parallel(table, selected_columns, pool, mr);
+  return decode_table_columns(table, selected_columns, {}, streams, mr);
+}
+
+std::unique_ptr<cudf::table> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  simpatico::stream_pool& pool,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::string* /*error_out*/)
+{
+  return decompress_scan_filter(table, selected_columns, request, result, pool.refs(), stream, mr);
 }
 
 }  // namespace simpatico

@@ -224,48 +224,48 @@ std::unique_ptr<cudf::table> decompress(
 /// carries the conjuncts a decode can resolve plus the output shape tag per
 /// selected column (see codegen/selection/selection.hpp).
 ///
-/// When the gate is on and every precondition holds, columns are decoded with
-/// the two-wave mask pipeline: wave 1 ballots each filter column's rows into
-/// mask words, the masks are AND-combined and counted (one host sync for the
-/// survivor count), then wave 2 decodes the compactable columns straight into
-/// survivor_count-row columns and the rest full width. @p result comes back
-/// with applied=true, the selection mask/offsets, and the gather map
-/// (row_indices) it used. The returned table is uniformly survivor-sized —
-/// the compacted routes came back that way and the full-width ones are
-/// compacted here — so the caller only has to skip its own filter pass.
+/// When the gate is on and every precondition holds, columns are decoded with the two-wave mask
+/// pipeline: wave 1 ballots each filter column's rows into mask words, the masks are AND-combined
+/// and counted (one host sync for the survivor count), then wave 2 decodes the compactable columns
+/// straight into survivor_count-row columns and gathers the rest to survivor rows on their own
+/// streams. Membership probes join wave 1 only when there is no range, BOOL8, or keep-mask source;
+/// otherwise they run between the combine and the count, one at a time on the first stream, each
+/// given the running combined mask as its prior. @p result comes back with applied=true, the
+/// selection mask/offsets, and the gather map (row_indices) it used. The returned table is
+/// uniformly survivor-sized, so the caller only has to skip its own filter pass.
 ///
 /// When the gate is off, @p request is empty, or any precondition fails
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
 /// decompress(table, selected_columns, pool, mr) — same kernels, same
 /// allocations — returned as released columns, and result.applied is false.
-/// result.status refines the applied=false cases: `refused` (no device work),
-/// `declined_unselective` (too many rows survived for compaction to pay off —
-/// the caller should remember this per scan and drop the row selection from its
-/// remaining batches), or `failed` (mid-flight fallback, exceptional).
+/// result.status refines the applied=false cases: `refused` (unsupported request or completed
+/// policy decline), `declined_unselective` (too many rows survived for compaction to pay off — the
+/// caller should remember this per scan and drop the row selection from its remaining batches).
+/// Execution failures set `failed` and propagate their original exception; they are not retried as
+/// ordinary decoding.
 ///
 /// Equality conjuncts answerable off a dictionary ride INSIDE the request
 /// (scan_filter_request::bool8_filters): wave 1 resolves them via the
 /// decode_predicate path, packs the BOOL8 result to mask words and ANDs it into
-/// the batch mask. On ANY non-applied outcome with bool8_filters present, the
-/// rerun is the PREDICATED decompress — those columns come back as BOOL8
+/// the batch mask. On any successful non-applied outcome with bool8_filters
+/// present, the rerun is the PREDICATED decompress — those columns come back as BOOL8
 /// substitution columns exactly like the ordinary pushdown, never a plain
 /// decode (the dictionary win survives every fallback). Callers must therefore
 /// be ready for BOOL8 at those columns whenever result.applied is false.
-/// Assembling the output can itself refuse (a null-masked column, an output
-/// that is neither full width nor survivor-sized): the call then falls back to
-/// the unfiltered decode, sets result.status = failed and writes @p error_out.
-/// A caller never sees a half-filtered batch.
+/// Unsupported nullable selection is an explicit completed policy decline. Malformed output shape
+/// or assembly failures throw; a caller never sees a half-filtered batch.
 ///
-/// Synchronizes @p stream before returning when the filtering applied, so the
-/// caller may free or rebind the inputs immediately.
+/// When the filtering applied, all work the call queued has completed before it returns, so the
+/// caller may free or rebind the inputs immediately. The filtered path queues nothing on @p stream;
+/// it is kept for compatibility, and the unfiltered fallback does not use it either.
+///
+/// @p error_out is kept for source compatibility and is never written: failures throw.
 // ── Per-column decode, for a caller-supplied selection ──────────────────────
 //
-// Late materialization produces ONE deferred column at a time, and the route it
-// can take depends on that column's plan: a bitpack root takes the sparse walk,
-// a dictionary or str_split shape does not. So these are per column, and a
-// route that cannot serve returns nullptr with @p error_out set rather than
-// throwing — a REFUSAL, not a failure. The caller then picks the next route,
-// and the cascade ends at the full decode, which always works.
+// Late materialization produces one deferred column at a time. Unsupported selection routes and
+// invalid selection preflight return nullptr with @p error_out set, allowing the caller to try
+// another route. Full decode is the general capability fallback. Failures during accepted execution
+// throw after draining submitted work; these APIs do not retry them as ordinary decoding.
 //
 // The three functions below (decompress_column_rows, decompress_column_compacted,
 // decompress_column_full) all re-tag the decode's storage type to the column's stored
@@ -297,9 +297,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
-/// One column decoded full width — the end of every cascade, so it refuses only
-/// on a genuine decode failure. Re-tags the decode's storage type to the
-/// column's stored dtype (see the per-column decode note above).
+/// One column decoded full width without a selection-route restriction. Re-tags the decode's
+/// storage type to the column's stored dtype (see the per-column decode note above).
 std::unique_ptr<cudf::column> decompress_column_full(
   const compressed_table& table,
   std::size_t column_index,
@@ -316,5 +315,45 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
+
+// ── Decompression across borrowed streams ────────────────────────────────────
+//
+// Each overload below behaves like its stream_pool counterpart above, which forwards to it, but
+// borrows the streams as `::cuda::stream_ref` handles, for callers whose streams are owned
+// elsewhere (for example, a memory space's stream pool). `streams` must be non-empty, and every
+// stream must belong to the current device. A call neither creates nor destroys the streams and
+// does not keep the span, but returned allocations may record a stream for deallocation: returned
+// columns record the stream that produced them (one of `streams`, or the scan-filter output
+// stream), and the mask, offset, and index buffers of a scan_filter_result record
+// `streams.front()`. The streams must outlive those allocations. Streams may repeat: requests are
+// assigned to them in rotation, and each wait covers each distinct stream at most once. They may
+// include the scan-filter output stream and may carry other callers' work, which every wait on that
+// stream also covers, so work on the supplied streams, including other callers', must never be
+// host-gated.
+
+/// Decompress a column subset across borrowed streams from the calling CPU thread.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const ::cuda::stream_ref> streams,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset with predicate pushdown across borrowed streams.
+std::unique_ptr<cudf::table> decompress(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  std::span<const decode_predicate> predicates,
+  std::span<const ::cuda::stream_ref> streams,
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+
+/// Decompress a column subset with the scan's row filter applied, across borrowed streams.
+std::unique_ptr<cudf::table> decompress_scan_filter(
+  const compressed_table& table,
+  std::span<const std::size_t> selected_columns,
+  sirius::codegen::scan_filter_request const& request,
+  sirius::codegen::scan_filter_result& result,
+  std::span<const ::cuda::stream_ref> streams,
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 }  // namespace simpatico

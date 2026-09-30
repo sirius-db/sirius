@@ -49,6 +49,7 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
@@ -1876,5 +1877,68 @@ TEST_CASE("validate_recorded_column_storage cross-checks recorded carriers again
     // A zero-chunk pin records nothing and is not an error.
     REQUIRE_NOTHROW(sirius::scan_manager::validate_recorded_column_storage(
       sirius::pinned_column_storage_matrix{}, 0, 2, kContext, stored));
+  }
+}
+
+// Decode takes its streams from the target GPU memory space, so both compressed-to-GPU converters
+// and decompress_chunk refuse a space that cannot supply them, before any payload fetch or decode.
+TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
+          "[cached_serving][scan_manager][compression]")
+{
+  auto& e         = env();
+  auto& registry  = sirius::converter_registry::get();
+  auto host_chunk = std::make_shared<sirius::compressed_host_representation>(
+    *e.host_space,
+    std::make_shared<sirius::pinned_compressed_blob>(),
+    std::vector<std::string>{"k"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/64);
+  auto device_chunk = std::make_shared<sirius::compressed_device_representation>(
+    *e.gpu_space,
+    std::make_shared<sirius::compressed_device_blob>(),
+    std::vector<std::string>{"k"},
+    /*compressed_bytes=*/64,
+    /*uncompressed_bytes=*/256,
+    /*num_rows=*/64);
+  auto const rejected = Catch::Matchers::ContainsSubstring("needs a GPU target memory space");
+
+  SECTION("host-to-GPU needs a GPU target")
+  {
+    REQUIRE_THROWS_AS(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, e.host_space, e.stream()),
+      std::invalid_argument);
+    REQUIRE_THROWS_WITH(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, e.host_space, e.stream()),
+      rejected);
+    REQUIRE_THROWS_AS(
+      registry.convert<cucascade::gpu_table_representation>(*host_chunk, nullptr, e.stream()),
+      std::invalid_argument);
+  }
+
+  SECTION("device-to-GPU rejects a non-GPU target")
+  {
+    REQUIRE_THROWS_AS(registry.convert<cucascade::gpu_table_representation>(
+                        *device_chunk, e.host_space, e.stream()),
+                      std::invalid_argument);
+    REQUIRE_THROWS_WITH(registry.convert<cucascade::gpu_table_representation>(
+                          *device_chunk, e.host_space, e.stream()),
+                        rejected);
+  }
+
+  // A GPU space on another device cannot be built on a single-GPU host, so only the tier half of
+  // decompress_chunk's precondition is exercised here.
+  SECTION("decompress_chunk needs a GPU space on the current device")
+  {
+    simpatico::compressed_table const empty;
+    REQUIRE_THROWS_WITH(
+      sirius::decompress_chunk(empty,
+                               {},
+                               nullptr,
+                               sirius::decode_visibility_mask{},
+                               *e.host_space,
+                               e.stream(),
+                               rmm::mr::get_current_device_resource_ref()),
+      Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
   }
 }

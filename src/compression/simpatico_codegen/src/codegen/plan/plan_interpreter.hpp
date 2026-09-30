@@ -84,7 +84,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 
 /// Per-column decode-time row selection
 /// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
-/// ``decompress_columns_parallel`` AFTER the combine + CNT wave fixed the
+/// table decode orchestration AFTER the combine + CNT wave fixed the
 /// survivor count; never active on the default path (gate off ⇒ callers pass
 /// nullptr and behavior is byte-identical).
 struct decode_selection {
@@ -100,19 +100,20 @@ struct decode_selection {
   cudf::column_view survivor_indices{};
   /// How this column produces its compacted output. One value, so the modes
   /// cannot contradict each other and a plan that supports none of them simply
-  /// takes @c full. Must match @c probe_column(tree).compact_route — a mismatch
-  /// is refused, never silently decoded full width.
+  /// takes @c full. The @c full route is legal on any decodable plan; compacted
+  /// routes must match @c probe_column(tree).compact_route. A mismatch is
+  /// refused, never silently decoded full width.
   ///
   /// @c str_split has NO generic in-walk fallback (compacted offsets cannot
   /// feed the ordinary str_split reconstruct): if its dedicated route declines,
-  /// the call errors and the orchestrator re-runs the batch unfiltered.
+  /// the call reports an error without retrying partially submitted decoding.
   sirius::codegen::decode_route route = sirius::codegen::decode_route::full;
   /// Walk the survivor index list instead of the mask bits — the cheaper
   /// enumeration once few rows survive. Only meaningful for
   /// @c decode_route::bitpack_mask; delta roots IGNORE it (the index walk
   /// rejects them at render) and a dictionary codes region is unaffected. The
-  /// orchestrator populates @c survivor_indices whenever it sets this; any
-  /// anomaly silently keeps the mask walk (the pick is an optimization).
+  /// orchestrator supplies @c survivor_indices; absent/size-mismatched maps use
+  /// the mask walk. An index map that is used must be nonnullable INT32 data.
   bool enumerate_by_index = false;
   /// A selection that arrived AFTER the scan — post-join survivor rows, bucketed
   /// per chunk (codegen/selection/chunk_row_set.hpp). Mutually exclusive with
@@ -139,8 +140,10 @@ struct decode_selection {
 
 /// Decompress a plan tree produced by compress_column. DecodeWalk performs a
 /// single reverse walk: each codegen-fused subtree root is inverted by one
-/// high-level ``decode_fused_subtree`` call and every other step by its rep's
-/// own decompress(). Runs entirely on ``stream``.
+/// fused decode launch and every other step by its rep's
+/// own decompress(). Runs entirely on ``stream`` and returns only after completion.
+/// Host validation failures return nullptr with @p error_out set. Execution failures
+/// attempt to complete submitted work and then propagate the original exception.
 /// @param pred  Optional set-membership directive. When non-null and active the
 ///              result is a BOOL8 column of the same row count carrying
 ///              `value ∈ pred->equals_any` instead of the reconstructed column
@@ -218,7 +221,8 @@ column_decode_caps probe_column(PlanTree const& tree);
 /// must hold ``selection_mask::AllocWordsFor(num_rows)`` words; every word of
 /// every covered chunk is written (out-of-range lanes ballot to 0, so tail
 /// bits are zero by construction). Returns false + @p error_out when the plan
-/// is not bitpack-rooted or the launch fails; no device state is corrupted.
+/// or destination fails host validation. Returns true only after mask writes complete.
+/// Execution failures throw; mask contents must not be used after a failed call.
 bool decompress_column_selection_mask(PlanTree const& tree,
                                       sirius::codegen::range_predicate pred,
                                       std::uint32_t* mask_words,
@@ -226,30 +230,14 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
-/// Assemble one filtered decode's ragged output into a uniformly
-/// survivor-sized table: compacted-route columns pass through; ALL full-width
-/// columns are compacted with ONE ``cudf::gather`` over ``result.row_indices``.
-/// When ``result.applied`` is false the columns are assembled unchanged.
-/// Null-masked columns are refused (returns nullptr + @p error_out).
-/// Synchronizes @p stream before returning, so the caller may free/rebind the
-/// inputs immediately.
-///
-/// Internal to the decode: ``decompress_scan_filter`` calls this before
-/// returning, so no caller outside sees the ragged intermediate.
-std::unique_ptr<cudf::table> compact_scan_filter_output(
-  std::vector<std::unique_ptr<cudf::column>>&& columns,
-  sirius::codegen::scan_filter_result const& result,
-  ::cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr,
-  std::string* error_out);
-
-/// Reconstruct a compressed_representation from named output columns. A thin
-/// dispatcher mapping the compressor name (or the ``bitextract_<spec>`` prefix)
-/// to the matching rep subclass's ``from_outputs`` factory, which validates
-/// names/arity/type and reconstructs the rep. ``meta`` carries per-node decode
-/// metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
-/// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered
-/// from the channel buffers alone. Used by the decode driver.
+/// Reconstruct a compressed_representation from named output columns: validate the names, arity,
+/// and types for the compressor name (or the ``bitextract_<spec>`` prefix) and adopt the columns.
+/// ``meta`` carries per-node decode metadata (e.g. ``leaf_meta::ans`` / ``leaf_meta::bitcomp`` with
+/// ``uncompressed_size`` and ``original_type_id``) that cannot be recovered from the channel
+/// buffers alone. A dictionary measures and publishes its key width before returning, waiting for
+/// @p stream. Used when loading stored representations; the decoder rebuilds representations with
+/// reconstruct_decode_representation (`decode/decode_session.hpp`), which shares this validation.
+/// Returns nullptr with @p error_out set when the channels do not describe the compressor.
 std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,

@@ -22,6 +22,8 @@ if(NOT TARGET nvcomp::nvcomp)
 endif()
 
 add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
+# The root CMakeLists.txt's CCCL DeviceScan workaround, for standalone builds.
+add_compile_definitions(CCCL_DISABLE_WARPSPEED_SCAN)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
@@ -82,6 +84,7 @@ add_custom_command(
 
 add_library(
   simpatico STATIC
+  src/decode/decode_session.cpp
   # Generated: CCCL header closure embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
@@ -118,6 +121,7 @@ add_library(
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
+  src/util/host_observation.cpp
   src/util/isoc23_compat.c
   src/bridge/fused_tree_build.cpp
   src/bridge/codegen_runtime.cpp
@@ -181,6 +185,10 @@ function(add_codegen_host_test name)
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
+add_codegen_host_test(test_async_decode)
+target_link_options(test_async_decode PRIVATE "-Wl,--wrap=cudaStreamQuery"
+                    "-Wl,--wrap=cudaStreamSynchronize")
+add_codegen_host_test(test_scan_filter_session)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
@@ -211,6 +219,8 @@ target_link_libraries(simpatico_cli PRIVATE simpatico)
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
+add_test(NAME async_decode COMMAND test_async_decode)
+add_test(NAME scan_filter_session COMMAND test_scan_filter_session)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)
