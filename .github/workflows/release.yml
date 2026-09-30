@@ -40,7 +40,11 @@ jobs:
     if: github.repository == 'sirius-db/sirius'
     runs-on: ubuntu-slim
     concurrency:
-      group: release-${{ inputs.mode || 'pr-dry-run' }}
+      # workflow_dispatch runs serialize by mode (real publishers to the same tag must queue
+      # behind each other). pull_request dry-runs use the PR number instead of a shared
+      # "pr-dry-run" bucket, so unrelated PRs touching this file don't queue behind each other,
+      # only re-pushes to the *same* PR do.
+      group: release-${{ inputs.mode || format('pr-{0}', github.event.pull_request.number) }}
       queue: max
       # Do not add cancel-in-progress here, even by copying a pattern from another workflow:
       # queue: max is what bounds concurrent runs for this group. Mixing in cancel-in-progress
@@ -49,17 +53,18 @@ jobs:
     permissions:
       contents: write
       actions: read
+    # No automated immutable-releases pre-flight check: GITHUB_TOKEN can't call
+    # GET .../immutable-releases (requires repo admin read, which is not a grantable
+    # GITHUB_TOKEN permission). Manually confirmed disabled for this repo; if it's ever
+    # re-enabled, tag-move/asset-upload below will fail instead of a clean pre-flight error.
+    #
+    # Every step below passes `${{ inputs.* }}` / `${{ steps.*.outputs.* }}` through `env:` and
+    # references them as shell variables, never interpolated directly into `run:` script text.
+    # GitHub substitutes `${{ }}` expressions as literal text into the script BEFORE bash parses
+    # it, so a value interpolated directly (e.g. `sha="${{ inputs.sha }}"`) lets a crafted input
+    # inject arbitrary shell commands that run before any of our own validation of that same
+    # value gets a chance to reject it. Routing through `env:` keeps user/derived input as data.
     steps:
-      - name: Check immutable releases is disabled
-        run: |
-          enabled=$(gh api "repos/${{ github.repository }}/immutable-releases" --jq '.enabled')
-          if [ "$enabled" = "true" ]; then
-            echo "::error::Immutable releases are enabled for this repo; this workflow cannot move tags or replace release assets while that's on." >&2
-            exit 1
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -74,63 +79,77 @@ jobs:
       - name: Validate inputs
         run: |
           set -euo pipefail
-          if [ "${{ inputs.mode }}" = "stable" ]; then
-            sha="${{ inputs.sha }}"
-            if [ -z "$sha" ]; then
+          if [ "$MODE" = "stable" ]; then
+            if [ -z "$SHA_INPUT" ]; then
               echo "::error::sha is required when mode=stable" >&2
               exit 1
             fi
-            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::sha must be a full 40-character commit SHA, got: $sha" >&2
+            if ! [[ "$SHA_INPUT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::sha must be a full 40-character commit SHA, got: $SHA_INPUT" >&2
               exit 1
             fi
-            if ! git merge-base --is-ancestor "$sha" origin/main; then
-              echo "::error::$sha is not an ancestor of main" >&2
+            if ! git merge-base --is-ancestor "$SHA_INPUT" origin/main; then
+              echo "::error::$SHA_INPUT is not an ancestor of main" >&2
               exit 1
             fi
           fi
+        env:
+          MODE: ${{ inputs.mode }}
+          SHA_INPUT: ${{ inputs.sha }}
 
       - name: Resolve target SHA
         id: target
         run: |
-          if [ "${{ inputs.mode }}" = "stable" ]; then
-            sha="${{ inputs.sha }}"
+          if [ "$MODE" = "stable" ]; then
+            # Lowercase, matching the case GitHub's API always returns SHAs in, so later
+            # string-equality checks against API-returned SHAs (e.g. the tag-move assertions)
+            # compare correctly regardless of how the input was cased.
+            sha="$(echo "$SHA_INPUT" | tr 'A-F' 'a-f')"
           else
             sha=$(git rev-parse origin/main)
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+        env:
+          MODE: ${{ inputs.mode }}
+          SHA_INPUT: ${{ inputs.sha }}
 
       - name: Resolve release tag
         id: tag
         run: |
-          if [ "${{ inputs.mode }}" = "stable" ]; then
+          if [ "$MODE" = "stable" ]; then
             echo "tag=stable" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
+        env:
+          MODE: ${{ inputs.mode }}
 
       - name: Find Distribution run for target commit
         id: run
         run: |
           set -euo pipefail
-          run_id=$(gh api "repos/${{ github.repository }}/actions/workflows/distribution.yml/runs?head_sha=${{ steps.target.outputs.sha }}&status=success" \
+          run_id=$(gh api "repos/${REPO}/actions/workflows/distribution.yml/runs?head_sha=${TARGET_SHA}&status=success" \
             --jq '[.workflow_runs[] | select(.event == "push")] | .[0].id // empty')
           if [ -z "$run_id" ]; then
-            echo "::error::No successful push-triggered Distribution run found for ${{ steps.target.outputs.sha }}. Re-run the existing Distribution run for that commit (or push a new commit), then try again. This workflow never triggers a new Distribution build itself." >&2
+            echo "::error::No successful push-triggered Distribution run found for ${TARGET_SHA}. Re-run the existing Distribution run for that commit (or push a new commit), then try again. This workflow never triggers a new Distribution build itself." >&2
             exit 1
           fi
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Download extension artifacts
         run: |
-          gh run download "${{ steps.run.outputs.run_id }}" \
-            --repo "${{ github.repository }}" \
+          gh run download "$RUN_ID" \
+            --repo "$REPO" \
             --pattern "sirius-v*-extension-linux_*-cuda*" \
             --dir artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
 
       - name: Verify and rename artifacts
         id: artifacts
@@ -179,23 +198,35 @@ jobs:
       - name: Cross-check DuckDB version against distribution.yml
         run: |
           set -euo pipefail
-          expected=$(git show "${{ steps.target.outputs.sha }}:.github/workflows/distribution.yml" \
+          # Capture to a variable first, then grep/sed against the in-memory string, not a live
+          # `git show` pipe: same SIGPIPE-under-pipefail class as the git log/ls fixes elsewhere
+          # in this file (a downstream command closing its pipe early can kill the upstream
+          # process). Not currently reproducible here (distribution.yml is ~4KB, well under a
+          # pipe buffer) but this removes the risk class entirely rather than relying on the
+          # file staying small.
+          content=$(git show "${TARGET_SHA}:.github/workflows/distribution.yml")
+          expected=$(printf '%s\n' "$content" \
             | grep -m1 'duckdb_version:' | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"' | tr -d '[:space:]')
-          actual="${{ steps.artifacts.outputs.duckdb_version }}"
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::DuckDB version mismatch: distribution.yml at target SHA says $expected, artifact filenames say $actual" >&2
+          if [ "$expected" != "$DUCKDB_VERSION" ]; then
+            echo "::error::DuckDB version mismatch: distribution.yml at target SHA says $expected, artifact filenames say $DUCKDB_VERSION" >&2
             exit 1
           fi
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
       - name: Build manifest
         run: |
           set -euo pipefail
           cd renamed
           {
-            echo "# source_sha=${{ steps.target.outputs.sha }}"
-            echo "# run_id=${{ steps.run.outputs.run_id }}"
+            echo "# source_sha=${TARGET_SHA}"
+            echo "# run_id=${RUN_ID}"
             sha256sum *.duckdb_extension
           } > MANIFEST.sha256
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
 
       - name: Build release notes
         # Content here is deliberately a full "getting started" walkthrough, not just a LOAD
@@ -205,22 +236,19 @@ jobs:
         # own quick-start section, not invented here, so they stay correct as that doc evolves.
         run: |
           set -euo pipefail
-          duckdb_version="${{ steps.artifacts.outputs.duckdb_version }}"
-          duckdb_version_bare="${duckdb_version#v}"
-          sha="${{ steps.target.outputs.sha }}"
-          tag="${{ steps.tag.outputs.tag }}"
+          duckdb_version_bare="${DUCKDB_VERSION#v}"
 
           cat > NOTES.md <<EOF
           ## Getting started
 
           A quick path from nothing installed to a GPU-accelerated query. Full details,
-          requirements, and the Python API: [docs/README.md](https://github.com/${{ github.repository }}/blob/main/docs/README.md).
+          requirements, and the Python API: [docs/README.md](https://github.com/${REPO}/blob/main/docs/README.md).
 
           **Requirements**: Linux (amd64 or arm64), NVIDIA GPU Turing or newer (compute
           capability 7.5+), and either CUDA 12.x (driver >=525.60.13) or CUDA 13.x (driver
           >=580.65.06) matching the file you download below.
 
-          ### 1. Install DuckDB ${duckdb_version}
+          ### 1. Install DuckDB ${DUCKDB_VERSION}
 
           Sirius extensions must match the exact DuckDB version they were built against:
 
@@ -235,11 +263,12 @@ jobs:
           renamed_files=(renamed/*.duckdb_extension)
           for f in "${renamed_files[@]}"; do
             name="$(basename "$f")"
-            echo "- [$name](https://github.com/${{ github.repository }}/releases/download/${tag}/${name})" >> NOTES.md
+            echo "- [$name](https://github.com/${REPO}/releases/download/${TAG}/${name})" >> NOTES.md
           done
-          # Array indexing, not `ls | head -1`: under `set -o pipefail`, head closing the pipe
-          # early can SIGPIPE the producer and abort the script (same class of bug as the
-          # `git log` fix below).
+          # Array indexing instead of `ls | head -1`: under `set -o pipefail`, head closing the
+          # pipe early can SIGPIPE the producer and abort the script (verified reproducible with
+          # git log below; this one didn't reproduce with only 4 files, but it's the same
+          # fragile pattern and not something to rely on staying small).
           first_file="$(basename "${renamed_files[0]}")"
 
           cat >> NOTES.md <<EOF
@@ -278,7 +307,7 @@ jobs:
 
           EOF
 
-          if [ "${{ inputs.mode }}" = "stable" ]; then
+          if [ "$MODE" = "stable" ]; then
             cat >> NOTES.md <<'BLURB'
           ## About Sirius
 
@@ -293,95 +322,111 @@ jobs:
               echo
             } >> NOTES.md
             if git rev-parse -q --verify refs/tags/stable >/dev/null 2>&1; then
-              range="stable..${sha}"
+              range="stable..${TARGET_SHA}"
             else
-              range="${sha}"
+              range="${TARGET_SHA}"
             fi
             # git log -n 50, not `git log ... | head -50`: under `set -o pipefail`, head closing
             # the pipe after 50 lines sends git log SIGPIPE, and pipefail then aborts the whole
-            # script with exit 141. Verified reproducible against this repo's real history.
-            # -n limits git log's own output at the source instead, no pipe to truncate.
+            # script with exit 141. Verified reproducible against this repo's real history
+            # (git log --oneline alone piped to head -50 fails the same way). -n limits git log's
+            # own output at the source instead, no pipe to truncate.
             git log -n 50 "${range}" --oneline | sed 's/^/- /' >> NOTES.md
           fi
+        env:
+          MODE: ${{ inputs.mode }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
       - name: Resolve or create draft release
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
             if [ "$is_draft" != "true" ]; then
-              gh release edit "$tag" --draft
+              gh release edit "$TAG" --draft
             fi
           else
-            gh release create "$tag" --draft --title "$tag" --notes "staging"
+            # --target is required here: without it, gh release create auto-creates the tag
+            # at whatever main HEAD is right now, not the target SHA, leaving a real tag
+            # pointing at the wrong commit until the later tag-move step corrects it.
+            gh release create "$TAG" --target "$TARGET_SHA" --draft --title "$TAG" --notes "staging"
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Upload release assets to the draft
         if: github.event_name == 'workflow_dispatch'
         run: |
-          gh release upload "${{ steps.tag.outputs.tag }}" \
+          gh release upload "$TAG" \
             renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
 
       - name: Verify uploaded assets while still draft
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
-          gh release download "${{ steps.tag.outputs.tag }}" --dir "$tmp"
-          (cd "$tmp" && sha256sum -c MANIFEST.sha256)
+          gh release download "$TAG" --dir "$tmp"
+          # Strip the # source_sha/run_id comment lines before checking: sha256sum -c doesn't
+          # fail on them (exit 0 either way, verified), but it does print a "WARNING: N lines
+          # are improperly formatted" that reads like a real problem in the logs.
+          (cd "$tmp" && grep -v '^#' MANIFEST.sha256 | sha256sum -c -)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
 
       - name: Move or create the release tag
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          sha="${{ steps.target.outputs.sha }}"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
             # existing tag, so this has to go through the git refs API directly.
-            gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" -f sha="$sha" -F force=true
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/$TAG" -f sha="$TARGET_SHA" -F force=true
           else
             # First-ever publish of this tag - create it directly at the target SHA. Do not
             # rely on `gh release create`'s implicit tag creation, which would plant it at
             # whatever main HEAD is at creation time, not the target SHA.
-            gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$tag" -f sha="$sha"
+            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/$TAG" -f sha="$TARGET_SHA"
           fi
-          resolved=$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)
-          if [ "$resolved" != "$sha" ]; then
-            echo "::error::Tag $tag resolved to $resolved after move/create, expected $sha" >&2
+          resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
+          if [ "$resolved" != "$TARGET_SHA" ]; then
+            echo "::error::Tag $TAG resolved to $resolved after move/create, expected $TARGET_SHA" >&2
             exit 1
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Finalize metadata and publish
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          short_sha=$(echo "${{ steps.target.outputs.sha }}" | cut -c1-7)
+          short_sha=$(echo "$TARGET_SHA" | cut -c1-7)
           # Both latest and stable are always marked prerelease on GitHub - this repo has no
           # versioned/GA release track yet, these are just maintainer-promoted rolling snapshots.
-          gh release edit "$tag" --title "${tag} (${short_sha})" --notes-file NOTES.md --prerelease=true
-          gh release edit "$tag" --draft=false
+          gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
+          gh release edit "$TAG" --draft=false
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Post-publish assertion
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          sha="${{ steps.target.outputs.sha }}"
-          out=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
+          out=$(gh release view "$TAG" --json isDraft,isPrerelease,assets)
           is_draft=$(echo "$out" | jq -r .isDraft)
           is_pre=$(echo "$out" | jq -r .isPrerelease)
           asset_count=$(echo "$out" | jq '.assets | length')
@@ -390,10 +435,13 @@ jobs:
             echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets>=5)" >&2
             exit 1
           fi
-          resolved=$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)
-          if [ "$resolved" != "$sha" ]; then
-            echo "::error::Final tag check failed: $tag resolves to $resolved, expected $sha" >&2
+          resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
+          if [ "$resolved" != "$TARGET_SHA" ]; then
+            echo "::error::Final tag check failed: $TAG resolves to $resolved, expected $TARGET_SHA" >&2
             exit 1
           fi
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
