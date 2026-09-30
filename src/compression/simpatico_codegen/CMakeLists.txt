@@ -25,6 +25,7 @@ add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
+include(cmake/jit_header_manifest.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -37,20 +38,19 @@ add_custom_command(
     ${CMAKE_COMMAND}
     "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
     "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
-    "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+    "-DOUT=${EMBED_JIT_HEADERS_OUT}" "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
+          "${XXHSUM_EXECUTABLE}"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
 add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
 
-# Embed the CCCL (<cuda/std/...>, <cub/...>) header closure the runtime NVRTC
-# JIT compiles against. Scanned transitively at build time from the kernel
-# prelude roots (so it tracks the CCCL version), and fed to NVRTC as in-memory
-# headers -- the JIT then needs no CCCL tree on disk, only the driver + the
-# nvrtc runtime the extension already links.
+# Embed the complete CCCL library bundle as named in-memory headers. Runtime
+# compilation needs neither an installed header tree nor include-closure rules.
 set(EMBED_CCCL_HEADERS_OUT
     "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/cccl_embedded_headers.cpp"
 )
@@ -72,17 +72,18 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} "-DINCLUDE_DIRS_FILE=${EMBED_CCCL_INCLUDE_DIRS}"
     "-DOUT=${EMBED_CCCL_HEADERS_OUT}" "-DDEPFILE=${EMBED_CCCL_HEADERS_DEPFILE}"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+    "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
-          "${EMBED_CCCL_INCLUDE_DIRS}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
+          "${EMBED_CCCL_INCLUDE_DIRS}" "${XXHSUM_EXECUTABLE}"
   DEPFILE "${EMBED_CCCL_HEADERS_DEPFILE}"
-  COMMENT
-    "Scanning + embedding CCCL JIT header closure into ${EMBED_CCCL_HEADERS_OUT}"
+  COMMENT "Embedding CCCL JIT header bundle into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
 
 add_library(
   simpatico STATIC
-  # Generated: CCCL header closure embedded for the runtime JIT.
+  # Generated: complete CCCL header bundle embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
@@ -209,6 +210,7 @@ target_include_directories(simpatico_cli
 target_link_libraries(simpatico_cli PRIVATE simpatico)
 
 enable_testing()
+add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
