@@ -36,6 +36,8 @@
 #include <thread>
 #include <vector>
 
+using Catch::Matchers::ContainsSubstring;
+
 namespace fs = std::filesystem;
 
 using namespace sirius::exec;
@@ -534,7 +536,7 @@ TEST_CASE_METHOD(fragment_fixture,
       auto receiver = make_receiver({{"a"}, integer_type, {0}});
       receiver->build();
       REQUIRE_THROWS_WITH(receiver->relay_from(*failed, 0, 0, 0),
-                          Catch::Contains("source fragment's run() failed"));
+                          ContainsSubstring("source fragment's run() failed"));
       require_receiver_still_open(*receiver);
     }
 
@@ -692,7 +694,7 @@ TEST_CASE_METHOD(fragment_fixture,
       streaming_fragment fragment(*con->context, std::move(spec));
       REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
       // A failed build() is single-shot, rather than failing later on a half-registered session.
-      REQUIRE_THROWS_WITH(fragment.build(), Catch::Contains("cannot be retried"));
+      REQUIRE_THROWS_WITH(fragment.build(), ContainsSubstring("cannot be retried"));
       require_window_free();
     }
 
@@ -716,7 +718,7 @@ TEST_CASE_METHOD(fragment_fixture,
       // The poisoned output surfaces the run's cause, not an empty or finished stream.
       REQUIRE_THROWS_WITH(fragment->pull(0), cause);
       REQUIRE_FALSE(fragment->drained(0));
-      REQUIRE_THROWS_WITH(fragment->run(), Catch::Contains("previous run() failed"));
+      REQUIRE_THROWS_WITH(fragment->run(), ContainsSubstring("previous run() failed"));
       require_window_free();
     }
 
@@ -989,9 +991,9 @@ TEST_CASE_METHOD(fragment_fixture,
       auto stale = make_leaf();
       stale->build();
       sirius_ctx->get_scan_manager().bump_pin_registry_epoch_for_testing();
-      REQUIRE_THROWS_WITH(stale->run(), Catch::Contains("pinned or unpinned"));
-      REQUIRE_THROWS_WITH(stale->pull(0), Catch::Contains("pinned or unpinned"));
-      REQUIRE_THROWS_WITH(stale->run(), Catch::Contains("previous run() failed"));
+      REQUIRE_THROWS_WITH(stale->run(), ContainsSubstring("pinned or unpinned"));
+      REQUIRE_THROWS_WITH(stale->pull(0), ContainsSubstring("pinned or unpinned"));
+      REQUIRE_THROWS_WITH(stale->run(), ContainsSubstring("previous run() failed"));
 
       auto next = make_leaf();
       next->build();
@@ -1016,7 +1018,7 @@ TEST_CASE_METHOD(fragment_fixture,
       receiver.build();
       receiver.relay_from(*sender, 0, 0, 0);
 
-      REQUIRE_THROWS_WITH(receiver.run(), Catch::Contains("still open"));
+      REQUIRE_THROWS_WITH(receiver.run(), ContainsSubstring("still open"));
       receiver.close_input(0, 1);
       receiver.run();
       REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5});
@@ -1027,9 +1029,9 @@ TEST_CASE_METHOD(fragment_fixture,
       auto fragment = make_leaf();
       {
         query_window window(*sirius_ctx, *con->context, "frag12_outer");
-        REQUIRE_THROWS_WITH(fragment->build(), Catch::Contains("nested execution window"));
+        REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("nested execution window"));
       }
-      REQUIRE_THROWS_WITH(fragment->build(), Catch::Contains("cannot be retried"));
+      REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("cannot be retried"));
     }
 
     con->Rollback();

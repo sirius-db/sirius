@@ -289,7 +289,7 @@ TEST_CASE("FFI a build() that fails after setup rolls back and leaves the Contex
     auto failed = sirius::ffi::make_fragment(*ctx);
     failed->declare_input_column(0, "a", "BIGINT");
     REQUIRE_THROWS_WITH(failed->build(local_files_plan(path)),
-                        Catch::Contains("the plan does not read it"));
+                        Catch::Matchers::ContainsSubstring("the plan does not read it"));
   }
 
   auto next = sirius::ffi::make_fragment(*ctx);
@@ -322,7 +322,7 @@ TEST_CASE("FFI a hash key on a single output is rejected at build()",
   auto routed = sirius::ffi::make_fragment(*ctx);
   routed->declare_output(0);
   routed->declare_output_hash_key(0);
-  REQUIRE_THROWS_WITH(routed->build(plan), Catch::Contains("at least two"));
+  REQUIRE_THROWS_WITH(routed->build(plan), Catch::Matchers::ContainsSubstring("at least two"));
 
   auto next = sirius::ffi::make_fragment(*ctx);
   next->build(plan);
