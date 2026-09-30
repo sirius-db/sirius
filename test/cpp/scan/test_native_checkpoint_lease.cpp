@@ -10,9 +10,14 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <fcntl.h>
+#include <op/scan/duckdb_native_metadata_cache.hpp>
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+#include <op/scan/metadata_walk_parallel.hpp>
 #include <signal.h>
 #include <sirius_context.hpp>
 #include <spawn.h>
@@ -32,6 +37,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -181,6 +187,102 @@ struct scoped_native_observer {
   }
   ~scoped_native_observer() { context.native_checkpoint_hook_for_testing = {}; }
 };
+
+struct walk_threads_guard {
+  std::optional<std::string> previous;
+  walk_threads_guard()
+  {
+    if (auto const* value = std::getenv("SIRIUS_METADATA_WALK_THREADS")) { previous = value; }
+    setenv("SIRIUS_METADATA_WALK_THREADS", "2", 1);
+  }
+  ~walk_threads_guard()
+  {
+    if (previous) {
+      setenv("SIRIUS_METADATA_WALK_THREADS", previous->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_METADATA_WALK_THREADS");
+    }
+  }
+};
+
+void check_metadata_walk_lease(bool cache_hit)
+{
+  NativeLeaseFixture fixture;
+  prepare_native_table(fixture);
+  auto& con    = *fixture.con;
+  auto sibling = sibling_connection(fixture);
+  auto context = sirius::test::get_registered_sirius_context(con);
+  auto& cache  = sirius::op::scan::duckdb_native_metadata_cache::instance();
+  walk_threads_guard threads;
+  cache.clear();
+  auto const sql = "SELECT sum(i) FROM native_lease_t WHERE i >= 100000";
+  if (cache_hit) { query_ok(con, sql); }
+
+  query_ok(con, "BEGIN TRANSACTION READ ONLY");
+  auto& catalog = duckdb::Catalog::GetCatalog(*con.context, fixture.attach_alias);
+  auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con.context, "main", "native_lease_t")
+                  .Cast<duckdb::DuckTableEntry>();
+  auto& blocks = dynamic_cast<duckdb::SingleFileBlockManager&>(
+    table.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
+  auto const iteration = blocks.GetCheckpointIteration();
+  query_ok(con, "COMMIT");
+
+  auto const hits           = cache.hits();
+  auto const products       = cache.product_hits();
+  auto const rebuilds       = cache.rebuilds();
+  auto const parallel_walks = sirius::op::scan::parallel_metadata_walks_for_testing.load();
+  auto const before         = context->get_transparent_execution_stats();
+  phase_gate prepared;
+  scoped_native_observer observer(*context, [&](auto&, auto phase, uint64_t value) {
+    if (phase == "native_prepared") { prepared.stop(value); }
+  });
+  auto query = std::async(std::launch::async, [&] { return scalar_or_error(con.Query(sql)); });
+  REQUIRE(prepared.wait());
+  CHECK(context->get_scan_manager().checkpoint_key_count() == 1);
+  CHECK(prepared.iteration == iteration);
+  CHECK(blocks.GetCheckpointIteration() == iteration);
+  if (cache_hit) {
+    CHECK(cache.hits() == hits + 1);
+    CHECK(cache.product_hits() == products + 1);
+    CHECK(cache.rebuilds() == rebuilds);
+    CHECK(sirius::op::scan::parallel_metadata_walks_for_testing.load() == parallel_walks);
+  } else {
+    CHECK(cache.hits() == hits);
+    CHECK(cache.product_hits() == products);
+    CHECK(cache.rebuilds() == rebuilds + 1);
+    CHECK(sirius::op::scan::parallel_metadata_walks_for_testing.load() > parallel_walks);
+  }
+  auto checkpoint = sibling->Query("CHECKPOINT");
+  REQUIRE(checkpoint);
+  REQUIRE(checkpoint->HasError());
+  CHECK(checkpoint->GetErrorType() == duckdb::ExceptionType::TRANSACTION);
+  auto forced = std::async(std::launch::async, [&] {
+    auto result = sibling->Query("FORCE CHECKPOINT");
+    return result->HasError() ? result->GetError() : std::string{};
+  });
+  CHECK(forced.wait_for(150ms) == std::future_status::timeout);
+  CHECK(blocks.GetCheckpointIteration() == iteration);
+  prepared.release();
+  REQUIRE(query.wait_for(10s) == std::future_status::ready);
+  CHECK(query.get() == "39999900000");
+  REQUIRE(forced.wait_for(10s) == std::future_status::ready);
+  CHECK(forced.get().empty());
+  CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+
+  query_ok(*sibling, "INSERT INTO native_lease_t VALUES (300000)");
+  query_ok(*sibling, "CHECKPOINT");
+  auto const next_iteration = blocks.GetCheckpointIteration();
+  CHECK(next_iteration > iteration);
+  CHECK(scalar_or_error(con.Query(sql)) == "40000200000");
+  CHECK(prepared.iteration == next_iteration);
+  CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+  auto const after = context->get_transparent_execution_stats();
+  CHECK(after.successful_rebinds == before.successful_rebinds + 2);
+  CHECK(after.executions == before.executions + 2);
+  CHECK(after.fallbacks == before.fallbacks);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.checkpoint_revalidation_failures == before.checkpoint_revalidation_failures);
+}
 
 }  // namespace
 
@@ -342,6 +444,20 @@ TEST_CASE("native checkpoint lease starts at execution preparation and releases 
   CHECK(forced_checkpoint.get().empty());
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   query_ok(*sibling, "CHECKPOINT");
+}
+
+TEST_CASE("native metadata cache hits retain checkpoint protection",
+          "[scan][native][checkpoint][integration]")
+{
+  if (sirius::test::run_isolated()) { return; }
+  check_metadata_walk_lease(true);
+}
+
+TEST_CASE("fresh parallel native metadata walks retain checkpoint protection",
+          "[scan][native][checkpoint][integration]")
+{
+  if (sirius::test::run_isolated()) { return; }
+  check_metadata_walk_lease(false);
 }
 
 TEST_CASE("planning and retained prepared native plans hold no checkpoint lease",
