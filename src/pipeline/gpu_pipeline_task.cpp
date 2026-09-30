@@ -474,6 +474,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
     } catch (...) {
       // The hook may have enqueued reads of the input, which is released as this unwinds.
       synchronize_after_exception(stream, pipeline);
+      (void)cudaGetLastError();  // Clear a non-sticky error so the next task does not inherit it.
       throw;
     }
     try {

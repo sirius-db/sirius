@@ -206,6 +206,11 @@ using raw_bloom_ref = cuco::bloom_filter_ref<Key,
 
 /**
  * @brief Throws `detail::accumulation_cuda_error` for a failed CUDA call after clearing the error.
+ *
+ * @param status The result of the CUDA call
+ * @param call The name of the CUDA call, used in the error message
+ * @param kernel_launch Whether @p status comes from a kernel launch
+ * @throws detail::accumulation_cuda_error if @p status is not `cudaSuccess`
  */
 void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
 {
@@ -256,28 +261,32 @@ class cuda_event final {
  * @brief One published replica of an accumulated key: the array and the partial stream that frees
  * it.
  *
- * `rmm::device_buffer` makes its own device current when it frees, so neither this replica nor a
- * builder partial needs a device guard on destruction.
+ * The replica and the builder's partial share the stream, and whichever releases it last destroys
+ * it, so both destructors make their own GPU current first.
  */
 struct accumulated_bloom_replica {
   int device_id;
-  cudf::data_type type;
   std::size_t blocks;
   std::shared_ptr<rmm::cuda_stream>
     stream;  // Declared before bits: outlives the stream-ordered free.
   std::unique_ptr<rmm::device_buffer> bits;
 
   accumulated_bloom_replica(int device,
-                            cudf::data_type key_type,
                             std::size_t num_blocks,
                             std::shared_ptr<rmm::cuda_stream> owner_stream,
                             std::unique_ptr<rmm::device_buffer> storage) noexcept
     : device_id{device},
-      type{key_type},
       blocks{num_blocks},
       stream{std::move(owner_stream)},
       bits{std::move(storage)}
   {
+  }
+
+  ~accumulated_bloom_replica() noexcept
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
+    bits.reset();
+    stream.reset();
   }
 
   accumulated_bloom_replica(accumulated_bloom_replica const&)            = delete;
@@ -549,12 +558,13 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
       return detail::run_membership_probe<Key>(
         _domain, probe, prior_mask_words, stream, mr, bloom_lookup<decltype(ref)>{ref});
     };
-    // accumulated_bloom_builder::supports admits only INT32 and INT64 keys.
-    return accumulated->type.id() == cudf::type_id::INT32 ? probe_with(std::int32_t{})
-                                                          : probe_with(std::int64_t{});
+    switch (_domain.rep) {
+      case membership_key_rep::i32: return probe_with(std::int32_t{});
+      case membership_key_rep::i64: return probe_with(std::int64_t{});
+      default: return nullptr;  // `accumulated_bloom_builder::supports` admits no other key type.
+    }
   }
-  auto const* replica =
-    _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  auto const* replica = _impl ? _impl->find(resolved) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
   return std::visit(
@@ -593,12 +603,16 @@ struct accumulated_bloom_builder::impl {
 
     ~partial()
     {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       if (leak_storage->load()) {
         // A failed host join left work that may still touch these arrays: never free them.
         for (auto& array : arrays) {
           (void)array.release();
         }
       }
+      init.reset();
+      arrays.clear();
+      stream.reset();
     }
 
     partial(partial const&)            = delete;
@@ -1052,7 +1066,6 @@ std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> accumulated_bloom_buil
     for (auto const& entry : _impl->partials) {
       filter->accumulated_replicas.push_back(
         std::make_unique<accumulated_bloom_replica>(entry->device_id,
-                                                    _impl->keys[key_index].type,
                                                     _impl->geometry.blocks,
                                                     entry->stream,
                                                     std::move(entry->arrays[key_index])));

@@ -169,6 +169,9 @@ class accumulated_bloom_builder final {
    *
    * Narrower than `sirius_dynamic_bloom_filter::supports`: every other key type publishes only from
    * a whole build.
+   *
+   * @param type The storage type of a build key column
+   * @return True if @p type is INT32 or INT64
    */
   [[nodiscard]] static constexpr bool supports(cudf::data_type type) noexcept
   {
@@ -201,6 +204,9 @@ class accumulated_bloom_builder final {
 
   /**
    * @brief Whether @p device holds a partial.
+   *
+   * @param device The GPU to look up
+   * @return True if `try_create` allocated arrays on @p device
    */
   [[nodiscard]] bool has_partial(rmm::cuda_device_id device) const noexcept;
 

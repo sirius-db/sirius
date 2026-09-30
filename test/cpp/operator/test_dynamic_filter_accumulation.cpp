@@ -921,20 +921,24 @@ TEST_CASE("an accumulated filter probes like every other membership filter",
   rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
   auto const stream = fixture.task_stream(0);
 
+  // Each probe also holds absent values inside and outside the build's range, so a probe that keeps
+  // every row fails. Bloom false positives are deterministic, so these stay absent.
   SECTION("an INT64 key reads an INT32 probe")
   {
-    auto const probe = make_probe<std::int32_t>({1, 4, 898, 2701, 3598}, stream);
+    auto const probe =
+      make_probe<std::int32_t>({1, 4, 898, 2701, 3598, 2, 901, 2000, -1, 1'000'000}, stream);
     REQUIRE(probe_mask(int64_key, probe->view(), stream) ==
-            std::vector<bool>{true, true, true, true, true});
+            std::vector<bool>{true, true, true, true, true, false, false, false, false, false});
   }
   SECTION("an INT32 key reads an INT64 probe and rejects values outside INT32")
   {
     constexpr auto above = std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1;
     constexpr auto below = std::int64_t{std::numeric_limits<std::int32_t>::min()} - 1;
-    auto const probe =
-      make_probe<std::int64_t>({0, 299, 900, 1199, above, below, std::int64_t{1} << 40}, stream);
-    REQUIRE(probe_mask(int32_key, probe->view(), stream) ==
-            std::vector<bool>{true, true, true, true, false, false, false});
+    auto const probe     = make_probe<std::int64_t>(
+      {0, 299, 900, 1199, above, below, std::int64_t{1} << 40, 300, 600, -1, 5000}, stream);
+    REQUIRE(
+      probe_mask(int32_key, probe->view(), stream) ==
+      std::vector<bool>{true, true, true, true, false, false, false, false, false, false, false});
   }
   SECTION("rows the prior mask dropped stay dropped")
   {
@@ -954,30 +958,98 @@ TEST_CASE("an accumulated filter probes like every other membership filter",
   }
 }
 
-TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot read",
+TEST_CASE("accumulation skips a key none of whose bindings can read its filter",
           "[dynamic_filter][multi_partition]")
 {
   acc::fixture fixture;
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const second = fixture.make_batch(0, 900, 300);
-  // Key 0 is probed at FLOAT64, which no integer key domain reads; key 1 is probed at a narrower
-  // integer carrier, which its domain reads.
-  REQUIRE(fixture.begin(
-    {first, second},
-    fixture.make_plan(
-      256 * mib,
-      {cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}},
-      {},
-      {cudf::data_type{cudf::type_id::FLOAT64}, cudf::data_type{cudf::type_id::INT32}})));
+  auto const before = fixture.allocated_bytes();
+  constexpr cudf::data_type int32{cudf::type_id::INT32};
+  constexpr cudf::data_type int64{cudf::type_id::INT64};
+  constexpr cudf::data_type float64{cudf::type_id::FLOAT64};
+
+  SECTION("as the only key, nothing starts or allocates")
+  {
+    REQUIRE_FALSE(
+      fixture.begin({first, second}, fixture.make_plan(256 * mib, {int32}, {}, {float64})));
+    REQUIRE_FALSE(fixture.session->accumulation_claimed());
+    REQUIRE(fixture.allocated_bytes() == before);
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.bindings_skipped_incompatible_probe == 1);
+    REQUIRE(counters.accumulations_started == 0);
+  }
+  SECTION("beside a readable key, only the readable key accumulates")
+  {
+    // Key 0 is probed at FLOAT64, which no integer key domain reads; key 1 is probed at a narrower
+    // integer carrier, which its domain reads.
+    REQUIRE(fixture.begin({first, second},
+                          fixture.make_plan(256 * mib, {int32, int64}, {}, {float64, int32})));
+    REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 1));
+    REQUIRE(fixture.stats.snapshot().bindings_skipped_incompatible_probe == 1);
+    REQUIRE_FALSE(fixture.contribute(first));
+    fixture.run(fixture.contribute(second), 0);
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.bindings_skipped_incompatible_probe == 1);
+    REQUIRE(counters.filters_pushed == 1);
+    REQUIRE(counters.accumulation_publications_finished == 1);
+    REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
+    for (auto const& batch : {first, second}) {
+      REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
+    }
+  }
+  SECTION("a binding without a recorded probe type is left to the runtime")
+  {
+    REQUIRE(fixture.begin(
+      {first, second},
+      fixture.make_plan(256 * mib, {int32}, {}, {cudf::data_type{cudf::type_id::EMPTY}})));
+    REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 1));
+    REQUIRE(fixture.stats.snapshot().bindings_skipped_incompatible_probe == 0);
+  }
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_error == 0);
+}
+
+TEST_CASE("an accumulated fan-out skips bindings whose probe type the key cannot read",
+          "[dynamic_filter][multi_partition]")
+{
+  using plan_type = op::dynamic_filter_publish_plan;
+  constexpr cudf::data_type int32{cudf::type_id::INT32};
+  constexpr cudf::data_type int64{cudf::type_id::INT64};
+  acc::fixture fixture;
+  auto const first  = fixture.make_batch(0, 0, 300);
+  auto const second = fixture.make_batch(0, 900, 300);
+  auto const before = fixture.allocated_bytes();
+  // Key 0 is readable on the fixture's channel, so it accumulates, but `other` probes it at
+  // FLOAT64, which its domain cannot read; key 1 is readable on the fixture's channel only.
+  auto const other = std::make_shared<op::sirius_dynamic_filter_set>();
+  std::vector<plan_type::probe_target> targets;
+  targets.push_back({.filter_set               = fixture.channel,
+                     .route_class              = op::dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings             = {{0, 0, int32}, {1, 1, int32}}});
+  targets.push_back({.filter_set               = other,
+                     .route_class              = op::dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = false,
+                     .key_bindings = {{0, 0, cudf::data_type{cudf::type_id::FLOAT64}}}});
+  plan_type plan{{{.planner_condition_index = 0, .build_key_ordinal = 0, .storage_type = int32},
+                  {.planner_condition_index = 1, .build_key_ordinal = 1, .storage_type = int64}},
+                 std::move(targets),
+                 fixture.spaces,
+                 {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+  REQUIRE(fixture.begin({first, second}, std::move(plan)));
+  REQUIRE(fixture.allocated_bytes()[0] == before[0] + partial_bytes(600, 2));
+  REQUIRE(fixture.stats.snapshot().bindings_skipped_incompatible_probe == 0);
   REQUIRE_FALSE(fixture.contribute(first));
   fixture.run(fixture.contribute(second), 0);
   auto const counters = fixture.stats.snapshot();
   REQUIRE(counters.bindings_skipped_incompatible_probe == 1);
-  REQUIRE(counters.filters_pushed == 1);
+  REQUIRE(counters.filters_pushed == 2);
   REQUIRE(counters.accumulation_publications_finished == 1);
   REQUIRE(counters.accumulations_skipped_error == 0);
-  REQUIRE(acc::filters_on_column(*fixture.channel, 0).empty());
+  REQUIRE(acc::filters_on_column(*other, 0).empty());
+  REQUIRE(other->snapshot().terminal());
   for (auto const& batch : {first, second}) {
+    REQUIRE(fixture.possible_rows(0, batch, 0) == 300);
     REQUIRE(fixture.possible_rows(1, batch, 0) == 300);
   }
   REQUIRE(fixture.channel->snapshot().terminal());

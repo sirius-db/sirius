@@ -547,15 +547,17 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         operation->record(selection);
         return false;
       }
-      std::vector<bool> bound(operation->plan.admitted_keys().size(), false);
+      // The probe storage type of every binding, per admitted key.
+      std::vector<std::vector<cudf::data_type>> probe_types(operation->plan.admitted_keys().size());
       for (auto const& target : operation->plan.probe_targets()) {
         for (auto const& binding : target.key_bindings) {
-          bound[binding.admitted_key_index] = true;
+          probe_types[binding.admitted_key_index].push_back(binding.probe_storage_type);
         }
       }
       auto const rows = inventory->total_rows();
-      for (std::size_t index = 0; index < bound.size(); ++index) {
-        if (!bound[index]) { continue; }
+      for (std::size_t index = 0; index < probe_types.size(); ++index) {
+        auto const& bindings = probe_types[index];
+        if (bindings.empty()) { continue; }
         auto const& key = operation->plan.admitted_keys()[index];
         ++selection.keys_considered;
         if (key.build_key_domain_cardinality != 0) {
@@ -577,6 +579,17 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         }
         if (!detail::accumulated_bloom_builder::supports(key.storage_type)) {
           ++selection.keys_skipped_bloom_unsupported;
+          continue;
+        }
+        // The fan-out's rule, applied before any array is allocated: a key whose domain can read
+        // none of its bindings' probe types would publish only filters that decline every batch.
+        auto const domain   = classify_membership_key(key.storage_type);
+        auto const readable = [&](cudf::data_type probe) {
+          return probe.id() == cudf::type_id::EMPTY ||
+                 (domain && membership_probe_compatible(*domain, probe));
+        };
+        if (std::ranges::none_of(bindings, readable)) {
+          selection.bindings_skipped_incompatible_probe += bindings.size();
           continue;
         }
         if (rows == 0) { continue; }
