@@ -42,8 +42,10 @@ jobs:
     concurrency:
       group: release-${{ inputs.mode || 'pr-dry-run' }}
       queue: max
-      # queue: max is incompatible with cancel-in-progress: true (workflow fails validation) -
-      # do not add cancel-in-progress here even by copying a pattern from another workflow.
+      # Do not add cancel-in-progress here, even by copying a pattern from another workflow:
+      # queue: max is what bounds concurrent runs for this group. Mixing in cancel-in-progress
+      # would let an in-flight release get cancelled mid-publish, after it has already started
+      # mutating tags/release assets, which is unsafe.
     permissions:
       contents: write
       actions: read
@@ -64,6 +66,9 @@ jobs:
           fetch-tags: true
 
       - name: Refresh origin/main
+        # actions/checkout only guarantees the triggering ref is current; origin/main can still
+        # be stale here (workflow_dispatch runs off whatever ref triggered it), so re-fetch
+        # explicitly before resolving/validating against it.
         run: git fetch origin main:refs/remotes/origin/main
 
       - name: Validate inputs
@@ -128,6 +133,8 @@ jobs:
           dirs=(*/)
           shopt -u nullglob
           count=${#dirs[@]}
+          # 4 = 2 archs (amd64/arm64) x 2 CUDA versions (12/13), per the matrix in
+          # distribution.yml - update this if that matrix changes.
           if [ "$count" -ne 4 ]; then
             echo "::error::Expected 4 extension artifacts, found $count: ${dirs[*]}" >&2
             exit 1
@@ -301,6 +308,8 @@ jobs:
           set -euo pipefail
           tag="${{ steps.release.outputs.tag }}"
           short_sha=$(echo "${{ steps.target.outputs.sha }}" | cut -c1-7)
+          # Both latest and stable are always marked prerelease on GitHub - this repo has no
+          # versioned/GA release track yet, these are just maintainer-promoted rolling snapshots.
           gh release edit "$tag" --title "${tag} (${short_sha})" --notes-file NOTES.md --prerelease=true
           gh release edit "$tag" --draft=false
         env:
@@ -316,6 +325,7 @@ jobs:
           is_draft=$(echo "$out" | jq -r .isDraft)
           is_pre=$(echo "$out" | jq -r .isPrerelease)
           asset_count=$(echo "$out" | jq '.assets | length')
+          # 5 = 4 .duckdb_extension files + MANIFEST.sha256
           if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -lt 5 ]; then
             echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets>=5)" >&2
             exit 1
