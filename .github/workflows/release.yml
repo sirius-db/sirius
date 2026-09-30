@@ -129,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           run_id=$(gh api "repos/${REPO}/actions/workflows/distribution.yml/runs?head_sha=${TARGET_SHA}&status=success" \
-            --jq '[.workflow_runs[] | select(.event == "push")] | .[0].id // empty')
+            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main")] | .[0].id // empty')
           if [ -z "$run_id" ]; then
             echo "::error::No successful push-triggered Distribution run found for ${TARGET_SHA}. Re-run the existing Distribution run for that commit (or push a new commit), then try again. This workflow never triggers a new Distribution build itself." >&2
             exit 1
@@ -300,62 +300,70 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
-      - name: Resolve or create draft release
+      - name: Stage assets on a scratch release for verification
         if: github.event_name == 'workflow_dispatch'
+        # Staged under "$TAG-pending", never the live "$TAG": the live release/tag/assets stay
+        # published and downloadable for the entire slow part (upload, download, checksum
+        # verify). Only the swap step below touches the live release, and that step is fast
+        # enough to have no user-visible gap - unlike drafting the live release itself, which
+        # would 404 its download URLs for the whole staging window.
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
-            if [ "$is_draft" != "true" ]; then
-              gh release edit "$TAG" --draft
-            fi
-          else
-            # --target is required here: without it, gh release create auto-creates the tag
-            # at whatever main HEAD is right now, not the target SHA, leaving a real tag
-            # pointing at the wrong commit until the later tag-move step corrects it.
-            gh release create "$TAG" --target "$TARGET_SHA" --draft --title "$TAG" --notes "staging"
-          fi
+          # Clean up a leftover scratch release/tag from a prior failed run before staging fresh.
+          gh release delete "$PENDING_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$PENDING_TAG" --target "$TARGET_SHA" --draft --title "$PENDING_TAG" --notes "staging"
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
           TARGET_SHA: ${{ steps.target.outputs.sha }}
 
-      - name: Upload release assets to the draft
+      - name: Upload assets to the scratch release
         if: github.event_name == 'workflow_dispatch'
         run: |
-          gh release upload "$TAG" \
+          gh release upload "$PENDING_TAG" \
             renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
-      - name: Verify uploaded assets while still draft
+      - name: Verify staged assets
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
-          gh release download "$TAG" --dir "$tmp"
+          gh release download "$PENDING_TAG" --dir "$tmp"
           # Strip the # source_sha/run_id comment lines before checking: sha256sum -c doesn't
           # fail on them (exit 0 either way, verified), but it does print a "WARNING: N lines
           # are improperly formatted" that reads like a real problem in the logs.
           (cd "$tmp" && grep -v '^#' MANIFEST.sha256 | sha256sum -c -)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
-      - name: Move or create the release tag
+      - name: Publish the live release
         if: github.event_name == 'workflow_dispatch'
+        # Assets are already verified above, so everything here is the fast swap: move/create
+        # the live tag, replace its assets in place (--clobber replaces one file at a time, never
+        # a bulk unpublish), and update metadata. The live release is never flipped to draft, so
+        # its download URLs stay valid throughout.
         run: |
           set -euo pipefail
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+          short_sha=$(echo "$TARGET_SHA" | cut -c1-7)
+          # Both latest and stable are always marked prerelease on GitHub - this repo has no
+          # versioned/GA release track yet, these are just maintainer-promoted rolling snapshots.
+          if gh release view "$TAG" >/dev/null 2>&1; then
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
             # existing tag, so this has to go through the git refs API directly.
             gh api -X PATCH "repos/${REPO}/git/refs/tags/$TAG" -f sha="$TARGET_SHA" -F force=true
+            gh release upload "$TAG" renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
+            gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           else
-            # First-ever publish of this tag - create it directly at the target SHA. Do not
-            # rely on `gh release create`'s implicit tag creation, which would plant it at
-            # whatever main HEAD is at creation time, not the target SHA.
-            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/$TAG" -f sha="$TARGET_SHA"
+            # First-ever publish of this tag - no live release exists yet to protect, so create
+            # and publish it directly with assets attached, no staging swap needed. --target is
+            # required: without it, gh release create would auto-create the tag at whatever main
+            # HEAD is right now, not the target SHA.
+            gh release create "$TAG" renamed/*.duckdb_extension renamed/MANIFEST.sha256 \
+              --target "$TARGET_SHA" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
           if [ "$resolved" != "$TARGET_SHA" ]; then
@@ -368,19 +376,12 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
 
-      - name: Finalize metadata and publish
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          set -euo pipefail
-          short_sha=$(echo "$TARGET_SHA" | cut -c1-7)
-          # Both latest and stable are always marked prerelease on GitHub - this repo has no
-          # versioned/GA release track yet, these are just maintainer-promoted rolling snapshots.
-          gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
-          gh release edit "$TAG" --draft=false
+      - name: Clean up the scratch release
+        if: always() && github.event_name == 'workflow_dispatch'
+        run: gh release delete "$PENDING_TAG" --yes --cleanup-tag 2>/dev/null || true
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Post-publish assertion
         if: github.event_name == 'workflow_dispatch'
@@ -391,8 +392,8 @@ jobs:
           is_pre=$(echo "$out" | jq -r .isPrerelease)
           asset_count=$(echo "$out" | jq '.assets | length')
           # 5 = 4 .duckdb_extension files + MANIFEST.sha256
-          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -lt 5 ]; then
-            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets>=5)" >&2
+          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -ne 5 ]; then
+            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets=5)" >&2
             exit 1
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
