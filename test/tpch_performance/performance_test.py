@@ -813,14 +813,12 @@ def open_connection(source, gpu_execution=False, data_source="parquet", s3_input
         log(f"Opening DuckDB connection over parquet dir {source}")
         con = duckdb.connect(":memory:", config=config)
 
-    # Load Sirius before registering S3 views, then disable GPU interception
-    # during binding; the timed query enables it again in time_query().
+    # Load Sirius before registering S3 views. GPU execution stays on while the
+    # views bind: sirius_httpfs serves S3 only under gpu_execution=true.
     if gpu_execution:
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD {_sql_literal(EXTENSION_PATH)}")
         log("Sirius extension loaded")
-        if s3_input is not None:
-            con.execute("SET gpu_execution = false;")
     elif s3_input is not None:
         con.execute("LOAD httpfs")
 
