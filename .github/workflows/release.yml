@@ -1,0 +1,329 @@
+# NOTICE - Actions permissions policy (Settings > Actions > General):
+#   - "Allow sirius-db, and select non-sirius-db, actions and reusable workflows"
+#     - Allow actions created by GitHub: YES (covers actions/*)
+#     - Allow actions by Marketplace verified creators: NO
+#     - Explicitly allowed third-party actions:
+#       prefix-dev/setup-pixi@*
+#       mozilla-actions/sccache-action@*
+#     - Require actions to be pinned to a full-length commit SHA: NO
+#
+# Adding a new action? You must:
+#   1. Pin it to a full-length commit SHA (e.g. uses: owner/repo@<40-char-sha> # vX.Y.Z)
+#   2. If it is not from sirius-db, GitHub, or the explicitly allowed third-party actions above, add it to the
+#      project-level allowlist above before merging
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which release to publish/promote"
+        type: choice
+        options: [latest, stable]
+        required: true
+      sha:
+        description: "Full 40-character commit SHA on main (required for mode=stable, ignored for mode=latest)"
+        type: string
+        required: false
+  pull_request:
+    # Dry-run trigger: any PR touching this file exercises every read-only step (Distribution
+    # run lookup, artifact download/verify/rename, DuckDB version cross-check, manifest and
+    # notes generation) against real data on main, without creating/editing/publishing anything.
+    # The mutating steps below are gated to workflow_dispatch only. This lets us catch script
+    # bugs in review instead of discovering them after merging and dispatching for real.
+    paths:
+      - ".github/workflows/release.yml"
+
+jobs:
+  manual-release:
+    name: manual-release (${{ inputs.mode || 'pr-dry-run' }})
+    if: github.repository == 'sirius-db/sirius'
+    runs-on: ubuntu-slim
+    concurrency:
+      group: release-${{ inputs.mode || 'pr-dry-run' }}
+      queue: max
+      # queue: max is incompatible with cancel-in-progress: true (workflow fails validation) -
+      # do not add cancel-in-progress here even by copying a pattern from another workflow.
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check immutable releases is disabled
+        run: |
+          enabled=$(gh api "repos/${{ github.repository }}/immutable-releases" --jq '.enabled')
+          if [ "$enabled" = "true" ]; then
+            echo "::error::Immutable releases are enabled for this repo; this workflow cannot move tags or replace release assets while that's on." >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Refresh origin/main
+        run: git fetch origin main:refs/remotes/origin/main
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.mode }}" = "stable" ]; then
+            sha="${{ inputs.sha }}"
+            if [ -z "$sha" ]; then
+              echo "::error::sha is required when mode=stable" >&2
+              exit 1
+            fi
+            if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::sha must be a full 40-character commit SHA, got: $sha" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$sha" origin/main; then
+              echo "::error::$sha is not an ancestor of main" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Resolve target SHA
+        id: target
+        run: |
+          if [ "${{ inputs.mode }}" = "stable" ]; then
+            sha="${{ inputs.sha }}"
+          else
+            sha=$(git rev-parse origin/main)
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Find Distribution run for target commit
+        id: run
+        run: |
+          set -euo pipefail
+          run_id=$(gh api "repos/${{ github.repository }}/actions/workflows/distribution.yml/runs?head_sha=${{ steps.target.outputs.sha }}&status=success" \
+            --jq '[.workflow_runs[] | select(.event == "push")] | .[0].id // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful push-triggered Distribution run found for ${{ steps.target.outputs.sha }}. Re-run the existing Distribution run for that commit (or push a new commit), then try again. This workflow never triggers a new Distribution build itself." >&2
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download extension artifacts
+        run: |
+          gh run download "${{ steps.run.outputs.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "sirius-v*-extension-linux_*-cuda*" \
+            --dir artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify and rename artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p renamed
+          cd artifacts
+          shopt -s nullglob
+          dirs=(*/)
+          shopt -u nullglob
+          count=${#dirs[@]}
+          if [ "$count" -ne 4 ]; then
+            echo "::error::Expected 4 extension artifacts, found $count: ${dirs[*]}" >&2
+            exit 1
+          fi
+          duckdb_version=""
+          for d in "${dirs[@]}"; do
+            name="${d%/}"
+            # e.g. sirius-v1.5.6-extension-linux_amd64-cuda12
+            if [[ "$name" =~ ^sirius-(v[0-9.]+)-extension-(linux_[a-z0-9]+)-cuda([0-9]+)$ ]]; then
+              version="${BASH_REMATCH[1]}"
+              arch="${BASH_REMATCH[2]}"
+              cuda="${BASH_REMATCH[3]}"
+            else
+              echo "::error::Unexpected artifact name: $name" >&2
+              exit 1
+            fi
+            if [ -z "$duckdb_version" ]; then
+              duckdb_version="$version"
+            elif [ "$duckdb_version" != "$version" ]; then
+              echo "::error::Mismatched DuckDB versions across artifacts: $duckdb_version vs $version" >&2
+              exit 1
+            fi
+            src="$name/sirius.duckdb_extension"
+            dest="../renamed/sirius-${arch}-cuda${cuda}.duckdb_extension"
+            if [ ! -f "$src" ]; then
+              echo "::error::Expected file not found: $src" >&2
+              exit 1
+            fi
+            cp "$src" "$dest"
+          done
+          echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-check DuckDB version against distribution.yml
+        run: |
+          set -euo pipefail
+          expected=$(git show "${{ steps.target.outputs.sha }}:.github/workflows/distribution.yml" \
+            | grep -m1 'duckdb_version:' | sed -E 's/.*duckdb_version:[[:space:]]*//' | tr -d '"' | tr -d '[:space:]')
+          actual="${{ steps.artifacts.outputs.duckdb_version }}"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::DuckDB version mismatch: distribution.yml at target SHA says $expected, artifact filenames say $actual" >&2
+            exit 1
+          fi
+
+      - name: Build manifest
+        run: |
+          set -euo pipefail
+          cd renamed
+          {
+            echo "# source_sha=${{ steps.target.outputs.sha }}"
+            echo "# run_id=${{ steps.run.outputs.run_id }}"
+            sha256sum *.duckdb_extension
+          } > MANIFEST.sha256
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          duckdb_version="${{ steps.artifacts.outputs.duckdb_version }}"
+          sha="${{ steps.target.outputs.sha }}"
+
+          cat > NOTES.md <<EOF
+          ## Using this release
+
+          Built against DuckDB ${duckdb_version}. Download the file matching your platform and
+          CUDA version, then:
+
+          \`\`\`bash
+          duckdb -unsigned
+          \`\`\`
+          \`\`\`sql
+          LOAD './sirius-<arch>-cuda<version>.duckdb_extension';
+          \`\`\`
+
+          For client APIs, pass unsigned-extension config at connect time instead of a runtime
+          \`SET\`, e.g. Python: \`duckdb.connect(config={"allow_unsigned_extensions": "true"})\`.
+
+          **Warning**: unsigned extensions execute native code with the host process's
+          privileges. These binaries aren't published through DuckDB's official signed
+          extension repository.
+
+          EOF
+
+          if [ "${{ inputs.mode }}" = "stable" ]; then
+            cat >> NOTES.md <<'BLURB'
+          ## About Sirius
+
+          Sirius is a GPU-accelerated execution engine for DuckDB. This `stable` release is a
+          maintainer-promoted snapshot, not a versioned release, it will be replaced the next
+          time a maintainer promotes a new commit. File issues at
+          https://github.com/sirius-db/sirius/issues or join the discussion on Slack.
+          BLURB
+          else
+            {
+              echo "## Changes"
+              echo
+            } >> NOTES.md
+            if git rev-parse -q --verify refs/tags/stable >/dev/null 2>&1; then
+              range="stable..${sha}"
+            else
+              range="${sha}"
+            fi
+            git log "${range}" --oneline | head -50 | sed 's/^/- /' >> NOTES.md
+          fi
+
+      - name: Resolve or create draft release
+        id: release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.mode }}" = "stable" ]; then
+            tag="stable"
+          else
+            tag="latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+            if [ "$is_draft" != "true" ]; then
+              gh release edit "$tag" --draft
+            fi
+          else
+            gh release create "$tag" --draft --title "$tag" --notes "staging"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload release assets to the draft
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          gh release upload "${{ steps.release.outputs.tag }}" \
+            renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify uploaded assets while still draft
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          gh release download "${{ steps.release.outputs.tag }}" --dir "$tmp"
+          (cd "$tmp" && sha256sum -c MANIFEST.sha256)
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Move or create the release tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          sha="${{ steps.target.outputs.sha }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            # Tag exists - force-move it. gh release edit --target does NOT retarget an
+            # existing tag, so this has to go through the git refs API directly.
+            gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" -f sha="$sha" -F force=true
+          else
+            # First-ever publish of this tag - create it directly at the target SHA. Do not
+            # rely on `gh release create`'s implicit tag creation, which would plant it at
+            # whatever main HEAD is at creation time, not the target SHA.
+            gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$tag" -f sha="$sha"
+          fi
+          resolved=$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)
+          if [ "$resolved" != "$sha" ]; then
+            echo "::error::Tag $tag resolved to $resolved after move/create, expected $sha" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Finalize metadata and publish
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          short_sha=$(echo "${{ steps.target.outputs.sha }}" | cut -c1-7)
+          gh release edit "$tag" --title "${tag} (${short_sha})" --notes-file NOTES.md --prerelease=true
+          gh release edit "$tag" --draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Post-publish assertion
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          sha="${{ steps.target.outputs.sha }}"
+          out=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
+          is_draft=$(echo "$out" | jq -r .isDraft)
+          is_pre=$(echo "$out" | jq -r .isPrerelease)
+          asset_count=$(echo "$out" | jq '.assets | length')
+          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -lt 5 ]; then
+            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets>=5)" >&2
+            exit 1
+          fi
+          resolved=$(gh api "repos/${{ github.repository }}/git/refs/tags/$tag" --jq .object.sha)
+          if [ "$resolved" != "$sha" ]; then
+            echo "::error::Final tag check failed: $tag resolves to $resolved, expected $sha" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
