@@ -1560,8 +1560,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
           sirius::references_sirius_owned_s3_parquet(current_query_sql)) {
         throw;
       }
-      sirius::transparent::require_s3_cpu_replay(
-        source_policy, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) { throw; }
       sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
       record_transparent_fallback();
@@ -1719,8 +1717,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         sirius::references_sirius_owned_s3_parquet(current_query_sql)) {
       throw;
     }
-    sirius::transparent::require_s3_cpu_replay(
-      source_policy, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) { throw; }
     sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
     record_transparent_fallback();
