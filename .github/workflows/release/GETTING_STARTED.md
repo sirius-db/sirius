@@ -20,7 +20,7 @@ curl https://install.duckdb.org | DUCKDB_VERSION={{DUCKDB_VERSION_BARE}} sh
 
 ### 3. Allow unsigned extensions
 
-Sirius isn't published through DuckDB's official signed extension repository, so you need to explicitly allow
+Sirius isn't published through DuckDB's official signed extension repository yet, so you need to explicitly allow
 unsigned extensions before loading it:
 
 ```bash
