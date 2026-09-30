@@ -552,6 +552,8 @@ struct partition_accumulation_fixture {
   std::shared_ptr<data_batch> push(std::vector<std::int32_t> const& values)
   {
     auto batch = make_numeric_batch<std::int32_t>(*gpu, values, cudf::type_id::INT32);
+    // The batch is allocated on the default stream but read on task streams; wait for it here.
+    default_stream().sync();
     tree.build_partition->push_data_batch("default", batch);
     return batch;
   }
