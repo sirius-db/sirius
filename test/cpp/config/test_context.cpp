@@ -1914,7 +1914,7 @@ TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusio
 // multi-GPU correctness when multiple executors target different devices.
 // ============================================================================
 
-TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
+TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1935,7 +1935,8 @@ TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
   }
 }
 
-TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_foundation]")
+TEST_CASE("reservation_manager_configurator builds N GPU spaces",
+          "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1961,7 +1962,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   REQUIRE(host_count >= 1);
 }
 
-TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation]")
+TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
