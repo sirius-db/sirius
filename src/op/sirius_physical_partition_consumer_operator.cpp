@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include "sirius/exception.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
 namespace sirius {
@@ -42,6 +43,39 @@ partition_strategy sirius_physical_partition_consumer_operator::get_partition_st
   throw std::runtime_error(
     "get_partition_strategy called on a non-sizing partition consumer operator " + get_name() +
     " (id " + std::to_string(get_operator_id()) + ")");
+}
+
+void sirius_physical_partition_consumer_operator::set_placement(
+  std::shared_ptr<const partition_placement> placement)
+{
+  if (placement == nullptr) {
+    throw sirius::internal_exception("set_placement called with a null placement on " + get_name());
+  }
+  auto expected = _placement.load(std::memory_order_acquire);
+  while (expected == nullptr) {
+    if (_placement.compare_exchange_weak(expected, placement, std::memory_order_acq_rel)) {
+      return;
+    }
+  }
+  if (*expected != *placement) {
+    throw sirius::internal_exception("set_placement: " + get_name() + " already has placement " +
+                                     expected->to_string() + ", refusing " +
+                                     placement->to_string());
+  }
+}
+
+std::shared_ptr<const partition_placement>
+sirius_physical_partition_consumer_operator::require_placement(
+  std::size_t fallback_num_partitions) const
+{
+  if (auto installed = placement()) { return installed; }
+  if (_active_gpu_ids.empty()) {
+    return std::make_shared<const partition_placement>(
+      partition_placement::unpinned(std::max<std::size_t>(1, fallback_num_partitions)));
+  }
+  throw sirius::internal_exception("require_placement: " + get_name() +
+                                   " is about to emit partitioned data but no upstream PARTITION "
+                                   "installed a placement");
 }
 
 }  // namespace op

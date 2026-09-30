@@ -146,7 +146,7 @@ Key methods:
 
 ### `partitioned_operator_data`
 
-Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, HASH_JOIN, MERGE_GROUP_BY, DENSE_COUNT_JOIN) to track which partition the data belongs to. Constructing it with an index takes the exchange's `partition_placement`, and a partition pinned to a GPU becomes the data's preferred device, so the task creator runs every task of a partition on one GPU. Data with no index carries no preference and is placed by locality.
 
 ### Class Hierarchy
 

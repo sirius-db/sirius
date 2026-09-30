@@ -486,7 +486,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   {
     inputs.push_back(in.total_bytes);
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
-    return {count, false, false};
+    return partition_strategy{
+      count, false, false, partition_placement::unpinned(static_cast<std::size_t>(count))};
   }
 
   uint64_t target_bytes = 1;
@@ -562,6 +563,9 @@ TEST_CASE("partition sizing uses a projection and keeps its first decision",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
   CHECK(f.consumer.count == 4);
+  // The consumer's placement is latched with the count.
+  REQUIRE(f.consumer.placement() != nullptr);
+  CHECK(f.consumer.placement()->num_partitions() == 4);
 
   // A later sizing attempt must keep the count, even when the final total differs.
   f.finish(8 * f.received_bytes);

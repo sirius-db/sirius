@@ -201,8 +201,10 @@ dense_count_join_input::dense_count_join_input(
 dense_count_join_input::dense_count_join_input(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
-  std::size_t partition_idx)
-  : partitioned_operator_data(combine_sides(preserved_batches, counted_batches), partition_idx),
+  std::size_t partition_idx,
+  partition_placement const& placement)
+  : partitioned_operator_data(
+      combine_sides(preserved_batches, counted_batches), partition_idx, placement),
     _preserved_count(preserved_batches.size()),
     _counted_count(counted_batches.size())
 {
@@ -304,7 +306,7 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
   auto num_partitions =
     static_cast<int>(std::min(wanted, static_cast<uint64_t>(std::numeric_limits<int>::max())));
 
-  int const min_parts = partition_min_num_partitions(_num_gpus);
+  int const min_parts = partition_min_num_partitions(num_gpus());
   // For multi-gpu execution, there is a balance between doing any partitioning (added compute) vs
   // distributing the load across more GPUs. This is a rough heuristic threshold to determine if we
   // would rather share the load or avoid partitioning which adds compute.
@@ -328,7 +330,11 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
       }
     }
   }
-  return {num_partitions, /*broadcast=*/false, /*build_probe=*/false};
+  return partition_strategy{
+    num_partitions,
+    /*broadcast=*/false,
+    /*build_probe=*/false,
+    partition_placement::round_robin(static_cast<std::size_t>(num_partitions), active_gpu_ids())};
 }
 
 std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()
@@ -395,13 +401,15 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_i
 
     // A single partition imposes no cross-task device agreement, so leave it untagged and let the
     // scheduler place it on whichever GPU already holds the data. With more than one, every task
-    // of a partition must share a device, which the partition index pins.
+    // of a partition must share a device, which the exchange's placement pins.
     if (num_partitions == 1) {
       return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
                                                       std::move(counted_batches));
     }
-    return std::make_unique<dense_count_join_input>(
-      std::move(preserved_batches), std::move(counted_batches), this_partition);
+    return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
+                                                    std::move(counted_batches),
+                                                    this_partition,
+                                                    *require_placement(num_partitions));
   }
   return nullptr;
 }
