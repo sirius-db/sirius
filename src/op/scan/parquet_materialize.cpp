@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <iterator>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -59,6 +61,31 @@ bool prefers_bulk_materialize(std::span<parquet_source const> sources,
 }
 
 namespace {
+
+char const* physical_type_name(cudf::io::parquet::Type type)
+{
+  switch (type) {
+    case cudf::io::parquet::Type::BOOLEAN: return "BOOLEAN";
+    case cudf::io::parquet::Type::INT32: return "INT32";
+    case cudf::io::parquet::Type::INT64: return "INT64";
+    case cudf::io::parquet::Type::INT96: return "INT96";
+    case cudf::io::parquet::Type::FLOAT: return "FLOAT";
+    case cudf::io::parquet::Type::DOUBLE: return "DOUBLE";
+    case cudf::io::parquet::Type::BYTE_ARRAY: return "BYTE_ARRAY";
+    case cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY: return "FIXED_LEN_BYTE_ARRAY";
+    default: return "group";
+  }
+}
+
+std::string describe(cudf::io::parquet::SchemaElement const& element)
+{
+  return "'" + element.name + "' " + physical_type_name(element.type);
+}
+
+std::string path_of(parquet_source const& src)
+{
+  return src.datasource ? src.datasource->get_io_object().object_path() : std::string{"<unknown>"};
+}
 
 /// One source's column chunks, resident on the device.
 struct fetched_chunks {
@@ -148,6 +175,8 @@ std::unique_ptr<cudf::table> materialize_bulk(
     return std::move(result.tbl);
   }
 
+  require_same_parquet_schema(sources);
+
   // Several files in one split: the multi-file reader takes the row groups per
   // source and wants its chunk data flattened in source order, with each
   // source's chunks in the same row-group / column order the single-file reader
@@ -211,6 +240,30 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
 }
 
 }  // namespace
+
+void require_same_parquet_schema(std::span<parquet_source const> sources)
+{
+  if (sources.size() < 2) { return; }
+  auto const& first = sources.front().metadata->schema;
+  for (auto const& src : sources.subspan(1)) {
+    auto const& schema = src.metadata->schema;
+    if (schema == first) { continue; }
+    std::string const prefix = "[parquet_materialize] All sources must have the same schema: '" +
+                               path_of(sources.front()) + "' and '" + path_of(src) + "' ";
+    if (schema.size() != first.size()) {
+      throw std::runtime_error(prefix + "have " + std::to_string(first.size()) + " and " +
+                               std::to_string(schema.size()) +
+                               " schema elements (including the root)");
+    }
+    auto const [lhs, rhs] = std::mismatch(first.begin(), first.end(), schema.begin(), schema.end());
+    std::string detail    = describe(*lhs) + " vs " + describe(*rhs);
+    if (lhs->name == rhs->name && lhs->type == rhs->type) {
+      detail += "; they differ in annotation, width or nesting";
+    }
+    throw std::runtime_error(prefix + "differ at schema element " +
+                             std::to_string(lhs - first.begin()) + " (" + detail + ")");
+  }
+}
 
 std::unique_ptr<cudf::table> materialize_parquet(
   std::span<parquet_source const> sources,
