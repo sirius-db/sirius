@@ -100,6 +100,15 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ inputs.mode }}" = "stable" ]; then
+            echo "tag=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Find Distribution run for target commit
         id: run
         run: |
@@ -189,30 +198,83 @@ jobs:
           } > MANIFEST.sha256
 
       - name: Build release notes
+        # Content here is deliberately a full "getting started" walkthrough, not just a LOAD
+        # command: someone who knows SQL but has never touched DuckDB or Sirius should be able
+        # to go from nothing installed to a running GPU query using only this release's notes.
+        # The install command and example query below are taken verbatim from docs/README.md's
+        # own quick-start section, not invented here, so they stay correct as that doc evolves.
         run: |
           set -euo pipefail
           duckdb_version="${{ steps.artifacts.outputs.duckdb_version }}"
+          duckdb_version_bare="${duckdb_version#v}"
           sha="${{ steps.target.outputs.sha }}"
+          tag="${{ steps.tag.outputs.tag }}"
 
           cat > NOTES.md <<EOF
-          ## Using this release
+          ## Getting started
 
-          Built against DuckDB ${duckdb_version}. Download the file matching your platform and
-          CUDA version, then:
+          A quick path from nothing installed to a GPU-accelerated query. Full details,
+          requirements, and the Python API: [docs/README.md](https://github.com/${{ github.repository }}/blob/main/docs/README.md).
+
+          **Requirements**: Linux (amd64 or arm64), NVIDIA GPU Turing or newer (compute
+          capability 7.5+), and either CUDA 12.x (driver >=525.60.13) or CUDA 13.x (driver
+          >=580.65.06) matching the file you download below.
+
+          ### 1. Install DuckDB ${duckdb_version}
+
+          Sirius extensions must match the exact DuckDB version they were built against:
+
+          \`\`\`bash
+          curl https://install.duckdb.org | DUCKDB_VERSION=${duckdb_version_bare} sh
+          \`\`\`
+
+          ### 2. Download the Sirius extension for your platform
+
+          EOF
+
+          renamed_files=(renamed/*.duckdb_extension)
+          for f in "${renamed_files[@]}"; do
+            name="$(basename "$f")"
+            echo "- [$name](https://github.com/${{ github.repository }}/releases/download/${tag}/${name})" >> NOTES.md
+          done
+          # Array indexing, not `ls | head -1`: under `set -o pipefail`, head closing the pipe
+          # early can SIGPIPE the producer and abort the script (same class of bug as the
+          # `git log` fix below).
+          first_file="$(basename "${renamed_files[0]}")"
+
+          cat >> NOTES.md <<EOF
+
+          ### 3. Allow unsigned extensions
+
+          Sirius isn't published through DuckDB's official signed extension repository, so you
+          need to explicitly allow unsigned extensions before loading it:
 
           \`\`\`bash
           duckdb -unsigned
           \`\`\`
-          \`\`\`sql
-          LOAD './sirius-<arch>-cuda<version>.duckdb_extension';
-          \`\`\`
 
-          For client APIs, pass unsigned-extension config at connect time instead of a runtime
-          \`SET\`, e.g. Python: \`duckdb.connect(config={"allow_unsigned_extensions": "true"})\`.
+          For client APIs, pass the same config at connect time instead, e.g. Python:
+          \`duckdb.connect(config={"allow_unsigned_extensions": "true"})\`.
 
           **Warning**: unsigned extensions execute native code with the host process's
-          privileges. These binaries aren't published through DuckDB's official signed
-          extension repository.
+          privileges.
+
+          ### 4. Load the extension and try it
+
+          \`\`\`sql
+          LOAD './${first_file}';
+
+          -- Generate TPC-H data on the fly (scale factor 1 = ~1 GB) and query it, on GPU,
+          -- automatically. No query rewrites needed; unsupported operators fall back to CPU.
+          INSTALL tpch;
+          LOAD tpch;
+          CALL dbgen(sf=1);
+
+          SELECT l_returnflag, sum(l_quantity)
+          FROM lineitem
+          GROUP BY l_returnflag
+          ORDER BY l_returnflag;
+          \`\`\`
 
           EOF
 
@@ -235,20 +297,18 @@ jobs:
             else
               range="${sha}"
             fi
-            git log "${range}" --oneline | head -50 | sed 's/^/- /' >> NOTES.md
+            # git log -n 50, not `git log ... | head -50`: under `set -o pipefail`, head closing
+            # the pipe after 50 lines sends git log SIGPIPE, and pipefail then aborts the whole
+            # script with exit 141. Verified reproducible against this repo's real history.
+            # -n limits git log's own output at the source instead, no pipe to truncate.
+            git log -n 50 "${range}" --oneline | sed 's/^/- /' >> NOTES.md
           fi
 
       - name: Resolve or create draft release
-        id: release
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          if [ "${{ inputs.mode }}" = "stable" ]; then
-            tag="stable"
-          else
-            tag="latest"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          tag="${{ steps.tag.outputs.tag }}"
           if gh release view "$tag" >/dev/null 2>&1; then
             is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
             if [ "$is_draft" != "true" ]; then
@@ -263,7 +323,7 @@ jobs:
       - name: Upload release assets to the draft
         if: github.event_name == 'workflow_dispatch'
         run: |
-          gh release upload "${{ steps.release.outputs.tag }}" \
+          gh release upload "${{ steps.tag.outputs.tag }}" \
             renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
         env:
           GH_TOKEN: ${{ github.token }}
@@ -273,7 +333,7 @@ jobs:
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
-          gh release download "${{ steps.release.outputs.tag }}" --dir "$tmp"
+          gh release download "${{ steps.tag.outputs.tag }}" --dir "$tmp"
           (cd "$tmp" && sha256sum -c MANIFEST.sha256)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -282,7 +342,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
+          tag="${{ steps.tag.outputs.tag }}"
           sha="${{ steps.target.outputs.sha }}"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
@@ -306,7 +366,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
+          tag="${{ steps.tag.outputs.tag }}"
           short_sha=$(echo "${{ steps.target.outputs.sha }}" | cut -c1-7)
           # Both latest and stable are always marked prerelease on GitHub - this repo has no
           # versioned/GA release track yet, these are just maintainer-promoted rolling snapshots.
@@ -319,7 +379,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          tag="${{ steps.release.outputs.tag }}"
+          tag="${{ steps.tag.outputs.tag }}"
           sha="${{ steps.target.outputs.sha }}"
           out=$(gh release view "$tag" --json isDraft,isPrerelease,assets)
           is_draft=$(echo "$out" | jq -r .isDraft)
