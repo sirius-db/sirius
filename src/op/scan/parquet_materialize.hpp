@@ -78,7 +78,8 @@ struct parquet_source {
 ///
 /// Both routes honor @p options' row filter: @c materialize_all_columns applies
 /// it at row level exactly as @c read_parquet does, so the route never changes
-/// which rows come back.
+/// which rows come back.  Unless @p options allow mismatched schemas, both
+/// routes also refuse sources whose schemas differ.
 ///
 /// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
 ///                the same order.  Only read on the bulk route; any source whose
@@ -97,5 +98,11 @@ struct parquet_source {
 [[nodiscard]] bool prefers_bulk_materialize(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options) noexcept;
+
+/// Throw unless every entry of @p sources has the same footer schema as the
+/// first, compared as cudf::io::read_parquet compares several sources.  The
+/// multi-file hybrid scan reader skips that check, so the bulk route calls
+/// this first.  Each source must have non-null metadata.
+void require_same_parquet_schema(std::span<parquet_source const> sources);
 
 }  // namespace sirius::op::scan
