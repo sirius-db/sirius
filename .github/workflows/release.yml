@@ -229,110 +229,70 @@ jobs:
           RUN_ID: ${{ steps.run.outputs.run_id }}
 
       - name: Build release notes
-        # Content here is deliberately a full "getting started" walkthrough, not just a LOAD
-        # command: someone who knows SQL but has never touched DuckDB or Sirius should be able
-        # to go from nothing installed to a running GPU query using only this release's notes.
-        # The install command and example query below are taken verbatim from docs/README.md's
-        # own quick-start section, not invented here, so they stay correct as that doc evolves.
+        # Content lives in .github/workflows/release/*.md, not inline here: GETTING_STARTED.md
+        # is the shared walkthrough (requirements, install, download, unsigned-extensions,
+        # load-and-try) used by both modes, with {{PLACEHOLDER}} tokens filled in below;
+        # LATEST.md/STABLE.md are short static blurbs explaining what each tag means, appended
+        # above the (script-generated, no template needed) changelog for latest or in place of
+        # one for stable. Editing release copy is then a plain markdown edit, no backtick
+        # escaping, no touching this workflow file. The install command and example query in
+        # GETTING_STARTED.md are taken verbatim from docs/README.md's own quick-start section,
+        # not invented here, so they stay correct as that doc evolves.
         run: |
           set -euo pipefail
-          duckdb_version_bare="${DUCKDB_VERSION#v}"
+          python3 - <<'PYEOF'
+          import glob
+          import os
+          import subprocess
 
-          cat > NOTES.md <<EOF
-          ## Getting started
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+          target_sha = os.environ["TARGET_SHA"]
+          mode = os.environ["MODE"]
+          duckdb_version = os.environ["DUCKDB_VERSION"]
+          duckdb_version_bare = duckdb_version.removeprefix("v")
 
-          A quick path from nothing installed to a GPU-accelerated query. Full details,
-          requirements, and the Python API: [docs/README.md](https://github.com/${REPO}/blob/main/docs/README.md).
+          renamed_files = sorted(glob.glob("renamed/*.duckdb_extension"))
+          download_links = "\n".join(
+              f"- [{os.path.basename(f)}](https://github.com/{repo}/releases/download/{tag}/{os.path.basename(f)})"
+              for f in renamed_files
+          )
+          first_file = os.path.basename(renamed_files[0])
 
-          **Requirements**: Linux (amd64 or arm64), NVIDIA GPU Turing or newer (compute
-          capability 7.5+), and either CUDA 12.x (driver >=525.60.13) or CUDA 13.x (driver
-          >=580.65.06) matching the file you download below.
+          with open(".github/workflows/release/GETTING_STARTED.md") as f:
+              notes = f.read()
+          notes = (
+              notes.replace("{{DUCKDB_VERSION_BARE}}", duckdb_version_bare)
+              .replace("{{DUCKDB_VERSION}}", duckdb_version)
+              .replace("{{REPO}}", repo)
+              .replace("{{DOWNLOAD_LINKS}}", download_links)
+              .replace("{{FIRST_FILE}}", first_file)
+          )
 
-          ### 1. Install DuckDB ${DUCKDB_VERSION}
+          if mode == "stable":
+              with open(".github/workflows/release/STABLE.md") as f:
+                  notes += "\n\n" + f.read().rstrip() + "\n"
+          else:
+              with open(".github/workflows/release/LATEST.md") as f:
+                  notes += "\n\n" + f.read().rstrip() + "\n"
+              has_stable = subprocess.run(
+                  ["git", "rev-parse", "-q", "--verify", "refs/tags/stable"],
+                  capture_output=True,
+              ).returncode == 0
+              rev_range = f"stable..{target_sha}" if has_stable else target_sha
+              # -n 50 limits git log's own output; no pipe to a truncating consumer (head/etc.)
+              # that could SIGPIPE it under a shell's pipefail, not a concern here either way
+              # since this runs as one subprocess call, not a shell pipeline.
+              log = subprocess.run(
+                  ["git", "log", "-n", "50", rev_range, "--oneline"],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+              changes = "\n".join(f"- {line}" for line in log.splitlines())
+              notes += "\n\n## Changes\n\n" + changes + "\n"
 
-          Sirius extensions must match the exact DuckDB version they were built against:
-
-          \`\`\`bash
-          curl https://install.duckdb.org | DUCKDB_VERSION=${duckdb_version_bare} sh
-          \`\`\`
-
-          ### 2. Download the Sirius extension for your platform
-
-          EOF
-
-          renamed_files=(renamed/*.duckdb_extension)
-          for f in "${renamed_files[@]}"; do
-            name="$(basename "$f")"
-            echo "- [$name](https://github.com/${REPO}/releases/download/${TAG}/${name})" >> NOTES.md
-          done
-          # Array indexing instead of `ls | head -1`: under `set -o pipefail`, head closing the
-          # pipe early can SIGPIPE the producer and abort the script (verified reproducible with
-          # git log below; this one didn't reproduce with only 4 files, but it's the same
-          # fragile pattern and not something to rely on staying small).
-          first_file="$(basename "${renamed_files[0]}")"
-
-          cat >> NOTES.md <<EOF
-
-          ### 3. Allow unsigned extensions
-
-          Sirius isn't published through DuckDB's official signed extension repository, so you
-          need to explicitly allow unsigned extensions before loading it:
-
-          \`\`\`bash
-          duckdb -unsigned
-          \`\`\`
-
-          For client APIs, pass the same config at connect time instead, e.g. Python:
-          \`duckdb.connect(config={"allow_unsigned_extensions": "true"})\`.
-
-          **Warning**: unsigned extensions execute native code with the host process's
-          privileges.
-
-          ### 4. Load the extension and try it
-
-          \`\`\`sql
-          LOAD './${first_file}';
-
-          -- Generate TPC-H data on the fly (scale factor 1 = ~1 GB) and query it, on GPU,
-          -- automatically. No query rewrites needed; unsupported operators fall back to CPU.
-          INSTALL tpch;
-          LOAD tpch;
-          CALL dbgen(sf=1);
-
-          SELECT l_returnflag, sum(l_quantity)
-          FROM lineitem
-          GROUP BY l_returnflag
-          ORDER BY l_returnflag;
-          \`\`\`
-
-          EOF
-
-          if [ "$MODE" = "stable" ]; then
-            cat >> NOTES.md <<'BLURB'
-          ## About Sirius
-
-          Sirius is a GPU-accelerated execution engine for DuckDB. This `stable` release is a
-          maintainer-promoted snapshot, not a versioned release, it will be replaced the next
-          time a maintainer promotes a new commit. File issues at
-          https://github.com/sirius-db/sirius/issues or join the discussion on Slack.
-          BLURB
-          else
-            {
-              echo "## Changes"
-              echo
-            } >> NOTES.md
-            if git rev-parse -q --verify refs/tags/stable >/dev/null 2>&1; then
-              range="stable..${TARGET_SHA}"
-            else
-              range="${TARGET_SHA}"
-            fi
-            # git log -n 50, not `git log ... | head -50`: under `set -o pipefail`, head closing
-            # the pipe after 50 lines sends git log SIGPIPE, and pipefail then aborts the whole
-            # script with exit 141. Verified reproducible against this repo's real history
-            # (git log --oneline alone piped to head -50 fails the same way). -n limits git log's
-            # own output at the source instead, no pipe to truncate.
-            git log -n 50 "${range}" --oneline | sed 's/^/- /' >> NOTES.md
-          fi
+          with open("NOTES.md", "w") as f:
+              f.write(notes)
+          PYEOF
         env:
           MODE: ${{ inputs.mode }}
           REPO: ${{ github.repository }}
