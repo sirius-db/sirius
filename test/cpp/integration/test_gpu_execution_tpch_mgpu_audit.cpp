@@ -35,8 +35,7 @@
 //      when SIRIUS_TEST_SF10_PATH is set, >=1 otherwise — SF1 lineitem is too
 //      small to reliably produce 5 batches per GPU after round-robin split)
 //
-// Single-GPU hosts hit the WARN+return path via cudaGetDeviceCount<2 (per
-// Catch2 convention; mirrors test/cpp/downgrade/test_downgrade_executor.cpp).
+// Single-GPU hosts skip through has_gpus(2).
 
 #include <cuda_runtime.h>
 
@@ -136,7 +135,7 @@ void attach_integration_duckdb(duckdb::Connection& con)
 }  // namespace
 
 TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
-          "[integration][mgpu-audit][gpu_execution][TPC-H][Q1]")
+          "[mgpu-audit][gpu_execution][TPC-H][Q1][multi_gpu]")
 {
   // The native duckdb scan is the default and does not emit the per-GPU scan
   // markers this audit greps for; skip.
@@ -145,14 +144,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
     "on this path — skipping");
   return;
 
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN(
-      "[mgpu-audit] AUDIT-01/02/03 requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 WARN+return convention)");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   auto* env = sirius::test::acquire_integration_env_for(2);
   REQUIRE(env != nullptr);
@@ -164,7 +156,7 @@ TEST_CASE("gpu_execution - [mgpu-audit] per-GPU distribution on TPC-H Q1",
   // SiriusContexts then share the extension's global operator-id space and
   // HASH_GROUP_BY ends up with a corrupted output schema (column count
   // mismatch: got 13, expected 10) leading to a SIGSEGV mid-execution. The
-  // [tpch] tests sidestep this naturally via RUN_TPCH_MGPU's bind_env /
+  // [tpch] tests sidestep this naturally via their bind_env /
   // release_env transitions; the AUDIT TEST_CASE acquires the 2-GPU env
   // directly so we must pause the 1-GPU env explicitly. Phase 11-01 record:
   // .planning/phases/11-mgpu-audit-attach-sigsegv/11-01-FIX.md.

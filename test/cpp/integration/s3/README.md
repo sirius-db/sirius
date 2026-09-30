@@ -72,13 +72,13 @@ Without an external endpoint, MinIO-backed cases skip when
 `SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
 SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
 GLOB_SCALE switches; the targets export them for the appropriate
-process. The two harness-PUT cases skip against an external endpoint,
+process. The three harness-PUT cases skip against an external endpoint,
 even in strict mode.
 
 Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
 still runs when it matches an explicit positive name or tag selector,
-subject to that selector's exclusions. Catch2 also adds `[!hide]` to
-hidden cases. These 15 hidden cases run in `make s3-test`:
+subject to that selector's exclusions. These 15 hidden cases run in
+`make s3-test`:
 
 - `DuckDB external file cache invalidates an overwritten S3 range by ETag`
 - `gpu_execution rejects operations on nested S3 parquet columns cleanly`
@@ -111,9 +111,9 @@ spec='[s3][integration]~[large]~[aws]'
 "$bin" --list-tests --verbosity quiet "$spec"
 ```
 
-The gate lists contain 97, 5, 3 and 3 cases respectively; the deprecated
+The gate lists contain 98, 5, 3 and 3 cases respectively; the deprecated
 TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
-plus `[.]` and `[!hide]`.
+plus `[.]`.
 
 ## MinIO lifecycle
 
@@ -133,8 +133,10 @@ ACCESS_KEY or SECRET_KEY fails those tests regardless of STRICT.
 The LARGE, TPCH and GLOB_SCALE switches use the same skip-or-fail rule.
 Live HEAD/GET and query errors fail regardless of STRICT, except that
 SF10 tests report a failed describe of the SF10 object as a skip unless
-STRICT is set. The two tests that PUT objects into managed MinIO skip when
+STRICT is set. The three tests that PUT objects into managed MinIO skip when
 the endpoint is externally managed; device tests also report unavailable CUDA.
+The PUT cases cover ETag invalidation, kvikio stream ordering, and
+`transparent S3 glob rejects parquet files whose schemas differ instead of decoding them together`.
 
 `unittest.cpp` calls explicit container shutdown before exiting. The
 library's default Ryuk reaper is best effort; a killed process can leave
@@ -177,7 +179,7 @@ not uploaded.
 | `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE | HTTP + HTTPS |
 | `tpch/sf1/*` | Eight SF1 tables; requires TPCH | HTTP + HTTPS |
 | `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE | HTTP only |
-| Objects written during tests | ETag overwrite and kvikio stream-ordering inputs | HTTP only |
+| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair | HTTP only |
 
 The SF10 cache was 2,223,320,375 bytes (about 2.07 GiB), measured on
 2026-05-21, before the DuckDB v1.5.6 pin.

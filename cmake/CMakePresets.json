@@ -33,10 +33,6 @@
       "name": "clang-tsan"
     },
     {
-      "configurePreset": "legacy-release",
-      "name": "legacy-release"
-    },
-    {
       "configurePreset": "vcpkg-debug",
       "name": "vcpkg-debug"
     },
@@ -185,15 +181,8 @@
       "name": "clang-tsan"
     },
     {
-      "binaryDir": "${sourceDir}/../build/legacy-release",
       "cacheVariables": {
-        "ENABLE_LEGACY_SIRIUS": "ON"
-      },
-      "inherits": "release",
-      "name": "legacy-release"
-    },
-    {
-      "cacheVariables": {
+        "CMAKE_LINKER_TYPE": "BFD",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
         "SIRIUS_BUILD_S3_TESTS": "OFF",

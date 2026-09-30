@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <cuda_runtime_api.h>
-
 #include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -185,22 +183,14 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
 }
 
 TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two GPUs",
-          "[integration][gpu_execution][dynamic_filter][multi_partition][mgpu]")
+          "[integration][gpu_execution][dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  int devices = 0;
-  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 2) {
-    (void)cudaGetLastError();
-    WARN("needs two GPUs");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
+  // The `[integration][multi_gpu]` tags make the `shared_env_listener` in `unittest.cpp` activate
+  // this environment; resuming it again here would replace its live SiriusContext.
   auto* env = sirius::test::acquire_integration_env_for(2);
   REQUIRE(env != nullptr);
-  // Only one integration environment may be active at a time.
-  if (sirius::test::g_integration_env != nullptr && sirius::test::g_integration_env->is_active()) {
-    sirius::test::g_integration_env->pause();
-  }
-  env->resume();
-  absl::Cleanup pause_env = [env] { env->pause(); };
+  REQUIRE(env->is_active());
 
   auto const database = std::filesystem::temp_directory_path() /
                         ("sirius_df_union_mgpu_" + std::to_string(::getpid()) + ".db");

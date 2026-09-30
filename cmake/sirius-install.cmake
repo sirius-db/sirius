@@ -3,6 +3,11 @@
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
 # set covers the full dependency chain.
+if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  install(FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
+          DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
+endif()
+
 install(
   TARGETS sirius_extension
           sirius_core

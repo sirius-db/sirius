@@ -90,7 +90,7 @@ else
 
     # Convert double-quoted identifiers to single quotes in all queries
     # e.g. "order count" -> 'order count'
-    # This allows uniform gpu_processing("...") wrapping without escaping conflicts
+    # This avoids escaping conflicts when each query is embedded in a SQL string.
     echo "Converting double-quoted identifiers to single quotes..."
     for f in "$QUERY_DIR"/q*.sql; do
         sed -i 's/"/'"'"'/g' "$f"

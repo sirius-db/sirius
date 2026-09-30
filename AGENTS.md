@@ -41,8 +41,7 @@ pixi run pre-commit run -a                 # all formatting/lint hooks
 
 Running tests directly (non-obvious invocations):
 ```bash
-pixi run build/release/test/unittest --test-dir . test/sql/tpch-sirius.test    # one SQLLogic file
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"  # by Catch2 tag/test name
+pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
 ```
 
 **Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
@@ -58,8 +57,7 @@ Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-
 `src/cuda/` (GPU kernels). **Read `docs/super-sirius/` before modifying Super Sirius code** —
 see its [README](docs/super-sirius/README.md) for reading order.
 
-**Everything under `src/legacy/` is the dead `gpu_processing` path — do not modify it.** All new
-work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
+All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.
 
 Before implementing operators / memory / expression / I/O work, run `/module-context <task>` to

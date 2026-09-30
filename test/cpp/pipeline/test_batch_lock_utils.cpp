@@ -30,6 +30,7 @@
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -99,12 +100,7 @@ bool enable_p2p_for_test(int num_gpus)
 /// hardware. The WARN records which flavor a run exercised.
 bool skip_if_not_mgpu()
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs");
-    return true;
-  }
+  if (!sirius::test::has_gpus(2)) { return true; }
   if (!enable_p2p_for_test(2)) {
     WARN("GPUs 0 and 1 are not P2P-capable — cross-GPU copies will host-stage");
   }
@@ -285,7 +281,7 @@ TEST_CASE("operator-data provenance retains original input order through prepara
 }
 
 TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM rescheduling",
-          "[batch_lock_utils][mgpu][dynamic_filter][task_input_provenance]")
+          "[batch_lock_utils][mgpu][multi_gpu][dynamic_filter][task_input_provenance]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -334,7 +330,7 @@ TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM resch
 }
 
 TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -379,7 +375,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
 }
 
 TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -576,7 +572,8 @@ TEST_CASE("host to GPU upgrade normalizes LIST offsets to INT32", "[batch_lock_u
   REQUIRE(column_values_to_host<int32_t>(lcv.child(), stream) == expected_list_values(kNumLists));
 }
 
-TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_lock_utils][mgpu]")
+TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets",
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -606,7 +603,7 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
 }
 
 TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -643,7 +640,7 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
 }
 
 TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target space",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -670,7 +667,7 @@ TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target spa
 }
 
 TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;

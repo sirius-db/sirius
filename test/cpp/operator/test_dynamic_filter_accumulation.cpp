@@ -17,6 +17,7 @@
 #include "dynamic_filter_accumulation_test_utils.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
@@ -317,11 +318,12 @@ TEST_CASE("publication waits for contributions still queued on the root's task s
 }
 
 TEST_CASE("publication waits for contributions still queued on every GPU",
-          "[dynamic_filter][multi_partition][in_flight][mgpu]")
+          "[dynamic_filter][multi_partition][in_flight][mgpu][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 3);
-  if (gpus < 2 || !acc::peer_dma_between_first(gpus)) {
-    WARN("needs at least two GPUs with working peer DMA between every pair");
+  if (!acc::peer_dma_between_first(gpus)) {
+    WARN("needs working peer DMA between every pair of GPUs");
     return;
   }
   // "sources": GPU 1 contributes, so the root merges it (fold, source-ready wait, merge, egress).
@@ -355,11 +357,12 @@ TEST_CASE("publication waits for contributions still queued on every GPU",
 }
 
 TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   auto const gpus = std::min(acc::visible_gpus(), 4);
-  if (gpus < 2 || !acc::peer_dma_between_first(gpus)) {
-    WARN("needs at least two GPUs with working peer DMA between every pair");
+  if (!acc::peer_dma_between_first(gpus)) {
+    WARN("needs working peer DMA between every pair of GPUs");
     return;
   }
   // 4'718'593 rows give 9'437'216-byte arrays: five 2 MiB chunks per key with a short last chunk,
@@ -435,10 +438,11 @@ TEST_CASE("the chunk pipeline publishes the exact union to every GPU",
 }
 
 TEST_CASE("non-aligned geometries publish with exactly the scratch lease free",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!acc::peer_dma_between_first(2)) {
-    WARN("needs two GPUs with working peer DMA");
+    WARN("needs working peer DMA between two GPUs");
     return;
   }
   struct case_shape {
@@ -514,10 +518,11 @@ TEST_CASE("duplicates and replays count once and never publish twice",
 }
 
 TEST_CASE("a refused scratch lease skips publication before enqueueing anything",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!acc::peer_dma_between_first(2)) {
-    WARN("needs two GPUs with working peer DMA");
+    WARN("needs working peer DMA between two GPUs");
     return;
   }
   acc::fixture fixture(2);
@@ -622,12 +627,9 @@ TEST_CASE("input closed before every batch contributed ends without a filter",
 }
 
 TEST_CASE("a contribution that does not match its partial's GPU fails the attempt",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (acc::visible_gpus() < 2) {
-    WARN("needs two GPUs");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture(2);
   auto const first  = fixture.make_batch(0, 0, 300);
   auto const remote = fixture.make_batch(1, 900, 300);
@@ -743,10 +745,11 @@ TEST_CASE("a tracked thread never releases partial storage", "[dynamic_filter][m
 }
 
 TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
   if (!acc::peer_dma_between_first(2)) {
-    WARN("needs two GPUs with working peer DMA");
+    WARN("needs working peer DMA between two GPUs");
     return;
   }
   acc::fixture fixture(2);
@@ -768,12 +771,9 @@ TEST_CASE("a refused partial lease on a later GPU rolls back every partial",
 }
 
 TEST_CASE("a failing publishing job is masked, counted, and settles",
-          "[dynamic_filter][multi_partition][mgpu]")
+          "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
-  if (acc::visible_gpus() < 2) {
-    WARN("needs two GPUs");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
   acc::fixture fixture(2);
   auto const first    = fixture.make_batch(0, 0, 300);
   auto const second   = fixture.make_batch(0, 900, 300);

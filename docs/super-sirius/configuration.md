@@ -26,9 +26,7 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-`SIRIUS_DISABLE` is a process-startup kill switch for the **Super Sirius runtime**, not a query-fallback setting. Set `SIRIUS_DISABLE=1` before starting DuckDB to prevent that runtime from initializing and transparently routing queries to the GPU. The extension binary still loads and registers its SQL surface; legacy functions therefore remain available in builds that include them. Sirius also skips creating its Quent telemetry context and does not publish an automatic NVTX injection path. A caller-supplied `NVTX_INJECTION64_PATH` remains untouched.
-
-This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks. An unset value or `SIRIUS_DISABLE=0` enables normal Super Sirius initialization; any other set value disables it.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -863,45 +861,22 @@ SET enable_runtime_size_estimation = true;   -- off by default
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Legacy Config Flags
-
-### Legacy-release DuckDB settings
-
-The following settings only control the legacy `gpu_processing` path. Sirius registers them
-when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
-`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
-`SET` them.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
-| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
-| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
-| `use_opt_table_scan` | true | Use the legacy optimized table scan |
-| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
-| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
-| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
-| `enable_fallback_check` | false | Enable legacy fallback validation |
-| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+## Compile-Time Config Flags
 
 ### Static flags
 
 **File:** `src/include/config.hpp`
 
-Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
+Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
-| `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
-| `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
+| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
@@ -912,8 +887,8 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
 | `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
