@@ -35,6 +35,7 @@ cufile.log
 # Generated nightly environment
 envs/
 compile_commands.json
+*.pch
 .cache
 /sirius-perf-sf1000.yaml
 .rumdl_cache/
