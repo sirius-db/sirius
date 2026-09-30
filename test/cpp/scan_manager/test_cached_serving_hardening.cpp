@@ -1931,13 +1931,14 @@ TEST_CASE("compressed decode rejects a memory space that is not a GPU space",
   SECTION("decompress_chunk needs a GPU space on the current device")
   {
     simpatico::compressed_table const empty;
-    REQUIRE_THROWS_WITH(sirius::decompress_chunk(empty,
-                                                 {},
-                                                 nullptr,
-                                                 sirius::decode_visibility_mask{},
-                                                 *e.host_space,
-                                                 e.stream(),
-                                                 rmm::mr::get_current_device_resource_ref()),
-                        Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
+    REQUIRE_THROWS_WITH(
+      sirius::decompress_chunk(empty,
+                               {},
+                               nullptr,
+                               sirius::decode_visibility_mask{},
+                               *e.host_space,
+                               e.stream(),
+                               rmm::mr::get_current_device_resource_ref()),
+      Catch::Matchers::ContainsSubstring("not a GPU space on the current device"));
   }
 }
