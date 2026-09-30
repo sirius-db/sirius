@@ -261,8 +261,8 @@ void downgrade_executor::processing_loop()
     if (host_to_disk && !predicate_satisfied(req.get())) {
       std::size_t const idle_target =
         req->target_bytes.value_or(std::numeric_limits<std::size_t>::max());
-      auto const freed = _prefetching_cache->evict(
-        sirius::io::cache::eviction::mode::idle, idle_target);
+      auto const freed =
+        _prefetching_cache->evict(sirius::io::cache::eviction::mode::idle, idle_target);
       if (freed > 0) {
         req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
         planned_bytes.fetch_add(freed, std::memory_order_relaxed);
@@ -478,8 +478,8 @@ void downgrade_executor::processing_loop()
       std::size_t const already_freed = req->bytes_freed.load(std::memory_order_relaxed);
       if (already_freed < *req->target_bytes) {
         std::size_t const remaining = *req->target_bytes - already_freed;
-        auto const freed            = _prefetching_cache->evict(
-          sirius::io::cache::eviction::mode::forced, remaining);
+        auto const freed =
+          _prefetching_cache->evict(sirius::io::cache::eviction::mode::forced, remaining);
         if (freed > 0) {
           req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
           predicate_satisfied(req.get());
