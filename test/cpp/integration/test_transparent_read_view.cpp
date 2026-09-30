@@ -23,6 +23,7 @@ struct read_view_settings_guard {
   ~read_view_settings_guard()
   {
     con.Query("ROLLBACK");
+    con.Query("PRAGMA enable_optimizer");
     con.Query("RESET disabled_optimizers");
     con.Query("SET sirius_test_inject_pin_registry_change = false");
     con.Query("SET sirius_test_inject_read_view_mismatch = 'off'");
@@ -200,6 +201,69 @@ TEST_CASE_METHOD(ReadViewFixture,
   CHECK(after.successful_rebinds == before.successful_rebinds + 1);
   CHECK(after.executions == before.executions + 1);
   query_ok(connection, "RESET disabled_optimizers");
+}
+
+TEST_CASE_METHOD(
+  ReadViewFixture,
+  "Hive partition pruning validates read views with the optimizer enabled or disabled",
+  "[transparent][read_view][integration]")
+{
+  auto& connection = *con;
+  read_view_settings_guard restore{connection};
+  query_ok(connection, "RESET disabled_optimizers");
+  query_ok(connection, "SET sirius_test_inject_read_view_mismatch = 'off'");
+  query_ok(connection, "SET sirius_test_inject_pin_registry_change = false");
+  query_ok(connection, "SET sirius_test_read_view_churn_path = ''");
+
+  auto const hive_dir = std::filesystem::path(__FILE__).parent_path() / "data/hive_partitioned";
+  REQUIRE(std::filesystem::exists(hive_dir));
+  auto const scan = "read_parquet(" +
+                    sirius::test::sql_literal((hive_dir / "**/*.parquet").string()) +
+                    ", hive_partitioning=true)";
+  auto const sql = "SELECT count(*) FROM " + scan + " WHERE year=2024";
+
+  for (bool optimizer_enabled : {true, false}) {
+    query_ok(connection,
+             optimizer_enabled ? "PRAGMA enable_optimizer" : "PRAGMA disable_optimizer");
+    query_ok(connection, "SET gpu_execution = false");
+    REQUIRE(scalar(connection, "SELECT count(*) FROM " + scan) == "3");
+    auto const expected = scalar(connection, sql);
+    REQUIRE(expected == "2");
+    query_ok(connection, "SET gpu_execution = true");
+
+    for (bool fallback : {true, false}) {
+      CAPTURE(optimizer_enabled, fallback);
+      query_ok(connection,
+               std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"));
+      auto const before = sirius::test::get_transparent_execution_stats(connection);
+
+      // With the optimizer disabled, Query (not Prepare) preserves the original inventory.
+      // The SQL replan optimizes it and prunes year=2025, so the read identities must differ.
+      auto result = connection.Query(sql);
+      REQUIRE(result);
+      auto const after = sirius::test::get_transparent_execution_stats(connection);
+      if (optimizer_enabled || fallback) {
+        INFO((result->HasError() ? result->GetError() : ""));
+        REQUIRE_FALSE(result->HasError());
+        REQUIRE(result->RowCount() == 1);
+        REQUIRE(result->ColumnCount() == 1);
+        CHECK(result->GetValue(0, 0).ToString() == expected);
+      } else {
+        REQUIRE(result->HasError());
+        CHECK(result->GetError().find("reason=fingerprint_mismatch") != std::string::npos);
+        CHECK(result->GetError().find("correspondence=single") != std::string::npos);
+      }
+
+      CHECK(after.read_view_mismatches ==
+            before.read_view_mismatches + (optimizer_enabled ? 0 : 1));
+      sirius::test::require_transparent_execution_delta(before,
+                                                        after,
+                                                        optimizer_enabled ? 1 : 0,
+                                                        !optimizer_enabled && fallback ? 1 : 0,
+                                                        optimizer_enabled ? 1 : 0,
+                                                        0);
+    }
+  }
 }
 
 TEST_CASE_METHOD(ReadViewFixture,
