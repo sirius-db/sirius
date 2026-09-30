@@ -252,7 +252,8 @@ void require_same_parquet_schema(std::span<parquet_source const> sources)
                                path_of(sources.front()) + "' and '" + path_of(src) + "' ";
     if (schema.size() != first.size()) {
       throw std::runtime_error(prefix + "have " + std::to_string(first.size()) + " and " +
-                               std::to_string(schema.size()) + " schema elements");
+                               std::to_string(schema.size()) +
+                               " schema elements (including the root)");
     }
     auto const [lhs, rhs] = std::mismatch(first.begin(), first.end(), schema.begin(), schema.end());
     std::string detail    = describe(*lhs) + " vs " + describe(*rhs);

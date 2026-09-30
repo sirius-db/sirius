@@ -78,8 +78,8 @@ struct parquet_source {
 ///
 /// Both routes honor @p options' row filter: @c materialize_all_columns applies
 /// it at row level exactly as @c read_parquet does, so the route never changes
-/// which rows come back.  Unless @p options allow mismatched schemas, both
-/// routes also refuse sources whose schemas differ.
+/// which rows come back.  With the reader options Sirius uses, both routes
+/// also refuse sources whose schemas differ.
 ///
 /// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
 ///                the same order.  Only read on the bulk route; any source whose
