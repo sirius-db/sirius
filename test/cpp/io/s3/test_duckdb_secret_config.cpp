@@ -70,6 +70,8 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
 {
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
+  // Direct resolver calls mirror bind-time catalog lookups, which run in a transaction.
+  require_sql_ok(con, "BEGIN TRANSACTION");
 
   require_sql_ok(con,
                  "CREATE OR REPLACE SECRET unrelated (TYPE SIRIUS_S3, PROVIDER CONFIG, "
@@ -142,6 +144,8 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
   CHECK(rotated.access_key == "rotated-key");
   CHECK(rotated.secret_key == "rotated-secret");
   CHECK(rotated.session_token == "rotated-token");
+
+  require_sql_ok(con, "ROLLBACK");
 }
 
 TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3][secret]")
@@ -150,6 +154,8 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
   duckdb::Connection con(db);
   auto& manager = duckdb::SecretManager::Get(*db.instance);
   register_test_httpfs_s3_secret(manager);
+  // Direct resolver calls mirror bind-time catalog lookups, which run in a transaction.
+  require_sql_ok(con, "BEGIN TRANSACTION");
 
   require_sql_ok(con,
                  "CREATE SECRET legacy (TYPE S3, SCOPE 's3://bucket/data/', "
@@ -181,4 +187,6 @@ TEST_CASE("Sirius S3 secret lookup prefers Sirius then httpfs then config", "[s3
                  "KEY_ID 'incomplete-key')");
   CHECK_THROWS(sirius::io::s3::resolve_duckdb_s3_secret(
     *con.context, "s3://bucket/invalid/file.parquet", defaults));
+
+  require_sql_ok(con, "ROLLBACK");
 }
