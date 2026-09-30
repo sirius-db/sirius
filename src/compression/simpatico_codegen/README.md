@@ -219,8 +219,22 @@ process is not supported. `nvrtcVersion` major/minor and `CUDART_VERSION` alone 
 compiler patches.
 
 Old flat cache entries are ignored and retained. Invalidation does not reclaim space; other
-builds may still use their entries. Header providers remain embedded and libcudf-aligned on
-CUDA 12 and 13; NVRTC bundled-header adoption is separate work.
+builds' namespaces remain reusable. Retention is unbounded until an operator calls
+`codegen::jit::clear_jit_disk_cache()` with writers stopped. It removes recognized
+legacy/v2 records and abandoned cache temporaries only; unrelated files, unknown versions,
+and symlinks are preserved. No startup scan or automatic eviction runs.
+
+Disk records carry a length and payload checksum, validated before CUDA loading.
+Publication uses an exclusively created, unique temporary file followed by rename.
+Failed writes/close/rename remove only that writer's temporary file. Missing, unreadable,
+truncated, corrupt, or incompatible entries are misses; successful compilation repairs
+the entry without first deleting another writer's destination. No power-loss durability
+is promised. Cubins larger than 256 MiB skip persistence but remain usable in memory.
+Use a trusted cache directory: checksums detect corruption, not malicious tampering.
+
+The format and cleanup details are in [CACHE_FORMAT.md](CACHE_FORMAT.md). Header providers
+remain embedded and libcudf-aligned on CUDA 12 and 13; NVRTC bundled-header adoption is
+separate work.
 
 ### Self-contained JIT (no header tree at runtime)
 
