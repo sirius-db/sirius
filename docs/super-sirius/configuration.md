@@ -24,6 +24,15 @@ Sirius searches for a config file in this order:
 
 If no config file is found, Sirius initializes with built-in defaults (95% GPU memory, 90% of each NUMA node's RAM as pinned host memory).
 
+### Concurrent query admission
+
+`sirius.max_concurrent_queries` is a positive startup integer, default **1**, shared by
+connections to one DatabaseInstance. It bounds initialization through retirement. Additional
+queries wait in a cancellable FIFO queue. The former
+`sirius.executor.scan_manager.max_concurrent_queries` key is a deprecated alias; conflicting
+values fail configuration loading. See [Concurrent queries](concurrent-queries.md) for the
+maintenance, error and multi-GPU contracts.
+
 ### `SIRIUS_DISABLE`
 
 Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
@@ -80,6 +89,7 @@ config.load_from_file("/path/to/config.yaml");  // Optional
 
 ```yaml
 sirius:
+  max_concurrent_queries: 1
   topology: { num_gpus: 1 }
   memory:
     gpu:
@@ -318,7 +328,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 0**) | remaining cores (min 4) | Metadata-producer threads. Blocking coalescers run in a separate pool sized from query admission, so they cannot occupy producer capacity. |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -350,8 +360,10 @@ against the pipeline pool's width rather than the backend's depth — one prefet
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
 
-Both are resolved against a single backend: the live one publishing the widest
-`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+A query's local policy is selected from the serving backend publishing the widest budget.
+A runtime budget additionally accounts for every backend touched by each split across all
+queries. Demand reads borrow immediately; their debt pauses speculative prefetch. Events are
+routed by query ID. A failed cache allocation gets one eviction retry before speculation yields.
 
 Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
 
@@ -485,8 +497,9 @@ Those two knobs derive the settings below, which are therefore **not** individua
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
 resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
-single-GPU configurations only (logs a warning and disables itself otherwise).
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Workers rotate over
+the query's admitted GPUs, use per-device reservations and exclusive stream leases, and release
+those leases before parking. Multi-GPU concurrency still requires actual hardware qualification.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -650,12 +663,19 @@ per-pool extras.
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
-GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_manager`, which requires
-`> 2`.
+GPU's CPU topology. `num_threads` must be `> 0` for every pool.
+
+At execution, sort partition caps are bounded by the smallest configured GPU capacity divided
+by `max_concurrent_queries`, multiplied by `max_sort_partition_memory_fraction`. Explicit
+`max_sort_partition_bytes` values can reduce that cap further. The bound uses configured capacity
+rather than another query's momentary free-memory usage.
 
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
+Registered in `src/sirius_extension.cpp`. Operator, expression and compression options are
+connection-local overrides of YAML defaults; GLOBAL writes are rejected and RESET restores the
+registered default. Each execution uses one immutable operator-options snapshot. Logging updates
+serialize runtime-wide. Hardware decompression requires startup configuration.
 
 ### Logging
 

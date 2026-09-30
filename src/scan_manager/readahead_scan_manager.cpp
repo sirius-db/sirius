@@ -333,8 +333,6 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_slot_wait = std::chrono::milliseconds{100};
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
-  // Bound the wait for a disposal notification. The timeout is also a recovery
-  // path for a coalesced or missed notification.
 
   // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
   // the prefetch was issued -- which is also whether the completion has taken

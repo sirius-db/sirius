@@ -17,7 +17,8 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | Document | Description |
 |----------|-------------|
 | [Architecture Overview](architecture-overview.md) | Component diagram, thread model, ownership hierarchy, execution lifecycle |
-| [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, cleanup barriers, and the remaining lifetime integration |
+| [Concurrent Queries](concurrent-queries.md) | Admission, maintenance, settings, error isolation, memory progress and qualification scope |
+| [Query Lifecycle](query-lifecycle.md) | Per-query submission guards, work leases, spill borrows and retirement barriers |
 | [Execution Flow](execution-flow.md) | End-to-end query trace with file:line references |
 | [Physical Plan Generation](physical-plan-generation.md) | Logical-to-physical mapping, pipeline construction, splitting rules |
 | [Operators](operators.md) | All physical operators: interface, GPU implementation, cuDF APIs |

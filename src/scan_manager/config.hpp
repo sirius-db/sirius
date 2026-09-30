@@ -207,9 +207,8 @@ struct memory_prefetcher_config {
 struct scan_manager_config {
   exec::thread_pool_config thread_pool{.num_threads        = default_scan_manager_num_threads(),
                                        .thread_name_prefix = "scan_manager"};
-  /// Number of blocking per-query sequencers reserved alongside the scan workers.
-  /// Each sequencer waits for metadata tasks running on the same pool, so the pool
-  /// uses separate producer and coalescer pools; admission supplies the query limit.
+  /// Admission limit; also sizes the separate blocking-coalescer pool.
+  /// Metadata producers run in thread_pool and cannot be starved by coalescer waits.
   int max_concurrent_queries{1};
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::sirius};

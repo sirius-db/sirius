@@ -190,7 +190,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   rmm::cuda_stream_view stream);
 ```
 
-If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, falling back with a warning to the no-reservation overload — see [Memory Management](memory-management.md).
+If the batch is already on `target_space`, it is locked in place under a shared (read) lock. If it lives on a *different GPU*, it is **cloned** into the target space under the same shared lock (`read_accessor.clone_to<...>`) — the source batch is never exclusively locked and never mutated, so concurrent readers on its home GPU proceed unhindered (see [Multi-GPU Architecture](multi-gpu-architecture.md)). Host/disk-resident batches are converted via `mut_accessor.convert_to<...>` (an upgrade, not a clone). The cross-GPU route goes through `cucascade::convert_gpu_to_gpu` (peer-DMA on server hardware, automatic host-staging on consumer hardware whose chipset misreports peer-access support). For HOST-targeted conversions the helper first attempts a caller-owned reservation (`make_reservation_or_null`) and passes it to the reservation-taking `convert_to` overload, using the conversion path described in [Memory Management](memory-management.md). Materialized result transfer requires a real HOST reservation.
 
 **Postcondition.** When `prepare_for_processing` returns, every input accessor references data on `requested_memory_space`. Therefore the per-operator expression `batches[0].get_memory_space() == target_space` holds at every audited read site. Operators that walk every batch and adopt the first non-null batch's space (e.g. `sirius_physical_sort_sample.cpp`, `sirius_physical_merge_sort.cpp`, `sirius_physical_table_scan.cpp`) are safe by the same postcondition.
 
@@ -208,17 +208,14 @@ if (evt->kind == task_request_kind::device_ready) {
 
 `schedule()` pushes directly into the task queue and also publishes `task_available`. The queue push wakes a matcher waiting for work while a device is already ready; the channel event wakes it when it is waiting for a device signal.
 
-**Per-device match.** For each ready device, the scheduler first pops a task with that exact preferred device. If none exists, it pops a task with no preference.
+**Per-device match.** The scheduler atomically compares exact-device and unbound tasks by
+query/pipeline priority, choosing the oldest compatible runnable task. A future retry deadline
+makes a memory- or lock-waiting task temporarily ineligible. A device preference remains binding;
+another GPU cannot claim that task. The creator confines tasks to their query's admitted GPU set.
+There is no equal-share or round-robin guarantee.
 
-```cpp
-task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
-if (!task) {
-  task =
-    _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
-}
-```
-
-A preference is binding: another ready GPU cannot claim that task. A preference-less task may be claimed by whichever ready device the management thread considers. With multiple ready devices, each independently searches for an exact-preference task before falling back to the shared no-preference bucket. There is no counter, offset, or round-robin ordering guarantee in this matcher.
+A ready-device credit is consumed only when the executor accepts dispatch. Refusing a canceled
+task leaves that worker capacity available for another query.
 
 `test/cpp/operator/test_task_scheduler_routing.cpp` covers these routing invariants with a task pinned to each available test GPU plus one preference-less task, without relying on scheduling order or timing.
 
@@ -285,9 +282,9 @@ while running:
        (schedule_lookahead(first ready device) — speculatively warms up a
        not-yet-activated scan; no-op unless strategy is `lookahead`)
     3. For each ready device, select a compatible queued task:
-       a. exact preferred-device match
-       b. unpreferred task
-    4. Dispatch the selected task to that device's GPU executor
+       a. compare exact-preference and unbound tasks in one priority-ordered selection
+       b. skip tasks whose retry deadline has not arrived
+    4. Dispatch; consume readiness only if the executor accepts the task
 ```
 
 Tasks stay in the top-level queue until a ready device can accept them, preserving visibility to

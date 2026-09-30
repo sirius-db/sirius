@@ -185,12 +185,12 @@ After the future resolves:
 If any task throws an exception during execution:
 
 1. The GPU executor catches it and calls `completion_handler->report_error(exception)`
-2. `drain_after_error()` is called on the pipeline executor which:
+2. Query-specific error retirement coordinates the creator, scheduler and executors:
    - Closes the query's submission gate and waits for admitted publishers before draining
-   - Stops the task creator threads
-   - Drains the task queue
-   - Calls `drain_and_wait()` on the GPU executors
-   - Restarts the task creator for the next query
+   - Stops that query's scan/prefetch producers and drains its creator requests
+   - Detaches that query's scheduler/executor tasks, destroying them outside queue locks
+   - Waits for its work leases, callbacks and spill borrows
+   - Retires its plan, repositories, scan state and telemetry; other queries keep running
 3. The error propagates through the future to the main thread, surfacing as an error-carrying result at `PhysicalSiriusExecution::GetData()`
 
 On the transparent path, that error triggers the runtime CPU fallback described in Step 2 (unless `enable_duckdb_fallback` is false, the error is a user interrupt, or the query reads S3). The fallback runs the stashed DuckDB CPU plan in the same transaction, so a runtime GPU failure completes on CPU rather than failing the query.

@@ -33,6 +33,8 @@
 #include "sirius_extension.hpp"
 #include "utils/pinned_entry_census.hpp"
 
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog_search_path.hpp>
@@ -2220,13 +2222,18 @@ void run_concurrent_admission(std::string const& variant,
     }
     current_sum = cpu->GetValue(0, 0).ToString();
   }
-  std::unique_ptr<cucascade::memory::reservation> pressure;
+  std::vector<std::unique_ptr<cucascade::memory::reservation>> pressure;
   if (memory_cancel || memory_timeout) {
-    auto* gpu = runtime->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
-    pressure  = gpu->make_reservation_or_null(gpu->get_available_memory());
-    if (!pressure) {
-      out.error = "could not reserve GPU for memory-wait test";
-      return;
+    for (auto const* space :
+         runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      auto* gpu = runtime->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU,
+                                                                 space->get_device_id());
+      auto reservation = gpu->make_reservation_or_null(gpu->get_available_memory());
+      if (!reservation) {
+        out.error = "could not reserve every GPU for memory-wait test";
+        return;
+      }
+      pressure.push_back(std::move(reservation));
     }
   }
   auto before        = runtime->get_transparent_execution_stats();
@@ -2306,7 +2313,7 @@ void run_concurrent_admission(std::string const& variant,
     if (memory_cancel) connections[0]->Interrupt();
     memory_cancel_prompt = queries[0].wait_for(std::chrono::seconds(memory_timeout ? 38 : 5)) ==
                            std::future_status::ready;
-    pressure.reset();
+    pressure.clear();
   }
   for (unsigned i = 0; i < limit; ++i) {
     auto error = queries[i].get();
@@ -2689,6 +2696,33 @@ TEST_CASE_METHOD(QueryLifecycleSlotFixture,
                               "concurrent_prepared",
                               "concurrent_cycles"}) {
     INFO(variant);
+    require_variant_succeeds(variant);
+  }
+}
+
+TEST_CASE_METHOD(QueryLifecycleSlotFixture,
+                 "concurrent SQL qualification requires two real GPUs",
+                 "[.][concurrent_queries_mgpu]")
+{
+  int devices = 0;
+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+  INFO("This explicit qualification target requires at least two visible GPUs; it must not skip.");
+  REQUIRE(devices >= 2);
+  config_path = config_path.parent_path() / "integration-2gpu.yaml";
+  REQUIRE(fs::exists(config_path));
+  for (auto const* variant : {"concurrent_2",
+                              "concurrent_4",
+                              "concurrent_mixed",
+                              "concurrent_two_failures",
+                              "concurrent_active_cancel",
+                              "concurrent_host_pin",
+                              "concurrent_gpu_pin",
+                              "concurrent_compressed_host",
+                              "concurrent_compressed_gpu",
+                              "concurrent_cache",
+                              "concurrent_memory_cancel",
+                              "concurrent_memory_timeout",
+                              "concurrent_cycles"}) {
     require_variant_succeeds(variant);
   }
 }

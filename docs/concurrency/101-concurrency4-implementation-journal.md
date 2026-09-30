@@ -2,7 +2,9 @@
 
 This branch implements the recommendations in `100-concurrent-query-implementation-plan.md`.
 Entries describe review boundaries, design decisions, and validation. A listed future step is
-not an implementation claim. No branches have been published.
+not an implementation claim. No branches have been published. Start with the
+[validation report and proposed PR split](102-concurrency4-validation-and-pr-split.md) for the
+current status, coverage and remaining hardware gates.
 
 ## Baseline and recovery
 
@@ -20,7 +22,7 @@ not an implementation claim. No branches have been published.
 - Supported concurrency means separate connections sharing one DatabaseInstance. One connection
   remains serialized by DuckDB. Independent DatabaseInstances sharing GPU allocator state are
   not covered by this contract.
-- Default admission remains one query. Startup `sirius.max_concurrent_queries` will be the
+- Default admission remains one query. Startup `sirius.max_concurrent_queries` is the
   authority for admission and scan capacity; the old scan-manager key is a compatibility alias.
 - Resource mutation (pin, unpin, cache reset, index operations) retains exclusive maintenance
   access. Waiting maintenance blocks new query admission.
@@ -44,7 +46,8 @@ not an implementation claim. No branches have been published.
 
 ## Commit log
 
-Implementation entries will be added here as each buildable change is validated and committed.
+Each entry records a buildable change validated before committing. Entries describe the state
+at that increment; later entries address dependencies noted in earlier ones.
 
 ### 1. `fix(exec): retain query work across asynchronous handoffs`
 
@@ -252,3 +255,20 @@ Implementation entries will be added here as each buildable change is validated 
   succeed. This simulates capacity exhaustion without filling the host filesystem.
 - Validation: full build; 8 telemetry/spill cases, 57 assertions.
 - Previous commit: `75251e166`.
+
+### 14. `test(concurrency): add multi-GPU qualification and review guide`
+
+- Added an explicit hidden `[concurrent_queries_mgpu]` target using the two-GPU configuration.
+  It requires two visible devices rather than silently skipping, and runs 13 watchdog scenarios
+  covering overlap, errors, pins/prefetch, cache, memory waits and reuse. Pressure setup reserves
+  every configured GPU so an idle second device cannot bypass the intended wait.
+- Updated architecture, configuration, execution, memory and streaming documentation. Added the
+  concurrent-SQL contract and a report mapping findings to commits, recording validation limits,
+  and proposing six future stacked PRs. The current commit order is not the final PR extraction.
+- Validation: clean full build (1,200 steps); final one-GPU concurrent SQL/logging rerun passed
+  2 parent cases / 107 assertions, including all 20 SQL scenarios. Formatting and diff checks
+  passed. The two-GPU target compiled but was not executed on this one-GPU host.
+- Final validation resumed on 2026-09-30 after a ChatGPT interruption; the build had completed
+  successfully and no implementation work was lost. Remaining release gates are listed in
+  `102-concurrency4-validation-and-pr-split.md`.
+- Previous commit: `0a205cbfd`.
