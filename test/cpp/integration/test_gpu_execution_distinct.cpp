@@ -24,7 +24,7 @@
  * results match whenever the query is answered at all, and a query that silently fell back to CPU
  * would still compare equal.
  *
- * The floating-point cases use `compare_gpu_vs_cpu_on_keys` instead: a group holding both 0.0 and
+ * The floating-point cases use `compare_gpu_vs_cpu_canonical` instead: a group holding both 0.0 and
  * -0.0, or NaN and -NaN, prints as whichever member each engine keeps.
  *
  * Every DISTINCT guard throws during `create_plan`, before any GPU work is scheduled, so the
@@ -36,66 +36,10 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
-#include <utils/transparent_execution_test_utils.hpp>
 
-#include <algorithm>
 #include <cstdint>
-#include <string>
-#include <vector>
 
 namespace {
-
-/// NaN and -NaN, and 0.0 and -0.0, are one group to both engines and print differently, so either
-/// engine may report either member. Maps each pair to one spelling.
-std::string canonical_key(std::string cell)
-{
-  if (cell == "-nan") { return "nan"; }
-  if (cell.size() > 1 && cell.front() == '-' &&
-      cell.find_first_not_of("0.", 1) == std::string::npos) {
-    cell.erase(0, 1);
-  }
-  return cell;
-}
-
-/// Runs @p query on the GPU and on the CPU and compares the row count and the @p key_columns of
-/// each row, after asserting one GPU execution with no fallback.
-void compare_gpu_vs_cpu_on_keys(sirius::test::GpuExecutionFixture& fixture,
-                                std::string const& query,
-                                std::vector<std::size_t> const& key_columns)
-{
-  fixture.run_ok("SET gpu_execution = true;");
-  auto const before = sirius::test::get_transparent_execution_stats(*fixture.con);
-  auto gpu_result   = fixture.con->Query(query);
-  auto const after  = sirius::test::get_transparent_execution_stats(*fixture.con);
-  REQUIRE(gpu_result);
-  if (gpu_result->HasError()) { UNSCOPED_INFO("GPU execution error: " << gpu_result->GetError()); }
-  REQUIRE_FALSE(gpu_result->HasError());
-  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
-
-  fixture.run_ok("SET gpu_execution = false;");
-  auto cpu_result = fixture.con->Query(query);
-  fixture.run_ok("SET gpu_execution = true;");
-  REQUIRE(cpu_result);
-  REQUIRE_FALSE(cpu_result->HasError());
-
-  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-  auto const keys_of = [&key_columns](duckdb::MaterializedQueryResult& result) {
-    std::vector<std::vector<std::string>> keys;
-    for (auto const& row : sirius::test::collect_rows(result)) {
-      std::vector<std::string> key;
-      for (auto const column : key_columns) {
-        REQUIRE(column < row.size());
-        key.push_back(canonical_key(row[column]));
-      }
-      keys.push_back(std::move(key));
-    }
-    std::sort(keys.begin(), keys.end());
-    return keys;
-  };
-  REQUIRE(keys_of(gpu_result->Cast<duckdb::MaterializedQueryResult>()) ==
-          keys_of(cpu_result->Cast<duckdb::MaterializedQueryResult>()));
-}
 
 /// Duplicate `(a, b)` pairs, NULLs in either key column, two rows sharing the composite key
 /// `(NULL, 1)`, a wholly-NULL column, and a fully-NULL row.
@@ -480,16 +424,13 @@ TEST_CASE_METHOD(DistinctFloatFixture,
   // groups both pairs. A disagreement is a wrong answer, not a fallback: the exact row count
   // catches a pair that fails to collapse, and the keys are compared with each pair's two spellings
   // treated as one, because either engine may keep either member.
-  SECTION("DOUBLE") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d FROM dist_fp", {0}); }
+  SECTION("DOUBLE") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT d FROM dist_fp"); }
 
-  SECTION("REAL") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT f FROM dist_fp", {0}); }
+  SECTION("REAL") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT f FROM dist_fp"); }
 
   // A composite key runs the same comparator over a two-column row, which is the shape the
   // single-column cases cannot reach.
-  SECTION("both columns")
-  {
-    compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d, f FROM dist_fp", {0, 1});
-  }
+  SECTION("both columns") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT d, f FROM dist_fp"); }
 
   // Exact, not canonicalized: the sections above prove nothing if the scan drops the sign bit.
   SECTION("the GPU scan keeps a negative zero")
