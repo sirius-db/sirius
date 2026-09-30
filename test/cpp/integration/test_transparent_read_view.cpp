@@ -510,7 +510,8 @@ TEST_CASE_METHOD(ReadViewFixture,
           files.file_literal(std::string(1, static_cast<char>('a' + expected - 1)) + ".parquet") +
           " (FORMAT PARQUET)");
     }
-    auto result = prepared->Execute();
+    auto const execution_before = sirius::test::get_transparent_execution_stats(connection);
+    auto result                 = prepared->Execute();
     REQUIRE(result);
     auto const error = result->HasError() ? result->GetError() : std::string{};
     INFO(error);
@@ -519,6 +520,11 @@ TEST_CASE_METHOD(ReadViewFixture,
     REQUIRE(chunk);
     REQUIRE(chunk->size() == 1);
     CHECK(chunk->GetValue(0, 0).ToString() == std::to_string(expected));
+    auto const execution_after = sirius::test::get_transparent_execution_stats(connection);
+    CHECK(execution_after.successful_rebinds == execution_before.successful_rebinds + 1);
+    CHECK(execution_after.fallbacks == execution_before.fallbacks);
+    CHECK(execution_after.executions == execution_before.executions + 1);
+    CHECK(execution_after.runtime_fallbacks == execution_before.runtime_fallbacks);
   }
 
   auto const after = sirius::test::get_transparent_execution_stats(connection);
