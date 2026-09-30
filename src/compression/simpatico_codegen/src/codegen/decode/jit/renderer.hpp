@@ -92,7 +92,10 @@ namespace codegen::decode::jit {
 enum class Enumerator : std::uint8_t {
   all_rows = 0,  ///< every row of the chunk (full-width decode)
   mask_bits,     ///< survivors of a selection mask, compacted by rank
-  index_list,    ///< an ascending survivor row-id list, compacted by slot
+  /// An ascending survivor row-id list, compacted by slot. A chunk's list is short (tens of rows at
+  /// the selectivities this walk is chosen for), so one WARP serves a chunk and a block serves
+  /// chunks_per_block(shape) consecutive chunks.
+  index_list,
   /// A chunk-bucketed CSR row set (codegen/selection/chunk_row_set.hpp): the
   /// grid covers only TOUCHED chunks, and block b serves chunk_ids[b]. For a
   /// selection that arrives after the scan and touches few chunks, this is the
@@ -125,6 +128,14 @@ inline constexpr DecodeShape kShapeSparseConsume{Enumerator::chunk_csr, Consumer
 inline constexpr DecodeShape kShapeSparseDictGather{Enumerator::chunk_csr, Consumer::dict_gather};
 inline constexpr DecodeShape kShapeSparseStrSplitMeta{Enumerator::chunk_csr,
                                                       Consumer::offsets_meta};
+
+/// Chunks one block of the rendered kernel serves: kTBSize / 32 (one chunk per warp) for the index
+/// walk, 1 for every other enumerator. The launcher sizes a dense grid as the batch's chunk count
+/// divided by this, rounded up; a chunk_csr grid (one block per touched chunk) does not use it.
+[[nodiscard]] constexpr int chunks_per_block(DecodeShape shape) noexcept
+{
+  return shape.enumerator == Enumerator::index_list ? ::codegen::kTBSize / 32 : 1;
+}
 
 /// False for product points with no meaning or no renderer support — e.g.
 /// re-ballotting only the survivors of an existing mask.  Render rejects these
@@ -185,7 +196,7 @@ struct DecodeKernelSpec {
   // emitted alongside the declaration text, so the two cannot disagree.
   std::vector<TrailingParam> trailing;
 
-  // Launch geometry.  grid_x = num_chunks_for(n) (launcher computes).
+  // Launch geometry.  The launcher computes grid_x = ceil(num_chunks_for(n) / chunks_per_block).
   int block_x      = 128;  // plain-CUDA block; RLE/Delta primitives assume 128
   int shared_bytes = 0;    // dynamic shared workspace peak (RLE boundaries)
 

@@ -431,6 +431,33 @@ class Walker {
       decls.emplace_back(tp.decl);
     }
 
+    // Block prologue: the chunk this thread serves. The index walk maps one warp per chunk, so its
+    // chunk follows from the warp index and the `len` guard below returns a warp rather than a
+    // block (nothing after it synchronizes).
+    std::string chunk_binding;
+    switch (shape_.enumerator) {
+      case Enumerator::chunk_csr:
+        chunk_binding =
+          "    const int32_t chunk_id = static_cast<int32_t>(chunk_ids[blockIdx.x]);\n"
+          "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n";
+        break;
+      case Enumerator::index_list:
+        chunk_binding =
+          "    constexpr int32_t CHUNKS_PER_BLOCK = " + std::to_string(chunks_per_block(shape_)) +
+          ";  // one chunk per warp\n"
+          "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
+          "    const int32_t lane     = tid & 31;\n"
+          "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x) * CHUNKS_PER_BLOCK + "
+          "(tid >> 5);\n";
+        break;
+      case Enumerator::all_rows:
+      case Enumerator::mask_bits:
+        chunk_binding =
+          "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
+          "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n";
+        break;
+    }
+
     std::ostringstream src;
     src << kPrelude;
     if (narrow_unpack_) src << kNarrowUnpackPrelude;
@@ -442,16 +469,14 @@ class Walker {
     }
     src << "{\n"
         << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
-        << (shape_.enumerator == Enumerator::chunk_csr
-              ? "    const int32_t chunk_id = static_cast<int32_t>(chunk_ids[blockIdx.x]);\n"
-              : "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n")
-        << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
-        << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
+        << chunk_binding << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
         << "                                static_cast<int64_t>(CHUNK);\n"
         << "    const int32_t len = static_cast<int32_t>(\n"
         << "        (n - chunk_start) < static_cast<int64_t>(CHUNK)\n"
         << "            ? (n - chunk_start) : static_cast<int64_t>(CHUNK));\n"
-        << "    if (len <= 0) return;\n"
+        << (shape_.enumerator == Enumerator::index_list
+              ? "    if (len <= 0) return;  // the last block's trailing warps pass the batch\n"
+              : "    if (len <= 0) return;\n")
         << "    extern __shared__ __align__(16) unsigned char workspace[];\n"
         << "    (void)workspace;\n"
         << "\n"
@@ -526,6 +551,17 @@ __device__ __forceinline__ uint32_t simpatico_bp_field32(
     const uint32_t w0 = packed[bp >> 5];
     const uint32_t w1 = packed[(bp >> 5) + 1];
     return __funnelshift_r(w0, w1, bp & 31) & vmask;
+}
+
+// simpatico_bp_at for a chunk with bits <= 32, including the constant-chunk
+// (bits == 0) short-circuit returning the chunk minimum.
+template <class T>
+__device__ __forceinline__ T simpatico_bp_at32(const uint32_t* __restrict__ packed_base,
+                                            int32_t bits, uint32_t vmask, T minv, int32_t idx) {
+    using U = typename ::cuda::std::make_unsigned<T>::type;
+    if (bits == 0) return minv;
+    return static_cast<T>(static_cast<U>(minv) +
+                          static_cast<U>(simpatico_bp_field32(packed_base, bits, vmask, idx)));
 }
 
 }  // namespace
@@ -682,14 +718,14 @@ void Walker::emit_mask_survivor_loop(const std::string& sink)
         << "    }\n";
 }
 
-// The index walk's counterpart: the chunk's survivors are READ from the
-// row-index list rather than searched for, so the loop runs `cnt` iterations
-// instead of a full pass over the chunk, and the slot IS the list position.
-// Binds the same names as the mask loop, so a consumer's sink is
-// enumerator-agnostic — except `w`, which has no meaning here.
+// The index walk's counterpart: the chunk's survivors are READ from the row-index list rather than
+// searched for, so the loop runs `cnt` iterations instead of a full pass over the chunk, and the
+// slot IS the list position. One warp serves the chunk (see the block prologue in finalize), so the
+// loop is lane-strided. Binds the same names as the mask loop, so a consumer's sink is
+// enumerator-agnostic -- except `w`, which has no meaning here.
 void Walker::emit_index_survivor_loop(const std::string& sink)
 {
-  body_ << "    for (int32_t slot = tid; slot < cnt; slot += " << tbs_ << ") {\n"
+  body_ << "    for (int32_t slot = lane; slot < cnt; slot += 32) {\n"
         << "        const int32_t rank = slot;\n"
         << "        const int32_t i = static_cast<int32_t>(idxs[slot] - chunk_start);\n"
         << sink << "    }\n";
@@ -706,10 +742,11 @@ void Walker::emit_chunk_csr_survivor_loop(const std::string& sink)
         << sink << "    }\n";
 }
 
-// Prologue for whichever compacting enumerator is in play: bind `out_base` and
-// early-return a chunk with no survivors. The mask walk stages the chunk's mask
-// words; the list walks slice their own arrays, which is where their
-// survivor-count-proportional cost comes from.
+// Prologue for whichever compacting enumerator is in play: bind `out_base` and early-return a chunk
+// with no survivors. The mask walk stages the chunk's mask words; the list walks slice their own
+// arrays, which is where their survivor-count-proportional cost comes from. A consumer that needs
+// per-chunk scalars loads them BEFORE this prologue: issued together with the offsets they cost no
+// extra memory round trip, whereas after the early return they wait on it.
 void Walker::emit_survivor_prologue()
 {
   switch (shape_.enumerator) {
@@ -803,17 +840,28 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
 }
 
 // =====================================================================
-// Index-list-consuming decode — the low-selectivity sibling of the mask walk.
-// Block c reads its slice of the ascending GLOBAL row-index list
-// (row_indices[chunk_offsets[c] .. chunk_offsets[c+1])) and random-access
-// decodes only those rows: out slot chunk_offsets[c]+k gets the value of
-// row row_indices[chunk_offsets[c]+k].  No mask staging, no ballot — the
-// per-block loop runs `cnt` iterations instead of 8 full 128-wide strips,
-// so runtime scales with survivors (microbench: 0.30 vs the mask walk's
-// 0.78 ms/payload at 1.9% selectivity; the mask walk wins again above the
-// ~15% crossover
-// — the caller picks from the survivor count).  Delta roots cannot
-// row-skip and are rejected.
+// Index-list-consuming decode -- the low-selectivity sibling of the mask walk.
+//
+// Inputs: the Bitpack channels, `out` (survivor-sized), `n`, `row_indices` (ascending global int32
+// row ids, chunk-partitioned) and `chunk_offsets` (C + 1 exclusive survivor bases).
+//
+// Mapping: one warp per chunk, chunks_per_block(shape) chunks per block: block b, warp w serves
+// chunk_id = b * chunks_per_block + w, and the launcher's grid is the chunk count divided by
+// chunks_per_block, rounded up. A warp whose chunk lies past the batch returns at `len <= 0` before
+// any per-chunk load; a chunk with no survivors returns per warp at `cnt == 0`. For slot in [0,
+// cnt), lane-strided, out[chunk_offsets[c] + slot] = value(row_indices[chunk_offsets[c] + slot] -
+// chunk_start). No mask staging, no ballot: the loop runs `cnt` iterations instead of 8 full
+// 128-wide strips, so runtime scales with survivors; the mask walk wins again above the ~15%
+// crossover, and the caller picks from the survivor count. A chunk holds tens of survivors at those
+// selectivities, so packing several chunks into a block keeps every warp slot busy through the
+// per-chunk dependent round trips instead of leaving all but one warp idle.
+//
+// Unpack: bits <= 32 through simpatico_bp_at32 (bits == 0 yields the chunk minimum); bits > 32
+// (int64 lanes only) through simpatico_bp_at, selected by a warp-uniform branch. Values are
+// bit-identical to the plain decode.
+//
+// This shape has no shared memory and no __syncthreads(), ever: the per-warp early returns depend
+// on it. Delta roots cannot row-skip and are rejected.
 // =====================================================================
 void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
 {
@@ -826,11 +874,23 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
   body_ << "    // --- node " << id_of(node)
         << ": Bitpack index-list decode -> compacted output ---\n"
         << "    (void)len;  // listed rows are < n by construction (mask tail bits were zero)\n";
+
+  ValueSource vs          = bitpack_value_source(node, dtype_);
+  const std::string idstr = std::to_string(id_of(node));
+  const std::string bits  = "bpbits_" + idstr;
+  const std::string vmask = "bpvmask_" + idstr;
+  body_ << "    const uint32_t " << vmask << " = (" << bits << " >= 32) ? 0xFFFFFFFFu : ((1u << "
+        << bits << ") - 1u);\n";
   emit_survivor_prologue();
 
-  // Per-chunk scalar prelude after the early return, then the survivor loop.
-  ValueSource vs = bitpack_value_source(node, dtype_);
-  emit_survivor_loop("            (out + out_base)[rank] = " + at_pos(vs.read_expr, "i") + ";\n");
+  narrow_unpack_           = true;
+  const std::string narrow = "simpatico_bp_at32(packed_" + idstr + " + bpbase_" + idstr + ", " +
+                             bits + ", " + vmask + ", bpmin_" + idstr + ", i)";
+  const std::string value =
+    dtype_elem_size(dtype_) == 8
+      ? "(" + bits + " > 32) ? " + at_pos(vs.read_expr, "i") + " : " + narrow
+      : narrow;
+  emit_survivor_loop("            (out + out_base)[rank] = " + value + ";\n");
 }
 
 // =====================================================================
