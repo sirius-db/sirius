@@ -2,15 +2,21 @@
 
 import copy
 from decimal import Decimal
+import json
+import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import unittest
 
 from run_conformance import (
+    ProcessError,
     compare_rows,
     decode_results,
     execute,
+    expect_planning_rejection,
+    query_result,
     scan_sql,
     select_cases,
 )
@@ -23,6 +29,81 @@ class ReferenceHarnessTests(unittest.TestCase):
             "columns": [["id", "BIGINT"], ["amount", "DECIMAL(12,2)"]],
             "rows": [[1, "10.00"], [1, "10.00"], [2, None]],
         }
+
+    def query_output(self, documents):
+        extension = {"version": "5e89198", "duckdb_version": "v1.5.5"}
+        results = [
+            [{"extension_version": extension["version"]}],
+            [{"version": extension["duckdb_version"]}],
+            [{"gpu": False}],
+            *documents,
+            [{"probe": "LIVENESS_OK"}],
+        ]
+        return "\n".join(json.dumps(r) for r in results), extension
+
+    def test_explicit_empty_query_result_passes(self):
+        self.assertEqual(query_result(*self.query_output([[]])), [])
+
+    def test_missing_query_result_fails(self):
+        with self.assertRaisesRegex(AssertionError, "exactly five SQL results"):
+            query_result(*self.query_output([]))
+
+    def test_extra_query_result_fails(self):
+        with self.assertRaisesRegex(AssertionError, "exactly five SQL results"):
+            query_result(*self.query_output([[], []]))
+
+    def test_nonempty_query_result_passes(self):
+        rows = [{"id": 42}]
+        self.assertEqual(query_result(*self.query_output([rows])), rows)
+
+    def test_query_identity_and_liveness_are_checked(self):
+        output, extension = self.query_output([[]])
+        for index in (0, 1, 2, 4):
+            with self.subTest(index=index), self.assertRaises(AssertionError):
+                results = json.loads("[" + output.replace("\n", ",") + "]")
+                results[index] = []
+                query_result("\n".join(json.dumps(r) for r in results), extension)
+
+    def rejection_process(self, ending, diagnostic=None):
+        if diagnostic is None:
+            diagnostic = (
+                "GPU plan generation failed: Table function 'paimon_scan' "
+                "is not supported in Sirius"
+            )
+        script = (
+            f"import sys\nprint({diagnostic!r}, file=sys.stderr, flush=True)\n{ending}"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            expect_planning_rejection(
+                lambda: execute([sys.executable, "-c", script], timeout=5, cwd=tmp)
+            )
+
+    def test_normal_planning_rejection_passes(self):
+        self.rejection_process("sys.exit(1)")
+
+    def test_unexpected_exit_with_matching_diagnostic_fails(self):
+        for code in (2, 7, 139):
+            with self.subTest(code=code), self.assertRaises(ProcessError) as error:
+                self.rejection_process(f"sys.exit({code})")
+            self.assertEqual(error.exception.returncode, code)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal exit status")
+    def test_crash_with_matching_diagnostic_fails(self):
+        with self.assertRaises(ProcessError) as error:
+            self.rejection_process(
+                "import os, resource, signal\n"
+                "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+                "os.kill(os.getpid(), signal.SIGSEGV)"
+            )
+        self.assertEqual(error.exception.returncode, -signal.SIGSEGV)
+
+    def test_unrelated_sql_error_is_not_expected_rejection(self):
+        with self.assertRaises(ProcessError):
+            self.rejection_process("sys.exit(1)", "Binder Error: missing table")
+
+    def test_success_with_matching_diagnostic_is_not_rejection(self):
+        with self.assertRaisesRegex(AssertionError, "Expected planning-time rejection"):
+            self.rejection_process("sys.exit(0)")
 
     def test_missing_duplicate_fails(self):
         with self.assertRaises(AssertionError):

@@ -17,6 +17,15 @@ ROOT = HERE.parents[4]
 WORK = ROOT / "build/paimon-conformance"
 
 
+class ProcessError(RuntimeError):
+    """Keep the exit status separate from diagnostics when checking SQL errors."""
+
+    def __init__(self, result):
+        self.returncode = result.returncode
+        self.stderr = result.stderr
+        super().__init__(f"Process exited {self.returncode}: {self.stderr[-6000:]}")
+
+
 def sql_literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -41,9 +50,7 @@ def execute(args, *, timeout, cwd, env=None, log=None):
         Path(str(log) + ".stdout").write_text(result.stdout)
         Path(str(log) + ".stderr").write_text(result.stderr)
     if result.returncode:
-        raise RuntimeError(
-            f"Process exited {result.returncode}: {result.stderr[-6000:]}"
-        )
+        raise ProcessError(result)
     return result.stdout
 
 
@@ -59,6 +66,39 @@ def decode_results(output):
         results.append(value)
         remaining = remaining[end:].strip()
     return results
+
+
+def query_result(output, extension):
+    """Require an explicit result document, including [] for zero rows."""
+    results = decode_results(output)
+    if len(results) != 5:
+        raise AssertionError(
+            "Expected exactly five SQL results: extension, version, CPU setting, "
+            f"query, and liveness; got {len(results)}"
+        )
+    if results[0] != [{"extension_version": extension["version"]}]:
+        raise AssertionError("Loaded extension version differs from qualified artifact")
+    if results[1] != [{"version": extension["duckdb_version"]}]:
+        raise AssertionError("Unexpected DuckDB version")
+    if results[2] != [{"gpu": False}]:
+        raise AssertionError("CPU setup was not verified")
+    if results[4] != [{"probe": "LIVENESS_OK"}]:
+        raise AssertionError("Second query on the same connection did not complete")
+    return results[3]
+
+
+def expect_planning_rejection(action):
+    """Only DuckDB's normal SQL-error exit qualifies as the expected refusal."""
+    try:
+        action()
+    except ProcessError as error:
+        if error.returncode == 1 and (
+            "GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius"
+            in error.stderr
+        ):
+            return
+        raise
+    raise AssertionError("Expected planning-time rejection with CPU fallback disabled")
 
 
 def normalize(value, type_name):
@@ -211,24 +251,10 @@ def main():
         )
 
     def query(sql, mode, label):
-        results = decode_results(
-            command(sql + "; SELECT 'LIVENESS_OK' AS probe;", mode, label)
+        return query_result(
+            command(sql + "; SELECT 'LIVENESS_OK' AS probe;", mode, label),
+            spec["extension"],
         )
-        if len(results) < 4:
-            raise AssertionError("Missing identity, CPU setting, or liveness result")
-        if results.pop(0) != [{"extension_version": spec["extension"]["version"]}]:
-            raise AssertionError(
-                "Loaded extension version differs from qualified artifact"
-            )
-        if results.pop(0) != [{"version": spec["extension"]["duckdb_version"]}]:
-            raise AssertionError("Unexpected DuckDB version")
-        if results.pop(0) != [{"gpu": False}]:
-            raise AssertionError("CPU setup was not verified")
-        if results.pop() != [{"probe": "LIVENESS_OK"}]:
-            raise AssertionError("Second query on the same connection did not complete")
-        if len(results) > 1:
-            raise AssertionError("Unexpected extra SQL results")
-        return results[0] if results else []
 
     def record(case_id, mode, action, **metadata):
         item = {"id": case_id, "mode": mode, **metadata}
@@ -274,17 +300,8 @@ def main():
         )
 
         def rejected():
-            try:
-                command(smoke_sql, "transparent", "rejection", rejection=True)
-            except RuntimeError as error:
-                if (
-                    "GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius"
-                    in str(error)
-                ):
-                    return
-                raise
-            raise AssertionError(
-                "Expected planning-time rejection with CPU fallback disabled"
+            expect_planning_rejection(
+                lambda: command(smoke_sql, "transparent", "rejection", rejection=True)
             )
 
         record("planning_rejection", "transparent", rejected)
