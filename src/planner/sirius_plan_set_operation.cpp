@@ -33,7 +33,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
   // a distinct UNION and duplicate rows.
   if (!op.setop_all) {
     throw duckdb::NotImplementedException(
-      "UNION (distinct) not supported yet; only UNION ALL is on the GPU path");
+      "UNION without ALL and no DISTINCT above it (a WITH RECURSIVE body with no self-reference) "
+      "is not supported on the GPU");
   }
 
   // `allow_out_of_order == false` asks for strict left-to-right evaluation, which N independently

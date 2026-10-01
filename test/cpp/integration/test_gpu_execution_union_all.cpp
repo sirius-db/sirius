@@ -32,8 +32,10 @@
 #include <duckdb.hpp>
 #include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <cstdint>
 #include <string>
 
 namespace {
@@ -254,6 +256,32 @@ TEST_CASE_METHOD(UnionAllFixture,
   expect_plan_fallback_matches_cpu("SELECT k FROM ua UNION SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution keeps a non-recursive WITH RECURSIVE UNION on the CPU",
+                 "[integration][gpu_execution][union_all]")
+{
+  // With no self-reference the binder plans a bare distinct UNION with no DISTINCT above it, so the
+  // set-operation builder's refusal is all that stands between this query and duplicate rows.
+  std::string const cte = "WITH RECURSIVE c AS (SELECT k FROM ua UNION SELECT k FROM ub) ";
+  expect_plan_fallback_matches_cpu(cte + "SELECT * FROM c");
+  {
+    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+    auto const result = con->Query(cte + "SELECT * FROM c");
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(),
+                 Catch::Matchers::ContainsSubstring("WITH RECURSIVE body with no self-reference"));
+  }
+
+  // Four distinct keys and one NULL out of six input rows: the shape does need a dedup.
+  run_ok("SET gpu_execution = false;");
+  auto const count = con->Query(cte + "SELECT count(*) FROM c");
+  run_ok("SET gpu_execution = true;");
+  REQUIRE(count);
+  REQUIRE_FALSE(count->HasError());
+  REQUIRE(count->GetValue(0, 0).GetValue<int64_t>() == 5);
 }
 
 TEST_CASE_METHOD(UnionAllFixture,
