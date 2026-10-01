@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <source_location>
 #include <string>
@@ -346,27 +347,15 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   first->build(plan);
   second->build(plan);
 
-  std::exception_ptr errors[3];
   ArrowArrayStream direct{};
-  auto capture = [&](int slot, auto&& call) {
-    return std::thread([&errors, slot, call] {
-      try {
-        call();
-      } catch (...) {
-        errors[slot] = std::current_exception();
-      }
-    });
-  };
-  std::thread runs[] = {
-    capture(0, [&] { first->run(); }),
-    capture(1, [&] { second->run(); }),
-    capture(2, [&] { ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&direct)); }),
+  std::future<void> runs[] = {
+    std::async(std::launch::async, [&] { first->run(); }),
+    std::async(std::launch::async, [&] { second->run(); }),
+    std::async(std::launch::async,
+               [&] { ctx->execute_substrait(plan, reinterpret_cast<std::uintptr_t>(&direct)); }),
   };
   for (auto& run : runs) {
-    run.join();
-  }
-  for (auto const& error : errors) {
-    if (error) { std::rethrow_exception(error); }
+    run.get();  // rethrows that call's exception on the test thread
   }
 
   auto const expected = std::vector<std::int64_t>{1, 2, 3, 4, 5};
