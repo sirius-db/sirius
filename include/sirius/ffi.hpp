@@ -150,13 +150,17 @@ class SIRIUS_FFI_EXPORT Fragment {
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
   /// Execute the fragment. Blocks until pipelines finish. Every input must be closed first
-  /// (relay_from and close_input close their sender).
-  /// @throws before build(), while an input is still open, or on execution failure.
+  /// (relay_from and close_input close their sender). Runs once: after a failure, build a new
+  /// fragment.
+  /// @throws before build(), while an input is still open (the fragment stays runnable), when
+  /// already run or after a failed run(), when a table was pinned or unpinned since build(), or
+  /// on execution failure.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
   /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.
-  /// @throws on an intermediate fragment or before run().
+  /// Callable once.
+  /// @throws on an intermediate fragment, before a successful run(), or when already called.
   void result_to_arrow(std::uintptr_t out_stream_addr);
 
   /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().

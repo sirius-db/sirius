@@ -305,6 +305,7 @@ Construction invariants:
 ```
 push(stream_id, batch)              // → source.push
 close_input(stream_id, sender_id)   // → source.close_input(sender)
+input_closed(stream_id) -> bool     // → source.stream().terminal() — every sender closed
 pull(stream_id) -> optional         // → sink.pull(partition)
 wait(stream_id)                     // → sink.wait(partition)
 drained(stream_id) -> bool          // → sink.drained(partition)
@@ -312,14 +313,15 @@ fail_output(stream_id, error)       // → sink.fail_output(error)    — poison
 ```
 
 - Stream ids are **session-local** and **direction-separated** — two independent namespaces:
-  `push`/`close_input` resolve input streams (sources); `pull`/`wait`/`drained` resolve output
-  streams (sink partitions). A partitioned sink registers N ids, one per destination. An unknown
-  id is a defined error.
+  `push`/`close_input`/`input_closed` resolve input streams (sources); `pull`/`wait`/`drained`
+  resolve output streams (sink partitions). A partitioned sink registers N ids, one per
+  destination. An unknown id is a defined error.
 - The session holds **no repositories** — it forwards to the operators, which own the queues. It
   builds no plan, submits nothing to the scheduler, and owns no teardown; it wraps
   already-instantiated operators.
 - A **leaf**-fragment session registers only sink ids (a session with no input streams is
-  legitimate); a **root**-fragment session registers a source id plus sink ids.
+  legitimate); a **result**-fragment session registers only source ids, because its terminal
+  is a `RESULT_COLLECTOR`, not a sink.
 
 > **Gotcha for plan-launcher work.** The sink is the pipeline **tail**, and it must be a member of
 > that pipeline's `operators` vector — being the pipeline's `sink` member is not enough. Pipeline

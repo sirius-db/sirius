@@ -198,7 +198,9 @@ a result fragment with empty `outputs`. Empty outputs with no partitioning is a
   `build()` throws "cannot be retried". Create a new fragment.
 - **Caller-supplied `prepared` metadata must match the plan.** For a result fragment,
   `bound_plan::prepared` supplies column names and types. The collector decodes GPU output with
-  those types, so `build()` throws when they differ from the physical plan's output types.
+  those types, so `build()` throws when they differ from the physical plan's output types. One
+  pair is allowed: a HUGEINT column over a BIGINT plan column. DuckDB types `SUM(BIGINT)` as
+  HUGEINT, the planner narrows it to BIGINT, and the collector casts it back.
 
 - **Hash-key cast types.** When `partitioning.key_cast_types` is empty, `build()` fills one type
   per key column. Independently planned senders must hash the same logical value the same way.
@@ -292,10 +294,15 @@ state) all need an active transaction. `Context::execute_substrait` wraps build,
 `streaming_fragment::build()` has declared the real stream bindings, so the view's `SELECT` binds
 against them and no placeholder declarations exist.
 
-`in_transaction(conn, body)` commits when `body` returns and otherwise rolls back and rethrows the
-original error, even if the rollback itself fails. The new `streaming_fragment` is handed to
-`Fragment` only after the commit, so a failed `build()` leaves the `Fragment` unbuilt and
-retryable.
+`in_transaction(serial, conn, body)` commits when `body` returns and otherwise rolls back and
+rethrows the original error, even if the rollback itself fails. The new `streaming_fragment` is
+handed to `Fragment` only after the commit, so a failed `build()` leaves the `Fragment` unbuilt
+and retryable.
+
+**One transaction at a time per `Context`.** Every `Fragment` shares the `Context`'s one
+connection, and a second `BEGIN` on it would fail and invalidate the open transaction.
+`in_transaction` holds the `Context`'s `conn_mutex` for the whole transaction, so concurrent
+`build()`, `run()`, and `execute_substrait` calls wait for each other.
 
 **Rollback, not commit, on failure.** If `create_stream_views()` already created some views when
 a later step fails, those `CREATE VIEW` statements are uncommitted catalog writes. Committing
@@ -355,11 +362,13 @@ shared test environments around that tag so they do not share GPU memory with it
 `result_to_arrow`, `execute_substrait`). It builds Substrait in the test because the FFI has no
 SQL passthrough. It covers a leaf result, a `relay_from` chain, several fragments built before any
 runs (on one and on two threads), `build()` and `run()` on different threads, drop after `build()`,
-a `build()` that fails after setup, and a hash key on one output. `test_streaming_fragment.cpp`
-covers spec errors, relay preconditions (FRAG-7), failed-run behavior (FRAG-8), hash partitioning
-(FRAG-9), out-of-order builds and runs (FRAG-10), another window between `build()` and `run()`
-(FRAG-11), the `run()` guards (FRAG-12), and runs from two threads (FRAG-13). Rollback of a `build()` that fails while resolving input types
-stays in `test_sirius_ffi_fragment.cpp`.
+a `build()` that fails after setup, a hash key on one output, and concurrent `run()` and
+`execute_substrait` calls on one `Context`. `test_streaming_fragment.cpp` covers spec errors,
+relay preconditions (FRAG-7), failed-run behavior (FRAG-8), hash partitioning (FRAG-9) including
+INTEGER and BIGINT senders (FRAG-9b), out-of-order builds and runs (FRAG-10), another window
+between `build()` and `run()` (FRAG-11), the `run()` guards (FRAG-12), and runs from two threads
+(FRAG-13). Rollback of a `build()` that fails while resolving input types stays in
+`test_sirius_ffi_fragment.cpp`.
 
 ## Not yet ported
 
