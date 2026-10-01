@@ -368,7 +368,7 @@ void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::st
         auto ro          = batch->to_read_only();
         auto* ms         = ro.get_memory_space();
         if (ms != nullptr && ms->get_tier() == cucascade::memory::Tier::GPU) {
-          if (auto const placed = _placement->partition_for_device(ms->get_device_id())) {
+          if (auto const placed = _placement->first_partition_for_device(ms->get_device_id())) {
             slot = *placed;
           } else {
             // Every admitted GPU holds a broadcast slot, so a GPU-resident probe batch always

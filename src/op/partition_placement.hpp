@@ -91,9 +91,11 @@ class partition_placement {
     return device;
   }
 
-  /// The first partition pinned to `device_id`, or nullopt when none is. Broadcast joins use it to
-  /// route a probe batch to the partition on the GPU the batch already resides on.
-  [[nodiscard]] std::optional<std::size_t> partition_for_device(int device_id) const noexcept
+  /// The lowest-index partition pinned to `device_id`, or nullopt when none is.
+  /// Multiple partitions may share a GPU; this lookup returns only the first match.
+  /// Broadcast joins use it to route probe batches because their placement has one partition
+  /// per GPU. It is not a general inverse of device_for().
+  [[nodiscard]] std::optional<std::size_t> first_partition_for_device(int device_id) const noexcept
   {
     for (std::size_t p = 0; p < _device_per_partition.size(); ++p) {
       if (_device_per_partition[p] != unpinned_device && _device_per_partition[p] == device_id) {

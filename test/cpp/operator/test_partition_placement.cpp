@@ -79,20 +79,20 @@ TEST_CASE("partition_placement::one_per_device maps slot i to gpu_ids[i]",
   REQUIRE(p.num_partitions() == 2);
   REQUIRE(p.device_for(0) == 3);
   REQUIRE(p.device_for(1) == 5);
-  REQUIRE(p.partition_for_device(3) == std::optional<std::size_t>{0});
-  REQUIRE(p.partition_for_device(5) == std::optional<std::size_t>{1});
-  REQUIRE_FALSE(p.partition_for_device(4).has_value());
+  REQUIRE(p.first_partition_for_device(3) == std::optional<std::size_t>{0});
+  REQUIRE(p.first_partition_for_device(5) == std::optional<std::size_t>{1});
+  REQUIRE_FALSE(p.first_partition_for_device(4).has_value());
 
   REQUIRE(partition_placement::one_per_device({}) == partition_placement::unpinned(1));
 }
 
-TEST_CASE("partition_placement::partition_for_device returns the first pinned slot",
+TEST_CASE("partition_placement::first_partition_for_device returns the first pinned slot",
           "[partition_placement][unit]")
 {
   auto const p = partition_placement::round_robin(4, {2, 7});
-  REQUIRE(p.partition_for_device(2) == std::optional<std::size_t>{0});
-  REQUIRE(p.partition_for_device(7) == std::optional<std::size_t>{1});
-  REQUIRE_FALSE(partition_placement::unpinned(2).partition_for_device(0).has_value());
+  REQUIRE(p.first_partition_for_device(2) == std::optional<std::size_t>{0});
+  REQUIRE(p.first_partition_for_device(7) == std::optional<std::size_t>{1});
+  REQUIRE_FALSE(partition_placement::unpinned(2).first_partition_for_device(0).has_value());
 }
 
 TEST_CASE("partition_placement rejects invalid shapes and indices", "[partition_placement][unit]")
