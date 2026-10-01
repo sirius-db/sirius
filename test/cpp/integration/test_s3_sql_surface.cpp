@@ -14,6 +14,7 @@
 #include "scan_manager/config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -40,6 +41,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1240,6 +1242,56 @@ TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
   compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
   auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
   sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE(
+  "transparent S3 glob rejects parquet files whose schemas differ instead of decoding them "
+  "together",
+  "[s3][integration][sql][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  sirius::test::scratch_dir dir("s3_schema_drift");
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  require_query_ok(con,
+                   "COPY (SELECT 1::INTEGER AS x UNION ALL SELECT 2) TO " +
+                     dir.file_literal("a.parquet") + " (FORMAT PARQUET)");
+  require_query_ok(con,
+                   "COPY (SELECT 2.5::DOUBLE AS x UNION ALL SELECT 17.5) TO " +
+                     dir.file_literal("b.parquet") + " (FORMAT PARQUET)");
+
+  auto read_bytes = [](std::string const& path) {
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in.is_open());
+    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>{in},
+                                    std::istreambuf_iterator<char>{}};
+    REQUIRE_FALSE(in.bad());
+    REQUIRE_FALSE(bytes.empty());
+    return bytes;
+  };
+  auto const bytes_a = read_bytes(dir.file("a.parquet"));
+  auto const bytes_b = read_bytes(dir.file("b.parquet"));
+  if (!sirius::test::put_s3_container_object("schema-drift/a.parquet", bytes_a)) {
+    SUCCEED("managed MinIO is required for the schema drift test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_container_object("schema-drift/b.parquet", bytes_b));
+
+  auto result =
+    fixture.con.Query("SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "schema-drift/*.parquet"));
+  REQUIRE(result);
+  INFO(result->ToString());
+  REQUIRE(result->HasError());
+  auto const error = result->GetError();
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(error.find("All sources must have the same schema") != std::string::npos);
+  CHECK(error.find("schema-drift/a.parquet") != std::string::npos);
+  CHECK(error.find("schema-drift/b.parquet") != std::string::npos);
 }
 
 TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",

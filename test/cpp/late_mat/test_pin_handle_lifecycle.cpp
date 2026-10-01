@@ -36,6 +36,7 @@
 #include <late_mat/column_origin.hpp>
 #include <memory/topology_index.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <memory>
 #include <string>
@@ -70,8 +71,9 @@ sirius::device_pin_chunk make_chunk(cucascade::memory::memory_space& space,
 sirius::scan_manager::cache_entry_info make_cache_info()
 {
   sirius::scan_manager::cache_entry_info info;
-  info.table_name = kTable;
-  info.names      = {"l_quantity"};
+  info.table_name     = kTable;
+  info.table_identity = sirius::test::test_table_identity(42);
+  info.names          = {"l_quantity"};
   info.column_ids.emplace_back(0);  // aligned with names, as the insert requires
   return info;
 }
@@ -106,7 +108,8 @@ column_origin capture_origin(sirius_scan_manager const& manager)
 
 std::shared_ptr<pinned_entry const> capture_entry_owner(sirius_scan_manager const& manager)
 {
-  return manager.find_pinned_entry_for_duckdb_table("", "", kTable);
+  return manager.find_pinned_entry_for_duckdb_table(
+    "", "", kTable, sirius::test::test_table_identity(42));
 }
 
 std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()

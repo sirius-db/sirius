@@ -85,19 +85,18 @@ namespace duckdb {
 
 namespace {
 
-static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
-static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
-static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
-static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
+static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
+static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
 
-optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
 {
   switch (op.type) {
     case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
     case PhysicalOperatorType::INSERT: {
       auto const& insert = op.Cast<PhysicalInsert>();
       if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
-        return &*insert.insert_table;
+        return insert.insert_table.get_mutable();
       }
       break;
     }
@@ -118,13 +117,17 @@ optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const&
   return nullptr;
 }
 
+/// Find the pin for this table incarnation. A recreated same-name table does not match.
 std::optional<std::string> pinned_name_for_table(
-  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry& table)
 {
+  if (!table.IsDuckTable()) { return std::nullopt; }
+  sirius::duckdb_table_identity const identity{table.oid,
+                                               table.GetStorage().GetRowGroupCollection()};
   std::optional<std::string> result;
   scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
     if (!entry.cache_info.matches_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name, identity)) {
       return true;
     }
     result = name;
@@ -193,25 +196,6 @@ std::optional<std::string> get_config_file_path()
   if (home_dir != nullptr) {
     auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
                      std::string(CONFIG_FILE_NAME);
-    if (std::filesystem::exists(home_path)) { return home_path.string(); }
-  }
-
-  return std::nullopt;
-}
-
-/// Check whether a legacy sirius.cfg file exists in any of the search locations.
-/// Returns the path if found, std::nullopt otherwise.
-std::optional<std::string> find_legacy_config_file()
-{
-  // Current working directory
-  auto cwd_path = std::filesystem::current_path() / std::string(LEGACY_CONFIG_FILE_NAME);
-  if (std::filesystem::exists(cwd_path)) { return cwd_path.string(); }
-
-  // Home directory
-  const char* home_dir = std::getenv("HOME");
-  if (home_dir != nullptr) {
-    auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
-                     std::string(LEGACY_CONFIG_FILE_NAME);
     if (std::filesystem::exists(home_path)) { return home_path.string(); }
   }
 
@@ -1797,21 +1781,9 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_ERROR("{}", msg);
     throw std::runtime_error(msg);
   } else {
-    // Check if the user has a legacy .cfg file they may need to migrate
-    if (auto legacy_path = find_legacy_config_file()) {
-      SIRIUS_LOG_WARN(
-        "Found legacy config file '{}'. Sirius now uses YAML configuration "
-        "(sirius.yaml). Please migrate your settings to the new format. "
-        "See docs/super-sirius/configuration.md for details.",
-        *legacy_path);
-    }
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    SIRIUS_LOG_WARN(
-      "Super Sirius will allocate most GPU and pinned host memory on startup. "
-      "If you are using the legacy code path (gpu_buffer_init / gpu_processing), "
-      "set SIRIUS_DISABLE=1 to prevent this.");
     config_.apply_defaults();
   }
 }

@@ -64,6 +64,7 @@ struct ordering_test_env {
 
 ordering_test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static ordering_test_env e;
   return e;
 }

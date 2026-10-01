@@ -22,10 +22,15 @@
 namespace sirius {
 namespace util {
 
-env_guard::env_guard(std::string name, const std::string& value) : name_(std::move(name))
+env_guard::env_guard(std::string name, const std::optional<std::string>& value)
+  : name_(std::move(name))
 {
   if (const char* prev = ::getenv(name_.c_str())) { previous_value_ = std::string(prev); }
-  ::setenv(name_.c_str(), value.c_str(), /*overwrite=*/1);
+  if (value) {
+    ::setenv(name_.c_str(), value->c_str(), /*overwrite=*/1);
+  } else {
+    ::unsetenv(name_.c_str());
+  }
   active_ = true;
 }
 

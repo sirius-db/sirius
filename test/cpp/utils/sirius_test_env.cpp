@@ -17,6 +17,7 @@
 #include "sirius_test_env.hpp"
 
 #include "catch.hpp"
+#include "util/env_guard.hpp"
 
 #include <cuda_runtime.h>
 
@@ -60,16 +61,17 @@ shared_test_env* g_shared_env           = nullptr;
 shared_test_env* g_integration_env      = nullptr;
 shared_test_env* g_integration_env_2gpu = nullptr;
 
+std::unique_ptr<duckdb::DuckDB> open_sirius_db(char const* path,
+                                               std::filesystem::path const& config_path)
+{
+  sirius::util::env_guard const config("SIRIUS_CONFIG_FILE", config_path.string());
+  sirius::util::env_guard const enabled("SIRIUS_DISABLE", std::nullopt);
+  return std::make_unique<duckdb::DuckDB>(path);
+}
+
 shared_test_env::shared_test_env(const std::filesystem::path& config_path)
   : config_path_(config_path)
 {
-  // Save the current SIRIUS_CONFIG_FILE value so we can restore it on destruction
-  const char* current = std::getenv("SIRIUS_CONFIG_FILE");
-  if (current) {
-    had_original_config_env_ = true;
-    original_config_env_     = current;
-  }
-
   create_db();
 }
 
@@ -77,24 +79,13 @@ shared_test_env::~shared_test_env()
 {
   // Destroy DuckDB — this releases the SiriusContext
   db_.reset();
-
-  // Restore original environment
-  if (had_original_config_env_) {
-    setenv("SIRIUS_CONFIG_FILE", original_config_env_.c_str(), 1);
-  } else {
-    unsetenv("SIRIUS_CONFIG_FILE");
-  }
 }
 
 void shared_test_env::create_db()
 {
-  // Point the extension callback at our test config and ensure Sirius is enabled
-  setenv("SIRIUS_CONFIG_FILE", config_path_.string().c_str(), 1);
-  unsetenv("SIRIUS_DISABLE");
-
   // Creating DuckDB triggers the extension load callback, which reads the config
   // and creates + initializes the SiriusContext.
-  db_ = std::make_unique<duckdb::DuckDB>(nullptr);
+  db_ = open_sirius_db(nullptr, config_path_);
 
   // Disable Sirius for any other DuckDB instances created by tests (e.g. operator
   // tests that use their own memory manager) so they don't create a SiriusContext.

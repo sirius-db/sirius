@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Run TPC-DS benchmark on new Sirius (gpu_execution) against parquet files.
+# Run TPC-DS benchmark on Sirius (gpu_execution) against parquet files.
 #
-# Uses gpu_execution (new Sirius) — no gpu_buffer_init needed.
 # Creates views from parquet files, then runs each query twice (cold + warm).
 #
 # Usage:

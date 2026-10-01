@@ -34,6 +34,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -244,7 +245,7 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                                           std::move(offsets),
                                           std::move(values),
                                           0,
-                                          rmm::device_buffer{});
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(list_col));
   return std::make_unique<cudf::table>(std::move(cols));

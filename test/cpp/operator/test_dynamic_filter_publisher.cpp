@@ -208,7 +208,8 @@ struct publisher_fixture {
     auto& source_space = replica_spaces.front().get_gpu_space();
     auto mask          = cudf::create_null_mask(
       column.size(), cudf::mask_state::ALL_VALID, stream, source_space.get_default_allocator());
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), begin, end, false, stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(mask.data()), begin, end, false, stream);
     column.set_null_mask(std::move(mask), end - begin);
     stream.sync();
   }
@@ -288,8 +289,11 @@ std::unique_ptr<cudf::column> make_string_values(publisher_fixture const& fixtur
                           fixture.stream.get()) == cudaSuccess);
   rmm::device_buffer chars_buf{chars.data(), chars.size(), fixture.stream, mr};
   fixture.stream.sync();
-  return cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  return cudf::make_strings_column(n,
+                                   std::move(offsets_col),
+                                   std::move(chars_buf),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixture,
@@ -744,7 +748,8 @@ TEST_CASE("dynamic-filter publisher builds exact IN-lists from a nullable build 
                                        cudf::mask_state::ALL_VALID,
                                        fixture.stream,
                                        cudf::get_current_device_resource_ref());
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 0, 1, false, fixture.stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(mask.data()), 0, 1, false, fixture.stream);
     probe->set_null_mask(std::move(mask), 1);
     REQUIRE(membership_mask(*filter, probe->view(), fixture) ==
             std::vector<std::uint8_t>{0, 1, 0, 0, 1, 0});

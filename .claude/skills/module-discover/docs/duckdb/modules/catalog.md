@@ -34,7 +34,7 @@ public:
 **Description**: The system catalog. Provides access to all database objects (tables, functions, schemas).
 
 **Our usage**:
-- `src/sirius_extension.cpp` — `CreateTableFunction()` to register `gpu_processing`, `gpu_execution`, etc.
+- `src/sirius_extension.cpp` — `CreateTableFunction()` to register `gpu_execution`, etc.
 - `test/cpp/scan/test_parquet_scan_task.cpp` — Look up parquet scan function in catalog
 - `test/cpp/integration/test_tpcds_plan_translation.cpp` — Register test functions
 

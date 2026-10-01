@@ -33,6 +33,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -304,15 +305,21 @@ cudf::size_type bulk_row_count(fs::path const& path,
 }
 
 /// A backend that prefers bulk IO -- the one thing `prefers_bulk_materialize`
-/// asks a source's datasource.  Nothing reads through it.
+/// asks a source's datasource.
 class bulk_object final : public sirius::io::io_object {
  public:
+  explicit bulk_object(std::string path = "bulk", std::size_t size = 0)
+    : _path(std::move(path)), _size(size)
+  {
+  }
+
   [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
-  [[nodiscard]] std::size_t size() const noexcept override { return 0; }
+  [[nodiscard]] std::size_t size() const noexcept override { return _size; }
 
  private:
-  std::string _path{"bulk"};
+  std::string _path;
+  std::size_t _size;
 };
 
 class bulk_reactor {
@@ -363,6 +370,15 @@ class bulk_context final : public sirius::io::templated_ioctx<bulk_reactor> {
   }
 };
 
+sirius::op::scan::parquet_source schema_source(fs::path const& path,
+                                               std::shared_ptr<bulk_context> const& ioctx)
+{
+  return {std::make_shared<sirius::io::sirius_datasource>(
+            ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
+          std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path)),
+          {}};
+}
+
 }  // namespace
 
 TEST_CASE("filtered options still take the bulk materialize route", "[scan][parquet][bulk_filter]")
@@ -385,6 +401,126 @@ TEST_CASE("filtered options still take the bulk materialize route", "[scan][parq
     reader.all_row_groups(options)});
 
   CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options));
+}
+
+TEST_CASE("bulk materialize rejects sources whose schemas differ before reading",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path_a =
+    write_parquet(con, dir, "drift_a", "CREATE TABLE drift_a AS SELECT 1::INTEGER AS x, 'a' AS y");
+  auto const path_b =
+    write_parquet(con, dir, "drift_b", "CREATE TABLE drift_b AS SELECT 2.5::DOUBLE AS x, 'b' AS y");
+  auto const options = cudf::io::parquet_reader_options::builder().build();
+  auto ioctx         = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> sources;
+  for (auto const& path : {path_a, path_b}) {
+    auto metadata = std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path));
+    cudf::io::parquet::experimental::hybrid_scan_reader reader{*metadata, options};
+    sources.push_back(sirius::op::scan::parquet_source{
+      std::make_shared<sirius::io::sirius_datasource>(
+        ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
+      std::move(metadata),
+      reader.all_row_groups(options)});
+  }
+
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  CHECK_THROWS_WITH(
+    sirius::op::scan::materialize_parquet(
+      sources, options, {}, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
+    Catch::Matchers::ContainsSubstring("All sources must have the same schema") &&
+      Catch::Matchers::ContainsSubstring("drift_a") &&
+      Catch::Matchers::ContainsSubstring("drift_b") && Catch::Matchers::ContainsSubstring("'x'"));
+}
+
+TEST_CASE("require_same_parquet_schema accepts a shared schema", "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_shared");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path_a =
+    write_parquet(con, dir, "shared_a", "CREATE TABLE shared_a AS SELECT 1::INTEGER AS x");
+  auto const path_b =
+    write_parquet(con, dir, "shared_b", "CREATE TABLE shared_b AS SELECT 2::INTEGER AS x");
+  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                              schema_source(path_b, ioctx)};
+
+  REQUIRE(sources[0].metadata != sources[1].metadata);
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(sources));
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(
+    std::span<sirius::op::scan::parquet_source const>(sources).first(1)));
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema({}));
+}
+
+TEST_CASE("require_same_parquet_schema rejects column order and extra-column drift",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_columns");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+
+  SECTION("column order")
+  {
+    auto const path_a = write_parquet(
+      con, dir, "order_a", "CREATE TABLE order_a AS SELECT 1::INTEGER AS x, 2::INTEGER AS y");
+    auto const path_b = write_parquet(
+      con, dir, "order_b", "CREATE TABLE order_b AS SELECT 2::INTEGER AS y, 1::INTEGER AS x");
+    std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                                schema_source(path_b, ioctx)};
+
+    CHECK_THROWS_WITH(
+      sirius::op::scan::require_same_parquet_schema(sources),
+      Catch::Matchers::ContainsSubstring("differ at schema element 1 ('x' INT32 vs 'y' INT32)"));
+  }
+
+  SECTION("extra column")
+  {
+    auto const path_a =
+      write_parquet(con, dir, "extra_a", "CREATE TABLE extra_a AS SELECT 1::INTEGER AS x");
+    auto const path_b = write_parquet(
+      con, dir, "extra_b", "CREATE TABLE extra_b AS SELECT 1::INTEGER AS x, 2::INTEGER AS z");
+    std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                                schema_source(path_b, ioctx)};
+
+    CHECK_THROWS_WITH(sirius::op::scan::require_same_parquet_schema(sources),
+                      Catch::Matchers::ContainsSubstring("have 2 and 3 schema elements"));
+  }
+}
+
+TEST_CASE("require_same_parquet_schema rejects a difference only in writer metadata",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_writer");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path =
+    write_parquet(con, dir, "writer", "CREATE TABLE writer AS SELECT 1::INTEGER AS x");
+  auto ioctx   = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto source  = schema_source(path, ioctx);
+  auto changed = std::make_shared<cudf::io::parquet::FileMetaData>(*source.metadata);
+  std::vector<sirius::op::scan::parquet_source> const sources{source,
+                                                              {source.datasource, changed, {}}};
+  REQUIRE(changed->schema.size() == 2);
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(sources));
+
+  SECTION("root name")
+  {
+    REQUIRE(changed->schema[0].name == "duckdb_schema");
+    changed->schema[0].name = "schema";
+    CHECK_THROWS_WITH(sirius::op::scan::require_same_parquet_schema(sources),
+                      Catch::Matchers::ContainsSubstring("differ at schema element 0") &&
+                        Catch::Matchers::ContainsSubstring("'schema' group"));
+  }
+
+  SECTION("converted type")
+  {
+    REQUIRE(changed->schema[1].converted_type == cudf::io::parquet::ConvertedType::INT_32);
+    changed->schema[1].converted_type = cudf::io::parquet::ConvertedType::UINT_32;
+    CHECK_THROWS_WITH(
+      sirius::op::scan::require_same_parquet_schema(sources),
+      Catch::Matchers::ContainsSubstring("differ at schema element 1 ('x' INT32 vs 'x' INT32") &&
+        Catch::Matchers::ContainsSubstring("; they differ in annotation, width or nesting"));
+  }
 }
 
 TEST_CASE("hybrid scan bulk materialize applies the reader filter like read_parquet",

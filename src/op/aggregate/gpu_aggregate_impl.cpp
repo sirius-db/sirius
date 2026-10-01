@@ -24,6 +24,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
@@ -346,13 +347,14 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
         struct_children.push_back(std::make_unique<cudf::column>(
           input_table.column(col_idx), stream, memory_space.get_default_allocator()));
       }
-      auto struct_col = cudf::make_structs_column(input_table.num_rows(),
-                                                  std::move(struct_children),
-                                                  0,
-                                                  rmm::device_buffer{},
-                                                  stream,
-                                                  memory_space.get_default_allocator());
-      request.values  = struct_col->view();
+      auto struct_col =
+        cudf::make_structs_column(input_table.num_rows(),
+                                  std::move(struct_children),
+                                  0,
+                                  cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                  stream,
+                                  memory_space.get_default_allocator());
+      request.values = struct_col->view();
       temp_struct_cols.push_back(std::move(struct_col));
     } else if (aggregate_col_id >= widened_sum_key_offset) {
       auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);

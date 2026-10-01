@@ -109,7 +109,11 @@ std::unique_ptr<cudf::table> make_source_table(::cuda::stream_ref stream,
     REQUIRE(cudf::size_of(key_type) == sizeof(KeyT));
     auto contents = key->release();
     key           = std::make_unique<cudf::column>(
-      key_type, kRows, std::move(*contents.data), rmm::device_buffer{}, 0);
+      key_type,
+      kRows,
+      std::move(*contents.data),
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+      0);
   }
   cols.push_back(std::move(key));
   stream.sync();
@@ -710,7 +714,11 @@ std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> const& hos
   rmm::device_buffer chars_buf{chars.data(), chars.size(), stream, mr};
   stream.sync();
   return cudf::make_strings_column(
-    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+    n,
+    std::move(offsets_col),
+    std::move(chars_buf),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 std::vector<std::string> strings_to_host(cudf::column_view const& col, ::cuda::stream_ref stream)

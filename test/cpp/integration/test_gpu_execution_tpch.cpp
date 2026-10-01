@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "util/env_guard.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -69,13 +70,11 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
-struct sirius_config_env_guard {
-  sirius_config_env_guard(const std::string& config_path)
+struct sirius_config_env_guard : sirius::util::env_guard {
+  explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 class GPUExecutionFixtureBase {
@@ -390,25 +389,6 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
   }
-
-  // // Disabled: these tests scan native (DuckDB-storage) tables via seq_scan. The
-  // // legacy duckdb_scan path was removed and GPU native scan has no IO backend
-  // // wired in this harness ("missing io_ctx, io_obj"), so every query throws
-  // // "Unsupported scan function: seq_scan" and poisons the shared integration
-  // // DB. Shadow the comparison helpers to skip until native scan is supported.
-  // void compare_gpu_vs_cpu(const std::string& /*query*/,
-  //                         std::optional<float> /*float_tolerance*/ = std::nullopt)
-  // {
-  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
-  // }
-
-  // bool compare_gpu_vs_cpu_for(int /*num_gpus*/,
-  //                             const std::string& /*query*/,
-  //                             std::optional<float> /*float_tolerance*/ = std::nullopt)
-  // {
-  //   WARN("duckdb-native tpch scan skipped — legacy duckdb_scan path removed");
-  //   return false;
-  // }
 };
 
 /**

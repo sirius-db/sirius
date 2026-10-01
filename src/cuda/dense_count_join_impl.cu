@@ -445,7 +445,7 @@ void write_null_group_row(cudf::column& key_col,
 
   auto mask = cudf::create_null_mask(key_col.size(), cudf::mask_state::ALL_VALID, stream, mr);
   cudf::set_null_mask(
-    static_cast<cudf::bitmask_type*>(mask.data()), row_idx, row_idx + 1, false, stream);
+    reinterpret_cast<cudf::bitmask_type*>(mask.data()), row_idx, row_idx + 1, false, stream);
   key_col.set_null_mask(std::move(mask), 1);
 }
 

@@ -11,7 +11,7 @@
 #   runs/tpcds_<timestamp>_sf<SF>/
 #     run_info.txt     - git, hardware, build info
 #     run_info.patch   - git diff when tree is dirty
-#     sirius_config.cfg
+#     sirius_config.yaml
 #     sirius/          - result_q<N>.txt, log_q<N>.txt, timings.csv
 #     duckdb/          - result_q<N>.txt, log_q<N>.txt, timings.csv
 #     validation.csv
@@ -329,14 +329,14 @@ mkdir -p "$RUN_DIR"
 # Resolve config — only required for sirius engine.
 if [[ " $ENGINES " == *" sirius "* ]]; then
     if [ -z "${SIRIUS_CONFIG_FILE:-}" ]; then
-        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.cfg"
+        export SIRIUS_CONFIG_FILE="$HOME/.sirius/sirius.yaml"
     fi
     if [ ! -f "$SIRIUS_CONFIG_FILE" ]; then
         echo "ERROR: config file not found: $SIRIUS_CONFIG_FILE"
         exit 1
     fi
     echo "Config file: $SIRIUS_CONFIG_FILE"
-    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.cfg"
+    cp "$SIRIUS_CONFIG_FILE" "$RUN_DIR/sirius_config.yaml"
 fi
 
 # Resolve parquet directory
