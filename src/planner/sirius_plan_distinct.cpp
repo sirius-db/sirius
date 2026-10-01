@@ -43,6 +43,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 {
   D_ASSERT(op.children.size() == 1);
 
+  // The binder lowers a distinct UNION to this node over a UNION ALL; distinct UNION is not on
+  // the GPU path yet, so keep it on CPU.
+  if (op.children[0]->type == duckdb::LogicalOperatorType::LOGICAL_UNION) {
+    throw duckdb::NotImplementedException(
+      "DISTINCT over a UNION is not supported on the GPU (falling back to CPU): distinct UNION is "
+      "not on the GPU path yet");
+  }
+
   // `order_by` is populated for DISTINCT ON only, so this tests the ordered shape and not
   // distinct_type. Relaxing it returns a plausible wrong row, not an error.
   if (op.order_by) {
