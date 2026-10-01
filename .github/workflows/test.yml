@@ -178,69 +178,10 @@ jobs:
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
 
-      # Two Catch2 shards per GPU. Each shard sees only its assigned GPU; [multi_gpu]
-      # tests run afterwards with all GPUs. Declaration order keeps tests using
-      # the same shared environment together.
       - name: Run C++ unit tests
         run: |
           nvidia-smi
-          bin=./build/release/extension/sirius/test/cpp/sirius_unittest
-          log_root=$PWD/build/release/extension/sirius/test/cpp/log
-          gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-          if ((gpus < 2)); then
-            echo "::error::Expected at least 2 GPUs, found $gpus" >&2
-            exit 1
-          fi
-          shards=$((2 * gpus))
-          export SIRIUS_TEST_INTEGRATION_CONFIG="$PWD/test/cpp/integration/integration-shard.yaml"
-          for ((i = 0; i < shards; i++)); do
-            mkdir -p "$log_root/shard-$i" "/tmp/shard-$i"
-            # Stream each shard live with a prefix; keep its full log for the failure summary.
-            {
-              status=0
-              started_at=$(date +%s)
-              CUDA_VISIBLE_DEVICES=$((i % gpus)) SIRIUS_TEST_SINGLE_GPU=1 SIRIUS_TEST_LOG_DIR="$log_root/shard-$i" \
-                TMPDIR="/tmp/shard-$i" \
-                timeout 45m "$bin" --abort --order decl --durations yes \
-                  --shard-count "$shards" --shard-index "$i" "~[.]~[multi_gpu]" 2>&1 || status=$?
-              echo "$status $(($(date +%s) - started_at))" > "/tmp/shard-$i.status"
-            } | tee "/tmp/unittest-$i.log" | sed -u -e "/^$/d" -e "s/^/[shard $i] /" &
-          done
-          wait
-          status=0
-          for ((i = 0; i < shards; i++)); do
-            summary=$(grep -E '^(All tests passed|test cases:)' "/tmp/unittest-$i.log" | tail -1 || true)
-            if ! read -r shard_status elapsed < "/tmp/shard-$i.status"; then
-              shard_status=missing
-              elapsed=unknown
-            fi
-            echo "Shard $i (exit $shard_status, ${elapsed}s): $summary"
-            [ "$shard_status" = 0 ] || status=1
-          done
-          cat /tmp/unittest-*.log > /tmp/unittest.log
-          exit $status
-
-      - name: Run multi-GPU C++ unit tests
-        run: |
-          set -o pipefail
-          gpus=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-          if ((gpus < 2)); then
-            echo "::error::Expected at least 2 GPUs for multi-GPU tests, found $gpus" >&2
-            exit 1
-          fi
-          timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl --durations yes \
-            "[multi_gpu]~[.]" 2>&1 | tee /tmp/unittest_multi_gpu.log
-
-      # The late-materialization gate is read from the environment once per process, so the
-      # feature is entirely absent from the run above. Without this step the end-to-end case
-      # (planning -> scan substitution -> transport -> restoration) returns successfully without
-      # executing, and a green suite says nothing about the feature.
-      - name: Run late-materialization tests with the gate on
-        run: |
-          set -o pipefail
-          SIRIUS_EXP_LATE_MAT=1 \
-            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort --order decl \
-            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
+          python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
@@ -266,9 +207,8 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest_late_mat.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest_multi_gpu.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -h -B 5 -A 10 'FAILED:' build/release/extension/sirius/test/cpp/log/*/unittest.log \
+            | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs

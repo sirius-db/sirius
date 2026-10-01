@@ -20,17 +20,18 @@ git submodule update --init --recursive
 
 ```bash
 # C++ unit tests
-build/release/extension/sirius/test/cpp/sirius_unittest
+make test
 
 # Run a specific tag or test name
 build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
-build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
-
-# SQL logic tests (end-to-end)
-make test
+build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
 ```
 
-Test logs are written to `build/release/extension/sirius/test/cpp/log/`.
+`make test` builds the release build and runs `scripts/run_unit_tests.py`, which CI also runs.
+See [test/README.md](test/README.md) for its options.
+
+Test logs are written to `build/release/extension/sirius/test/cpp/log/`, one subdirectory per
+test process.
 
 ## Code style
 
