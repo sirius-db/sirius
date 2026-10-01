@@ -57,7 +57,7 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
   }
 }
 
-/// The type a SUM over a column of type @p type is computed in: the next wider decimal type for
+/// The type of a SUM over a column of type @p type is computed in: the next wider decimal type for
 /// DECIMAL32 and DECIMAL64, and nullopt for every other type.
 std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
 {
