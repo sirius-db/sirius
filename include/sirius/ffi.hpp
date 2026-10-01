@@ -15,9 +15,8 @@
  */
 
 /*
- * Public C++ surface for embedding Sirius (`sirius::ffi::Context` plus
- * `Fragment`). The embedder is the process that links it: Rust `sirius-sys`
- * or C++ tests.
+ * Public C++ surface for embedding Sirius (`sirius::ffi::Context` and `Fragment`).
+ * The embedder is the process that links it: Rust `sirius-sys` or C++ tests.
  *
  * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without
@@ -89,11 +88,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// Any number of fragments may be built before any runs, and run in any order that respects
-/// relay_from (a source runs before its receiver's relay). build(), run() and
-/// Context::execute_substrait execute one at a time per Context: a concurrent call waits for
-/// the one in progress. run() and destruction may happen on a thread other than the one that
-/// called build().
+/// Any number of fragments may be built before any runs; run them in any order where each
+/// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
+/// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
+/// destruction may happen on a thread other than build()'s.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -149,12 +147,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Execute the fragment. Blocks until pipelines finish. Every input must be closed first
-  /// (relay_from and close_input close their sender). Runs once: after a failure, build a new
+  /// Execute the fragment and block until pipelines finish. Every input must be closed first
+  /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
   /// fragment.
-  /// @throws before build(), while an input is still open (the fragment stays runnable), when
-  /// already run or after a failed run(), when a table was pinned or unpinned since build(), or
-  /// on execution failure.
+  /// @throws before build(), while an input is open (the fragment stays runnable), on a second
+  /// call, when a table was pinned or unpinned since build(), or on execution failure.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at

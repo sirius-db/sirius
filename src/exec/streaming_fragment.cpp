@@ -41,13 +41,9 @@ namespace {
 
 constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
 
-// Fill a per-key cuDF cast type so independently planned senders hash the same logical value.
-// Planners may bind one column to INT32 in one fragment and INT64 in another. cuDF murmur3
+// Per-key cuDF cast type so independently planned senders hash the same logical value.
+// Planners may bind a column to INT32 in one fragment and INT64 in another, and cuDF murmur3
 // hashes bytes, so matching keys would otherwise land in different partitions.
-// TINYINT, SMALLINT, INTEGER become INT64.
-// BIGINT, BOOLEAN, VARCHAR stay as-is (EMPTY).
-// DECIMAL becomes FLOAT64.
-// Any other type throws.
 cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 {
   switch (t.id()) {
@@ -66,15 +62,14 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 }
 
 // Fill partition_spec::key_cast_types when the caller left it empty.
-// No-op when the caller already set cast types.
 void normalize_key_cast_types(op::partition_spec& spec,
                               const duckdb::vector<sirius::logical_type>& output_types)
 {
   if (!spec.key_cast_types.empty()) { return; }
   spec.key_cast_types.reserve(spec.key_columns.size());
   for (int key : spec.key_columns) {
-    // The sink also checks key ranges, but it is constructed after this. An out-of-range
-    // or negative key would index output_types first.
+    // The sink checks key ranges too, but is constructed after this; a bad key would index
+    // output_types first.
     if (key < 0 || static_cast<std::size_t>(key) >= output_types.size()) {
       throw sirius::invalid_input_exception("streaming_fragment: partition key column " +
                                             std::to_string(key) + " is out of range for a " +
@@ -130,7 +125,6 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
       " output streams need a partition spec; a gather fragment has exactly one");
   }
 
-  // Repositories outlive data_repository_manager_ cleanup so sender output outlives this fragment.
   for (auto id : _spec.outputs) {
     if (_output_repos.count(id) != 0) {
       throw sirius::invalid_input_exception("streaming_fragment: duplicate output stream id " +
@@ -244,8 +238,8 @@ void streaming_fragment::build()
   }
 
   duckdb::shared_ptr<stream_bind_catalog> catalog;
-  // Bind and create_plan read these ids; nothing reads them after build(), so drop them on
-  // every exit rather than leave a stale binding for the next fragment on this connection.
+  // Only bind and create_plan read these ids. Erase them on every exit so no stale binding
+  // reaches the next fragment on this connection.
   auto erase_declared = [&]() noexcept {
     if (!catalog) { return; }
     for (const auto& [id, _] : _spec.inputs) {
@@ -276,8 +270,8 @@ void streaming_fragment::build()
 
     duckdb::unique_ptr<op::sirius_physical_operator> subtree;
     {
-      // create_plan reads the pinned-table registry, which only the slot keeps stable. The
-      // window itself is opened by run(); stamp the epoch so run() can tell the plan went stale.
+      // create_plan reads the pinned-table registry, which only the slot keeps stable. run()
+      // opens the window and compares this epoch to detect a stale plan.
       duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
       _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
       subtree            = sirius::planner::sirius_physical_plan_generator(_context).create_plan(
@@ -309,8 +303,8 @@ void streaming_fragment::run()
       throw sirius::invalid_input_exception("streaming_fragment: already running");
     default: throw sirius::invalid_input_exception("streaming_fragment: already run");
   }
-  // A run() that waited on an open input would hold the query window, and every other query
-  // on this engine, until some other thread closed it. Fail instead; the fragment stays runnable.
+  // Waiting on an open input would hold the query window, and so every other query on this
+  // engine, until another thread closed it.
   for (auto id : _session.input_streams()) {
     if (!_session.input_closed(id)) {
       throw sirius::invalid_input_exception(
@@ -320,7 +314,7 @@ void streaming_fragment::run()
   }
 
   auto& sirius_ctx = sirius_context_of(_context);
-  // The switch above names the state; this closes the gap for a run() racing on another thread.
+  // The switch above reports the state; the CAS catches a concurrent run().
   auto expected = phase::built;
   if (!_phase.compare_exchange_strong(expected, phase::running)) {
     throw sirius::invalid_input_exception("streaming_fragment: already running");

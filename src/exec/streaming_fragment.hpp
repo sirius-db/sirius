@@ -60,8 +60,8 @@ struct bound_plan {
   duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
 };
 
-/// Called once, by build(), after the fragment's input streams are declared in the connection's
-/// stream_bind_catalog, so the plan may bind `sirius_stream_source(<id>)` reads.
+/// Called once by build(), after the input streams are declared in the connection's
+/// stream_bind_catalog, so the plan can bind `sirius_stream_source(<id>)`.
 using logical_plan_source = std::function<bound_plan(duckdb::ClientContext&)>;
 
 struct fragment_spec {
@@ -92,16 +92,16 @@ class streaming_fragment {
   /// Declare inputs, lower to STREAMING_SOURCE plus STREAMING_SINK or RESULT_COLLECTOR, and
   /// register with the session. Holds the engine's query-lifecycle slot only while generating
   /// the physical plan, so any number of fragments may be built before any runs. Inputs can be
-  /// filled after this returns. A failed build() cannot be retried; create a new fragment.
-  /// @throws sirius::invalid_input_exception when already built, after a failed build(), no
-  ///         catalog, no Sirius state, null plan, a declared input the plan never reads, or
-  ///         bound_plan::prepared types that do not match the plan's output types (HUGEINT over
-  ///         a BIGINT plan column is accepted).
+  /// filled after this returns.
+  /// @throws sirius::invalid_input_exception when already built, after a failed build() (no
+  ///         retry; create a new fragment), no catalog, no Sirius state, null plan, a declared
+  ///         input the plan never reads, or bound_plan::prepared types that do not match the
+  ///         plan's output types (HUGEINT over a BIGINT plan column is accepted).
   /// @throws whatever the plan source, binder, or plan generator raises.
   void build();
 
-  /// Open the query window, execute, and block until done; the window closes before this
-  /// returns. Every input must already be closed. On failure, poisons every output first.
+  /// Open the query window, execute, and block; the window closes before this returns. Every
+  /// input must already be closed. On failure, poisons every output before the window closes.
   /// @throws sirius::invalid_input_exception before build(), when an input is still open (the
   ///         fragment stays runnable), when already run, after a failed run() (create a new
   ///         fragment), or when a table was pinned or unpinned since build().
@@ -121,7 +121,7 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
-  /// nullopt means no batch is parked now. That is not EOS. Call drained(id) for EOS.
+  /// nullopt means no batch is parked now, not EOS; use drained(id) for EOS.
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
   /// @throws the output's poison error, which after a failed run() is that run's cause.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
@@ -162,10 +162,10 @@ class streaming_fragment {
   duckdb::ClientContext& _context;
   fragment_spec _spec;
 
-  // Declaration order is the lifetime contract (C++ destroys in reverse): repositories
-  // outlive the plan; `_result_plan` outlives the plan because a RESULT_COLLECTOR holds a
-  // reference into it; `_session` is destroyed before the operators it borrows. The plan root
-  // lives in `_plan_root` from build() until run() hands it to `_engine`.
+  // Declaration order is the lifetime contract (destroyed in reverse): repositories and
+  // `_result_plan` (referenced by a RESULT_COLLECTOR) outlive the plan, and `_session` dies
+  // before the operators it borrows. `_plan_root` holds the plan from build() until run() moves
+  // it into `_engine`.
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _output_repos;
   duckdb::shared_ptr<sirius::sirius_prepared_statement_data> _result_plan;
   duckdb::unique_ptr<duckdb::QueryResult> _result;

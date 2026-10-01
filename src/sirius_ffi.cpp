@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-// Implementation of the public FFI surface (sirius/ffi.hpp): Context plus Fragment.
-// This translation unit sees the heavy internal types so consumers (e.g. the Rust
-// bindings) never include sirius_context.hpp.
+// Implementation of sirius/ffi.hpp. This translation unit sees the heavy internal types so
+// consumers (e.g. the Rust bindings) never include sirius_context.hpp.
 
 #include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
@@ -129,10 +128,9 @@ sirius::exec::bound_plan lower_substrait(duckdb::Connection& conn,
   return {std::move(logical_plan), std::move(prepared)};
 }
 
-// Run `body` in a DuckDB transaction: commit on success, roll back and rethrow on failure. A
-// failed rollback does not replace the original error. `serial` is held for the whole
-// transaction: every Fragment of a Context shares its one connection, and a second BEGIN on
-// it would fail (and invalidate the open transaction) instead of waiting.
+// Run `body` in a transaction on `conn`; a failed rollback does not replace body's error.
+// `serial` is held throughout because every Fragment of a Context shares `conn`, and a second
+// BEGIN on it fails (and invalidates the open transaction) instead of waiting.
 template <typename Body>
 void in_transaction(std::mutex& serial, duckdb::Connection& conn, Body&& body)
 {
@@ -264,7 +262,6 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     plan_ms,
     execute_ms);
 
-  // Write the result into the caller's ArrowArrayStream at out_stream_addr.
   // The stream's release callback deletes the ResultArrowArrayStreamWrapper.
   auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
@@ -287,8 +284,8 @@ struct Fragment::Impl {
 
   Context::Impl& ctx;
 
-  // One column declared before build(). type_name is the DuckDB type string parsed at
-  // build() time. Parsing may need a catalog lookup, so it must run inside a transaction.
+  // An input stream declared before build(). type_names are parsed at build(), inside a
+  // transaction, because parsing may need a catalog lookup.
   struct declared_input {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
