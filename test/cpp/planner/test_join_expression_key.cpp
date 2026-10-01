@@ -25,6 +25,7 @@
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -182,10 +183,7 @@ struct join_expression_key_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(_db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     // big_left is larger so the optimizer keeps small_right as the build side.
@@ -196,8 +194,6 @@ struct join_expression_key_fixture {
     con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
   }
-
-  ~join_expression_key_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;

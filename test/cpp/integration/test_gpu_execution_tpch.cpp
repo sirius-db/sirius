@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "util/env_guard.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -69,13 +70,11 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
-struct sirius_config_env_guard {
-  sirius_config_env_guard(const std::string& config_path)
+struct sirius_config_env_guard : sirius::util::env_guard {
+  explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 class GPUExecutionFixtureBase {

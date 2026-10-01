@@ -87,6 +87,7 @@ struct test_env {
 
 test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }

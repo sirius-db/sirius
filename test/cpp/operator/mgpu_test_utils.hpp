@@ -32,6 +32,7 @@
 
 #include "pipeline/task_scheduler.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
@@ -210,8 +211,8 @@ inline void generate_parquet_surface(std::filesystem::path const& dir,
                                      int num_files)
 {
   std::filesystem::create_directories(dir);
-  setenv("SIRIUS_DISABLE", "1", 1);
   {
+    sirius::util::env_guard const disabled("SIRIUS_DISABLE", "1");
     duckdb::DuckDB gen_db(nullptr);
     duckdb::Connection gen(gen_db);
     auto create = gen.Query("CREATE TABLE t AS " + create_select_sql + ";");
@@ -225,7 +226,6 @@ inline void generate_parquet_surface(std::filesystem::path const& dir,
       REQUIRE_FALSE(copy->HasError());
     }
   }
-  unsetenv("SIRIUS_DISABLE");
 }
 
 /**

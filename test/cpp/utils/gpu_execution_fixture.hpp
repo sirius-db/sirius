@@ -29,6 +29,8 @@
  * native scan can see it on disk.
  */
 
+#include "util/env_guard.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <unistd.h>
@@ -67,13 +69,12 @@ inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQu
 }
 
 /// RAII guard that points Sirius at a config file for the lifetime of a fixture
-/// that spins up its own (non-shared) host database.
-struct sirius_config_env_guard {
+/// that spins up its own (non-shared) host database, then restores the previous value.
+struct sirius_config_env_guard : sirius::util::env_guard {
   explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 /**
