@@ -1201,7 +1201,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     try {
       generate_sirius_plan(*con, query);
     } catch (NotImplementedException const& e) {
-      REQUIRE_THAT(std::string(e.what()), Catch::Contains(message_fragment));
+      REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring(message_fragment));
       return;
     } catch (std::exception const& e) {
       FAIL("expected a NotImplementedException containing: " << message_fragment
@@ -1217,7 +1217,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     try {
       generate_sirius_plan(*con, query);
     } catch (std::exception const& e) {
-      REQUIRE_THAT(std::string(e.what()), Catch::Contains(message_fragment));
+      REQUIRE_THAT(std::string(e.what()), Catch::Matchers::ContainsSubstring(message_fragment));
       return;
     }
     FAIL("expected an exception containing: " << message_fragment);
