@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "duckdb_table_identity.hpp"
+
 // sirius
 #include <helper/logical_type.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
@@ -88,6 +90,9 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::string catalog_name;
   std::string schema_name;
   std::string table_name;
+  /// Catalog object id plus the storage collection visible to this transaction.
+  /// Rewritten storage must miss even when ALTER preserves the object id and type.
+  sirius::duckdb_table_identity table_identity;
 
   duckdb_native_ingestible_table_info() = default;
 

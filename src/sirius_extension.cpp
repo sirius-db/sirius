@@ -763,11 +763,11 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
   info->storage = &storage;
   info->context = &context;
   info->db_path = canonical;
-  // Qualified-name identity for the pin cache — derived from the resolved
-  // DuckTableEntry so it matches the query-side derivation (the pipeline converter).
+  // Match the scan path by deriving the cache identity from the resolved entry.
   info->catalog_name           = entry.ParentCatalog().GetName();
   info->schema_name            = entry.ParentSchema().name;
   info->table_name             = entry.name;
+  info->table_identity         = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = batch_size;
   // Full-schema names (logical order) so column_names() can derive the
   // column_ids-aligned view; the decoder itself ignores names.
@@ -1578,7 +1578,11 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   // build, so pin_owner must outlive it — a concurrent unpin on another connection must not
   // invalidate the entry mid-build.
   std::shared_ptr<sirius::scan_manager::pinned_entry const> pin_owner =
-    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
+    scan_mgr.find_pinned_entry_for_duckdb_table(
+      entry_catalog,
+      entry_schema,
+      entry.name,
+      {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
@@ -1720,15 +1724,17 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   }
 
   sirius::vss::index_metadata meta;
-  meta.kind         = ann_index_kind_from_type(data.index_type);
-  meta.catalog_name = entry_catalog;
-  meta.schema_name  = entry_schema;
-  meta.table_name   = entry.name;
-  meta.column_name  = data.column_name;
-  meta.dim          = dim;
-  meta.num_rows     = n_rows;
-  meta.n_lists      = static_cast<int64_t>(n_lists);
-  meta.metric       = metric;
+  meta.kind           = ann_index_kind_from_type(data.index_type);
+  meta.catalog_name   = entry_catalog;
+  meta.schema_name    = entry_schema;
+  meta.table_name     = entry.name;
+  meta.table_identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
+  meta.pin_snapshot   = pin->snapshot_identity;
+  meta.column_name    = data.column_name;
+  meta.dim            = dim;
+  meta.num_rows       = n_rows;
+  meta.n_lists        = static_cast<int64_t>(n_lists);
+  meta.metric         = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
   meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
@@ -1974,6 +1980,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.catalog             = entry.ParentCatalog().GetName();
   req.schema              = entry.ParentSchema().name;
   req.table_name          = entry.name;  // catalog-resolved name (matches query-side derivation)
+  req.table_identity      = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
   auto const schema_types = columns.GetColumnTypes();
@@ -1988,7 +1995,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // must not invalidate it mid-search.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
   auto pin_owner = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_identity);
   const auto* pin = pin_owner.get();
   if (pin == nullptr) {
     throw BinderException("sirius_knn_search: table '" + req.table_name +
@@ -2075,6 +2082,21 @@ static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext
   // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
   // non-owning. The slot also serializes the current-device-resource swap the build does.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
+  // A prepared table function can retain its bind data across DDL: the table
+  // name is a string argument, not a bound table scan dependency. Compare with
+  // the catalog visible to this execution before looking up either cache.
+  // Do not just refresh req's identity: its output types and vector dimension
+  // were also fixed at bind time and may no longer describe the current table.
+  auto const& req = bind_data.req;
+  auto& entry =
+    Catalog::GetEntry<TableCatalogEntry>(context, req.catalog, req.schema, req.table_name);
+  if (!entry.IsDuckTable() ||
+      !req.table_identity.matches({entry.oid, entry.GetStorage().GetRowGroupCollection()})) {
+    throw InvalidInputException(
+      "sirius_knn_search: table '" + req.table_name +
+      "' changed since the query was bound; re-pin the table and prepare the query again");
+  }
 
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);

@@ -264,18 +264,51 @@ narrowing marker. It also carries a `pinned_zone_maps` sidecar — the pin-time 
 min/max statistics, absent when capture was disabled (see [Zone maps](#zone-maps)).
 
 `cache_entry_info` captures format identity — the resolved parquet **file set**, or the DuckDB
-**catalog.schema.table** — plus the cached columns (by storage index) and their names.
-`can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same
-format, same identity, and a **column superset** of the scan's request. A Parquet pin never serves a
-DuckDB scan or vice versa. DuckDB cache serving additionally requires every projected column's
-current native cuDF mapping to equal the mapping recorded at pin time; a mismatch is a clean cache
-miss rather than a conversion of stale data under a new type.
+**catalog.schema.table plus the table's catalog object id and row-group collection identity** — plus the cached columns (by storage
+index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry
+can serve a scan: same format, same identity, and a **column superset** of the scan's request. A
+Parquet pin never serves a DuckDB scan or vice versa. DuckDB cache serving additionally requires
+every projected column's current native cuDF mapping to equal the mapping recorded at pin time; a
+mismatch is a clean cache miss rather than a conversion of stale data under a new type.
+
+The object id is the DuckDB identity's **incarnation** half. `DROP TABLE t; CREATE TABLE t (...)`
+rebuilds a different table under the same qualified name, and neither the name, the column layout
+nor the chunk shape tells the two apart. DuckDB gives newly created tables distinct object ids,
+but preserves the id across `ALTER TABLE`. An ALTER that rewrites column values or layout replaces
+the table's row-group collection, even for `ALTER COLUMN a TYPE INTEGER USING a + 100`. The cache
+therefore also records a weak reference to that collection and requires it to match. An expired
+reference cannot match newly allocated storage at the same address, and does not retain the old
+table's memory. INSERT and DELETE preserve the collection; existing MVCC checks still govern them.
+A scan of a recreated or storage-rewritten table misses the pin, as does a re-pin merge or ANN index
+lookup against the old storage. Metadata-only ALTER operations that preserve storage are not
+invalidated by this storage check. Whether a miss may fall through to a fresh disk-native read
+depends on the table itself: that path
+is MVCC-blind and reads only the checkpointed image, so the scan declines at plan time into the
+transparent CPU fallback whenever the table has diverged from that image — uncheckpointed rows (the
+pin's checkpoint suppression keeps them that way, leaving the dropped table's image on disk),
+deleted rows the image still carries, or in-memory update chains. A `CHECKPOINT` after the recreate
+folds appends and deletes into the image, and the superseded pin becomes an ordinary clean miss
+served by a fresh read; a checkpoint taken *before* the recreate proves nothing. Either way
+`CALL unpin_table(...)` then `pin_table` again to cache the new table.
+
+Prepared `sirius_knn_search` statements also resolve the qualified table name in the executing
+transaction's catalog before accessing the pin or ANN cache. If its catalog/storage identity
+differs from the bound identity, execution fails with an instruction to re-pin and prepare again.
+Refreshing only the cache key would leave the prepared output types and vector dimension stale.
+A dropped table fails catalog lookup. This check applies to both exact and ANN searches.
+
+ANN indexes additionally record a weak reference to the pin snapshot used for their build.
+Unpinning, replacing a pin, or merging a re-pin invalidates that match. This matters even when
+DML preserves the table's catalog/storage identity: new vectors or row positions in a new pin
+must not be searched with the old index. ANN searches reject the stale index and request a rebuild
+with `sirius_create_ann_index`; `use_index => false` can search the current pin immediately.
+The stale index remains cached until it is rebuilt, explicitly dropped, or the cache is cleared.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 
 ### Re-pin semantics
 
-For the GPU tier, `insert_pinned_entry` merges into an existing entry when the row count matches (adding only columns not already cached; per-chunk memory-space placement must match) and replaces it otherwise. The HOST tier always replaces, since each host chunk already holds every column.
+For the GPU tier, `insert_pinned_entry` merges into an existing entry when that entry reads the **same source** (`same_source_as`: same table incarnation and storage, or same file set) and the row count matches — adding only columns not already cached, with per-chunk memory-space placement required to match — and replaces it otherwise. The identity half of that test is what stops a pin name reused across a `DROP`/`CREATE` from fusing two unrelated tables into one entry: an equally-sized different table passes every chunk-shape guard the merge applies. The HOST tier always replaces, since each host chunk already holds every column.
 
 ### MVCC under concurrent DML (duckdb pins)
 

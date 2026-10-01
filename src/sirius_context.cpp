@@ -89,14 +89,14 @@ static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
 static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
 static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
 
-optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
 {
   switch (op.type) {
     case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
     case PhysicalOperatorType::INSERT: {
       auto const& insert = op.Cast<PhysicalInsert>();
       if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
-        return &*insert.insert_table;
+        return insert.insert_table.get_mutable();
       }
       break;
     }
@@ -117,13 +117,17 @@ optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const&
   return nullptr;
 }
 
+/// Find the pin for this table incarnation. A recreated same-name table does not match.
 std::optional<std::string> pinned_name_for_table(
-  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry& table)
 {
+  if (!table.IsDuckTable()) { return std::nullopt; }
+  sirius::duckdb_table_identity const identity{table.oid,
+                                               table.GetStorage().GetRowGroupCollection()};
   std::optional<std::string> result;
   scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
     if (!entry.cache_info.matches_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name, identity)) {
       return true;
     }
     result = name;
