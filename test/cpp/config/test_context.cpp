@@ -18,6 +18,7 @@
 #include "log/level.hpp"
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -129,37 +130,9 @@ struct finally {
   }
 };
 
-namespace {
-class scoped_env_assignment {
- public:
-  scoped_env_assignment(const char* name, const char* value) : _name(name)
-  {
-    if (auto const* previous = std::getenv(name)) { _previous = previous; }
-    setenv(_name.c_str(), value, 1);
-  }
-
-  ~scoped_env_assignment()
-  {
-    if (_previous) {
-      setenv(_name.c_str(), _previous->c_str(), 1);
-    } else {
-      unsetenv(_name.c_str());
-    }
-  }
-
-  scoped_env_assignment(scoped_env_assignment const&)            = delete;
-  scoped_env_assignment& operator=(scoped_env_assignment const&) = delete;
-
- private:
-  std::string _name;
-  std::optional<std::string> _previous;
-};
-
-}  // namespace
-
 TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]")
 {
-  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -181,7 +154,7 @@ TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]"
 TEST_CASE("like_swar_fastpath is isolated between connections",
           "[sirius][config][like-swar][isolated_context]")
 {
-  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con_a(db);

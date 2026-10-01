@@ -24,6 +24,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -357,10 +358,7 @@ struct dense_count_join_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db           = sirius::test::open_sirius_db(db_path.path().c_str(), cfg);
     con          = std::make_unique<Connection>(*db);
     auto enabled = con->Query("SET enable_dense_count_join = true");
     REQUIRE(enabled != nullptr);
@@ -374,8 +372,6 @@ struct dense_count_join_fixture {
     con->Query(
       "INSERT INTO ord SELECT range, (range * 7) % 30, concat('n', range) FROM range(200)");
   }
-
-  ~dense_count_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   bool has_dense_count_join(const std::string& query, plan_generation_options options = {})
   {

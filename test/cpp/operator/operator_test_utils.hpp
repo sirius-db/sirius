@@ -76,8 +76,17 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   return manager;
 }
 
+/// Initializes the process-global converter registry unless it is already initialized. Tests that
+/// cache a memory manager across test cases call this on every access, since other tests may shut
+/// the registry down in between.
+inline void ensure_converter_registry()
+{
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
+}
+
 inline cucascade::memory::memory_space* get_default_gpu_space()
 {
+  ensure_converter_registry();
   static auto manager = initialize_memory_manager();
   return const_cast<cucascade::memory::memory_space*>(
     manager->get_memory_space(cucascade::memory::Tier::GPU, 0));

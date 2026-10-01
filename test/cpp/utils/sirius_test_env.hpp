@@ -29,10 +29,22 @@ namespace sirius::test {
 std::filesystem::path integration_config_path();
 
 /**
+ * @brief Open a DuckDB database with Sirius enabled and configured from @p config_path.
+ *
+ * SIRIUS_CONFIG_FILE and SIRIUS_DISABLE are set only while the database is created, which is
+ * when the extension reads them, and are restored afterwards.
+ *
+ * @param path Database file, or nullptr for an in-memory database.
+ * @param config_path Sirius config file.
+ */
+std::unique_ptr<duckdb::DuckDB> open_sirius_db(char const* path,
+                                               std::filesystem::path const& config_path);
+
+/**
  * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
  *
- * The constructor sets SIRIUS_CONFIG_FILE and creates a DuckDB instance, which triggers
- * the extension callback to create a SiriusContext.
+ * The constructor creates a DuckDB instance with @p config_path, which triggers the extension
+ * callback to create a SiriusContext.
  * All tests in the "shared" phase get connections to this DuckDB instance, avoiding
  * the overhead of repeated SiriusContext creation/destruction.
  *
@@ -87,8 +99,6 @@ class shared_test_env {
   void create_db();
 
   std::filesystem::path config_path_;
-  std::string original_config_env_;
-  bool had_original_config_env_{false};
   std::unique_ptr<duckdb::DuckDB> db_;
 };
 
