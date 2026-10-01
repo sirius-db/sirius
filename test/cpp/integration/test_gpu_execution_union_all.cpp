@@ -135,6 +135,19 @@ TEST_CASE_METHOD(UnionAllFixture,
 }
 
 TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution UNION over HUGEINT aggregates narrowed to BIGINT",
+                 "[integration][gpu_execution][union_all]")
+{
+  // DuckDB types sum(INTEGER) as HUGEINT and the union declares that, but each GPU arm plans the
+  // aggregate as BIGINT, so the union's declared type and its arms' planned type differ.
+  compare_gpu_vs_cpu("SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub");
+  compare_gpu_vs_cpu(
+    "SELECT s + 1 FROM (SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub) t");
+  compare_gpu_vs_cpu_ordered(
+    "SELECT sum(k) AS s FROM ua UNION ALL SELECT sum(k) FROM ub ORDER BY s");
+}
+
+TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL preserves NULLs",
                  "[integration][gpu_execution][union_all]")
 {
@@ -248,7 +261,7 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "[integration][gpu_execution][union_all]")
 {
   // Regression for the arity guard in sirius_plan_set_operation.cpp, which used to read the arm's
-  // *physical* width. A materialized CTE declares its materialization side, so an arm whose
+  // physical `types`. A materialized CTE declares its materialization side, so an arm whose
   // definition and body differ in width was declined to the CPU.
   //
   // Two traps when reshaping these. The CTE must stay MATERIALIZED, or a single-reference one is
