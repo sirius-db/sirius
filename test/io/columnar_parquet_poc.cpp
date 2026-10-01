@@ -277,13 +277,13 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 // the uring io_ctx.  source_info takes a raw (non-owning) datasource* so no
 // shim or ownership transfer is needed.
 std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::move(result.tbl);
 }
 
