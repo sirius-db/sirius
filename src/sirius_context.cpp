@@ -411,10 +411,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
-  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
-  // before this window's finish(). So this is not "clean up before the plan dies" — it is
-  // "stop touching a plan that has died".
+  // On the transparent path the plan those pointers target is already gone: sirius_interface::
+  // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
+  // engine outlives the window, so its plan is still alive. Either way this only stops task
+  // creation from touching the plan; it never frees it.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same

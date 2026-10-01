@@ -150,7 +150,8 @@ physical plan, and roots it in a `sirius_physical_streaming_sink` or
 
 - **No query window.** It holds the query-lifecycle slot (`SlotGuard`) only around
   `create_plan()`, which reads the pinned-table registry, and records that registry's epoch. The
-  transparent path plans the same way. Any number of fragments can be built before any runs.
+  transparent path usually plans this way too, but re-plans inside the window when the epoch
+  changed or a prepared statement executes again. Any number of fragments can be built before any runs.
 - **A failed `build()` cannot be retried.** The session keeps partial registrations; create a new
   fragment.
 - **Every declared input must be read by the plan.** An unread input throws; nothing would ever
@@ -185,10 +186,11 @@ with "nested execution window"; on another thread they wait for the slot.
 `source`'s output into this fragment's input, then closes `sender`. Before anything moves it
 checks: both fragments built, the source has run successfully, this fragment has not run, a shared
 `ClientContext`, the source is not a result fragment, the input is declared, the sender is in the
-input's expected set (when one is declared), and column count and types match `source.sink_types()`. The source must have run because
-"nothing parked" on an open stream looks the same as "ended"; relaying early would close the
-input after zero batches. `pull`, `close_input`, and `drained` wrap the session, which is not
-public.
+input's expected set (when one is declared), and column count and types match
+`source.sink_types()`. The source must have run because "nothing parked" on an open stream looks
+the same as "ended"; relaying early would close the input after zero batches. One failure comes
+after a batch moves: if the input already ended, the first push is refused and that batch is lost.
+`pull`, `close_input`, and `drained` wrap the session, which is not public.
 
 **Member declaration order is the lifetime contract** (C++ destroys in reverse; reordering is a
 use-after-free): repositories, then `_result_plan` (a `RESULT_COLLECTOR` references it), then

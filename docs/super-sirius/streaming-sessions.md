@@ -380,7 +380,7 @@ physical-plan time via `stream_bind_catalog`, and the embedder API (`sirius::ffi
 | `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[integration][pipeline][streaming_sink_root]`, `[integration][pipeline][streaming_sink_root_exec]` |
 
 Fragment-layer tests (`test_stream_bind_catalog.cpp`, `test_streaming_fragment.cpp`,
-`test_sirius_ffi_fragment.cpp`) are listed in [Streaming Fragments](streaming-fragments.md#tests).
+`test_sirius_ffi_embedder.cpp`, `test_sirius_ffi_fragment.cpp`) are listed in [Streaming Fragments](streaming-fragments.md#tests).
 
 A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
 hook path are proven without a live executor. The `[pipeline_completion]` cases drive the real

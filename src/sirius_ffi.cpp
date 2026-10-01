@@ -234,7 +234,7 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // transaction: scans read DuckDB MVCC state through it. GPU execution is eager (the result
   // is materialized), so the transaction can close before the Arrow stream is consumed.
   duckdb::unique_ptr<duckdb::QueryResult> result;
-  // Phase timings (lowering / physical planning / GPU execution), logged per query: the host
+  // Phase timings (lowering / physical planning / GPU execution), logged per query: the embedder
   // only sees the total, and the query window in the telemetry covers execution alone.
   double lower_ms = 0, plan_ms = 0, execute_ms = 0;
   in_transaction(impl_->conn_mutex, *impl_->conn, [&] {
