@@ -13,6 +13,7 @@ target_sources(
           sirius_plan_column_data_get.cpp
           sirius_plan_comparison_join.cpp
           sirius_plan_compressed_schema.cpp
+          sirius_plan_cross_product.cpp
           sirius_plan_cte.cpp
           sirius_plan_delim_get.cpp
           sirius_plan_delim_join.cpp
