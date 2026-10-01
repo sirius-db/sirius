@@ -17,6 +17,7 @@
 #include "utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -119,8 +120,12 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
 
         rmm::device_buffer d_chars(h_chars.data(), h_chars.size(), stream, mr);
 
-        auto col = cudf::make_strings_column(
-          num_rows, std::move(offsets_col), std::move(d_chars), 0, rmm::device_buffer{});
+        auto col =
+          cudf::make_strings_column(num_rows,
+                                    std::move(offsets_col),
+                                    std::move(d_chars),
+                                    0,
+                                    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
         cols.push_back(std::move(col));
         break;
       }

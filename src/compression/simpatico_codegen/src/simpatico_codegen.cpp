@@ -12,6 +12,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -262,11 +263,11 @@ std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> c
       cudf::size_of(col->type()) != cudf::size_of(stored)) {
     return col;
   }
-  auto const n  = col->size();
-  auto const nc = col->null_count();
-  auto contents = col->release();
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  auto const n   = col->size();
+  auto const nc  = col->null_count();
+  auto contents  = col->release();
+  auto null_mask = contents.null_mask ? std::move(*contents.null_mask)
+                                      : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   return std::make_unique<cudf::column>(
     stored, n, std::move(*contents.data), std::move(null_mask), nc, std::move(contents.children));
 }

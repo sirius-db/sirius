@@ -159,10 +159,14 @@ std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
                                                  ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
-  rmm::device_buffer null_mask{};
+  auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (s.null_count > 0) {
-    null_mask =
-      to_device(s.mask_words.data(), s.mask_words.size() * sizeof(cudf::bitmask_type), stream, mr);
+    null_mask = cudf::create_null_mask(num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(null_mask.data(),
+                                  s.mask_words.data(),
+                                  s.mask_words.size() * sizeof(cudf::bitmask_type),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
   }
 
   if (s.is_varchar) {
@@ -170,7 +174,7 @@ std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
       cudf::data_type{cudf::type_id::INT32},
       num_rows + 1,
       to_device(s.offsets.data(), s.offsets.size() * sizeof(int32_t), stream, mr),
-      rmm::device_buffer{0, stream, mr},
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
       0);
     return cudf::make_strings_column(num_rows,
                                      std::move(offsets_col),

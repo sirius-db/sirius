@@ -246,7 +246,7 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
   auto size   = static_cast<cudf::size_type>(values.size());
 
   auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
   cudf::size_type null_count = 0;
   for (cudf::size_type i = 0; i < size; ++i) {
     if (!valids[i]) {
@@ -315,11 +315,12 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                     stream.get());
   }
 
-  return cudf::make_strings_column(strings_count,
-                                   std::move(offsets_col),
-                                   std::move(chars_buf),
-                                   0,
-                                   rmm::device_buffer{0, stream, mr});
+  return cudf::make_strings_column(
+    strings_count,
+    std::move(offsets_col),
+    std::move(chars_buf),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_string_batch(

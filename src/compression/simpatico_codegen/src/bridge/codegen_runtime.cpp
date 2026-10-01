@@ -66,6 +66,7 @@
 #include "codegen/plan/representation.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -323,11 +324,12 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
   // under cudf's 2^31-element cap.  The column size includes the guard words
   // so they travel through serialisation/deserialisation without any special
   // extra allocation at the read site.  `live` is always a multiple of 4.
-  return std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                        static_cast<cudf::size_type>(live / 4 + kGuardWords),
-                                        std::move(dense),
-                                        rmm::device_buffer(0, stream, mr),
-                                        0);
+  return std::make_unique<cudf::column>(
+    cudf::data_type(cudf::type_id::UINT32),
+    static_cast<cudf::size_type>(live / 4 + kGuardWords),
+    std::move(dense),
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+    0);
 }
 
 }  // namespace
@@ -1442,27 +1444,30 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
-          auto mins_col = std::make_unique<cudf::column>(bp_elem_type,
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_min]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto cnt_col  = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                        static_cast<cudf::size_type>(num_chunks),
-                                                        std::move(bufs[i_cnt]),
-                                                        rmm::device_buffer(0, stream),
-                                                        0);
-          auto bits_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT8),
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_bits]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto pkd_overalloc =
-            std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                           static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
-                                           std::move(bufs[i_pkd]),
-                                           rmm::device_buffer(0, stream),
-                                           0);
+          auto mins_col = std::make_unique<cudf::column>(
+            bp_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_min]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto cnt_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::INT32),
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_cnt]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto bits_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::UINT8),
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_bits]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto pkd_overalloc = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::UINT32),
+            static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
+            std::move(bufs[i_pkd]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
 
           // EAGERLY compact the OverAllocate ``packed`` so every fused subtree's
           // bitpack output is born Compact (dense). The meta columns
@@ -1505,12 +1510,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (first_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (first_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                      : cudf::data_type(cudf::type_id::INT32);
-          auto first_col = std::make_unique<cudf::column>(first_elem_type,
-                                                          static_cast<cudf::size_type>(num_chunks),
-                                                          std::move(bufs[i_first]),
-                                                          rmm::device_buffer(0, stream),
-                                                          0);
-          auto rep       = std::make_unique<simpatico::codegen_fused_representation>(
+          auto first_col = std::make_unique<cudf::column>(
+            first_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_first]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Delta, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("delta_first", std::move(first_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1560,12 +1566,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             return -1;
           }
 
-          auto off_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                        static_cast<cudf::size_type>(off_count),
-                                                        std::move(bufs[i_off]),
-                                                        rmm::device_buffer(0, stream),
-                                                        0);
-          auto rep     = std::make_unique<simpatico::codegen_fused_representation>(
+          auto off_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::INT32),
+            static_cast<cudf::size_type>(off_count),
+            std::move(bufs[i_off]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Rle, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("rle_runs_offsets", std::move(off_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1589,12 +1596,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (refs_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (refs_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                     : cudf::data_type(cudf::type_id::INT32);
-          auto refs_col = std::make_unique<cudf::column>(refs_elem_type,
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_refs]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto rep      = std::make_unique<simpatico::codegen_fused_representation>(
+          auto refs_col = std::make_unique<cudf::column>(
+            refs_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_refs]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::For, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("references", std::move(refs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1627,12 +1635,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (zz_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (zz_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                   : cudf::data_type(cudf::type_id::INT32);
-          auto zz_col = std::make_unique<cudf::column>(zz_type,
-                                                       static_cast<cudf::size_type>(zz_rows),
-                                                       std::move(bufs[i_zz]),
-                                                       rmm::device_buffer(0, stream),
-                                                       0);
-          auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
+          auto zz_col = std::make_unique<cudf::column>(
+            zz_type,
+            static_cast<cudf::size_type>(zz_rows),
+            std::move(bufs[i_zz]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("zigzag", std::move(zz_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1684,18 +1693,18 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 
-            auto data_col =
-              std::make_unique<cudf::column>(data_elem_type,
-                                             static_cast<cudf::size_type>(num_chunks * kChunkSize),
-                                             std::move(bufs[i_data]),
-                                             rmm::device_buffer(0, stream),
-                                             0);
-            auto offs_col =
-              std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                             static_cast<cudf::size_type>(num_chunks + 1),
-                                             std::move(bufs[i_offs]),
-                                             rmm::device_buffer(0, stream),
-                                             0);
+            auto data_col = std::make_unique<cudf::column>(
+              data_elem_type,
+              static_cast<cudf::size_type>(num_chunks * kChunkSize),
+              std::move(bufs[i_data]),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
+            auto offs_col = std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::INT32),
+              static_cast<cudf::size_type>(num_chunks + 1),
+              std::move(bufs[i_offs]),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             auto rep = std::make_unique<simpatico::codegen_fused_representation>(
               simpatico::OpId::Identity, original_type, static_cast<cudf::size_type>(num_rows));
@@ -1770,11 +1779,12 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
               cudaStreamSynchronize(stream.get());
             }
 
-            auto data_col = std::make_unique<cudf::column>(data_elem_type,
-                                                           static_cast<cudf::size_type>(total_runs),
-                                                           std::move(compact_buf),
-                                                           rmm::device_buffer(0, stream),
-                                                           0);
+            auto data_col = std::make_unique<cudf::column>(
+              data_elem_type,
+              static_cast<cudf::size_type>(total_runs),
+              std::move(compact_buf),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             const std::size_t offs_bytes =
               static_cast<std::size_t>(num_chunks + 1) * sizeof(std::int32_t);
@@ -1788,12 +1798,12 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                  "RLE Raw compact (%s): offsets DtoD failed",
                                  origin.parent_channel.c_str());
             cudaStreamSynchronize(stream.get());
-            auto offs_col =
-              std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                             static_cast<cudf::size_type>(num_chunks + 1),
-                                             std::move(offs_buf),
-                                             rmm::device_buffer(0, stream),
-                                             0);
+            auto offs_col = std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::INT32),
+              static_cast<cudf::size_type>(num_chunks + 1),
+              std::move(offs_buf),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             auto rep = std::make_unique<simpatico::codegen_fused_representation>(
               simpatico::OpId::Identity, original_type, static_cast<cudf::size_type>(num_rows));
