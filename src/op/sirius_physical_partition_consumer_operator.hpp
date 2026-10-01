@@ -20,11 +20,64 @@
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius {
 namespace op {
+
+/// One physical column of a partition's input, as the PARTITION actually observed it on the
+/// device. Recorded per column rather than summarized because only the consumer knows what each
+/// column means (for a grouped aggregation: which are grouping keys and which partial states).
+struct observed_column_meta {
+  /// `cudf::type_id` value, kept as an int so this header stays free of cuDF includes.
+  int type_id = 0;
+  /// Fixed element width in bytes; 0 means the type is not fixed-width (STRING/LIST/STRUCT/
+  /// DICTIONARY32).
+  uint32_t fixed_width_bytes = 0;
+  /// The column carries a validity mask in at least one input batch, so concatenating the batches
+  /// allocates one for it.
+  bool nullable = false;
+};
+
+/// A snapshot of what is waiting on a PARTITION's single input port, for consumers whose sizing
+/// decision depends on more than the byte total.
+///
+/// Built by the PARTITION operator, which owns the input repository and its lock, and offered to
+/// the consumer through @ref partition_sizing_input::input_metadata_source. Nothing is collected
+/// unless the consumer asks, so consumers that ignore it cost nothing.
+///
+/// Every quantity that can be genuinely unknown is an optional. A missing value and a real zero
+/// are different answers — "this input has no nullable columns" must not be confused with "the
+/// column metadata could not be read".
+struct observed_input_metadata {
+  /// The partition's input pipeline has finished: every batch has actually arrived. This is what
+  /// makes the row/type metadata below a fact rather than a forecast, and it is a stronger claim
+  /// than `data_size_estimate::exact`, which only says the byte total is known.
+  bool upstream_complete = false;
+
+  /// Every batch is a plain cuDF table resident in exactly one GPU memory space.
+  bool single_gpu_resident = false;
+
+  /// Per-column physical metadata, in table order. Absent when the schema could not be read, or
+  /// was inconsistent between batches.
+  std::optional<std::vector<observed_column_meta>> columns;
+
+  /// Total rows over all batches; absent when the metadata could not be read.
+  std::optional<uint64_t> total_rows;
+
+  /// Bytes a new reservation could still obtain on the space the input lives in, from
+  /// memory::gpu_reservable_bytes() (not `memory_space::get_available_memory()`, which over-states
+  /// it). Absent when it could not be determined.
+  std::optional<uint64_t> admissible_additional_budget;
+
+  /// Device the input actually lives on. -1 when unknown; never assumed to be 0.
+  int target_device_id = -1;
+};
 
 /// What the upstream PARTITION operator measures/knows and forwards to its downstream consumer so
 /// the consumer can decide how many partitions to produce (and whether to broadcast).
@@ -37,6 +90,14 @@ struct partition_sizing_input {
   /// partition has no sibling). A consumer whose task holds both join inputs at once sizes from
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
+
+  /// Collects @ref observed_input_metadata on demand; empty when the partition has no single input
+  /// port to describe (sibling-partition joins). Lazy so a consumer that does not need it, or
+  /// whose cheap gates already decide, never walks the batches. Callable only during the
+  /// get_partition_strategy call, which runs under the partition's lock. Individual batches are
+  /// read-locked only while being inspected; residency and the budget can change after that
+  /// snapshot.
+  std::function<std::optional<observed_input_metadata>()> input_metadata_source;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
+#include "memory/reservable_bytes.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -33,6 +34,10 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
+
+#include <cudf/utilities/traits.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <mutex>
@@ -200,6 +205,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 }
 
 bool sirius_physical_partition::is_build_partition() const { return _is_build; }
+
 MemoryBarrierType sirius_physical_partition::input_barrier_for(
   sirius_physical_operator const& producer) const
 {
@@ -416,6 +422,114 @@ std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
 
   // An estimate cannot invalidate bytes already received.
   return std::max(static_cast<uint64_t>(_size_estimate->bytes), compute_total_bytes());
+}
+
+std::optional<observed_input_metadata> sirius_physical_partition::collect_input_metadata()
+{
+  if (ports.size() != 1) { return std::nullopt; }
+
+  observed_input_metadata meta;
+
+  auto* port = ports.begin()->second;
+  // "Complete" means every batch has physically arrived, which is what makes the row and type
+  // counts below a fact rather than a forecast.
+  meta.upstream_complete =
+    port->src_pipeline != nullptr && port->src_pipeline->is_pipeline_finished();
+  // A projection can fix the partition count before the producer finishes. It cannot establish
+  // complete residency or schema, so report the input as incomplete without walking the batches.
+  if (!meta.upstream_complete) { return meta; }
+
+  auto* repo = port->repo;
+  // No repository means no batches to read; every metadata optional stays absent rather than
+  // reporting "nothing observed" as "nothing there".
+  if (repo == nullptr) { return meta; }
+  auto batch_ids = repo->get_batch_ids(0);
+
+  std::uint64_t total_rows = 0;
+  std::vector<observed_column_meta> columns;
+  bool schema_known                                  = true;
+  bool schema_latched                                = false;
+  const cucascade::memory::memory_space* input_space = nullptr;
+
+  for (auto batch_id : batch_ids) {
+    auto batch = repo->get_data_batch_by_id(batch_id, 0);
+    // A batch that vanished mid-walk leaves the rows unknown.
+    if (!batch) {
+      schema_known = false;
+      break;
+    }
+    auto ro    = batch->to_read_only();
+    auto* data = ro.get_data();
+    if (data == nullptr) {
+      schema_known = false;
+      break;
+    }
+    if (auto* space = ro.get_memory_space(); space != nullptr) {
+      if (input_space != nullptr && input_space != space) {
+        schema_known = false;
+        break;
+      }
+      input_space = space;
+    } else {
+      schema_known = false;
+      break;
+    }
+
+    // Anything that is not a plain GPU cuDF table — host/disk carriers, Simpatico-compressed
+    // payloads — has no table_view to read here. Report it as not resident rather than guess.
+    auto const* gpu_table = dynamic_cast<const cucascade::gpu_table_representation*>(data);
+    if (gpu_table == nullptr || data->get_current_tier() != cucascade::memory::Tier::GPU) {
+      schema_known = false;
+      break;
+    }
+
+    auto const view = get_cudf_table_view(ro);
+    total_rows = memory::saturating_add(total_rows, static_cast<std::uint64_t>(view.num_rows()));
+
+    bool const first_batch = !schema_latched;
+    if (first_batch) {
+      columns.resize(static_cast<std::size_t>(view.num_columns()));
+      schema_latched = true;
+    } else if (columns.size() != static_cast<std::size_t>(view.num_columns())) {
+      // Batches disagreeing on column count means the schema cannot be trusted.
+      schema_known = false;
+      break;
+    }
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+      auto const col   = view.column(static_cast<cudf::size_type>(c));
+      auto const dtype = col.type();
+      auto& entry      = columns[c];
+      int const id     = static_cast<int>(dtype.id());
+      auto const width =
+        cudf::is_fixed_width(dtype) ? static_cast<std::uint32_t>(cudf::size_of(dtype)) : 0;
+      if (first_batch) {
+        entry.type_id           = id;
+        entry.fixed_width_bytes = width;
+      } else if (entry.type_id != id) {
+        // A column changing physical type between batches would change every width term.
+        schema_known = false;
+        break;
+      }
+      // Nullable if *any* batch carries a mask: the concatenated column then gets one.
+      entry.nullable = entry.nullable || col.nullable();
+    }
+    if (!schema_known) { break; }
+  }
+
+  meta.single_gpu_resident = schema_known && input_space != nullptr;
+
+  if (schema_known && schema_latched && !columns.empty()) {
+    meta.columns    = std::move(columns);
+    meta.total_rows = total_rows;
+  }
+
+  // The budget must come from the space the input actually lives in. Reading it from the batches
+  // is what keeps this off physical GPU 0 on a multi-GPU box.
+  if (meta.single_gpu_resident) {
+    meta.target_device_id             = input_space->get_device_id();
+    meta.admissible_additional_budget = memory::gpu_reservable_bytes(*input_space);
+  }
+  return meta;
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -642,13 +756,15 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       // Without an estimate, the task hint waits until the received input is complete.
       auto const estimated   = estimated_total_input_bytes();
       auto const total_bytes = estimated.value_or(compute_total_bytes());
-      partition_sizing_input const in{total_bytes,
-                                      _is_build,
-                                      /*build_foldable=*/false,
-                                      /*combined_total_bytes=*/total_bytes};
-      auto const strategy = consumer->get_partition_strategy(in);
-      _num_partitions     = strategy.num_partitions;
-      _sizing_bytes       = in.total_bytes;
+      partition_sizing_input in{total_bytes,
+                                _is_build,
+                                /*build_foldable=*/false,
+                                /*combined_total_bytes=*/total_bytes};
+      // Offered to every consumer; only one that calls it pays for the batch walk.
+      in.input_metadata_source = [this] { return collect_input_metadata(); };
+      auto const strategy      = consumer->get_partition_strategy(in);
+      _num_partitions          = strategy.num_partitions;
+      _sizing_bytes            = in.total_bytes;
       if (estimated.has_value()) {
         _sizing_basis = (_size_estimate && _size_estimate->exact) ? sizing_basis::upstream_complete
                                                                   : sizing_basis::projected;
