@@ -161,7 +161,7 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   bind_prepared_statement_parameters(statement, parameters);
 
   duckdb::unique_ptr<sirius_engine> temp =
-    duckdb::make_uniq<sirius_engine>(context, *this, query_id);
+    duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);
   auto prop                   = temp->context.GetClientProperties();
   sirius_active_query->engine = std::move(temp);
   auto& engine                = get_sirius_engine();

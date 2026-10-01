@@ -382,8 +382,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
-  // Runs inside the held slot, after acquire and the health check and before
-  // the final create_plan.
+  // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
   // throwing steps that matter; a throw here is handled by the scope ctor's
@@ -416,10 +415,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
-  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
-  // before this window's finish(). So this is not "clean up before the plan dies" — it is
-  // "stop touching a plan that has died".
+  // On the transparent path the plan those pointers target is already gone: sirius_interface::
+  // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
+  // engine outlives the window, so its plan is still alive. Either way this only stops task
+  // creation from touching the plan; it never frees it.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -1631,6 +1630,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
+  // Unlocking a std::mutex from a thread that does not hold it is undefined behaviour.
+  D_ASSERT(holder_thread_hash_.load(std::memory_order_relaxed) ==
+           (std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1));
   holder_thread_hash_.store(0, std::memory_order_relaxed);
   query_lifecycle_held_.store(false, std::memory_order_release);
   query_lifecycle_mutex_.unlock();

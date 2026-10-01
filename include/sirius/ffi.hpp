@@ -15,8 +15,10 @@
  */
 
 /*
- * Public C++ surface for embedding Sirius (FFI use cases, e.g. the Rust
- * `sirius-sys` crate). Intentionally lightweight — a small RAII wrapper that
+ * Public C++ surface for embedding Sirius (`sirius::ffi::Context` and `Fragment`).
+ * The embedder is the process that links it: Rust `sirius-sys` or C++ tests.
+ *
+ * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without
  * pulling in sirius_context.hpp (and its cudf/rmm/duckdb includes).
  *
@@ -46,7 +48,7 @@ class Fragment;
 /// `duckdb::SiriusContext`) and an embedded in-process DuckDB whose connection
 /// has that engine registered as the `sirius_state` so the GPU executor can find
 /// it. DuckDB is used only to lower a Substrait plan to a DuckDB
-/// `LogicalOperator` (the translation step) and to host the catalog — execution
+/// `LogicalOperator` (the translation step) and to own the catalog. Execution
 /// runs directly on the Sirius engine, not through DuckDB's query pipeline.
 ///
 /// Held from Rust via `cxx::UniquePtr`; created by `make_context()` /
@@ -86,9 +88,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
-/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
-/// build() but before run() closes the lifecycle itself.
+/// Any number of fragments may be built before any runs; run them in any order where each
+/// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
+/// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
+/// destruction may happen on a thread other than build()'s.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -108,32 +111,43 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build().
   void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Declare an output stream. A fragment with no output stream is a result fragment.
+  /// Declare an output stream. A fragment with no output stream is a result fragment; two or
+  /// more need declare_output_broadcast() or declare_output_hash_key(), or build() throws.
   /// @throws after build() or on duplicate id.
   void declare_output(std::uint64_t stream_id);
 
   /// Every output receives the full fragment output (broadcast sink). Requires at least two
   /// declared outputs: build() rejects a partition mode declared on 0 or 1 outputs rather than
   /// silently ignoring it. Mutually exclusive with declare_output_hash_key.
-  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
+  /// @throws after build() or after declare_output_hash_key(), or from build() itself when
+  /// fewer than two outputs are declared.
   void declare_output_broadcast();
 
   /// Declare one hash-partition key column for a multi-output sink. Call once per key in
   /// partition-expression order. Requires at least two declared outputs, same as
   /// declare_output_broadcast(). Mutually exclusive with declare_output_broadcast.
-  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
+  /// @throws after build() or after declare_output_broadcast(), or from build() itself when
+  /// fewer than two outputs are declared or the key column is out of range or of an
+  /// unsupported type (integer, boolean, varchar, and decimal keys are supported).
   void declare_output_hash_key(std::uint32_t column_index);
 
-  /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.
-  /// Creates a view `sirius_stream_<id>` for each declared input stream.
-  /// @throws on translation/planning failure or if already built.
+  /// Lower and plan `substrait_plan` against the declared streams.
+  /// Creates a view `sirius_stream_<id>` for each declared input stream. A failed build() rolls
+  /// back and leaves the Fragment unbuilt, so it may be called again.
+  /// @throws if already built, on an unknown input type name, a declared input the plan never
+  /// reads, an invalid output partitioning (see declare_output*), or translation/planning
+  /// failure.
   void build(const std::string& substrait_plan);
 
   /// Move every batch on `source`'s output stream `source_stream_id` into this fragment's
-  /// input stream `input_stream_id`, then close `sender_id` on it. Schema is validated before
-  /// any data moves. Must be called after source.run() and before this->run().
+  /// input stream `input_stream_id`, then close `sender_id` on it. Must be called after
+  /// source.run() and before this->run(). Every check below runs before any data moves, except
+  /// an input that already ended: that throws on the first batch, which is lost.
   /// @return number of batches moved.
-  /// @throws on unknown stream id, schema mismatch, or before build().
+  /// @throws before either fragment's build(), when the source has not run or its run() failed,
+  /// after this->run(), when the source is a result fragment or on another Context, on an
+  /// undeclared input or unknown stream id, on a sender outside the declared set, on a schema
+  /// mismatch, or when the input already ended.
   std::size_t relay_from(Fragment& source,
                          std::uint64_t source_stream_id,
                          std::uint64_t input_stream_id,
@@ -144,16 +158,21 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
-  /// @throws before build() or on execution failure.
+  /// Execute the fragment and block until pipelines finish. Every input must be closed first
+  /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
+  /// fragment.
+  /// @throws before build(), while an input is open (the fragment stays runnable), on a second
+  /// call, or on execution failure.
   void run();
 
   /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
   /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.
-  /// @throws on an intermediate fragment or before run().
+  /// Callable once.
+  /// @throws on an intermediate fragment, before a successful run(), or when already called.
   void result_to_arrow(std::uintptr_t out_stream_addr);
 
-  /// Batches currently parked on output stream `stream_id`. For diagnostics.
+  /// Batches currently parked on output stream `stream_id`. For diagnostics. 0 before build().
+  /// @throws after build() on an unknown id, including any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
