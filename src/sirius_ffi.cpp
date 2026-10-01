@@ -19,6 +19,7 @@
 
 #include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
+#include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
@@ -36,6 +37,7 @@
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/arrow_host_import.hpp"   // sirius::import_arrow_host_table
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "log/logging.hpp"                // SIRIUS_LOG_INFO
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
@@ -451,6 +453,42 @@ void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 {
   impl_->require_built("close_input()");
   impl_->fragment->close_input(stream_id, sender_id);
+}
+
+void Fragment::push_arrow(std::uint64_t stream_id,
+                          std::uint32_t sender_id,
+                          std::uintptr_t array_addr,
+                          std::uintptr_t schema_addr)
+{
+  impl_->require_built("push_arrow()");
+  auto& fragment       = *impl_->fragment;
+  const auto& declared = fragment.input_spec(stream_id);
+  // Refuse before the copy; push() checks again because run() or close_input() may intervene.
+  fragment.check_push(stream_id, sender_id);
+  auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, /*device_id=*/0);
+  if (gpu_space == nullptr) {
+    throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
+  }
+
+  // A pool stream, not cudf's default stream: a synchronize on the legacy default stream is a
+  // device-wide barrier. The pool stream is the batch's writer stream.
+  auto stream = gpu_space->acquire_stream();
+  auto table =
+    sirius::import_arrow_host_table(reinterpret_cast<const ArrowSchema*>(schema_addr),
+                                    reinterpret_cast<const ArrowArray*>(array_addr),
+                                    "Fragment: Arrow batch for stream " + std::to_string(stream_id),
+                                    declared.names,
+                                    declared.types,
+                                    stream,
+                                    gpu_space->get_default_allocator());
+  // The caller may free its buffers once this returns.
+  stream.sync();
+  // A host batch has no producing operator, so there is no telemetry lineage to link.
+  fragment.push(stream_id,
+                sender_id,
+                sirius::make_data_batch(
+                  std::move(table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{}));
 }
 
 void Fragment::run()
