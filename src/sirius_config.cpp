@@ -836,37 +836,16 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
 void sirius_config::finalize_derived_config()
 {
-  derive_uring_scan_budget();
+  // The uring (local-disk) readahead budget is NOT derived from the pipeline
+  // width: the local backend defaults to 0 (readahead off), because on local
+  // NVMe the prefetch competes with the executor's own reads for the same
+  // device.  An explicit uring.n_max_concurrent_scans in the config still wins.
   // The opportunistic strategy schedules against what the executor can run,
   // not what the device can queue, so it needs the pipeline pool's width.
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_sirius_backend_for_multi_gpu();
-}
-
-void sirius_config::derive_uring_scan_budget()
-{
-  // The uring backend wants one concurrent scan per pipeline executor thread.
-  // io::uring::config can only spell that as the COMPILE-TIME thread count, so
-  // a config that resizes the pipeline pool would otherwise leave the readahead
-  // budget pinned to the old default and unable to keep the pool fed.
-  //
-  // Only an omitted value is derived, so every explicit
-  // uring.n_max_concurrent_scans value still wins -- including one numerically
-  // equal to the struct default.
-  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
-
-  auto const pipeline_threads =
-    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
-  if (pipeline_threads == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
-
-  SIRIUS_LOG_INFO(
-    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
-    "({} threads), replacing the built-in default of {}",
-    pipeline_threads,
-    _scan_manager_config.uring.n_max_concurrent_scans);
-  _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -879,18 +858,23 @@ void sirius_config::derive_rest_scan_budget()
   // such round trip to hide, so uring stays at one per thread.
   //
   // Only the untouched default is replaced, so an explicit
-  // rest.n_max_concurrent_scans in the config still wins.
-  constexpr std::size_t scans_per_thread = 4;
+  // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
+  // 2x the configured pipeline pool size, floored at 8 so a small pool still
+  // keeps enough ranged GETs in flight to cover the link's round-trip latency.
+  constexpr std::size_t scans_per_thread = 2;
+  constexpr std::size_t min_rest_scans   = 8;
   if (_scan_manager_config.rest.n_max_concurrent_scans_explicit) { return; }
 
   auto const derived =
-    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
-    scans_per_thread;
+    std::max(min_rest_scans,
+             static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
+               scans_per_thread);
   if (derived == _scan_manager_config.rest.n_max_concurrent_scans) { return; }
 
   SIRIUS_LOG_INFO(
-    "sirius_config: rest.n_max_concurrent_scans defaulted to {}x the configured pipeline pool size "
-    "({}), replacing the built-in default of {}",
+    "sirius_config: rest.n_max_concurrent_scans defaulted to max({}, {}x the configured pipeline "
+    "pool size) = {}, replacing the built-in default of {}",
+    min_rest_scans,
     scans_per_thread,
     derived,
     _scan_manager_config.rest.n_max_concurrent_scans);
