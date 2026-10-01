@@ -139,14 +139,6 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// equal keys would land in different partitions and the consuming join would miss matches.
   [[nodiscard]] std::vector<int> const& partition_keys() const noexcept { return _partition_keys; }
 
-  /// The sorted, deduped device ids of the GPUs the query runs on — identical to the list
-  /// task_creator routes partitions across (`_active_gpu_ids[partition_idx % size]`). Used by
-  /// broadcast mode to map a probe batch's residence GPU back to its partition slot.
-  void set_active_gpu_ids(std::vector<int> active_gpu_ids)
-  {
-    _active_gpu_ids = std::move(active_gpu_ids);
-  }
-
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -165,10 +157,14 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// @pre `lock` is held.
   std::optional<uint64_t> estimated_total_input_bytes();
 
-  /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
-  /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
-  /// safe fallback that keeps the batch on some valid slot).
-  [[nodiscard]] std::size_t slot_for_device(int device_id) const;
+  /// Latch `strategy`'s count, broadcast flag, and placement on this partition and its sibling,
+  /// and install the placement on `consumer` and on every operator either partition sinks into,
+  /// so every emitter of this exchange's partitioned data stamps the same devices.
+  /// @throws sirius::internal_exception if the placement names a GPU outside
+  ///         `consumer.active_gpu_ids()`.
+  /// @pre `lock` held; if there is a sibling, its `lock` held too.
+  void apply_partition_strategy(partition_strategy const& strategy,
+                                sirius_physical_partition_consumer_operator& consumer);
   sirius_physical_operator* _sibling_partition_op = nullptr;
   //! The downstream consumer that decides this partition's count / broadcast (see
   //! set_downstream_consumer_op). Always a partition-sizing consumer (HASH_JOIN / NESTED_LOOP_JOIN
@@ -186,13 +182,14 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _sizing_requires_sibling_input{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
-  /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.
-  std::vector<int> _active_gpu_ids;
   /// Broadcast mode: the build table is small enough to replicate to every GPU instead of
-  /// hash-partitioning. Set on BOTH sibling partition ops when the join accepts BUILD_PROBE at
-  /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
-  /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
+  /// hash-partitioning. Set on BOTH sibling partition ops when the join accepts BUILD_PROBE with
+  /// one partition per GPU. Build side deposits its batch into every slot; probe side deposits
+  /// each batch into the slot placed on its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
+  /// Which GPU each partition runs on, latched with `_num_partitions` by
+  /// apply_partition_strategy (null until then). Broadcast probe batches are routed by it.
+  std::shared_ptr<const partition_placement> _placement;
   /// Non-owning context providing narrow-passthrough events. The registered-state shared_ptr owns
   /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;

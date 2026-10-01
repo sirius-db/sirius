@@ -31,6 +31,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -349,8 +350,13 @@ void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::st
     // Broadcast mode (small build table replicated across GPUs):
     //  - Build side: deposit each (zero-copy shared_ptr) batch into EVERY slot. The executor
     //    peer-clones it onto each slot's GPU on demand at build time, non-destructively.
-    //  - Probe side: stream each batch into the slot matching its CURRENT GPU, so the per-GPU
+    //  - Probe side: stream each batch into the slot placed on its CURRENT GPU, so the per-GPU
     //    join task finds its probe data already local (no cross-device copy).
+    if (_placement == nullptr) {
+      throw sirius::internal_exception(
+        "sirius_physical_partition id {}: broadcast sink before a placement was latched",
+        this->get_operator_id());
+    }
     auto const slots = static_cast<std::size_t>(_num_partitions.value());
     for (auto& batch : input_batches) {
       if (_is_build) {
@@ -360,8 +366,26 @@ void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::st
       } else {
         std::size_t slot = 0;
         auto ro          = batch->to_read_only();
-        if (auto* ms = ro.get_memory_space(); ms != nullptr) {
-          slot = slot_for_device(ms->get_device_id());
+        auto* ms         = ro.get_memory_space();
+        if (ms != nullptr && ms->get_tier() == cucascade::memory::Tier::GPU) {
+          if (auto const placed = _placement->first_partition_for_device(ms->get_device_id())) {
+            slot = *placed;
+          } else {
+            // Every admitted GPU holds a broadcast slot, so a GPU-resident probe batch always
+            // has one; a miss means the batch left the admitted set.
+            SIRIUS_LOG_WARN(
+              "sirius_physical_partition id {}: probe batch on GPU {} has no slot in broadcast "
+              "placement {}; using slot 0",
+              this->get_operator_id(),
+              ms->get_device_id(),
+              _placement->to_string());
+          }
+        } else {
+          // Downgraded off the GPU: any slot's task will bring it back to that slot's device.
+          SIRIUS_LOG_DEBUG(
+            "sirius_physical_partition id {}: broadcast probe batch is not GPU-resident; using "
+            "slot 0",
+            this->get_operator_id());
         }
         deposit(batch, slot);
       }
@@ -458,15 +482,42 @@ void sirius_physical_partition::on_finalize_operator()
     _num_partitions.value_or(0));
 }
 
-std::size_t sirius_physical_partition::slot_for_device(int device_id) const
+void sirius_physical_partition::apply_partition_strategy(
+  partition_strategy const& strategy, sirius_physical_partition_consumer_operator& consumer)
 {
-  for (std::size_t i = 0; i < _active_gpu_ids.size(); ++i) {
-    if (_active_gpu_ids[i] == device_id) { return i; }
+  // The task creator honors a stamped device as given, so a placement outside the admitted set
+  // would run this query on a GPU it was not admitted to.
+  auto const& admitted = consumer.active_gpu_ids();
+  for (int const device : strategy.placement.devices()) {
+    if (std::find(admitted.begin(), admitted.end(), device) == admitted.end()) {
+      throw sirius::internal_exception(
+        "sirius_physical_partition id {}: placement {} names GPU {}, which the query was not "
+        "admitted to",
+        this->get_operator_id(),
+        strategy.placement.to_string(),
+        device);
+    }
   }
-  SIRIUS_LOG_WARN(
-    "slot_for_device: device_id {} not found in active GPU list, falling back to slot 0",
-    device_id);
-  return 0;
+
+  auto const placement = std::make_shared<const partition_placement>(strategy.placement);
+  auto install         = [&](sirius_physical_partition& partition) {
+    partition._num_partitions = strategy.num_partitions;
+    partition._broadcast      = strategy.broadcast;
+    partition._placement      = placement;
+    // The operators this partition sinks into re-emit its partitions (a join's CONCATs), so they
+    // stamp the same devices as the consumer.
+    for (auto& next_port : partition.get_next_ports_after_sink()) {
+      if (auto* receiver =
+            dynamic_cast<sirius_physical_partition_consumer_operator*>(next_port.next_operator)) {
+        receiver->set_placement(placement);
+      }
+    }
+  };
+  consumer.set_placement(placement);
+  install(*this);
+  if (_sibling_partition_op != nullptr) {
+    install(_sibling_partition_op->Cast<sirius_physical_partition>());
+  }
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()
@@ -499,8 +550,20 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
                               sizing_port->repo && sizing_port->repo->total_size() == 0;
     }
     if (!sizing_finished_empty) { return _sibling_partition_op->get_next_task_hint(); }
-    _num_partitions = 1;
-    sizing_partition.set_num_partitions(1);
+    // Do not ask the consumer: a zero-byte build would pick broadcast / BUILD_PROBE, which cannot
+    // run without a build batch.
+    auto* consumer =
+      dynamic_cast<sirius_physical_partition_consumer_operator*>(_downstream_consumer_op);
+    if (consumer == nullptr) {
+      throw std::runtime_error("sirius_physical_partition id " +
+                               std::to_string(this->get_operator_id()) +
+                               " has no downstream partition-sizing consumer set");
+    }
+    std::lock_guard<std::mutex> sizing_guard(sizing_partition.lock);
+    apply_partition_strategy(
+      partition_strategy{
+        1, false, false, partition_placement::round_robin(1, consumer->active_gpu_ids())},
+      *consumer);
   }
   if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
@@ -622,19 +685,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         build_arrives_whole      = found_this || found_sibling;
       }
       if (hash_join != nullptr) { hash_join->set_build_arrives_whole(build_arrives_whole); }
-      _broadcast              = strategy.broadcast;
-      sibling._broadcast      = strategy.broadcast;
-      _num_partitions         = strategy.num_partitions;
-      sibling._num_partitions = strategy.num_partitions;
+      apply_partition_strategy(strategy, *consumer);
       SIRIUS_LOG_DEBUG(
         "sirius_physical_partition id {} sized {} partitions on sizing id {} ({} side){}, sibling "
-        "id {}",
+        "id {}, placement {}",
         this->get_operator_id(),
         strategy.num_partitions,
         sizing_partition.get_operator_id(),
         (sizing_partition._is_build ? "build" : "probe"),
         (strategy.broadcast ? " [broadcast]" : ""),
-        _sibling_partition_op->get_operator_id());
+        _sibling_partition_op->get_operator_id(),
+        strategy.placement.to_string());
     }
   } else {
     std::lock_guard<std::mutex> guard(lock);
@@ -647,19 +708,21 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                       /*build_foldable=*/false,
                                       /*combined_total_bytes=*/total_bytes};
       auto const strategy = consumer->get_partition_strategy(in);
-      _num_partitions     = strategy.num_partitions;
-      _sizing_bytes       = in.total_bytes;
+      apply_partition_strategy(strategy, *consumer);
+      _sizing_bytes = in.total_bytes;
       if (estimated.has_value()) {
         _sizing_basis = (_size_estimate && _size_estimate->exact) ? sizing_basis::upstream_complete
                                                                   : sizing_basis::projected;
       } else {
         _sizing_basis = sizing_basis::measured;
       }
-      SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions from {} bytes ({})",
-                       this->get_operator_id(),
-                       strategy.num_partitions,
-                       in.total_bytes,
-                       sizing_basis_name(_sizing_basis));
+      SIRIUS_LOG_DEBUG(
+        "sirius_physical_partition id {} sized {} partitions from {} bytes ({}), placement {}",
+        this->get_operator_id(),
+        strategy.num_partitions,
+        in.total_bytes,
+        sizing_basis_name(_sizing_basis),
+        strategy.placement.to_string());
     }
   }
   return sirius_physical_operator::get_next_task_input_data();

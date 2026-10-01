@@ -105,9 +105,9 @@ look-ahead is not a user-selectable YAML setting.
 
 In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash table and caches it; subsequent tasks for that partition only probe.
 
-**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (proposes `num_gpus` partitions, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes.
+**Broadcast small build tables (multi-GPU):** when the build side is small (`< small_table_bytes`), the PARTITION operator replicates it to every GPU (one partition placed on each GPU, `_broadcast` flag) instead of funneling the build to one GPU, so every GPU builds its own hash table and probes locally. Build-only slots are discarded once the probe side finishes.
 
-**Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing
+**Code path:** `src/op/sirius_physical_hash_join.cpp` — `compute_hash_join_partition_strategy()`, `get_partition_strategy()`; `src/op/sirius_physical_partition.cpp` — broadcast slot routing by the join's partition placement
 
 **Config:** `max_build_hash_table_bytes` (default: 500 MB)
 

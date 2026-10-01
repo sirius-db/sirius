@@ -204,7 +204,7 @@ The plan generator inserts every GPU pipeline operator into the plan tree (Part 
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
 5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
+6. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
 7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.
