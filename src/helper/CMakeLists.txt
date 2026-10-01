@@ -1,5 +1,5 @@
 target_sources(
-  sirius_objects PRIVATE numeric_narrowing.cpp timestamp_semantics.cpp
+  sirius_objects PRIVATE arrow_host_import.cpp numeric_narrowing.cpp timestamp_semantics.cpp
                          transaction_utils.cpp type_conversions.cpp)
 
 # DuckDB's database-manager header requires its private fmt namespace. Keep it
