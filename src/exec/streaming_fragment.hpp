@@ -121,6 +121,21 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
+  /// Push one batch into input `id` as `sender`. Legal between build() and run(), from any
+  /// thread. Does not close the sender. A sender that already closed may still push while
+  /// another sender of the same input is open.
+  /// @throws sirius::invalid_input_exception before build(), once run() started, on an unknown
+  ///         id, a sender outside the declared set, or an input that already ended.
+  void push(stream_id_t id, sender_id_t sender, std::shared_ptr<cucascade::data_batch> batch);
+
+  /// The checks push() runs, for a caller that wants to refuse before building the batch.
+  /// @throws what push() throws.
+  void check_push(stream_id_t id, sender_id_t sender) const;
+
+  /// The declared names, types, and senders of input `id`.
+  /// @throws sirius::invalid_input_exception on an unknown id.
+  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
+
   /// nullopt means no batch is parked now, not EOS; use drained(id) for EOS.
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
   /// @throws the output's poison error, which after a failed run() is that run's cause.
