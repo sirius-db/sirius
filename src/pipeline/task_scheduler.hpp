@@ -20,6 +20,7 @@
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -181,19 +182,29 @@ class task_scheduler {
   void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
-   * @brief Report a fatal query error via the completion future.
+   * @brief Fail one query by reporting @p error to its own completion handler.
    *
-   * Deliberately does NOT stop or drain any executor itself: callers can run on a GPU executor's
-   * or the task_creator's own worker thread (e.g. notify_downstream_pipelines() from
-   * ~gpu_pipeline_task), and synchronously stopping a pool from its own worker thread self-
-   * deadlocks in bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the
-   * query thread's future.get() throw; its catch block then calls drain_after_error() to perform
-   * the actual cancellation from a thread that is never a pool worker.
+   * Touches no shared subsystem: other in-flight queries keep running. Deliberately does NOT
+   * stop or drain any executor itself: callers can run on a GPU executor's or the task_creator's
+   * own worker thread (e.g. notify_downstream_pipelines() from ~gpu_pipeline_task), and
+   * synchronously stopping a pool from its own worker thread self-deadlocks in
+   * bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the query thread's
+   * future.get() throw; sirius_engine::execute's catch block then calls drain_after_error(query_id)
+   * to perform the actual cancellation from a thread that is never a pool worker.
    *
+   * @param handler The failing query's completion handler.
    * @param error The error to report.
    */
   void terminate_query(const std::shared_ptr<completion_handler>& handler,
                        std::exception_ptr error);
+
+  /**
+   * @brief Bind the per-query lifecycle gate, propagating it to every GPU executor.
+   *
+   * Without one (the default, and what most unit tests use) every query is treated as accepting
+   * work, i.e. the pre-gate behaviour.
+   */
+  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry);
 
   /**
    * @brief Drain all in-flight tasks after a query error.
@@ -240,6 +251,8 @@ class task_scheduler {
   /// Observer of query event transitions. Never null.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  /// Non-owning; owned by SiriusContext and outlives this scheduler. Null in unit tests.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

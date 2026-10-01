@@ -266,10 +266,11 @@ sub-executor or scan-priority queue owned here.
 |--------|---------|
 | `start()` | Starts every GPU executor, then launches the management thread |
 | `stop()` | Interrupts/closes scheduler channels, joins the management thread, then stops GPU executors |
-| `prepare_for_query(query)` | Drains executor leftovers and installs query/completion state |
-| `start_query()` | Schedules `query.get_scan_operators().front()` through `task_creator` and returns the completion future |
-| `terminate_query(exception)` | Reports error to completion handler |
-| `drain_after_error()` | Multi-stage drain for clean shutdown |
+| `start_query(query)` | Schedules `query.get_scan_operators().front()` through `task_creator` |
+| `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
+| `wait_for_completion(query_id)` | Stops task creation and validates the scheduler and executor queues after completion |
+| `drain_after_error(query_id)` | Drains in-flight work after a query error |
+| `drain_query_tasks(query_id)` | Discards queued work belonging to one query |
 
 ### Management Event Loop
 
@@ -379,14 +380,15 @@ This epilogue is the usual signaller, but not the only one — see the completio
 query-terminal pipeline signals completion there because task-creator, streaming-source, and
 parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
 
-`task_scheduler::prepare_for_query()` installs the handler on terminal pipelines as a
-`std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
+`sirius_engine::execute()` creates the handler and future, then passes the handler through
+`SiriusContext::create_query()` to `task_creator::prepare_for_query()`. Terminal pipelines hold it
+as a `std::weak_ptr`, preventing retired pipelines from retaining a handler.
 The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
 after releasing the lock and finishing all pipeline access.
 
 The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
 `completion_handler` accepts only the first one. After the future resolves,
-`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
+`task_scheduler::wait_for_completion(query_id)` stops task creation and validates the queues before
 operators are destroyed.
 
 ### Task Request Flow
@@ -440,12 +442,12 @@ If max retries are exceeded, the error propagates and terminates the query.
 
 **File:** `src/pipeline/task_scheduler.cpp`
 
-`drain_after_error()` performs a multi-stage clean shutdown:
+`drain_after_error(query_id)` performs a multi-stage clean shutdown while execution windows remain serialized:
 
 1. **Stop task creator thread pool** — prevents new tasks from being created
 2. **Drain the task queue** — clears pending pipeline tasks
 3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the task creator's pending tasks** — `drain_pending_tasks()` (also clears look-ahead state)
+4. **Drain the failed query's pending creation requests** — `drain_pending_tasks(query_id)` (also clears its look-ahead state)
 5. **Clear the task queue again** — catches tasks enqueued during the drain
 
 This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.

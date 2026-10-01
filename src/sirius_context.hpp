@@ -20,6 +20,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
@@ -526,6 +527,12 @@ class SiriusContext : public ClientContextState {
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
+  /// \brief The per-query enqueue gate, for tests and for subsystems that consult it directly.
+  [[nodiscard]] sirius::exec::query_lifecycle_registry& get_query_lifecycle_registry() noexcept
+  {
+    return query_lifecycle_;
+  }
+
   [[nodiscard]] sirius::pipeline::task_scheduler& get_task_scheduler();
   [[nodiscard]] const sirius::pipeline::task_scheduler& get_task_scheduler() const;
 
@@ -747,8 +754,14 @@ class SiriusContext : public ClientContextState {
   /// Observes where a query is in its execution.  Declared before the creator
   /// and scheduler that report into it so it outlives them on teardown.
   std::shared_ptr<sirius::event::query_event_publisher> query_event_publisher_;
-  // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
-  // before reset; reverse member destruction also preserves that order if initialize() throws.
+  /// Per-query "may work still be enqueued?" gate, consulted by every enqueue point in the
+  /// engine. Opened at window begin, quiesced at the top of the query's cleanup so the drains
+  /// below it cannot be outrun by a completion callback, and closed once they finish. Declared
+  /// before the subsystems that hold a pointer to it so it is destroyed after them.
+  sirius::exec::query_lifecycle_registry query_lifecycle_;
+  // The creator and downgrade executors borrow this scheduler. Reverse member destruction
+  // destroys scan_manager_, creator, and downgrade executors before the scheduler if initialize()
+  // throws before terminate() can run; terminate() also stops their threads before reset.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;

@@ -51,6 +51,21 @@ itask_executor::~itask_executor() { stop(); }
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {
   if (task) {
+    // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
+    // drain for this query may already have passed. Refuse rather than re-arm work behind it.
+    if (_query_lifecycle != nullptr) {
+      const auto query_id = sirius::make_query_id(pipeline::index_keys_for(*task).query_id);
+      const auto state    = _query_lifecycle->state(query_id);
+      if (!state) {
+        if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+          if (auto handler = gpu_task->get_completion_handler()) {
+            handler->report_error("task_executor: query lifecycle registration is missing");
+          }
+        }
+        SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
+      }
+      if (state != exec::query_lifecycle_state::open) { return; }
+    }
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
         .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -137,35 +152,85 @@ void itask_executor::drain_and_wait()
   _manager_thread = std::thread([this] { manager_loop(); });
 }
 
-void itask_executor::wait_and_validate_empty()
+void itask_executor::quiesce_manager()
 {
-  // Same quiescing as drain_and_wait(): interrupt the pool + queue so the manager
-  // exits, join it, and wait for all in-flight thread-pool tasks to finish.
+  // Releasing the manager thread's pool slot is a PRECONDITION for wait_all(), not an
+  // optimization. manager_loop() calls reserve() and then blocks in _task_queue.pop(), so an idle
+  // manager permanently holds an active slot; wait_all() waits for active_ == 0 and would never
+  // return. interrupt() makes reserve() hand back an invalid slot and pop() return nullptr, which
+  // is what lets the loop exit and the join succeed.
   _bounded_pool->interrupt();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _bounded_pool->wait_all();
+}
 
-  // Instead of draining, VALIDATE the queue is empty. A non-empty queue here means
-  // tasks were still scheduled on this executor when the query was declared complete.
-  const std::size_t remaining = _task_queue.size();
-
-  // Re-enable the pool/queue and restart the manager so the executor is left in a
-  // usable state for the next query, whether or not validation passes.
+void itask_executor::resume_manager()
+{
   _bounded_pool->resume();
   _task_queue.reactivate();
   _manager_thread = std::thread([this] { manager_loop(); });
+}
+
+void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
+{
+  // Never started (or already stopped): nothing dispatched, nothing to validate. drain_and_wait()
+  // has always had this guard; the whole-executor variant this replaced did not, and
+  // null-dereferenced when a query failed before any work reached this executor.
+  if (!_bounded_pool) { return; }
+
+  // Per-query wait, no quiesce bracket. This is the success path: the query's completion handler
+  // has already fired, so nothing of this query remains to be popped and the pop-to-attach window
+  // that the error path must worry about cannot occur here. Untagged slots (a manager parked in
+  // pop()) are ignored by drain_and_wait, which is exactly what lets this return without stopping
+  // the executor -- and therefore without interrupting the shared queue and dropping a co-tenant's
+  // in-transit task, which the previous bracket did on EVERY successful completion.
+  // wait_for_query, NOT drain_and_wait: this is the success path, so the query's remaining work
+  // must be allowed to RUN. Dropping it here would silently discard tasks the query legitimately
+  // scheduled and then report success.
+  _bounded_pool->wait_for_query(query_id);
+
+  // Only THIS query's tasks must be gone. The original validated the WHOLE queue, so a query
+  // completing normally threw because a co-tenant had work legitimately queued.
+  const std::size_t remaining =
+    _task_queue.size(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
   if (remaining != 0) {
     SIRIUS_LOG_ERROR(
-      "itask_executor::wait_and_validate_empty: task queue NOT empty at query completion — "
+      "itask_executor::wait_and_validate_empty: task queue NOT empty for query {} at completion — "
       "{} task(s) still queued; tasks were still being scheduled when the query was marked "
       "complete",
+      query_id,
       remaining);
     throw std::runtime_error(
       "task_executor: task queue not empty at query completion (" + std::to_string(remaining) +
       " task(s) remaining) — premature completion while work was still scheduled");
   }
+}
+
+void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
+{
+  // Error-path counterpart of wait_and_validate_empty: let in-flight work finish so no thread is
+  // still touching the failing query's plan, then drop that query's queued tasks.
+  //
+  // This one KEEPS the quiesce bracket, deliberately. Unlike the success path, a failing query can
+  // still have tasks sitting in the queue that the manager is free to pop at any moment, and there
+  // is a window between pop() and slot::attach() where the task belongs to neither the queue nor
+  // the per-query slot count. Joining the manager is what closes it: after that, no task can be
+  // in-hand. The caller's next act is to let the plan be destroyed, so "almost certainly quiesced"
+  // is not good enough here.
+  //
+  // What did change: the drain in the middle is per-query. The original cleared the ENTIRE queue,
+  // destroying every co-tenant's queued work and leaving those queries waiting on completions that
+  // could never arrive. The residual cost is that co-tenant pushes are refused across the bracket
+  // — on the error path only, not on every successful completion as before.
+  if (!_bounded_pool) {
+    drain_query_tasks(query_id);
+    return;
+  }
+  quiesce_manager();
+  drain_query_tasks(query_id);
+  resume_manager();
 }
 
 }  // namespace parallel

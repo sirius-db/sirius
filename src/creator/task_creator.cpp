@@ -34,6 +34,7 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -52,15 +53,16 @@ task_creator::task_creator(task_creator_config config,
   : _running(false),
     _config(std::move(config)),
     _task_creation_queue([](const task_creation_request& request) -> exec::index_keys {
-      // The request carries its own keys: they are resolved at schedule() time, where the
-      // node's pipeline (and therefore its query and priority) is unambiguously alive. The
-      // query key is what makes drain(query_index{...}) able to drop one query's pending
-      // requests and leave every other query's in place.
-      return exec::index_keys{
-        request.priority,
-        request.node != nullptr ? request.node->type : op::SiriusPhysicalOperatorType::INVALID,
-        static_cast<exec::query_key>(sirius::value_of(request.query_id)),
-        request.device_id};
+      // The request carries ALL of its own keys, resolved at schedule() time where the node's
+      // pipeline (and therefore its query, priority and type) is unambiguously alive. Nothing
+      // here dereferences `node`: this runs inside the queue mutex on every push, and reading a
+      // freed operator there would corrupt the index of a queue every query shares. The query key
+      // is what makes drain(query_index{...}) able to drop one query's pending requests and leave
+      // every other query's in place.
+      return exec::index_keys{request.priority,
+                              request.operator_type,
+                              static_cast<exec::query_key>(sirius::value_of(request.query_id)),
+                              request.device_id};
     }),
     _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
@@ -94,28 +96,6 @@ std::vector<int> task_creator::get_active_gpu_ids(sirius::query_id_t query_id) c
 {
   auto state = get_query_task_global_state(query_id);
   return state ? state->active_gpu_ids : std::vector<int>{};
-}
-
-void task_creator::query_task_global_state::enter_in_flight()
-{
-  std::lock_guard<std::mutex> lock(in_flight_mutex);
-  ++in_flight;
-}
-
-void task_creator::query_task_global_state::leave_in_flight()
-{
-  {
-    std::lock_guard<std::mutex> lock(in_flight_mutex);
-    --in_flight;
-    if (in_flight != 0) { return; }
-  }
-  in_flight_cv.notify_all();
-}
-
-void task_creator::query_task_global_state::wait_for_in_flight()
-{
-  std::unique_lock<std::mutex> lock(in_flight_mutex);
-  in_flight_cv.wait(lock, [this] { return in_flight == 0; });
 }
 
 std::shared_ptr<task_creator::query_task_global_state> task_creator::get_query_task_global_state(
@@ -291,10 +271,12 @@ void task_creator::drain_pending_tasks(sirius::query_id_t query_id)
   auto state = get_query_task_global_state(query_id);
   if (!state) { return; }
 
-  // Wait out this query's in-flight creation lambdas — the per-query stand-in for
-  // _bounded_pool->wait_all(), which would also wait on every other query's work. Workers
-  // decrement on exit (including by exception), so this cannot hang on a throwing lambda.
-  state->wait_for_in_flight();
+  // Wait out this query's in-flight creation work. The pool tracks it per query via the slot
+  // attached in manager_loop, so this waits on THIS query only — never on a co-tenant's lambda,
+  // and never on the manager thread's own idle reservation, which carries no query. Slots are
+  // released by RAII on every exit path including an exception, so a throwing creation lambda
+  // cannot strand this wait.
+  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
 
   // Clear lookahead state so any schedule_lookahead() racing with query teardown finds an
   // empty queue and exits cleanly instead of dereferencing operators that are about to die.
@@ -368,8 +350,24 @@ next_task_result task_creator::get_operator_for_next_task(
   return {node, false};
 }
 
+namespace {
+//! Set for the duration of a creation-worker lambda, so stop() can assert it is not being called
+//! from inside its own pool (see task_creator::stop).
+thread_local bool t_in_creation_worker = false;
+}  // namespace
+
+bool task_creator::is_pool_worker_thread() { return t_in_creation_worker; }
+
 void task_creator::stop()
 {
+  // Calling this from a creation worker is a guaranteed self-deadlock: do_stop_thread_pool()
+  // calls _bounded_pool->wait_all(), which blocks until active_ == 0, but the calling worker IS
+  // an active slot. If it somehow got past, _bounded_pool.reset() would join the calling thread
+  // with itself inside a noexcept function. The rogue call sites that did this are gone; assert
+  // so a new one is caught in a debug build rather than hanging CI.
+  assert(!is_pool_worker_thread() &&
+         "task_creator::stop() must not be called from one of its own pool workers");
+
   _task_creation_queue.interrupt();
   std::lock_guard<std::mutex> lock(_thread_pool_mutex);
   do_stop_thread_pool();
@@ -438,21 +436,66 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
-  auto request                    = std::make_unique<task_creation_request>();
-  request->node                   = node;
-  request->query_id               = query_id;
-  request->priority               = priority;
-  _task_creation_queue.push(std::move(request));
+  // Most calls here come from a completion callback (notify_downstream_pipelines, or the GPU
+  // executor scheduling a finished task's consumers). If the query is tearing down, `node` points
+  // into a plan that is about to be destroyed and a drain has very likely already passed this
+  // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
+  // queue, which refused EVERY query's pushes at once.
+  if (!accepts_work(query_id)) { return; }
+  auto request           = std::make_unique<task_creation_request>();
+  request->node          = node;
+  request->query_id      = query_id;
+  request->priority      = priority;
+  request->operator_type = node->type;
+  report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
+  if (!accepts_work(query_id)) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
-  _task_creation_queue.push(std::move(request));
+  request->operator_type   = node->type;
+  report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
+}
+
+void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) const
+{
+  if (pushed) { return; }
+  // multi_index_priority_queue::push returns false for exactly one reason: the queue is
+  // interrupted, i.e. shutting down. For a query the gate still reports as accepting work that is
+  // a genuine loss -- the request is destroyed, its pipeline never gets its task, and the query
+  // waits on a completion that can never arrive. Silence here is what turned every dropped-work
+  // bug in this subsystem into an unexplained hang.
+  //
+  // For a quiescing/closed query the drop is the documented teardown contract, not a bug.
+  if (accepts_work(query_id)) {
+    SIRIUS_LOG_ERROR(
+      "task_creator: creation request for query {} was DROPPED by an interrupted queue while the "
+      "query was still accepting work; that query will not receive the task it was waiting for",
+      query_id);
+  } else {
+    SIRIUS_LOG_DEBUG("task_creator: dropped a creation request for tearing-down query {}",
+                     query_id);
+  }
+}
+
+bool task_creator::accepts_work(sirius::query_id_t query_id) const
+{
+  if (_query_lifecycle == nullptr) { return true; }
+  const auto state = _query_lifecycle->state(query_id);
+  if (!state) {
+    if (auto query_state = get_query_task_global_state(query_id);
+        query_state && query_state->completion_handler) {
+      query_state->completion_handler->report_error(
+        "task_creator: query lifecycle registration is missing");
+    }
+    SIRIUS_LOG_ERROR("task_creator: refusing work for unknown query {}", query_id);
+  }
+  return state == sirius::exec::query_lifecycle_state::open;
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
@@ -462,17 +505,18 @@ void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion
   // from inside the dispatched task-creation lambda, or via notify_downstream_pipelines() called
   // from ~gpu_pipeline_task on a GPU executor thread). Calling stop() here would join
   // _manager_thread and then block in _bounded_pool->wait_all() waiting for this very task's slot
-  // to free -- a self-wait deadlock, since the slot can't free until this call returns.
-  // terminate_query() only fulfills the completion future; the query thread (sirius_engine.cpp,
-  // future.get() catch block) observes the error and calls task_scheduler::drain_after_error(),
-  // which drains and restarts every pool from a thread that is never one of their own workers.
+  // to free -- a self-wait deadlock, since the slot can't free until this call returns -- and
+  // would tear down task creation for every other in-flight query besides. terminate_query()
+  // only fulfills the completion future; the query thread (sirius_engine.cpp, future.get() catch
+  // block) observes the error and calls task_scheduler::drain_after_error(), which drains and
+  // restarts every pool from a thread that is never one of their own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
 
 void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error)
 {
-  // A query whose state was already dropped has no handler left to report to; the error is
-  // logged upstream by the caller and there is nothing further to signal.
+  // A query whose state was already dropped has no handler left to report to; the error has
+  // nowhere to go, which is correct — that query is already being torn down.
   auto state = get_query_task_global_state(query_id);
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
@@ -488,10 +532,18 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   std::shared_ptr<query_task_global_state> state;
   {
     std::lock_guard<std::mutex> lock(_global_state_mutex);
-    if (_query_task_global_states.empty()) { return; }
-    auto it  = _query_task_global_states.begin();
-    query_id = it->first;
-    state    = it->second;
+    // Oldest-first, matching the FIFO scheduling policy — but SKIPPING queries that are no longer
+    // accepting work rather than giving up on the first one. The oldest entry is routinely a
+    // query that has finished and is mid-cleanup but whose state has not been dropped yet:
+    // warming it up would dereference operators of a plan that is already gone, and bailing out
+    // entirely would starve every younger query of lookahead for the whole cleanup window.
+    for (auto& [id, candidate] : _query_task_global_states) {
+      if (candidate && accepts_work(id)) {
+        query_id = id;
+        state    = candidate;
+        break;
+      }
+    }
   }
   if (!state) { return; }
 
@@ -516,7 +568,8 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
       request->query_id        = query_id;
       request->priority        = priority;
       request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
-      _task_creation_queue.push(std::move(request));
+      request->operator_type   = node->type;
+      report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
       ++state->index_of_next_lookahead;
       return;
     }
@@ -553,6 +606,21 @@ void task_creator::manager_loop()
       continue;
     }
 
+    // Attribute the slot to this query BEFORE touching `node` again.
+    //
+    // get_operator_for_next_task() dereferences the operator (recursively, via
+    // get_next_task_hint()) on THIS thread. Attaching only just before dispatch would leave that
+    // dereference outside the counted region, so drain_pending_tasks(query_id) could return while
+    // the manager was still walking the query's operators — and the caller's next act is to let
+    // the plan be destroyed.
+    //
+    // The slot's own RAII covers every exit: an early `continue` below destroys it and decrements
+    // the query's count; the dispatch path moves it into the worker, which releases it when the
+    // creation lambda returns. Entered once, left once, with no separate bookkeeping to keep in
+    // sync. (Attribution cannot happen at reserve() time: the manager reserves before it knows
+    // which query it will serve, and an idle manager must not be counted against anyone.)
+    slot.attach(query_id);
+
     std::vector<std::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
     auto* requested_node = node;
     auto const next      = get_operator_for_next_task(node, visited_pipelines);
@@ -588,19 +656,15 @@ void task_creator::manager_loop()
     }
     node = next.op;
 
-    // Counted before dispatch so drain_pending_tasks(query_id) cannot observe zero in-flight
-    // while this task creation is still queued to run.
-    query_state->enter_in_flight();
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(
       std::move(slot),
       [this, node, request_kind, query_id, query_state = std::move(query_state)]() mutable {
-        // Released on every exit path, including the catch below, so a throwing creation can
-        // never strand drain_pending_tasks() waiting forever.
-        struct in_flight_guard {
-          const std::shared_ptr<query_task_global_state>& state;
-          ~in_flight_guard() { state->leave_in_flight(); }
-        } guard{query_state};
+        // Scoped marker so task_creator::stop() can assert it is never called from here.
+        struct worker_marker {
+          worker_marker() { t_in_creation_worker = true; }
+          ~worker_marker() { t_in_creation_worker = false; }
+        } marker;
         try {
           // Get what we need to create the task
           auto pipeline = node->get_pipeline();
