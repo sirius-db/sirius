@@ -697,6 +697,32 @@ TEST_CASE_METHOD(fragment_fixture,
       require_window_free();
     }
 
+    SECTION("a HUGEINT prepared column over a BIGINT plan column, as DuckDB types SUM(BIGINT)")
+    {
+      fragment_spec spec;
+      spec.plan_source =
+        [leaf = sirius::test::sql_plan_source("SELECT a::BIGINT FROM (VALUES (-7), (2)) t(a)")](
+          duckdb::ClientContext& context) {
+          auto bound     = leaf(context);
+          bound.prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+            duckdb::StatementType::SELECT_STATEMENT);
+          bound.prepared->names = {"a"};
+          bound.prepared->types = {duckdb::LogicalType::HUGEINT};
+          return bound;
+        };
+      streaming_fragment fragment(*con->context, std::move(spec));
+      fragment.build();
+      fragment.run();
+      auto result = duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
+        fragment.take_result());
+      REQUIRE(result->types == duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT});
+      REQUIRE(result->RowCount() == 2);
+      // A sign-dropping widen would turn -7 into a value no int64 holds.
+      REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() +
+                result->GetValue(0, 1).GetValue<std::int64_t>() ==
+              -5);
+    }
+
     SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
     {
       // A pin change between build() and run() fails the run without depending on I/O timing:
