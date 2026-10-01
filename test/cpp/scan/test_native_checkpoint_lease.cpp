@@ -886,8 +886,16 @@ TEST_CASE("pin_table holds the native checkpoint lease through materialization",
   CHECK(pin.wait_for(10s) == std::future_status::ready);
   CHECK(pin.get().empty());
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+  query_ok(*con, "BEGIN TRANSACTION READ ONLY");
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, attach_alias);
+  auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
+                  .Cast<duckdb::DuckTableEntry>();
   auto const entry = context->get_scan_manager().find_pinned_entry_for_duckdb_table(
-    attach_alias, "main", "native_lease_t");
+    attach_alias,
+    "main",
+    "native_lease_t",
+    {table.oid, table.GetStorage().GetRowGroupCollection()});
+  query_ok(*con, "COMMIT");
   REQUIRE(entry);
   REQUIRE(entry->mvcc);
   CHECK(entry->mvcc->checkpoint_iteration == pin_ready.iteration);
