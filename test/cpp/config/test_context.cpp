@@ -19,6 +19,7 @@
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -154,73 +155,26 @@ class scoped_env_assignment {
   std::optional<std::string> _previous;
 };
 
-struct setting_assignment {
-  const char* name;
-  const char* value;
-};
-
-constexpr std::array<setting_assignment, 10> legacy_only_settings{{
-  {"use_pin_memory", "false"},
-  {"use_pin_memory_for_caching", "true"},
-  {"use_cudf_expr", "false"},
-  {"use_custom_top_n", "false"},
-  {"use_opt_table_scan", "false"},
-  {"opt_table_scan_num_streams", "4"},
-  {"opt_table_scan_memcpy_size", "1048576"},
-  {"print_gpu_table_max_rows", "42"},
-  {"enable_fallback_check", "true"},
-  {"modified_pipeline", "true"},
-}};
-
-constexpr std::array<const char*, 4> super_sirius_settings{{
-  "expression_evaluator_strategy",
-  "enable_regex_jit_impl",
-  "enable_duckdb_fallback",
-  "like_swar_fastpath",
-}};
 }  // namespace
 
-TEST_CASE("Legacy-only settings follow the build surface",
-          "[sirius][config][legacy-settings][isolated_context]")
+TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]")
 {
-  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
-  setenv("SIRIUS_DISABLE", "1", 1);
+  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
 
-  auto setting_count = [&con](const char* name) {
+  constexpr std::array settings{"expression_evaluator_strategy",
+                                "enable_regex_jit_impl",
+                                "enable_duckdb_fallback",
+                                "like_swar_fastpath"};
+  for (auto const* name : settings) {
+    CAPTURE(name);
     auto result =
       con.Query("SELECT count(*) FROM duckdb_settings() WHERE name = '" + std::string(name) + "'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
-    return result->GetValue(0, 0).GetValue<int64_t>();
-  };
-
-  for (auto const& setting : legacy_only_settings) {
-    CAPTURE(setting.name);
-#ifdef SIRIUS_ENABLE_LEGACY
-    REQUIRE(setting_count(setting.name) == 1);
-
-    auto set_result = con.Query("SET " + std::string(setting.name) + " = " + setting.value);
-    REQUIRE(set_result != nullptr);
-    REQUIRE_FALSE(set_result->HasError());
-
-    auto reset_result = con.Query("RESET " + std::string(setting.name));
-    REQUIRE(reset_result != nullptr);
-    REQUIRE_FALSE(reset_result->HasError());
-#else
-    REQUIRE(setting_count(setting.name) == 0);
-
-    auto set_result = con.Query("SET " + std::string(setting.name) + " = " + setting.value);
-    REQUIRE(set_result != nullptr);
-    REQUIRE(set_result->HasError());
-#endif
-  }
-
-  for (auto const* name : super_sirius_settings) {
-    CAPTURE(name);
-    REQUIRE(setting_count(name) == 1);
+    REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 1);
   }
 }
 
@@ -1903,17 +1857,13 @@ TEST_CASE("Sirius configuration keeps absent memory paths out of mutual-exclusio
 //          are dispatched in the pipeline executor's GPU context.
 //    Status: N/A — no direct GPU operations; data upload handled by converters.
 //
-// 5. Legacy CUDA wrappers (src/cuda/cudf/*.cu)
-//    Role: Only called from gpu_processing (legacy) path, never from gpu_execution.
-//    Status: N/A for Super Sirius (new path).
-//
 // Summary: All GPU thread entry points in the Super Sirius (gpu_execution) path
 // correctly set the CUDA device before performing GPU operations. The device_id
 // is derived from the memory_space associated with each executor, ensuring
 // multi-GPU correctness when multiple executors target different devices.
 // ============================================================================
 
-TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
+TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1934,7 +1884,8 @@ TEST_CASE("topology_discovery populates GPU info", "[multi_gpu_foundation]")
   }
 }
 
-TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_foundation]")
+TEST_CASE("reservation_manager_configurator builds N GPU spaces",
+          "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -1960,7 +1911,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   REQUIRE(host_count >= 1);
 }
 
-TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation]")
+TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_foundation][multi_gpu]")
 {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
@@ -2042,14 +1993,9 @@ TEST_CASE("converter_registry exposes gpu_to_gpu converter after initialize() (M
   sirius::converter_registry::shutdown();
 }
 
-TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
+TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   sirius::converter_registry::reset_for_testing();
 
@@ -2091,14 +2037,9 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
 // .planning/phases/07-*/07-RESEARCH.md — Ada Lovelace + Sapphire Rapids).
 // WARN+return on single-GPU hosts (Catch2 skip idiom).
 TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-06)",
-          "[multi_gpu_foundation][mgpu_04_round_trip]")
+          "[multi_gpu_foundation][mgpu_04_round_trip][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs for MGPU-04 round-trip");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   sirius::converter_registry::reset_for_testing();
 

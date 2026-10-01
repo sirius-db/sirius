@@ -14,7 +14,6 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
-    $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB
@@ -54,11 +53,6 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
-
-if(SIRIUS_LEGACY_COMPILE_DEFINITIONS)
-  target_compile_definitions(sirius_unittest
-                             PRIVATE ${SIRIUS_LEGACY_COMPILE_DEFINITIONS})
-endif()
 
 # -----------------------------------------------------------------------------
 # test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource

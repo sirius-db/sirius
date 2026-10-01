@@ -75,7 +75,7 @@ fs::path make_tmp_dir(std::string const& tag)
 }  // namespace
 
 TEST_CASE("physical_order - large sort distributes across two GPUs",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -128,7 +128,7 @@ TEST_CASE("physical_order - large sort distributes across two GPUs",
 // a 2-element partition vector. See 12-CONTEXT.md and 12-stack-trace.txt for
 // the original off-by-one site at sirius_physical_hash_join.cpp:622-637.
 TEST_CASE("physical_order - small sort rangecheck regression",
-          "[mgpu][operator-mgpu][order][gpu_execution][regression]")
+          "[mgpu][operator-mgpu][order][gpu_execution][regression][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -168,7 +168,7 @@ TEST_CASE("physical_order - small sort rangecheck regression",
 }
 
 TEST_CASE("physical_order - small sort stays single-GPU",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 
@@ -203,7 +203,7 @@ TEST_CASE("physical_order - small sort stays single-GPU",
 }
 
 TEST_CASE("physical_order - order by with limit over large input",
-          "[mgpu][operator-mgpu][order][gpu_execution]")
+          "[mgpu][operator-mgpu][order][gpu_execution][multi_gpu]")
 {
   if (!require_two_gpus()) return;
 

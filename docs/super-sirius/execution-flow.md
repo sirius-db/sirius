@@ -30,7 +30,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
 
-## Step 1b: Explicit Table Function Path (Legacy)
+## Step 1b: Explicit Table Function Path
 
 **File:** `src/sirius_extension.cpp`
 

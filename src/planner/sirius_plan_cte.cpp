@@ -30,12 +30,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
   // Create the working_table that the PhysicalCTE will use for evaluation.
   auto working_table =
     duckdb::make_shared_ptr<duckdb::ColumnDataCollection>(context, op.children[0]->types);
-  // auto working_table_gpu =
-  // duckdb::make_shared_ptr<duckdb::GPUIntermediateRelation>(op.children[0]->types.size());
 
   // Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
   recursive_cte_tables[op.table_index] = working_table;
-  // gpu_recursive_cte_tables[op.table_index] = working_table_gpu;
   materialized_ctes[op.table_index] =
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
 
