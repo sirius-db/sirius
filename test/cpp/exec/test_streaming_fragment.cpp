@@ -26,7 +26,6 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
-#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -525,15 +524,12 @@ TEST_CASE_METHOD(fragment_fixture,
 
     SECTION("source's run() failed")
     {
-      // The scan reads the file during run(), so deleting it after build() fails execution. A
-      // per-process directory keeps another test process from recreating the deleted path.
-      sirius::test::scratch_dir scratch("frag7_failed_source");
-      fs::path const copy = scratch.file("lineitem.parquet");
-      fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
-      auto failed = make_fragment(
-        *con->context, "SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
+      // A pin change between build() and run() fails the run without depending on I/O timing.
+      auto failed = make_fragment(*con->context, kLeafQuery, {0});
       failed->build();
-      fs::remove(copy);
+      con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+        ->get_scan_manager()
+        .bump_pin_registry_epoch_for_testing();
       REQUIRE_THROWS(failed->run());
 
       auto receiver = make_receiver({{"a"}, integer_type, {0}});
@@ -703,15 +699,13 @@ TEST_CASE_METHOD(fragment_fixture,
 
     SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
     {
-      // The scan reads the file during run(), so deleting it after build() fails execution. A
-      // per-process directory keeps another test process from recreating the deleted path.
-      sirius::test::scratch_dir scratch("frag8_failed_run");
-      fs::path const copy = scratch.file("lineitem.parquet");
-      fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
-      auto fragment =
-        make_fragment("SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
+      // A pin change between build() and run() fails the run without depending on I/O timing:
+      // the scan cache may already hold a small file, so deleting it is not a reliable failure.
+      auto fragment = make_fragment(kLeafQuery, {0});
       fragment->build();
-      fs::remove(copy);
+      con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+        ->get_scan_manager()
+        .bump_pin_registry_epoch_for_testing();
 
       std::string cause;
       try {
