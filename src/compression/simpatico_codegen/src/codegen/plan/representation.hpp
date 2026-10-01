@@ -378,8 +378,8 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   void ensure_null_mask_copy(cudf::column_view const& source, ::cuda::stream_ref stream) const
   {
     if (null_mask_copy) return;
-    auto mr                 = rmm::mr::get_current_device_resource_ref();
-    auto bits               = copy_bitmask_as_data(source, stream, mr);
+    auto mr   = rmm::mr::get_current_device_resource_ref();
+    auto bits = copy_bitmask_as_data(source, stream, mr);
     auto const mask_bytes =
       static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
     null_mask_copy =

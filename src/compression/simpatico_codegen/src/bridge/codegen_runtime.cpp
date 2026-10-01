@@ -1516,7 +1516,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             std::move(bufs[i_first]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
-          auto rep       = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Delta, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("delta_first", std::move(first_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1572,7 +1572,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             std::move(bufs[i_off]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
-          auto rep     = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Rle, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("rle_runs_offsets", std::move(off_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1602,7 +1602,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             std::move(bufs[i_refs]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
-          auto rep      = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::For, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("references", std::move(refs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1641,7 +1641,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             std::move(bufs[i_zz]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
-          auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("zigzag", std::move(zz_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));

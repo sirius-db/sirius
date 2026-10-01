@@ -124,8 +124,8 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
   // A non-null column gets NO mask channel (2-channel str_split).
   std::unique_ptr<cudf::column> null_mask;
   if (src.null_count() > 0) {
-    auto mbuf               = copy_bitmask_as_data(src, stream, mr);
-    auto const mbytes       = static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(n));
+    auto mbuf         = copy_bitmask_as_data(src, stream, mr);
+    auto const mbytes = static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(n));
     null_mask =
       std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
                                      mbytes,

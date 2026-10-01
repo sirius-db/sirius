@@ -237,7 +237,7 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
   auto size   = static_cast<cudf::size_type>(values.size());
 
   auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  auto* mask_ptr             = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
   cudf::size_type null_count = 0;
   for (cudf::size_type i = 0; i < size; ++i) {
     if (!valids[i]) {

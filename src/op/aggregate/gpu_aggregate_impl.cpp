@@ -333,7 +333,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                   stream,
                                   memory_space.get_default_allocator());
-      request.values  = struct_col->view();
+      request.values = struct_col->view();
       temp_struct_cols.push_back(std::move(struct_col));
     } else {
       request.values = input_table.column(aggregate_col_id);

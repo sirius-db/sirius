@@ -263,9 +263,9 @@ std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> c
       cudf::size_of(col->type()) != cudf::size_of(stored)) {
     return col;
   }
-  auto const n  = col->size();
-  auto const nc = col->null_count();
-  auto contents = col->release();
+  auto const n   = col->size();
+  auto const nc  = col->null_count();
+  auto contents  = col->release();
   auto null_mask = contents.null_mask ? std::move(*contents.null_mask)
                                       : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   return std::make_unique<cudf::column>(
