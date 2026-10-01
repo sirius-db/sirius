@@ -1183,7 +1183,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
 
   // Every task of partition p carries index p (execute() selects p's hash-table slot from it) and
   // p's device from the placement, so it lands on the GPU holding p's hash table.
-  auto const placement = require_placement(_partition_build_states.size());
+  auto const placement = this->placement();
 
   // Prefer a partition awaiting its build (SCHEDULING, claimed by get_next_task_hint): issue a task
   // carrying that partition's single folded build batch plus its first probe batch. Concurrent
@@ -1339,7 +1339,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       if (auto batch = probe_port->repo->pop_next_data_batch(p)) {
         std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
         input_batch.push_back(std::move(batch));
-        auto const placement = require_placement(probe_port->repo->num_partitions());
+        auto const placement = this->placement();
         return std::make_unique<partitioned_operator_data>(std::move(input_batch), p, *placement);
       }
     }
@@ -1360,10 +1360,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       std::to_string(this->get_operator_id()));
   }
 
-  // Looked up only when a task is emitted: a poll that finds nothing to pair emits no data.
-  auto const placement_for_emit = [&] {
-    return require_placement(probe_port->repo->num_partitions());
-  };
   auto const finished = refresh_cross_schedule();
   auto const step     = next_cross_schedule_pair(_cross, finished.first, finished.second);
   if (step.kind == cross_schedule_kind::emit_pair) {
@@ -1388,7 +1384,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     input_batch.push_back(std::move(build_batch));  // [1] = build / "build" / right
 
     return std::make_unique<partitioned_operator_data>(
-      std::move(input_batch), step.partition, *placement_for_emit());
+      std::move(input_batch), step.partition, *this->placement());
   }
 
   // No normal pair. If both producers finished, a partition may have batches on one side and an
@@ -1448,7 +1444,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       input_batch.push_back(std::move(empty_batch));    // [1] = empty build / "build" / right
     }
     return std::make_unique<partitioned_operator_data>(
-      std::move(input_batch), orphan.partition, *placement_for_emit());
+      std::move(input_batch), orphan.partition, *this->placement());
   }
 
   return nullptr;

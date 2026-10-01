@@ -406,10 +406,8 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_i
       return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
                                                       std::move(counted_batches));
     }
-    return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
-                                                    std::move(counted_batches),
-                                                    this_partition,
-                                                    *require_placement(num_partitions));
+    return std::make_unique<dense_count_join_input>(
+      std::move(preserved_batches), std::move(counted_batches), this_partition, *this->placement());
   }
   return nullptr;
 }

@@ -64,18 +64,15 @@ void sirius_physical_partition_consumer_operator::set_placement(
   }
 }
 
-std::shared_ptr<const partition_placement>
-sirius_physical_partition_consumer_operator::require_placement(
-  std::size_t fallback_num_partitions) const
+std::shared_ptr<const partition_placement> sirius_physical_partition_consumer_operator::placement()
+  const
 {
-  if (auto installed = placement()) { return installed; }
-  if (_active_gpu_ids.empty()) {
-    return std::make_shared<const partition_placement>(
-      partition_placement::unpinned(std::max<std::size_t>(1, fallback_num_partitions)));
+  auto installed = _placement.load(std::memory_order_acquire);
+  if (installed == nullptr) {
+    throw sirius::internal_exception("placement: " + get_name() +
+                                     " has no installed partition placement");
   }
-  throw sirius::internal_exception("require_placement: " + get_name() +
-                                   " is about to emit partitioned data but no upstream PARTITION "
-                                   "installed a placement");
+  return installed;
 }
 
 }  // namespace op

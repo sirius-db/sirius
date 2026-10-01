@@ -195,7 +195,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     // Stamp the partition's device from the exchange's placement. merge_group_by materializes a
     // cuco hash table to combine its input batches, so — like hash_join — every task of a given
     // partition must stay on a single GPU.
-    auto const placement = require_placement(ports.begin()->second->repo->num_partitions());
+    auto const placement = this->placement();
     return std::make_unique<partitioned_operator_data>(
       std::move(input_batch), this_partition_id, *placement);
   } else {

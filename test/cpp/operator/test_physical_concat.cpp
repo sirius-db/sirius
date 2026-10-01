@@ -302,6 +302,8 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
     1000,
     fixture.hash_join.get(),
     false);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   // Execute
   auto outputs = concat_op.execute(unpinned_partition(input_batches, 0), default_stream());
@@ -337,6 +339,8 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
     1000,
     fixture.hash_join.get(),
     false);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto outputs = concat_op.execute(unpinned_partition({input_batch}, 0), default_stream());
 
@@ -354,6 +358,8 @@ TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
     1000,
     fixture.hash_join.get(),
     false);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto outputs = concat_op.execute(unpinned_partition({}, 0), default_stream());
 
@@ -376,6 +382,8 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
     1000,
     fixture.hash_join.get(),
     false);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   // Mix valid and null batches
   std::vector<std::shared_ptr<data_batch>> input = {batch1, nullptr, batch2, nullptr};
@@ -534,6 +542,8 @@ TEST_CASE("sirius_physical_concat stops concatenating at concat_batch_bytes thre
     fixture.hash_join.get(),
     false,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   // Set up a port with a data repository
   auto repo = std::make_unique<cucascade::shared_data_repository>();
@@ -593,6 +603,8 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
     fixture.hash_join.get(),
     true,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   // Set up a port with a data repository
   auto repo = std::make_unique<cucascade::shared_data_repository>();
@@ -644,6 +656,8 @@ TEST_CASE("sirius_physical_concat defers under-threshold groups while the source
     fixture.hash_join.get(),
     false,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto source = create_unfinished_source_pipeline();
@@ -720,6 +734,8 @@ TEST_CASE("sirius_physical_concat holds a lone oversized batch until more data o
     fixture.hash_join.get(),
     false,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto source = create_unfinished_source_pipeline();
@@ -786,6 +802,8 @@ TEST_CASE("sirius_physical_concat with concat_all defers all batches until pipel
     fixture.hash_join.get(),
     true,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto source = create_unfinished_source_pipeline();
@@ -840,6 +858,8 @@ TEST_CASE("sirius_physical_concat pulls from a later partition when earlier ones
     fixture.hash_join.get(),
     false,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(2)));
 
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto source = create_unfinished_source_pipeline();
@@ -911,6 +931,8 @@ TEST_CASE("sirius_physical_concat keeps a batch exactly at the threshold in its 
     fixture.hash_join.get(),
     false,
     threshold);
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
   auto repo   = std::make_unique<cucascade::shared_data_repository>();
   auto source = create_unfinished_source_pipeline();
@@ -1185,7 +1207,7 @@ TEST_CASE("sibling partitions install one placement on the join and both CONCATs
   attach_port(*fixture.hash_join, "build", join_build_repo);
   attach_port(*fixture.hash_join, "default", join_default_repo);
 
-  REQUIRE(fixture.hash_join->placement() == nullptr);
+  REQUIRE_THROWS_AS(fixture.hash_join->placement(), sirius::internal_exception);
   REQUIRE(build_partition.get_next_task_input_data() != nullptr);
 
   auto const placement = fixture.hash_join->placement();
@@ -1281,8 +1303,10 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
 
   constexpr int num_batches_per_partition = 20;
   constexpr int num_partitions            = 5;
-  constexpr std::size_t rows_per_batch    = 500;
-  int total_batches                       = num_batches_per_partition * num_partitions;
+  concat_op.set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(num_partitions)));
+  constexpr std::size_t rows_per_batch = 500;
+  int total_batches                    = num_batches_per_partition * num_partitions;
 
   std::set<uint64_t> expected_batch_ids;
   for (int p = 0; p < num_partitions; ++p) {
@@ -1380,6 +1404,8 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
         1000,
         fixture.hash_join.get(),
         false);
+      concat_op.set_placement(
+        std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
 
       // Create a dedicated CUDA stream for this thread
       cudaStream_t raw_stream;

@@ -167,19 +167,10 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
   /// @throws sirius::internal_exception if a different placement was already installed.
   void set_placement(std::shared_ptr<const partition_placement> placement);
 
-  /// The installed placement, or null before the upstream PARTITION has decided it.
-  [[nodiscard]] std::shared_ptr<const partition_placement> placement() const
-  {
-    return _placement.load(std::memory_order_acquire);
-  }
-
-  /// @brief The installed placement, for an operator about to emit partitioned data. Operators
-  /// built without an engine (unit tests driving an operator with no upstream PARTITION) have no
-  /// GPU list and get `unpinned(fallback_num_partitions)`.
-  /// @throws sirius::internal_exception if no placement is installed but a GPU list is — the
-  ///         upstream PARTITION must have installed one before any partitioned data arrived.
-  [[nodiscard]] std::shared_ptr<const partition_placement> require_placement(
-    std::size_t fallback_num_partitions) const;
+  /// The installed placement. PARTITION must install it before partitioned data is emitted;
+  /// standalone operator tests must install it explicitly with set_placement().
+  /// @throws sirius::internal_exception if no placement has been installed.
+  [[nodiscard]] std::shared_ptr<const partition_placement> placement() const;
 
  protected:
   //! Target size (bytes) per hash partition — the natural-count divisor. Set from operator_params

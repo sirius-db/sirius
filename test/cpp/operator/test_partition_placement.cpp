@@ -159,3 +159,21 @@ TEST_CASE("partitioned_operator_data stamps the partition's device as its prefer
   REQUIRE_FALSE(locality.get_partition_idx().has_value());
   REQUIRE_FALSE(locality.get_preferred_device_id().has_value());
 }
+
+TEST_CASE("partition consumers require an explicitly installed placement",
+          "[partition_placement][unit]")
+{
+  sirius::op::sirius_physical_partition_consumer_operator consumer(
+    sirius::op::SiriusPhysicalOperatorType::CONCAT, {}, 0);
+
+  // Standalone operators follow the same contract even without an engine's GPU list.
+  REQUIRE_THROWS_AS(consumer.placement(), sirius::internal_exception);
+  consumer.set_active_gpu_ids({3, 5});
+  REQUIRE_THROWS_AS(consumer.placement(), sirius::internal_exception);
+
+  auto const placement =
+    std::make_shared<const partition_placement>(partition_placement::round_robin(4, {3, 5}));
+  consumer.set_placement(placement);
+  REQUIRE(consumer.placement() == placement);
+  REQUIRE(consumer.placement()->device_for(3) == 5);
+}
