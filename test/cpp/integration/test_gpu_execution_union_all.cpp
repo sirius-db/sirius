@@ -30,7 +30,6 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -163,13 +162,6 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL composes with downstream operators",
                  "[integration][gpu_execution][union_all]")
 {
-  // COMPRESSED_MATERIALIZATION rewrites these narrow keys into __internal_compress_integral_*
-  // inside a projection, which the expression translator declines, so the query runs on the CPU
-  // and the fixture's GPU-execution assertion fails. Sirius masks that optimizer at load, but
-  // ~UniqueJoinFixture (test_gpu_execution_unique_join.cpp:68) resets the mask to '', so it is
-  // live again for anything running after it. The guard appends, restoring the mask it found.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
-
   // Aggregate downstream: UNION becomes a pipeline sink under the group-by's hash PARTITION,
   // which is the is_sink() == true shape.
   compare_gpu_vs_cpu(
@@ -199,9 +191,6 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL nested inside another UNION ALL arm",
                  "[integration][gpu_execution][union_all]")
 {
-  // Same COMPRESSED_MATERIALIZATION guard as the case above.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
-
   // An arm whose own subtree is a UNION: the inner and outer passthrough sinks must not collide,
   // since port names are per-operator.
   compare_gpu_vs_cpu(
@@ -223,8 +212,6 @@ TEST_CASE_METHOD(UnionAllFixture,
   // so two arms never present different carriers for one logical column. uwide.k is BIGINT with
   // small values (a narrowing candidate) against an INTEGER arm, and must be pinned for a sidecar
   // to be installed at all (sirius_plan_get.cpp:633).
-  // Same COMPRESSED_MATERIALIZATION guard as the case above.
-  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
   auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
   REQUIRE(pin);
   REQUIRE_FALSE(pin->HasError());
