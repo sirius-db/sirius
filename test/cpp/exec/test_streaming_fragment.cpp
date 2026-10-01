@@ -26,6 +26,7 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -524,8 +525,10 @@ TEST_CASE_METHOD(fragment_fixture,
 
     SECTION("source's run() failed")
     {
-      // The scan reads the file during run(), so deleting it after build() fails execution.
-      auto const copy = fs::temp_directory_path() / "sirius_frag7_lineitem.parquet";
+      // The scan reads the file during run(), so deleting it after build() fails execution. A
+      // per-process directory keeps another test process from recreating the deleted path.
+      sirius::test::scratch_dir scratch("frag7_failed_source");
+      fs::path const copy = scratch.file("lineitem.parquet");
       fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
       auto failed = make_fragment(
         *con->context, "SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
@@ -700,8 +703,10 @@ TEST_CASE_METHOD(fragment_fixture,
 
     SECTION("a failed run() poisons outputs, refuses a retry, and frees the window")
     {
-      // The scan reads the file during run(), so deleting it after build() fails execution.
-      auto const copy = fs::temp_directory_path() / "sirius_frag8_lineitem.parquet";
+      // The scan reads the file during run(), so deleting it after build() fails execution. A
+      // per-process directory keeps another test process from recreating the deleted path.
+      sirius::test::scratch_dir scratch("frag8_failed_run");
+      fs::path const copy = scratch.file("lineitem.parquet");
       fs::copy_file(lineitem_parquet_path(), copy, fs::copy_options::overwrite_existing);
       auto fragment =
         make_fragment("SELECT l_orderkey FROM read_parquet('" + copy.string() + "')", {0});
