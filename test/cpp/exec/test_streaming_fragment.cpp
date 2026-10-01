@@ -21,6 +21,8 @@
 #include "sirius_context.hpp"
 #include "sirius_engine.hpp"
 
+#include <cudf/unary.hpp>
+
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <data/data_batch_utils.hpp>
@@ -857,17 +859,13 @@ TEST_CASE_METHOD(fragment_fixture,
     REQUIRE(narrow->sink_types()[0].id() == sirius::type_id::INTEGER);
     REQUIRE(wide->sink_types()[0].id() == sirius::type_id::BIGINT);
 
-    auto drain_keys = [](streaming_fragment& sender, stream_id_t destination, bool is_wide) {
+    auto drain_keys = [](streaming_fragment& sender, stream_id_t destination) {
       std::vector<std::int64_t> values;
       while (auto batch = sender.pull(destination)) {
-        auto column = sirius::get_cudf_table_view(**batch).column(0);
-        if (is_wide) {
-          auto host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(column);
-          values.insert(values.end(), host.begin(), host.end());
-        } else {
-          auto host = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(column);
-          values.insert(values.end(), host.begin(), host.end());
-        }
+        auto wide = cudf::cast(sirius::get_cudf_table_view(**batch).column(0),
+                               cudf::data_type{cudf::type_id::INT64});
+        auto host = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(*wide);
+        values.insert(values.end(), host.begin(), host.end());
       }
       std::sort(values.begin(), values.end());
       return values;
@@ -875,8 +873,8 @@ TEST_CASE_METHOD(fragment_fixture,
 
     std::size_t routed = 0;
     for (stream_id_t destination : {0, 1}) {
-      auto const from_narrow = drain_keys(*narrow, destination, false);
-      auto const from_wide   = drain_keys(*wide, destination, true);
+      auto const from_narrow = drain_keys(*narrow, destination);
+      auto const from_wide   = drain_keys(*wide, destination);
       // Both destinations get keys, so matching sets are not just "everything went to one".
       REQUIRE_FALSE(from_narrow.empty());
       REQUIRE(from_narrow == from_wide);
