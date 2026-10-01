@@ -1335,7 +1335,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalPositionalJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
-      // UNION ALL only; the builder rejects distinct UNION and ordered arms.
+      // UNION ALL only; the builder rejects `setop_all == false` and ordered arms.
       plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:

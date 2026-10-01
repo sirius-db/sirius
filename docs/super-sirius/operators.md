@@ -310,12 +310,16 @@ Fallback for joins not supported by cuDF hash join (pure inequality conditions).
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
 ### `sirius_physical_union` — `UNION`
-**File:** `src/include/op/sirius_physical_union.hpp`
+**File:** `src/op/sirius_physical_union.hpp`
 
 `UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
 identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
-over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
-(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+over `children`. A distinct `UNION` reaches it as the bag union under a `DISTINCT`, which DuckDB's
+binder plants above it, and runs on the GPU through the `DISTINCT` lowering. `EXCEPT` and
+`INTERSECT` are rejected by the generator's dispatch switch. The plan builder
+(`src/planner/sirius_plan_set_operation.cpp`) rejects `allow_out_of_order = false`. It also rejects
+`setop_all = false`, the shape a `WITH RECURSIVE` body with no self-reference binds to, with no
+`DISTINCT` above it.
 
 - **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
   `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the

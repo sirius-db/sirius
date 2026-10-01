@@ -45,9 +45,13 @@
 //   3. Balanced arms distribute across two GPUs — needs 2 GPUs.
 //   4. Unequal arms do not strand work on one GPU — needs 2 GPUs. The
 //      stranding failure the hint exists to prevent.
+//   5. Distinct UNION dedups across many batches — SINGLE GPU. Every wide-arm
+//      row arrives eight times, in eight batches, so the merge after the
+//      shuffle must collapse duplicates the per-batch dedup never saw together.
+//   6. The same on two GPUs — needs 2 GPUs. Checks the answer only.
 //
-// TEST_CASEs 1 and 2 carry [single-gpu] and no [mgpu] tag, so they run on a
-// single-GPU host; 3 and 4 carry [mgpu] and gate on require_two_gpus().
+// TEST_CASEs 1, 2 and 5 carry [single-gpu] and no [mgpu] tag, so they run on a
+// single-GPU host; 3, 4 and 6 carry [mgpu] and gate on require_two_gpus().
 //
 // NOT asserted here: zero cross-device migration — that a UNION task ran on
 // the GPU that produced its input batch. `tasks_executed` per executor proves
@@ -65,11 +69,13 @@
 #include <duckdb.hpp>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -127,14 +133,42 @@ void generate_middle_arm(fs::path const& dir)
   generate_parquet_surface(dir, "SELECT range AS k, range * 5 AS v FROM range(200000)", 2);
 }
 
-std::string union_of(std::vector<fs::path> const& dirs)
+std::string union_of(std::vector<fs::path> const& dirs, std::string_view keyword = "UNION ALL")
 {
   std::string sql;
   for (size_t i = 0; i < dirs.size(); ++i) {
-    if (i != 0) sql += " UNION ALL ";
+    if (i != 0) {
+      sql += ' ';
+      sql += keyword;
+      sql += ' ';
+    }
     sql += "SELECT k, v FROM read_parquet('" + parquet_glob(dirs[i]) + "')";
   }
   return sql;
+}
+
+// Run the two- and three-arm distinct UNIONs under @p yaml and check each against
+// the CPU and its exact distinct count. The arms share only the row (0, 0).
+void require_distinct_union_counts(fs::path const& yaml, fs::path const& tmp)
+{
+  auto wide   = tmp / "wide";
+  auto middle = tmp / "middle";
+  auto narrow = tmp / "narrow";
+  generate_wide_arm(wide);
+  generate_middle_arm(middle);
+  generate_narrow_arm(narrow);
+
+  scoped_mgpu_env env(yaml);
+  auto con                 = env.make_connection();
+  auto const require_count = [&con](std::string const& query, int64_t expected) {
+    require_gpu_matches_cpu(con, query, /*force_cpu_reference=*/true);
+    auto rows = con.Query("SELECT count(*) FROM (" + query + ") t;");
+    REQUIRE(rows);
+    REQUIRE_FALSE(rows->HasError());
+    REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == expected);
+  };
+  require_count(union_of({wide, narrow}, "UNION"), 100000 + 1000 - 1);
+  require_count(union_of({wide, middle, narrow}, "UNION"), 100000 + 200000 + 1000 - 2);
 }
 
 // Run `query` under a generated env and return tasks_executed per device.
@@ -272,6 +306,36 @@ TEST_CASE("physical_union - unequal arms do not strand work on one GPU",
   REQUIRE(tasks_per_gpu.count(1));
   REQUIRE(tasks_per_gpu.at(0) >= 1);
   REQUIRE(tasks_per_gpu.at(1) >= 1);
+
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("physical_union - distinct UNION dedups across many batches",
+          "[single-gpu][operator-mgpu][union_all][gpu_execution]")
+{
+  auto tmp  = make_tmp_dir("distinct-1gpu");
+  auto yaml = tmp / "mgpu.yaml";
+  write_mgpu_yaml(yaml, make_params(/*num_gpus=*/1));
+  REQUIRE(fs::exists(yaml));
+
+  require_distinct_union_counts(yaml, tmp);
+
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+TEST_CASE("physical_union - distinct UNION dedups across many batches on two GPUs",
+          "[mgpu][operator-mgpu][union_all][gpu_execution][multi_gpu]")
+{
+  if (!require_two_gpus()) return;
+
+  auto tmp  = make_tmp_dir("distinct-2gpu");
+  auto yaml = tmp / "mgpu.yaml";
+  write_mgpu_yaml(yaml, make_params(/*num_gpus=*/2));
+  REQUIRE(fs::exists(yaml));
+
+  require_distinct_union_counts(yaml, tmp);
 
   std::error_code ec;
   fs::remove_all(tmp, ec);

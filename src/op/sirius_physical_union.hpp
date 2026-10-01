@@ -25,8 +25,9 @@ namespace sirius {
 namespace op {
 
 //! Physical `UNION ALL`: an N-ary, non-materializing fan-in. Bag union computes nothing, so this
-//! operator only routes batches and `execute` is the identity. Distinct `UNION`, `EXCEPT` and
-//! `INTERSECT` never reach it: the plan builder accepts only `setop_all == true`.
+//! operator only routes batches and `execute` is the identity. Distinct `UNION` reaches it only as
+//! the bag union under a DISTINCT; `EXCEPT` and `INTERSECT` never reach it, and the plan builder
+//! accepts only `setop_all == true`.
 //!
 //! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a distinct
 //! `port_label(i)` port.
