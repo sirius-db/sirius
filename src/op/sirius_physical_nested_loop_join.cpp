@@ -29,6 +29,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -630,6 +631,23 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   std::unique_ptr<cudf::table> result_table;
 
   if (conditions.empty()) {
+    // An output that exceeds the memory space can never be allocated, so fail instead of
+    // rescheduling the task on every out-of-memory error until the retry limit. The output holds
+    // every left column once per right row and every right column once per left row.
+    auto const output_bytes =
+      memory::saturating_add(memory::saturating_mul(left_batch.get_data()->get_size_in_bytes(),
+                                                    static_cast<std::size_t>(right.num_rows())),
+                             memory::saturating_mul(right_batch.get_data()->get_size_in_bytes(),
+                                                    static_cast<std::size_t>(left.num_rows())));
+    auto const max_bytes = space->get_max_memory();
+    if (max_bytes > 0 && output_bytes > max_bytes) {
+      throw sirius::not_implemented_exception(
+        "Cross join of {} x {} rows needs {} bytes, more than the {} bytes of GPU memory",
+        left.num_rows(),
+        right.num_rows(),
+        output_bytes,
+        max_bytes);
+    }
     auto cross         = cudf::cross_join(left, right, stream, mr);
     auto left_released = cross->release();
     const auto left_n  = static_cast<std::size_t>(left.num_columns());
