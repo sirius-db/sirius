@@ -593,7 +593,7 @@ echo "=== Collecting run info and filesystem benchmark ==="
     echo ""
 
     echo "--- Build ---"
-    DUCKDB_BIN="$PROJECT_DIR/build/release/duckdb"
+    DUCKDB_BIN="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
     if [ -f "$DUCKDB_BIN" ]; then
         echo "duckdb binary: $DUCKDB_BIN"
         echo "duckdb mtime:  $(stat -c %y "$DUCKDB_BIN" 2>/dev/null || stat -f '%Sm' "$DUCKDB_BIN" 2>/dev/null)"

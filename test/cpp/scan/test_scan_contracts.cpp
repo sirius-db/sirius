@@ -27,6 +27,7 @@
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/loadable_extension.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
@@ -802,6 +803,11 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
   auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" /
                       "data" / "configurator.yaml";
   REQUIRE(std::filesystem::is_regular_file(config));
+  auto const extension = sirius::test::loadable_extension_path();
+  if (extension.empty())
+    WARN("Set SIRIUS_EXTENSION_PATH to include dynamic scan-registration checks.");
+  else
+    REQUIRE(std::filesystem::is_regular_file(extension));
   for (auto const* phase : {"cold",
                             "warm",
                             "cold_same",
@@ -833,6 +839,8 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
                             "iceberg_unavailable",
                             "iceberg_disabled"}) {
     INFO(phase);
+    if (extension.empty() && std::string_view(phase).find("dynamic") != std::string_view::npos)
+      continue;
     bool const iceberg = std::string_view(phase).starts_with("iceberg_");
     bool const preload = iceberg || std::string_view(phase).starts_with("preload");
     // The parent test process may leave integration.yaml in the environment after pausing its
@@ -906,9 +914,8 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
       unsetenv("SIRIUS_DISABLE");
     marker("BEGIN sirius_load");
     if (dynamic) {
-      auto const executable = std::filesystem::canonical("/proc/self/exe");
-      auto const extension =
-        executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
+      auto const extension = sirius::test::loadable_extension_path();
+      REQUIRE(std::filesystem::is_regular_file(extension));
       auto result = con.Query("LOAD " + sirius::test::sql_literal(extension.string()));
       INFO((result->HasError() ? result->GetError() : "loaded"));
       REQUIRE_FALSE(result->HasError());
@@ -1057,9 +1064,8 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   unsetenv("SIRIUS_DISABLE");
   bool const dynamic = phase.starts_with("preload_dynamic");
   if (dynamic) {
-    auto const executable = std::filesystem::canonical("/proc/self/exe");
-    auto const extension =
-      executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
+    auto const extension = sirius::test::loadable_extension_path();
+    REQUIRE(std::filesystem::is_regular_file(extension));
     duckdb::Connection load(database);
     auto result = load.Query("LOAD " + sirius::test::sql_literal(extension.string()));
     INFO((result->HasError() ? result->GetError() : "loaded"));

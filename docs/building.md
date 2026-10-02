@@ -1,11 +1,25 @@
 # Building Sirius
 
+## Separate DuckDB extension
+
+[`sirius-duckdb/`](../sirius-duckdb/README.md) contains the independent extension
+setup, with its own DuckDB checkout, Pixi environment, and Makefile. It consumes
+an installed shared or static Sirius CMake package and runs GPU SQL tests
+through the normal DuckDB extension test target. The root build produces only the Sirius libraries and C++ tests.
+
+```bash
+pixi run cmake --preset release
+pixi run cmake --build --preset release --target sirius_library sirius_unittest
+```
+
+`pixi run make` builds the same targets. Build the extension separately from
+`sirius-duckdb/` using its Makefile.
+
 ## Shared implementation objects
 
 The internal `sirius_objects` CMake target compiles the common C++ and CUDA
 implementation once per build configuration. Its objects form `sirius_core`, an
-internal archive, and feed the shared Sirius library and DuckDB extension
-outputs directly. CUDA device linking takes place on concrete library targets, not on the
+internal archive, and feed the shared and static Sirius libraries. CUDA device linking takes place on concrete library targets, not on the
 object target.
 
 Compile options, dependency headers, PIC, and visibility belong to the object
@@ -59,39 +73,30 @@ pixi run cmake --build build/consumer
 
 Consumers are responsible for DuckDB and C++ runtime ABI compatibility.
 
-### Standalone CMake
+## Static library
 
-The root can also build Sirius directly, with DuckDB as a source dependency.
-Use the existing Makefile for the integrated DuckDB extension build.
-
-```bash
-pixi run cmake -S . -B build/standalone -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=native
-pixi run cmake --build build/standalone --target sirius_library
-pixi run cmake --install build/standalone --component sirius_library --prefix "$PWD/build/install"
-```
-
-Enable `SIRIUS_BUILD_TESTS` to build the C++ tests. Run them directly with
-`pixi run build/standalone/test/cpp/sirius_unittest`.
-
-### Static package
-
-Use the vcpkg dependency set for a static package:
+`SIRIUS_BUILD_STATIC=ON` installs a normal static Sirius library and its
+source-built support libraries. Third-party dependencies remain separate packages;
+CMake's exported targets carry their link requirements. No archives are merged.
 
 ```bash
-pixi run -e vcpkg cmake -S . -B build/static -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DSIRIUS_BUILD_STATIC=ON -DVCPKG_BUILD=ON \
-  -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-  -DCPM_LOCAL_PACKAGES_ONLY=ON
-pixi run -e vcpkg cmake --build build/static --target sirius_library
-pixi run -e vcpkg cmake --install build/static --component sirius_library --prefix "$PWD/build/static-install"
+pixi run -e vcpkg cmake --preset vcpkg-release -DSIRIUS_BUILD_TESTS=OFF
+pixi run -e vcpkg cmake --build build/vcpkg-release --target sirius_library
+pixi run -e vcpkg cmake --install build/vcpkg-release \
+  --component sirius_library --prefix "$PWD/build/static-install"
 ```
 
-The package exports `sirius::sirius_static` through
-`find_package(sirius CONFIG REQUIRED COMPONENTS static)`. Configure consumers
-with the same vcpkg toolchain and dependency prefix. Sirius and its source-built
-support libraries are ordinary archives; third-party dependencies remain normal
-CMake package targets. The final executable or extension links them together.
+Consumers use `find_package(sirius CONFIG REQUIRED COMPONENTS static)` and link
+`sirius::sirius_static`, with the dependency packages available through the vcpkg
+toolchain. The final consumer chooses its compiler-runtime linkage.
+
+For extension development, use the shared library with Conda/Pixi dependencies.
+For distribution, the wrapper's Sirius vcpkg port supplies the static package and
+the final extension link bundles its dependencies. See the
+[wrapper instructions](../sirius-duckdb/README.md) for both paths.
 
 Static consumers select their own compiler runtime linkage. The distribution
 extension uses `-static-libgcc -static-libstdc++` to bundle those runtimes.
+
+To include extension-loading checks in the C++ suite, set `SIRIUS_EXTENSION_PATH`
+to the built wrapper's absolute path when running `make test`. CI supplies this path.

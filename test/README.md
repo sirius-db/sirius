@@ -20,10 +20,10 @@ The script runs three steps:
 | `multi_gpu` | The `[multi_gpu]` tests with all GPUs visible. Skipped with fewer than two GPUs. |
 | `late_mat` | The `[late_mat]`, `[deferred_query]` and `[native_filter]` tests with `SIRIUS_EXP_LATE_MAT=1`. |
 
-It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each process writes `unittest.log` and `sirius.log` to its own subdirectory of `build/release/extension/sirius/test/cpp/log/`, for example `shard-0/` or `late_mat/`.
+It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each process writes `unittest.log` and `sirius.log` to its own subdirectory of `build/release/test/cpp/log/`, for example `shard-0/` or `late_mat/`.
 
 To run specific tests, call the test binary directly with a Catch2 tag or test name:
 ```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
+pixi run build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
 ```

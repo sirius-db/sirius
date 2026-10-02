@@ -1,5 +1,7 @@
-# When changing the duckdb submodule, update OVERRIDE_GIT_DESCRIBE in
-# cmake/sirius-duckdb-provider.cmake and cmake/CMakePresets.json, plus pixi.toml.
+# Keep DuckDB gitlinks and sirius-duckdb/vcpkg_ports/sirius/portfile.cmake in sync.
+# When changing DuckDB versions, update cmake/sirius-duckdb-provider.cmake,
+# cmake/CMakePresets.json, pixi.toml, sirius-duckdb/Makefile, and
+# .github/workflows/distribution.yml.
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/duckdb/duckdb.git
@@ -30,3 +32,9 @@
 	path = experimental/doris/doris
 	url = https://github.com/apache/doris
 	shallow = true
+[submodule "sirius-duckdb/duckdb"]
+	path = sirius-duckdb/duckdb
+	url = https://github.com/sirius-db/duckdb.git
+[submodule "sirius-duckdb/extension-ci-tools"]
+	path = sirius-duckdb/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools.git

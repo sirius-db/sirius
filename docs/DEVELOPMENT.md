@@ -72,16 +72,16 @@ If the build exhausts memory, reduce parallelism:
 CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
 ```
 
-Run the Sirius-linked DuckDB binary — the extension is statically built in and loads automatically:
+Build the extension separately using [its Makefile](../sirius-duckdb/README.md).
 
 ```bash
-./build/release/duckdb
+pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
 ## Pre-commit
@@ -109,8 +109,8 @@ pixi run make test
 Run tests by Catch2 tag or name:
 
 ```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
+pixi run build/release/test/cpp/sirius_unittest "uri_parser parses object-store URIs"
 ```
 
 ## Using CLion for development

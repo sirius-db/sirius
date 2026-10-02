@@ -7,7 +7,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DUCKDB="${SWEEP_DUCKDB:-$PROJECT_DIR/build/release/duckdb}"
+DUCKDB="${SWEEP_DUCKDB:-$PROJECT_DIR/sirius-duckdb/build/release/duckdb}"
+SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
 QUERY_DIR="${SWEEP_QUERY_DIR:-$PROJECT_DIR/test/tpch_performance/tpch_queries/orig}"
 SF="${SWEEP_SF:-100_rg2m}"
 PARQUET_DIR="${SWEEP_PARQUET_DIR:-$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}}"
@@ -170,7 +172,7 @@ run_sirius_sweep() {
             cat "$query_file"
         } > "$CURRENT_SQL"
 
-        if ! output=$("$DUCKDB" -f "$CURRENT_SQL" 2>&1); then
+        if ! output=$("$DUCKDB" "${DUCKDB_ARGS[@]}" -f "$CURRENT_SQL" 2>&1); then
             echo "$output" >&2
             die "DuckDB failed for $label query $q"
             return 1

@@ -1,22 +1,3 @@
-if(VCPKG_BUILD AND NOT PROJECT_IS_TOP_LEVEL)
-  install(FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
-          DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
-endif()
-
-if(NOT PROJECT_IS_TOP_LEVEL)
-  install(
-    TARGETS sirius_extension
-            sirius_core
-            cucascade_static
-            cucascade_cudf_static
-            cucascade_topology_discovery_static
-            telemetry_bridge
-            simpatico
-    EXPORT "${DUCKDB_EXPORT_SET}"
-    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
-endif()
-
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"

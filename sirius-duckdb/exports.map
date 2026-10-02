@@ -1,0 +1,8 @@
+{
+  global:
+    sirius_duckdb_cpp_init;
+    InitializeInjectionNvtx2;
+    dlopen;
+  local:
+    *;
+};

@@ -26,12 +26,13 @@ connection, so the gate declines the table and hides everything downstream of it
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
 ap = argparse.ArgumentParser()
 ap.add_argument("corpus")
-ap.add_argument("--duckdb", default="build/release/duckdb")
+ap.add_argument("--duckdb", default="sirius-duckdb/build/release/duckdb")
 ap.add_argument("--timeout", type=int, default=90)
 ap.add_argument("--case", default=None, help="run only this case")
 args = ap.parse_args()
@@ -57,7 +58,15 @@ def norm(rows):
 
 def run_case(case):
     cols = ", ".join(f'"{c}"' for c in case["columns"])
+    extension = os.environ.get(
+        "SIRIUS_EXTENSION_PATH",
+        str(
+            Path(args.duckdb).resolve().parent
+            / "extension/sirius/sirius.duckdb_extension"
+        ),
+    ).replace("'", "''")
     sql = (
+        f"LOAD '{extension}';\n"
         "LOAD iceberg;\n"
         "SET GLOBAL unsafe_enable_version_guessing=true;\n"
         f"SELECT {cols} FROM iceberg_scan('{case['table_dir']}');\n"
@@ -66,7 +75,7 @@ def run_case(case):
     )
     try:
         p = subprocess.run(
-            [args.duckdb, "-unsigned", "-json", "-c", sql],
+            [args.duckdb, "-unsigned", "-bail", "-json", "-c", sql],
             capture_output=True,
             text=True,
             timeout=args.timeout,
@@ -78,6 +87,8 @@ def run_case(case):
             f"no answer in {args.timeout}s (runtime fallback poisoned the connection)",
         )
 
+    if p.returncode != 0:
+        return "SQL_ERROR", (p.stderr or p.stdout).strip()
     if "LIVENESS_OK" not in p.stdout:
         err = (p.stderr or p.stdout).strip().splitlines()
         return "NO_LIVENESS", "second query never answered: " + (

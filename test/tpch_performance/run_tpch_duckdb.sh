@@ -41,7 +41,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SIRIUS_DUCKDB="$PROJECT_DIR/build/release/duckdb"
+SIRIUS_DUCKDB="$PROJECT_DIR/sirius-duckdb/build/release/duckdb"
 
 DUCKDB_FILE=""
 NUM_ITERATIONS=2
@@ -115,10 +115,14 @@ if [ "$ENGINE" != "sirius" ] && [ "$ENGINE" != "duckdb" ]; then
     exit 1
 fi
 DUCKDB="$SIRIUS_DUCKDB"
-QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
-if [ "$ENGINE" != "sirius" ]; then
-    export SIRIUS_DISABLE=1
+DUCKDB_ARGS=()
+if [ "$ENGINE" = "sirius" ]; then
+    SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+    DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
+    export SIRIUS_DISABLE=0
 fi
+QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
+
 
 if [ ! -f "$DUCKDB_FILE" ]; then
     echo "DuckDB database not found: $DUCKDB_FILE"
@@ -199,15 +203,15 @@ run_single_session() {
     START_TIME=$(date +%s.%N)
     if [ "$SESSION_TIMEOUT" -gt 0 ] 2>/dev/null; then
         if [ -n "${OUTPUT_DIR:-}" ]; then
-            FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" env SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
+            FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" env SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" "${DUCKDB_ARGS[@]}" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
         else
-            FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" "$DUCKDB" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
+            FULL_OUTPUT=$(timeout "$SESSION_TIMEOUT" "$DUCKDB" "${DUCKDB_ARGS[@]}" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
         fi
     else
         if [ -n "${OUTPUT_DIR:-}" ]; then
-            FULL_OUTPUT=$(SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
+            FULL_OUTPUT=$(SIRIUS_LOG_DIR="$OUTPUT_DIR" "$DUCKDB" "${DUCKDB_ARGS[@]}" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
         else
-            FULL_OUTPUT=$("$DUCKDB" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
+            FULL_OUTPUT=$("$DUCKDB" "${DUCKDB_ARGS[@]}" "$DUCKDB_FILE" -f "$TEMP_SQL" 2>&1)
         fi
     fi
     SESSION_EXIT=$?
@@ -347,7 +351,7 @@ run_multi_session() {
 
         local OUTPUT=""
         local Q_EXIT=0
-        local RUN_ENV=("$DUCKDB" "$DUCKDB_FILE" -f "$TEMP_SQL")
+        local RUN_ENV=("$DUCKDB" "${DUCKDB_ARGS[@]}" "$DUCKDB_FILE" -f "$TEMP_SQL")
         if [ "$ENGINE" = "sirius" ] && [ -n "${Q_DIR:-}" ]; then
             RUN_ENV=(env SIRIUS_LOG_DIR="$Q_DIR" "${RUN_ENV[@]}")
         fi

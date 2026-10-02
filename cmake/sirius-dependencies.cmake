@@ -94,6 +94,12 @@ if(BUILD_WITH_CTRACK)
 
 endif()
 
+if(VCPKG_BUILD)
+  set(_sirius_pkg_config_path "$ENV{PKG_CONFIG_PATH}")
+  set(ENV{PKG_CONFIG_PATH}
+      "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig:${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share/pkgconfig:$ENV{PKG_CONFIG_PATH}"
+  )
+endif()
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 if(VCPKG_BUILD)
@@ -103,6 +109,10 @@ if(VCPKG_BUILD)
 else()
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+endif()
+
+if(VCPKG_BUILD)
+  set(ENV{PKG_CONFIG_PATH} "${_sirius_pkg_config_path}")
 endif()
 
 # Scope dependency options without changing the caller's cache.
@@ -150,17 +160,3 @@ endif()
 add_subdirectory(rust/crates/telemetry/bridge)
 
 find_package(kvikio REQUIRED CONFIG)
-
-# The legacy DuckDB parent enables only C/CXX.
-if(NOT PROJECT_IS_TOP_LEVEL)
-  if(TARGET BS::thread_pool)
-    get_target_property(_bs_thread_pool_features BS::thread_pool
-                        INTERFACE_COMPILE_FEATURES)
-    if(_bs_thread_pool_features)
-      list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
-      set_target_properties(
-        BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
-                                   "${_bs_thread_pool_features}")
-    endif()
-  endif()
-endif()

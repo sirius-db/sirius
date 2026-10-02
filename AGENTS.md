@@ -31,7 +31,7 @@ Run commands through `pixi run <cmd>` (don't drop into the interactive `pixi she
 command runs in the activated environment:
 
 ```bash
-pixi run make                              # full build (uses all cores)
+pixi run make                              # library and C++ tests (uses all cores)
 pixi run make clean                        # wipe the build dir (after a failed build, before rebuilding)
 
 pixi run make test                         # build + run the C++ unit tests (scripts/run_unit_tests.py); make test_debug for debug
@@ -41,12 +41,12 @@ pixi run pre-commit run -a                 # all formatting/lint hooks
 
 Running tests directly (non-obvious invocations):
 ```bash
-pixi run build/release/extension/sirius/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
+pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"  # by Catch2 tag/test name
 ```
 
 `scripts/run_unit_tests.py` runs the unit tests in parallel shards (2 per GPU), then the
 `[multi_gpu]` and late-materialization tests. Arguments after `--` go to every Catch2 process.
-Logs go to `build/release/extension/sirius/test/cpp/log/<process>/`.
+Logs go to `build/release/test/cpp/log/<process>/`.
 
 **Python API**: the default Pixi environment includes DuckDB's Python package. Load the built
 Sirius extension from Python as shown in [docs/README.md](docs/README.md#python-api).
@@ -73,7 +73,7 @@ Load the extension and run normal SQL — Sirius intercepts it transparently and
 queries on the GPU (controlled by the `gpu_execution` setting, on by default):
 
 ```sql
-LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
+LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';
 SELECT ...;                  -- transparently routed to the GPU
 -- SET gpu_execution = false;  -- to disable interception
 ```

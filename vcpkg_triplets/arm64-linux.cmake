@@ -15,5 +15,11 @@ else()
   set(VCPKG_CUDA_VERSION 13)
 endif()
 
-# Include CUDA version in ABI hash so binary caching distinguishes CUDA 12 vs 13
-set(VCPKG_ENV_PASSTHROUGH VCPKG_CUDA_VERSION)
+# Architecture selection and CUDA version both affect the binary cache key.
+if(DEFINED ENV{VCPKG_CUDA_ARCHITECTURES}
+   AND NOT "$ENV{VCPKG_CUDA_ARCHITECTURES}" STREQUAL "")
+  set(VCPKG_CUDA_ARCHITECTURES "$ENV{VCPKG_CUDA_ARCHITECTURES}")
+else()
+  set(VCPKG_CUDA_ARCHITECTURES RAPIDS)
+endif()
+set(VCPKG_ENV_PASSTHROUGH VCPKG_CUDA_VERSION VCPKG_CUDA_ARCHITECTURES)

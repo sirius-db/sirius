@@ -33,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # All paths configurable via environment variables
-DUCKDB="${DUCKDB:-$PROJECT_DIR/build/release/duckdb}"
+DUCKDB="${DUCKDB:-$PROJECT_DIR/sirius-duckdb/build/release/duckdb}"
 ITERATIONS=${ITERATIONS:-2}
 # Per-query timeout in seconds (covers both iterations + nsys overhead).
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-90}
@@ -45,7 +45,7 @@ if [ $# -lt 1 ]; then
     echo ""
     echo "Environment variables:"
     echo "  SIRIUS_CONFIG_FILE - path to Sirius config (required)"
-    echo "  DUCKDB             - path to DuckDB binary (default: build/release/duckdb)"
+    echo "  DUCKDB             - path to DuckDB binary (default: sirius-duckdb/build/release/duckdb)"
     echo "  PARQUET_DIR        - path to parquet data directory (default: test_datasets/tpch_parquet_sf<SF>)"
     echo "  QUERY_DIR          - path to TPC-H query SQL files (default: test/tpch_performance/tpch_queries/orig)"
     echo "  OUTPUT_DIR         - output directory for profiles (default: nsys_profiles/sf<SF>)"

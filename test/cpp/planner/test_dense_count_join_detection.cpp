@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/loadable_extension.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/scoped_sirius_setting.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -886,16 +887,12 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamically loaded extension",
           "[dense_count_join][plan][dynamic_load]")
 {
-#ifdef SIRIUS_STANDALONE_TESTS
-  SKIP("The standalone build does not produce a loadable extension.");
-#endif
+  auto const extension = sirius::test::loadable_extension_path();
+  if (extension.empty()) SKIP("Set SIRIUS_EXTENSION_PATH to test the loadable extension.");
   auto const source          = GENERATE("parquet", "native");
   auto const host_visibility = GENERATE("local", "global");
   CAPTURE(source, host_visibility);
   scoped_temp_directory temp;
-  auto const executable = std::filesystem::canonical("/proc/self/exe");
-  auto const extension =
-    executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
   auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" /
                       "data" / "configurator_dense_count_join.yaml";
   REQUIRE(std::filesystem::is_regular_file(extension));
