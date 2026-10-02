@@ -25,9 +25,6 @@ class Verdict(str, Enum):
     VARIANT_MISMATCH = (
         "variant_mismatch"  # same query, different Sirius setting, different rows
     )
-    FALLBACK_MISMATCH = (
-        "fallback_mismatch"  # frontier: CPU fallback path returned wrong rows
-    )
     PLAN_FALLBACK = "plan_fallback"  # Sirius declined the plan (coverage gap)
     GPU_ERROR = "gpu_error"  # runtime failure on the GPU path
     GPU_INTERNAL_ERROR = "gpu_internal_error"  # CUDA / cuDF / internal error text
@@ -36,21 +33,13 @@ class Verdict(str, Enum):
     CRASH = "crash"  # worker process died during the query
     KNOWN_ISSUE = "known_issue"
 
-    def is_finding(self, on_plan_fallback: str = "fail") -> bool:
-        return self in _FINDINGS and (
-            self != Verdict.PLAN_FALLBACK or on_plan_fallback == "fail"
-        )
-
-
-def uses_plan_fallback(verdict: str, context: dict) -> bool:
-    """Whether execution retried a rejected plan with fallback enabled."""
-    return verdict == Verdict.FALLBACK_MISMATCH or "plan_fallback_reason" in context
+    def is_finding(self) -> bool:
+        return self in _FINDINGS
 
 
 _FINDINGS = {
     Verdict.MISMATCH,
     Verdict.VARIANT_MISMATCH,
-    Verdict.FALLBACK_MISMATCH,
     Verdict.PLAN_FALLBACK,
     Verdict.GPU_ERROR,
     Verdict.GPU_INTERNAL_ERROR,
@@ -66,7 +55,6 @@ SEVERITY = [
     Verdict.GPU_INTERNAL_ERROR,
     Verdict.MISMATCH,
     Verdict.VARIANT_MISMATCH,
-    Verdict.FALLBACK_MISMATCH,
     Verdict.GPU_OOM,
     Verdict.GPU_ERROR,
     Verdict.PLAN_FALLBACK,
@@ -105,19 +93,14 @@ def strip_duckdb_prefix(msg: str) -> str:
     return re.sub(r"^[A-Za-z ]+ Error: ", "", first).strip()
 
 
-def classify_gpu_error(
-    message: str, *, fallback_enabled: bool = False
-) -> tuple[Verdict, str]:
+def classify_gpu_error(message: str) -> tuple[Verdict, str]:
     """Verdict plus a short reason for an error raised by the GPU run."""
     text = message or ""
     body = strip_duckdb_prefix(text)
     idx = text.find(PLAN_PREFIX)
     if idx >= 0:
         reason = text[idx + len(PLAN_PREFIX) :].split("\n", 1)[0].strip()
-        # A rejection with fallback already enabled is a failed execution, not
-        # a coverage gap that the frontier profile can ignore.
-        verdict = Verdict.GPU_ERROR if fallback_enabled else Verdict.PLAN_FALLBACK
-        return verdict, strip_duckdb_prefix(reason)
+        return Verdict.PLAN_FALLBACK, strip_duckdb_prefix(reason)
     idx = text.find(RUNTIME_PREFIX)
     body_lower = text.lower()
     if any(m in body_lower for m in _OOM_MARKERS):

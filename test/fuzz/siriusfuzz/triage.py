@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .artifacts import command, fingerprint, verify, write_json
-from .classify import normalize_reason, uses_plan_fallback
+from .classify import normalize_reason
 from .triage_reduce import dataset_candidates, permute_dataset, query_candidates
 
 FILES = (
@@ -53,7 +53,6 @@ FILES = (
 FAILURES = {
     "mismatch",
     "variant_mismatch",
-    "fallback_mismatch",
     "crash",
     "timeout",
     "gpu_error",
@@ -250,13 +249,6 @@ def describe_outcome(
         # normalization erases them and conflates unrelated failures.
         "reason": reason if kind == "crash" else normalize_reason(reason),
         "variant": variant,
-        "execution_path": (
-            "fallback"
-            if uses_plan_fallback(
-                kind, record.get("context", metadata.get("context", {}))
-            )
-            else "strict"
-        ),
     }
     if kind == "crash":
         key["engine_sha256"] = (engine or {}).get("sha256")

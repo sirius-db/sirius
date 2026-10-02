@@ -1,8 +1,10 @@
-# siriusfuzz "strict" profile: every enabled feature runs on the GPU today, so any
-# plan-time fallback is a finding (a generator bug or an undocumented gap).
-# Keys mirror siriusfuzz/config.py; unknown keys are rejected.
-
-profile = "strict"
+# siriusfuzz configuration: the one shipped file, loaded by every command unless
+# --config names another.
+#
+# [features] flags mark what Sirius runs on the GPU today. Every enabled feature
+# is expected to stay on the GPU, so a plan-time fallback is a finding (a generator
+# bug or an undocumented gap). When Sirius gains a feature, flip its flag to true
+# here. Keys mirror siriusfuzz/config.py; unknown keys are rejected.
 
 [features]
 window_functions = false
@@ -65,7 +67,7 @@ try = false
 [features.casts]
 enabled = true
 temporal_numeric = false  # declined in translate_cast
-to_varchar = false        # number formatting differs between cuDF and DuckDB; enable to survey
+to_varchar = false        # runs on the GPU, but number formatting differs from DuckDB (mismatches)
 targets = ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
 
 [features.order_by]
@@ -112,7 +114,6 @@ float32_rel_tol = 1e-4
 float64_rel_tol = 1e-9
 abs_tol = 1e-12
 ambiguity_filter = true
-on_plan_fallback = "fail"
 known_issues = "known_issues.toml"
 query_timeout_seconds = 60
 reduce = true

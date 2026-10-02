@@ -4,9 +4,9 @@
 # See the LICENSE file at the repo root for the full text.
 """Feature / data / oracle configuration, loaded from TOML.
 
-Every default matches the GPU surface of Sirius today; a profile that enables a
-feature Sirius does not run yet (the "frontier" profile) turns plan-time
-fallbacks from findings into a counted coverage report.
+``config/default.toml`` is the one shipped configuration: its ``[features]``
+flags mark what Sirius runs on the GPU today, and a plan-time fallback inside
+that surface is a finding. The dataclass defaults only fill keys a file omits.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from typing import Any
 
 FUZZ_DIR = pathlib.Path(__file__).resolve().parent.parent
 REPO_ROOT = FUZZ_DIR.parent.parent
+DEFAULT_CONFIG = FUZZ_DIR / "config" / "default.toml"
 
 
 class ConfigError(ValueError):
@@ -231,7 +232,6 @@ class Oracle:
     float64_rel_tol: float = 1e-9
     abs_tol: float = 1e-12
     ambiguity_filter: bool = True
-    on_plan_fallback: str = "fail"  # fail | count | skip
     known_issues: str = "known_issues.toml"
     query_timeout_seconds: float = 60.0
     reduce: bool = True
@@ -267,7 +267,6 @@ class Sirius:
 
 @dataclass
 class FuzzConfig:
-    profile: str = "strict"
     features: Features = field(default_factory=Features)
     nulls: Nulls = field(default_factory=Nulls)
     data: Data = field(default_factory=Data)
@@ -299,8 +298,6 @@ class FuzzConfig:
             )
         if self.sirius.dataset_queries <= 0:
             raise ConfigError("sirius.dataset_queries must be positive")
-        if self.oracle.on_plan_fallback not in ("fail", "count", "skip"):
-            raise ConfigError("oracle.on_plan_fallback must be fail | count | skip")
         if f.aggregates.distinct not in ("off", "grouped_only", "on"):
             raise ConfigError(
                 "features.aggregates.distinct must be off | grouped_only | on"
@@ -342,13 +339,16 @@ def _strip_trailing_underscores(obj: Any) -> Any:
     return obj
 
 
-# Removed options the generator never implemented. Saved bundles still list them
-# as false; accept that so older findings replay, and reject anything else.
-_RETIRED_KEYS = {
-    "features.cte.recursive",
-    "features.aggregates.filter",
-    "features.aggregates.order_by",
-    "features.limit.percent",
+# Removed options. Bundles saved before the removal still carry them: accept the
+# values that match today's behaviour so those findings replay, reject the rest.
+# ``None`` accepts any value (the key was a label only).
+_RETIRED_KEYS: dict[str, tuple[Any, ...] | None] = {
+    "features.cte.recursive": (False,),
+    "features.aggregates.filter": (False,),
+    "features.aggregates.order_by": (False,),
+    "features.limit.percent": (False,),
+    "profile": None,
+    "oracle.on_plan_fallback": ("fail",),  # count/skip were the frontier profile
 }
 
 
@@ -359,9 +359,12 @@ def _build(cls: type, data: dict[str, Any], path: str) -> Any:
         name = _KEYWORD_FIELDS.get(key, key)
         if name not in fields:
             if f"{path}{key}" in _RETIRED_KEYS:
-                if value is False:
+                accepted = _RETIRED_KEYS[f"{path}{key}"]
+                if accepted is None or value in accepted:
                     continue
-                raise ConfigError(f"{path}{key} was never implemented and is removed")
+                raise ConfigError(
+                    f"{path}{key} was removed; {value!r} is no longer supported"
+                )
             raise ConfigError(f"unknown key {path}{key}")
         ftype = fields[name].type
         target = _resolve_type(ftype)
@@ -438,13 +441,38 @@ def _set_dotted(data: dict[str, Any], dotted: str, raw: str) -> None:
     cur[keys[-1]] = _parse_override(raw)
 
 
+def _split_list(inner: str) -> list[str]:
+    """Split a list body on top-level commas, keeping ``DECIMAL(18,4)`` and quoted items whole."""
+    items: list[str] = []
+    depth = 0
+    quote = ""
+    current = ""
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(current)
+            current = ""
+            continue
+        current += ch
+    items.append(current)
+    return items
+
+
 def _parse_override(raw: str) -> Any:
     text = raw.strip()
     if text.lower() in ("true", "false"):
         return text.lower() == "true"
     if text.startswith("[") and text.endswith("]"):
         inner = text[1:-1].strip()
-        return [_parse_override(v) for v in inner.split(",")] if inner else []
+        return [_parse_override(v) for v in _split_list(inner)] if inner else []
     try:
         return int(text)
     except ValueError:
@@ -458,21 +486,37 @@ def _parse_override(raw: str) -> Any:
     return text
 
 
+def schema_keys(cls: type = FuzzConfig, prefix: str = "") -> list[str]:
+    """Dotted TOML keys of every configuration value (tables excluded)."""
+    keys: list[str] = []
+    for f in dataclasses.fields(cls):
+        if f.name == "source_path":
+            continue
+        key = _KEYWORD_FIELDS_INV.get(f.name, f.name)
+        target = _resolve_type(f.type)
+        if dataclasses.is_dataclass(target):
+            keys += schema_keys(target, f"{prefix}{key}.")
+        else:
+            keys.append(f"{prefix}{key}")
+    return keys
+
+
 def load_config(
     path: str | pathlib.Path | None, overrides: list[str] | None = None
 ) -> FuzzConfig:
-    """Load a TOML profile (or the defaults) and apply ``key.path=value`` overrides."""
-    data: dict[str, Any] = {}
-    if path is not None:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
+    """Load a TOML file (``config/default.toml`` when ``path`` is None) and apply
+    ``key.path=value`` overrides."""
+    if path is None:
+        path = DEFAULT_CONFIG
+    with open(path, "rb") as fh:
+        data: dict[str, Any] = tomllib.load(fh)
     for item in overrides or []:
         if "=" not in item:
             raise ConfigError(f"override must look like key.path=value, got {item!r}")
         key, _, value = item.partition("=")
         _set_dotted(data, key.strip(), value)
     cfg = _build(FuzzConfig, data, "")
-    cfg.source_path = str(path) if path is not None else None
+    cfg.source_path = str(path)
     cfg.validate()
     return cfg
 

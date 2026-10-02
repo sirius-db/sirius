@@ -31,7 +31,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from .classify import Verdict, classify_gpu_error, normalize_reason, uses_plan_fallback
+from .classify import Verdict, classify_gpu_error, normalize_reason
 from .artifacts import runtime_info, write_json
 from .compare import ResultSet, Tolerances, compare_mode, compare_results
 from .config import FuzzConfig
@@ -174,8 +174,6 @@ class Evaluator:
             rec.verdict = verdict.value
             rec.reason = reason
             rec.detail = gpu.error.split("\n", 1)[0][:500]
-            if verdict == Verdict.PLAN_FALLBACK:
-                self._handle_plan_fallback(rec, cpu.result, mode)
             return rec
         assert gpu.result is not None
         gpu.result.columns = cpu.result.columns
@@ -196,42 +194,6 @@ class Evaluator:
         return rec
 
     # -- helpers -------------------------------------------------------------
-
-    def _handle_plan_fallback(
-        self, rec: QueryRecord, cpu_result: ResultSet, mode: str
-    ) -> None:
-        policy = self.cfg.oracle.on_plan_fallback
-        if policy != "count" or not self.s.gpu_available:
-            return
-        rec.context["plan_fallback_reason"] = rec.reason
-        # Frontier: the fallback path itself must stay clean. Re-run with fallback on.
-        self.s.begin_fallback_retry(rec.reason)
-        try:
-            self.s.con.execute("SET enable_duckdb_fallback = true")
-            fb = self.s.run(rec.sql, gpu=True, timeout=self.timeout)
-        finally:
-            try:
-                self.s.con.execute("SET enable_duckdb_fallback = false")
-            finally:
-                self.s.end_fallback_retry()
-        if fb.status == "ok" and fb.result is not None:
-            fb.result.columns = cpu_result.columns
-            outcome = compare_results(
-                cpu_result, fb.result, mode == "ordered", self.tol
-            )
-            if not outcome.equal:
-                rec.verdict = Verdict.FALLBACK_MISMATCH.value
-                rec.reason = outcome.detail
-                rec.detail = f"fallback path: {outcome.detail}"
-                rec.diffs = outcome.diffs
-        elif fb.status == "timeout":
-            rec.verdict = Verdict.TIMEOUT.value
-            rec.reason = f"fallback run exceeded {self.timeout}s"
-            rec.detail = f"fallback path timed out: {fb.error[:300]}"
-        elif fb.status == "error":
-            verdict, rec.reason = classify_gpu_error(fb.error, fallback_enabled=True)
-            rec.verdict = verdict.value
-            rec.detail = f"fallback path failed: {fb.error[:300]}"
 
     def _is_ambiguous(self, sql: str, cpu_result: ResultSet, mode: str) -> bool:
         """DQP filter: re-run on CPU over the same rows inserted in a different order."""
@@ -341,7 +303,6 @@ class Evaluator:
         verdict = Verdict(rec.verdict)
         variant = rec.variant or {}
         gpu = self.s.gpu_available
-        fallback = uses_plan_fallback(rec.verdict, rec.context)
 
         def ambiguous(sql: str, cpu: ResultSet, mode: str) -> bool:
             return self.cfg.oracle.ambiguity_filter and self._is_ambiguous(
@@ -352,39 +313,13 @@ class Evaluator:
             res = self.s.run(sql, gpu=False, timeout=self.timeout)
             return res if res.status == "ok" and res.result is not None else None
 
-        def plan_rejected(sql: str) -> str | None:
-            strict = self.s.run(sql, gpu=gpu, timeout=self.timeout)
-            if strict.status == "error":
-                classified, reason = classify_gpu_error(strict.error)
-                if classified == Verdict.PLAN_FALLBACK:
-                    return reason
-            return None
-
-        def run_fallback(sql: str, reason: str) -> RunResult:
-            self.s.begin_fallback_retry(reason)
-            try:
-                self.s.con.execute("SET enable_duckdb_fallback = true")
-                return self.s.run(sql, gpu=gpu, timeout=self.timeout)
-            finally:
-                try:
-                    self.s.con.execute("SET enable_duckdb_fallback = false")
-                finally:
-                    self.s.end_fallback_retry()
-
-        if verdict in (Verdict.MISMATCH, Verdict.FALLBACK_MISMATCH):
+        if verdict == Verdict.MISMATCH:
 
             def check(sql: str, query: Query | None = None) -> bool:
                 cpu = cpu_ok(sql)
                 if cpu is None:
                     return False
-                rejection = plan_rejected(sql) if fallback else None
-                if fallback and rejection is None:
-                    return False
-                g = (
-                    run_fallback(sql, rejection)
-                    if rejection is not None
-                    else self.s.run(sql, gpu=gpu, timeout=self.timeout)
-                )
+                g = self.s.run(sql, gpu=gpu, timeout=self.timeout)
                 if g.status != "ok" or g.result is None:
                     return False
                 mode = compare_mode(query)
@@ -437,24 +372,17 @@ class Evaluator:
             def check_error(sql: str, query: Query | None = None) -> bool:
                 if cpu_ok(sql) is None:
                     return False
-                rejection = plan_rejected(sql) if fallback else None
-                if fallback and rejection is None:
-                    return False
                 if variant:
                     name, value = next(iter(variant.items()))
                     self.s.set(name, value)
                 try:
-                    g = (
-                        run_fallback(sql, rejection)
-                        if rejection is not None
-                        else self.s.run(sql, gpu=gpu, timeout=self.timeout)
-                    )
+                    g = self.s.run(sql, gpu=gpu, timeout=self.timeout)
                 finally:
                     if variant:
                         self.s.restore(next(iter(variant)))
                 if g.status != "error":
                     return False
-                v2, reason2 = classify_gpu_error(g.error, fallback_enabled=fallback)
+                v2, reason2 = classify_gpu_error(g.error)
                 if v2 != verdict:
                     return False
                 return normalize_reason(reason2) == want
@@ -580,7 +508,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     if (
                         args.reduce
                         and cfg.oracle.reduce
-                        and Verdict(rec.verdict).is_finding(cfg.oracle.on_plan_fallback)
+                        and Verdict(rec.verdict).is_finding()
                     ):
                         session.stage = "reduction"
                         evaluator.reduce(rec, query)
