@@ -25,7 +25,12 @@ from siriusfuzz.report import (
     load_known_issues,
     signature,
 )
-from siriusfuzz.runner import Evaluator, Orchestrator, OrchestratorOptions
+from siriusfuzz.runner import (
+    Evaluator,
+    Orchestrator,
+    OrchestratorOptions,
+    first_of_signature,
+)
 from siriusfuzz.session import RunResult, Session
 from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem, TableRef
 
@@ -175,6 +180,28 @@ class EvaluatorTests(unittest.TestCase):
             self.assertEqual(active["operation"], "sqlsmith_reduction")
             self.assertEqual(active["input_sql"], "SELECT candidate")
             self.assertNotIn("sql", active)
+
+    def test_reduction_runs_once_per_error_signature(self):
+        seen = set()
+        error = QueryRecord(
+            0,
+            "d0",
+            1,
+            "SELECT f(x)",
+            "gpu_error",
+            reason="Unsupported expression: f(x)",
+        )
+        same_reason = replace(
+            error,
+            sql="SELECT f(y)",
+            dataset="d1",
+            reason="Unsupported expression: f(y)",
+        )
+        self.assertTrue(first_of_signature(error, seen))
+        self.assertFalse(first_of_signature(same_reason, seen))
+        mismatch = QueryRecord(0, "d0", 1, "SELECT 1", "mismatch", reason="1 vs 2")
+        self.assertTrue(first_of_signature(mismatch, seen))
+        self.assertTrue(first_of_signature(replace(mismatch, sql="SELECT 2"), seen))
 
     def test_variant_mismatch(self):
         rec, _ = evaluate(gpu_variant_wrong, **{"variants.per_query": "1"})

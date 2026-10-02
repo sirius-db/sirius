@@ -251,7 +251,8 @@ labels match. Repeated errors group by normalized reason. This favours keeping
 evidence over compact counts; use triage groups to merge candidates after investigation.
 
 **Reduction never replaces the original.** The original observation is saved before reduction
-starts. A reducer failure is recorded separately with `stage=reduction` and the active
+starts. Each error signature is reduced once per worker; later queries with the same signature
+are kept as additional reproducers without spending another reduction budget. A reducer failure is recorded separately with `stage=reduction` and the active
 candidate. Reduced output is additional evidence and must itself be replayed. `bundle.json`
 detects missing or edited original inputs; to test an edited query, use SQL-file replay with an
 explicit dataset.
