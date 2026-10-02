@@ -7,6 +7,8 @@
 ``config/default.toml`` is the one shipped configuration: its ``[features]``
 flags mark what Sirius runs on the GPU today, and a plan-time fallback inside
 that surface is a finding. The dataclass defaults only fill keys a file omits.
+``--mode gaps`` turns every switch marked with ``gap_switch`` on to survey what
+Sirius declines today.
 """
 
 from __future__ import annotations
@@ -29,12 +31,20 @@ class ConfigError(ValueError):
     pass
 
 
+def gap_switch(default: Any, on: Any = True) -> Any:
+    """A feature switch that is off because Sirius does not run it on the GPU yet.
+
+    ``--mode gaps`` sets every such switch to ``on``.
+    """
+    return field(default=default, metadata={"gaps": on})
+
+
 @dataclass
 class SetOps:
     union_all: bool = True
-    union: bool = False
-    except_: bool = False
-    intersect: bool = False
+    union: bool = gap_switch(False)
+    except_: bool = gap_switch(False)
+    intersect: bool = gap_switch(False)
 
 
 @dataclass
@@ -54,8 +64,8 @@ class Subqueries:
     scalar: bool = True
     correlated: bool = True
     # Uncorrelated scalar / EXISTS subqueries plan as cross products, which Sirius declines.
-    uncorrelated_scalar: bool = False
-    uncorrelated_exists: bool = False
+    uncorrelated_scalar: bool = gap_switch(False)
+    uncorrelated_exists: bool = gap_switch(False)
     max_depth: int = 2
 
 
@@ -69,7 +79,7 @@ class Aggregates:
     functions: list[str] = field(
         default_factory=lambda: ["sum", "count", "count_star", "min", "max", "avg"]
     )
-    distinct: str = "grouped_only"  # off | grouped_only | on
+    distinct: str = gap_switch("grouped_only", "on")  # off | grouped_only | on
 
 
 @dataclass
@@ -116,14 +126,14 @@ class Expressions:
     between: bool = True
     is_null: bool = True
     is_distinct_from: bool = True
-    try_: bool = False
+    try_: bool = gap_switch(False)
 
 
 @dataclass
 class Casts:
     enabled: bool = True
-    temporal_numeric: bool = False
-    to_varchar: bool = False
+    temporal_numeric: bool = gap_switch(False)
+    to_varchar: bool = False  # runs on the GPU; number formatting differs (mismatches)
     targets: list[str] = field(
         default_factory=lambda: ["BIGINT", "UBIGINT", "DOUBLE", "DECIMAL(18,4)"]
     )
@@ -152,11 +162,11 @@ class Complexity:
 
 @dataclass
 class Features:
-    window_functions: bool = False
-    distinct: bool = False
-    grouping_sets: bool = False
-    full_join: bool = False
-    cross_join: bool = False
+    window_functions: bool = gap_switch(False)
+    distinct: bool = gap_switch(False)
+    grouping_sets: bool = gap_switch(False)
+    full_join: bool = gap_switch(False)
+    cross_join: bool = gap_switch(False)
     set_ops: SetOps = field(default_factory=SetOps)
     joins: Joins = field(default_factory=Joins)
     subqueries: Subqueries = field(default_factory=Subqueries)
@@ -431,14 +441,14 @@ def _coerce(value: Any, target: Any, path: str) -> Any:
     return value
 
 
-def _set_dotted(data: dict[str, Any], dotted: str, raw: str) -> None:
+def _set_dotted(data: dict[str, Any], dotted: str, value: Any) -> None:
     keys = dotted.split(".")
     cur = data
     for k in keys[:-1]:
         cur = cur.setdefault(k, {})
         if not isinstance(cur, dict):
             raise ConfigError(f"cannot override {dotted}: {k} is not a table")
-    cur[keys[-1]] = _parse_override(raw)
+    cur[keys[-1]] = value
 
 
 def _split_list(inner: str) -> list[str]:
@@ -501,20 +511,53 @@ def schema_keys(cls: type = FuzzConfig, prefix: str = "") -> list[str]:
     return keys
 
 
+MODES = ("correctness", "gaps")
+
+
+def _gap_switches(cls: type = FuzzConfig, prefix: str = "") -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for f in dataclasses.fields(cls):
+        key = _KEYWORD_FIELDS_INV.get(f.name, f.name)
+        target = _resolve_type(f.type)
+        if dataclasses.is_dataclass(target):
+            out.update(_gap_switches(target, f"{prefix}{key}."))
+        elif "gaps" in f.metadata:
+            out[f"{prefix}{key}"] = f.metadata["gaps"]
+    return out
+
+
+def mode_overrides(mode: str) -> dict[str, Any]:
+    """Values a run mode forces before ``--set`` overrides apply.
+
+    ``gaps`` turns on every switch the configuration keeps off because Sirius
+    does not run the feature on the GPU yet, and skips setting variants, which
+    look for bugs rather than gaps.
+    """
+    if mode not in MODES:
+        raise ConfigError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+    if mode == "gaps":
+        return {**_gap_switches(), "variants.per_query": 0}
+    return {}
+
+
 def load_config(
-    path: str | pathlib.Path | None, overrides: list[str] | None = None
+    path: str | pathlib.Path | None,
+    overrides: list[str] | None = None,
+    mode: str = "correctness",
 ) -> FuzzConfig:
-    """Load a TOML file (``config/default.toml`` when ``path`` is None) and apply
-    ``key.path=value`` overrides."""
+    """Load a TOML file (``config/default.toml`` when ``path`` is None), apply the
+    mode's presets, then ``key.path=value`` overrides."""
     if path is None:
         path = DEFAULT_CONFIG
     with open(path, "rb") as fh:
         data: dict[str, Any] = tomllib.load(fh)
+    for key, value in mode_overrides(mode).items():
+        _set_dotted(data, key, value)
     for item in overrides or []:
         if "=" not in item:
             raise ConfigError(f"override must look like key.path=value, got {item!r}")
         key, _, value = item.partition("=")
-        _set_dotted(data, key.strip(), value)
+        _set_dotted(data, key.strip(), _parse_override(value))
     cfg = _build(FuzzConfig, data, "")
     cfg.source_path = str(path)
     cfg.validate()

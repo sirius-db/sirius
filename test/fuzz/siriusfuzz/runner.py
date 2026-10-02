@@ -31,7 +31,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
-from .classify import Verdict, classify_gpu_error, normalize_reason
+from .classify import Verdict, classify_gpu_error, narrows_gap, normalize_reason
 from .artifacts import runtime_info, write_json
 from .compare import ResultSet, Tolerances, compare_mode, compare_results
 from .config import FuzzConfig
@@ -362,12 +362,20 @@ class Evaluator:
             return check_variant
         if verdict in (
             Verdict.PLAN_FALLBACK,
+            Verdict.RUNTIME_FALLBACK,
             Verdict.GPU_ERROR,
             Verdict.GPU_INTERNAL_ERROR,
             Verdict.GPU_OOM,
         ):
             original_reason = rec.reason.split(": ", 1)[-1] if variant else rec.reason
             want = normalize_reason(original_reason)
+
+            def same_failure(reason: str) -> bool:
+                # A gap may narrow to the one function Sirius cannot translate;
+                # any other error must keep its exact normalized reason.
+                if verdict.is_gap():
+                    return narrows_gap(original_reason, reason)
+                return normalize_reason(reason) == want
 
             def check_error(sql: str, query: Query | None = None) -> bool:
                 if cpu_ok(sql) is None:
@@ -383,9 +391,10 @@ class Evaluator:
                 if g.status != "error":
                     return False
                 v2, reason2 = classify_gpu_error(g.error)
-                if v2 != verdict:
+                if v2 != verdict or not same_failure(reason2):
                     return False
-                return normalize_reason(reason2) == want
+                rec.reduced_reason = reason2  # the accepted candidate's own reason
+                return True
 
             return check_error
         return None

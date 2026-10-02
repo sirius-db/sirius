@@ -24,22 +24,9 @@ try:
 except ImportError:  # pragma: no cover
     duckdb = None
 
-# Everything the generator can emit, including shapes the default configuration
-# keeps off because Sirius does not run them on the GPU yet.
+# Everything the generator can emit: the gaps-mode presets plus VARCHAR casts, which
+# the default configuration keeps off for formatting mismatches rather than support.
 ALL_FEATURES = [
-    "features.window_functions=true",
-    "features.distinct=true",
-    "features.grouping_sets=true",
-    "features.full_join=true",
-    "features.cross_join=true",
-    "features.set_ops.union=true",
-    "features.set_ops.except=true",
-    "features.set_ops.intersect=true",
-    "features.subqueries.uncorrelated_scalar=true",
-    "features.subqueries.uncorrelated_exists=true",
-    "features.aggregates.distinct=on",
-    "features.expressions.try=true",
-    "features.casts.temporal_numeric=true",
     "features.casts.to_varchar=true",
     "features.casts.targets=[BIGINT,UBIGINT,DOUBLE,DECIMAL(18,4),VARCHAR]",
 ]
@@ -79,11 +66,20 @@ class GeneratorValidity(unittest.TestCase):
         self.assertGreaterEqual(ok / 300, 0.95, errors)
 
     def test_all_features_validity(self):
-        cfg = load_config(None, [*ALL_FEATURES, "data.rows=[20,200]"])
+        cfg = load_config(None, [*ALL_FEATURES, "data.rows=[20,200]"], mode="gaps")
         ok, errors, _ = run_batch(cfg, 300, seed=2)
         self.assertNotIn("BinderException", errors, errors)
         self.assertNotIn("ParserException", errors, errors)
         self.assertGreaterEqual(ok / 300, 0.90, errors)
+
+    def test_gaps_mode_emits_every_claimed_feature(self):
+        cfg = load_config(None, ["data.rows=[20,100]"], mode="gaps")
+        stats = collections.Counter()
+        for seed in range(3):
+            _, _, s = run_batch(cfg, 200, seed=20 + seed)
+            stats.update(s)
+        missing = [f for f in _CLAIMED_FEATURES(cfg) if stats.get(f, 0) == 0]
+        self.assertEqual(missing, [], f"never emitted: {missing}")
 
     def test_every_claimed_feature_is_emitted(self):
         cfg = load_config(None, ["data.rows=[20,100]"])
@@ -119,7 +115,7 @@ class GeneratorValidity(unittest.TestCase):
     def test_row_number_is_independent_of_input_order(self):
         # The ambiguity filter permutes input rows the same way; a row_number()
         # whose ORDER BY has ties would fail this and be discarded as ambiguous.
-        cfg = load_config(None, [*ALL_FEATURES, "data.rows=[20,200]"])
+        cfg = load_config(None, ["data.rows=[20,200]"], mode="gaps")
         dg = DataGenerator(cfg, random.Random(4))
         ds = dg.generate(4)
         base, permuted = duckdb.connect(), duckdb.connect()

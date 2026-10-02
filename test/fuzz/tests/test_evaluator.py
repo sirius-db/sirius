@@ -114,8 +114,18 @@ def gpu_variant_wrong(sql, cols, rows, s):
 def gpu_count_distinct_error(sql, cols, rows, s):
     return RunResult(
         "error",
-        error="Sirius GPU execution failed: Distinct aggregates not supported in GPU path yet",
+        error="Invalid Error: Sirius GPU execution failed: Distinct aggregates not supported in GPU path yet",
     )
+
+
+UNSUPPORTED_REASON = "Unsupported expression in projection (falling back to CPU): "
+UNSUPPORTED_PROJECTION = (
+    "Not implemented Error: GPU plan generation failed: " + UNSUPPORTED_REASON
+)
+
+
+def gpu_rejects(expression):
+    return lambda *args: RunResult("error", error=UNSUPPORTED_PROJECTION + expression)
 
 
 def gpu_reversed(sql, cols, rows, s):
@@ -180,6 +190,44 @@ class EvaluatorTests(unittest.TestCase):
             self.assertEqual(active["operation"], "sqlsmith_reduction")
             self.assertEqual(active["input_sql"], "SELECT candidate")
             self.assertNotIn("sql", active)
+
+    def test_gap_reduction_narrows_to_the_unsupported_function(self):
+        rec, ev = evaluate(
+            gpu_rejects('regexp_matches(concat("a"."c1", "a"."c2"), \'x\')')
+        )
+        self.assertEqual(rec.verdict, Verdict.PLAN_FALLBACK.value)
+        check = ev._make_still_fails(rec)
+        # Dropping the supported concat keeps the rejection: accepted, and the
+        # record remembers what the smaller query was rejected for.
+        ev.s.gpu_behaviour = gpu_rejects('regexp_matches("a"."c1", \'x\')')
+        self.assertTrue(check("SELECT 1"))
+        self.assertTrue(rec.reduced_reason.endswith('regexp_matches("a"."c1", \'x\')'))
+        # A different unsupported function, a different rejection, or success: rejected.
+        for behaviour in (
+            gpu_rejects('upper("a"."c1")'),
+            lambda *a: RunResult(
+                "error",
+                error="Not implemented Error: GPU plan generation failed: Window not supported",
+            ),
+            gpu_ok,
+        ):
+            ev.s.gpu_behaviour = behaviour
+            self.assertFalse(check("SELECT 1"))
+        # Other GPU errors still need the exact normalized reason.
+        rec, ev = evaluate(
+            lambda *a: RunResult(
+                "error", error="Sirius GPU execution failed: f(x) broke"
+            )
+        )
+        check = ev._make_still_fails(rec)
+        ev.s.gpu_behaviour = lambda *a: RunResult(
+            "error", error="Sirius GPU execution failed: f(y) broke"
+        )
+        self.assertTrue(check("SELECT 1"))
+        ev.s.gpu_behaviour = lambda *a: RunResult(
+            "error", error="Sirius GPU execution failed: broke"
+        )
+        self.assertFalse(check("SELECT 1"))
 
     def test_reduction_runs_once_per_error_signature(self):
         seen = set()
@@ -451,6 +499,7 @@ class ReportTests(unittest.TestCase):
         sql = "SELECT count(DISTINCT k) AS c0 FROM t"
         rec, _ = evaluate(gpu_count_distinct_error, sql=sql)
         self.assertTrue(any(k.matches(rec) for k in known))
+        self.assertEqual(rec.verdict, Verdict.RUNTIME_FALLBACK.value)
         other, _ = evaluate(
             lambda *a: RunResult(
                 "error", error="Sirius GPU execution failed: unrelated join failure"
@@ -537,38 +586,85 @@ class ReportTests(unittest.TestCase):
                 report.add(rec)
             self.assertEqual(len(report.finish()["findings"]), 2)
 
-    def test_plan_fallback_is_a_finding_that_fails_the_campaign(self):
+    def test_plan_fallback_fails_a_correctness_campaign_but_not_a_gaps_campaign(self):
         def run_campaign(runner):
             session = FakeSession(gpu_plan_fallback)
             ev = Evaluator(runner.cfg, session, lambda message: None)
             runner.report.add(ev.evaluate(None, "SELECT 1", 0, "synthetic", 0))
             summary = runner.report.finish()
             self.assertEqual(summary["counts"], {"plan_fallback": 1})
-            self.assertEqual(
-                summary["plan_fallback_reasons"], [("Window not supported", 1)]
-            )
             self.assertEqual(len(summary["findings"]), 1)
+            self.assertEqual(summary["gaps"][0]["reason"], "Window not supported")
+            self.assertEqual(summary["gaps"][0]["sql"], "SELECT 1")
             return summary
 
+        for mode, exit_code in (("correctness", 1), ("gaps", 0)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                args = build_parser().parse_args(
+                    ["run", "--mode", mode, "--seed", "1", "--queries", "1"]
+                    + ["--fail-on-findings", "--out", tmp]
+                )
+                with patch(
+                    "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
+                ), patch("siriusfuzz.cli.provenance", return_value={}), patch.object(
+                    Orchestrator, "run", autospec=True, side_effect=run_campaign
+                ):
+                    self.assertEqual(cmd_run(args), exit_code)
+                summary = json.loads(
+                    next(pathlib.Path(tmp).glob("run-*/summary.json")).read_text()
+                )
+                self.assertEqual(summary["mode"], mode)
+
+    def test_summary_groups_gaps_by_their_reduced_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
-            args = build_parser().parse_args(
-                [
-                    "run",
-                    "--seed",
-                    "1",
-                    "--queries",
-                    "1",
-                    "--fail-on-findings",
-                    "--out",
-                    tmp,
-                ]
-            )
-            with patch(
-                "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
-            ), patch("siriusfuzz.cli.provenance", return_value={}), patch.object(
-                Orchestrator, "run", autospec=True, side_effect=run_campaign
+            report = Report(pathlib.Path(tmp), load_config(None), [], 0, mode="gaps")
+            # Two rejections of different expressions around the same function, plus
+            # one unrelated plan rejection and one mismatch.
+            records = []
+            for expression, sql in (
+                (
+                    'regexp_matches(concat("a"."c1", "a"."c2"), \'x\')',
+                    "SELECT f(g(c1, c2)) FROM t",
+                ),
+                (
+                    'regexp_matches(substring("a"."c1", 1, 2), \'y\')',
+                    "SELECT f(h(c1)) FROM t",
+                ),
             ):
-                self.assertEqual(cmd_run(args), 1)
+                rec, _ = evaluate(gpu_rejects(expression), sql=sql)
+                rec.labels = ["Func(concat)", "Func(regexp_matches)", "Select"]
+                report.add(rec)
+                records.append(rec)
+            other, _ = evaluate(gpu_plan_fallback, sql="SELECT w() OVER () FROM t")
+            report.add(other)
+            wrong, _ = evaluate(gpu_wrong, sql="SELECT c1 FROM t")
+            report.add(wrong)
+            self.assertEqual(len(report.findings), 4)
+            for rec, reduced in zip(
+                records, ("SELECT f(c1) FROM t", "SELECT f(c1) FROM t_2")
+            ):
+                rec.reduced_sql = reduced
+                rec.reduced_labels = ["Func(regexp_matches)", "Select"]
+                rec.reduced_reason = (
+                    UNSUPPORTED_REASON + 'regexp_matches("a"."c1", \'x\')'
+                )
+                report.add_reduction(rec)
+            summary = report.finish()
+            gaps = summary["gaps"]
+            self.assertEqual([g["count"] for g in gaps], [2, 1])
+            self.assertEqual(gaps[0]["sql"], "SELECT f(c1) FROM t")
+            self.assertEqual(gaps[0]["labels"], ["Func(regexp_matches)", "Select"])
+            self.assertEqual(len(gaps[0]["findings"]), 2)
+            self.assertEqual(gaps[1]["reason"], "Window not supported")
+            text = report.render_summary(summary)
+            self.assertIn(
+                "gaps (2 unsupported features, 3 queries fell back to CPU)", text
+            )
+            self.assertIn("SELECT f(c1) FROM t\n", text)
+            self.assertIn("features: Func(regexp_matches), Select", text)
+            # The mismatch is listed as a finding; the gaps are not listed twice.
+            self.assertIn("findings (1 unique):", text)
+            self.assertEqual(text.count("Window not supported"), 1)
 
     def test_dedup_known_issue_and_artifacts(self):
         cfg = load_config(None)
@@ -582,7 +678,7 @@ class ReportTests(unittest.TestCase):
                 KnownIssue(
                     "Distinct aggregates not supported in GPU path",
                     "sirius-db/sirius#1218",
-                    verdicts=["gpu_error"],
+                    verdicts=["runtime_fallback"],
                     sql_pattern="count\\(DISTINCT",
                 )
             ]
@@ -617,10 +713,10 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(rec3.verdict, Verdict.KNOWN_ISSUE.value)
             self.assertIn("#1218", rec3.reason)
             summary = report.finish()
-            self.assertEqual(summary["counts"]["gpu_error"], 2)
+            self.assertEqual(summary["counts"]["runtime_fallback"], 2)
             self.assertEqual(summary["counts"]["known_issue"], 1)
             self.assertTrue((run_dir / "summary.txt").exists())
-            self.assertIn("gpu_error", report.render_summary(summary))
+            self.assertIn("runtime_fallback", report.render_summary(summary))
 
 
 if __name__ == "__main__":
