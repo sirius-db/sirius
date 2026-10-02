@@ -15,7 +15,10 @@
  */
 
 #include "catch.hpp"
+#include "memory/slab_memory_resource.hpp"
 #include "sirius_config.hpp"
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -154,4 +157,46 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
+}
+
+TEST_CASE("sirius_config selects the slab pool on both GPU memory paths", "[gpu_allocator][config]")
+{
+  auto const text = GENERATE(as<std::string>{},
+                             "sirius:\n"
+                             "  memory:\n"
+                             "    gpu:\n"
+                             "      usage_limit_bytes: 4MiB\n"
+                             "      allocator: slab\n",
+                             "sirius:\n"
+                             "  space:\n"
+                             "    gpu:\n"
+                             "      - device_id: 0\n"
+                             "        memory_capacity: 4MiB\n"
+                             "        allocator: slab\n");
+  scoped_yaml yaml("sirius_gpu_allocator.yaml", text);
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  cucascade::memory::memory_space gpu(
+    std::get<cucascade::memory::gpu_memory_space_config>(cfg.get_memory_space_configs().front()));
+  CHECK(sirius::memory::find_slab(gpu).has_value());
+}
+
+TEST_CASE("sirius_config rejects an unknown GPU allocator", "[gpu_allocator][config]")
+{
+  auto const text = GENERATE(as<std::string>{},
+                             "sirius:\n"
+                             "  memory:\n"
+                             "    gpu:\n"
+                             "      allocator: arena\n",
+                             "sirius:\n"
+                             "  space:\n"
+                             "    gpu:\n"
+                             "      - device_id: 0\n"
+                             "        allocator: arena\n");
+  scoped_yaml yaml("sirius_bad_gpu_allocator.yaml", text);
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS_WITH(cfg.load_from_file(yaml.path),
+                    Catch::Matchers::ContainsSubstring("must be one of async, slab"));
 }
