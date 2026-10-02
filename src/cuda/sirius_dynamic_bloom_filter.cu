@@ -62,7 +62,7 @@ template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
                                         cuda::thread_scope_device,
-                                        cuco::default_filter_policy<KeyT>,
+                                        cuco::bloom_filter_policy<KeyT>,
                                         bloom_alloc>;
 
 template <class Filter>
