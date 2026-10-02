@@ -67,7 +67,7 @@
     "warehouse/reference.db/pk_filter_history/snapshot/snapshot-1": "b3ff683d61e4a4c9fe0de38c7e49b82516e9b4d058d2ba5b9ea26e9fd65e618e",
     "warehouse/reference.db/pk_filter_history/snapshot/snapshot-2": "0ecf87f480d72a16d44c1ca089bb2cbe7ecfc328882f4e695ef400c490136198"
   },
-  "format_version": 1,
+  "format_version": 2,
   "generator": {
     "delete_writer_sha256": "091a0ec7b9c7ec6c5aa6f123eff5b5f9744607b64949e2aa4769cb5d01c00697",
     "native_commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
@@ -77,6 +77,25 @@
   "independent_checks": [
     {
       "case": "append_a",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c76056dd7773550495bb5d4d20497ea7e773358fce777d46921be32ac1238013",
+        "snapshot_id": 1,
+        "snapshot_label": "A",
+        "snapshot_sha256": "377787fe023df9214492127e0ab348f2dc164b3f445038b68bbf86e89210e9f9",
+        "sql": "SELECT * FROM {scan}",
+        "table": "append_basic",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -95,6 +114,25 @@
     },
     {
       "case": "append_b",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c76056dd7773550495bb5d4d20497ea7e773358fce777d46921be32ac1238013",
+        "snapshot_id": 2,
+        "snapshot_label": "B",
+        "snapshot_sha256": "7c8008cc54384c2529376b7fc9bbe4f88cad3d38f0f3af137580e67cf054d286",
+        "sql": "SELECT * FROM {scan}",
+        "table": "append_basic",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -117,6 +155,25 @@
     },
     {
       "case": "pk_a",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c257ac98a30000a5a483e336e97ffa0c644ef703352ac0d0092f97e2ea817584",
+        "snapshot_id": 1,
+        "snapshot_label": "A",
+        "snapshot_sha256": "3aba26642e418bdc41854ab2d8ea81e6e7d4465c19bd84faaeccb4a828d82bfc",
+        "sql": "SELECT * FROM {scan}",
+        "table": "orders_pk",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -131,6 +188,25 @@
     },
     {
       "case": "pk_b",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c257ac98a30000a5a483e336e97ffa0c644ef703352ac0d0092f97e2ea817584",
+        "snapshot_id": 2,
+        "snapshot_label": "B",
+        "snapshot_sha256": "f599e6771f087d5672e7121cd1b79cceed713cec23ed95ba855b07a45f2ccb07",
+        "sql": "SELECT * FROM {scan}",
+        "table": "orders_pk",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -149,6 +225,25 @@
     },
     {
       "case": "pk_c",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c257ac98a30000a5a483e336e97ffa0c644ef703352ac0d0092f97e2ea817584",
+        "snapshot_id": 3,
+        "snapshot_label": "C",
+        "snapshot_sha256": "16b2ecbe42426926d13aae5fc627239c1dc8e6ac7f6ddb941bdee21c338eea43",
+        "sql": "SELECT * FROM {scan}",
+        "table": "orders_pk",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -163,6 +258,25 @@
     },
     {
       "case": "pk_d",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c257ac98a30000a5a483e336e97ffa0c644ef703352ac0d0092f97e2ea817584",
+        "snapshot_id": 4,
+        "snapshot_label": "D",
+        "snapshot_sha256": "7566dce6d6ecb0a2d37bba065fd73f006730a5dbbcf4e0f30a04cd4df9b70644",
+        "sql": "SELECT * FROM {scan}",
+        "table": "orders_pk",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -181,6 +295,33 @@
     },
     {
       "case": "strings_all",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ],
+          [
+            "label",
+            "VARCHAR"
+          ],
+          [
+            "day",
+            "DATE"
+          ]
+        ],
+        "schema_sha256": "c3b18823fdf3c77f61e5b4f1f70752991b25a6e2f008ba5f19bf856501eaf6dc",
+        "snapshot_id": 1,
+        "snapshot_label": "A",
+        "snapshot_sha256": "b9e97cd36dc970db98d79c9cc739cfa173bc9f4336352d86ac2d921509749f3d",
+        "sql": "SELECT * FROM {scan}",
+        "table": "nullable_strings",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -211,11 +352,53 @@
     },
     {
       "case": "empty_rows",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "c7392ba4c15bda42cae58871c6cc78b353c214d1a0ebc26748c17714f8dfaa1c",
+        "snapshot_id": null,
+        "snapshot_label": null,
+        "snapshot_sha256": null,
+        "sql": "SELECT * FROM {scan}",
+        "table": "empty_table",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": []
     },
     {
       "case": "partitions_all",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ],
+          [
+            "day",
+            "DATE"
+          ]
+        ],
+        "schema_sha256": "778d5916d88ae08dda217ebbb648357c9e15376c971637b12931e71483f24927",
+        "snapshot_id": 2,
+        "snapshot_label": "B",
+        "snapshot_sha256": "2bfeab7e46ea6feed98811d07bf95104cfe473b0d378d87d7b9d0d12f55d6cc8",
+        "sql": "SELECT * FROM {scan}",
+        "table": "partitioned_files",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -237,6 +420,25 @@
     },
     {
       "case": "filter_history_a",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "5973c692659a7879d5484b17dfedb3e4a2e449704ce515abb336457da5b07c93",
+        "snapshot_id": 1,
+        "snapshot_label": "A",
+        "snapshot_sha256": "b3ff683d61e4a4c9fe0de38c7e49b82516e9b4d058d2ba5b9ea26e9fd65e618e",
+        "sql": "SELECT * FROM {scan}",
+        "table": "pk_filter_history",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -247,6 +449,25 @@
     },
     {
       "case": "filter_history_b",
+      "identity": {
+        "columns": [
+          [
+            "id",
+            "BIGINT"
+          ],
+          [
+            "amount",
+            "DECIMAL(12,2)"
+          ]
+        ],
+        "schema_sha256": "5973c692659a7879d5484b17dfedb3e4a2e449704ce515abb336457da5b07c93",
+        "snapshot_id": 2,
+        "snapshot_label": "B",
+        "snapshot_sha256": "0ecf87f480d72a16d44c1ca089bb2cbe7ecfc328882f4e695ef400c490136198",
+        "sql": "SELECT * FROM {scan}",
+        "table": "pk_filter_history",
+        "warehouse_inventory_sha256": "1ccf22369873dba97be4d9daba9f8a64d15dcaea4dd490c6c6c9394aabfbfab1"
+      },
       "passed": true,
       "rows": [
         {
@@ -256,6 +477,10 @@
       ]
     }
   ],
+  "metadata_revision": {
+    "date": "2026-10-02",
+    "reason": "Persisted options and structured partitions; oracle identities reconstructed from the unchanged committed corpus and recorded case definitions. Original PyPaimon reads were not rerun."
+  },
   "tables": {
     "append_basic": {
       "live_files": [
@@ -263,7 +488,7 @@
         "data-d4e61164-1465-4a7e-9d93-a24709c43615-0.parquet"
       ],
       "live_partitions": [
-        "[]"
+        []
       ],
       "options": {
         "bucket": "-1",
@@ -273,6 +498,7 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [],
       "path": "warehouse/reference.db/append_basic",
       "schema": [
         [
@@ -301,6 +527,7 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [],
       "path": "warehouse/reference.db/empty_table",
       "schema": [
         [
@@ -320,7 +547,7 @@
         "data-dfecc34f-b6fc-47c2-985d-283a83b0478c-0.parquet"
       ],
       "live_partitions": [
-        "[]"
+        []
       ],
       "options": {
         "bucket": "-1",
@@ -330,6 +557,7 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [],
       "path": "warehouse/reference.db/nullable_strings",
       "schema": [
         [
@@ -362,10 +590,11 @@
         "data-df5c4d57-30d9-4cbf-a50b-499a82c7b056-0.parquet"
       ],
       "live_partitions": [
-        "[]"
+        []
       ],
       "options": {
         "bucket": "1",
+        "file-system": "local",
         "file.format": "parquet",
         "manifest.format": "avro",
         "merge-engine": "deduplicate",
@@ -373,6 +602,7 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [],
       "path": "warehouse/reference.db/orders_pk",
       "schema": [
         [
@@ -398,8 +628,12 @@
         "data-ace701ec-fd15-4ef7-b74a-1f6f0b42e1fd-0.parquet"
       ],
       "live_partitions": [
-        "[datetime.date(2026, 9, 26)]",
-        "[datetime.date(2026, 9, 27)]"
+        [
+          "2026-09-26"
+        ],
+        [
+          "2026-09-27"
+        ]
       ],
       "options": {
         "bucket": "-1",
@@ -410,6 +644,12 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [
+        [
+          "day",
+          "DATE"
+        ]
+      ],
       "path": "warehouse/reference.db/partitioned_files",
       "schema": [
         [
@@ -437,7 +677,7 @@
         "data-d25ac427-7e3f-487f-a2af-b81317d9f69f-0.parquet"
       ],
       "live_partitions": [
-        "[]"
+        []
       ],
       "options": {
         "bucket": "1",
@@ -448,6 +688,7 @@
         "snapshot.num-retained.min": "100",
         "write-only": "true"
       },
+      "partition_columns": [],
       "path": "warehouse/reference.db/pk_filter_history",
       "schema": [
         [

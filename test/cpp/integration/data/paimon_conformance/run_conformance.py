@@ -4,13 +4,19 @@
 import argparse
 from collections import Counter
 from decimal import Decimal
-import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+
+from corpus_checks import (
+    digest,
+    validate_inventory,
+    validate_table_metadata,
+    validate_oracle,
+)
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[4]
@@ -177,11 +183,6 @@ def scan_sql(path, snapshot):
     return f"paimon_scan({argument})"
 
 
-def digest(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path, nargs="?", default=HERE)
@@ -202,10 +203,9 @@ def main():
         raise ValueError(
             "Unqualified Paimon artifact: expected the version and SHA256 in expectations.json"
         )
-    for relative, expected in manifest["files"].items():
-        file = (corpus / relative).resolve(strict=True)
-        if not file.is_relative_to(corpus) or digest(file) != expected:
-            raise ValueError(f"Changed or external corpus file: {relative}")
+    validate_inventory(corpus, manifest)
+    validate_table_metadata(corpus, manifest)
+    validate_oracle(spec, manifest, compare_rows)
     WORK.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=WORK))
     config = run_dir / "sirius.yaml"
@@ -333,6 +333,7 @@ def main():
             raise RuntimeError("Conformance failures: inspect per-case errors and logs")
         if len(report["cases"]) != report["planned_cases"]:
             raise RuntimeError("Incomplete case execution")
+        validate_inventory(corpus, manifest)
         report["state"] = "passed"
     except Exception as error:
         report.update(state="failed", error=str(error))

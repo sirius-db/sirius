@@ -13,7 +13,16 @@ import subprocess
 import pyarrow as pa
 from pypaimon import CatalogFactory, Schema
 
-from run_conformance import compare_rows, digest
+from run_conformance import compare_rows
+from corpus_checks import (
+    canonical_json,
+    digest,
+    oracle_identity,
+    table_schema,
+    validate_inventory,
+    validate_table_metadata,
+    validate_oracle,
+)
 
 HERE = Path(__file__).resolve().parent
 OPTIONS = {
@@ -44,7 +53,7 @@ def main():
     catalog = CatalogFactory.create({"warehouse": str(warehouse)})
     catalog.create_database("reference", False)
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "generator": {
             "pypaimon": version("pypaimon"),
             "pyarrow": pa.__version__,
@@ -148,7 +157,18 @@ def main():
         table = catalog.get_table(f"reference.{name}")
         plan = table.new_read_builder().new_scan().plan()
         files = sorted({f.file_name for split in plan.splits() for f in split.files})
-        partitions = sorted({str(split.partition.values) for split in plan.splits()})
+        partitions = sorted(
+            {
+                tuple(
+                    v.isoformat() if isinstance(v, date) else v
+                    for v in split.partition.values
+                )
+                for split in plan.splits()
+            }
+        )
+        persisted = table_schema(
+            output, {"path": str(Path("warehouse/reference.db") / name)}
+        )
         if recipe.get("partitioned") and (len(files) < 2 or len(partitions) != 2):
             raise AssertionError("Need two live partitions and at least two live files")
         if not recipe["commits"] and (plan.snapshot_id is not None or plan.splits()):
@@ -159,10 +179,13 @@ def main():
             "path": str(Path("warehouse/reference.db") / name),
             "snapshots": snapshots,
             "schema": recipe["schema"],
-            "options": options,
+            "options": persisted["options"],
+            "partition_columns": [
+                [key, dict(recipe["schema"])[key]] for key in persisted["partitionKeys"]
+            ],
             "writer": "paimon-cpp" if name == "orders_pk" else "pypaimon",
             "live_files": files,
-            "live_partitions": partitions,
+            "live_partitions": [list(values) for values in partitions],
         }
         print(f"Generated {name}: {snapshots}", flush=True)
 
@@ -196,9 +219,13 @@ def main():
         for p in sorted(warehouse.rglob("*"))
         if p.is_file()
     }
-    (output / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, default=str, ensure_ascii=False) + "\n"
-    )
+    for entry in manifest["independent_checks"]:
+        case = next(c for c in spec["cases"] if c["id"] == entry["case"])
+        entry["identity"] = oracle_identity(case, manifest)
+    validate_inventory(output, manifest)
+    validate_table_metadata(output, manifest)
+    validate_oracle(spec, manifest, compare_rows)
+    (output / "manifest.json").write_text(canonical_json(manifest))
     print(f"Validated corpus: {output}", flush=True)
 
 
