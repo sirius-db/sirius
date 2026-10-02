@@ -545,7 +545,15 @@ class SiriusContext : public ClientContextState {
   /// \brief The registry itself, for subsystems that hold a long-lived binding to it.
   [[nodiscard]] sirius::data::data_repository_manager_registry& get_data_repository_registry();
 
-  /// \brief The per-query enqueue gate, for tests and for subsystems that consult it directly.
+  enum class query_retirement_mode { completed, cancelled };
+
+  /// Close publication, stop scan producers, and settle this query's asynchronous work.
+  /// Completed queries validate empty queues; cancelled queries discard queued work.
+  /// Called by the query owner, never by a worker holding one of the query's leases.
+  /// Keeps the plan and registries owned until the execution window releases them.
+  void retire_query_work(sirius::query_id_t query_id, query_retirement_mode mode);
+
+  /// \brief The per-query registry used by runtime components and diagnostics.
   [[nodiscard]] sirius::exec::query_lifecycle_registry& get_query_lifecycle_registry() noexcept
   {
     return query_lifecycle_;
@@ -684,21 +692,23 @@ class SiriusContext : public ClientContextState {
                               sirius::query_id_t query_id,
                               std::string_view window_label,
                               std::string_view pool_tag);
-  /// The mandatory per-query cleanup (the former QueryEnd body, order
-  /// preserved). Runs INSIDE the held slot; may throw. Only the mandatory
-  /// steps (query/drain/repositories/scan/task resets) can throw out of it —
-  /// telemetry and logging inside are best-effort and never abort the
-  /// remaining steps. @p query_id selects which query's repositories to drop;
+  /// Retire work and release query state inside the held admission permit; may throw. Only the
+  /// mandatory steps (query/drain/repositories/scan/task resets) can throw out of it — telemetry
+  /// and logging inside are best-effort and never abort the remaining steps. @p query_id selects
+  /// which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
   void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
+  /// Release creator state, plan, repositories and scan providers after work retirement.
+  /// A failure stops release; remaining owners stay registered for the shutdown backstop.
+  void release_query_state(sirius::query_id_t query_id);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
 
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
-  /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
-  /// queued tasks. Each step is separately guarded; neither can throw.
+  /// window will run cleanup. Reuses the normal retirement/release sequence and stops
+  /// at the first failure, retaining any owners whose borrowers are not proven idle.
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;

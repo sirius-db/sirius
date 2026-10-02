@@ -39,12 +39,16 @@ retaining providers and buffers for downstream consumers. This is separate from 
 
 ## Retirement
 
-Logical completion may precede the final callback. Retirement must finish before resources
-are released:
+Logical completion may precede the final callback. `SiriusContext::retire_query_work()` is the
+shared coordinator used by engine completion/error handling, engine destruction and execution
+window cleanup. It keeps ownership intact while settling borrowers. The private
+`release_query_state()` phase runs only after successful retirement, during window cleanup.
+Retirement must finish before resources are released:
 
 1. Close Q's publication/borrow gate and wait for admitted publishers.
 2. Stop Q's scan/prefetch producers, retaining their buffers.
-3. Drain Q's creator, scheduler and executor queues; leave other queries' workers running.
+3. On cancellation, drain Q's creator, scheduler and executor queues. On success, validate
+   empty execution queues and settle workers. Leave other queries' workers running.
 4. Wait for Q's work leases, including in-hand tasks, completion callbacks and spill victims.
 5. Release Q's plan, repositories, scan state and telemetry in dependency order.
 6. Close the registry entry; the surrounding execution scope releases admission.

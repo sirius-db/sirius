@@ -43,3 +43,31 @@ Logs: `/tmp/simplification-1-build.log`, `/tmp/simplification-1-tests.log`, and
 Validation: build and formatting/lint passed; 49 pin/uniqueness/MVCC cases passed
 with 1,045 assertions. Logs: `/tmp/simplification-2-build.log` and
 `/tmp/simplification-2-tests.log`.
+
+## 3. Centralize retirement
+
+- Added `SiriusContext::retire_query_work(query_id, mode)`: close publication and
+  settle publishers, stop scan producers, validate completion or drain cancelled
+  work, then wait for borrowers. Engine success/error/destruction and window
+  cleanup/backstops all use it.
+- Added a private `release_query_state()` phase shared by normal and best-effort
+  cleanup. It runs only after retirement succeeds, releasing creator state, the
+  retained plan, telemetry placements, repositories and scan providers in order.
+- Creator state now remains available until asynchronous work has settled. Engine
+  retirement does not release the retained plan prematurely: post-execution plan
+  inspection and failed-cleanup retention still work.
+- Kept scheduler barriers for standalone users and the final runtime work barrier
+  for partial initialization. No new global mutex or retirement flags were added.
+- Protected scheduler retirement logging so a diagnostic failure cannot abort
+  mandatory cleanup. Successful queries still report unexpectedly queued tasks;
+  they do not silently take the cancellation path.
+- Added integration coverage for both retirement modes, ownership through window
+  close, and repeated retirement before and after registry removal.
+
+Validation: build and formatting/lint passed. The first test selection passed
+73 cases / 1,083 assertions; its one failure was the hidden worker-pressure case
+requiring an unset `SIRIUS_TEST_TPCH_DIR`. Re-running that case with the repository's
+`test/cpp/integration/data/parquet` fixture passed (1 case / 6 assertions).
+Logs: `/tmp/simplification-3-build.log`, `/tmp/simplification-3-tests.log`, and
+`/tmp/simplification-3-pressure-tests.log`. This is regression coverage with the
+bundled fixture, not a throughput qualification.

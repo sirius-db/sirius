@@ -404,36 +404,48 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
+void SiriusContext::retire_query_work(sirius::query_id_t query_id, query_retirement_mode mode)
+{
+  // Publication must settle before producers stop and queues drain. A snapshot check alone
+  // cannot prevent an already-admitted publisher inserting behind a completed drain.
+  query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
+  if (scan_manager_) { scan_manager_->quiesce(query_id); }
+
+  if (task_scheduler_) {
+    if (mode == query_retirement_mode::completed) {
+      task_scheduler_->wait_for_completion(query_id);
+    } else {
+      task_scheduler_->drain_after_error(query_id);
+    }
+  } else if (task_creator_) {
+    // Partial initialization: no scheduler exists, but any creator requests must still retire.
+    task_creator_->drain_pending_tasks(query_id);
+  }
+  // Also covers partial initialization and repository borrowers. Keep the scheduler's own
+  // barriers: standalone callers use that API without the runtime's scan-producer phase.
+  query_lifecycle_.wait_for_work(query_id);
+}
+
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
 {
-  // Observability inside the cleanup is best-effort: only the mandatory steps
-  // (query/drain/repository/scan/task resets) may throw out of this function
-  // and thereby poison the runtime — a logging or telemetry failure must not.
   try {
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }
+  retire_query_work(query_id, query_retirement_mode::cancelled);
+  release_query_state(query_id);
+  try {
+    log_pool_stats(end_tag);
+  } catch (...) {
+  }
+}
 
-  // Close publication and wait for producers that already acquired a submission guard. Only
-  // then may queues be drained: an earlier gate check alone cannot prevent a late insertion.
-  query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
-  if (scan_manager_) { scan_manager_->quiesce(query_id); }
-
-  // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
-  // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
-  // joins that work before returning. Only this query's is touched; other in-flight queries keep
-  // creating tasks.
-  //
-  // The lifecycle control retains the plan until all work and spill borrows have retired.
+void SiriusContext::release_query_state(sirius::query_id_t query_id)
+{
+  // All asynchronous users have retired. Drop creator-held DuckDB scan state before its
+  // plan, and the plan before repositories/providers. Existing readers keep their owners
+  // if a retirement barrier throws; no release phase is entered in that case.
   if (task_creator_) { task_creator_->reset(query_id); }
-
-  // With the producer stopped, drop whatever it already queued for this query, for the same
-  // reason. Other in-flight queries keep their queued work.
-  if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
-
-  // The closed gate prevents new spill victims for this query. Existing repository borrows
-  // and extracted tasks retain work leases; unrelated requests and monitors continue running.
-  query_lifecycle_.wait_for_work(query_id);
   query_lifecycle_.release_resources(query_id);
 
   // Close out batch placements still alive (un-consumed repo contents,
@@ -459,7 +471,7 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     try {
       for (auto const& info : leaked) {
         SIRIUS_LOG_WARN(
-          "SiriusContext::run_mandatory_cleanup: query {} operator {} port '{}' still had {} "
+          "SiriusContext::release_query_state: query {} operator {} port '{}' still had {} "
           "un-consumed data batch(es) (memory leak).",
           query_id,
           info.operator_id,
@@ -475,7 +487,7 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // sliced host_data_representation are gone before the providers go away.
   if (scan_manager_) { scan_manager_->reset(query_id); }
 
-  // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
+  // task_creator_->reset(query_id) already ran before releasing the plan. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
   // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles; leaving it alive
   // past the window would release those handles during ~task_creator at DB teardown (~DBConfig
@@ -484,11 +496,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // Every drain has run; the window is over, so forget the query rather than leaving a tombstone
   // that would grow the map for the life of the process.
   query_lifecycle_.close(query_id);
-
-  try {
-    log_pool_stats(end_tag);
-  } catch (...) {  // best-effort observability
-  }
 }
 
 void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
@@ -523,15 +530,8 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   // Never continue destruction after an unproven retirement. Keep the complete query state
   // registered for shutdown, where all shared workers have been stopped.
   try {
-    query_lifecycle_.quiesce_and_wait_for_submissions(query_id);
-    if (scan_manager_) { scan_manager_->quiesce(query_id); }
-    if (task_scheduler_) { task_scheduler_->drain_after_error(query_id); }
-    if (task_creator_) { task_creator_->reset(query_id); }
-    query_lifecycle_.wait_for_work(query_id);
-    query_lifecycle_.release_resources(query_id);
-    data_repository_registry_.erase(query_id);
-    if (scan_manager_) { scan_manager_->reset(query_id); }
-    query_lifecycle_.close(query_id);
+    retire_query_work(query_id, query_retirement_mode::cancelled);
+    release_query_state(query_id);
   } catch (...) {
     // Health was latched by the caller. Resources remain owned until terminate().
   }

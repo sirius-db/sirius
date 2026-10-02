@@ -133,9 +133,8 @@ sirius_engine::~sirius_engine()
   if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       runtime && runtime->is_initialized()) {
     try {
-      runtime->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
-      runtime->get_scan_manager().quiesce(query_id_);
-      runtime->get_task_scheduler().drain_after_error(query_id_);
+      runtime->retire_query_work(query_id_,
+                                 duckdb::SiriusContext::query_retirement_mode::cancelled);
     } catch (...) {
       // The registry retains the plan if retirement fails. Do not free resources whose
       // borrowers cannot be proved idle; the shutdown path retires them after worker joins.
@@ -261,7 +260,8 @@ void sirius_engine::execute()
     future.get();
     if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
       sirius_ctx->throw_runtime_unavailable();
-    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
+    sirius_ctx->retire_query_work(query_id_,
+                                  duckdb::SiriusContext::query_retirement_mode::completed);
   } catch (const std::exception& e) {
     registry->record_error(query_id_, std::current_exception());
     if (fatal_device_exception(std::current_exception())) {
@@ -270,21 +270,16 @@ void sirius_engine::execute()
     }
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
-    // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
-    // clear_all_repositories() immediately after execute() throws; without
-    // this drain, tasks still running in the thread pool hold raw pointers to
-    // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
-    sirius_ctx->get_scan_manager().quiesce(query_id_);
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    // Retire asynchronous borrowers before the execution window can release repositories.
+    sirius_ctx->retire_query_work(query_id_,
+                                  duckdb::SiriusContext::query_retirement_mode::cancelled);
     throw;
   } catch (...) {
     registry->record_error(query_id_, std::current_exception());
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
-    sirius_ctx->get_query_lifecycle_registry().quiesce_and_wait_for_submissions(query_id_);
-    sirius_ctx->get_scan_manager().quiesce(query_id_);
-    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
+    sirius_ctx->retire_query_work(query_id_,
+                                  duckdb::SiriusContext::query_retirement_mode::cancelled);
     throw;
   }
 

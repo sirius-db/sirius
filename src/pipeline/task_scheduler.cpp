@@ -226,7 +226,11 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
   // Close admission and settle publishers before removing this query's queued work.
   _query_lifecycle.quiesce_and_wait_for_submissions(query_id);
 
-  SIRIUS_LOG_INFO("task_scheduler: draining after error for query {}", query_id);
+  try {
+    SIRIUS_LOG_INFO("task_scheduler: draining after error for query {}", query_id);
+  } catch (...) {
+    // Retirement must continue even if diagnostic logging fails.
+  }
   // Teardown ordering is load-bearing. The executor drains below run in-flight tasks to
   // completion, and a completing task schedules its downstream consumers via
   // task_creator::schedule(). Each such request holds a raw sirius_physical_operator* owned by
@@ -259,7 +263,11 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 
   _query_lifecycle.wait_for_work(query_id);
 
-  SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
+  try {
+    SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
+  } catch (...) {
+    // Retirement must continue even if diagnostic logging fails.
+  }
 }
 
 void task_scheduler::wait_for_completion(sirius::query_id_t query_id)

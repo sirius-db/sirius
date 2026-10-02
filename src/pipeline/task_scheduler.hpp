@@ -199,24 +199,13 @@ class task_scheduler {
   void terminate_query(const std::shared_ptr<completion_handler>& handler,
                        std::exception_ptr error);
 
-  /**
-   * @brief Drain all in-flight tasks after a query error.
-   *
-   * Drains the top-level task queue and waits for each GPU executor to finish
-   * all in-flight thread-pool tasks.  After this call it is safe for QueryEnd
-   * to destroy data repositories without causing a use-after-free in executing
-   * tasks.  Each GPU executor's manager thread is restarted so the executor is
-   * ready for the next query.
-   */
+  /// Close publication, drain this query's queues and wait for its workers/borrowers.
+  /// Shared managers keep serving other queries. Runtime owners first stop scan producers
+  /// through SiriusContext::retire_query_work(); standalone fixtures have no such producers.
   void drain_after_error(sirius::query_id_t query_id);
 
-  /**
-   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
-   * If any tasks are still in flight, an error is logged and an exception is thrown.
-   * This is used to ensure that all tasks have completed before the query returns and tears down
-   * the plan.
-   * @throws std::runtime_error if any tasks are still in flight.
-   */
+  /// Close publication and settle workers while validating successful completion.
+  /// Throws if this query left queued execution tasks; it must not silently discard them.
   void wait_for_completion(sirius::query_id_t query_id);
 
  private:
