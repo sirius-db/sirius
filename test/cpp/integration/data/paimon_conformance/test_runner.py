@@ -9,6 +9,8 @@ import signal
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import subprocess
 
 from run_conformance import (
     ProcessError,
@@ -104,6 +106,53 @@ class ReferenceHarnessTests(unittest.TestCase):
     def test_success_with_matching_diagnostic_is_not_rejection(self):
         with self.assertRaisesRegex(AssertionError, "Expected planning-time rejection"):
             self.rejection_process("sys.exit(0)")
+
+    def test_timeout_preserves_partial_logs(self):
+        for stdout, stderr in [
+            (b"out-marker", b"err-marker"),
+            ("out-marker", "err-marker"),
+            (None, None),
+        ]:
+            with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "timeout"
+                failure = subprocess.TimeoutExpired(
+                    ["fake"], 1, output=stdout, stderr=stderr
+                )
+                with patch(
+                    "run_conformance.subprocess.run", side_effect=failure
+                ), self.assertRaisesRegex(RuntimeError, "timed out"):
+                    execute(["fake"], timeout=1, cwd=tmp, log=log)
+                self.assertEqual(
+                    log.with_suffix(".stdout").read_text(),
+                    "out-marker" if stdout else "",
+                )
+                error = log.with_suffix(".stderr").read_text()
+                self.assertIn("timed out", error)
+                if stderr:
+                    self.assertIn("err-marker", error)
+
+    def test_real_timeout_preserves_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "timeout"
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                execute(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys,time; print('out-marker',flush=True); print('err-marker',file=sys.stderr,flush=True); time.sleep(10)",
+                    ],
+                    timeout=1,
+                    cwd=tmp,
+                    log=log,
+                )
+            self.assertIn("out-marker", log.with_suffix(".stdout").read_text())
+            self.assertIn("err-marker", log.with_suffix(".stderr").read_text())
+
+    def test_invalid_decimal_categories_fail(self):
+        case = {"columns": [["amount", "DECIMAL(12,2)"]], "rows": [["1.00"]]}
+        for value in (True, False, 1.0, "NaN", "Infinity"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                compare_rows(case, [{"amount": value}])
 
     def test_missing_duplicate_fails(self):
         with self.assertRaises(AssertionError):

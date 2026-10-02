@@ -44,7 +44,18 @@ def execute(args, *, timeout, cwd, env=None, log=None):
         )
     except subprocess.TimeoutExpired as error:
         if log:
-            Path(str(log) + ".stderr").write_text(str(error))
+            # TimeoutExpired may carry bytes even when subprocess uses text=True.
+            def text(value):
+                return (
+                    value.decode("utf-8", errors="replace")
+                    if isinstance(value, bytes)
+                    else value or ""
+                )
+
+            Path(str(log) + ".stdout").write_text(text(error.stdout))
+            Path(str(log) + ".stderr").write_text(
+                text(error.stderr) + "\n" + str(error) + "\n"
+            )
         raise RuntimeError(f"Process timed out after {timeout}s: {args[0]}") from error
     if log:
         Path(str(log) + ".stdout").write_text(result.stdout)
@@ -105,9 +116,12 @@ def normalize(value, type_name):
     if value is None:
         return None
     if type_name.startswith("DECIMAL("):
-        if isinstance(value, float):
-            raise ValueError("Binary floating point is not an exact decimal reference")
-        return Decimal(value)
+        if isinstance(value, (float, bool)):
+            raise ValueError("Float/bool is not an exact decimal reference")
+        result = Decimal(value)
+        if not result.is_finite():
+            raise ValueError("Non-finite decimal reference")
+        return result
     if type_name == "BIGINT":
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError(f"Expected integer, got {value!r}")
