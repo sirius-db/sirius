@@ -268,6 +268,7 @@ impl BrpcRuntime {
         executor: Arc<dyn FragmentExecutor>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
+        let server = BrpcServer::with_executor(executor, compute_node);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = tokio::task::spawn_blocking(move || {
@@ -276,8 +277,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor)
-                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+                server.serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });
 

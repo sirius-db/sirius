@@ -1,8 +1,9 @@
-//! Execution of a translated fragment into Arrow result batches.
+//! Execution of a translated fragment.
 //!
-//! The engine→CN result interchange is the Arrow C Data Interface (see the `SiriusExecutor`
-//! TODO). Today a [`StubExecutor`] stands in for the GPU engine so the StarRocks dispatch and
-//! result-return plumbing can be exercised end to end without a build tree or a GPU.
+//! A result fragment returns Arrow batches for `fetch_data`; a sender fragment parks its native
+//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in. A [`StubExecutor`] stands
+//! in for the GPU engine so the StarRocks dispatch and result-return plumbing can be exercised end
+//! to end without a build tree or a GPU.
 
 use std::sync::Arc;
 
@@ -45,11 +46,26 @@ impl FragmentResult {
     }
 }
 
-/// Runs a translated fragment and returns its result batches.
+/// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
+#[derive(Debug)]
+pub struct FragmentRun<'a> {
+    /// Translated plan, including the schema of every exchange lowered to a stream read.
+    pub plan: &'a TranslatedPlan,
+    /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
+    pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
+    pub outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (a broadcast sink).
+    pub broadcast: bool,
+    /// Hash-partition key columns for a hash fan-out (empty otherwise).
+    pub hash_keys: Vec<usize>,
+}
+
+/// Runs a translated fragment, either parking its output for a downstream fragment or returning
+/// its rows.
 ///
-/// This is intentionally a synchronous, fully-materializing seam for the single-fragment
-/// milestone: `exec_plan_fragment` runs it to completion before returning, and `fetch_data` then
-/// drains the buffered rows.
+/// This is intentionally a synchronous, fully-materializing seam: `exec_plan_fragment` runs a
+/// fragment to completion before returning, and `fetch_data` then drains the buffered rows.
 ///
 /// TODO(starrocks-execute): a real GPU executor should not block dispatch on full materialization.
 /// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
@@ -57,8 +73,17 @@ impl FragmentResult {
 /// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
 /// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
-    /// Executes `translated` and returns its Arrow result batches.
+    /// Executes `translated` as a result fragment (no exchange inputs, no output streams).
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+
+    /// Runs one fragment. Returns rows only when `outputs` is empty (a result fragment). The
+    /// default ignores parked inputs and parks nothing, which is enough for the stub.
+    fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        if !run.outputs.is_empty() {
+            return Ok(None);
+        }
+        self.execute(run.plan).map(Some)
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
