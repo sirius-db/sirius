@@ -19,6 +19,7 @@
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -27,6 +28,8 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
+
+#include <algorithm>
 
 namespace sirius {
 namespace op {
@@ -214,8 +217,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
+  bool const has_stddev =
+    std::ranges::any_of(aggregate_slots, [](auto const& slot) { return slot.is_stddev_samp; });
+
   // Fast path: single batch with no post-processing needed
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
+  if (input_batches.size() == 1 && !has_avg && !has_count_distinct && !has_stddev) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -237,7 +243,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct) {
+  if (!has_avg && !has_count_distinct && !has_stddev) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
@@ -288,6 +294,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       }
 
       output_cols.push_back(std::move(avg_col));
+    } else if (slot.is_stddev_samp) {
+      output_cols.push_back(
+        finalize_stddev(merged_cols[num_group_cols + slot.cudf_idx]->view(), stream, mr));
     } else if (slot.is_count_distinct) {
       // The merged column is a LIST column (output of MERGE_SETS). Count elements per row to
       // produce the final distinct count, then cast to INT64.

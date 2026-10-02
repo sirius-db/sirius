@@ -418,9 +418,12 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.grouping_sets.size() > 1) { break; }
       // AVG decomposes into SUM + COUNT_VALID partial columns and COUNT(DISTINCT) keeps a LIST
-      // partial column, so the partial batch layout deviates from the declared `types` shape a
-      // sidecar describes; those shapes keep the native boundary.
-      if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      // partial column; STDDEV_SAMP keeps a count/mean/M2 STRUCT, so the partial batch layout
+      // deviates from the declared `types` shape a sidecar describes; those shapes keep the native
+      // boundary.
+      if (aggregate.has_avg || aggregate.has_count_distinct || aggregate.has_stddev_samp()) {
+        break;
+      }
       // Grouping functions append output columns the operator does not compute through group_idx /
       // aggregate_slots; the arity check rejects that shape along with any other layout drift.
       if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {

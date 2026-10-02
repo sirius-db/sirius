@@ -582,7 +582,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     auto* hgb_ptr = hgb_op.get();
 
     // Construct the merge while the child still carries the final SQL schema. COUNT(DISTINCT)
-    // emits LIST sets locally and only becomes BIGINT after merge post-processing.
+    // emits LIST sets locally and only becomes BIGINT after merge post-processing;
+    // STDDEV_SAMP emits count/mean/M2 STRUCT states and only becomes DOUBLE after merge.
     auto merge = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate_merge>(
       &hgb_ptr->Cast<sirius::op::sirius_physical_grouped_aggregate>(),
       op_params.hash_partition_bytes);
@@ -594,7 +595,9 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
     bool const has_supported_count_distinct_layout =
       grouped.has_count_distinct && !grouped.has_avg && !hgb_ptr->has_physical_overrides() &&
       hgb_ptr->types.size() == grouped.group_idx.size() + grouped.aggregate_slots.size();
-    if (has_supported_count_distinct_layout) {
+    if (grouped.has_stddev_samp()) {
+      hgb_ptr->types = grouped.local_types;
+    } else if (has_supported_count_distinct_layout) {
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();
     }
 
