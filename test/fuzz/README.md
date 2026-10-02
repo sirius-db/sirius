@@ -228,8 +228,7 @@ feature, flip its flag to `true` there. `--set key.path=value` overrides any key
 ## Finding unsupported features
 
 `fuzz run --mode gaps` answers a different question from the default run: not "does the GPU
-get the right answer" but "what does Sirius hand back to the CPU". It differs from the default
-`correctness` mode in three ways:
+get the right answer" but "what does Sirius hand back to the CPU". It changes three things:
 
 - **Everything is generated.** Every feature switch the configuration keeps off because Sirius
   does not run it yet (window functions, `DISTINCT`, grouping sets, `FULL`/`CROSS` joins,
@@ -242,8 +241,28 @@ get the right answer" but "what does Sirius hand back to the CPU". It differs fr
   rejected for the same *kind* of reason, with the rejected expression's function set allowed
   to shrink. Dropping a supported `concat` from an unsupported `regexp_matches(concat(..))`
   therefore keeps going until only the function Sirius cannot translate is left.
-- **Gaps are the output, not a failure.** `--fail-on-findings` ignores gap verdicts in this
-  mode; mismatches, errors, hangs and crashes still fail the run and are reported as usual.
+- **Gaps do not fail the run.** `--fail-on-findings` ignores the two gap verdicts in this mode.
+
+Everything else works as in a correctness run: every query is still compared with the CPU, and a
+query that fails for any other reason is still reported. Where each outcome ends up:
+
+| Outcome | Verdict | In the summary | `--fail-on-findings` |
+|---------|---------|----------------|----------------------|
+| Sirius declined the plan, or the GPU raised an error that says the operation is not supported | `plan_fallback`, `runtime_fallback` | the `gaps` table, reduced to the unsupported feature | ignored |
+| GPU rows differ from CPU rows | `mismatch` | `findings`, reduced as in a correctness run | fails |
+| any other GPU error | `gpu_error`, `gpu_internal_error`, `gpu_oom` | `findings`, reduced as in a correctness run | fails |
+| the GPU run hung, or the worker died | `timeout`, `crash` | `findings` | fails |
+| the query failed on the CPU | `cpu_error`, `cpu_timeout` | skipped and counted; the top reasons are listed | ignored |
+| matches `known_issues.toml` | `known_issue` | `findings`, with the issue link | ignored |
+
+So a bug that only shows up once window functions or `EXCEPT` are generated is not lost: it sits
+in the `findings` section of the same summary with its own replayable bundle, below the gaps.
+
+The line between a gap and an error is the message. A runtime error counts as a gap only when it
+says *not supported*, *unsupported* or *not implemented*; any other GPU error would also fall back
+to the CPU in production, but it looks like a bug rather than a missing feature, so it is listed
+under `findings` with its reason. If one of those turns out to be an unsupported feature phrased
+differently, widen the pattern in `siriusfuzz/classify.py`.
 
 The summary groups gaps by the reason their smallest reproducer reports, so rejections of
 different expressions around the same function merge into one line:
@@ -259,18 +278,17 @@ gaps (3 unsupported features, 212 queries fell back to CPU); smallest query that
   [runtime_fallback] x5  Distinct aggregates not supported in GPU path yet
       SELECT count(DISTINCT "a0"."c1") AS c0 FROM "t2" AS "a0"
       features: Agg(count,distinct), ColumnRef, Select, TableRef   findings: 007-runtime_fallback-2b3c4d5e
+
+findings (1 unique):
+  [mismatch] x1    012-mismatch-7c8d9e0f  row count 41 vs 40
 ```
 
 `summary.json` carries the same table under `gaps`, with every contributing finding directory.
 Each finding keeps its own `reduced.sql` and `reduction.json` (which records the reduced query's
-reason), and replays like any other finding; the gap in a correctness run is the same evidence
+reason), and replays like any other finding; a gap in a correctness run is the same evidence
 without the all-features generation. A query is reported for the first rejection Sirius hits, so
 a long run finds more than a short one; the "features emitted" line in the summary shows how much
 of the generator's surface a run covered.
-
-Other GPU errors (`gpu_error`, `gpu_internal_error`, `gpu_oom`) also fall back to the CPU in
-production, but their messages do not say "unsupported", so they stay findings to investigate
-rather than gaps to record.
 
 ---
 
