@@ -50,6 +50,12 @@ mod compute_node_service;
 mod engine;
 mod file_schema;
 mod fragment_executor;
+// Unused until the CN service and engine dispatch through them.
+#[cfg_attr(not(test), allow(dead_code))]
+mod local_exchange;
+#[cfg(any(test, feature = "sirius-engine"))]
+#[cfg_attr(not(test), allow(dead_code))]
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
