@@ -90,9 +90,12 @@ pub(crate) struct ResultStore {
 
 impl ResultStore {
     /// Reserves the slot of a result fragment that waits on exchange inputs, so `fetch_data`
-    /// waits for its rows instead of reporting an unknown fragment.
+    /// waits for its rows instead of reporting an unknown fragment. A slot that already exists is
+    /// kept, so a repeated dispatch cannot hide rows or a failure behind a fresh wait.
     pub(crate) fn reserve(&self, id: FragmentInstanceId, query: FragmentInstanceId) {
-        self.lock().insert(id, FragmentState::Waiting { query });
+        self.lock()
+            .entry(id)
+            .or_insert(FragmentState::Waiting { query });
     }
 
     /// Buffers an executed fragment's result for later `fetch_data` collection.
@@ -234,6 +237,18 @@ mod tests {
         let poll = std::thread::spawn(move || waiting.take_next(id, Duration::from_secs(5)));
         store.insert(id, batch(&["x"]));
         let outcome = poll.join().unwrap().expect("rows arrived");
+        assert_eq!(outcome.batch.unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn reserve_keeps_an_existing_slot() {
+        let store = ResultStore::default();
+        let id = FragmentInstanceId::from_halves(7, 1);
+        store.insert(id, batch(&["x"]));
+        store.reserve(id, FragmentInstanceId::from_halves(7, 0));
+        let outcome = store
+            .take_next(id, Duration::ZERO)
+            .expect("rows survive a repeated reserve");
         assert_eq!(outcome.batch.unwrap().rows.len(), 1);
     }
 
