@@ -118,6 +118,7 @@ fn translate_expr_node(
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
             reason: "expression node is outside the v1 StarRocks slice",
@@ -483,6 +484,12 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
     })
 }
 
+/// Unwraps a StarRocks `CLONE_EXPR`, which the FE inserts when two slots share one column.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
+}
+
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
 ///
 /// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
@@ -574,6 +581,18 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    // DuckDB returns BIGINT for year/month/day and length/char_length. The FE slot is narrower
+    // (year SMALLINT, month/day TINYINT, length INT). Cast back so the next hop's schema matches.
+    if matches!(name, "year" | "month" | "day" | "length" | "char_length") {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(Expression {
+            rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                r#type: Some(output_type),
+                input: Some(Box::new(scalar_function(anchor, children, produced))),
+                failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+            }))),
+        });
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
