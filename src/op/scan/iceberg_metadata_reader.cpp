@@ -25,6 +25,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <duckdb/common/types/vector.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/transaction/meta_transaction.hpp>
@@ -159,16 +160,13 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
                                        std::string_view injection)
 {
   auto counters = iceberg_counters(context);
-  if (counters) ++counters->iceberg_manifest_walks;
   iceberg_metadata_connection metadata_conn(context);
-  auto& conn = metadata_conn.get();
-  std::string query =
-    "SELECT content, file_path, manifest_sequence_number, file_format, manifest_path "
-    "FROM iceberg_metadata('" +
-    escape_sql_string(table_path) + "'";
+  auto& conn         = metadata_conn.get();
+  std::string source = "iceberg_metadata('" + escape_sql_string(table_path) + "'";
   if (snapshot_id.has_value()) {
-    query += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
+    source += ", snapshot_from_id = " + std::to_string(snapshot_id.value());
   }
+  source += ")";
   // status is the entry's liveness (ADDED / EXISTING / DELETED); a manifest keeps listing entries
   // that later commits retired. Without this filter a delete file that a compaction replaced is
   // read back as live and removes rows the current snapshot keeps.
@@ -176,42 +174,53 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
   // ⚠️ status and content BOTH use the string "EXISTING" for unrelated things: status EXISTING
   // means "carried over from an earlier snapshot", content EXISTING means "this is a DATA file"
   // (which is what kExisting below tests). Do not merge these two tests.
-  query += ") WHERE status <> 'DELETED'";
+  auto const live = source + " WHERE status <> 'DELETED'";
 
   // Injection is latched by the planning attempt, after the original scan bound successfully.
   if (injection == "missing") throw inventory_query_error("", true);
   if (injection == "fail") throw inventory_query_error("injected inventory query failure", false);
-  auto meta_result = conn.Query(query);
+  // One metadata query supplies both the equality count and the admitted
+  // inventory. Retain raw chunks until the count is known; a refusal discards
+  // them without copying their path strings or issuing a second manifest walk.
+  if (counters) ++counters->iceberg_manifest_walks;
+  auto meta_result = conn.SendQuery(
+    "SELECT content::VARCHAR, file_path, manifest_sequence_number, file_format, manifest_path "
+    "FROM " +
+    live);
   if (!meta_result) throw inventory_query_error("", true);
   if (meta_result->HasError()) throw inventory_query_error(meta_result->GetError(), false);
   inventory_result result{iceberg_delete_inventory{}, 0};
-  // The materialized five-column result coexists with the node-owned classification state.
-  uint64_t bytes = sizeof(iceberg_delete_inventory) + meta_result->Collection().AllocationSize();
+  std::vector<duckdb::unique_ptr<duckdb::DataChunk>> chunks;
+  uint64_t bytes      = sizeof(iceberg_delete_inventory);
   uint64_t peak_bytes = bytes;
-  // A refused equality-delete table needs only the count. Scan the already
-  // materialized content column before copying long data-file paths into the
-  // inventory; admitted tables still build the full inventory below.
-  duckdb::ColumnDataScanState count_scan;
-  duckdb::DataChunk content_chunk;
-  auto& collection = meta_result->Collection();
-  collection.InitializeScan(count_scan, std::vector<duckdb::column_t>{0});
-  collection.InitializeScanChunk(count_scan, content_chunk);
-  while (collection.Scan(count_scan, content_chunk)) {
-    for (duckdb::idx_t i = 0; i < content_chunk.size(); ++i) {
-      if (content_chunk.GetValue(0, i).ToString() == "EQUALITY_DELETES") ++result.equality_count;
+  try {
+    while (auto chunk = meta_result->Fetch()) {
+      if (chunk->size() == 0) break;
+      duckdb::UnifiedVectorFormat content;
+      chunk->data[0].ToUnifiedFormat(chunk->size(), content);
+      auto const* values = content.GetData<duckdb::string_t>();
+      for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
+        auto const row = content.sel->get_index(i);
+        if (content.validity.RowIsValid(row) &&
+            std::string_view(values[row].GetDataUnsafe(), values[row].GetSize()) ==
+              "EQUALITY_DELETES")
+          ++result.equality_count;
+      }
+      peak_bytes = std::max(peak_bytes, bytes + chunk->GetAllocationSize());
+      if (result.equality_count) {
+        chunks.clear();
+        bytes = sizeof(iceberg_delete_inventory);
+      } else {
+        bytes += chunk->GetAllocationSize();
+        chunks.push_back(std::move(chunk));
+      }
     }
+  } catch (std::exception const& error) {
+    throw inventory_query_error(error.what(), false);
   }
-  if (result.equality_count) {
-    if (counters) {
-      auto peak = counters->iceberg_inventory_bytes_peak.load();
-      while (peak < peak_bytes &&
-             !counters->iceberg_inventory_bytes_peak.compare_exchange_weak(peak, peak_bytes)) {}
-    }
-    result.inventory.reset();
-    return result;
-  }
-  while (auto chunk = meta_result->Fetch()) {
-    if (chunk->size() == 0) break;
+  if (meta_result->HasError()) throw inventory_query_error(meta_result->GetError(), false);
+  if (result.equality_count) result.inventory.reset();
+  for (auto& chunk : chunks) {
     for (duckdb::idx_t i = 0; i < chunk->size(); ++i) {
       iceberg_delete_inventory::entry row{chunk->GetValue(0, i).ToString(),
                                           chunk->GetValue(1, i).ToString(),
@@ -223,11 +232,12 @@ inventory_result read_delete_inventory(duckdb::ClientContext& context,
       auto old_capacity = result.inventory->entries.capacity();
       result.inventory->entries.push_back(std::move(row));
       auto capacity = result.inventory->entries.capacity();
-      // Capacity accounting also covers the old vector storage during a growing allocation.
-      peak_bytes = std::max(peak_bytes,
+      peak_bytes    = std::max(peak_bytes,
                             bytes + (capacity + (capacity != old_capacity ? old_capacity : 0)) *
                                       sizeof(iceberg_delete_inventory::entry));
     }
+    bytes -= chunk->GetAllocationSize();
+    chunk.reset();
   }
   if (counters) {
     auto peak = counters->iceberg_inventory_bytes_peak.load();

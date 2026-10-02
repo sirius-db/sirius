@@ -2997,7 +2997,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   auto after = sirius::test::get_transparent_execution_stats(*con);
   auto index = static_cast<std::size_t>(sirius::op::scan::verdict_reason::evidence_missing);
   CHECK(after.semantic_declines[index] == before.semantic_declines[index] + 1);
-  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+  CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks);
   CHECK(after.iceberg_dv_manifest_reads == before.iceberg_dv_manifest_reads);
   CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads);
   REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());

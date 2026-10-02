@@ -158,6 +158,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   // registry record without resolving or capturing a candidate read view.
   std::optional<uint64_t> contract_window_id;
   uint64_t contract_finalize_generation = 0;
+  bool host_export_available            = true;
   std::optional<scan::pre_decline> pre_declined;
   std::optional<scan::iceberg_delete_inventory> delete_inventory;
 

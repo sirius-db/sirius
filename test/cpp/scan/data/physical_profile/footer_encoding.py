@@ -1,10 +1,10 @@
-# Test-fixture-only Compact Protocol rewrite: preserve pages and all other footer fields.
-import struct
+"""Test-only Compact Protocol footer edits; preserve every untouched byte."""
 
 
-def rewrite_encoding_lists(data, replacement):
+def _rewrite_fields(data, context, field_number, replacement, include_header=False):
     offset = 0
     edits = []
+    child_context = {(1, 4): 2, (2, 1): 3, (3, 3): 4, (1, 2): 5}
 
     def byte():
         nonlocal offset
@@ -16,13 +16,13 @@ def rewrite_encoding_lists(data, replacement):
         value = 0
         shift = 0
         while True:
-            b = byte()
-            value |= (b & 127) << shift
-            if not b & 128:
+            current = byte()
+            value |= (current & 127) << shift
+            if not current & 128:
                 return value
             shift += 7
 
-    def skip(kind, context, field=False):
+    def skip(kind, child=0, field=False):
         nonlocal offset
         if kind in (1, 2):
             if not field:
@@ -42,37 +42,49 @@ def rewrite_encoding_lists(data, replacement):
             if count == 15:
                 count = varint()
             for _ in range(count):
-                skip(header & 15, context)
+                skip(header & 15, child)
         elif kind == 11:
             count = varint()
             if count:
                 types = byte()
                 for _ in range(count):
-                    skip(types >> 4, 0)
-                    skip(types & 15, 0)
+                    skip(types >> 4)
+                    skip(types & 15)
         elif kind == 12:
-            structure(context)
+            structure(child)
         else:
             raise ValueError(kind)
 
-    def structure(context):
+    def structure(parent):
         field_id = 0
-        while header := byte():
+        while True:
+            start = offset
+            header = byte()
+            if not header:
+                break
             delta = header >> 4
             if delta:
                 field_id += delta
             else:
-                value = varint()
-                field_id = (value >> 1) ^ -(value & 1)
-            start = offset
-            child = {(1, 4): 2, (2, 1): 3, (3, 3): 4}.get((context, field_id), 0)
-            skip(header & 15, child, True)
-            if context == 4 and field_id == 2:
-                edits.append((start, offset))
+                encoded = varint()
+                field_id = (encoded >> 1) ^ -(encoded & 1)
+            value_start = offset
+            skip(header & 15, child_context.get((parent, field_id), 0), True)
+            if parent == context and field_id == field_number:
+                edits.append((start if include_header else value_start, offset))
 
     structure(1)
-    assert offset == len(data)
+    assert offset == len(data) and edits, (offset, len(data), edits)
     for start, end in reversed(edits):
         data = data[:start] + replacement + data[end:]
-    assert edits
     return data
+
+
+def rewrite_encoding_lists(data, replacement):
+    return _rewrite_fields(data, 4, 2, replacement)
+
+
+def remove_raw_logical_annotation(data):
+    # SchemaElement.logicalType is the last field, so removing its header and
+    # value leaves the preceding compact field deltas intact.
+    return _rewrite_fields(data, 5, 10, b"", include_header=True)

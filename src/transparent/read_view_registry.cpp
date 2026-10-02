@@ -687,7 +687,7 @@ std::string format_split_certificates_for_dump(scan_info const& split)
           << " type_mismatch:" << value.type_mismatch
           << " logical_annotation:" << value.logical_annotation
           << " converted_annotation:" << value.converted_annotation << " scale:" << value.scale
-          << " precision:" << value.precision << '}';
+          << " precision:" << value.precision << " checked_chunks:" << value.checked_chunks << '}';
     }
     out << ']';
   }

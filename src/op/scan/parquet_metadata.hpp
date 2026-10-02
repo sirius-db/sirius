@@ -45,12 +45,14 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                    std::size_t footer_byte_len,
-                   parquet_encryption_evidence encryption = {},
-                   std::vector<uint8_t> original_schema   = {},
-                   std::string arrow_schema               = {})
+                   parquet_encryption_evidence encryption            = {},
+                   std::vector<uint8_t> original_schema              = {},
+                   std::string arrow_schema                          = {},
+                   std::vector<uint8_t> original_logical_annotations = {})
     : encryption_evidence(encryption),
       original_schema(std::move(original_schema)),
       arrow_schema(std::move(arrow_schema)),
+      original_logical_annotations(std::move(original_logical_annotations)),
       _file_metadata(std::move(file_metadata)),
       _footer_byte_len(footer_byte_len)
   {
@@ -68,6 +70,9 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
   // Retained before hybrid_scan_reader normalizes REQUIRED fields to OPTIONAL.
   std::vector<uint8_t> const original_schema;
   std::string const arrow_schema;
+  // One byte per raw SchemaElement; distinguishes a real logicalType from a
+  // converted_type annotation synthesized by cuDF during sanitize_schema.
+  std::vector<uint8_t> const original_logical_annotations;
 
  private:
   std::shared_ptr<cudf::io::parquet::FileMetaData const> _file_metadata;

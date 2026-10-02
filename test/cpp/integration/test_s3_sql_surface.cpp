@@ -3476,12 +3476,23 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
   REQUIRE(local_source);
   CHECK_FALSE(local_source->prefers_bulk_io());
   if (bulk) {
-    require_query_ok(fixture.con,
-                     "CALL pin_table(" + directory.file_literal("*.parquet") +
-                       ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    // Give pin_table pristine paths. The ordinary local scan above has warmed
+    // a.parquet and b.parquet, so using those paths would only exercise a
+    // metadata cache hit rather than the pin-first footer producer.
+    for (auto file : {"a.parquet", "b.parquet"}) {
+      std::filesystem::copy_file(directory.path() / file,
+                                 directory.path() / (std::string("pin-") + file));
+    }
+    auto pin_glob    = directory.file_literal("pin-*.parquet");
+    auto cold_source = manager.create_datasource(directory.file("pin-a.parquet"));
+    REQUIRE(cold_source);
+    CHECK(cold_source->metadata() == nullptr);
+    require_query_ok(
+      fixture.con,
+      "CALL pin_table(" + pin_glob + ", name='r2a_d7_pin', format='parquet', tier='parquet')");
+    CHECK(cold_source->metadata() != nullptr);
     auto local_before = sirius::test::get_transparent_execution_stats(fixture.con);
-    auto pinned       = require_query_ok(
-      fixture.con, "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
+    auto pinned = require_query_ok(fixture.con, "SELECT x FROM read_parquet(" + pin_glob + ")");
     auto pinned_rows = collect_rows(*pinned);
     std::sort(pinned_rows.begin(), pinned_rows.end());
     CHECK(pinned_rows == expected);

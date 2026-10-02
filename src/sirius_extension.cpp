@@ -230,7 +230,8 @@ struct cpu_replay_result {
 cpu_replay_result run_internal_cpu_fallback_query(ClientContext& context,
                                                   Connection& connection,
                                                   const string& query,
-                                                  const string& gpu_error = "")
+                                                  const string& gpu_error             = "",
+                                                  duckdb::SiriusContext* test_context = nullptr)
 {
   // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
   // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
@@ -261,6 +262,8 @@ cpu_replay_result run_internal_cpu_fallback_query(ClientContext& context,
                 make_shared_ptr<cpu_replay_policy_validator>(gpu_error, policy_refused));
   absl::Cleanup remove_validator = [&] { states.Remove(validator_key); };
   try {
+    if (test_context && test_context->cpu_replay_query_hook_for_testing)
+      test_context->cpu_replay_query_hook_for_testing();
     auto result = connection.Query(query);
     return {std::move(result), *policy_refused, {}};
   } catch (...) {
@@ -675,7 +678,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
       auto cpu_replay = run_internal_cpu_fallback_query(
-        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage());
+        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
       if (cpu_replay.policy_refused) {
         failure_trace.refused_by =
           sirius::transparent::late_failure_condition::policy_refused_in_replay;

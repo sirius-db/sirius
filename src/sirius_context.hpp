@@ -462,6 +462,7 @@ class SiriusContext : public ClientContextState {
     internal_connection& operator=(const internal_connection&) = delete;
 
     unique_ptr<MaterializedQueryResult> Query(const string& sql);
+    unique_ptr<QueryResult> SendQuery(const string& sql);
 
    private:
     struct implementation;
@@ -480,6 +481,7 @@ class SiriusContext : public ClientContextState {
                                              std::string_view phase,
                                              uint64_t iteration = 0);
   std::function<void()> cpu_replay_hook_for_testing;
+  std::function<void()> cpu_replay_query_hook_for_testing;
   void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.

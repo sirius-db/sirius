@@ -472,7 +472,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   if constexpr (std::is_base_of_v<op::scan::parquet_ingestible_table_info, InfoT>) {
     info->physical_contract          = scan.read_views->entry(scan.contract_id).contract;
     info->physical_contract.profiles = info->profiles;
-    info->bound_types                = info->physical_contract.view->identity->bound_types;
+    info->physical_contract.host_export_available = scan.host_export_available;
+    info->bound_types      = info->physical_contract.view->identity->bound_types;
     info->semantic_columns = scan.read_views->entry(scan.contract_id).eligibility.semantic_columns;
   }
 
