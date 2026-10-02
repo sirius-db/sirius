@@ -322,8 +322,7 @@ impl PlanTranslator {
                         ));
                     };
                     columns.push(
-                        translated
-                            .resolve(SlotKey::new(slot_ref.tuple_id, slot_ref.slot_id))?,
+                        translated.resolve(SlotKey::new(slot_ref.tuple_id, slot_ref.slot_id))?,
                     );
                 }
                 Some(columns)

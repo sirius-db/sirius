@@ -3294,6 +3294,236 @@ fn exchange_translates_to_stream_read() {
     assert_eq!(table.names, vec!["sirius_stream_7"]);
 }
 
+/// A merging exchange is a stream read wrapped in the exchange's sort.
+#[test]
+fn merging_exchange_wraps_stream_read_in_sort() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut exchange = exchange_node(7, vec![0]);
+    exchange.exchange_node.as_mut().unwrap().sort_info = Some(sort_info);
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+    let rel::RelType::Sort(sort) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a sort over the stream read");
+    };
+    let rel::RelType::Read(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the stream read under the sort");
+    };
+}
+
+/// `CLONE_EXPR` is the child expression: the FE uses it to duplicate a slot, not to change type.
+#[test]
+fn clone_expr_is_its_child() {
+    let clone = base_expr_node(
+        TExprNodeType::CLONE_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        1,
+    );
+    let mut nodes = vec![clone];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a root projection");
+    };
+    assert!(matches!(
+        project.expressions[0].rex_type,
+        Some(expression::RexType::Selection(_))
+    ));
+}
+
+/// `year(date)` in a SMALLINT slot is a cast over the BIGINT function, not a bare BIGINT.
+#[test]
+fn year_call_casts_back_to_the_fe_slot_type() {
+    let mut year = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::SMALLINT),
+        1,
+    );
+    year.fn_ = Some(builtin_function(
+        "year",
+        scalar_type(TPrimitiveType::SMALLINT),
+    ));
+    let mut nodes = vec![year];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(desc_table(
+            vec![(0, Some(100))],
+            vec![slot(1, 0, "d", scalar_type(TPrimitiveType::DATE))],
+        )),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a root projection");
+    };
+    let expression::RexType::Cast(cast) = project.expressions[0].rex_type.as_ref().unwrap() else {
+        panic!("expected year() to be cast to the FE slot type");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        cast.input.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected the cast input to be year()");
+    };
+    assert!(function.function_reference > 0);
+}
+
+/// Q14's shape: the aggregate reads a common slot the project does not materialize, so the
+/// project carries it as a trailing column and the aggregate reads it there.
+#[test]
+fn common_slot_read_above_its_project_is_carried() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let varchar = scalar_type(TPrimitiveType::VARCHAR);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(
+        5,
+        arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(1, 0, bigint.clone()),
+            int_literal(1),
+        ),
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(2, 0, varchar.clone()));
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let agg = aggregation_node(
+        2,
+        2,
+        vec![slot_ref(3, 1, varchar.clone())],
+        vec![aggregate_expr(
+            "sum",
+            bigint.clone(),
+            Some(slot_ref(5, 1, bigint.clone())),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None)],
+        vec![
+            slot(1, 0, "id", bigint.clone()),
+            slot(2, 0, "name", varchar.clone()),
+            slot(3, 1, "name", varchar.clone()),
+            slot(6, 2, "name", varchar),
+            slot(7, 2, "total", bigint),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Aggregate(aggregate) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    let project = as_project(aggregate.input.as_ref().unwrap());
+    assert_eq!(project.expressions.len(), 2);
+    assert_eq!(struct_field(&project.expressions[1]), 2);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    let Some(substrait::proto::function_argument::ArgType::Value(argument)) =
+        &measure.arguments[0].arg_type
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(struct_field(argument), 1);
+}
+
+/// A carried column feeding a join would shift the right side's fields, so it is refused.
+#[test]
+fn carried_common_slot_into_a_join_is_rejected() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, bigint.clone()));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(4, slot_ref(1, 0, bigint.clone()));
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![2]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let mut select = base_plan_node(3, TPlanNodeType::SELECT_NODE, 1, vec![2]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(5, 2, bigint.clone()),
+        int_literal(0),
+    )]);
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.row_tuples = vec![2, 1];
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![TEqJoinCondition::new(
+        slot_ref(4, 2, bigint.clone()),
+        slot_ref(1, 1, bigint.clone()),
+        Some(TExprOpcode::EQ),
+    )];
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, Some(100)), (2, None)],
+        vec![
+            slot(1, 0, "a", bigint.clone()),
+            slot(1, 1, "b", bigint.clone()),
+            slot(4, 2, "a", bigint),
+        ],
+    );
+
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            join,
+            select,
+            project,
+            scan_node(0, 0),
+            scan_node(4, 1),
+        ])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected an unsupported plan node, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "common-expr columns carried into a join are not supported"
+    );
+}
+
 /// Partial and merge SUM stay SUM: two-phase GROUP BY re-aggregates partial sums.
 #[test]
 fn two_phase_sum_stays_sum() {
