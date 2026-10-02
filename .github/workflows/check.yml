@@ -28,6 +28,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Test Paimon conformance harness (CPU only)
+        # ubuntu-24.04 supplies Python 3.12; these tests need no native build,
+        # extension download, Paimon dependencies, or GPU.
+        run: |
+          set -o pipefail
+          python3 -m unittest discover \
+            -s test/cpp/integration/data/paimon_conformance \
+            -p 'test_*.py' -v 2>&1 | tee /tmp/paimon-harness.log
+
+      - name: Upload Paimon harness log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paimon-harness-${{ github.run_id }}
+          path: /tmp/paimon-harness.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Test thread sweep harness
         run: |
           set -o pipefail
