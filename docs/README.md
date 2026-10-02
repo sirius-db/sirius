@@ -37,6 +37,17 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
+## Installing a Prebuilt Sirius Release
+
+Getting started? Download one of our prebuilt extensions instead of building from source:
+
+- [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): maintainer-selected build with passing benchmarks.
+- [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): newest successful build of `main`, moves forward automatically
+  - Expect to encounter breaking changes and in-development work
+
+Both include full install instructions in the release notes: installing a matching DuckDB
+version, downloading the right binary for your platform, and a sample query to try it with.
+
 ## Building and Running Sirius
 
 For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
