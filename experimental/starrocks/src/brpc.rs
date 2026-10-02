@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    ComputeNodeConfig,
     compute_node_service::SiriusComputeNodeService,
     fragment_executor::{FragmentExecutor, StubExecutor},
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
@@ -34,14 +35,19 @@ struct BrpcServiceServer<S> {
 impl BrpcServer {
     /// Builds a BRPC server with the placeholder stub executor (no GPU engine).
     pub fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
+        Self::with_executor(Arc::new(StubExecutor), &ComputeNodeConfig::default())
     }
 
     /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
-    /// `SiriusEngine`, or a stub).
-    pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
-        let service =
-            PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(executor));
+    /// `SiriusEngine`, or a stub) for the CN `compute_node` advertises.
+    pub fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        compute_node: &ComputeNodeConfig,
+    ) -> Self {
+        let service = PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(
+            executor,
+            compute_node,
+        ));
         Self {
             inner: BrpcServiceServer::with_service(service),
         }
