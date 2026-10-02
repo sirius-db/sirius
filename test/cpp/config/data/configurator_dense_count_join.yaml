@@ -24,6 +24,10 @@ sirius:
       monitor_period: 10ms
   operator_params:
     enable_dense_count_join: true
+    # The eager aggregation pushdown fires on the same COUNT-grouped-by-join-key
+    # shape and rewrites it before the fusion can match; this test exercises the
+    # fusion itself, so keep the pass out of the way.
+    enable_eager_agg_pushdown: false
   telemetry:
     enable_quent: false
     output_directory: "/tmp/sirius_telemetry_config_test"

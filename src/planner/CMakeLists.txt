@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
-  PRIVATE late_mat_plan_pass.cpp
+  PRIVATE eager_agg_pushdown_plan_pass.cpp
+          late_mat_plan_pass.cpp
           dynamic_filter/build_filter_evidence.cpp
           dynamic_filter/build_key_domain.cpp
           dynamic_filter/dynamic_filter_key_admission.cpp

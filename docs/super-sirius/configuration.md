@@ -111,6 +111,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    enable_eager_agg_pushdown: true       # pre-aggregate one equi-join side below the join
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -535,6 +536,7 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `enable_eager_agg_pushdown` | true | Master switch for eager aggregation pushdown: when a grouped aggregate sits on an equi-join and every aggregate input comes from one side, pre-aggregate that side by its join keys below the join and combine the partials above it. Only provable shapes are rewritten, and planning falls back to the original plan if the rewritten one fails any later stage. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -784,6 +786,22 @@ rejected as unknown, and the old `SET` variables no longer exist.
 The direct DuckDB session overrides are registered only when the process
 explicitly enables Sirius test options; they are not part of the normal user
 surface.
+
+### Eager Aggregation Pushdown
+
+The planner's eager-aggregation-pushdown pass is automatic and enabled by default.
+The kill switch is also settable in YAML under `sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_eager_agg_pushdown` | true | Master switch for eager aggregation pushdown. When off, the pass never fires and plans are built exactly as before. |
+| `eager_agg_pushdown_force` | false | TEST ONLY: bypass the pass's benefit heuristic so an A/B run can measure shapes it declines. The correctness gates always apply. |
+
+See [optimizations.md](optimizations.md) → Eager Aggregation Pushdown for the rewrite
+shape and the full gate list.
+
+`eager_agg_pushdown_force` is registered only when the process explicitly enables Sirius
+test options (`SIRIUS_ENABLE_TEST_OPTIONS=1`); it is not part of the normal user surface.
 
 ### Pinned Tables
 

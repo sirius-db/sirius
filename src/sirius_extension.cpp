@@ -2667,6 +2667,26 @@ static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER to {}", params->enable_dynamic_filter);
 }
 
+static void SetEnableEagerAggPushdown(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                         = lock_operator_params_slot(context);
+  params->enable_eager_agg_pushdown = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_EAGER_AGG_PUSHDOWN to {}",
+                   params->enable_eager_agg_pushdown);
+}
+
+static void SetEagerAggPushdownForce(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                        = lock_operator_params_slot(context);
+  params->eager_agg_pushdown_force = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config EAGER_AGG_PUSHDOWN_FORCE to {}",
+                   params->eager_agg_pushdown_force);
+}
+
 static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2916,6 +2936,24 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  // A/B knob only: it relaxes a cost heuristic, never a correctness gate, so it has no
+  // business on the production surface.
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "eager_agg_pushdown_force",
+                    "bypass the eager-aggregation-pushdown benefit heuristic",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.eager_agg_pushdown_force),
+                    SetEagerAggPushdownForce);
+
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "enable_eager_agg_pushdown",
+                    "Whether to pre-aggregate one side of an equi-join below the join and "
+                    "combine the partials above it (eager aggregation pushdown)",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_eager_agg_pushdown),
+                    SetEnableEagerAggPushdown);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,

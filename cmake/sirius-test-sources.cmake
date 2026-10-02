@@ -57,6 +57,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
+    test/cpp/integration/test_gpu_execution_eager_agg.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
@@ -189,6 +190,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
+    test/cpp/planner/test_eager_agg_pushdown.cpp
     test/cpp/planner/test_build_filter_evidence.cpp
     test/cpp/planner/test_copy_logical_plan.cpp
     test/cpp/planner/test_build_key_domain.cpp

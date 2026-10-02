@@ -8,10 +8,13 @@ This document covers three interconnected topics: translating DuckDB logical pla
 
 The `sirius_physical_plan_generator::create_plan()` method is the entry point. It:
 
-1. Resolves types for each logical operator
-2. Resolves column references via `ColumnBindingResolver`
-3. Dispatches to operator-specific `create_plan()` overloads via a switch on `op.type`
-4. Returns a `sirius_physical_operator` tree
+1. Attempts the eager-aggregation-pushdown rewrite (`try_eager_aggregation_pushdown()`) — a logical-level rewrite, so it runs first, before type and binding resolution
+2. Resolves types for each logical operator
+3. Resolves column references via `ColumnBindingResolver`
+4. Dispatches to operator-specific `create_plan()` overloads via a switch on `op.type`
+5. Returns a `sirius_physical_operator` tree
+
+Steps 2–5 live in `create_plan_stages()`. When step 1 produces a rewritten plan (always a copy — the original is never modified), `create_plan()` runs `create_plan_stages()` for it on a *throwaway* generator and only adopts that generator's state (dynamic-filter channels, delim indexes, CTE tables, dependencies) once every stage succeeded. If any stage throws, planning falls back to `create_plan_stages()` on the untouched original plan on this generator, so the query behaves exactly as if the pass had not run. See [optimizations.md](optimizations.md) → Eager Aggregation Pushdown.
 
 ### Operator Mapping Table
 

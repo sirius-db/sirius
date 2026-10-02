@@ -94,7 +94,9 @@ class sirius_physical_plan_generator {
 
  public:
   //! Creates a plan from the logical operator. This involves resolving column bindings and
-  //! generating physical operator nodes.
+  //! generating physical operator nodes. Attempts the eager-aggregation-pushdown logical
+  //! rewrite first; if the rewritten copy fails any later planning stage, planning is retried
+  //! with the untouched original plan (fail closed).
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::unique_ptr<duckdb::LogicalOperator> logical);
 
@@ -111,6 +113,17 @@ class sirius_physical_plan_generator {
     sirius::op::sirius_physical_operator& op);
 
  protected:
+  //! The actual planning stages (type resolution, column binding, physical operator
+  //! generation, plan passes). create_plan() runs these on the eager-agg-rewritten copy
+  //! first — on a throwaway generator, since the stages are not idempotent — and again on
+  //! the original plan, on this generator, if that attempt throws.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan_stages(
+    duckdb::unique_ptr<duckdb::LogicalOperator> logical);
+
+  //! Take over the planning state (dynamic-filter channels, CTE tables, dependencies, delim
+  //! indexes) accumulated by a throwaway generator whose create_plan_stages succeeded.
+  void adopt_state_from(sirius_physical_plan_generator& other);
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
