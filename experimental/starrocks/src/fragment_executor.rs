@@ -1,9 +1,9 @@
 //! Execution of a translated fragment.
 //!
 //! A result fragment returns Arrow batches for `fetch_data`; a sender fragment parks its native
-//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in. A [`StubExecutor`] stands
-//! in for the GPU engine so the StarRocks dispatch and result-return plumbing can be exercised end
-//! to end without a build tree or a GPU.
+//! GPU output under [`SenderSlot`]s for a same-CN receiver to relay in, or for the NIXL transport
+//! to export to a remote one. A [`StubExecutor`] stands in for the GPU engine so the StarRocks
+//! dispatch and result-return plumbing can be exercised end to end without a build tree or a GPU.
 
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::local_exchange::RemoteBatch;
 use crate::result_store::FragmentInstanceId;
 
 /// Where one sender fragment's output is parked until its receiver runs.
@@ -25,6 +26,18 @@ pub struct SenderSlot {
     pub(crate) node_id: i32,
     /// Sender ordinal within that exchange's sender set.
     pub(crate) sender_id: i32,
+}
+
+/// One parked batch exported for a direct exchange: its buffers stay valid until `token` is
+/// released on this CN's direct exchange.
+#[derive(Debug)]
+pub struct ExportedBatch {
+    pub token: u64,
+    pub rows: u64,
+    /// What the receiver allocates matching buffers from.
+    pub layout: Vec<u8>,
+    /// `(address, length)` of each buffer.
+    pub src: Vec<(u64, u64)>,
 }
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -53,6 +66,8 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Batches remote senders wrote into this CN, as `(exchange node id, sender id, batches)`.
+    pub remote_inputs: Vec<(i32, i32, Vec<RemoteBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     pub outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (a broadcast sink).
@@ -83,6 +98,19 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
             return Ok(None);
         }
         self.execute(run.plan).map(Some)
+    }
+
+    /// Exports the next batch parked under `slot` for a direct exchange; `None` once drained.
+    fn export_direct_next(&self, slot: SenderSlot) -> Result<Option<ExportedBatch>, String> {
+        Err(format!(
+            "this executor cannot export the output parked under {slot:?}"
+        ))
+    }
+
+    /// Drops one destination's claim on parked output, which is freed with the last claim. The
+    /// default parks nothing, so there is nothing to drop.
+    fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
+        Ok(())
     }
 }
 

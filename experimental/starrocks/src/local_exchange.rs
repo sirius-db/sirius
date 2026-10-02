@@ -23,14 +23,12 @@ pub(crate) struct ExchangeKey {
 }
 
 /// One batch a remote sender delivered into this CN's memory.
-// Fed by the cross-node transport, which this build does not have yet.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteBatch {
+pub struct RemoteBatch {
     /// Names the receive allocation holding the batch.
-    pub(crate) token: u64,
+    pub token: u64,
     /// Exact row count, for the receiver's declared input cardinality.
-    pub(crate) rows: u64,
+    pub rows: u64,
 }
 
 /// One sender's output, and where it sits.
@@ -164,7 +162,6 @@ impl LocalExchange {
     }
 
     /// Records one frame from a remote sender: a batch, eos, or both.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_remote_frame(
         &self,
         key: ExchangeKey,
