@@ -38,20 +38,21 @@ class ReferenceHarnessTests(unittest.TestCase):
             [{"extension_version": extension["version"]}],
             [{"version": extension["duckdb_version"]}],
             [{"gpu": False}],
+            [{"column_name": "id", "column_type": "BIGINT"}],
             *documents,
             [{"probe": "LIVENESS_OK"}],
         ]
-        return "\n".join(json.dumps(r) for r in results), extension
+        return "\n".join(json.dumps(r) for r in results), extension, [["id", "BIGINT"]]
 
     def test_explicit_empty_query_result_passes(self):
         self.assertEqual(query_result(*self.query_output([[]])), [])
 
     def test_missing_query_result_fails(self):
-        with self.assertRaisesRegex(AssertionError, "exactly five SQL results"):
+        with self.assertRaisesRegex(AssertionError, "exactly six SQL results"):
             query_result(*self.query_output([]))
 
     def test_extra_query_result_fails(self):
-        with self.assertRaisesRegex(AssertionError, "exactly five SQL results"):
+        with self.assertRaisesRegex(AssertionError, "exactly six SQL results"):
             query_result(*self.query_output([[], []]))
 
     def test_nonempty_query_result_passes(self):
@@ -59,12 +60,14 @@ class ReferenceHarnessTests(unittest.TestCase):
         self.assertEqual(query_result(*self.query_output([rows])), rows)
 
     def test_query_identity_and_liveness_are_checked(self):
-        output, extension = self.query_output([[]])
-        for index in (0, 1, 2, 4):
+        output, extension, columns = self.query_output([[]])
+        for index in (0, 1, 2, 3, 5):
             with self.subTest(index=index), self.assertRaises(AssertionError):
                 results = json.loads("[" + output.replace("\n", ",") + "]")
                 results[index] = []
-                query_result("\n".join(json.dumps(r) for r in results), extension)
+                query_result(
+                    "\n".join(json.dumps(r) for r in results), extension, columns
+                )
 
     def rejection_process(self, ending, diagnostic=None):
         if diagnostic is None:

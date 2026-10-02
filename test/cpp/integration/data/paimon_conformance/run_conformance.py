@@ -6,10 +6,12 @@ from collections import Counter
 from decimal import Decimal
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import traceback
 
 from corpus_checks import (
     digest,
@@ -85,23 +87,27 @@ def decode_results(output):
     return results
 
 
-def query_result(output, extension):
-    """Require an explicit result document, including [] for zero rows."""
+def query_result(output, extension, columns, mode="cpu"):
+    """Check the complete six-document protocol, including explicit empty rows."""
     results = decode_results(output)
-    if len(results) != 5:
+    if len(results) != 6:
         raise AssertionError(
-            "Expected exactly five SQL results: extension, version, CPU setting, "
-            f"query, and liveness; got {len(results)}"
+            "Expected exactly six SQL results: extension, version, GPU setting, "
+            f"types, query, and liveness; got {len(results)}"
         )
     if results[0] != [{"extension_version": extension["version"]}]:
         raise AssertionError("Loaded extension version differs from qualified artifact")
     if results[1] != [{"version": extension["duckdb_version"]}]:
         raise AssertionError("Unexpected DuckDB version")
-    if results[2] != [{"gpu": False}]:
-        raise AssertionError("CPU setup was not verified")
-    if results[4] != [{"probe": "LIVENESS_OK"}]:
+    enabled = mode == "transparent"
+    if results[2] != [{"gpu": enabled}] or results[2][0]["gpu"] is not enabled:
+        raise AssertionError("GPU execution setting was not verified")
+    if results[5] != [{"probe": "LIVENESS_OK"}]:
         raise AssertionError("Second query on the same connection did not complete")
-    return results[3]
+    observed = [[row["column_name"], row["column_type"]] for row in results[3]]
+    if observed != columns:
+        raise AssertionError(f"Expected types {columns}, observed {observed}")
+    return results[4]
 
 
 def expect_planning_rejection(action):
@@ -166,7 +172,13 @@ def compare_rows(case, actual):
 
 def select_cases(cases, requested):
     ids = [c["id"] for c in cases]
-    if not cases or len(set(ids)) != len(ids):
+    if (
+        not cases
+        or any(
+            not isinstance(i, str) or not re.fullmatch(r"[a-zA-Z0-9_]+", i) for i in ids
+        )
+        or len(set(ids)) != len(ids)
+    ):
         raise ValueError("Expected a nonempty case list with unique IDs")
     unknown = set(requested) - set(ids)
     if unknown:
@@ -183,31 +195,7 @@ def scan_sql(path, snapshot):
     return f"paimon_scan({argument})"
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("corpus", type=Path, nargs="?", default=HERE)
-    parser.add_argument("--duckdb", type=Path, default=ROOT / "build/release/duckdb")
-    parser.add_argument("--paimon-extension", type=Path, required=True)
-    parser.add_argument("--timeout", type=int, default=90)
-    parser.add_argument("--case", action="append", default=[])
-    args = parser.parse_args()
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
-    corpus = args.corpus.resolve()
-    spec = json.loads((corpus / "expectations.json").read_text())
-    cases = select_cases(spec["cases"], args.case)
-    manifest = json.loads((corpus / "manifest.json").read_text())
-    extension = args.paimon_extension.resolve(strict=True)
-    cli = args.duckdb.resolve(strict=True)
-    if digest(extension) != spec["extension"]["sha256"]:
-        raise ValueError(
-            "Unqualified Paimon artifact: expected the version and SHA256 in expectations.json"
-        )
-    validate_inventory(corpus, manifest)
-    validate_table_metadata(corpus, manifest)
-    validate_oracle(spec, manifest, compare_rows)
-    WORK.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=WORK))
+def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report):
     config = run_dir / "sirius.yaml"
     config.write_text(
         """sirius:
@@ -219,31 +207,19 @@ def main():
   telemetry: {enable_quent: false}
 """
     )
-    report = {
-        "state": "running",
-        "corpus": str(corpus),
-        "expected_sha256": digest(corpus / "expectations.json"),
-        "manifest_sha256": digest(corpus / "manifest.json"),
-        "duckdb": {"path": str(cli), "sha256": digest(cli)},
-        "extension": spec["extension"],
-        "planned_cases": len(cases) * 2 + 3,
-        "cases": [],
-    }
-    print(f"Report directory: {run_dir}", flush=True)
 
     def command(sql, mode, label, *, rejection=False):
         env = os.environ.copy()
-        env.update(SIRIUS_CONFIG_FILE=str(config), TZ="UTC")
+        env.update(SIRIUS_CONFIG_FILE=str(config), TZ="UTC", SIRIUS_LOG_LEVEL="warn")
         env["SIRIUS_DISABLE"] = "1" if mode == "disabled" else "0"
+        enabled = "true" if mode == "transparent" else "false"
         setup = (
             "SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
-            f"LOAD {sql_literal(extension)}; SET gpu_execution=false;"
+            f"LOAD {sql_literal(extension)}; SET gpu_execution={enabled};"
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='paimon';"
             "SELECT version() AS version;"
             "SELECT current_setting('gpu_execution') AS gpu;"
         )
-        if mode == "transparent":
-            setup += "SET gpu_execution=true;"
         if rejection:
             setup += "SET enable_duckdb_fallback=false;"
         return execute(
@@ -264,21 +240,32 @@ def main():
             log=run_dir / label,
         )
 
-    def query(sql, mode, label):
-        return query_result(
-            command(sql + "; SELECT 'LIVENESS_OK' AS probe;", mode, label),
-            spec["extension"],
+    def query(case, sql, mode, label, setup=""):
+        output = command(
+            setup + "DESCRIBE " + sql + ";" + sql + "; SELECT 'LIVENESS_OK' AS probe;",
+            mode,
+            label,
+        )
+        compare_rows(
+            case, query_result(output, spec["extension"], case["columns"], mode)
         )
 
-    def record(case_id, mode, action, **metadata):
-        item = {"id": case_id, "mode": mode, **metadata}
+    def record(case_id, mode, action):
+        item = next(
+            i for i in report["cases"] if i["id"] == case_id and i["mode"] == mode
+        )
         try:
-            action()
-            item["passed"] = True
-        except (RuntimeError, OSError, ValueError, AssertionError) as error:
-            item.update(passed=False, error=str(error))
-        report["cases"].append(item)
-        print(f"{mode}/{case_id}: {'PASS' if item['passed'] else 'FAIL'}", flush=True)
+            action(item)
+            item.update(state="PASS", passed=True)
+        except Exception as error:
+            item.update(
+                state="FAIL",
+                passed=False,
+                error=str(error),
+                error_type=type(error).__name__,
+                traceback=traceback.format_exc(),
+            )
+        print(f"{mode}/{case_id}: {item['state']}", flush=True)
 
     def case_sql(case):
         table = manifest["tables"][case["table"]]
@@ -288,59 +275,128 @@ def main():
             snapshot,
         )
 
-    try:
-        for mode in ("disabled", "cpu"):
-            for case in cases:
+    for mode in ("disabled", "cpu"):
+        for case in cases:
+
+            def check(item, case=case, mode=mode):
                 sql, snapshot = case_sql(case)
+                item["snapshot_id"] = snapshot
+                query(case, sql, mode, mode + "-" + case["id"])
 
-                def check(case=case, sql=sql, mode=mode):
-                    label = mode + "-" + case["id"]
-                    desc = query("DESCRIBE " + sql, mode, label + "-types")
-                    columns = [[r["column_name"], r["column_type"]] for r in desc]
-                    if columns != case["columns"]:
-                        raise AssertionError(
-                            f"Expected {case['columns']}, observed {columns}"
-                        )
-                    compare_rows(case, query(sql, mode, label))
+            record(case["id"], mode, check)
 
-                record(case["id"], mode, check, snapshot_id=snapshot)
+    def transparent(item):
+        case = next(c for c in spec["cases"] if c["id"] == "append_b")
+        sql, item["snapshot_id"] = case_sql(case)
+        query(case, sql, "transparent", "transparent")
 
-        smoke = next(c for c in spec["cases"] if c["id"] == "append_b")
-        smoke_sql, _ = case_sql(smoke)
-        record(
-            "rows_and_liveness",
-            "transparent",
-            lambda: compare_rows(smoke, query(smoke_sql, "transparent", "transparent")),
+    record("rows_and_liveness", "transparent", transparent)
+
+    def rejected(item):
+        case = next(c for c in spec["cases"] if c["id"] == "append_b")
+        sql, item["snapshot_id"] = case_sql(case)
+        expect_planning_rejection(
+            lambda: command(sql, "transparent", "rejection", rejection=True)
         )
 
-        def rejected():
-            expect_planning_rejection(
-                lambda: command(smoke_sql, "transparent", "rejection", rejection=True)
+    record("planning_rejection", "transparent", rejected)
+
+    def attached(item):
+        case = next(c for c in spec["cases"] if c["id"] == "pk_d")
+        setup = (
+            f"ATTACH {sql_literal(corpus / 'warehouse')} AS p (TYPE paimon, READ_ONLY);"
+        )
+        query(
+            case,
+            "SELECT id, amount FROM p.reference.orders_pk",
+            "cpu",
+            "attached",
+            setup,
+        )
+
+    record("attached_catalog", "cpu", attached)
+
+    validate_inventory(corpus, manifest)
+    if any(c["state"] != "PASS" for c in report["cases"]):
+        raise RuntimeError("Conformance failures: inspect per-case errors and logs")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("corpus", type=Path, nargs="?", default=HERE)
+    parser.add_argument("--duckdb", type=Path, default=ROOT / "build/release/duckdb")
+    parser.add_argument("--paimon-extension", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=WORK,
+        help="Parent directory for reports (outside the corpus)",
+    )
+    parser.add_argument("--timeout", type=int, default=90)
+    parser.add_argument("--case", action="append", default=[])
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    corpus = args.corpus.resolve()
+    output = args.output.resolve()
+    if output.is_relative_to(corpus):
+        parser.error("--output must be outside the corpus")
+    output.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=output))
+    report = {
+        "state": "running",
+        "corpus": str(corpus),
+        "cases": [],
+        "requested_cases": args.case,
+        "planned_cases": None,
+    }
+    print(f"Report directory: {run_dir}", flush=True)
+    try:
+        spec = json.loads((corpus / "expectations.json").read_text())
+        cases = select_cases(spec["cases"], args.case)
+        report["cases"] = [
+            {"id": c["id"], "mode": mode, "state": "NOT RUN"}
+            for mode in ("disabled", "cpu")
+            for c in cases
+        ]
+        report["cases"] += [
+            {"id": case_id, "mode": mode, "state": "NOT RUN"}
+            for case_id, mode in (
+                ("rows_and_liveness", "transparent"),
+                ("planning_rejection", "transparent"),
+                ("attached_catalog", "cpu"),
             )
-
-        record("planning_rejection", "transparent", rejected)
-
-        def attached():
-            sql = (
-                f"ATTACH {sql_literal(corpus / 'warehouse')} AS p (TYPE paimon, READ_ONLY);"
-                "SELECT id, amount FROM p.reference.orders_pk"
-            )
-            case = next(c for c in spec["cases"] if c["id"] == "pk_d")
-            compare_rows(case, query(sql, "cpu", "attached"))
-
-        record("attached_catalog", "cpu", attached)
-        if any(not case["passed"] for case in report["cases"]):
-            raise RuntimeError("Conformance failures: inspect per-case errors and logs")
-        if len(report["cases"]) != report["planned_cases"]:
-            raise RuntimeError("Incomplete case execution")
+        ]
+        report["planned_cases"] = len(report["cases"])
+        manifest = json.loads((corpus / "manifest.json").read_text())
+        if manifest["format_version"] != 2 or not isinstance(manifest["tables"], dict):
+            raise ValueError("Expected corpus manifest format 2")
+        report.update(
+            expected_sha256=digest(corpus / "expectations.json"),
+            manifest_sha256=digest(corpus / "manifest.json"),
+        )
         validate_inventory(corpus, manifest)
+        validate_table_metadata(corpus, manifest)
+        validate_oracle(spec, manifest, compare_rows)
+        extension = args.paimon_extension.resolve(strict=True)
+        cli = args.duckdb.resolve(strict=True)
+        report.update(
+            duckdb={"path": str(cli), "sha256": digest(cli)},
+            extension=spec["extension"],
+        )
+        if digest(extension) != spec["extension"]["sha256"]:
+            raise ValueError(
+                "Unqualified Paimon artifact: expected the version and SHA256 in expectations.json"
+            )
+        run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report)
         report["state"] = "passed"
-    except Exception as error:
-        report.update(state="failed", error=str(error))
+    except BaseException as error:
+        report.update(state="failed", error=str(error), error_type=type(error).__name__)
         raise
     finally:
-        report["executed_cases"] = len(report["cases"])
-        report["failed_cases"] = sum(not c["passed"] for c in report["cases"])
+        report["executed_cases"] = sum(c["state"] != "NOT RUN" for c in report["cases"])
+        report["failed_cases"] = sum(c["state"] == "FAIL" for c in report["cases"])
+        report["not_run_cases"] = sum(c["state"] == "NOT RUN" for c in report["cases"])
         (run_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"Report: {run_dir / 'report.json'}", flush=True)
 
