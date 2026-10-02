@@ -364,11 +364,11 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       auto const& col  = input_table.column(aggregate_col_id - widened_sum_key_offset);
       auto widened_col = cudf::cast(
         col, *widened_decimal_sum_type(col.type()), stream, memory_space.get_default_allocator());
-      request.values = widened_col->view();
-  auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
-  // The widened/struct inputs are only needed by aggregate(); `requests[i].values` is not read
-  // again, so release them before the output-side allocations below.
-  temp_struct_cols.clear();
+      request.values      = widened_col->view();
+      auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
+      // The widened/struct inputs are only needed by aggregate(); `requests[i].values` is not read
+      // again, so release them before the output-side allocations below.
+      temp_struct_cols.clear();
     } else {
       request.values = input_table.column(aggregate_col_id);
     }
