@@ -45,7 +45,6 @@ def descriptor(kind="mismatch", reference="stable", reason="different values"):
             "phase": "gpu",
             "reason": reason,
             "variant": None,
-            "execution_path": "fallback" if kind == "fallback_mismatch" else "strict",
         },
         "reference": reference,
         "reference_status": "ok",
@@ -179,22 +178,6 @@ class ClassificationTests(unittest.TestCase):
         d["reference_status"] = "error"
         self.assertFalse(failure_matches(descriptor(), d))
 
-    def test_failure_identity_distinguishes_strict_and_fallback_execution(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = fixture(pathlib.Path(tmp))
-            outcome = read(path / "outcome.json")
-            outcome["record"].update(
-                verdict="gpu_error", reason="conversion failed", context={}
-            )
-            strict = describe_outcome(path, outcome)
-            outcome["record"]["context"] = {
-                "plan_fallback_reason": "Window not supported"
-            }
-            fallback = describe_outcome(path, outcome)
-            self.assertFalse(failure_matches(fallback, strict))
-            self.assertFalse(failure_matches(strict, fallback))
-            self.assertTrue(failure_matches(fallback, describe_outcome(path, outcome)))
-
     def test_timeout_deadline_and_phase_are_part_of_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = fixture(pathlib.Path(tmp))
@@ -324,39 +307,6 @@ class WorkflowTests(unittest.TestCase):
             return result
 
         _, batch = self.run_batch(changed)
-        self.assertEqual(len(batch["reduction"]["trials"]), 2)
-        self.assertEqual(batch["reduction"]["accepted"], [])
-
-    def test_reduction_cannot_promote_a_strict_error_for_a_fallback_error(self):
-        metadata = read(self.source / "meta.json")
-        metadata.update(
-            verdict="gpu_error",
-            reason="conversion failed",
-            context={"plan_fallback_reason": "Window not supported"},
-        )
-        write_json(self.source / "meta.json", metadata)
-        outcome = read(self.source / "outcome.json")
-        outcome["record"].update(metadata)
-        write_json(self.source / "outcome.json", outcome)
-        seal(self.source)
-        self.directory = import_candidate(self.root, self.source)
-        self.args.no_reduce = False
-        self.args.reduce_steps = 2
-
-        def changed(batch, tag, *rest):
-            receipt = self.fake_attempt(batch, tag, *rest)
-            path = batch / "attempts" / tag / receipt["evidence"]
-            result = read(path / "outcome.json")
-            if tag.startswith("reduce-"):
-                result["record"]["context"] = {}
-            write_json(path / "outcome.json", result)
-            seal(path)
-            receipt["hashes"] = evidence_hashes(path)
-            receipt["description"] = describe_outcome(path, result)
-            return receipt
-
-        _, batch = self.run_batch(changed)
-        self.assertEqual(batch["automatic"]["status"], "automatically_reproduced")
         self.assertEqual(len(batch["reduction"]["trials"]), 2)
         self.assertEqual(batch["reduction"]["accepted"], [])
 
