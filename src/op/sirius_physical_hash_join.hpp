@@ -318,6 +318,40 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
+  /**
+   * @brief Whether this join accumulates Bloom filters from a multi-partition build.
+   */
+  [[nodiscard]] bool accumulates_dynamic_filters() const noexcept
+  {
+    return _dynamic_filter_session.plan().multi_partition_enabled();
+  }
+
+  /**
+   * @brief Starts accumulation for the build PARTITION; see
+   * `dynamic_filter_publication_session::try_begin_accumulation`.
+   */
+  bool begin_dynamic_filter_accumulation(
+    std::optional<complete_build_inventory> inventory) noexcept;
+
+  /**
+   * @brief Contributes one build batch; see `dynamic_filter_publication_session::contribute`.
+   *
+   * @return The session's job wrapped as after-task work, or empty work
+   */
+  [[nodiscard]] parallel::after_task_work contribute_dynamic_filter(
+    std::uint64_t original_id,
+    cucascade::read_only_data_batch const& source,
+    ::cuda::stream_ref stream) noexcept;
+
+  /**
+   * @brief Ends accumulation without a filter; see
+   * `dynamic_filter_publication_session::decline_accumulation`.
+   *
+   * @return The session's settle job wrapped as after-task work, or empty work
+   */
+  [[nodiscard]] parallel::after_task_work decline_dynamic_filter_accumulation(
+    accumulation_decline reason) noexcept;
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);

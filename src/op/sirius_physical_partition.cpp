@@ -29,6 +29,7 @@
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "parallel/after_task_work.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -36,7 +37,11 @@
 #include "telemetry/nvtx.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <mutex>
+#include <new>
+#include <optional>
+#include <string_view>
 
 namespace sirius {
 namespace op {
@@ -725,7 +730,122 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         strategy.placement.to_string());
     }
   }
+  // Decided before any batch leaves the input repository, so the ledger still matches it.
+  if (!decide_accumulation()) { return nullptr; }
   return sirius_physical_operator::get_next_task_input_data();
+}
+
+parallel::after_task_work sirius_physical_partition::observe_task_input(operator_data const& input,
+                                                                        ::cuda::stream_ref stream)
+{
+  auto* join = accumulated_filter_join();
+  if (join == nullptr) { return {}; }
+  auto const* data = dynamic_cast<pipelineable_operator_data const*>(&input);
+  if (!port_directive().empty() || data == nullptr || data->original_batch_ids().size() != 1 ||
+      data->get_data_batches().size() != 1) {
+    return join->decline_dynamic_filter_accumulation(
+      accumulation_decline::CONTRIBUTION_UNACCOUNTABLE);
+  }
+  try {
+    auto const batches = data->get_read_only_batches();
+    return join->contribute_dynamic_filter(
+      data->original_batch_ids().front(), batches.front(), stream);
+  } catch (std::bad_alloc const&) {
+    return join->decline_dynamic_filter_accumulation(
+      accumulation_decline::CONTRIBUTION_UNACCOUNTABLE);
+  } catch (std::exception const& e) {
+    // The read serves only the optional filter, so its failure ends the accumulation, not the task.
+    auto work = join->decline_dynamic_filter_accumulation(accumulation_decline::INPUT_UNREADABLE);
+    try {
+      SIRIUS_LOG_WARN(
+        "sirius_physical_partition id {} cannot read its task input for the accumulated Bloom: {}",
+        get_operator_id(),
+        e.what());
+    } catch (...) {  // The decline stands without its log line.
+    }
+    return work;
+  }
+}
+
+void sirius_physical_partition::on_input_batch_pushed(std::string_view port_id,
+                                                      ::cucascade::data_batch& batch)
+{
+  if (port_id != "default" || !_is_build || _partition_type != PartitionType::HASH) { return; }
+  auto const* port = try_get_port(port_id);
+  auto const* join = dynamic_cast<sirius_physical_hash_join const*>(_downstream_consumer_op);
+  // clang-format off
+  if (port == nullptr ||
+      port->type != MemoryBarrierType::FULL ||
+      join == nullptr ||
+      !join->accumulates_dynamic_filters()) {
+    // clang-format on
+    return;
+  }
+  _arrival_ledger.record(batch);
+}
+
+sirius_physical_hash_join* sirius_physical_partition::accumulated_filter_join() const noexcept
+{
+  // clang-format off
+  if (!_is_build ||
+      _partition_type != PartitionType::HASH ||
+      _broadcast ||
+      !_num_partitions ||
+      *_num_partitions <= 1 ||
+      _partition_keys.empty()) {
+    // clang-format on
+    return nullptr;
+  }
+  auto* join = dynamic_cast<sirius_physical_hash_join*>(_downstream_consumer_op);
+  return join != nullptr && join->accumulates_dynamic_filters() ? join : nullptr;
+}
+
+bool sirius_physical_partition::decide_accumulation()
+{
+  std::scoped_lock guard(_accumulation_mutex);
+  if (_accumulation_decided) { return true; }
+  auto* join = accumulated_filter_join();
+  if (join == nullptr) {
+    _arrival_ledger.abandon();
+    _accumulation_decided = true;
+    return true;
+  }
+  auto const decline = [&](std::string_view reason) {
+    _arrival_ledger.abandon();
+    (void)join->begin_dynamic_filter_accumulation(std::nullopt);
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_partition] partition (id={}) has no accumulated dynamic filter: {}.",
+      get_operator_id(),
+      reason);
+    _accumulation_decided = true;
+    return true;
+  };
+  port const* input      = nullptr;
+  std::size_t data_ports = 0;
+  for (auto const& candidate : _ports_list) {
+    if (candidate->repo != nullptr) {
+      ++data_ports;
+      input = candidate.get();
+    }
+  }
+  if (data_ports != 1 || try_get_port("default") != input || input->repo->num_partitions() != 1) {
+    return decline("the build input is not one single-partition default port");
+  }
+  if (input->type != MemoryBarrierType::FULL) {
+    return decline("the build input is not a FULL barrier");
+  }
+  if (!input->src_pipeline) { return decline("the build input has no source pipeline"); }
+  if (!input->src_pipeline->is_pipeline_finished()) { return false; }
+  auto inventory =
+    _arrival_ledger.certify({.repository_batches = input->repo->size(0),
+                             .partition_count    = static_cast<std::size_t>(*_num_partitions)});
+  if (!inventory) { return decline("the arrival ledger does not match the build input"); }
+  if (!join->begin_dynamic_filter_accumulation(std::move(inventory))) {
+    // No filter can be published, so a later arrival must not fail the query.
+    _arrival_ledger.abandon();
+  }
+  _accumulation_decided = true;
+  return true;
 }
 
 std::size_t sirius_physical_partition::no_history_peak_memory_estimate(

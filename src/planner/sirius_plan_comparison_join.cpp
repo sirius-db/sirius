@@ -50,6 +50,8 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/memory/common.hpp>
+
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -688,6 +690,20 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
       }
     }
+    if (op_params.enable_dynamic_filter_multi_partition && filter_replica_spaces.size() > 1) {
+      // Probe every ordered pair of replica GPUs here, on the query thread, so that
+      // `dynamic_filter_publication_session::try_begin_accumulation`, which checks the same pairs
+      // under the build pipeline's task-creation lock, reads only cached results.
+      for (auto const& from : filter_replica_spaces) {
+        for (auto const& to : filter_replica_spaces) {
+          auto const source      = from.get_gpu_space().get_device_id();
+          auto const destination = to.get_gpu_space().get_device_id();
+          if (source != destination) {
+            (void)cucascade::memory::probe_peer_dma_works(source, destination);
+          }
+        }
+      }
+    }
 
     sirius::op::dynamic_filter_publish_plan filter_plan{
       std::move(admitted_keys),
@@ -695,7 +711,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_replica_spaces),
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
-       .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction}};
+       .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
+       .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
+       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,

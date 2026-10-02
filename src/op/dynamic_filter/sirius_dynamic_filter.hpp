@@ -44,6 +44,10 @@
 
 namespace sirius::op {
 
+namespace detail {
+class accumulated_bloom_builder;
+}
+
 enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
 
 /**
@@ -381,8 +385,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  friend class detail::accumulated_bloom_builder;
   membership_key_domain _domain{};
   struct impl;
+  sirius_dynamic_bloom_filter(membership_key_domain domain, std::unique_ptr<impl> completed);
+  /// Wraps the replicas `detail::accumulated_bloom_builder` published for keys of @p domain.
+  [[nodiscard]] static std::shared_ptr<sirius_dynamic_bloom_filter> make_accumulated(
+    membership_key_domain domain, std::unique_ptr<impl> completed);
   std::unique_ptr<impl> _impl;
 };
 

@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
+#include "parallel/after_task_work.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -37,6 +38,16 @@ namespace op {
 //===--------------------------------------------------------------------===//
 // operator_data
 //===--------------------------------------------------------------------===//
+
+pipelineable_operator_data::pipelineable_operator_data(
+  std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+  : _data_batches(std::move(data_batches))
+{
+  _original_batch_ids.reserve(_data_batches.size());
+  for (auto const& batch : _data_batches) {
+    if (batch) { _original_batch_ids.push_back(batch->get_batch_id()); }
+  }
+}
 
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
@@ -275,11 +286,23 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
     std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
+parallel::after_task_work sirius_physical_operator::observe_task_input(
+  operator_data const& /*input*/, ::cuda::stream_ref /*stream*/)
+{
+  return {};
+}
+
+void sirius_physical_operator::on_input_batch_pushed(std::string_view /*port_id*/,
+                                                     ::cucascade::data_batch& /*batch*/)
+{
+}
+
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
                                                std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) {
+    if (batch) { on_input_batch_pushed(port_id, *batch); }
     // Emit before the batch becomes poppable so `queued` precedes `packaged`.
     telemetry::batch_telemetry_registry::instance().on_published(
       batch, p->repo, telemetry::batch_origin::operator_output);

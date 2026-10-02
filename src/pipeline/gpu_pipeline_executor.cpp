@@ -26,6 +26,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry/nvtx.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -39,7 +40,9 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 namespace sirius {
 namespace pipeline {
@@ -360,6 +363,7 @@ void gpu_pipeline_executor::manager_loop()
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        parallel::after_task_work after;
         try {
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
@@ -378,6 +382,7 @@ void gpu_pipeline_executor::manager_loop()
 
           // Sync the stream to ensure all memory is released before the reschedule.
           exc_stream->synchronize();
+          after = gpu_task->take_after_task_work();
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -471,6 +476,11 @@ void gpu_pipeline_executor::manager_loop()
             pipeline_task->set_telemetry_finalized();
           }
           this->schedule(std::move(new_task));
+          if (after) {
+            nvtx_scoped_range range{"after_task_work::reschedule_exit"};
+            run_after_task_work(
+              std::move(after), ::cuda::stream_ref{exc_stream.get()}, completion.get());
+          }
           return;
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
@@ -491,12 +501,15 @@ void gpu_pipeline_executor::manager_loop()
           pipeline_task->telemetry_handle().exit();
           pipeline_task->set_telemetry_finalized();
         }
+        if (auto* gpu_task = cast_to_gpu_pipeline_task(task.get())) {
+          after = gpu_task->take_after_task_work();
+        }
         task.reset();
 
-        // Check if query is complete BEFORE scheduling downstream tasks.
-        // mark_completed() signals the future that engine.execute() is waiting on,
-        // which may destroy the engine and its operators. We must not schedule
-        // tasks that reference those operators after signaling completion.
+        // The terminal task must not schedule consumers after it completes the query. Other
+        // post-success work in this lambda (a non-terminal cascade, after-task work) is safe: the
+        // query thread's wait_for_completion joins this worker (wait_all) before any operator is
+        // destroyed, and a stopped creator queue drops late schedule requests.
         bool query_complete = false;
         if (completion && pipeline && pipeline->is_query_terminal()) {
           query_complete = pipeline->is_pipeline_finished();
@@ -530,7 +543,45 @@ void gpu_pipeline_executor::manager_loop()
           _task_creator->drain_pending_tasks(pipeline->get_query_id());
           completion->mark_completed();
         }
+        if (after) {
+          nvtx_scoped_range range{"after_task_work::success_exit"};
+          run_after_task_work(
+            std::move(after), ::cuda::stream_ref{exc_stream.get()}, completion.get());
+        }
       });
+  }
+}
+
+void gpu_pipeline_executor::run_after_task_work(parallel::after_task_work work,
+                                                ::cuda::stream_ref stream,
+                                                completion_handler* completion) noexcept
+{
+  auto const log_error = [](std::string_view message, char const* detail) noexcept {
+    try {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: {}: {}", message, detail);
+    } catch (...) {  // Logging failed; nothing else can report it.
+    }
+  };
+  if (!work || (completion != nullptr && completion->is_completed())) { return; }
+  try {
+    std::move(work)(stream);
+  } catch (std::exception const& e) {
+    log_error("after-task work failed", e.what());
+  } catch (...) {
+    log_error("after-task work failed", "non-standard exception");
+  }
+  // A sticky error survives cudaGetLastError(); a non-sticky one left by the work is cleared here
+  // so the next task on this worker does not inherit it.
+  if (cudaPeekAtLastError() == cudaSuccess) { return; }
+  (void)cudaGetLastError();
+  auto const sticky = cudaPeekAtLastError();
+  if (sticky == cudaSuccess) { return; }
+  log_error("after-task work left a sticky CUDA error", cudaGetErrorString(sticky));
+  if (completion == nullptr) { return; }
+  try {
+    completion->report_error(std::make_exception_ptr(std::runtime_error(
+      std::string{"after-task work left a sticky CUDA error: "} + cudaGetErrorString(sticky))));
+  } catch (...) {  // Out of host memory; the next CUDA call on this context fails the query.
   }
 }
 

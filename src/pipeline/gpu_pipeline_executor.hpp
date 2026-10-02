@@ -130,6 +130,24 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     return _config;
   }
 
+  /**
+   * @brief Feature infrastructure (multi-partition dynamic filters): runs @p work on the calling
+   * worker unless its query already completed.
+   *
+   * Both task exits of `manager_loop` call it; it is public so that tests can run after-task work
+   * without an executor. Skipped work is destroyed uninvoked. An escaping exception is logged at
+   * ERROR and dropped. If the work leaves the CUDA context in a sticky error state, the error is
+   * reported to @p completion. Sticky errors are context-wide, so an error raised concurrently by
+   * another task may be attributed to this query.
+   *
+   * @param work The task's after-task work; empty work is a no-op
+   * @param stream The finished task's exclusive stream
+   * @param completion The task's query completion handler, or null when the task has none
+   */
+  static void run_after_task_work(parallel::after_task_work work,
+                                  ::cuda::stream_ref stream,
+                                  completion_handler* completion) noexcept;
+
  protected:
   void manager_loop() override;
 

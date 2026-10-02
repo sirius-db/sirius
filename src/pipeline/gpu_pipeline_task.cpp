@@ -41,8 +41,10 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace sirius {
 namespace pipeline {
@@ -391,6 +393,12 @@ gpu_pipeline_task::gpu_pipeline_task(
   }
 }
 
+parallel::after_task_work gpu_pipeline_task::take_after_task_work() noexcept
+{
+  auto* local_state = dynamic_cast<gpu_pipeline_task_local_state*>(_local_state.get());
+  return local_state ? std::move(local_state->after_task_work) : parallel::after_task_work{};
+}
+
 gpu_pipeline_task::~gpu_pipeline_task()
 {
   {
@@ -452,6 +460,23 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
 
   for (size_t i = start_index; i < operators.size(); i++) {
     auto& op = operators[i].get();
+
+    // Register after-task work if the operator has any. Outside the operator's try/catch so that an
+    // exception fails the task rather than triggering a reschedule.
+    try {
+      if (auto work = op.observe_task_input(*operator_input_output_data, stream)) {
+        if (local_state.after_task_work) {
+          throw std::logic_error(
+            "[gpu_pipeline_task::compute_task] two operators returned after-task work");
+        }
+        local_state.after_task_work = std::move(work);
+      }
+    } catch (...) {
+      // The hook may have enqueued reads of the input, which is released as this unwinds.
+      synchronize_after_exception(stream, pipeline);
+      (void)cudaGetLastError();  // Clear a non-sticky error so the next task does not inherit it.
+      throw;
+    }
     try {
       this->telemetry_handle().computing({
         .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),

@@ -2677,6 +2677,30 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
+static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
+                   params->enable_dynamic_filter_multi_partition);
+}
+
+static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                      = lock_operator_params_slot(context);
+  params->max_dynamic_filter_bloom_bytes_per_gpu = parameter.GetValue<uint64_t>();
+  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
+                   params->max_dynamic_filter_bloom_bytes_per_gpu);
+}
+
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -3049,6 +3073,26 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     LogicalType::DOUBLE,
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
+
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_dynamic_filter_multi_partition",
+    "Enable Bloom accumulation for eligible non-broadcast hash builds with more than one "
+    "partition; requires enable_dynamic_filter",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
+    SetEnableDynamicFilterMultiPartition);
+
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "max_dynamic_filter_bloom_bytes_per_gpu",
+    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
+    "0 disables accumulation without changing whole-build publication",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
+    SetMaxDynamicFilterBloomBytesPerGpu);
 
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
