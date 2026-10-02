@@ -30,7 +30,7 @@ namespace {
 
 // Forward table: DuckDB aggregate name -> Sirius aggregate id.
 // Linear scan; called once per BoundAggregateExpression at translator entry.
-constexpr std::array<std::pair<std::string_view, aggregate_id>, 8> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, aggregate_id>, 9> kForwardTable = {{
   {"sum", aggregate_id::sum},
   {"sum_no_overflow", aggregate_id::sum_no_overflow},
   {"count", aggregate_id::count},
@@ -39,11 +39,12 @@ constexpr std::array<std::pair<std::string_view, aggregate_id>, 8> kForwardTable
   {"max", aggregate_id::max},
   {"avg", aggregate_id::avg},
   {"first", aggregate_id::first},
+  {"stddev_samp", aggregate_id::stddev_samp},
 }};
 
 // Reverse table: Sirius aggregate id -> canonical DuckDB aggregate name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 8> kReverseTable = {
+constexpr std::array<std::string_view, 9> kReverseTable = {
   "sum",
   "sum_no_overflow",
   "count",
@@ -52,13 +53,14 @@ constexpr std::array<std::string_view, 8> kReverseTable = {
   "max",
   "avg",
   "first",
+  "stddev_samp",
 };
 
-static_assert(static_cast<std::size_t>(aggregate_id::first) + 1 == 8,
-              "aggregate_id::first must be the last entry; cardinality locked at 8.");
-static_assert(kReverseTable.size() == 8,
+static_assert(static_cast<std::size_t>(aggregate_id::stddev_samp) + 1 == 9,
+              "aggregate_id::stddev_samp must be the last entry; cardinality locked at 9.");
+static_assert(kReverseTable.size() == 9,
               "kReverseTable must have one slot per aggregate_id value.");
-static_assert(kForwardTable.size() == 8,
+static_assert(kForwardTable.size() == 9,
               "kForwardTable must have one entry per aggregate_id value.");
 
 // Walks both tables to ensure every enum value has exactly one canonical

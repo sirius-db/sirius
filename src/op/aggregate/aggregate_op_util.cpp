@@ -53,6 +53,7 @@ std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregat
     case sirius::aggregate_id::count_star: return cudf::aggregation::Kind::COUNT_ALL;
     case sirius::aggregate_id::min: return cudf::aggregation::Kind::MIN;
     case sirius::aggregate_id::max: return cudf::aggregation::Kind::MAX;
+    case sirius::aggregate_id::stddev_samp: return cudf::aggregation::Kind::M2;
     case sirius::aggregate_id::avg:
     case sirius::aggregate_id::first: return std::nullopt;
   }
@@ -70,6 +71,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     auto const& ref =
       sirius::ast::require_reference(group.get(), "convert_duckdb_aggregates_to_cudf group");
     result.group_idx.push_back(static_cast<int>(ref.column_index));
+    result.local_types.push_back(group->return_type());
   }
 
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
@@ -78,6 +80,10 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       aggregate.get(), "convert_duckdb_aggregates_to_cudf aggregate");
     auto const fid       = aggr.function();
     auto const& children = aggr.arguments();
+
+    if (fid == sirius::aggregate_id::stddev_samp && aggr.distinct()) {
+      throw_unsupported_aggregate(fid, "with DISTINCT");
+    }
 
     // Handle AVG specially: it expands into SUM + COUNT_VALID
     if (fid == sirius::aggregate_id::avg) {
@@ -94,6 +100,30 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
         AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+      auto sum_type = children[0]->return_type();
+      switch (sum_type.id()) {
+        case sirius::type_id::TINYINT:
+        case sirius::type_id::SMALLINT:
+        case sirius::type_id::INTEGER:
+          sum_type = sirius::logical_type::make(sirius::type_id::BIGINT);
+          break;
+        case sirius::type_id::UTINYINT:
+        case sirius::type_id::USMALLINT:
+        case sirius::type_id::UINTEGER:
+          sum_type = sirius::logical_type::make(sirius::type_id::UBIGINT);
+          break;
+        default: break;
+      }
+      // Groupby widens decimal SUM by one carrier width.
+      if (sum_type.id() == sirius::type_id::DECIMAL) {
+        auto const ct = sirius::get_cudf_type(sum_type);
+        if (ct.id() == cudf::type_id::DECIMAL32)
+          sum_type = sirius::logical_type::make_decimal(18, sum_type.decimal_scale());
+        if (ct.id() == cudf::type_id::DECIMAL64)
+          sum_type = sirius::logical_type::make_decimal(38, sum_type.decimal_scale());
+      }
+      result.local_types.push_back(sum_type);
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
       result.has_avg = true;
       continue;
     }
@@ -126,6 +156,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
 
       result.aggregate_slots.push_back(AggregateSlot{false, true, position});
+      result.local_types.push_back(sirius::logical_type::make(sirius::type_id::LIST));
       result.has_count_distinct = true;
       continue;
     }
@@ -154,7 +185,12 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    result.aggregate_slots.push_back(AggregateSlot{false, false, current_position});
+    AggregateSlot slot{false, false, current_position};
+    slot.is_stddev_samp = fid == sirius::aggregate_id::stddev_samp;
+    result.aggregate_slots.push_back(slot);
+    result.local_types.push_back(slot.is_stddev_samp
+                                   ? sirius::logical_type::make(sirius::type_id::STRUCT)
+                                   : aggr.return_type());
   }
 
   return result;
