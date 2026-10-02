@@ -143,6 +143,7 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `allocator` | `async` \| `slab` | `async` | `async` is a CUDA async pool. `slab` suballocates one `cudaMalloc` of the whole capacity (rounded down to 2 MiB) taken at startup, so a transport can register it once; it is never trimmed on OOM. Also accepted per space as `sirius.space.gpu[].allocator`. |
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level

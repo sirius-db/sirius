@@ -18,6 +18,7 @@
 
 #include "exec/config.hpp"
 #include "log/logging.hpp"
+#include "memory/slab_memory_resource.hpp"
 #include "yaml_reader.hpp"
 
 #include <cuda_runtime_api.h>
@@ -119,6 +120,16 @@ static void validate_downgrade_fractions(std::string_view scope, double trigger,
   }
 }
 
+static bool read_slab_allocator(yaml::reader& r)
+{
+  std::string allocator = "async";
+  r.optional("allocator", allocator, [](std::string const& value) {
+    if (value == "async" || value == "slab") return true;
+    throw std::runtime_error("must be one of async, slab");
+  });
+  return allocator == "slab";
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_space_config& opt)
 {
   opt.per_stream_reservation = false;  // default to false for sirius
@@ -131,6 +142,7 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_spac
     "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
   r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
+  if (read_slab_allocator(r)) { opt.mr_factory_fn = memory::make_slab_pool_factory(); }
   r.reject_unknown();
   validate_downgrade_fractions(
     "sirius.space.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -485,6 +497,7 @@ struct gpu_mem_config {
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   double downgrade_trigger_fraction{0.8};
   double downgrade_stop_fraction{0.6};
+  bool slab_allocator{false};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -509,6 +522,7 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
+    opt.slab_allocator = read_slab_allocator(r);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
@@ -533,6 +547,9 @@ struct gpu_mem_config {
       builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
+    if (slab_allocator) {
+      builder.set_gpu_memory_resource_factory(memory::make_slab_pool_factory());
+    }
     // Keep the high-level path on Sirius's default. The low-level
     // space.gpu[] replacement surface retains the diagnostic per-stream control.
     builder.track_reservation_per_stream(false);
