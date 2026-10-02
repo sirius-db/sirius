@@ -38,7 +38,7 @@ jobs:
   manual-release:
     name: manual-release (${{ inputs.mode || 'pr-dry-run' }})
     if: github.repository == 'sirius-db/sirius'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     concurrency:
       # workflow_dispatch runs serialize by mode (real publishers to the same tag must queue
       # behind each other). pull_request dry-runs use the PR number instead of a shared
@@ -195,6 +195,11 @@ jobs:
           done
           echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
 
+      - name: Compress artifacts
+        # GitHub Releases rejects any single asset >= 2 GiB; cuda12 builds land right at that
+        # line. All 4 variants are compressed for consistency, not just the ones that need it.
+        run: gzip -9 renamed/*.duckdb_extension
+
       - name: Cross-check DuckDB version against distribution.yml
         run: |
           set -euo pipefail
@@ -222,7 +227,7 @@ jobs:
           {
             echo "# source_sha=${TARGET_SHA}"
             echo "# run_id=${RUN_ID}"
-            sha256sum *.duckdb_extension
+            sha256sum *.duckdb_extension.gz
           } > MANIFEST.sha256
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
@@ -252,12 +257,14 @@ jobs:
           duckdb_version = os.environ["DUCKDB_VERSION"]
           duckdb_version_bare = duckdb_version.removeprefix("v")
 
-          renamed_files = sorted(glob.glob("renamed/*.duckdb_extension"))
+          renamed_files = sorted(glob.glob("renamed/*.duckdb_extension.gz"))
           download_links = "\n".join(
               f"- [{os.path.basename(f)}](https://github.com/{repo}/releases/download/{tag}/{os.path.basename(f)})"
               for f in renamed_files
           )
-          first_file = os.path.basename(renamed_files[0])
+          # Decompressed name: the LOAD example in GETTING_STARTED.md runs after the gunzip step
+          # it also adds, so {{FIRST_FILE}} needs to be the extracted filename, not the .gz one.
+          first_file = os.path.basename(renamed_files[0]).removesuffix(".gz")
 
           with open(".github/workflows/release/GETTING_STARTED.md") as f:
               notes = f.read()
@@ -321,7 +328,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           gh release upload "$PENDING_TAG" \
-            renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
+            renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 --clobber
         env:
           GH_TOKEN: ${{ github.token }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
@@ -355,14 +362,14 @@ jobs:
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
             # existing tag, so this has to go through the git refs API directly.
             gh api -X PATCH "repos/${REPO}/git/refs/tags/$TAG" -f sha="$TARGET_SHA" -F force=true
-            gh release upload "$TAG" renamed/*.duckdb_extension renamed/MANIFEST.sha256 --clobber
+            gh release upload "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 --clobber
             gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           else
             # First-ever publish of this tag - no live release exists yet to protect, so create
             # and publish it directly with assets attached, no staging swap needed. --target is
             # required: without it, gh release create would auto-create the tag at whatever main
             # HEAD is right now, not the target SHA.
-            gh release create "$TAG" renamed/*.duckdb_extension renamed/MANIFEST.sha256 \
+            gh release create "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 \
               --target "$TARGET_SHA" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
