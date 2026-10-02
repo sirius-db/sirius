@@ -37,7 +37,7 @@ from .compare import ResultSet, Tolerances, compare_mode, compare_results
 from .config import FuzzConfig
 from .query_gen import QueryGenerator
 from .reduce import reduce_query
-from .report import QueryRecord, Report
+from .report import QueryRecord, Report, signature
 from .schema_gen import DataGenerator, Dataset
 from .session import RunResult, Session
 from .sqlast import Query, labels
@@ -396,6 +396,21 @@ class Evaluator:
 # --------------------------------------------------------------------------
 
 
+def first_of_signature(rec: QueryRecord, seen: set[str]) -> bool:
+    """Whether ``rec`` is the first finding with its signature in this worker.
+
+    Errors and plan rejections dedup by normalized reason, so reducing a second
+    query with the same signature would spend the whole budget on a reproducer
+    the report already has. Mismatch and timeout signatures include the query
+    and stay unique.
+    """
+    sig = signature(rec)
+    if sig in seen:
+        return False
+    seen.add(sig)
+    return True
+
+
 def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     w = args.worker_id
@@ -445,6 +460,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
     evaluator.rng = random.Random(args.seed ^ 0x5EED)
     done_queries = 0
     dataset_idx = 0
+    reduced: set[str] = set()
     try:
         while not stop.is_set():
             if args.deadline and time.time() >= args.deadline:
@@ -509,6 +525,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                         args.reduce
                         and cfg.oracle.reduce
                         and Verdict(rec.verdict).is_finding()
+                        and first_of_signature(rec, reduced)
                     ):
                         session.stage = "reduction"
                         evaluator.reduce(rec, query)
