@@ -376,14 +376,13 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
 
           std::unique_ptr<cudf::column> casted_col;
           if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
-            if (col.type().id() == cudf::type_id::DECIMAL32) {
-              casted_col = cudf::cast(
-                col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);
-              col = casted_col->view();
-            }
-            if (col.type().id() == cudf::type_id::DECIMAL64) {
-              casted_col = cudf::cast(
-                col, cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()), stream);
+            if (col.type().id() == cudf::type_id::DECIMAL32 ||
+                col.type().id() == cudf::type_id::DECIMAL64) {
+              casted_col =
+                cudf::cast(col,
+                           cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()),
+                           stream,
+                           space->get_default_allocator());
               col = casted_col->view();
             }
           }

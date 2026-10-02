@@ -57,6 +57,8 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
   }
 }
 
+namespace {
+
 /// The type a SUM over a column of type @p type is computed in: the next wider decimal type for
 /// DECIMAL32 and DECIMAL64, and nullopt for every other type.
 std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
@@ -67,6 +69,8 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
     default: return std::nullopt;
   }
 }
+
+}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
   const cucascade::read_only_data_batch& input,
@@ -330,8 +334,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     input_col_to_output_idx[aggregate_col_id].push_back(i);
   }
 
-  // Temp struct columns for multi-col COLLECT_SET and widened SUM inputs; must outlive the
-  // groupby call.
+  // Temp struct columns for multi-col COLLECT_SET and widened SUM inputs. They back
+  // `requests[i].values` and are released right after the groupby call.
   std::vector<std::unique_ptr<cudf::column>> temp_struct_cols;
 
   std::vector<cudf::groupby::aggregation_request> requests;
@@ -371,7 +375,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   // Call cudf groupby and populate output columns
   auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
-  auto output_cols    = groupby_result.first->release();
+  // Nothing reads `requests[i].values` after the groupby, so release the temporary inputs before
+  // the allocations below.
+  temp_struct_cols.clear();
+  auto output_cols = groupby_result.first->release();
 
   // Expand the single label key back into the original group key columns. The groupby emits
   // one row per distinct label, so this gather runs at group cardinality, not input rows.
