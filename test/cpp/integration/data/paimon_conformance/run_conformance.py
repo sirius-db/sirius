@@ -13,6 +13,8 @@ import sys
 import tempfile
 import traceback
 
+from qualified_extension import select_qualification
+
 from corpus_checks import (
     digest,
     validate_inventory,
@@ -195,6 +197,35 @@ def scan_sql(path, snapshot):
     return f"paimon_scan({argument})"
 
 
+def probe_identity(cli, directory, timeout):
+    env = os.environ.copy()
+    env["SIRIUS_DISABLE"] = "1"
+    output = execute(
+        [
+            cli,
+            "-init",
+            "/dev/null",
+            "-json",
+            "-batch",
+            "-bail",
+            ":memory:",
+            "-c",
+            "SELECT version() AS version; PRAGMA platform;",
+        ],
+        timeout=timeout,
+        cwd=directory,
+        env=env,
+        log=directory / "reader-identity",
+    )
+    results = decode_results(output)
+    if len(results) != 2 or len(results[0]) != 1 or len(results[1]) != 1:
+        raise ValueError("Incomplete reader version/platform identity")
+    version, platform = results[0][0]["version"], results[1][0]["platform"]
+    if not isinstance(version, str) or not isinstance(platform, str):
+        raise ValueError("Malformed reader version/platform identity")
+    return {"version": version, "platform": platform}
+
+
 def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report):
     config = run_dir / "sirius.yaml"
     config.write_text(
@@ -327,6 +358,9 @@ def main(argv=None):
     parser.add_argument("--duckdb", type=Path, default=ROOT / "build/release/duckdb")
     parser.add_argument("--paimon-extension", type=Path, required=True)
     parser.add_argument(
+        "--registry", type=Path, default=HERE / "qualified-artifacts.json"
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=WORK,
@@ -380,13 +414,16 @@ def main(argv=None):
         validate_oracle(spec, manifest, compare_rows)
         extension = args.paimon_extension.resolve(strict=True)
         cli = args.duckdb.resolve(strict=True)
+        identity = probe_identity(cli, run_dir, args.timeout)
+        spec["extension"] = select_qualification(args.registry, identity)
         report.update(
-            duckdb={"path": str(cli), "sha256": digest(cli)},
+            duckdb={"path": str(cli), "sha256": digest(cli), **identity},
             extension=spec["extension"],
+            registry_sha256=digest(args.registry),
         )
         if digest(extension) != spec["extension"]["sha256"]:
             raise ValueError(
-                "Unqualified Paimon artifact: expected the version and SHA256 in expectations.json"
+                "Unqualified Paimon artifact: expected the version and SHA256 in qualified-artifacts.json"
             )
         run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report)
         report["state"] = "passed"

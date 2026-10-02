@@ -32,7 +32,14 @@ class OrchestrationTests(unittest.TestCase):
         self.extension = self.root / "paimon.duckdb_extension"
         self.extension.write_bytes(b"fake extension for harness testing only")
         self.spec = json.loads((HERE / "expectations.json").read_text())
+        self.spec["extension"] = json.loads(
+            (HERE / "qualified-artifacts.json").read_text()
+        )["artifacts"][0]
         self.spec["extension"]["sha256"] = digest(self.extension)
+        self.registry = self.root / "qualified-artifacts.json"
+        self.registry.write_text(
+            canonical_json({"format_version": 1, "artifacts": [self.spec["extension"]]})
+        )
         self.original = copy.deepcopy(self.spec)
         self.trace = self.root / "trace.jsonl"
         self.cli = self.root / "fake-duckdb"
@@ -48,6 +55,11 @@ sql = sys.argv[sys.argv.index('-c') + 1]
 mode = 'disabled' if os.environ.get('SIRIUS_DISABLE') == '1' else ('transparent' if 'SET gpu_execution=true;' in sql else 'cpu')
 with open(trace, 'a') as f: f.write(json.dumps({'sql':sql,'mode':mode})+'\\n')
 fault = os.environ.get('PAIMON_TEST_FAULT', '')
+if sql == 'SELECT version() AS version; PRAGMA platform;':
+    print(json.dumps([{'version':os.environ.get('PAIMON_TEST_VERSION', spec['extension']['duckdb_version'])}]))
+    print(json.dumps([{'platform':spec['extension']['platform']}]))
+    sys.exit(0)
+
 if 'SET enable_duckdb_fallback=false;' in sql:
     print("GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius", file=sys.stderr, flush=True)
     if fault == 'rejection_crash':
@@ -97,6 +109,8 @@ for result in results: print(json.dumps(result))
             str(self.cli),
             "--paimon-extension",
             str(self.extension),
+            "--registry",
+            str(self.registry),
             "--output",
             str(self.root / "reports"),
         ]
@@ -128,7 +142,7 @@ for result in results: print(json.dumps(result))
             ),
             (53, 53, 0, 0),
         )
-        self.assertEqual(len(self.trace.read_text().splitlines()), 53)
+        self.assertEqual(len(self.trace.read_text().splitlines()), 54)
         attached = [
             json.loads(line)["sql"]
             for line in self.trace.read_text().splitlines()
@@ -214,3 +228,10 @@ for result in results: print(json.dumps(result))
         failures = [c for c in report["cases"] if c["state"] == "FAIL"]
         self.assertEqual([c["id"] for c in failures], ["planning_rejection"])
         self.assertEqual(failures[0]["error_type"], "ProcessError")
+
+    def test_unqualified_reader_version_fails_before_load(self):
+        with patch.dict(os.environ, PAIMON_TEST_VERSION="v1.5.6"):
+            report, error = self.run_suite(["empty_rows"])
+        self.assertIn("No qualified Paimon artifact", str(error))
+        self.assertEqual(report["not_run_cases"], 5)
+        self.assertEqual(len(self.trace.read_text().splitlines()), 1)
