@@ -45,8 +45,9 @@ const RESULT_WAIT: Duration = Duration::from_secs(600);
 pub(crate) struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
-    /// Executes a translated fragment into Arrow result batches. Production injects the GPU-backed
-    /// `SiriusEngine` (via [`with_executor`](Self::with_executor)); tests use a stub.
+    /// Runs translated fragments, returning a result fragment's Arrow batches or parking a sender
+    /// fragment's output. Production injects the GPU-backed `SiriusEngine` (via
+    /// [`with_executor`](Self::with_executor)); tests use a stub.
     executor: Arc<dyn FragmentExecutor>,
     /// Buffers executed-fragment results for FE `fetch_data` collection. Shared across BRPC
     /// connections so a `fetch_data` poll sees what an `exec_plan_fragment` buffered.
@@ -89,9 +90,10 @@ impl SiriusComputeNodeService {
 }
 
 impl PInternalService for SiriusComputeNodeService {
-    /// Handles a single FE-dispatched plan fragment thrift attachment: translate it, and for a
-    /// root RESULT_SINK fragment execute it and buffer the rows for `fetch_data`. An OK status
-    /// means the fragment was accepted (and, for a result fragment, executed and buffered).
+    /// Handles a single FE-dispatched plan fragment thrift attachment. A fragment fed by an
+    /// exchange returns OK once registered and runs when its senders have parked. Any other
+    /// fragment runs now: a RESULT_SINK buffers its rows for `fetch_data`, a DATA_STREAM_SINK
+    /// parks its output for its receivers.
     #[instrument(skip_all)]
     async fn exec_plan_fragment(
         &self,
@@ -117,16 +119,16 @@ impl PInternalService for SiriusComputeNodeService {
         Ok(Self::exec_plan_result(status).into())
     }
 
-    /// Handles FE batch fragment dispatch: translate every per-instance fragment and execute the
-    /// RESULT_SINK roots among them.
+    /// Handles FE batch fragment dispatch: processes every per-instance fragment as
+    /// `exec_plan_fragment` does.
     #[instrument(skip_all)]
     async fn exec_batch_plan_fragments(
         &self,
         request: PExecBatchPlanFragmentsRequest,
         attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PExecBatchPlanFragmentsResult>, crate::prpc::Error> {
-        // Like `exec_plan_fragment`, an instance can run a RESULT_SINK fragment on the GPU, so
-        // offload to a blocking worker rather than blocking the BRPC current-thread runtime.
+        // Like `exec_plan_fragment`, an instance can run a fragment on the GPU, so offload to a
+        // blocking worker rather than blocking the BRPC current-thread runtime.
         let protocol = request.attachment_protocol;
         let service = self.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -247,13 +249,14 @@ impl SiriusComputeNodeService {
                 .as_ref()
                 .ok_or_else(|| "exchange receiver is missing execution params".to_string())?;
             let id = FragmentInstanceId::from(&exec.fragment_instance_id);
+            let query = FragmentInstanceId::from(&exec.query_id);
             if Self::is_mysql_result_sink(&params)? {
-                self.results
-                    .reserve(id, FragmentInstanceId::from(&exec.query_id));
+                self.results.reserve(id, query);
             }
             let ready = self
                 .exchanges
-                .register_receiver(id, expected_senders, params)?;
+                .register_receiver(id, expected_senders, params)
+                .inspect_err(|err| self.results.fail_query(query, err))?;
             return self.drain_ready(ready.into_iter().collect());
         }
         let translated = self.translate_fragment_logged(&params, &[], dump_seq)?;
@@ -370,26 +373,11 @@ impl SiriusComputeNodeService {
             .as_deref()
             .filter(|destinations| !destinations.is_empty())
             .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
-        // One destination is a gather whatever the partition type. The translator has already
-        // refused hash keys that are not bare slot refs.
-        let hash_keys = match stream_sink.output_partition.type_ {
-            _ if destinations.len() == 1 => Vec::new(),
-            TPartitionType::UNPARTITIONED => Vec::new(),
-            TPartitionType::HASH_PARTITIONED => {
-                translated.output_partition_columns.clone().ok_or_else(|| {
-                    "a hash-partitioned data stream sink translated without partition key columns"
-                        .to_string()
-                })?
-            }
-            other => {
-                return Err(format!(
-                    "a data stream sink with {} destinations carries partition type {other:?}, \
-                     which this CN does not support",
-                    destinations.len()
-                ));
-            }
-        };
-        let broadcast = destinations.len() > 1 && hash_keys.is_empty();
+        let (broadcast, hash_keys) = Self::sink_mode(
+            stream_sink.output_partition.type_,
+            destinations.len(),
+            translated.output_partition_columns.as_ref(),
+        )?;
 
         let sender_id = exec.sender_id.unwrap_or(0);
         let mut outputs = Vec::with_capacity(destinations.len());
@@ -425,6 +413,31 @@ impl SiriusComputeNodeService {
         Ok(ready)
     }
 
+    /// How a sink to `destinations` fans out: whether it broadcasts, and its hash key columns
+    /// (empty unless hash-partitioned). One destination is a gather whatever the partition type.
+    /// The translator has already refused hash keys that are not bare slot refs.
+    fn sink_mode(
+        partition: TPartitionType,
+        destinations: usize,
+        partition_columns: Option<&Vec<usize>>,
+    ) -> std::result::Result<(bool, Vec<usize>), String> {
+        let hash_keys = match partition {
+            _ if destinations == 1 => Vec::new(),
+            TPartitionType::UNPARTITIONED => Vec::new(),
+            TPartitionType::HASH_PARTITIONED => partition_columns.cloned().ok_or_else(|| {
+                "a hash-partitioned data stream sink translated without partition key columns"
+                    .to_string()
+            })?,
+            other => {
+                return Err(format!(
+                    "a data stream sink with {destinations} destinations carries partition type \
+                     {other:?}, which this CN does not support"
+                ));
+            }
+        };
+        Ok((destinations > 1 && hash_keys.is_empty(), hash_keys))
+    }
+
     /// Errors unless `destination` is this CN: this build has no cross-node transport.
     fn ensure_local(
         &self,
@@ -446,7 +459,10 @@ impl SiriusComputeNodeService {
 
     /// Runs receivers whose sender sets completed, then the receivers their outputs complete. A
     /// failure also fails the query's waiting result slot, so `fetch_data` reports it at once.
+    /// One failed receiver does not stop the rest, whose parked inputs would otherwise never be
+    /// released; the first error is returned.
     fn drain_ready(&self, mut queue: Vec<ReadyFragment>) -> std::result::Result<(), String> {
+        let mut first_error = None;
         while let Some(ready) = queue.pop() {
             let query = ready
                 .params
@@ -459,11 +475,11 @@ impl SiriusComputeNodeService {
                     if let Some(query) = query {
                         self.results.fail_query(query, &err);
                     }
-                    return Err(err);
+                    first_error.get_or_insert(err);
                 }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Translates a ready receiver against its senders' output names and runs it on their
@@ -646,8 +662,8 @@ impl SiriusComputeNodeService {
     }
 
     /// Classifies the fragment output sink: `Ok(true)` for a MySQL text-protocol RESULT_SINK this
-    /// CN can encode, `Ok(false)` for a non-result sink (translate-only), and `Err` for a
-    /// RESULT_SINK whose format is not supported yet (binary rows, HTTP/FILE/Arrow Flight, etc.).
+    /// CN can encode, `Ok(false)` for a non-result sink, and `Err` for a RESULT_SINK whose format
+    /// is not supported yet (binary rows, HTTP/FILE/Arrow Flight, etc.).
     /// The encoder only emits MySQL text rows, so other result-sink formats must be rejected
     /// rather than returned in the wrong wire format.
     fn is_mysql_result_sink(params: &TExecPlanFragmentParams) -> std::result::Result<bool, String> {
@@ -755,8 +771,7 @@ impl SiriusComputeNodeService {
         }
     }
 
-    /// StarRocks OK status. For these RPCs OK means "fragment accepted and translated", not
-    /// "fragment executed" — execution and result delivery are not implemented yet.
+    /// StarRocks OK status.
     fn ok_status() -> StatusPb {
         StatusPb {
             status_code: TStatusCode::OK.0,
@@ -1164,6 +1179,56 @@ mod tests {
             "{:?}",
             fetched.status.error_msgs
         );
+    }
+
+    #[test]
+    fn failed_receiver_registration_fails_the_waiting_result() {
+        // A repeated dispatch of a waiting result fragment is refused, and fetch_data reports that
+        // at once instead of waiting out RESULT_WAIT.
+        let service = SiriusComputeNodeService::new();
+        let mut result = query_fragment(11, 10, exchange_plan_node(2, 0), result_sink());
+        expect_senders(&mut result, 2, 1);
+        exec_ok(&service, &result);
+        assert_eq!(
+            exec(&service, &result).status_code,
+            TStatusCode::INTERNAL_ERROR.0
+        );
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(11, 10),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert!(
+            fetched.status.error_msgs[0].contains("duplicate receiver registration"),
+            "{:?}",
+            fetched.status.error_msgs
+        );
+    }
+
+    #[test]
+    fn sink_mode_follows_destinations_and_partition_type() {
+        let keys = vec![1];
+        let mode = |partition, destinations| {
+            SiriusComputeNodeService::sink_mode(partition, destinations, Some(&keys))
+        };
+        assert_eq!(
+            mode(TPartitionType::HASH_PARTITIONED, 1),
+            Ok((false, Vec::new())),
+            "one destination is a gather"
+        );
+        assert_eq!(
+            mode(TPartitionType::UNPARTITIONED, 2),
+            Ok((true, Vec::new()))
+        );
+        assert_eq!(
+            mode(TPartitionType::HASH_PARTITIONED, 2),
+            Ok((false, vec![1]))
+        );
+        let err = mode(TPartitionType::RANDOM, 2).unwrap_err();
+        assert!(err.contains("does not support"), "{err}");
     }
 
     /// Fragment instance `instance` of query `query`: one plan node feeding `sink`.

@@ -109,6 +109,13 @@ fn engine_thread(
     // One fragment at a time until the handle (and its sender) is dropped.
     while let Ok(request) = requests.recv() {
         let result = run_fragment(&context, &mut parked, &request);
+        if result.is_err() {
+            // A failed fragment may stop before relaying every input; release them all so the
+            // senders' GPU batches are freed. An input already relayed is gone and just errors.
+            for slot in request.inputs.iter().flat_map(|(_, slots)| slots) {
+                let _ = parked.release(slot);
+            }
+        }
         // Ignore a send error: the waiting fragment may have been dropped/cancelled.
         let _ = request.respond.send(result);
     }
@@ -687,5 +694,27 @@ mod tests {
             .expect("the receiver returns rows");
         let relayed_rows: usize = relayed.batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(relayed_rows, 3);
+
+        // A receiver that fails before relaying still releases its input, so the slot parks again.
+        let park = || {
+            engine.run_fragment(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+            })
+        };
+        park().expect("park the sender output");
+        engine
+            .run_fragment(FragmentRun {
+                plan: &receiver,
+                inputs: vec![(7, vec![slot])],
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: vec![usize::MAX],
+            })
+            .expect_err("an overflowing hash key fails the receiver");
+        park().expect("the failed receiver released its input");
     }
 }
