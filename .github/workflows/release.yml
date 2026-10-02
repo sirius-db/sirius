@@ -196,12 +196,8 @@ jobs:
           echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
 
       - name: Compress artifacts
-        # GitHub Releases rejects any single asset >= 2 GiB. The raw cuda12 extensions land
-        # right around that line (~2.47 GB); gzip -9 gets every variant comfortably under it
-        # (verified: ~1.54 GB) without touching the build or what GPU architectures it supports.
-        # All 4 variants are compressed for consistency, not just the ones that need it today -
-        # mixing compressed and uncompressed download instructions in the same release notes
-        # would be confusing, and leaves headroom before this has to be revisited.
+        # GitHub Releases rejects any single asset >= 2 GiB; cuda12 builds land right at that
+        # line. All 4 variants are compressed for consistency, not just the ones that need it.
         run: gzip -9 renamed/*.duckdb_extension
 
       - name: Cross-check DuckDB version against distribution.yml
