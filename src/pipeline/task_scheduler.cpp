@@ -46,6 +46,7 @@ namespace sirius {
 namespace pipeline {
 
 task_scheduler::task_scheduler(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
@@ -53,7 +54,9 @@ task_scheduler::task_scheduler(
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
   // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
   // belongs to; see pipeline::index_keys_for.
-  : _task_queue(&index_keys_for), _telemetry_context(std::move(telemetry_context))
+  : _query_lifecycle(lifecycle),
+    _task_queue(&index_keys_for),
+    _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
@@ -91,7 +94,8 @@ task_scheduler::task_scheduler(
     // Pass a publisher so gpu_pipeline_executor can submit task requests
     _gpu_executors.emplace(
       device_id,
-      std::make_unique<gpu_pipeline_executor>(config,
+      std::make_unique<gpu_pipeline_executor>(lifecycle,
+                                              config,
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
                                               dg_exec,
@@ -109,9 +113,9 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
   // Refuse work for a query that is tearing down. A task creation worker can land here after
   // that query's queue drain already ran, and the task would then sit in the shared queue holding
   // raw repository pointers into a manager about to be erased.
-  if (_query_lifecycle != nullptr && task) {
+  if (task) {
     const auto query_id = sirius::make_query_id(index_keys_for(*task).query_id);
-    submission          = _query_lifecycle->try_begin_submission(query_id);
+    submission          = _query_lifecycle.try_begin_submission(query_id);
     if (submission.status() == exec::query_submission_status::unknown) {
       if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
         if (auto handler = gpu_task->get_completion_handler()) {
@@ -141,7 +145,7 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
     // push returns false only when the queue is interrupted. If the gate still reports this query
     // as accepting work, the task is destroyed and its query waits forever on a completion that
     // cannot arrive -- the silent-drop failure mode behind several "query just hangs" reports.
-    if (_query_lifecycle == nullptr || _query_lifecycle->accepts_work(pushed_query)) {
+    if (_query_lifecycle.accepts_work(pushed_query)) {
       SIRIUS_LOG_ERROR(
         "task_scheduler: task for query {} was DROPPED by an interrupted queue while the query was "
         "still accepting work; that query will not complete",
@@ -196,17 +200,6 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
   }
 }
 
-void task_scheduler::set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry)
-{
-  _query_lifecycle = registry;
-
-  // Propagated so each device queue refuses a dying query's tasks too — notably the OOM
-  // reschedule, which re-enters itask_executor::schedule from a worker thread.
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_query_lifecycle_registry(registry);
-  }
-}
-
 void task_scheduler::start_query(const planner::query& query)
 {
   const auto& scans = query.get_scan_operators();
@@ -231,7 +224,7 @@ void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& 
 void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 {
   // Close admission and settle publishers before removing this query's queued work.
-  if (_query_lifecycle) { _query_lifecycle->quiesce_and_wait_for_submissions(query_id); }
+  _query_lifecycle.quiesce_and_wait_for_submissions(query_id);
 
   SIRIUS_LOG_INFO("task_scheduler: draining after error for query {}", query_id);
   // Teardown ordering is load-bearing. The executor drains below run in-flight tasks to
@@ -264,7 +257,7 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
   // queue before the gate refused its successor, so sweep this query once more.
   _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  if (_query_lifecycle) { _query_lifecycle->wait_for_work(query_id); }
+  _query_lifecycle.wait_for_work(query_id);
 
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error for query {}", query_id);
 }
@@ -273,7 +266,7 @@ void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
 {
   // Settle publishers before checking queues. Per-query worker waits and the final work-lease
   // wait below also cover running tasks and repository borrowers.
-  if (_query_lifecycle) { _query_lifecycle->quiesce_and_wait_for_submissions(query_id); }
+  _query_lifecycle.quiesce_and_wait_for_submissions(query_id);
 
   // Once the query has signaled completion, NOTHING should still be queued. Rather
   // than drain (which would hide the bug), validate that every queue is empty and
@@ -309,7 +302,7 @@ void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
     throw;
   }
   if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
-  if (_query_lifecycle) { _query_lifecycle->wait_for_work(query_id); }
+  _query_lifecycle.wait_for_work(query_id);
 }
 
 void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)

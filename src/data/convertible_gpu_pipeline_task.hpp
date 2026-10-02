@@ -67,7 +67,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
   convertible_gpu_pipeline_task(
     std::unique_ptr<sirius::parallel::itask> task,
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
-    sirius::exec::query_lifecycle_registry* query_lifecycle = nullptr)
+    sirius::exec::query_lifecycle_registry& query_lifecycle)
     : _task(std::move(task)), _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
@@ -96,27 +96,27 @@ class convertible_gpu_pipeline_task : public convertible_data {
     sirius::exec::query_lifecycle_registry::submission_guard submission;
     // Destroy a refused/unsubmitted task before releasing an admitted publisher on unwind.
     auto task = std::move(_task);
-    if (_query_lifecycle != nullptr) {
-      const auto query_id = sirius::make_query_id(sirius::pipeline::index_keys_for(*task).query_id);
-      submission          = _query_lifecycle->try_begin_submission(query_id);
-      if (submission.status() == sirius::exec::query_submission_status::unknown) {
-        try {
-          SIRIUS_LOG_ERROR("convertible_gpu_pipeline_task: refusing work for unknown query {}",
-                           query_id);
-        } catch (...) {
-          // Destructors must not throw while unwinding a failed query.
-        }
-        if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(task.get())) {
-          if (auto handler = gpu_task->get_completion_handler()) {
-            handler->report_error(
-              "convertible_gpu_pipeline_task: query lifecycle registration is missing");
-          }
-        }
+
+    const auto query_id = sirius::make_query_id(sirius::pipeline::index_keys_for(*task).query_id);
+    submission          = _query_lifecycle.try_begin_submission(query_id);
+    if (submission.status() == sirius::exec::query_submission_status::unknown) {
+      try {
+        SIRIUS_LOG_ERROR("convertible_gpu_pipeline_task: refusing work for unknown query {}",
+                         query_id);
+      } catch (...) {
+        // Destructors must not throw while unwinding a failed query.
       }
-      if (!submission) {
-        return;  // query is tearing down or has already closed; do not resurrect its task
+      if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error(
+            "convertible_gpu_pipeline_task: query lifecycle registration is missing");
+        }
       }
     }
+    if (!submission) {
+      return;  // query is tearing down or has already closed; do not resurrect its task
+    }
+
     (void)_queue.push(std::move(task));
   }
 
@@ -242,8 +242,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
 
   std::unique_ptr<sirius::parallel::itask> _task;
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
-  /// Non-owning; owned by SiriusContext. Null in unit tests, which restores the ungated push.
-  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this wrapper.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 /**
@@ -263,7 +263,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
    */
   explicit convertible_gpu_pipeline_task_provider(
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& queue,
-    sirius::exec::query_lifecycle_registry* query_lifecycle = nullptr)
+    sirius::exec::query_lifecycle_registry& query_lifecycle)
     : _queue(queue), _query_lifecycle(query_lifecycle)
   {
   }
@@ -357,7 +357,7 @@ class convertible_gpu_pipeline_task_provider : public convertible_data_provider 
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>& _queue;
   /// Non-owning; owned by SiriusContext. Forwarded to each wrapper so its RAII re-push is
   /// refused once the owning query starts tearing down.
-  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 }  // namespace sirius

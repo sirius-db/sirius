@@ -47,13 +47,15 @@ static std::string tier_to_string(cucascade::memory::Tier tier)
 }
 
 downgrade_executor::downgrade_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::downgrade_executor_config config,
   sirius::data::data_repository_manager_registry& data_repo_registry,
   cucascade::memory::memory_space_id space_id,
   cucascade::memory::memory_space* memory_space,
   sirius::memory::sirius_memory_reservation_manager& reservation_manager,
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
-  : _config(std::move(config)),
+  : _query_lifecycle(lifecycle),
+    _config(std::move(config)),
     _data_repo_registry(data_repo_registry),
     _space_id(space_id),
     _memory_space(memory_space),
@@ -270,9 +272,8 @@ void downgrade_executor::processing_loop()
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.candidates();
     for (auto const& [victim_id, manager] : std::views::reverse(managers)) {
-      auto borrow = _query_lifecycle ? _query_lifecycle->try_acquire_work(victim_id)
-                                     : exec::query_lifecycle_registry::work_lease{};
-      if (_query_lifecycle && !borrow) { continue; }
+      auto borrow = _query_lifecycle.try_acquire_work(victim_id);
+      if (!borrow) { continue; }
       if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
@@ -306,11 +307,10 @@ void downgrade_executor::processing_loop()
           auto candidate_bytes      = candidate_sizes[*pick];
           // The manager-local borrow protects candidate discovery. Transfer a separate
           // victim claim into each candidate before handing it to another thread.
-          if (_query_lifecycle) {
-            auto work = _query_lifecycle->try_acquire_work(victim_id);
-            if (!work) { break; }
-            candidate->retain_work(std::move(work));
-          }
+
+          auto work = _query_lifecycle.try_acquire_work(victim_id);
+          if (!work) { break; }
+          candidate->retain_work(std::move(work));
 
           auto slot = _pool->reserve();
           if (!slot) {

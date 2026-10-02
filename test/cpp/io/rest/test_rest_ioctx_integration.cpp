@@ -1342,7 +1342,8 @@ TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integrat
   scan_manager_fixture fixture;
   auto cfg       = make_fake_rest_config(server.endpoint());
   cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://tail-cache-bucket/object.bin");
   REQUIRE(datasource != nullptr);
 
@@ -1541,8 +1542,9 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
   range_http_server server(parquet);
   scan_manager_fixture fixture;
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius_scan_manager manager{
-    make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};
+    scan_lifecycle, make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};
 
   auto result = manager.describe_parquet("s3://footer-bucket/nation.parquet");
 
@@ -1994,7 +1996,9 @@ TEST_CASE("rest_ioctx reads the MinIO hello fixture through scan_manager create_
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
 
@@ -2025,7 +2029,9 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on MinIO fixtures",
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
   require_rest_ioctx(datasource);
 
@@ -2067,7 +2073,8 @@ TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the MinIO medi
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
   cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
   require_rest_ioctx(datasource);
 
@@ -2182,7 +2189,8 @@ TEST_CASE(
   scan_manager_fixture fixture;
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   SECTION("single chunk")
   {
@@ -2227,7 +2235,8 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
     range_http_server server(payload, fault);
     auto cfg                    = make_fake_rest_config(server.endpoint());
     cfg.rest.max_retry_attempts = 4;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
+    sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
     auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
     require_rest_ioctx(datasource);
@@ -2245,7 +2254,8 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
     range_http_server server(payload, fault);
     auto cfg                    = make_fake_rest_config(server.endpoint());
     cfg.rest.max_retry_attempts = 2;
-    sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
+    sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
     auto datasource = manager.create_datasource("s3://retry-bucket/object.bin");
     require_rest_ioctx(datasource);
@@ -2266,7 +2276,8 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
   auto cfg                 = make_fake_rest_config(server.endpoint());
   cfg.rest.max_connections = 2;
   cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://concurrency-bucket/object.bin");
   require_rest_ioctx(datasource);
@@ -2310,7 +2321,8 @@ TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
   cfg.rest_n_reactors      = 4;
   cfg.rest.max_connections = 1;
   cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://fanout-bucket/object.bin");
   require_rest_ioctx(datasource);
@@ -2351,7 +2363,9 @@ TEST_CASE("rest_ioctx reads through the TLS MinIO endpoint with the harness CA b
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_tls_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_tls_minio_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
   require_rest_ioctx(datasource);
 
@@ -2375,7 +2389,9 @@ TEST_CASE("rest_ioctx teardown resolves an in-flight async read without hanging"
   auto fixture             = std::make_unique<scan_manager_fixture>();
   auto cfg                 = make_fake_rest_config(server->endpoint());
   cfg.rest.max_connections = 1;
-  auto manager    = std::make_unique<sirius_scan_manager>(cfg, *fixture->memory, fixture->topology);
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  auto manager =
+    std::make_unique<sirius_scan_manager>(scan_lifecycle, cfg, *fixture->memory, fixture->topology);
   auto datasource = manager->create_datasource("s3://lifecycle-bucket/object.bin");
   require_rest_ioctx(datasource);
   auto future = datasource->host_read_async(0, got.size(), got.data());

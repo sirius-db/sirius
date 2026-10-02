@@ -108,9 +108,12 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
 
 TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -118,6 +121,8 @@ TEST_CASE("Task scheduler can start and stop gracefully", "[task_scheduler]")
 
 TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_scheduler][config]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   gpu_config.cpu_affinity_list = {999};
@@ -130,7 +135,7 @@ TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_s
   topology.gpus.push_back(std::move(gpu));
 
   task_scheduler executor(
-    gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
 
   std::size_t visited = 0;
   executor.visit_executors([&](int device_id, auto const& gpu_executor) {
@@ -143,9 +148,12 @@ TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_s
 
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -177,6 +185,8 @@ TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_schedul
 TEST_CASE("terminate_query fails only its own query and leaves the scheduler running",
           "[task_scheduler][concurrency]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   // Regression for the "one query's failure hangs the whole engine" class of bug:
   // terminate_query used to call stop(), which closed the request channel, joined the management
   // thread and stopped every GPU executor -- for ALL queries -- with no path that ever calls
@@ -184,7 +194,8 @@ TEST_CASE("terminate_query fails only its own query and leaves the scheduler run
   // arrive, as was every subsequent query in the process.
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   executor.start();
 
@@ -230,10 +241,10 @@ TEST_CASE("the lifecycle gate refuses scheduling for a quiescing query",
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   // Declared BEFORE the scheduler so it is destroyed AFTER it: the scheduler and every GPU
-  // executor hold a raw pointer to the gate, and ~task_scheduler still runs stop().
+  // executor hold a reference to the gate, and ~task_scheduler still runs stop().
   sirius::exec::query_lifecycle_registry lifecycle;
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
-  executor.set_query_lifecycle_registry(&lifecycle);
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0.
   const auto mock_query = sirius::make_query_id(0);
@@ -280,8 +291,8 @@ TEST_CASE("scheduling an unknown query reports an error instead of leaving it pe
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::query_lifecycle_registry lifecycle;
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
-  executor.set_query_lifecycle_registry(&lifecycle);
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto handler      = std::make_shared<completion_handler>();
   auto future       = handler->get_awaitable();
@@ -306,8 +317,8 @@ TEST_CASE("wait_for_completion validates only its own query's queue",
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
   sirius::exec::query_lifecycle_registry lifecycle;
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
-  executor.set_query_lifecycle_registry(&lifecycle);
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   // Mock tasks carry no pipeline, so index_keys_for() reports them as query 0. Completing a
   // DIFFERENT query id must ignore them entirely.
@@ -343,9 +354,12 @@ TEST_CASE("wait_for_completion validates only its own query's queue",
 
 TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler executor(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  task_scheduler executor(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -384,7 +398,10 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
 {
   auto manager = initialize_memory_manager(1);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  task_scheduler sched(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
   auto* queue       = sched.get_pipeline_task_queue();
@@ -403,7 +420,7 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   while (auto t = queue->mutable_pop_if([](sirius::parallel::itask&) { return true; },
                                         /*front_to_back=*/false)) {
     extracted.push_back(
-      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue));
+      std::make_unique<sirius::convertible_gpu_pipeline_task>(std::move(*t), *queue, lifecycle));
   }
   REQUIRE(extracted.size() == num_tasks);
 
@@ -432,7 +449,10 @@ TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_sched
 
   auto manager = initialize_memory_manager(2);
   sirius::exec::thread_pool_config gpu_config{2};
-  task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  task_scheduler sched(
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
   sched.start();
@@ -492,8 +512,7 @@ TEST_CASE("scheduler and spill return retain submission through rejected task de
   SECTION("scheduler enqueue")
   {
     auto manager = initialize_memory_manager(1);
-    task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
-    scheduler.set_query_lifecycle_registry(&lifecycle);
+    task_scheduler scheduler(lifecycle, {2}, *manager, sirius::test::make_test_telemetry_context());
     scheduler.get_pipeline_task_queue()->interrupt();
     scheduler.schedule(
       std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction));
@@ -506,7 +525,7 @@ TEST_CASE("scheduler and spill return retain submission through rejected task de
       sirius::convertible_gpu_pipeline_task spilled(
         std::make_unique<submission_observing_task>(lifecycle, publishers_at_destruction),
         queue,
-        &lifecycle);
+        lifecycle);
     }
     REQUIRE(queue.empty());
   }
@@ -522,8 +541,7 @@ TEST_CASE("scheduler error cleanup waits for publishers before its existing drai
 {
   auto manager = initialize_memory_manager(1);
   sirius::exec::query_lifecycle_registry lifecycle;
-  task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
-  scheduler.set_query_lifecycle_registry(&lifecycle);
+  task_scheduler scheduler(lifecycle, {2}, *manager, sirius::test::make_test_telemetry_context());
   const auto q = sirius::make_query_id(0);
   lifecycle.open_query(q);
   auto publisher = lifecycle.try_begin_submission(q);
@@ -553,8 +571,7 @@ TEST_CASE("scheduler retirement waits for a task removed from its queue",
 {
   auto manager = initialize_memory_manager(1);
   sirius::exec::query_lifecycle_registry lifecycle;
-  task_scheduler scheduler({2}, *manager, sirius::test::make_test_telemetry_context());
-  scheduler.set_query_lifecycle_registry(&lifecycle);
+  task_scheduler scheduler(lifecycle, {2}, *manager, sirius::test::make_test_telemetry_context());
   const auto q = sirius::make_query_id(0);
   lifecycle.open_query(q);
   auto global = std::make_shared<mock_gpu_pipeline_task_global_state>();
@@ -585,8 +602,10 @@ TEST_CASE("scheduler retirement waits for a task removed from its queue",
 TEST_CASE("scheduler chooses oldest compatible runnable task across affinity buckets",
           "[task_scheduler][concurrency]")
 {
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   auto manager = initialize_memory_manager(1);
-  task_scheduler scheduler({1}, *manager, sirius::test::make_test_telemetry_context());
+  task_scheduler scheduler(lifecycle, {1}, *manager, sirius::test::make_test_telemetry_context());
   std::vector<int> order;
   std::atomic<int> completed{0};
   class ordered_task : public mock_gpu_pipeline_task {

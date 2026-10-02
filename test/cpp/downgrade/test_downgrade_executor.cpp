@@ -131,14 +131,15 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
  *
  * Pass nullptr for memory_space when the monitor loop shouldn't trigger automatically.
  */
-downgrade_executor make_test_executor(sirius::data::data_repository_manager_registry& repo_registry,
+downgrade_executor make_test_executor(sirius::exec::query_lifecycle_registry& lifecycle,
+                                      sirius::data::data_repository_manager_registry& repo_registry,
                                       cucascade::memory::memory_space* gpu_space,
                                       sirius::memory::sirius_memory_reservation_manager& mem_mgr)
 {
   sirius::exec::downgrade_executor_config config{
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = std::chrono::milliseconds{0}};
-  return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
+  return downgrade_executor(lifecycle, config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
 
 std::unique_ptr<cudf::table> make_int32_table(cucascade::memory::memory_space& gpu_space,
@@ -215,11 +216,13 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
   // nullptr memory_space — monitor loop won't trigger, just tests lifecycle
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -229,10 +232,12 @@ TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downg
 {
   auto mem_mgr    = make_test_memory_manager();
   auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1024);
@@ -247,6 +252,8 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -262,7 +269,7 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::GPU);
   REQUIRE(get_batch_tier(*batch3) == cucascade::memory::Tier::GPU);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -288,6 +295,8 @@ TEST_CASE("request_free_memory preserves pending producer writes",
   ::cuda::stream_ref writer_stream =
     use_default_stream ? ::cuda::stream_ref{cudaStream_t{nullptr}} : ::cuda::stream_ref{producer};
   CAPTURE(use_default_stream);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -295,7 +304,7 @@ TEST_CASE("request_free_memory preserves pending producer writes",
   auto* data     = table->mutable_view().column(0).data<int32_t>();
   std::shared_ptr<cudf::table> table_owner;
   std::shared_ptr<cucascade::data_batch> batch;
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   producer_gate gate{writer_stream};
 
   REQUIRE(cudaLaunchHostFunc(writer_stream.get(), producer_gate::wait, &gate) == cudaSuccess);
@@ -349,6 +358,8 @@ TEST_CASE("GPU downgrade rejects a missing writer event until the producer recor
   auto* gpu_space                  = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr      = *repo_registry.create_for_query(kTestQueryId);
   auto repo           = std::make_unique<cucascade::shared_data_repository>();
@@ -372,7 +383,7 @@ TEST_CASE("GPU downgrade rejects a missing writer event until the producer recor
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
   REQUIRE(executor.request_free_memory_and_wait(1ull << 30) > 0);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
@@ -387,6 +398,8 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -401,7 +414,7 @@ TEST_CASE("request_free_memory respects byte target via predicate", "[downgrade_
   size_t one_batch_size = get_batch_size(*batches[0]);
   REQUIRE(one_batch_size > 0);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(one_batch_size);
@@ -426,6 +439,8 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
 
@@ -448,7 +463,7 @@ TEST_CASE("request_free_memory downgrades across multiple repos", "[downgrade_ex
 
   size_t one_batch_size = get_batch_size(*batch_p0);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Request enough to downgrade at least one batch
@@ -471,6 +486,8 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -486,7 +503,7 @@ TEST_CASE("request_free_memory iterates partitions from last to first", "[downgr
 
   size_t two_batches = get_batch_size(*batch_p0) * 2;
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(two_batches);
@@ -506,6 +523,8 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -522,7 +541,7 @@ TEST_CASE("request_free_memory skips active partitions in first pass", "[downgra
 
   size_t three_batches = get_batch_size(*batch_p0) * 3;
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(three_batches);
@@ -545,6 +564,8 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr  = *repo_registry.create_for_query(kTestQueryId);
   auto repo       = std::make_unique<cucascade::shared_data_repository>();
@@ -572,7 +593,7 @@ TEST_CASE("request_free_memory skips batches already on HOST", "[downgrade_execu
 
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   size_t freed = executor.request_free_memory_and_wait(1ull << 30);
@@ -590,6 +611,8 @@ TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[d
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -597,7 +620,7 @@ TEST_CASE("request_free_memory returns future that resolves to bytes freed", "[d
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   auto future  = executor.request_free_memory(1ull << 30);
@@ -614,6 +637,8 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -627,7 +652,7 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
 
   std::atomic<size_t> call_count{0};
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Already-true predicate: the pre-dispatch check must satisfy the request without spilling
@@ -656,6 +681,8 @@ TEST_CASE("request_downgrade stops once the predicate becomes satisfied", "[down
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -669,7 +696,7 @@ TEST_CASE("request_downgrade stops once the predicate becomes satisfied", "[down
 
   std::atomic<size_t> call_count{0};
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Predicate becomes true from the second evaluation on. Pool width is 1, so the pre-dispatch
@@ -695,6 +722,8 @@ TEST_CASE("request_free_memory does not overshoot its byte target", "[downgrade_
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -709,7 +738,7 @@ TEST_CASE("request_free_memory does not overshoot its byte target", "[downgrade_
   size_t one_batch_size = get_batch_size(*batches[0]);
   REQUIRE(one_batch_size > 0);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Target of 1.5 batches: planned-bytes gating stops dispatch at 2 batches instead of
@@ -733,6 +762,8 @@ TEST_CASE("request_free_memory best-fits a small deficit instead of a whole larg
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
@@ -750,7 +781,7 @@ TEST_CASE("request_free_memory best-fits a small deficit instead of a whole larg
   REQUIRE(small_size > 0);
   REQUIRE(get_batch_size(*batch_large2) > small_size);
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Deficit the small batch covers: best-fit spills it, where policy order alone would have
@@ -772,6 +803,8 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   auto* gpu_space = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
 
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr    = *repo_registry.create_for_query(kTestQueryId);
   auto repo         = std::make_unique<cucascade::shared_data_repository>();
@@ -780,7 +813,7 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 
-  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
   // Request far more than available

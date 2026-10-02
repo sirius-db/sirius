@@ -39,7 +39,7 @@ namespace sirius::scan_manager {
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
                                      cucascade::memory::memory_space* gpu_space,
-                                     exec::query_lifecycle_registry* lifecycle)
+                                     exec::query_lifecycle_registry& lifecycle)
   : memory_prefetcher(
       cfg,
       std::move(connectors),
@@ -51,7 +51,7 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
                                      std::vector<cucascade::memory::memory_space*> gpu_spaces,
-                                     exec::query_lifecycle_registry* lifecycle)
+                                     exec::query_lifecycle_registry& lifecycle)
   : _lifecycle(lifecycle),
     _config(cfg),
     _connectors(std::move(connectors)),
@@ -108,12 +108,11 @@ void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
 {
   if (!fatal_device_exception(error)) return;
   _running.store(false, std::memory_order_relaxed);
-  if (_lifecycle) {
-    _lifecycle->mark_runtime_failed();
-    try {
-      _lifecycle->quiesce_all();
-    } catch (...) {
-    }
+
+  _lifecycle.mark_runtime_failed();
+  try {
+    _lifecycle.quiesce_all();
+  } catch (...) {
   }
 }
 

@@ -66,8 +66,9 @@ class dummy_task : public itask {
  */
 class dummy_task_executor : public itask_executor {
  public:
-  explicit dummy_task_executor(sirius::exec::thread_pool_config config)
-    : itask_executor(std::move(config), sirius::test::make_test_telemetry_context())
+  explicit dummy_task_executor(sirius::exec::query_lifecycle_registry& lifecycle,
+                               sirius::exec::thread_pool_config config)
+    : itask_executor(lifecycle, std::move(config), sirius::test::make_test_telemetry_context())
   {
   }
 
@@ -91,7 +92,9 @@ class dummy_task_executor : public itask_executor {
 TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 {
   sirius::exec::thread_pool_config config{4, "test_exec"};
-  dummy_task_executor executor(config);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  dummy_task_executor executor(lifecycle, config);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -100,7 +103,9 @@ TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 TEST_CASE("Executor executes scheduled tasks", "[task_executor]")
 {
   sirius::exec::thread_pool_config config{4, "test_exec"};
-  dummy_task_executor executor(config);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  dummy_task_executor executor(lifecycle, config);
   auto g = std::make_shared<dummy_task_global_state>();
 
   REQUIRE_NOTHROW(executor.start());
@@ -133,8 +138,7 @@ TEST_CASE("executor retains submission through rejected task destruction",
   sirius::exec::query_lifecycle_registry lifecycle;
   const auto q = sirius::make_query_id(0);  // Non-pipeline test tasks use query 0.
   lifecycle.open_query(q);
-  dummy_task_executor executor({1, "submission-test"});
-  executor.set_query_lifecycle_registry(&lifecycle);
+  dummy_task_executor executor(lifecycle, {1, "submission-test"});
   executor.interrupt_queue_for_test();
   std::size_t publishers_at_destruction = 99;
   class observing_task : public dummy_task {

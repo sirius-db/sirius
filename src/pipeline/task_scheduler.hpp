@@ -71,7 +71,8 @@ class task_scheduler {
    * @param sys_topology Optional system topology info for CPU affinity
    * @param downgrade_executors Optional vector of downgrade executors
    */
-  explicit task_scheduler(const exec::thread_pool_config& gpu_executor_config,
+  explicit task_scheduler(sirius::exec::query_lifecycle_registry& lifecycle,
+                          const exec::thread_pool_config& gpu_executor_config,
                           sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
@@ -199,14 +200,6 @@ class task_scheduler {
                        std::exception_ptr error);
 
   /**
-   * @brief Bind the per-query lifecycle gate, propagating it to every GPU executor.
-   *
-   * Without one (the default, and what most unit tests use) every query is treated as accepting
-   * work, i.e. the pre-gate behaviour.
-   */
-  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry);
-
-  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish
@@ -251,8 +244,8 @@ class task_scheduler {
   /// Observer of query event transitions. Never null.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
-  /// Non-owning; owned by SiriusContext and outlives this scheduler. Null in unit tests.
-  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this scheduler.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

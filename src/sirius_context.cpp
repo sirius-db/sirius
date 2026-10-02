@@ -927,6 +927,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         dg_cfg.preferred_numa_node = topology_index_->numa_node_of(space->get_device_id());
       }
       auto executor = std::make_unique<sirius::parallel::downgrade_executor>(
+        query_lifecycle_,
         dg_cfg,
         data_repository_registry_,
         space->get_id(),
@@ -941,33 +942,24 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   create_executors_for_tier(cucascade::memory::Tier::HOST);
 
   task_scheduler_ =
-    std::make_unique<sirius::pipeline::task_scheduler>(config_.get_gpu_pipeline_executor_config(),
+    std::make_unique<sirius::pipeline::task_scheduler>(query_lifecycle_,
+                                                       config_.get_gpu_pipeline_executor_config(),
                                                        *memory_manager_,
                                                        telemetry_context_,
                                                        &config_.get_hw_topology(),
                                                        &downgrade_executors_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_config(), *memory_manager_, topology_index_);
+    query_lifecycle_, config_.get_task_creator_config(), *memory_manager_, topology_index_);
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
   query_event_publisher_ = std::make_shared<sirius::event::query_event_publisher>();
   task_creator_->set_query_event_publisher(*query_event_publisher_);
   task_scheduler_->set_query_event_publisher(*query_event_publisher_);
-  // Bind the per-query enqueue gate to every producer. From here on, a query that has entered
-  // cleanup cannot have work added behind a drain that already passed — previously this was only
-  // achievable by interrupting the shared queues, which refused every query's pushes at once.
-  task_creator_->set_query_lifecycle_registry(&query_lifecycle_);
-  task_scheduler_->set_query_lifecycle_registry(&query_lifecycle_);
-  for (auto& executor : downgrade_executors_) {
-    executor->set_query_lifecycle_registry(&query_lifecycle_);
-  }
-
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), *memory_manager_, topology_index_);
+    query_lifecycle_, config_.get_scan_manager_config(), *memory_manager_, topology_index_);
   scan_manager_->set_query_event_publisher(*query_event_publisher_);
-  scan_manager_->set_query_lifecycle_registry(&query_lifecycle_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

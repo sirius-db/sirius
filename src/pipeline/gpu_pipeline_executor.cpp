@@ -48,13 +48,14 @@ namespace sirius {
 namespace pipeline {
 
 gpu_pipeline_executor::gpu_pipeline_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : sirius::parallel::itask_executor(
-      config, std::move(telemetry_context), mem_space->get_device_id()),
+      lifecycle, config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
@@ -213,15 +214,14 @@ void gpu_pipeline_executor::process_task(
       _memory_space->get_max_memory());
     auto const* pipe    = gpu_task->get_pipeline();
     const auto query_id = pipe ? pipe->get_query_id() : make_query_id(0);
-    if (_query_lifecycle && !_query_lifecycle->accepts_work(query_id)) { return; }
+    if (!_query_lifecycle.accepts_work(query_id)) { return; }
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
     if (!reservation || reservation->size() < bytes_needs) {
       reservation.reset();
       const auto now = std::chrono::steady_clock::now();
       if (pipeline_task->memory_wait_started == std::chrono::steady_clock::time_point{}) {
         pipeline_task->memory_wait_started = now;
-        if (_query_lifecycle)
-          pipeline_task->memory_wait = _query_lifecycle->begin_memory_wait(query_id);
+        pipeline_task->memory_wait         = _query_lifecycle.begin_memory_wait(query_id);
         if (_query_event_publisher) {
           _query_event_publisher->publish_wait_for_memory_for_task(
             query_id,
@@ -243,9 +243,9 @@ void gpu_pipeline_executor::process_task(
         try {
           _pending_reclamation.get();
         } catch (...) {
-          if (_query_lifecycle && fatal_device_exception(std::current_exception())) {
-            _query_lifecycle->mark_runtime_failed();
-            _query_lifecycle->quiesce_all();
+          if (fatal_device_exception(std::current_exception())) {
+            _query_lifecycle.mark_runtime_failed();
+            _query_lifecycle.quiesce_all();
             if (iteration_completion) iteration_completion->report_error(std::current_exception());
             return;
           }
@@ -258,13 +258,8 @@ void gpu_pipeline_executor::process_task(
         _next_reclamation    = now + std::chrono::milliseconds(50);
       }
       pipeline_task->retry_not_before = now + std::chrono::milliseconds(5);
-      if (_task_creator) {
-        _task_creator->reschedule(std::move(pipeline_task));
-      } else {
-        // Standalone component compatibility; production always has a task creator.
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        schedule(std::move(pipeline_task));
-      }
+      if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
+      _task_creator->reschedule(std::move(pipeline_task));
       return;  // releases the reserved worker slot
     }
     pipeline_task->memory_wait_started = {};
@@ -329,9 +324,9 @@ void gpu_pipeline_executor::process_task(
 
           // Sync the stream to ensure all memory is released before the reschedule.
           auto const status = cudaStreamSynchronize(exc_stream.get().get());
-          if (_query_lifecycle && fatal_cuda_status(status)) {
-            _query_lifecycle->mark_runtime_failed();
-            _query_lifecycle->quiesce_all();
+          if (fatal_cuda_status(status)) {
+            _query_lifecycle.mark_runtime_failed();
+            _query_lifecycle.quiesce_all();
           }
           check_cuda_health(status);
           if (status != cudaSuccess)
@@ -430,16 +425,13 @@ void gpu_pipeline_executor::process_task(
             pipeline_task->telemetry_handle().exit();
             pipeline_task->set_telemetry_finalized();
           }
-          if (_task_creator) {
-            _task_creator->reschedule(std::move(new_task));
-          } else {
-            this->schedule(std::move(new_task));
-          }
+          if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
+          _task_creator->reschedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
-          if (_query_lifecycle && fatal_device_exception(std::current_exception())) {
-            _query_lifecycle->mark_runtime_failed();
-            _query_lifecycle->quiesce_all();
+          if (fatal_device_exception(std::current_exception())) {
+            _query_lifecycle.mark_runtime_failed();
+            _query_lifecycle.quiesce_all();
           }
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (completion) { completion->report_error(std::current_exception()); }

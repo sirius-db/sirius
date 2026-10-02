@@ -423,7 +423,8 @@ TEST_CASE("the pinned entry records the proof by name", "[late_mat][pin_uniquene
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
   pin_columns(manager, *space, "customer", {"c_name", "c_custkey"}, stream);
   REQUIRE(proven_of(manager, "customer").empty());  // no fact yet = unknown
@@ -445,7 +446,8 @@ TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
   pin_columns(manager, *space, "customer", {"c_custkey"}, stream);
   std::vector<std::string> const proven{"c_custkey"};
@@ -470,7 +472,8 @@ TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, topology};
 
   // First pin stores both of its columns.
   auto const first =

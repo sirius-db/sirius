@@ -120,7 +120,8 @@ class task_creator {
    * @param mem_res_mgr Reference to the memory reservation manager.
    * @param topology_index Optional shared GPU<->NUMA index for NUMA-aware GPU routing.
    */
-  task_creator(task_creator_config config,
+  task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+               task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                std::shared_ptr<const sirius::memory::topology_index> topology_index = nullptr);
 
@@ -170,15 +171,6 @@ class task_creator {
   void publish_pipeline_closure(sirius::query_id_t query_id,
                                 std::size_t pipeline_id,
                                 std::size_t source_operator_id) noexcept;
-
-  /// \brief Bind the per-query lifecycle gate consulted before every enqueue.
-  ///
-  /// Without one (the default, and what most unit tests use) every query is treated as accepting
-  /// work, i.e. the pre-gate behaviour.
-  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry) noexcept
-  {
-    _query_lifecycle = registry;
-  }
 
   /// \brief Register the per-query state for @p query's pipelines.
   ///
@@ -296,7 +288,7 @@ class task_creator {
   /**
    * @brief Register a publisher and diagnose an unknown query. Retain the guard through push.
    *
-   * An empty guard with no registry bound preserves the standalone unit-test behavior.
+   * Unknown and retiring queries return a refused guard; no work may be published.
    */
   [[nodiscard]] sirius::exec::query_lifecycle_registry::submission_guard begin_submission(
     sirius::query_id_t query_id) const;
@@ -363,8 +355,8 @@ class task_creator {
   /// the context's own in set_query_event_publisher.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
-  /// Non-owning; owned by SiriusContext and outlives this creator. Null in unit tests.
-  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this creator.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 

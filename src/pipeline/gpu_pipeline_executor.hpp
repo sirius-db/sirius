@@ -77,6 +77,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    * memory space.
    */
   explicit gpu_pipeline_executor(
+    sirius::exec::query_lifecycle_registry& lifecycle,
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,

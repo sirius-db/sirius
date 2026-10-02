@@ -91,6 +91,7 @@ class downgrade_executor {
    * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
+    sirius::exec::query_lifecycle_registry& lifecycle,
     exec::downgrade_executor_config config,
     sirius::data::data_repository_manager_registry& data_repo_registry,
     cucascade::memory::memory_space_id space_id,
@@ -147,18 +148,6 @@ class downgrade_executor {
    */
   void set_pipeline_task_queue(
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
-
-  /**
-   * @brief Bind the per-query lifecycle gate.
-   *
-   * Forwarded to every convertible_gpu_pipeline_task the TIER-2 sweep creates, so a task
-   * extracted from the shared queue is dropped rather than re-pushed once its query starts
-   * tearing down. Without one (the unit-test default) the re-push is ungated, as before.
-   */
-  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry) noexcept
-  {
-    _query_lifecycle = registry;
-  }
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -229,8 +218,8 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
-  /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
-  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 }  // namespace parallel

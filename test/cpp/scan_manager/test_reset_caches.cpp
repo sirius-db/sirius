@@ -143,8 +143,10 @@ TEST_CASE("reset_caches replaces a populated cache with an empty one",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
   auto* before = manager.io_ctx()->cache();
   REQUIRE(before != nullptr);
   bool const was_armed = before->is_armed();
@@ -176,8 +178,10 @@ TEST_CASE("a rebuilt cache is usable again", "[scan_manager][cache][reset_cache]
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
   REQUIRE(claim_some_cache(manager, file) > 0);
   manager.reset_caches();
 
@@ -192,8 +196,10 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   manager.reset_caches();
@@ -224,8 +230,10 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
   auto* host_mr = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
   REQUIRE(host_mr != nullptr);
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   // Baseline AFTER construction: the scan manager's own io/uring buffers are
@@ -252,8 +260,10 @@ TEST_CASE("reset_caches is a no-op where the configuration does not cache",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
 
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::none), *memory, topology};
+    scan_lifecycle, config_with_cache(sirius::io::cache::cache_mode::none), *memory, topology};
   // Caching off, so no cache was ever built...
   REQUIRE(manager.io_ctx()->cache() == nullptr);
 

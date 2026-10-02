@@ -554,3 +554,12 @@ TEST_CASE("failed runtime closes existing publishers and refuses late initializa
   registry.close(make_query_id(1));
   CHECK(registry.runtime_failed());
 }
+
+TEST_CASE("retaining query resources requires registration", "[query_lifecycle_gate]")
+{
+  sirius::exec::query_lifecycle_registry registry;
+  auto owner = std::make_shared<int>(42);
+  REQUIRE_THROWS_AS(registry.retain_resources(sirius::make_query_id(42), owner), std::logic_error);
+  REQUIRE(registry.size() == 0);
+  REQUIRE(owner.use_count() == 1);
+}

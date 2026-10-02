@@ -1298,10 +1298,12 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
-  : _config(config),
+  : _query_lifecycle(lifecycle),
+    _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _thread_pool(_config.thread_pool.num_threads,

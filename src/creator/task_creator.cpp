@@ -47,10 +47,12 @@ namespace sirius::creator {
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(task_creator_config config,
+task_creator::task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+                           task_creator_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                            std::shared_ptr<const sirius::memory::topology_index> topology_index)
-  : _running(false),
+  : _query_lifecycle(lifecycle),
+    _running(false),
     _config(std::move(config)),
     _task_creation_queue([](const task_creation_request& request) -> exec::index_keys {
       // The request carries ALL of its own keys, resolved at schedule() time where the node's
@@ -443,27 +445,27 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   // Callers still own the plan while extracting keys above. Register this publisher through
   // push(), so cleanup cannot drain between checking the gate and inserting the request.
   auto submission = begin_submission(query_id);
-  if (_query_lifecycle != nullptr && !submission) { return; }
+  if (!submission) { return; }
   auto request           = std::make_unique<task_creation_request>();
   request->node          = node;
   request->query_id      = query_id;
   request->priority      = priority;
   request->operator_type = node->type;
-  if (submission) { request->work = submission.take_work_lease(); }
+  request->work          = submission.take_work_lease();
   report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
   auto submission = begin_submission(query_id);
-  if (_query_lifecycle != nullptr && !submission) { return; }
+  if (!submission) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
   request->operator_type   = node->type;
-  if (submission) { request->work = submission.take_work_lease(); }
+  request->work            = submission.take_work_lease();
   report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
 }
 
@@ -477,7 +479,7 @@ void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) c
   // bug in this subsystem into an unexplained hang.
   //
   // For a quiescing/closed query the drop is the documented teardown contract, not a bug.
-  if (_query_lifecycle == nullptr || _query_lifecycle->accepts_work(query_id)) {
+  if (_query_lifecycle.accepts_work(query_id)) {
     if (auto state = get_query_task_global_state(query_id); state && state->completion_handler) {
       state->completion_handler->report_error("creator queue closed before publication");
     }
@@ -494,8 +496,7 @@ void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) c
 sirius::exec::query_lifecycle_registry::submission_guard task_creator::begin_submission(
   sirius::query_id_t query_id) const
 {
-  if (_query_lifecycle == nullptr) { return {}; }
-  auto submission = _query_lifecycle->try_begin_submission(query_id);
+  auto submission = _query_lifecycle.try_begin_submission(query_id);
   if (submission.status() == sirius::exec::query_submission_status::unknown) {
     if (auto query_state = get_query_task_global_state(query_id);
         query_state && query_state->completion_handler) {
@@ -544,7 +545,7 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
   for (auto const& [query_id, state] : states) {
     if (!state) { continue; }
     auto submission = begin_submission(query_id);
-    if (_query_lifecycle && !submission) { continue; }
+    if (!submission) { continue; }
     try {
       std::lock_guard lock(state->lookahead_mutex);
       for (; state->index_of_next_lookahead < state->lookahead_queue.size();
@@ -568,7 +569,7 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
           request->priority        = priority;
           request->device_id       = device_id_hint.value_or(exec::no_preferred_device);
           request->operator_type   = node->type;
-          if (submission) { request->work = submission.take_work_lease(); }
+          request->work            = submission.take_work_lease();
           report_if_dropped(_task_creation_queue.push(std::move(request)), query_id);
           ++state->index_of_next_lookahead;
           return;

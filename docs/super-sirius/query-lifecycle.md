@@ -20,7 +20,8 @@ gate and accounting. Neither mutex is held during work, queue insertion or resou
 `accepts_work()` is an advisory snapshot. It cannot authorize a later queue push. Publishers use
 `try_begin_submission()` and retain the guard through insertion. `take_work_lease()` transfers
 the guard's work claim into a request or task; the guard then accounts only for publication.
-Standalone test components without a bound registry retain their previous behavior.
+Runtime components require a registry reference at construction, including standalone test
+fixtures. The registry must outlive their workers and queues; there is no ungated mode.
 
 Creator requests keep their lease through hint traversal and the creation worker. Execution
 tasks keep theirs through scheduler routing, executor dispatch, retries and destruction. The

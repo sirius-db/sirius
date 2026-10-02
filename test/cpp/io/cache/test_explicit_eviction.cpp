@@ -149,7 +149,9 @@ TEST_CASE("claimed_bytes tracks the staging memory the cache is holding",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -178,7 +180,9 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -215,7 +219,9 @@ TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retry
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -252,7 +258,9 @@ TEST_CASE("failed nonblocking preparation starts eviction without waiting",
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -297,7 +305,9 @@ TEST_CASE("prepare does not publish a request the retry's eviction left short of
   auto memory   = constrained_memory_manager();
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, constrained_lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -360,7 +370,9 @@ TEST_CASE("prepare abandons immediately after the consumer reaches the split",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto ds = manager.create_datasource(file.path.string());
   REQUIRE(ds != nullptr);
 
@@ -379,7 +391,9 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -408,7 +422,9 @@ TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
 
@@ -436,7 +452,9 @@ TEST_CASE("the evictor retires disposed requests while the pool is under its thr
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_evict();
 
-  sirius_scan_manager manager{lru_config(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius_scan_manager manager{scan_lifecycle, lru_config(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());

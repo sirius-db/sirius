@@ -30,10 +30,12 @@ namespace sirius {
 namespace parallel {
 
 itask_executor::itask_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::thread_pool_config config,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::optional<int> device_id)
-  : _config(std::move(config)),
+  : _query_lifecycle(lifecycle),
+    _config(std::move(config)),
     // Shared with the task_scheduler's queue so both derive a task's query the same way; see
     // pipeline::index_keys_for.
     _task_queue(&pipeline::index_keys_for),
@@ -56,20 +58,20 @@ bool itask_executor::schedule(std::unique_ptr<itask> input)
   if (task) {
     // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
     // drain for this query may already have passed. Refuse rather than re-arm work behind it.
-    if (_query_lifecycle != nullptr) {
-      const auto query_id = sirius::make_query_id(pipeline::index_keys_for(*task).query_id);
-      submission          = _query_lifecycle->try_begin_submission(query_id);
-      if (submission.status() == exec::query_submission_status::unknown) {
-        if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-          if (auto handler = gpu_task->get_completion_handler()) {
-            handler->report_error("task_executor: query lifecycle registration is missing");
-          }
+
+    const auto query_id = sirius::make_query_id(pipeline::index_keys_for(*task).query_id);
+    submission          = _query_lifecycle.try_begin_submission(query_id);
+    if (submission.status() == exec::query_submission_status::unknown) {
+      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error("task_executor: query lifecycle registration is missing");
         }
-        SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
       }
-      if (!submission) { return false; }
-      task->retain_work(submission.take_work_lease());
+      SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
     }
+    if (!submission) { return false; }
+    task->retain_work(submission.take_work_lease());
+
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
         .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -207,19 +209,8 @@ void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
 {
   // Production tasks carry leases from publication, including manager-local tasks. The
   // scheduler drains every queue before waiting for those leases. No shared thread is stopped.
-  if (_query_lifecycle) {
-    drain_query_tasks(query_id);
-    if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
-    return;
-  }
-  // Standalone executors without lifecycle accounting still need the legacy join.
-  if (!_bounded_pool) {
-    drain_query_tasks(query_id);
-    return;
-  }
-  quiesce_manager();
   drain_query_tasks(query_id);
-  resume_manager();
+  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
 }
 
 }  // namespace parallel

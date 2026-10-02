@@ -369,11 +369,11 @@ class query_lifecycle_registry {
   }
 
   /// Keep the execution's plan alive independently of its front-end engine. Registration
-  /// precedes publication. Unknown IDs support standalone plan-building fixtures.
+  /// precedes publication; an unknown ID is a missing registration, not a standalone mode.
   void retain_resources(query_id_t query_id, std::shared_ptr<void> resources)
   {
     auto control = find(query_id);
-    if (!control) { return; }
+    if (!control) { throw std::logic_error("query resources require lifecycle registration"); }
     std::lock_guard lock(control->mutex);
     if (control->state != query_lifecycle_state::open || control->resources) {
       throw std::logic_error("query resources already registered or retiring");

@@ -493,15 +493,11 @@ class sirius_scan_manager {
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  sirius_scan_manager(const scan_manager_config& config,
+  sirius_scan_manager(sirius::exec::query_lifecycle_registry& lifecycle,
+                      const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
                       std::shared_ptr<const sirius::memory::topology_index> topology_index);
 
-  /// Startup wiring; registry outlives all prefetch workers.
-  void set_query_lifecycle_registry(exec::query_lifecycle_registry* registry)
-  {
-    _query_lifecycle = registry;
-  }
   ~sirius_scan_manager();
 
   // Non-copyable and non-movable
@@ -1035,7 +1031,7 @@ class sirius_scan_manager {
   /// backend cannot be built.  The returned ioctx stays owned by this manager.
   sirius::io::rest::rest_ioctx* rest_ioctx_for_list();
 
-  exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of

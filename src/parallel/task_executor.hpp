@@ -56,7 +56,8 @@ class itask_executor {
    * @param device_id GPU this executor is bound to, if any. Used to parent the
    * task-queue telemetry under that GPU's device group instead of the engine.
    */
-  explicit itask_executor(exec::thread_pool_config config,
+  explicit itask_executor(sirius::exec::query_lifecycle_registry& lifecycle,
+                          exec::thread_pool_config config,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           std::optional<int> device_id = std::nullopt);
 
@@ -75,17 +76,6 @@ class itask_executor {
    * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
   bool schedule(std::unique_ptr<itask> task);
-
-  /**
-   * @brief Bind the per-query lifecycle gate consulted before enqueuing.
-   *
-   * Without one (the default, and what most unit tests use) every query is treated as accepting
-   * work, i.e. the pre-gate behaviour.
-   */
-  void set_query_lifecycle_registry(exec::query_lifecycle_registry* registry) noexcept
-  {
-    _query_lifecycle = registry;
-  }
 
   /**
    * @brief Start the executor: creates the thread pool and manager thread.
@@ -167,7 +157,7 @@ class itask_executor {
    * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
    * slot forever and wait_all() (which waits for active_ == 0) would never return.
    *
-   * Used by the whole-executor drain and the standalone fallback without lifecycle accounting.
+   * Used by the whole-executor drain.
    * Production per-query retirement leaves the manager running.
    */
   void quiesce_manager();
@@ -226,8 +216,8 @@ class itask_executor {
   /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
   /// same extractor the task_scheduler's queue uses.
   exec::multi_index_priority_queue<itask> _task_queue;
-  /// Non-owning; owned by SiriusContext and outlives this executor. Null in unit tests.
-  exec::query_lifecycle_registry* _query_lifecycle{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  exec::query_lifecycle_registry& _query_lifecycle;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

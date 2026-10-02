@@ -156,7 +156,9 @@ TEST_CASE("describe_parquet routes S3 parquet through rest_ioctx and returns nat
   auto const uri    = parquet_uri(bucket, "nation.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   auto result = manager.describe_parquet(uri);
   require_rest_ioctx_for(manager, uri);
@@ -192,7 +194,9 @@ TEST_CASE("describe_parquet reports nation and region row counts and the region 
   auto const region_uri = parquet_uri(bucket, "region.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   auto nation = manager.describe_parquet(nation_uri);
   auto region = manager.describe_parquet(region_uri);
@@ -209,7 +213,8 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
   cfg.backend = sirius::scan_manager::io_backend::sirius;
-  sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, std::move(cfg), *fixture.memory, fixture.topology};
 
   for (auto const fixture_name : {"nested_struct.parquet",
                                   "nested_list.parquet",
@@ -239,7 +244,9 @@ TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU re
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   for (auto const fixture_name : {"nested_struct.parquet",
                                   "nested_list.parquet",
@@ -270,7 +277,9 @@ TEST_CASE("describe_parquet surfaces missing S3 parquet objects from HEAD",
   auto const uri    = parquet_uri(bucket, "does-not-exist.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   try {
     (void)manager.describe_parquet(uri);
@@ -293,7 +302,9 @@ TEST_CASE("describe_parquet parks parsed parquet metadata in the rest metadata s
   auto const uri    = parquet_uri(bucket, "nation.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   auto result = manager.describe_parquet(uri);
 
@@ -323,7 +334,9 @@ TEST_CASE("describe_parquet returns identical bind results on repeated S3 binds"
   auto const uri    = parquet_uri(bucket, "nation.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{
+    scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
 
   auto cold = manager.describe_parquet(uri);
   auto warm = manager.describe_parquet(uri);
@@ -342,7 +355,9 @@ TEST_CASE("describe_parquet handles small and larger S3 parquet objects",
 
   auto require_valid_description = [&](std::string const& file_name) {
     scan_manager_fixture fixture;
-    sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
+    sirius_scan_manager manager{
+      scan_lifecycle, make_minio_rest_config(), *fixture.memory, fixture.topology};
     auto result = manager.describe_parquet(parquet_uri(bucket, file_name));
 
     INFO(file_name << " object_size: " << result.object_size);

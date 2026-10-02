@@ -129,7 +129,9 @@ TEST_CASE("RAII returns task to queue on destruction", "[convertible_gpu_pipelin
   REQUIRE(queue.size() == 1);
 
   {
-    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    lifecycle.open_query(sirius::make_query_id(0));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
     REQUIRE(queue.empty());
@@ -150,7 +152,9 @@ TEST_CASE("RAII returns task after successful convert", "[convertible_gpu_pipeli
   REQUIRE(queue.push(std::move(task)));
 
   {
-    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    lifecycle.open_query(sirius::make_query_id(0));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
 
@@ -185,7 +189,9 @@ TEST_CASE("RAII returns task on exception", "[convertible_gpu_pipeline_task]")
   REQUIRE(queue.push(std::move(task)));
 
   {
-    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    lifecycle.open_query(sirius::make_query_id(0));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
     REQUIRE(queue.empty());
@@ -209,7 +215,9 @@ TEST_CASE("non-gpu_pipeline_task skipped by predicate", "[convertible_gpu_pipeli
   REQUIRE(queue.push(std::make_unique<dummy_task>()));
   REQUIRE(queue.size() == 1);
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd == nullptr);
   REQUIRE(queue.size() == 1);  // dummy task still in queue
@@ -226,7 +234,9 @@ TEST_CASE("wrong memory_space skipped by predicate", "[convertible_gpu_pipeline_
   auto task = make_test_gpu_task(1, {batch});
   REQUIRE(queue.push(std::move(task)));
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   // Search for tasks in host_space — should find nothing (batch is in gpu_space)
   auto cd = provider.get_next_convertible(e.host_space, false);
   REQUIRE(cd == nullptr);
@@ -247,7 +257,9 @@ TEST_CASE("non-idle batch skipped by predicate", "[convertible_gpu_pipeline_task
   // Hold an exclusive lock so batch is not idle — provider should skip it
   auto exclusive_lock = batch->to_mutable();
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd == nullptr);
   REQUIRE(queue.size() == 1);
@@ -268,7 +280,9 @@ TEST_CASE("matching task selected by predicate", "[convertible_gpu_pipeline_task
   auto task = make_test_gpu_task(1, {batch});  // batch is idle
   REQUIRE(queue.push(std::move(task)));
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
   REQUIRE(queue.empty());
@@ -284,7 +298,9 @@ TEST_CASE("convert GPU task to HOST", "[convertible_gpu_pipeline_task]")
   auto task = make_test_gpu_task(1, {batch});
   REQUIRE(queue.push(std::move(task)));
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
 
@@ -310,7 +326,9 @@ TEST_CASE("bytes_in_space returns correct size", "[convertible_gpu_pipeline_task
   auto task = make_test_gpu_task(1, {batch1, batch2});
   REQUIRE(queue.push(std::move(task)));
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto cd = provider.get_next_convertible(e.gpu_space, false);
   REQUIRE(cd != nullptr);
 
@@ -332,7 +350,9 @@ TEST_CASE("get_all_convertible extracts all matching tasks", "[convertible_gpu_p
   }
   REQUIRE(queue.size() == 3);
 
-  sirius::convertible_gpu_pipeline_task_provider provider(queue);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
   auto all = provider.get_all_convertible(e.gpu_space, false);
   REQUIRE(all.size() == 3);
   REQUIRE(queue.empty());
@@ -353,7 +373,9 @@ TEST_CASE("RAII on interrupted queue does not crash", "[convertible_gpu_pipeline
   REQUIRE(queue.push(std::move(task)));
 
   {
-    sirius::convertible_gpu_pipeline_task_provider provider(queue);
+    sirius::exec::query_lifecycle_registry lifecycle;
+    lifecycle.open_query(sirius::make_query_id(0));
+    sirius::convertible_gpu_pipeline_task_provider provider(queue, lifecycle);
     auto cd = provider.get_next_convertible(e.gpu_space, false);
     REQUIRE(cd != nullptr);
     REQUIRE(queue.empty());
