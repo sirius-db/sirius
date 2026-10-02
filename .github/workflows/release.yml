@@ -100,18 +100,36 @@ jobs:
       - name: Resolve target SHA
         id: target
         run: |
+          set -euo pipefail
           if [ "$MODE" = "stable" ]; then
             # Lowercase, matching the case GitHub's API always returns SHAs in, so later
             # string-equality checks against API-returned SHAs (e.g. the tag-move assertions)
             # compare correctly regardless of how the input was cased.
             sha="$(echo "$SHA_INPUT" | tr 'A-F' 'a-f')"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            # Dry-run: target the most recent main commit that already has a completed,
+            # successful, push-triggered Distribution run, not literal main HEAD. Distribution's
+            # CUDA builds can take over an hour; when the merge queue lands commits faster than
+            # that, literal HEAD is a moving target that never has a finished build by the time
+            # this step runs, so the dry-run fails forever instead of actually exercising this
+            # PR's own logic. The dry-run doesn't care which exact commit it tests against, only
+            # that a real build exists for it.
+            sha=$(gh api "repos/${REPO}/actions/workflows/distribution.yml/runs?branch=main&event=push&status=success" \
+              --jq '.workflow_runs[0].head_sha // empty')
+            if [ -z "$sha" ]; then
+              echo "::error::No completed push-triggered Distribution run found on main at all." >&2
+              exit 1
+            fi
           else
             sha=$(git rev-parse origin/main)
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           MODE: ${{ inputs.mode }}
           SHA_INPUT: ${{ inputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
 
       - name: Resolve release tag
         id: tag
