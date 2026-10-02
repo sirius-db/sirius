@@ -1,0 +1,8 @@
+query_id=2941952651a54222-a7e9fba11c291cbe
+batch_seq=0
+fragments=5
+[0] fragment_id=6 sink=RESULT_SINK instances=1 nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+[1] fragment_id=5 sink=DATA_STREAM_SINK instances=1 nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+[2] fragment_id=4 sink=DATA_STREAM_SINK instances=1 nodes=[FILE_SCAN_NODE]
+[3] fragment_id=2 sink=DATA_STREAM_SINK instances=1 nodes=[FILE_SCAN_NODE]
+[4] fragment_id=0 sink=DATA_STREAM_SINK instances=1 nodes=[AGGREGATION_NODE > FILE_SCAN_NODE]
