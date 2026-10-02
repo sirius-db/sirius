@@ -26,7 +26,8 @@ def validate_inventory(corpus, manifest):
     for relative in files:
         path = PurePosixPath(relative)
         if (
-            path.is_absolute()
+            not path.parts
+            or path.is_absolute()
             or ".." in path.parts
             or path.parts[0] != "warehouse"
             or str(path) != relative
@@ -81,6 +82,33 @@ def validate_table_metadata(corpus, manifest):
         ]
         if table["partition_columns"] != partition_columns:
             raise ValueError(f"Partition schema differs: {name}")
+        # Verify the summary against recorded live file locations. This does not
+        # re-plan Avro manifests or claim to independently prove file liveness.
+        locations = set()
+        for filename in table["live_files"]:
+            matches = [
+                PurePosixPath(p).relative_to(table["path"])
+                for p in manifest["files"]
+                if p.startswith(table["path"] + "/")
+                and PurePosixPath(p).name == filename
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"Missing or ambiguous live file: {name}/{filename}")
+            directories = matches[0].parts[
+                :-2
+            ]  # partition directories before bucket/file
+            if len(directories) != len(partition_columns):
+                raise ValueError(f"Partition layout differs: {name}/{filename}")
+            values = []
+            for directory, (key, _) in zip(directories, partition_columns, strict=True):
+                if not directory.startswith(key + "="):
+                    raise ValueError(f"Partition key differs: {name}/{filename}")
+                values.append(directory[len(key) + 1 :])
+            locations.add(tuple(values))
+        if table["live_partitions"] != [list(v) for v in sorted(locations)]:
+            raise ValueError(
+                f"Partition values differ from live file locations: {name}"
+            )
         for values in table["live_partitions"]:
             if not isinstance(values, list) or len(values) != len(partition_columns):
                 raise ValueError(f"Invalid structured partition: {name}")

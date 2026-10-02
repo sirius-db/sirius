@@ -69,7 +69,13 @@ class CorpusTests(unittest.TestCase):
                     validate_inventory(corpus, self.manifest)
 
     def test_invalid_inventory_path(self):
-        for path in ("/tmp/file", "../file", "warehouse/../file", "warehouse//file"):
+        for path in (
+            "",
+            "/tmp/file",
+            "../file",
+            "warehouse/../file",
+            "warehouse//file",
+        ):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 validate_inventory(HERE, {"files": {path: "fake"}})
 
@@ -125,6 +131,10 @@ class CorpusTests(unittest.TestCase):
                     table["live_partitions"] = ["datetime.date(2026, 9, 26)"]
                 elif mutation == "partition_columns":
                     table["partition_columns"] = []
+                elif mutation == "partition_value":
+                    table["live_partitions"] = [["2020-01-01"]]
+                elif mutation == "live_file":
+                    table["live_files"][0] = "missing.parquet"
                 else:
                     table["snapshots"]["B"] = True
                 with self.assertRaises(ValueError):

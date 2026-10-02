@@ -164,6 +164,11 @@ class ReferenceHarnessTests(unittest.TestCase):
                 [{"id": 1, "amount": Decimal("10.00")}, {"id": 2, "amount": None}],
             )
 
+    def test_duplicate_json_keys_and_non_json_numbers_fail(self):
+        for output in ('[{"v":1,"v":2}]', '[{"v":NaN}]', '[{"v":Infinity}]'):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                decode_results(output)
+
     def test_null_is_not_empty_string(self):
         case = {"columns": [["label", "VARCHAR"]], "rows": [[None], [""]]}
         with self.assertRaises(AssertionError):

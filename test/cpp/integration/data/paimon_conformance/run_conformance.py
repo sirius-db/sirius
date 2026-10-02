@@ -77,7 +77,23 @@ def execute(args, *, timeout, cwd, env=None, log=None):
 
 def decode_results(output):
     """DuckDB emits one JSON document per statement with a result."""
-    decoder = json.JSONDecoder(parse_float=Decimal)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON result column: {key}")
+            result[key] = value
+        return result
+
+    def invalid_constant(value):
+        raise ValueError(f"Non-JSON numeric constant: {value}")
+
+    decoder = json.JSONDecoder(
+        parse_float=Decimal,
+        object_pairs_hook=unique_object,
+        parse_constant=invalid_constant,
+    )
     results = []
     remaining = output.strip()
     while remaining:
