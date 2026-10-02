@@ -1,11 +1,11 @@
 use std::io;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "nixl-transport"))]
 use crate::proto::brpc::policy::RpcRequestMeta;
 use crate::proto::brpc::policy::{RpcMeta, RpcResponseMeta};
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-#[cfg(test)]
+#[cfg(any(test, feature = "nixl-transport"))]
 use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -153,6 +153,41 @@ impl Error {
     }
 }
 
+/// One blocking PRPC call: connect, send one request, and return its response body and
+/// attachment.
+#[cfg(feature = "nixl-transport")]
+pub(crate) fn call_blocking(
+    peer: std::net::SocketAddr,
+    service_name: &str,
+    method_name: &str,
+    body: Vec<u8>,
+    attachment: Vec<u8>,
+    timeout: std::time::Duration,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    use std::io::Write;
+
+    let mut stream = std::net::TcpStream::connect_timeout(&peer, timeout)
+        .with_context(|| format!("failed to connect to {peer}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = Frame::for_request(service_name, method_name, body, attachment, Some(1));
+    stream
+        .write_all(&request.encode())
+        .context("failed to send PRPC request")?;
+    let frame = Frame::read(&mut stream)?.context("peer closed before responding")?;
+    let response = frame
+        .meta
+        .response
+        .context("PRPC reply carries no response metadata")?;
+    match response.error_code.unwrap_or(PRPC_SUCCESS) {
+        PRPC_SUCCESS => Ok((frame.body, frame.attachment)),
+        code => Err(anyhow!(
+            "PRPC error {code}: {}",
+            response.error_text.unwrap_or_default()
+        )),
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.text)
@@ -224,7 +259,7 @@ impl Frame {
     }
 
     /// Builds a request frame without going through the TCP reader.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "nixl-transport"))]
     pub(crate) fn for_request(
         service_name: impl Into<String>,
         method_name: impl Into<String>,
@@ -259,7 +294,7 @@ impl Frame {
     }
 
     /// Reads one PRPC frame from a stream, returning `None` on normal connection close.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "nixl-transport"))]
     pub(crate) fn read(stream: &mut impl Read) -> Result<Option<Self>> {
         let mut header = [0u8; PRPC_HEAD_SIZE];
         match stream.read_exact(&mut header) {
@@ -397,8 +432,8 @@ async fn read_payload(stream: &mut (impl AsyncRead + Unpin), len: usize) -> Resu
     Ok(payload)
 }
 
-/// Synchronous counterpart to [`read_payload`] used by the test frame reader.
-#[cfg(test)]
+/// Synchronous counterpart to [`read_payload`] used by blocking readers.
+#[cfg(any(test, feature = "nixl-transport"))]
 fn read_payload_sync(stream: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(len.min(PRPC_READ_CHUNK));
     while payload.len() < len {
