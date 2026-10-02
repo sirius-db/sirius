@@ -500,8 +500,8 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 
 **File:** `src/include/sirius_config.hpp` — `operator_params` struct
 
-The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
-`concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
+The five batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
+`concat_batch_bytes`, `cross_join_task_bytes`, `sort_sample_bytes`) share one built-in default. Without an
 explicit GPU capacity in YAML, it is computed at startup as
 `clamp(smallest visible physical GPU memory / 40, 512 MiB, 5 GiB)` (800 MiB when no
 GPU is visible). When the active YAML memory path explicitly caps GPU capacity, the
@@ -518,6 +518,7 @@ individually.
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
 | `concat_batch_bytes` | Shared physical/effective GPU batch default described above | Target output batch size for CONCAT operator |
+| `cross_join_task_bytes` | Shared physical/effective GPU batch default described above | Target output size of each cross product task; a larger pair of input batches is split into tasks over row ranges of the left batch |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default described above | Bytes sampled before computing sort partition boundaries |
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side size for BUILD_PROBE join mode |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join. A build below this size is replicated to every GPU (instead of hash-partitioned) when it is tiny, or when the DuckDB-estimated probe-to-build row ratio is at least `num_gpus * 1.25`. |

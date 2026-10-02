@@ -214,7 +214,7 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
     output.push_back(
       sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
   }
-  return std::make_unique<op::pipelineable_operator_data>(std::move(output));
+  return input->with_data_batches(std::move(output));
 }
 
 /// Quiesce work already submitted to a task stream without replacing the exception being handled.

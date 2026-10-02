@@ -30,6 +30,7 @@
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/cross_join_slicing.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -287,11 +288,11 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
   // Hold the mutex for the entire operation to prevent concurrent pop/get races.
   // A pop on one thread must not remove a batch that another thread's get expects to find.
   std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+  auto* default_port = get_port("default");
+  auto* build_port   = get_port("build");
 
-  // One-time initialization: snapshot all batch IDs from both ports.
+  // One-time initialization: snapshot all batch IDs from both ports and list the tasks.
   if (left_batch_ids.empty() && right_batch_ids.empty()) {
-    auto* default_port = get_port("default");
-    auto* build_port   = get_port("build");
     if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
       return nullptr;
     }
@@ -300,53 +301,72 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_i
         "sirius_physical_nested_loop_join: number of partitions for default and build ports must "
         "match");
     }
+    auto const sizes = [&](cucascade::shared_data_repository& repo,
+                           std::vector<uint64_t> const& ids,
+                           std::size_t partition_idx) {
+      std::vector<batch_rows_and_bytes> result;
+      result.reserve(ids.size());
+      for (uint64_t id : ids) {
+        auto batch = repo.get_data_batch_by_id(id, partition_idx);
+        // Takes a read lock on the batch while batches_to_processed_mutex is held. It runs before
+        // the join has tasks, so the only exclusive holder can be a spill, which never takes this
+        // mutex, and the wait is at most one spill copy. A non-blocking read would leave the pair
+        // unsplit.
+        result.push_back(batch ? get_batch_rows_and_bytes(*batch) : batch_rows_and_bytes{});
+      }
+      return result;
+    };
     left_batch_ids.reserve(default_port->repo->num_partitions());
     right_batch_ids.reserve(build_port->repo->num_partitions());
-    for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
-      left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
-      right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
-      num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+    for (size_t p = 0; p < default_port->repo->num_partitions(); p++) {
+      left_batch_ids.push_back(default_port->repo->get_batch_ids(p));
+      right_batch_ids.push_back(build_port->repo->get_batch_ids(p));
+      // Only a cross product is split, so only its batch sizes are read.
+      std::vector<batch_rows_and_bytes> left_sizes;
+      std::vector<batch_rows_and_bytes> right_sizes;
+      if (conditions.empty()) {
+        left_sizes  = sizes(*default_port->repo, left_batch_ids[p], p);
+        right_sizes = sizes(*build_port->repo, right_batch_ids[p], p);
+      }
+      for (std::size_t left = 0; left < left_batch_ids[p].size(); left++) {
+        for (std::size_t right = 0; right < right_batch_ids[p].size(); right++) {
+          auto const num_slices =
+            conditions.empty()
+              ? cross_join_num_slices(left_sizes[left], right_sizes[right], cross_join_task_bytes)
+              : std::size_t{1};
+          for (std::size_t slice = 0; slice < num_slices; slice++) {
+            pair_tasks.push_back({p, left, right, slice, num_slices});
+          }
+        }
+      }
     }
+    num_batches_to_process = pair_tasks.size();
   }
 
   if (current_partition_index >= num_batches_to_process) { return nullptr; }
 
-  size_t batch_index = current_partition_index++;
+  auto const& task      = pair_tasks[current_partition_index++];
+  auto const& left_ids  = left_batch_ids[task.partition];
+  auto const& right_ids = right_batch_ids[task.partition];
+  // Tasks are handed out in order, so a left batch is last used by the last slice of its pair with
+  // the last right batch, and a right batch by the last slice of its pair with the last left batch.
+  bool const last_slice = task.slice + 1 == task.num_slices;
+  bool const pop_left   = last_slice && task.right + 1 == right_ids.size();
+  bool const pop_right  = last_slice && task.left + 1 == left_ids.size();
 
   std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
-  size_t counter     = 0;
-  auto* default_port = get_port("default");
-  auto* build_port   = get_port("build");
-  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
-    size_t left_counter = 0;
-    for (auto& left_batch_id : left_batch_ids[partition_idx]) {
-      size_t right_counter = 0;
-      for (auto& right_batch_id : right_batch_ids[partition_idx]) {
-        if (counter == batch_index) {
-          if (right_counter == right_batch_ids[partition_idx].size() - 1) {
-            input_batch.push_back(
-              default_port->repo->pop_data_batch_by_id(left_batch_id, partition_idx));
-          } else {
-            input_batch.push_back(
-              default_port->repo->get_data_batch_by_id(left_batch_id, partition_idx));
-          }
-          if (left_counter == left_batch_ids[partition_idx].size() - 1) {
-            input_batch.push_back(
-              build_port->repo->pop_data_batch_by_id(right_batch_id, partition_idx));
-          } else {
-            input_batch.push_back(
-              build_port->repo->get_data_batch_by_id(right_batch_id, partition_idx));
-          }
-          return std::make_unique<pipelineable_operator_data>(input_batch);
-        }
-        right_counter++;
-        counter++;
-      }
-      left_counter++;
-    }
+  input_batch.push_back(
+    pop_left ? default_port->repo->pop_data_batch_by_id(left_ids[task.left], task.partition)
+             : default_port->repo->get_data_batch_by_id(left_ids[task.left], task.partition));
+  input_batch.push_back(
+    pop_right ? build_port->repo->pop_data_batch_by_id(right_ids[task.right], task.partition)
+              : build_port->repo->get_data_batch_by_id(right_ids[task.right], task.partition));
+  if (conditions.empty()) {
+    return std::make_unique<cross_join_slice_data>(
+      std::move(input_batch), task.slice, task.num_slices);
   }
-  return nullptr;
+  return std::make_unique<pipelineable_operator_data>(input_batch);
 }
 
 namespace {
@@ -632,14 +652,28 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   std::unique_ptr<cudf::table> result_table;
 
   if (conditions.empty()) {
+    // The task joins one slice of the left batch with the right batch.
+    auto const all_left_rows = static_cast<std::size_t>(left.num_rows());
+    if (auto const* slice_data = dynamic_cast<const cross_join_slice_data*>(&input_data);
+        slice_data != nullptr && slice_data->num_slices > 1) {
+      auto const begin = all_left_rows * slice_data->slice / slice_data->num_slices;
+      auto const end   = all_left_rows * (slice_data->slice + 1) / slice_data->num_slices;
+      left =
+        cudf::slice(
+          left, {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end)}, stream)
+          .front();
+    }
+    auto const left_rows  = static_cast<std::size_t>(left.num_rows());
+    auto const right_rows = static_cast<std::size_t>(right.num_rows());
+
     // An output that exceeds the memory space can never be allocated, so fail instead of
     // rescheduling the task on every out-of-memory error until the retry limit. The output holds
     // every left column once per right row and every right column once per left row.
-    auto const output_bytes =
-      memory::saturating_add(memory::saturating_mul(left_batch.get_data()->get_size_in_bytes(),
-                                                    static_cast<std::size_t>(right.num_rows())),
-                             memory::saturating_mul(right_batch.get_data()->get_size_in_bytes(),
-                                                    static_cast<std::size_t>(left.num_rows())));
+    auto const left_bytes =
+      memory::saturating_mul(left_batch.get_data()->get_size_in_bytes(), left_rows) / all_left_rows;
+    auto const output_bytes = memory::saturating_add(
+      memory::saturating_mul(left_bytes, right_rows),
+      memory::saturating_mul(right_batch.get_data()->get_size_in_bytes(), left_rows));
     auto const max_bytes = space->get_max_memory();
     if (max_bytes > 0 && output_bytes > max_bytes) {
       throw sirius::not_implemented_exception(

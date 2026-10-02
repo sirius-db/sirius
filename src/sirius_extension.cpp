@@ -2517,6 +2517,15 @@ static void SetConcatBatchBytes(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config CONCAT_BATCH_BYTES to {}", params->concat_batch_bytes);
 }
 
+static void SetCrossJoinTaskBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                     = lock_operator_params_slot(context);
+  params->cross_join_task_bytes = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config CROSS_JOIN_TASK_BYTES to {}", params->cross_join_task_bytes);
+}
+
 static void SetSortSampleBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -3050,6 +3059,13 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "cross_join_task_bytes",
+                    "override the internally derived output target of a cross product task",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.cross_join_task_bytes),
+                    SetCrossJoinTaskBytes);
 
   // Add in config options for special JIT implementation for regex
   add_sirius_option(config,
