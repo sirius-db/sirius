@@ -112,8 +112,8 @@ VIEW_SQL=""
 for TABLE_NAME in "${TPCDS_TABLES[@]}"; do
     FILES=()
     for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
-             "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
-             "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
+             "$PARQUET_DIR/${TABLE_NAME}/"*.parquet \
+             "$PARQUET_DIR/${TABLE_NAME}_"[0-9]*.parquet; do
         [ -f "$f" ] && FILES+=("'$f'")
     done
     if [ ${#FILES[@]} -eq 0 ]; then
