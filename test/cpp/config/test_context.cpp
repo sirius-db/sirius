@@ -1396,8 +1396,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   auto invalid_keep_threshold = con.Query("SET dynamic_filter_keep_threshold = 'NaN'");
   REQUIRE(invalid_keep_threshold != nullptr);
   REQUIRE(invalid_keep_threshold->HasError());
-  REQUIRE_THAT(invalid_keep_threshold->GetError(),
-               Catch::Matchers::ContainsSubstring("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
+  REQUIRE_THAT(
+    invalid_keep_threshold->GetError(),
+    Catch::Matchers::ContainsSubstring("dynamic_filter_keep_threshold must be in [0.0, 1.0]"));
   REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_keep_threshold ==
           Approx(0.7));
 
@@ -1408,7 +1409,8 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
     REQUIRE(invalid_inlist_fraction != nullptr);
     REQUIRE(invalid_inlist_fraction->HasError());
     REQUIRE_THAT(invalid_inlist_fraction->GetError(),
-                 Catch::Matchers::ContainsSubstring("dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0]"));
+                 Catch::Matchers::ContainsSubstring(
+                   "dynamic_filter_inlist_max_l2_fraction must be in [0.0, 1.0]"));
     REQUIRE(duckdb::session_operator_params(*con.context).dynamic_filter_inlist_max_l2_fraction ==
             Approx(0.4));
   }
@@ -2340,7 +2342,7 @@ TEST_CASE("Sirius admission configuration has one authoritative limit",
   REQUIRE_THROWS_WITH(
     load(
       "sirius: {max_concurrent_queries: 2, executor: {scan_manager: {max_concurrent_queries: 3}}}"),
-    Catch::Contains("conflicting"));
+    Catch::Matchers::ContainsSubstring("conflicting"));
   REQUIRE_THROWS(load("sirius: {max_concurrent_queries: 0}"));
   CHECK(load("sirius: {}").max_concurrent_queries() == 1);
 }

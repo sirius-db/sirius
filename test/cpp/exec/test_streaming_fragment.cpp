@@ -1049,7 +1049,8 @@ TEST_CASE_METHOD(fragment_fixture,
       auto fragment = make_leaf();
       {
         query_window window(*sirius_ctx, *con->context, "frag12_outer");
-        REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("nested execution window"));
+        REQUIRE_THROWS_WITH(fragment->build(),
+                            ContainsSubstring("Nested Sirius execution windows"));
       }
       REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("cannot be retried"));
     }

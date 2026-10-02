@@ -311,7 +311,8 @@ TEST_CASE("pin publication includes visibility and uniqueness facts",
   metadata.proven_unique_columns = {"c0"};
   std::ignore                    = manager.insert_pinned_entry(
     "orders", make_cache_info({0, 1}), {}, {}, {}, {}, {}, std::move(metadata));
-  auto entry = manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable);
+  auto entry = manager.find_pinned_entry_for_duckdb_table(
+    kCatalog, kSchema, kTable, sirius::test::test_table_identity(kTableOid));
   REQUIRE(entry);
   REQUIRE(entry->mvcc);
   CHECK(entry->mvcc->v_base == 42);

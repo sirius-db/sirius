@@ -26,8 +26,9 @@ Keep the default per-thread reservation tracking mode. `per_stream_reservation: 
 when the limit exceeds one: conversions may change streams, and the underlying per-stream tracker
 reset cannot safely race allocation on another user's stream.
 
-Concurrent FFI/streaming fragments on one Context are outside this contract. Nested execution
-windows fail explicitly; a dormant fragment must not retain a permit needed by its producer.
+Concurrent FFI/streaming calls on one Context are outside this contract; the FFI Context
+serializes them. Building a fragment does not retain a query admission permit. Running one
+holds a permit through execution and retirement, and nested execution windows fail explicitly.
 Independent DatabaseInstances sharing the process GPU allocator also require a separate ownership
 contract. Multiple connections to one DatabaseInstance use the shared runtime described here.
 
