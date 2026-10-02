@@ -16,8 +16,8 @@ Use the user's requested revision, configuration, mode, seed, duration and host 
 For an unspecified run, start with a short campaign on the default configuration: seed 42, one
 worker, at most 100 queries or three minutes, and no automatic reduction. This is a readiness
 and correctness sample, not comprehensive coverage. A request to find unsupported features or
-operators, or to see what falls back to the CPU, is a `--mode gaps` run; keep reduction on
-there, since the reduced query is what names the unsupported feature. Requests to run fuzzing require a
+operators, or to see what falls back to the CPU at runtime, is a `--mode gaps` run; keep
+reduction on there, since the reduced query is what names the unsupported feature. Requests to run fuzzing require a
 compatible GPU and a passing doctor. Run CPU harness tests or selftest only when explicitly
 requested; they are not a substitute for GPU fuzzing. Inspecting saved reports needs no GPU.
 
@@ -125,8 +125,8 @@ Separate setup failures, CPU reference errors, coverage gaps, result discrepanci
 failures. Dedup signatures are grouping hints, not counts of confirmed defects. A counted CPU
 range/conversion error is not a GPU result comparison. Report skipped queries and incomplete
 work explicitly. Do not infer GPU success from a CPU selftest. In a gaps run, report the
-`gaps` table (reason, smallest query, features) separately from findings; gaps are its expected
-output and do not fail the run.
+runtime-fallback table first (reason, GPU time thrown away, smallest query, features), then the
+plan-time table, separately from findings; gaps are its expected output and do not fail the run.
 
 Preserve original finding bundles and their datasets/configuration. A request to run fuzzing
 ends with saved evidence and a summary; it does not imply engine edits, repeated crash/hang

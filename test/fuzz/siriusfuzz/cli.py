@@ -68,10 +68,11 @@ def _mode_arg(p: argparse.ArgumentParser) -> None:
         choices=MODES,
         default="correctness",
         help="correctness (default): fuzz the configuration's enabled features, where any "
-        "fallback is a finding. gaps: find what Sirius does not run on the GPU yet; "
-        "every generator feature is on regardless of the configuration, setting variants "
-        "are skipped, and each plan/runtime fallback is reduced to the smallest query "
-        "that still falls back",
+        "fallback is a finding. gaps: find the queries Sirius accepts at plan time and "
+        "hands to the CPU at runtime; every generator feature is on regardless of the "
+        "configuration, setting variants are skipped, each runtime fallback is reduced to "
+        "the smallest query that passes the planner and still fails, and plan-time "
+        "rejections are listed by reason without reduction",
     )
 
 
@@ -168,6 +169,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         quiet=args.quiet,
         max_respawns=args.max_respawns,
         allow_metadata_mismatch=getattr(args, "allow_metadata_mismatch", False),
+        mode=args.mode,
     )
     if opts.duration is None and opts.max_queries is None:
         opts.max_queries = 500

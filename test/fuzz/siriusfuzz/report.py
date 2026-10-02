@@ -119,6 +119,7 @@ def signature(rec: QueryRecord) -> str:
         key = f"{v}|{digest.hexdigest()}"
     elif v in (
         Verdict.PLAN_FALLBACK,
+        Verdict.RUNTIME_FALLBACK,
         Verdict.GPU_ERROR,
         Verdict.GPU_INTERNAL_ERROR,
         Verdict.GPU_OOM,
@@ -190,6 +191,7 @@ class Report:
         if sig in self.findings:
             entry = self.findings[sig]
             entry["count"] += 1
+            entry["gpu_seconds"] += rec.elapsed_gpu
             if entry["count"] <= EXTRA_REPRODUCERS + 1:
                 name = f"{entry['name']}/additional/{entry['count']:03d}"
                 self._write_finding(name, rec, sig)
@@ -206,6 +208,7 @@ class Report:
             "reduced_sql": None,
             "reduced_labels": [],
             "reduced_reason": "",
+            "gpu_seconds": rec.elapsed_gpu,  # over every query with this signature
         }
         self._write_finding(name, rec, sig)
         return name
@@ -342,36 +345,56 @@ class Report:
             )
 
     @staticmethod
-    def gaps(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def gaps(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         """Gap findings grouped by the reason their smallest reproducer reports.
 
-        Reduction narrows an "Unsupported <expression>" rejection to the function
-        Sirius cannot translate, so findings that started from different
-        expressions around the same function end up in one group.
+        ``runtime`` fallbacks come first, ordered by the GPU time they threw away,
+        since those are the checks worth moving to plan time; ``plan`` rejections
+        follow, ordered by count. Reduction narrows an "Unsupported <expression>"
+        rejection to the function Sirius cannot translate, so findings that
+        started from different expressions around the same function share a
+        group. A group shows the smallest reduced query it has, or an original
+        query when nothing in it was reduced.
         """
-        groups: dict[str, dict[str, Any]] = {}
+        groups: dict[str, dict[str, dict[str, Any]]] = {"runtime": {}, "plan": {}}
         for f in findings:
-            if not Verdict(f["verdict"]).is_gap():
+            verdict = Verdict(f["verdict"])
+            if not verdict.is_gap():
                 continue
+            kind = "runtime" if verdict == Verdict.RUNTIME_FALLBACK else "plan"
+            reduced = f["reduced_sql"] is not None
             reason = f["reduced_reason"] or f["reason"]
             sql = f["reduced_sql"] or f["sql"]
             labels = f["reduced_labels"] or f["labels"]
-            group = groups.setdefault(
-                normalize_reason(reason),
+            key = normalize_reason(reason)
+            group = groups[kind].setdefault(
+                key,
                 {
                     "verdict": f["verdict"],
+                    "key": key,
                     "reason": reason,
                     "count": 0,
+                    "gpu_seconds": 0.0,
                     "sql": sql,
                     "labels": labels,
+                    "reduced": reduced,
                     "findings": [],
                 },
             )
             group["count"] += f["count"]
+            group["gpu_seconds"] += f.get("gpu_seconds", 0.0)
             group["findings"].append(f["name"])
-            if len(sql) < len(group["sql"]):
-                group.update(reason=reason, sql=sql, labels=labels)
-        return sorted(groups.values(), key=lambda g: (-g["count"], g["reason"]))
+            if (reduced, -len(sql)) > (group["reduced"], -len(group["sql"])):
+                group.update(reason=reason, sql=sql, labels=labels, reduced=reduced)
+        return {
+            "runtime": sorted(
+                groups["runtime"].values(),
+                key=lambda g: (-g["gpu_seconds"], -g["count"], g["key"]),
+            ),
+            "plan": sorted(
+                groups["plan"].values(), key=lambda g: (-g["count"], g["key"])
+            ),
+        }
 
     def finish(self) -> dict[str, Any]:
         self._log.close()
@@ -421,28 +444,47 @@ class Report:
         ]
         for k, v in sorted(summary["counts"].items(), key=lambda kv: -kv[1]):
             lines.append(f"  {k:20s} {v}")
-        gaps = summary.get("gaps", [])
-        if gaps:
-            total = sum(g["count"] for g in gaps)
+        gaps = summary.get("gaps") or {}
+        runtime, plan = gaps.get("runtime", []), gaps.get("plan", [])
+
+        def names(g: dict[str, Any]) -> str:
+            more = len(g["findings"]) - 3
+            return (
+                "findings: "
+                + ", ".join(g["findings"][:3])
+                + (f" (+{more})" if more > 0 else "")
+            )
+
+        def reasons(groups: list[dict[str, Any]]) -> str:
+            return f"{len(groups)} reason" + ("" if len(groups) == 1 else "s")
+
+        if runtime:
+            seconds = sum(g["gpu_seconds"] for g in runtime)
             lines.append("")
             lines.append(
-                f"gaps ({len(gaps)} unsupported features, {total} queries fell back to CPU);"
-                " smallest query that still falls back, and its features:"
+                f"runtime fallbacks ({reasons(runtime)}, "
+                f"{sum(g['count'] for g in runtime)} queries, {seconds:.1f}s of GPU work "
+                "thrown away); smallest query that passes the planner and still fails, "
+                "and its features:"
             )
-            for g in gaps:
+            for g in runtime:
                 lines.append(
-                    f"  [{g['verdict']}] x{g['count']:<4d} {g['reason'][:110]}"
+                    f"  x{g['count']:<4d} {g['gpu_seconds']:6.1f}s  {g['reason'][:110]}"
                 )
                 lines.append(f"      {' '.join(g['sql'].split())[:220]}")
-                lines.append(
-                    f"      features: {', '.join(g['labels'])}"
-                    f"   findings: {', '.join(g['findings'][:3])}"
-                    + (
-                        f" (+{len(g['findings']) - 3})"
-                        if len(g["findings"]) > 3
-                        else ""
-                    )
-                )
+                lines.append(f"      features: {', '.join(g['labels'])}   {names(g)}")
+        if plan:
+            lines.append("")
+            lines.append(
+                f"plan-time fallbacks ({reasons(plan)}, "
+                f"{sum(g['count'] for g in plan)} queries):"
+            )
+            for g in plan:
+                shown = g["reason"] if g["reduced"] else g["key"]
+                lines.append(f"  x{g['count']:<4d} {shown[:110]}   {names(g)}")
+                if g["reduced"]:
+                    lines.append(f"      {' '.join(g['sql'].split())[:220]}")
+                    lines.append(f"      features: {', '.join(g['labels'])}")
         findings = [
             f for f in summary["findings"] if not Verdict(f["verdict"]).is_gap()
         ]

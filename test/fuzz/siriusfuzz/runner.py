@@ -95,6 +95,7 @@ class WorkerArgs:
     stderr_path: str | None = None  # per-worker capture of native backtraces
     allow_metadata_mismatch: bool = False
     spawn_id: int = 0
+    mode: str = "correctness"
 
 
 # --------------------------------------------------------------------------
@@ -405,14 +406,21 @@ class Evaluator:
 # --------------------------------------------------------------------------
 
 
-def first_of_signature(rec: QueryRecord, seen: set[str]) -> bool:
-    """Whether ``rec`` is the first finding with its signature in this worker.
+def wants_reduction(rec: QueryRecord, mode: str, seen: set[str]) -> bool:
+    """Whether the worker should reduce ``rec`` now.
 
-    Errors and plan rejections dedup by normalized reason, so reducing a second
-    query with the same signature would spend the whole budget on a reproducer
-    the report already has. Mismatch and timeout signatures include the query
-    and stay unique.
+    Each signature is reduced once per worker: errors and plan rejections dedup
+    by normalized reason, so a second query with the same signature would spend
+    the whole budget on a reproducer the report already has (mismatch and
+    timeout signatures include the query and stay unique). A gaps run reduces
+    runtime fallbacks only: a plan rejection is already named by its reason and
+    costs no GPU time, so it is not what that run is looking for.
     """
+    verdict = Verdict(rec.verdict)
+    if not verdict.is_finding():
+        return False
+    if mode == "gaps" and verdict == Verdict.PLAN_FALLBACK:
+        return False
     sig = signature(rec)
     if sig in seen:
         return False
@@ -533,8 +541,7 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     if (
                         args.reduce
                         and cfg.oracle.reduce
-                        and Verdict(rec.verdict).is_finding()
-                        and first_of_signature(rec, reduced)
+                        and wants_reduction(rec, args.mode, reduced)
                     ):
                         session.stage = "reduction"
                         evaluator.reduce(rec, query)
@@ -635,6 +642,7 @@ class OrchestratorOptions:
     max_respawns: int = 200  # crashes are findings, not a reason to stop the run
     allow_metadata_mismatch: bool = False
     startup_timeout: float = 120.0
+    mode: str = "correctness"
 
 
 class Orchestrator:
@@ -687,6 +695,7 @@ class Orchestrator:
             stderr_path,
             self.opts.allow_metadata_mismatch,
             self.spawn_count,
+            mode=self.opts.mode,
         )
         self.stderr_paths[worker_id] = stderr_path
         self.active_paths[worker_id] = pathlib.Path(stderr_path).with_suffix(

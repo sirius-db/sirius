@@ -227,20 +227,30 @@ feature, flip its flag to `true` there. `--set key.path=value` overrides any key
 
 ## Finding unsupported features
 
-`fuzz run --mode gaps` answers a different question from the default run: not "does the GPU
-get the right answer" but "what does Sirius hand back to the CPU". It changes three things:
+`fuzz run --mode gaps` finds the queries Sirius accepts at plan time and then hands to the CPU at
+runtime. The two kinds of fallback cost very different amounts: a plan-time rejection costs one
+failed translation, after which DuckDB's own plan runs; a runtime fallback runs the GPU pipeline up
+to the failing operator and then runs the stored CPU plan from scratch, so all the GPU work is
+thrown away. The mode exists to find the runtime ones so their checks can move to plan time. It
+changes three things:
 
 - **Everything is generated.** Every feature switch the configuration keeps off because Sirius
   does not run it yet (window functions, `DISTINCT`, grouping sets, `FULL`/`CROSS` joins,
   `UNION`/`EXCEPT`/`INTERSECT`, uncorrelated subqueries, ungrouped `COUNT(DISTINCT)`, `TRY`,
-  temporal-numeric casts) is turned on, and setting variants are skipped. `--set` still applies
-  afterwards, so `--set features.window_functions=false` narrows the survey. `show-config
-  --mode gaps` prints the effective configuration.
-- **Fallbacks are reduced to the unsupported feature.** A `plan_fallback` or `runtime_fallback`
-  is shrunk like any other finding, but the reducer accepts a smaller query as long as it is
-  rejected for the same *kind* of reason, with the rejected expression's function set allowed
-  to shrink. Dropping a supported `concat` from an unsupported `regexp_matches(concat(..))`
-  therefore keeps going until only the function Sirius cannot translate is left.
+  temporal-numeric casts) is turned on, and setting variants are skipped. Known-unsupported
+  features stay on because the shapes of them that slip past the planner are exactly the runtime
+  fallbacks being looked for. `--set` still applies afterwards, so
+  `--set features.window_functions=false` narrows the survey; `show-config --mode gaps` prints the
+  effective configuration.
+- **Runtime fallbacks are reduced to the unsupported feature.** A `runtime_fallback` is shrunk
+  like any other finding, but the reducer accepts a smaller query as long as it still fails at
+  runtime for the same *kind* of reason, with the rejected expression's function set allowed to
+  shrink. Dropping a supported `concat` from an unsupported `regexp_matches(concat(..))` therefore
+  keeps going until only the function Sirius cannot translate is left. A candidate that turns into
+  a plan rejection is refused, so every reduced reproducer still passes the planner: once the check
+  moves to plan time, replaying it should flip from `runtime_fallback` to `plan_fallback`, which
+  makes it the regression test for that check. Plan-time rejections are not reduced in this mode;
+  their reason already names the operator, and they cost no GPU time.
 - **Gaps do not fail the run.** `--fail-on-findings` ignores the two gap verdicts in this mode.
 
 Everything else works as in a correctness run: every query is still compared with the CPU, and a
@@ -248,7 +258,8 @@ query that fails for any other reason is still reported. Where each outcome ends
 
 | Outcome | Verdict | In the summary | `--fail-on-findings` |
 |---------|---------|----------------|----------------------|
-| Sirius declined the plan, or the GPU raised an error that says the operation is not supported | `plan_fallback`, `runtime_fallback` | the `gaps` table, reduced to the unsupported feature | ignored |
+| the GPU raised an error that says the operation is not supported | `runtime_fallback` | the `runtime fallbacks` table, reduced, with the GPU time thrown away | ignored |
+| Sirius declined the plan | `plan_fallback` | the `plan-time fallbacks` table, by reason, not reduced | ignored |
 | GPU rows differ from CPU rows | `mismatch` | `findings`, reduced as in a correctness run | fails |
 | any other GPU error | `gpu_error`, `gpu_internal_error`, `gpu_oom` | `findings`, reduced as in a correctness run | fails |
 | the GPU run hung, or the worker died | `timeout`, `crash` | `findings` | fails |
@@ -264,31 +275,31 @@ to the CPU in production, but it looks like a bug rather than a missing feature,
 under `findings` with its reason. If one of those turns out to be an unsupported feature phrased
 differently, widen the pattern in `siriusfuzz/classify.py`.
 
-The summary groups gaps by the reason their smallest reproducer reports, so rejections of
-different expressions around the same function merge into one line:
+Runtime fallbacks come first, ordered by the GPU time they threw away, which is the order in which
+to move their checks to plan time. A reason's time is summed over every query that hit it; fuzz
+datasets are small, so read the figures as relative. Both tables group by the reason the smallest
+reproducer reports, so rejections of different expressions around the same function merge into one
+line:
 
 ```text
-gaps (3 unsupported features, 212 queries fell back to CPU); smallest query that still falls back, and its features:
-  [plan_fallback] x180  Window not supported
-      SELECT row_number() OVER (ORDER BY "a0"."k") AS c0 FROM "t1" AS "a0"
-      features: ColumnRef, Select, TableRef, Window(row_number)   findings: 000-plan_fallback-1f2e3d4c
-  [plan_fallback] x27   Unsupported expression in projection (falling back to CPU): regexp_matches("a0"."c2", 'a+')
-      SELECT regexp_matches("a0"."c2", 'a+') AS c0 FROM "t0" AS "a0"
-      features: ColumnRef, Func(regexp_matches), Literal, Select, TableRef   findings: 003-plan_fallback-9a8b7c6d, 011-plan_fallback-5e6f7a8b
-  [runtime_fallback] x5  Distinct aggregates not supported in GPU path yet
+runtime fallbacks (1 reason, 5 queries, 3.2s of GPU work thrown away); smallest query that passes the planner and still fails, and its features:
+  x5      3.2s  Distinct aggregates not supported in GPU path yet
       SELECT count(DISTINCT "a0"."c1") AS c0 FROM "t2" AS "a0"
       features: Agg(count,distinct), ColumnRef, Select, TableRef   findings: 007-runtime_fallback-2b3c4d5e
+
+plan-time fallbacks (2 reasons, 207 queries):
+  x180  Window not supported   findings: 000-plan_fallback-1f2e3d4c
+  x27   Unsupported expression in projection: {concat, regexp_matches}   findings: 003-plan_fallback-9a8b7c6d, 011-plan_fallback-5e6f7a8b
 
 findings (1 unique):
   [mismatch] x1    012-mismatch-7c8d9e0f  row count 41 vs 40
 ```
 
-`summary.json` carries the same table under `gaps`, with every contributing finding directory.
-Each finding keeps its own `reduced.sql` and `reduction.json` (which records the reduced query's
-reason), and replays like any other finding; a gap in a correctness run is the same evidence
-without the all-features generation. A query is reported for the first rejection Sirius hits, so
-a long run finds more than a short one; the "features emitted" line in the summary shows how much
-of the generator's surface a run covered.
+`summary.json` carries the same tables under `gaps.runtime` and `gaps.plan`, with every
+contributing finding directory. Each runtime finding keeps its own `reduced.sql` and
+`reduction.json` (which records the reduced query's reason) and replays like any other finding. A
+query is reported for the first rejection Sirius hits, so a long run finds more than a short one;
+the "features emitted" line in the summary shows how much of the generator's surface a run covered.
 
 ---
 
