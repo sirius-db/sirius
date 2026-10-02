@@ -110,14 +110,13 @@ TEST_CASE_METHOD(AggNullFixture,
 }
 
 // Not a result divergence: ungrouped COUNT(DISTINCT) is unsupported on the GPU
-// and forces a runtime fallback to DuckDB CPU (the result is still correct).
-// Asserted with expect_gpu_fallback rather than abusing [!shouldfail] on the
-// no-fallback comparator. Tracked in issue #1218.
+// and is refused at plan time, so DuckDB CPU answers (the result is still correct).
+// Tracked in issue #1218.
 TEST_CASE_METHOD(AggNullFixture,
                  "gpu_execution ungrouped COUNT(DISTINCT) falls back to CPU",
                  "[integration][gpu_execution][aggregate][nulls]")
 {
-  expect_gpu_fallback("SELECT COUNT(DISTINCT v) FROM agg_n");
+  expect_plan_fallback_matches_cpu("SELECT COUNT(DISTINCT v) FROM agg_n");
 }
 
 TEST_CASE_METHOD(AggNullFixture,
