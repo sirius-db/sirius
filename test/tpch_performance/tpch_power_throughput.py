@@ -41,6 +41,15 @@ validation and the clean/post-RF1/post-RF2 comparison meaningful.
 --query-dir (see generate_tpch_queries.sh), as an official run requires;
 validation is not supported there.
 
+In both mode the throughput streams are validated too: the deferred pure-DuckDB
+worker replays the N throughput RF1/RF2 pairs and snapshots the 19 refresh-sensitive
+query results (q2/q11/q16 excluded) at the post-power baseline and after each
+refresh commit (2N+1 snapshots). Each stream's GPU rows must match a forward-moving
+sequence of states consistent with its query transactions and refresh commits.
+Commits overlapping a query's transaction remain ambiguous. Throughput-only mode
+has no validated power baseline, so it skips this. Including the two power checks,
+the worker runs 2N+3 CPU query passes.
+
 Metrics:
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
     Throughput@Size = (N * 22 * 3600 / measurement_interval) * SF
@@ -335,14 +344,18 @@ def check_refresh_matches_base(cur, refresh_dir, n):
         )
 
 
-def run_refresh(cur, statements, label):
-    """Run one refresh function as a single transaction and return its wall time."""
+def run_refresh(cur, statements, label, commit_window=None):
+    """Run a refresh transaction; optionally bracket COMMIT for validation."""
     start = time.perf_counter()
     sql(cur, "BEGIN TRANSACTION")
     try:
         for stmt in statements:
             sql(cur, stmt)
+        if commit_window is not None:
+            commit_window["start_ns"] = time.perf_counter_ns()
         sql(cur, "COMMIT")
+        if commit_window is not None:
+            commit_window["end_ns"] = time.perf_counter_ns()
     except Exception:
         sql(cur, "ROLLBACK")
         raise
@@ -360,7 +373,9 @@ def _is_select(stmt):
     return stmt.lstrip().lower().startswith("select")
 
 
-def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
+def timed_query(
+    cur, statements, timeout_s, label=None, nsys_tag=None, transaction_window=None
+):
     """Run one query as a single transaction; return (elapsed_s, rows).
 
     A query is timed end to end including its transaction, matching the
@@ -379,6 +394,10 @@ def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
     process-global, so concurrent streams must not use it). Start/stop sit
     outside the timer, but an nsys-wrapped run is an analysis run — do not
     quote its metrics as scores.
+
+    `transaction_window` records monotonic timestamps before BEGIN and after
+    COMMIT. Together with refresh COMMIT windows these establish conservative
+    visibility bounds without adding a lock that changes stream scheduling.
     """
     if label:
         cur.execute(f"CALL sirius_set_query_label('{label}')").fetchall()
@@ -396,6 +415,8 @@ def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
         timer.start()
     start = time.perf_counter()
     try:
+        if transaction_window is not None:
+            transaction_window["start_ns"] = time.perf_counter_ns()
         cur.execute(begin).fetchall()
         rows = []
         for stmt in statements:
@@ -403,6 +424,8 @@ def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
             if _is_select(stmt):
                 rows = result
         cur.execute("COMMIT").fetchall()
+        if transaction_window is not None:
+            transaction_window["end_ns"] = time.perf_counter_ns()
     except Exception:
         try:
             cur.execute("ROLLBACK").fetchall()
@@ -497,19 +520,75 @@ def compare_rows(cpu_rows, gpu_rows):
     return None
 
 
-def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
-    """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
-    failures = {}
+def cpu_pass(cpu, plan, timeout_s):
+    """Run the refresh-sensitive queries on a plain-DuckDB cursor; {qnum: rows}."""
+    rows_by_q = {}
     for q, statements in plan:
         if q in REFRESH_INVARIANT_QUERIES:
             continue
-        _, cpu_rows = timed_query(cpu, statements, timeout_s)
+        _, rows_by_q[q] = timed_query(cpu, statements, timeout_s)
+    return rows_by_q
+
+
+def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
+    """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
+    failures = {}
+    for q, cpu_rows in cpu_pass(cpu, plan, timeout_s).items():
         msg = compare_rows(cpu_rows, gpu_rows_by_q[q])
         if msg is None:
             log(f"  [{label}] q{q}: OK")
         else:
             failures[f"q{q}"] = msg
             log(f"  [{label}] q{q}: MISMATCH — {msg}")
+    return failures
+
+
+def validate_throughput(stream_rows, snapshots, refresh_commits):
+    """Match each stream's stored GPU rows against the knowledge-base snapshots.
+
+    A throughput query stream runs concurrently with the refresh stream, so a
+    query result is only pinned down to *some* committed refresh state: the
+    pre-throughput baseline or the state after any RF1/RF2 commit. A result is
+    valid iff the stream has a nondecreasing assignment to matching snapshots
+    consistent with the recorded transaction/commit windows. These windows
+    conservatively allow either state when a commit overlaps a query.
+    """
+    if len(snapshots) != len(refresh_commits) + 1:
+        raise ValueError("snapshot count does not match recorded refresh commits")
+    failures = {}
+    for i, rows_by_q in sorted(stream_rows.items()):
+        generation = 0
+        # Dict insertion order is the actual query execution order, preserved
+        # by pickle. Picking the earliest feasible match leaves every later
+        # generation available to subsequent queries, including ambiguous rows.
+        for q, result in rows_by_q.items():
+            gpu_rows = result["rows"]
+            lower = sum(
+                commit["end_ns"] < result["start_ns"] for commit in refresh_commits
+            )
+            upper = sum(
+                commit["start_ns"] <= result["end_ns"] for commit in refresh_commits
+            )
+            tried = {}
+            for candidate, (label, cpu_rows_by_q) in enumerate(snapshots.items()):
+                msg = compare_rows(cpu_rows_by_q[q], gpu_rows)
+                if msg is None:
+                    if max(generation, lower) <= candidate <= upper:
+                        generation = candidate
+                        log(f"  [throughput] stream {i} q{q}: OK ({label})")
+                        break
+                    msg = (
+                        f"rows match, but generation {candidate} is outside the "
+                        f"allowed range {max(generation, lower)}..{upper} "
+                        "(stream order and transaction/commit timing)"
+                    )
+                tried[label] = msg
+            else:
+                failures[f"stream{i}_q{q}"] = tried
+                log(
+                    f"  [throughput] stream {i} q{q}: MISMATCH — no causally "
+                    f"consistent match among {len(snapshots)} snapshots"
+                )
     return failures
 
 
@@ -523,8 +602,13 @@ def stash_gpu_rows(run_dir, label, rows_by_q):
         pickle.dump(rows_by_q, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def deferred_validation(args, run_dir):
+def deferred_validation(args, run_dir, throughput_streams):
     """Diff the stored GPU rows against pure DuckDB, in a fresh process.
+
+    With throughput_streams > 0 the worker also builds the throughput knowledge
+    base: after the power replay it re-runs the N throughput RF1/RF2 pairs,
+    snapshotting the CPU results after the baseline and each commit, and matches
+    every stream's stashed GPU rows against those 2N+1 snapshots.
 
     Validation cannot share a process with the pinned run. Sirius's host pool
     is a growing pool allocator, so unpinning returns blocks to the pool rather
@@ -552,12 +636,16 @@ def deferred_validation(args, run_dir):
         "query_dir": args.query_dir,
         "query_timeout": args.query_timeout,
         "keep_scratch_db": args.keep_scratch_db,
+        "throughput_streams": throughput_streams,
     }
     spec_path = os.path.join(run_dir, "_validate_spec.json")
     with open(spec_path, "w") as f:
         json.dump(spec, f)
 
     log("=== Validation: pure DuckDB, refresh functions replayed (untimed) ===")
+    verdict_path = os.path.join(run_dir, "_validate_verdict.json")
+    if os.path.exists(verdict_path):
+        os.remove(verdict_path)  # Never reuse a previous worker's verdict.
     env = dict(os.environ)
     env.pop("SIRIUS_CONFIG_FILE", None)  # nothing here should load the extension
     proc = subprocess.run(
@@ -571,14 +659,33 @@ def deferred_validation(args, run_dir):
         ],
         env=env,
     )
-    verdict_path = os.path.join(run_dir, "_validate_verdict.json")
-    if not os.path.exists(verdict_path):
-        return {
-            "after_rf1": {"worker": f"no verdict (exit {proc.returncode})"},
-            "after_rf2": {},
-        }
-    with open(verdict_path) as f:
-        return json.load(f)
+    expected = ["after_rf1", "after_rf2"]
+    if throughput_streams:
+        expected.append("throughput")
+    error = f"validation worker did not complete (exit {proc.returncode})"
+    try:
+        with open(verdict_path) as f:
+            verdict = json.load(f)
+        if not isinstance(verdict, dict) or any(
+            not isinstance(value, dict) for value in verdict.values()
+        ):
+            raise ValueError("invalid verdict structure")
+    except (OSError, ValueError) as e:
+        return {label: {"worker": f"{error}: {e}"} for label in expected}
+    for label in expected:
+        verdict.setdefault(label, {"worker": error})
+    if proc.returncode and not any(verdict[label] for label in expected):
+        # Even a failure after the last verdict write must fail the command.
+        verdict[expected[-1]]["worker"] = error
+    return verdict
+
+
+def _write_validation_verdict(run_dir, verdict):
+    """Publish complete JSON atomically, including results of finished stages."""
+    path = os.path.join(run_dir, "_validate_verdict.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(verdict, f)
+    os.replace(path + ".tmp", path)
 
 
 def validation_worker(spec_path):
@@ -586,6 +693,13 @@ def validation_worker(spec_path):
     with open(spec_path) as f:
         spec = json.load(f)
     run_dir = spec["run_dir"]
+    expected = ["after_rf1", "after_rf2"]
+    if spec["throughput_streams"]:
+        expected.append("throughput")
+    verdict = {
+        label: {"worker": "validation stage did not complete"} for label in expected
+    }
+    _write_validation_verdict(run_dir, verdict)
     plan = stream_queries(
         0,
         argparse.Namespace(
@@ -597,7 +711,6 @@ def validation_worker(spec_path):
     )
     scratch = spec["scratch"]
     copy_database(spec["input"], scratch)
-    verdict = {}
     con = duckdb.connect(scratch)
     try:
         cur = con.cursor()
@@ -616,14 +729,42 @@ def validation_worker(spec_path):
             verdict[label] = validate_pass(
                 cur, gpu_rows, plan, label.replace("_", " "), spec["query_timeout"]
             )
+            _write_validation_verdict(run_dir, verdict)
+        tp_streams = spec["throughput_streams"]
+        tp_rows_path = _gpu_rows_path(run_dir, "throughput")
+        if tp_streams and os.path.exists(tp_rows_path):
+            # Knowledge base: the CPU results at every state a concurrent
+            # stream could have observed — the post-power baseline (the state
+            # this connection is in right now, RF1/RF2 of set 1 applied) plus
+            # each RF1/RF2 commit of the throughput refresh stream.
+            log(
+                f"=== Throughput knowledge base: baseline + {2 * tp_streams} "
+                "refresh states ==="
+            )
+            snapshots = {"baseline": cpu_pass(cur, plan, spec["query_timeout"])}
+            for pair in range(1, tp_streams + 1):
+                n = pair + 1  # set 1 belongs to the power run
+                for rf_label, statements in (
+                    (f"after_rf1_set{n}", rf1_statements(spec["refresh_dir"], n)),
+                    (f"after_rf2_set{n}", rf2_statements(spec["refresh_dir"], n)),
+                ):
+                    run_refresh(cur, statements, rf_label)
+                    snapshots[rf_label] = cpu_pass(cur, plan, spec["query_timeout"])
+            with open(tp_rows_path, "rb") as f:
+                throughput_rows = pickle.load(f)
+            verdict["throughput"] = validate_throughput(
+                throughput_rows["streams"],
+                snapshots,
+                throughput_rows["refresh_commits"],
+            )
+            _write_validation_verdict(run_dir, verdict)
     finally:
         con.close()
         if not spec["keep_scratch_db"]:
             for f in (scratch, scratch + ".wal"):
                 if os.path.exists(f):
                     os.remove(f)
-    with open(os.path.join(run_dir, "_validate_verdict.json"), "w") as f:
-        json.dump(verdict, f)
+    _write_validation_verdict(run_dir, verdict)
 
 
 def table_counts(cpu):
@@ -1156,6 +1297,8 @@ def throughput_run(con, args, run_dir, writer, streams):
     barrier = threading.Barrier(streams + 2)  # N query + 1 refresh + main
     errors = []
     stream_times = {i: {} for i in range(1, streams + 1)}
+    stream_rows = {i: {} for i in range(1, streams + 1)}
+    refresh_commits = []
     stream_elapsed = {}
     refresh_times = []
 
@@ -1181,10 +1324,17 @@ def throughput_run(con, args, run_dir, writer, streams):
             barrier.wait()
             start = time.perf_counter()
             for q, statements in plan:
-                elapsed, _ = timed_query(
-                    cur, statements, args.query_timeout, label=f"q{q:02d}"
+                transaction_window = {} if args.throughput_validation else None
+                elapsed, rows = timed_query(
+                    cur,
+                    statements,
+                    args.query_timeout,
+                    label=f"q{q:02d}",
+                    transaction_window=transaction_window,
                 )
                 stream_times[i][f"q{q}"] = elapsed
+                if args.throughput_validation and q not in REFRESH_INVARIANT_QUERIES:
+                    stream_rows[i][q] = {"rows": rows, **transaction_window}
                 with _write_lock:
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
                 log(f"  [stream {i}] q{q}: {elapsed:.4f}s")
@@ -1208,16 +1358,24 @@ def throughput_run(con, args, run_dir, writer, streams):
             for pair in range(1, streams + 1):
                 # set offset+1 belongs to the power run
                 n = args.update_set_offset + pair + 1
+                rf1_commit = {} if args.throughput_validation else None
                 t1 = run_refresh(
                     cur,
                     rf1_statements(args.refresh_dir, n, args.staged_refresh),
                     f"RF1(set {n})",
+                    commit_window=rf1_commit,
                 )
+                if rf1_commit is not None:
+                    refresh_commits.append(rf1_commit)
+                rf2_commit = {} if args.throughput_validation else None
                 t2 = run_refresh(
                     cur,
                     rf2_statements(args.refresh_dir, n, args.staged_refresh),
                     f"RF2(set {n})",
+                    commit_window=rf2_commit,
                 )
+                if rf2_commit is not None:
+                    refresh_commits.append(rf2_commit)
                 refresh_times.append({"set": n, "rf1": t1, "rf2": t2})
                 with _write_lock:
                     writer.writerow(
@@ -1263,6 +1421,16 @@ def throughput_run(con, args, run_dir, writer, streams):
 
     if errors:
         raise RuntimeError("throughput run failed:\n  " + "\n  ".join(errors))
+
+    if args.throughput_validation:
+        # Written while the pinned benchmark process is still alive, so the
+        # deferred extension-free worker can read it after this process has
+        # released the Sirius pools.
+        stash_gpu_rows(
+            run_dir,
+            "throughput",
+            {"streams": stream_rows, "refresh_commits": refresh_commits},
+        )
 
     throughput_at_size = streams * 22 * 3600.0 / interval * args.sf
     log(
@@ -1338,7 +1506,11 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
         for label in ("after_rf1", "after_rf2"):
             if label in val:
                 n_fail = len(val[label])
-                status = "PASS" if n_fail == 0 else f"FAIL ({n_fail} queries)"
+                status = (
+                    "FAIL (worker error)"
+                    if "worker" in val[label]
+                    else "PASS" if n_fail == 0 else f"FAIL ({n_fail} queries)"
+                )
                 out(
                     f"Validation {label}: {status} "
                     f"({skipped} skipped: refresh-invariant)"
@@ -1351,6 +1523,21 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
             )
         out(f"Power@Size       = {power['power_at_size']:.2f}")
     if throughput:
+        tp_val = throughput.get("validation")
+        if tp_val is not None:
+            status = (
+                "FAIL (worker error)"
+                if "worker" in tp_val
+                else (
+                    "PASS"
+                    if not tp_val
+                    else f"FAIL ({len(tp_val)} stream-query results)"
+                )
+            )
+            out(
+                f"Validation throughput: {status} "
+                f"(each stream vs {2 * streams + 1} snapshots)"
+            )
         out(
             f"Throughput@Size  = {throughput['throughput_at_size']:.2f}   "
             f"({streams} streams, interval "
@@ -1388,6 +1575,7 @@ def write_run_info(run_dir, args, streams):
         f"vary_predicates: {args.vary_predicates}",
         f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
         f"validation: {args.validation}",
+        f"throughput_validation: {args.throughput_validation}",
         f"baseline_pass: {args.baseline_pass}",
         f"warmup_pass: {args.warmup_pass}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
@@ -1519,8 +1707,10 @@ def parse_args():
         "--validation",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run; "
-        "default: on unless --vary-predicates)",
+        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run), and "
+        "in --mode both also match every throughput stream's results against "
+        "the 2N+1 possible refresh states (default: on unless "
+        "--vary-predicates)",
     )
     p.add_argument(
         "--baseline-pass",
@@ -1654,6 +1844,15 @@ def main():
         args.pin_layout = os.path.abspath(args.pin_layout)
         args.pin_layout_entries = load_pin_layout(args.pin_layout)
 
+    # Throughput validation needs the power run's validated post-RF2 state as
+    # its baseline snapshot, so it only runs in --mode both.
+    args.throughput_validation = args.validation and args.mode == "both"
+    if args.validation and args.mode == "throughput":
+        log(
+            "Throughput validation skipped: it needs the power run as its "
+            "baseline (--mode both)"
+        )
+
     # Simpatico compression happens at pin time, so it needs a pinned tier, and
     # it is a no-op without at least one plan file naming a TPC-H table.
     compression_tables = []
@@ -1773,7 +1972,14 @@ def main():
     # unpinned, the connection is closed and the pinned scratch copy is gone,
     # so the child process gets the machine to itself.
     if power and args.validation:
-        power["validation"].update(deferred_validation(args, run_dir))
+        tp_streams = (
+            streams if (throughput is not None and args.throughput_validation) else 0
+        )
+        verdict = deferred_validation(args, run_dir, tp_streams)
+        tp_verdict = verdict.pop("throughput", None)
+        power["validation"].update(verdict)
+        if throughput is not None and tp_verdict is not None:
+            throughput["validation"] = tp_verdict
 
     qphh = None
     if power and throughput:
@@ -1825,6 +2031,8 @@ def main():
         for label in ("after_rf1", "after_rf2"):
             if val.get(label):
                 failures.append(f"validation {label}: {sorted(val[label])}")
+    if throughput and throughput.get("validation"):
+        failures.append(f"validation throughput: {sorted(throughput['validation'])}")
     if failures:
         raise SystemExit("FAILED: " + "; ".join(failures))
     _rollback_exit(0)
