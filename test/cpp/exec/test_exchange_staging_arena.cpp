@@ -114,15 +114,17 @@ TEST_CASE("ARENA-3: oversize and exhaustion are separate, actionable errors", "[
   // Path 1 -- larger than the arena will EVER be. No amount of waiting or releasing helps, so
   // this must not be dressed up as "exhausted"; it is a sizing error, named as one.
   REQUIRE_THROWS_WITH(arena.lease(8192),
-                      Catch::Contains("exceeds") && Catch::Contains("4096 byte capacity"));
+                      Catch::Matchers::ContainsSubstring("exceeds") &&
+                        Catch::Matchers::ContainsSubstring("4096 byte capacity"));
   REQUIRE_THROWS_AS(arena.lease(8192), sirius::invalid_input_exception);
 
   // Path 2 -- fits the arena, does not fit what is free right now. This one IS transient, and
   // the message carries the fragmentation split (blocks / largest) plus the env var to raise.
   REQUIRE_THROWS_WITH(arena.lease(4000),
-                      Catch::Contains("requested 4000") && Catch::Contains("4096 capacity") &&
-                        Catch::Contains("largest") &&
-                        Catch::Contains("SIRIUS_EXCHANGE_STAGING_BYTES"));
+                      Catch::Matchers::ContainsSubstring("requested 4000") &&
+                        Catch::Matchers::ContainsSubstring("4096 capacity") &&
+                        Catch::Matchers::ContainsSubstring("largest") &&
+                        Catch::Matchers::ContainsSubstring("SIRIUS_EXCHANGE_STAGING_BYTES"));
 
   // A refused lease must consume nothing -- checked against live bytes and the free list, so
   // the assertion cannot be satisfied vacuously by a later full release resetting state.
@@ -146,7 +148,8 @@ TEST_CASE("ARENA-4: zero-length, unknown, and double release are rejected", "[st
   auto a = arena.lease(100);
   REQUIRE_THROWS_AS(arena.release(a + 256), sirius::invalid_input_exception);
   arena.release(a);
-  REQUIRE_THROWS_WITH(arena.release(a), Catch::Contains("not an outstanding lease"));
+  REQUIRE_THROWS_WITH(arena.release(a),
+                      Catch::Matchers::ContainsSubstring("not an outstanding lease"));
 }
 
 // ============================================================================
@@ -157,7 +160,8 @@ TEST_CASE("ARENA-5: require(nullptr) names the configuration knob", "[staging_ar
 {
   REQUIRE_THROWS_WITH(
     exchange_staging_arena::require(nullptr),
-    Catch::Contains("exchange staging arena not configured (set SIRIUS_EXCHANGE_STAGING_BYTES)"));
+    Catch::Matchers::ContainsSubstring(
+      "exchange staging arena not configured (set SIRIUS_EXCHANGE_STAGING_BYTES)"));
 
   exchange_staging_arena arena(kMiB);
   REQUIRE(&exchange_staging_arena::require(&arena) == &arena);
@@ -189,7 +193,7 @@ TEST_CASE("ARENA-6: from_env honours the byte-suffix parser", "[staging_arena]")
 
   setenv(var, "not-a-size", 1);
   REQUIRE_THROWS_WITH(exchange_staging_arena::from_env(),
-                      Catch::Contains("SIRIUS_EXCHANGE_STAGING_BYTES"));
+                      Catch::Matchers::ContainsSubstring("SIRIUS_EXCHANGE_STAGING_BYTES"));
 
   setenv(var, "0", 1);
   REQUIRE_THROWS_AS(exchange_staging_arena::from_env(), sirius::invalid_input_exception);
@@ -485,7 +489,8 @@ TEST_CASE("ARENA-14: Context FFI throws when unset and leases when configured", 
   {
     auto ctx = sirius::ffi::make_context_from_config(config);
     REQUIRE(ctx->staging_arena_handle() == nullptr);
-    REQUIRE_THROWS_WITH(ctx->staging_lease(1024), Catch::Contains("SIRIUS_EXCHANGE_STAGING_BYTES"));
+    REQUIRE_THROWS_WITH(ctx->staging_lease(1024),
+                        Catch::Matchers::ContainsSubstring("SIRIUS_EXCHANGE_STAGING_BYTES"));
   }
 
   setenv(var, "4MiB", 1);
