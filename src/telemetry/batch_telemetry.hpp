@@ -97,7 +97,7 @@ class batch_telemetry_registry {
   void register_consumer_port(const cucascade::shared_data_repository* repo,
                               uuid::UUID pipeline_uuid,
                               uuid::UUID port_uuid,
-                              query_id_t query_id = make_query_id(0));
+                              query_id_t query_id);
 
   /// A producer published `batch` into `repo`: registered -> queued. Call
   /// before the batch is added to the repository.
@@ -110,7 +110,7 @@ class batch_telemetry_registry {
   void on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
                    uuid::UUID consumer_pipeline_uuid,
                    uuid::UUID task_uuid,
-                   query_id_t query_id = make_query_id(0));
+                   query_id_t query_id);
 
   /// The claiming task started computing: packaged -> processing.
   void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);

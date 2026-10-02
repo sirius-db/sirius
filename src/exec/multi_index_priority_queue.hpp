@@ -637,19 +637,6 @@ class multi_index_priority_queue {
     _levels.erase(lit);
   }
 
-  /// Drops every task of one level (removing each from its device bucket) and the
-  /// level itself. Used by drain(query_index).
-  void drop_level(queue_priority prio)
-  {
-    const auto lit = _levels.find(prio);
-    if (lit == _levels.end()) { return; }
-    for (node& n : lit->second.tasks) {
-      erase_from_device(n.keys.device_id, prio, n.device_it);
-      --_size;
-    }
-    remove_level(lit);
-  }
-
   /// Removes one entry from the device side index, pruning the empty priority
   /// bucket and then the empty device entry so the map stays sparse.
   void erase_from_device(device_key dev,

@@ -142,25 +142,9 @@ void itask_executor::drain_and_wait()
     return;
   }
 
-  // Interrupt the pool so the manager's reserve() unblocks with an invalid slot.
-  _bounded_pool->interrupt();
-
-  // Interrupt pop() so the manager loop sees a nullptr and breaks out.
-  _task_queue.interrupt();
-
-  // Join the manager thread so we know it has exited.
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-
-  // Wait for all in-flight thread-pool tasks to finish.
-  _bounded_pool->wait_all();
-
-  // Clear any remaining tasks from the queue.
+  quiesce_manager();
   _task_queue.drain();
-
-  // Re-enable the pool and queue so the executor is ready for the next query.
-  _bounded_pool->resume();
-  _task_queue.reactivate();
-  _manager_thread = std::thread([this] { manager_loop(); });
+  resume_manager();
 }
 
 void itask_executor::quiesce_manager()

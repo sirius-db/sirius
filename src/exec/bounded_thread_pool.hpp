@@ -304,12 +304,7 @@ class bounded_thread_pool {
       }
     }
     dropped.clear();  // releases the dropped items' slots, outside the lock
-
-    std::unique_lock lock(mu_);
-    cv_query_idle_.wait(lock, [&] {
-      auto it = active_by_query_.find(query_id);
-      return it == active_by_query_.end() || it->second == 0;
-    });
+    wait_for_query(query_id);
   }
 
   /// \brief Number of running slots attributed to @p query_id. Test/diagnostic aid.

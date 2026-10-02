@@ -356,8 +356,6 @@ namespace {
 thread_local bool t_in_creation_worker = false;
 }  // namespace
 
-bool task_creator::is_pool_worker_thread() { return t_in_creation_worker; }
-
 void task_creator::stop()
 {
   // Calling this from a creation worker is a guaranteed self-deadlock: do_stop_thread_pool()
@@ -365,7 +363,7 @@ void task_creator::stop()
   // an active slot. If it somehow got past, _bounded_pool.reset() would join the calling thread
   // with itself inside a noexcept function. The rogue call sites that did this are gone; assert
   // so a new one is caught in a debug build rather than hanging CI.
-  assert(!is_pool_worker_thread() &&
+  assert(!t_in_creation_worker &&
          "task_creator::stop() must not be called from one of its own pool workers");
 
   _task_creation_queue.interrupt();
@@ -519,8 +517,8 @@ void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion
   // to free -- a self-wait deadlock, since the slot can't free until this call returns -- and
   // would tear down task creation for every other in-flight query besides. terminate_query()
   // only fulfills the completion future; the query thread (sirius_engine.cpp, future.get() catch
-  // block) observes the error and calls task_scheduler::drain_after_error(), which drains and
-  // restarts every pool from a thread that is never one of their own workers.
+  // block) observes the error and calls task_scheduler::drain_after_error(), which retires this
+  // query's work from a thread that is never one of the pool's own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
 

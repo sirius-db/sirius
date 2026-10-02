@@ -87,9 +87,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
    *
    * TIER-2 spilling holds an extracted task across pool reservation and conversion. Register
    * the return as a publisher, so cleanup either refuses it or waits for its insertion before
-   * draining. This guard covers publication only: the existing downgrade drain must still keep
-   * the plan/repositories alive through conversion and task destruction. Full borrowed-resource
-   * lifetime tracking is separate from preventing reinsertion behind a completed drain.
+   * draining. The task's work lease keeps its plan/repositories alive through conversion and
+   * destruction; the submission guard prevents reinsertion behind a completed drain.
    */
   ~convertible_gpu_pipeline_task() override
   {

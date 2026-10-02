@@ -146,9 +146,7 @@ class itask_executor {
    * and stalled their producers on every completion. It also no longer validates the *whole*
    * queue, which made one query fail because another had work legitimately queued.
    *
-   * The in-flight wait is still whole-pool; per-query in-flight accounting arrives with the
-   * query-aware bounded_thread_pool. Waiting on a co-tenant's task is a stall, not a correctness
-   * problem.
+   * The pool wait is scoped to this query; idle manager slots and other queries are ignored.
    */
   void wait_and_validate_empty(sirius::query_id_t query_id);
 
@@ -169,10 +167,8 @@ class itask_executor {
    * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
    * slot forever and wait_all() (which waits for active_ == 0) would never return.
    *
-   * Cost, and why it is temporary: interrupting the queue makes push() return false for the
-   * duration, so a co-tenant query's task in transit from the scheduler can be dropped here. The
-   * query-aware bounded_thread_pool removes the need for this bracket by making the in-flight
-   * wait per-query.
+   * Used by the whole-executor drain and the standalone fallback without lifecycle accounting.
+   * Production per-query retirement leaves the manager running.
    */
   void quiesce_manager();
 

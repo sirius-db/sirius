@@ -65,7 +65,8 @@ class shared_scan_budget {
       }
       owner->cv.notify_all();
     }
-    ticket(ticket const&) = delete;
+    ticket(ticket const&)            = delete;
+    ticket& operator=(ticket const&) = delete;
 
    private:
     friend class shared_scan_budget;

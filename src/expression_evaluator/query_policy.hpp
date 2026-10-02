@@ -34,7 +34,8 @@ class scoped_expression_policy {
     active_expression_policy = policy;
   }
   ~scoped_expression_policy() { active_expression_policy = previous; }
-  scoped_expression_policy(const scoped_expression_policy&) = delete;
+  scoped_expression_policy(const scoped_expression_policy&)            = delete;
+  scoped_expression_policy& operator=(const scoped_expression_policy&) = delete;
 
  private:
   std::optional<expression_query_policy> previous;

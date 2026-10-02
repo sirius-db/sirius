@@ -70,13 +70,11 @@ TEST_CASE("query_id: an earlier query always sorts before a later one", "[query_
   CHECK(earlier_last < later_first);
 }
 
-TEST_CASE("query_id: exhaustion never wraps identity or priority", "[query_id]")
+TEST_CASE("query_id: priority rejects IDs outside the scheduling range", "[query_id]")
 {
+  CHECK(query_priority_bits(make_query_id(sirius::max_query_id)) ==
+        (static_cast<std::int64_t>(sirius::max_query_id) << 32));
   CHECK_THROWS_AS(query_priority_bits(make_query_id(0x8000'0000U)), std::overflow_error);
-  std::atomic<std::uint32_t> counter{sirius::max_query_id - 1};
-  CHECK(value_of(sirius::next_query_id(counter)) == sirius::max_query_id);
-  CHECK_THROWS_AS(sirius::next_query_id(counter), std::overflow_error);
-  CHECK(counter.load() == sirius::max_query_id);
 }
 
 TEST_CASE("planner::query reports the id it was constructed with", "[query_id]")

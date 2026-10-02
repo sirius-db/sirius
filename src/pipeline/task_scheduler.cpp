@@ -271,8 +271,8 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 
 void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
 {
-  // Settle publishers before interrupting/draining queues. Keep the existing worker joins:
-  // submission accounting does not yet cover running tasks and repository borrowers.
+  // Settle publishers before checking queues. Per-query worker waits and the final work-lease
+  // wait below also cover running tasks and repository borrowers.
   if (_query_lifecycle) { _query_lifecycle->quiesce_and_wait_for_submissions(query_id); }
 
   // Once the query has signaled completion, NOTHING should still be queued. Rather

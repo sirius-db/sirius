@@ -1088,13 +1088,6 @@ SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
   return data_repository_registry_.get(query_id);
 }
 
-std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
-SiriusContext::get_data_repository_managers() const
-{
-  throw_if_not_initialized();
-  return data_repository_registry_.get_all();
-}
-
 sirius::data::data_repository_manager_registry& SiriusContext::get_data_repository_registry()
 {
   throw_if_not_initialized();

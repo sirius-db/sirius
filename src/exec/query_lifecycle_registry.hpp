@@ -280,7 +280,6 @@ class query_lifecycle_registry {
   struct query_activity {
     std::size_t submissions{0};
     std::size_t work{0};
-    std::shared_ptr<void> resources;
   };
 
   query_lifecycle_registry()                                           = default;

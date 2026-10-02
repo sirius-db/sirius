@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <format>
 #include <stdexcept>
@@ -68,17 +67,6 @@ inline constexpr std::uint32_t max_query_id = 0x7FFF'FFFFU;
 {
   if (value_of(id) > max_query_id) { throw std::overflow_error("Sirius query priority exhausted"); }
   return static_cast<std::int64_t>(value_of(id)) << 32;
-}
-
-inline query_id_t next_query_id(std::atomic<std::uint32_t>& counter)
-{
-  auto value = counter.load(std::memory_order_relaxed);
-  for (;;) {
-    if (value >= max_query_id) { throw std::overflow_error("Sirius query IDs exhausted"); }
-    if (counter.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) {
-      return make_query_id(value + 1);
-    }
-  }
 }
 
 }  // namespace sirius

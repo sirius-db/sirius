@@ -305,11 +305,6 @@ class task_creator {
   /// A refused push destroys the request, so a live query silently loses a task it is waiting on.
   void report_if_dropped(bool pushed, sirius::query_id_t query_id) const;
 
-  /// \brief Whether the calling thread is one of this creator's task-creation pool workers.
-  /// Used only to assert that stop() is never called from inside its own pool, which would
-  /// self-deadlock in wait_all(). See task_creator::stop.
-  [[nodiscard]] static bool is_pool_worker_thread();
-
   /**
    * @brief Stop the worker thread pool.
    *
