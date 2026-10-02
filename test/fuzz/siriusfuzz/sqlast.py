@@ -273,7 +273,7 @@ class ScalarSubquery(Expr):
 
 @dataclass
 class Window(Expr):
-    """Frontier-only: ``func(arg) OVER (PARTITION BY ... ORDER BY ...)``."""
+    """``func(arg) OVER (PARTITION BY ... ORDER BY ...)`` (features.window_functions)."""
 
     name: str
     arg: Expr | None
@@ -396,7 +396,7 @@ class Select(Node):
     limit: int | None = None
     offset: int | None = None
     distinct: bool = False
-    grouping_sets: str | None = None  # e.g. "ROLLUP" / "CUBE" (frontier)
+    grouping_sets: str | None = None  # "ROLLUP" / "CUBE" (features.grouping_sets)
 
     def output_names(self) -> list[str]:
         return [i.alias for i in self.items]

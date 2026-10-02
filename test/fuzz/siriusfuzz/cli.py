@@ -51,7 +51,7 @@ def _common_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--config",
         default=None,
-        help="TOML profile (default: config/strict.toml)",
+        help="TOML configuration (default: config/default.toml)",
     )
     p.add_argument(
         "--set",
@@ -86,8 +86,7 @@ def _common_engine_args(p: argparse.ArgumentParser) -> None:
 
 
 def _load(args: argparse.Namespace) -> FuzzConfig:
-    path = args.config if args.config and args.config != "-" else None
-    return load_config(path, args.set)
+    return load_config(args.config, args.set)
 
 
 def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> tuple[str | None, list[str]]:
@@ -160,7 +159,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if opts.duration is None and opts.max_queries is None:
         opts.max_queries = 500
     print(
-        f"siriusfuzz {__version__}: profile={cfg.profile} seed={seed} workers={opts.workers} "
+        f"siriusfuzz {__version__}: config={cfg.config_hash()} seed={seed} workers={opts.workers} "
         f"{'cpu-only' if extension is None else extension} -> {run_dir}",
         file=sys.stderr,
     )

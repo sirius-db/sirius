@@ -13,7 +13,7 @@ from unittest.mock import patch
 from . import conftest_path  # noqa: F401
 from siriusfuzz import sqltypes as st
 from siriusfuzz.artifacts import verify
-from siriusfuzz.classify import Verdict, uses_plan_fallback
+from siriusfuzz.classify import Verdict
 from siriusfuzz.cli import build_parser, cmd_run
 from siriusfuzz.compare import ColumnInfo, ResultSet
 from siriusfuzz.config import FUZZ_DIR, load_config
@@ -54,12 +54,6 @@ class FakeSession:
     def execute(self, sql, *a):
         self.calls.append(sql)
         return self
-
-    def begin_fallback_retry(self, reason):
-        self.plan_fallback_reason = reason
-
-    def end_fallback_retry(self):
-        self.plan_fallback_reason = None
 
     def mark_auxiliary(self, operation, input_sql):
         self.auxiliary = {"operation": operation, "input_sql": input_sql}
@@ -106,21 +100,6 @@ def gpu_plan_fallback(sql, cols, rows, s):
     )
 
 
-def gpu_plan_then_fallback(sql, cols, rows, s):
-    if s.calls and s.calls[-1] == "SET enable_duckdb_fallback = true":
-        return gpu_ok(sql, cols, rows, s)
-    return gpu_plan_fallback(sql, cols, rows, s)
-
-
-def failing_fallback(result):
-    def behaviour(sql, cols, rows, session):
-        if session.calls and session.calls[-1] == "SET enable_duckdb_fallback = true":
-            return result
-        return gpu_plan_fallback(sql, cols, rows, session)
-
-    return behaviour
-
-
 def gpu_variant_wrong(sql, cols, rows, s):
     if s.settings.get("hash_partition_bytes") is not None:
         return RunResult("ok", ResultSet(cols, [(1, 1.5)] * 2))
@@ -159,46 +138,6 @@ def evaluate(behaviour, sql="SELECT 1 AS c0, 1.5 AS c1", **over):
 
 
 class EvaluatorTests(unittest.TestCase):
-    def test_fallback_retry_marker_survives_before_and_during_native_query(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            active_path = pathlib.Path(tmp) / "worker.active.json"
-            session = Session(
-                None, None, pathlib.Path(tmp), 0, evidence_path=active_path
-            )
-            session.evidence["gpu"] = {
-                "sql": "SELECT 1",
-                "phase": "gpu",
-                "stage": "evaluation",
-                "status": "error",
-            }
-            session.begin_fallback_retry("Window not supported")
-            self.assertEqual(
-                json.loads(active_path.read_text())["plan_fallback_reason"],
-                "Window not supported",
-            )
-
-            class Cursor:
-                description = []
-
-                def execute(self, sql):
-                    self.active_during_query = json.loads(active_path.read_text())
-                    return self
-
-                def fetchall(self):
-                    return []
-
-            session.con = Cursor()
-            with patch.object(session, "set_gpu"), patch.dict(
-                "sys.modules", {"duckdb": SimpleNamespace(InterruptException=Exception)}
-            ):
-                session.run("SELECT 1", gpu=True, timeout=0)
-            self.assertEqual(
-                session.con.active_during_query["plan_fallback_reason"],
-                "Window not supported",
-            )
-            session.end_fallback_retry()
-            self.assertIsNone(session.plan_fallback_reason)
-
     def test_ok_and_float_noise(self):
         rec, _ = evaluate(gpu_ok)
         self.assertEqual(rec.verdict, Verdict.OK.value)
@@ -215,125 +154,17 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(rec.verdict, Verdict.PLAN_FALLBACK.value)
         self.assertEqual(rec.reason, "Window not supported")
 
-    def test_skip_policy_does_not_execute_fallback(self):
-        rec, ev = evaluate(
-            gpu_plan_then_fallback, **{"oracle.on_plan_fallback": "skip"}
-        )
-        self.assertEqual(rec.verdict, "plan_fallback")
-        self.assertEqual(ev.s.calls, [])
-
-    def test_fallback_failures_record_actual_verdict_and_reason(self):
-        for status, error, verdict, reason in (
-            (
-                "error",
-                "Invalid Input Error: fallback conversion failed",
-                "gpu_error",
-                "fallback conversion failed",
-            ),
-            (
-                "error",
-                "CUDA internal error",
-                "gpu_internal_error",
-                "CUDA internal error",
-            ),
-            ("error", "out of memory", "gpu_oom", "out of memory"),
-            ("timeout", "interrupted", "timeout", "fallback run exceeded 60.0s"),
-        ):
-            with self.subTest(verdict=verdict):
-                rec, ev = evaluate(
-                    failing_fallback(RunResult(status, error=error)),
-                    **{"oracle.on_plan_fallback": "count"},
-                )
-                self.assertEqual(rec.verdict, verdict)
-                self.assertEqual(rec.reason, reason)
-                self.assertIn(error, rec.detail)
-                self.assertEqual(
-                    rec.context["plan_fallback_reason"], "Window not supported"
-                )
-                self.assertEqual(ev.s.calls[-1], "SET enable_duckdb_fallback = false")
-                if status == "timeout":
-                    self.assertIsNone(ev._make_still_fails(rec))
-
-    def test_fallback_error_reduction_preserves_execution_path_and_failure(self):
-        failure = RunResult(
-            "error", error="Invalid Input Error: fallback conversion failed"
-        )
-        rec, ev = evaluate(
-            failing_fallback(failure), **{"oracle.on_plan_fallback": "count"}
-        )
-        check = ev._make_still_fails(rec)
-        self.assertIsNotNone(check)
-        self.assertTrue(check("SELECT 1"))
-        for replacement in (
-            RunResult("error", error="fallback storage failed"),
-            RunResult("timeout", error="interrupted"),
-            RunResult("ok", ResultSet([ColumnInfo("c0", st.INTEGER)], [(1,)])),
-        ):
-            ev.s.gpu_behaviour = failing_fallback(replacement)
-            self.assertFalse(check("SELECT 1"))
-            self.assertEqual(ev.s.calls[-1], "SET enable_duckdb_fallback = false")
-        # An error before reaching fallback is not the same execution path.
-        ev.s.gpu_behaviour = lambda *args: failure
-        self.assertFalse(check("SELECT 1"))
-
-    def test_fallback_mismatch_reduction_requires_strict_plan_rejection(self):
-        result = RunResult(
-            "ok",
-            ResultSet(
-                [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)], [(1, 1.5)]
-            ),
-        )
-        rec, ev = evaluate(
-            failing_fallback(result), **{"oracle.on_plan_fallback": "count"}
-        )
-        self.assertEqual(rec.verdict, "fallback_mismatch")
-        check = ev._make_still_fails(rec)
-        self.assertTrue(check("SELECT 1"))
-        ev.s.gpu_behaviour = gpu_wrong
-        self.assertFalse(check("SELECT 1"))
-        self.assertEqual(ev.s.calls[-1], "SET enable_duckdb_fallback = false")
-
-    def test_reduction_fallback_checks_mark_the_active_retry(self):
-        for result in (
-            RunResult("error", error="Invalid Input Error: fallback conversion failed"),
-            RunResult(
-                "ok",
-                ResultSet(
-                    [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)],
-                    [(1, 1.5)],
-                ),
-            ),
-        ):
-            with self.subTest(status=result.status):
-                rec, ev = evaluate(
-                    failing_fallback(result), **{"oracle.on_plan_fallback": "count"}
-                )
-                check = ev._make_still_fails(rec)
-                self.assertIsNotNone(check)
-                with patch.object(
-                    ev.s, "begin_fallback_retry", wraps=ev.s.begin_fallback_retry
-                ) as begin:
-                    self.assertTrue(check("SELECT 1"))
-                begin.assert_called_once_with("Window not supported")
-                self.assertIsNone(ev.s.plan_fallback_reason)
-
     def test_sqlsmith_call_marks_nonquery_reducer_work(self):
         _, ev = evaluate(gpu_wrong)
         with patch.object(ev.s, "mark_auxiliary", wraps=ev.s.mark_auxiliary) as mark:
             ev._sqlsmith_candidates("SELECT candidate")
         mark.assert_called_once_with("sqlsmith_reduction", "SELECT candidate")
 
-    def test_auxiliary_marker_replaces_completed_fallback_query(self):
+    def test_auxiliary_marker_replaces_completed_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             active_path = pathlib.Path(tmp) / "worker.active.json"
             active_path.write_text(
-                json.dumps(
-                    {
-                        "sql": "SELECT old_candidate",
-                        "plan_fallback_reason": "Window not supported",
-                        "status": "ok",
-                    }
-                )
+                json.dumps({"sql": "SELECT old_candidate", "status": "ok"})
             )
             session = Session(
                 None, None, pathlib.Path(tmp), 0, evidence_path=active_path
@@ -344,45 +175,6 @@ class EvaluatorTests(unittest.TestCase):
             self.assertEqual(active["operation"], "sqlsmith_reduction")
             self.assertEqual(active["input_sql"], "SELECT candidate")
             self.assertNotIn("sql", active)
-            self.assertNotIn("plan_fallback_reason", active)
-
-    def test_fallback_replay_preserves_comparison_mode(self):
-        def reversed_fallback(sql, cols, rows, session):
-            result = gpu_plan_then_fallback(sql, cols, rows, session)
-            if result.result:
-                result.result.rows.reverse()
-            return result
-
-        ordered_query = Select(
-            [
-                SelectItem(ColumnRef("t", name, typ), name)
-                for name, typ in (("c0", st.INTEGER), ("c1", st.DOUBLE))
-            ],
-            TableRef("t", "t"),
-            order_by=[OrderItem(Alias("c0")), OrderItem(Alias("c1"))],
-        )
-        for mode, verdict in (
-            ("ordered", "fallback_mismatch"),
-            ("multiset", "plan_fallback"),
-            (None, "fallback_mismatch"),
-        ):
-            with self.subTest(mode=mode):
-                cfg = load_config(None, ["oracle.on_plan_fallback=count"])
-                session = FakeSession(reversed_fallback)
-                evaluator = Evaluator(cfg, session, lambda message: None)
-                evaluator.replay_mode = mode
-                rec = evaluator.evaluate(
-                    ordered_query if mode is None else None,
-                    ordered_query.sql(),
-                    0,
-                    "synthetic",
-                    0,
-                )
-                self.assertEqual(rec.verdict, verdict)
-                self.assertEqual(rec.comparison, mode or "ordered")
-                self.assertEqual(
-                    session.calls[-1], "SET enable_duckdb_fallback = false"
-                )
 
     def test_variant_mismatch(self):
         rec, _ = evaluate(gpu_variant_wrong, **{"variants.per_query": "1"})
@@ -425,7 +217,7 @@ class EvaluatorTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def test_finding_dedup_preserves_distinct_inputs_and_evidence(self):
-        for verdict in ("mismatch", "fallback_mismatch", "variant_mismatch", "timeout"):
+        for verdict in ("mismatch", "variant_mismatch", "timeout"):
             with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
                 report = Report(pathlib.Path(tmp), load_config(None), [], 1)
                 original = QueryRecord(
@@ -471,12 +263,6 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(signature(original), signature(reduced))
                 self.assertIsNone(report.add(reduced))
                 self.assertEqual(len(report.finish()["findings"]), len(records))
-                if verdict == "timeout":
-                    fallback = replace(
-                        original,
-                        context={"plan_fallback_reason": "Window not supported"},
-                    )
-                    self.assertNotEqual(signature(original), signature(fallback))
 
     def test_catch2_reproducer_applies_and_restores_variant(self):
         for variant in (
@@ -526,34 +312,6 @@ class ReportTests(unittest.TestCase):
                             f"Result>(), {'false' if mode == 'ordered' else 'true'})",
                             snippet,
                         )
-
-    def test_catch2_reproducer_compares_the_recorded_fallback_path(self):
-        for verdict, context in (
-            ("fallback_mismatch", {}),
-            ("gpu_error", {"plan_fallback_reason": "Window not supported"}),
-        ):
-            for mode in ("ordered", "multiset"):
-                with self.subTest(verdict=verdict, mode=mode):
-                    rec = QueryRecord(
-                        0,
-                        "d0",
-                        1,
-                        "SELECT k FROM t",
-                        verdict,
-                        comparison=mode,
-                        context=context,
-                    )
-                    snippet = catch2_snippet("test", rec, None, rec.sql)
-                    self.assertIn("#include <utils/scoped_sirius_setting.hpp>", snippet)
-                    self.assertIn(
-                        'scoped_sirius_setting fallback(*con, "enable_duckdb_fallback", true)',
-                        snippet,
-                    )
-                    self.assertIn(
-                        f"expect_plan_fallback_matches_cpu(query, {'true' if mode == 'ordered' else 'false'})",
-                        snippet,
-                    )
-                    self.assertNotIn("compare_gpu_vs_cpu", snippet)
 
     def test_reduction_compares_each_candidate_in_its_own_order_mode(self):
         cfg = load_config(None, ["oracle.ambiguity_filter=false"])
@@ -688,7 +446,6 @@ class ReportTests(unittest.TestCase):
                     "stage": "reduction",
                     "phase": "gpu",
                     "sql": "SELECT old_candidate",
-                    "plan_fallback_reason": "Window not supported",
                     "status": "ok",
                 },
             ):
@@ -723,108 +480,39 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(list((root / "findings").iterdir()), [])
                     report.finish()
 
-    def test_supervisor_crash_and_hang_keep_fallback_path_in_finding(self):
-        for verdict in ("crash", "timeout"):
-            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
-                root = pathlib.Path(tmp)
-                cfg = load_config(None, ["oracle.on_plan_fallback=count"])
-                report = Report(root, cfg, [], 1)
-                active_path = root / "worker.active.json"
-                active_path.write_text(
-                    json.dumps(
-                        {
-                            "sql": "SELECT 1",
-                            "phase": "gpu",
-                            "status": "running",
-                            "plan_fallback_reason": "Window not supported",
-                        }
-                    )
-                )
-                runner = Orchestrator(cfg, report, 1, OrchestratorOptions())
-                runner.active_paths[0] = active_path
-                runner.inflight[0] = ("SELECT 1", "synthetic", time.time(), [])
-                runner._say = lambda text: None
-                process = SimpleNamespace(
-                    exitcode=-11, kill=lambda: None, join=lambda timeout: None
-                )
-                with patch.object(runner, "_maybe_respawn"):
-                    if verdict == "crash":
-                        runner._worker_died(0, process, set())
-                    else:
-                        runner._worker_hung(0, process, runner.inflight[0], set())
-                record = json.loads(report.log_path.read_text().splitlines()[0])
-                self.assertEqual(record["verdict"], verdict)
-                self.assertTrue(uses_plan_fallback(verdict, record["context"]))
-                finding = next((root / "findings").iterdir())
-                repro = (finding / "repro.sql").read_text()
-                self.assertIn("-- Recorded fallback path", repro)
-                report.finish()
-
-    def test_standalone_repro_reaches_the_recorded_fallback_failure(self):
-        for behaviour in (
-            failing_fallback(RunResult("error", error="fallback conversion failed")),
-            failing_fallback(RunResult("timeout", error="interrupted")),
-            failing_fallback(
-                RunResult(
-                    "ok",
-                    ResultSet(
-                        [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)],
-                        [(1, 1.5)],
-                    ),
-                )
-            ),
-            gpu_wrong,
-        ):
-            with self.subTest(
-                behaviour=behaviour
-            ), tempfile.TemporaryDirectory() as tmp:
-                cfg = load_config(None, ["oracle.on_plan_fallback=count"])
-                rec, _ = evaluate(behaviour, **{"oracle.on_plan_fallback": "count"})
-                report = Report(pathlib.Path(tmp), cfg, [], 0)
-                name = report.add(rec)
-                report.finish()
-                script = (
-                    pathlib.Path(tmp) / "findings" / name / "repro.sql"
-                ).read_text()
-                # Interpret the generated setting/query sequence against the scripted
-                # session, including a shell configured to stop on the first error.
-                session = FakeSession(behaviour)
-                gpu, bail, results = False, True, []
-                for line in script.splitlines():
-                    if line == ".bail off":
-                        bail = False
-                    elif line.startswith("SET gpu_execution = "):
-                        gpu = line.endswith("true;")
-                    elif line.startswith("SET enable_duckdb_fallback = "):
-                        session.execute(line.rstrip(";"))
-                    elif line == rec.sql + ";":
-                        results.append(session.run(rec.sql, gpu, 60))
-                        if results[-1].status != "ok" and bail:
-                            break
-                expected_runs = 2 if rec.verdict == "mismatch" else 3
-                self.assertEqual(len(results), expected_runs, script)
-                if expected_runs == 3:
-                    self.assertIn("GPU plan generation failed", results[1].error)
-                    self.assertNotIn("GPU plan generation failed", results[2].error)
-                self.assertEqual(
-                    session.calls[-1], "SET enable_duckdb_fallback = false"
-                )
-
-    def test_distinct_fallback_errors_do_not_share_the_plan_rejection_signature(self):
-        cfg = load_config(None, ["oracle.on_plan_fallback=count"])
+    def test_standalone_repro_runs_reference_then_gpu(self):
         with tempfile.TemporaryDirectory() as tmp:
-            report = Report(pathlib.Path(tmp), cfg, [], 0)
-            for reason in ("fallback conversion failed", "fallback storage failed"):
+            rec, _ = evaluate(gpu_wrong)
+            report = Report(pathlib.Path(tmp), load_config(None), [], 0)
+            name = report.add(rec)
+            report.finish()
+            script = (pathlib.Path(tmp) / "findings" / name / "repro.sql").read_text()
+            # Interpret the generated setting/query sequence against the scripted session.
+            session = FakeSession(gpu_wrong)
+            gpu, results = False, []
+            for line in script.splitlines():
+                if line.startswith("SET gpu_execution = "):
+                    gpu = line.endswith("true;")
+                elif line == rec.sql + ";":
+                    results.append(session.run(rec.sql, gpu, 60))
+            self.assertEqual([r.status for r in results], ["ok", "ok"], script)
+            self.assertNotEqual(results[0].result.rows, results[1].result.rows)
+
+    def test_distinct_runtime_errors_do_not_share_a_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Report(pathlib.Path(tmp), load_config(None), [], 0)
+            for reason in ("conversion failed", "storage failed"):
                 rec, _ = evaluate(
-                    failing_fallback(RunResult("error", error=reason)),
-                    **{"oracle.on_plan_fallback": "count"},
+                    lambda *a, reason=reason: RunResult(
+                        "error", error=f"Sirius GPU execution failed: {reason}"
+                    )
                 )
                 report.add(rec)
             self.assertEqual(len(report.finish()["findings"]), 2)
 
-    def test_plan_fallback_policy_controls_campaign_exit(self):
+    def test_plan_fallback_is_a_finding_that_fails_the_campaign(self):
         def run_campaign(runner):
-            session = FakeSession(gpu_plan_then_fallback)
+            session = FakeSession(gpu_plan_fallback)
             ev = Evaluator(runner.cfg, session, lambda message: None)
             runner.report.add(ev.evaluate(None, "SELECT 1", 0, "synthetic", 0))
             summary = runner.report.finish()
@@ -832,56 +520,28 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(
                 summary["plan_fallback_reasons"], [("Window not supported", 1)]
             )
-            self.assertEqual(
-                len(summary["findings"]),
-                int(runner.cfg.oracle.on_plan_fallback == "fail"),
-            )
+            self.assertEqual(len(summary["findings"]), 1)
             return summary
 
-        for policy, exit_code in (("fail", 1), ("count", 0), ("skip", 0)):
-            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as tmp:
-                args = build_parser().parse_args(
-                    [
-                        "run",
-                        "--seed",
-                        "1",
-                        "--queries",
-                        "1",
-                        "--fail-on-findings",
-                        "--out",
-                        tmp,
-                        "--set",
-                        f"oracle.on_plan_fallback={policy}",
-                    ]
-                )
-                with patch(
-                    "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
-                ), patch("siriusfuzz.cli.provenance", return_value={}), patch.object(
-                    Orchestrator, "run", autospec=True, side_effect=run_campaign
-                ):
-                    self.assertEqual(cmd_run(args), exit_code)
-
-    def test_count_policy_still_reports_fallback_mismatches_and_errors(self):
-        def wrong_fallback(sql, cols, rows, session):
-            if (
-                session.calls
-                and session.calls[-1] == "SET enable_duckdb_fallback = true"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "run",
+                    "--seed",
+                    "1",
+                    "--queries",
+                    "1",
+                    "--fail-on-findings",
+                    "--out",
+                    tmp,
+                ]
+            )
+            with patch(
+                "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
+            ), patch("siriusfuzz.cli.provenance", return_value={}), patch.object(
+                Orchestrator, "run", autospec=True, side_effect=run_campaign
             ):
-                return gpu_wrong(sql, cols, rows, session)
-            return gpu_plan_fallback(sql, cols, rows, session)
-
-        for behaviour, verdict in (
-            (wrong_fallback, "fallback_mismatch"),
-            (gpu_plan_fallback, "gpu_error"),
-        ):
-            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
-                cfg = load_config(None, ["oracle.on_plan_fallback=count"])
-                record, _ = evaluate(behaviour, **{"oracle.on_plan_fallback": "count"})
-                report = Report(pathlib.Path(tmp), cfg, [], 0)
-                name = report.add(record)
-                summary = report.finish()
-                self.assertIsNotNone(name)
-                self.assertEqual(summary["findings"][0]["verdict"], verdict)
+                self.assertEqual(cmd_run(args), 1)
 
     def test_dedup_known_issue_and_artifacts(self):
         cfg = load_config(None)

@@ -12,12 +12,12 @@ This skill has no dependency on a particular workstation, cloud provider, accoun
 
 ## Select the task and execution environment
 
-Use the user's requested revision, profile, seed, duration and host when supplied. For an
-unspecified run, start with a short strict-profile campaign: seed 42, one worker, at most
-100 queries or three minutes, and no automatic reduction. This is a readiness and correctness
-sample, not comprehensive coverage. Requests to run fuzzing require a compatible GPU and a
-passing doctor. Run CPU harness tests or selftest only when explicitly requested; they are not
-a substitute for GPU fuzzing. Inspecting saved reports needs no GPU.
+Use the user's requested revision, configuration, seed, duration and host when supplied. For
+an unspecified run, start with a short campaign on the default configuration: seed 42, one
+worker, at most 100 queries or three minutes, and no automatic reduction. This is a readiness
+and correctness sample, not comprehensive coverage. Requests to run fuzzing require a
+compatible GPU and a passing doctor. Run CPU harness tests or selftest only when explicitly
+requested; they are not a substitute for GPU fuzzing. Inspecting saved reports needs no GPU.
 
 Inspect the current checkout and the execution environments already available to this task.
 Consider a remote development host when the user names it or an existing connection provides
@@ -53,9 +53,9 @@ not an implicit part of selecting an existing environment.
 - Select an existing host-appropriate Sirius YAML, verifying memory settings and writable spill
   paths. Do not copy another machine's resource limits. Keep metadata checks enabled; a mismatch
   is a setup problem to investigate, not a reason to automatically bypass the check.
-- Choose absolute paths for the profile, extension, YAML and a fresh output root. The Pixi
+- Choose absolute paths for the configuration, extension, YAML and a fresh output root. The Pixi
   `fuzz` task changes directory to `test/fuzz`. Record host, source state, submodules, binary
-  identity, device selection, profile and overrides without dumping credentials or the full environment.
+  identity, device selection, configuration and overrides without dumping credentials or the full environment.
 
 Use one available GPU and one worker initially. For long runs, use an available persistent
 session/job mechanism, preserve logs and exit codes, and reconnect to that job after a
@@ -63,13 +63,13 @@ disconnect. Do not launch a duplicate campaign because a client lost its connect
 
 ## Check readiness and execute
 
-Set `repo`, `profile`, `extension`, `yaml` and `out` to verified absolute paths on the selected
-host. For the default strict profile, use `$repo/test/fuzz/config/strict.toml`.
+Set `repo`, `config`, `extension`, `yaml` and `out` to verified absolute paths on the selected
+host. The default configuration is `$repo/test/fuzz/config/default.toml`.
 Run commands from that checkout and capture each command's output and actual exit code.
 
 ```bash
 pixi run -e duckdb-python fuzz doctor \
-  --config "$profile" --extension "$extension" --sirius-config "$yaml" \
+  --config "$config" --extension "$extension" --sirius-config "$yaml" \
   --no-allow-metadata-mismatch --timeout 120 --out "$out/doctor"
 ```
 
@@ -83,7 +83,7 @@ For a short run when the user has not specified other limits:
 
 ```bash
 pixi run -e duckdb-python fuzz run \
-  --config "$profile" --extension "$extension" --sirius-config "$yaml" \
+  --config "$config" --extension "$extension" --sirius-config "$yaml" \
   --no-allow-metadata-mismatch --seed 42 --queries 100 --duration 3m \
   --workers 1 --no-reduce --max-respawns 0 --out "$out/campaign"
 ```
@@ -122,7 +122,7 @@ interpret other exit codes using the guide for that command.
 Separate setup failures, CPU reference errors, coverage gaps, result discrepancies and process
 failures. Dedup signatures are grouping hints, not counts of confirmed defects. A counted CPU
 range/conversion error is not a GPU result comparison. Report skipped queries and incomplete
-work explicitly. Do not infer GPU success from a CPU selftest or from a frontier run's fallback.
+work explicitly. Do not infer GPU success from a CPU selftest.
 
 Preserve original finding bundles and their datasets/configuration. A request to run fuzzing
 ends with saved evidence and a summary; it does not imply engine edits, repeated crash/hang

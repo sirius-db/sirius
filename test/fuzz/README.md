@@ -22,7 +22,7 @@ disagreement as a replayable finding. It is a plain command-line tool; no AI age
 - [How it works](#how-it-works)
 - [Verdicts](#verdicts)
 - [Running a campaign](#running-a-campaign)
-- [Profiles](#profiles)
+- [Configuration](#configuration)
 - [Saved evidence](#saved-evidence)
 - [Replaying a finding](#replaying-a-finding)
 - [Triage and issue drafts](#triage-and-issue-drafts)
@@ -116,14 +116,14 @@ All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
 Also: `pixi run -e duckdb-python fuzz-test` runs the harness unit tests.
 
 **Path rule:** the Pixi `fuzz` task runs from `test/fuzz`, so use absolute paths for any input or
-output outside the repository. Profile-relative engine paths are resolved by the configuration
-loader.
+output outside the repository. Relative engine paths in the configuration resolve against the
+repository root.
 
 ---
 
 ## How it works
 
-1. **Generate.** Typed tables, data and SQL come from a TOML feature profile, including NULLs and
+1. **Generate.** Typed tables, data and SQL come from the TOML configuration, including NULLs and
    edge values. The run summary flags enabled features that were never generated.
 2. **Execute.** Each query runs on DuckDB CPU, then on Sirius with
    `enable_duckdb_fallback = false`. After a match, the query is rerun under randomized Sirius
@@ -154,8 +154,7 @@ Two implementation details worth knowing:
 | `known_issue` | matches an entry in `known_issues.toml`; counted, not failed | no |
 | `mismatch` | GPU rows differ from CPU rows | **yes** |
 | `variant_mismatch` | same query, one Sirius setting changed, different rows | **yes** |
-| `plan_fallback` | Sirius declined the plan; the reason is recorded | strict: **yes**; frontier: counted |
-| `fallback_mismatch` | frontier only: the CPU fallback path returned wrong rows | **yes** |
+| `plan_fallback` | Sirius declined the plan: an enabled feature does not run on the GPU; the reason is recorded | **yes** |
 | `gpu_error` / `gpu_internal_error` / `gpu_oom` | the GPU run raised | **yes** |
 | `timeout` | the GPU run exceeded `oracle.query_timeout_seconds` | **yes** (hang candidate) |
 | `crash` | the worker process died during the query | **yes** |
@@ -208,27 +207,13 @@ remove them after inspection.
 
 ---
 
-## Profiles
+## Configuration
 
-Profiles live in `config/`:
-
-| Profile | Enables | Plan fallback is |
-|---------|---------|------------------|
-| `strict.toml` | Only what runs on the GPU today. Identical to the built-in defaults (a unit test enforces this). | a finding |
-| `frontier.toml` | Everything in strict, plus window functions, `DISTINCT`, grouping sets, `FULL`/`CROSS` joins, `UNION`/`EXCEPT`/`INTERSECT`, uncorrelated subqueries, `TRY`, temporal-numeric and to-VARCHAR casts. | counted; the fallback path is checked for correct results |
-
-When a feature lands on the GPU, flip its key in `strict.toml`.
-
-`oracle.on_plan_fallback` controls what happens on a plan rejection:
-
-| Value | Behaviour |
-|-------|-----------|
-| `fail` | save a finding |
-| `count` | record the coverage gap and check the fallback result against CPU |
-| `skip` | record the gap without executing the fallback query |
-
-Coverage gaps under `count` or `skip` do not trigger `--fail-on-findings` or reduction.
-Fallback mismatches and execution errors are always findings.
+There is one configuration file, `config/default.toml`; every command loads it unless `--config`
+names another. Its `[features]` flags mark what Sirius runs on the GPU today: every enabled
+feature is expected to stay on the GPU, so a plan-time fallback is a finding. When Sirius gains a
+feature, flip its flag to `true` there. `--set key.path=value` overrides any key for one run, and
+`show-config` prints the effective result.
 
 `known_issues.toml` quarantines confirmed divergences by regex. Every entry carries an issue link.
 
@@ -261,8 +246,8 @@ run-<timestamp>-seed<seed>-<unique>/
 
 **How findings are grouped.** Signatures are grouping heuristics, not confirmed root causes.
 Mismatch and timeout signatures include the original SQL, dataset identity, comparison mode,
-variant value, execution path and result evidence, so distinct inputs stay separate even when
-their operator labels match. Repeated errors group by normalized reason. This favours keeping
+variant value and result evidence, so distinct inputs stay separate even when their operator
+labels match. Repeated errors group by normalized reason. This favours keeping
 evidence over compact counts; use triage groups to merge candidates after investigation.
 
 **Reduction never replaces the original.** The original observation is saved before reduction
@@ -274,9 +259,7 @@ explicit dataset.
 **Provenance.** Source revisions describe the checkout at run time; the extension fingerprint
 identifies the actual binary, and the revision alone does not prove how it was built. Findings
 carry small, labelled result samples and comparator differences rather than full result dumps.
-`repro.sql` prints CPU/GPU results plus any recorded fallback or variant results; the CLI does
-the comparison. For fallback findings, the script continues past the expected strict plan
-rejection and reruns with fallback enabled.
+`repro.sql` prints CPU/GPU results plus any recorded variant result; the CLI does the comparison.
 
 **Naming.** Dataset filenames include the worker incarnation, so a respawn cannot overwrite
 earlier data. Every retained additional reproducer carries its own dataset and settings.
@@ -414,11 +397,11 @@ Regeneration preserves user edits and reports conflicts.
 - **Reduces (optional).** SQL and data are shrunk in fresh supervised processes, including for
   native crash and timeout candidates. Defaults: 20 proposed edits and 120 s per candidate;
   tune with `--reduce-steps`, `--reduce-seconds`, or disable with `--no-reduce`. A reduction is
-  accepted only if it preserves the failure signature and strict/fallback execution path twice,
-  has a stable CPU reference, and passes the available row-order check. The reducer removes
-  selected clauses, projections and `INSERT` rows; it leaves ordered-query SQL unchanged and
-  declines unsupported quoting. The result is the smallest reproducer seen within budget, not a
-  guaranteed minimum. An unrelated crash cannot substitute for a mismatch.
+  accepted only if it preserves the failure signature twice, has a stable CPU reference, and
+  passes the available row-order check. The reducer removes selected clauses, projections and
+  `INSERT` rows; it leaves ordered-query SQL unchanged and declines unsupported quoting. The
+  result is the smallest reproducer seen within budget, not a guaranteed minimum. An unrelated
+  crash cannot substitute for a mismatch.
 
 ### Budgets, exit codes and resuming
 

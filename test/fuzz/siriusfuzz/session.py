@@ -61,7 +61,6 @@ class Session:
         self.evidence_path = evidence_path
         self.active_settings: dict[str, Any] = {}
         self.evidence: dict[str, Any] = {}
-        self.plan_fallback_reason: str | None = None
         self.stage = "evaluation"
         self.con: Any = None
         self.gpu_available = extension is not None
@@ -227,21 +226,6 @@ class Session:
                 },
             )
 
-    def begin_fallback_retry(self, reason: str) -> None:
-        """Persist the retry path before native code can crash or be killed."""
-        self.plan_fallback_reason = reason
-        if self.evidence_path:
-            state = dict(self.evidence.get("gpu", {}))
-            state.update(
-                plan_fallback_reason=reason,
-                status="running",
-                started_at=time.time(),
-            )
-            write_json(self.evidence_path, state)
-
-    def end_fallback_retry(self) -> None:
-        self.plan_fallback_reason = None
-
     def run(self, sql: str, gpu: bool, timeout: float) -> RunResult:
         import duckdb
 
@@ -255,8 +239,6 @@ class Session:
             "started_at": time.time(),
             "dataset": self.current_alias,
         }
-        if gpu and self.plan_fallback_reason is not None:
-            state["plan_fallback_reason"] = self.plan_fallback_reason
         if self.evidence_path:
             write_json(self.evidence_path, state)
         self.set_gpu(gpu)

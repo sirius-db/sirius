@@ -17,7 +17,7 @@ import tomllib
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .classify import SEVERITY, Verdict, normalize_reason, uses_plan_fallback
+from .classify import SEVERITY, Verdict, normalize_reason
 from .artifacts import seal, write_json, sql_literal
 from .config import FuzzConfig, FUZZ_DIR
 
@@ -93,12 +93,7 @@ EXTRA_REPRODUCERS = 5  # additional query-<n>.sql files kept per deduplicated fi
 def signature(rec: QueryRecord) -> str:
     """Group errors by reason; retain distinct mismatch and timeout observations."""
     v = rec.verdict
-    if v in (
-        Verdict.MISMATCH,
-        Verdict.FALLBACK_MISMATCH,
-        Verdict.VARIANT_MISMATCH,
-        Verdict.TIMEOUT,
-    ):
+    if v in (Verdict.MISMATCH, Verdict.VARIANT_MISMATCH, Verdict.TIMEOUT):
         # Findings are persisted before reduction, which may itself crash. Operator
         # labels are too coarse to discard later examples: retain each input and
         # observed difference, including the value of a variant setting.
@@ -110,9 +105,6 @@ def signature(rec: QueryRecord) -> str:
             "reason": rec.reason,
             "detail": rec.detail,
             "diffs": rec.diffs,
-            "execution_path": (
-                "fallback" if uses_plan_fallback(v, rec.context) else "strict"
-            ),
             "phase": rec.context.get("phase"),
             "stage": rec.context.get("stage"),
             "results": [
@@ -176,26 +168,21 @@ class Report:
     def add(self, rec: QueryRecord) -> str | None:
         """Record a query; returns the finding directory name when a new finding was written."""
         self.queries += 1
-        verdict = Verdict(rec.verdict)
+        observed = verdict = Verdict(rec.verdict)
         for ki in self.known:
-            if verdict.is_finding(self.cfg.oracle.on_plan_fallback) and ki.matches(rec):
+            if verdict.is_finding() and ki.matches(rec):
                 rec.reason = f"{ki.issue}: {rec.reason}"
                 rec.verdict = Verdict.KNOWN_ISSUE.value
                 verdict = Verdict.KNOWN_ISSUE
                 break
         self.counts[rec.verdict] += 1
-        if verdict == Verdict.PLAN_FALLBACK or (
-            verdict == Verdict.KNOWN_ISSUE and "plan" in rec.detail[:40].lower()
-        ):
+        if observed == Verdict.PLAN_FALLBACK:
             self.fallback_reasons[normalize_reason(rec.reason)] += 1
         if verdict == Verdict.CPU_ERROR:
             self.cpu_error_reasons[normalize_reason(rec.reason)] += 1
         self._log.write(json.dumps(asdict(rec), default=str) + "\n")
         self._log.flush()
-        if (
-            not verdict.is_finding(self.cfg.oracle.on_plan_fallback)
-            and verdict != Verdict.KNOWN_ISSUE
-        ):
+        if not verdict.is_finding() and verdict != Verdict.KNOWN_ISSUE:
             return None
         sig = signature(rec)
         if sig in self.findings:
@@ -292,14 +279,6 @@ class Report:
             f"SET {key} = {sql_literal(value) if isinstance(value, str) else value};\n"
             for key, value in (rec.variant or {}).items()
         )
-        fallback = uses_plan_fallback(rec.verdict, rec.context)
-        fallback_sql = (
-            "-- Recorded fallback path\nSET enable_duckdb_fallback = true;\n"
-            + query
-            + "SET enable_duckdb_fallback = false;\n"
-            if fallback
-            else ""
-        )
         (d / "repro.sql").write_text(
             "-- Run in this directory with a matching Sirius-loaded DuckDB shell.\n"
             "-- Use a fresh database path for each attempt.\n"
@@ -309,13 +288,7 @@ class Report:
             + query
             + "SET enable_duckdb_fallback = false;\nSET gpu_execution = true;\n"
             "-- GPU baseline\n"
-            + (
-                "-- Continue after the expected plan rejection.\n.bail off\n"
-                if fallback
-                else ""
-            )
             + query
-            + fallback_sql
             + ("-- Recorded variant\n" + variant_sql + query if variant_sql else "")
         )
         (d / "REPLAY.md").write_text(
@@ -327,8 +300,7 @@ class Report:
             "use --sirius-config for a local copy when necessary; the override is recorded.\n\n"
             "For a standalone shell reproduction, start the matching DuckDB shell in this directory, set SIRIUS_CONFIG_FILE to sirius.yaml, "
             "LOAD the matching Sirius extension, then `.read repro.sql`. Use a fresh directory/database for each attempt. "
-            "repro.sql prints CPU, strict GPU, recorded fallback and variant results as applicable; it does not compare them. "
-            "For fallback findings it disables shell bail-on-error so the expected plan rejection does not stop the fallback attempt.\n"
+            "repro.sql prints CPU, strict GPU and recorded variant results as applicable; it does not compare them.\n"
         )
         seal(d)
 
@@ -366,7 +338,7 @@ class Report:
             "stop_reason": self.stop_reason,
             "seed": self.seed,
             "config_hash": self.cfg.config_hash(),
-            "profile": self.cfg.profile,
+            "config_path": self.cfg.source_path,
             "elapsed_seconds": round(elapsed, 1),
             "queries": self.queries,
             "datasets": self.datasets,
@@ -387,7 +359,7 @@ class Report:
         lines = [
             f"siriusfuzz run: {self.run_dir}",
             f"status={summary.get('status', 'unknown')}: {summary.get('stop_reason', '')}",
-            f"profile={summary['profile']} seed={summary['seed']} config={summary['config_hash']} "
+            f"seed={summary['seed']} config={summary['config_hash']} "
             f"queries={summary['queries']} datasets={summary['datasets']} elapsed={summary['elapsed_seconds']}s",
             "",
             "verdict counts:",
@@ -463,15 +435,7 @@ def catch2_snippet(
         else "compare_gpu_vs_cpu"
     )
     comparison = f"  {comparator}(query);\n"
-    includes = ""
-    if uses_plan_fallback(rec.verdict, rec.context):
-        includes = "#include <utils/scoped_sirius_setting.hpp>\n\n"
-        ordered = "true" if rec.comparison == "ordered" else "false"
-        comparison = (
-            '  sirius::test::scoped_sirius_setting fallback(*con, "enable_duckdb_fallback", true);\n'
-            f"  expect_plan_fallback_matches_cpu(query, {ordered});\n"
-        )
-    elif rec.variant:
+    if rec.variant:
         comparison += (
             "  auto baseline = con->Query(query);\n"
             "  REQUIRE(baseline);\n"
@@ -511,8 +475,7 @@ def catch2_snippet(
             "  REQUIRE(baseline_rows == variant_rows);\n"
         )
     return (
-        includes
-        + "// Generated by siriusfuzz; drop into test/cpp/integration/test_gpu_execution_fuzz.cpp\n"
+        "// Generated by siriusfuzz; drop into test/cpp/integration/test_gpu_execution_fuzz.cpp\n"
         f"{schema_hint}"
         "TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,\n"
         f'                 "fuzz repro {name}",\n'
