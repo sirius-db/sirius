@@ -38,7 +38,6 @@
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda/stream>
 #include <cuda_runtime.h>
@@ -899,7 +898,7 @@ TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and su
   auto f64 =
     make_values_table<double>({0.0, 1.0, 2.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
 
-  // supports() gate: 1..k_max_keys keys, INT32/INT64, no nulls.
+  // supports() gate: 1..k_max_keys *valid* integer keys; the all-null column has none.
   REQUIRE(F::supports(one_i32->view()));
   REQUIRE(F::supports(max_i32->view()));
   REQUIRE_FALSE(F::supports(empty_i32->view()));
@@ -953,14 +952,16 @@ class counting_in_list_filter final : public sirius_dynamic_filter,
     return _inner->is_available_on_device(device_id);
   }
 
+  using sirius::op::sirius_mask_applicable::compute_mask;
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override
   {
     ++_mask_calls;
-    return _inner->compute_mask(probe, device_id, stream, mr);
+    return _inner->compute_mask(probe, prior_mask_words, device_id, stream, mr);
   }
 
   [[nodiscard]] int mask_calls() const noexcept { return _mask_calls; }
@@ -994,8 +995,10 @@ class throwing_mask_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] bool is_available_on_device(int) const noexcept override { return true; }
 
+  using sirius::op::sirius_mask_applicable::compute_mask;
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const&,
+    std::uint32_t const*,
     int,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref) const override
@@ -1132,9 +1135,11 @@ TEST_CASE("decode probes retain exactly the captured snapshot after channel grow
     REQUIRE(probes.probes[1].empty());
   }
   REQUIRE_FALSE(filter_lifetime.expired());
-  auto mask = probes.probes[0][0].probe(
-    input->view().column(0), stream, cudf::get_current_device_resource_ref());
-  stream.synchronize();
+  auto mask = probes.probes[0][0].probe(input->view().column(0),
+                                        /*prior_mask_words=*/nullptr,
+                                        stream,
+                                        cudf::get_current_device_resource_ref());
+  REQUIRE(cudaStreamSynchronize(cuda::stream_ref{stream}.get()) == cudaSuccess);
   REQUIRE(mask != nullptr);
   REQUIRE(mask->size() == input->num_rows());
   probes = {};
@@ -1145,7 +1150,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
           "[dynamic_filter][scan_merge][snapshot]")
 {
   rmm::cuda_stream stream;
-  auto input    = make_int64_sequence_table(10, stream.view());
+  auto input    = make_int64_sequence_table(10, stream);
   int device_id = -1;
   REQUIRE(cudaGetDevice(&device_id) == cudaSuccess);
   blocked_filter_work work;
@@ -1165,7 +1170,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
   std::jthread worker([&] {
     try {
       rmm::cuda_set_device_raii device{rmm::cuda_device_id{device_id}};
-      (void)sirius::op::scan::apply_dynamic_filters_to_view(input->view(), snapshot, stream.view());
+      (void)sirius::op::scan::apply_dynamic_filters_to_view(input->view(), snapshot, stream);
       returned.set_value();
     } catch (...) {
       returned.set_exception(std::current_exception());
@@ -1174,15 +1179,15 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
   struct release_join_guard {
     blocked_filter_work& work;
     std::jthread& worker;
-    rmm::cuda_stream_view stream;
+    cuda::stream_ref stream;
 
     ~release_join_guard()
     {
       work.unblock();
       if (worker.joinable()) { worker.join(); }
-      stream.synchronize_no_throw();
+      (void)cudaStreamSynchronize(stream.get());
     }
-  } cleanup{work, worker, stream.view()};
+  } cleanup{work, worker, stream};
 
   auto const callback_started =
     started.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
@@ -1190,7 +1195,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
     result.wait_for(std::chrono::milliseconds{100}) == std::future_status::ready;
   work.unblock();
   worker.join();
-  stream.synchronize();
+  REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
 
   REQUIRE(callback_started);
   REQUIRE_FALSE(returned_while_blocked);

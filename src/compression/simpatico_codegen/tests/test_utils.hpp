@@ -276,8 +276,11 @@ inline std::unique_ptr<cudf::column> make_string_column(int num_rows, ::cuda::st
     throw std::runtime_error("make_string_column: chars copy failed");
   stream.sync();
 
-  return cudf::make_strings_column(
-    num_rows, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  return cudf::make_strings_column(num_rows,
+                                   std::move(offsets_col),
+                                   std::move(chars_buf),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Single-column STRING table wrapping make_string_column.
@@ -389,8 +392,11 @@ inline std::unique_ptr<cudf::column> make_strings_column(std::vector<std::string
 
   if (!has_nulls) {
     stream.sync();
-    return cudf::make_strings_column(
-      n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+    return cudf::make_strings_column(n,
+                                     std::move(offsets_col),
+                                     std::move(chars_buf),
+                                     0,
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   }
   std::size_t const mask_bytes = cudf::bitmask_allocation_size_bytes(n);
   std::vector<std::uint32_t> words(static_cast<std::size_t>((n + 31) / 32), 0u);
@@ -401,7 +407,7 @@ inline std::unique_ptr<cudf::column> make_strings_column(std::vector<std::string
     else
       ++nulls;
   }
-  rmm::device_buffer mask_buf(mask_bytes, stream);
+  auto mask_buf = cudf::create_null_mask(n, cudf::mask_state::UNINITIALIZED, stream);
   cudaMemsetAsync(mask_buf.data(), 0, mask_bytes, stream.get());
   cudaMemcpyAsync(mask_buf.data(),
                   words.data(),

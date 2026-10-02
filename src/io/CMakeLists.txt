@@ -1,0 +1,20 @@
+target_sources(
+  sirius_objects
+  PRIVATE datasource_factory.cpp
+          io_context.cpp
+          parquet_helpers.cpp
+          sirius_datasource.cpp
+          uri_parser.cpp
+          cache/metadata_store.cpp
+          cache/prefetching_cache.cpp
+          cache/types.cpp
+          kvikio/kvikio_context.cpp
+          rest/curl_handle.cpp
+          rest/rest_ioctx.cpp
+          rest/rest_reactor.cpp
+          rest/s3/list_parser.cpp
+          rest/s3/sigv4.cpp
+          s3/sirius_httpfs.cpp
+          rest/s3/sigv4_authorizer.cpp
+          uring/uring_ioctx.cpp
+          uring/uring_reactor.cpp)

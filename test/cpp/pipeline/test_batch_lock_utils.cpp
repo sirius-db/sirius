@@ -29,10 +29,12 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -90,19 +92,14 @@ bool enable_p2p_for_test(int num_gpus)
   return all_enabled;
 }
 
-/// Skip idiom for multi-GPU tests (Catch2 v2): WARN + return true when fewer than two GPUs
+/// Skip idiom for multi-GPU tests (Catch2): WARN + return true when fewer than two GPUs
 /// are present. These tests validate lock/clone semantics, which hold on both cross-GPU
 /// transfer flavors, so P2P is enabled best-effort rather than required: with it the clone
 /// peer-DMAs, without it cucascade host-stages — exactly as production would on the same
 /// hardware. The WARN records which flavor a run exercised.
 bool skip_if_not_mgpu()
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs");
-    return true;
-  }
+  if (!sirius::test::has_gpus(2)) { return true; }
   if (!enable_p2p_for_test(2)) {
     WARN("GPUs 0 and 1 are not P2P-capable — cross-GPU copies will host-stage");
   }
@@ -248,7 +245,7 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                                           std::move(offsets),
                                           std::move(values),
                                           0,
-                                          rmm::device_buffer{});
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(list_col));
   return std::make_unique<cudf::table>(std::move(cols));
@@ -259,7 +256,7 @@ constexpr std::size_t kNumRows = 4096;
 }  // namespace
 
 TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -304,7 +301,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
 }
 
 TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -501,7 +498,8 @@ TEST_CASE("host to GPU upgrade normalizes LIST offsets to INT32", "[batch_lock_u
   REQUIRE(column_values_to_host<int32_t>(lcv.child(), stream) == expected_list_values(kNumLists));
 }
 
-TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_lock_utils][mgpu]")
+TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets",
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -531,7 +529,7 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
 }
 
 TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -568,7 +566,7 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
 }
 
 TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target space",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -595,7 +593,7 @@ TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target spa
 }
 
 TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;

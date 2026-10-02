@@ -1,0 +1,36 @@
+--- a/cpp/src/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cu
++++ b/cpp/src/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cu
+@@ -7,6 +7,7 @@
+ // Created by Stardust on 2/23/25.
+ //
+ 
++#include "../../../core/omp_wrapper.hpp"
+ #include "../../../util/serialize_validation.hpp"
+ #include "../../detail/ann_utils.cuh"
+ #include "../utils/reductions.cuh"
+@@ -31,7 +32,6 @@
+ 
+ #include <limits>
+ #include <numeric>
+-#include <omp.h>
+ #include <vector>
+ 
+ namespace cuvs::neighbors::ivf_rabitq::detail {
+@@ -777,7 +777,7 @@
+   size_t batch_count = 0;
+ 
+   // Calculate number of threads for host data gathering
+-  const size_t num_threads = omp_get_max_threads();
++  const size_t num_threads = cuvs::core::omp::get_max_threads();
+ 
+   size_t cluster_idx = 0;
+ 
+@@ -808,7 +808,7 @@
+     // Use OpenMP parallel region to leverage persistent thread pool across batches
+ #pragma omp parallel num_threads(num_threads)
+     {
+-      size_t tid        = omp_get_thread_num();
++      size_t tid        = cuvs::core::omp::get_thread_num();
+       size_t chunk_size = batch_vectors / num_threads;
+       size_t start      = tid * chunk_size;
+       size_t end        = (tid == num_threads - 1) ? batch_vectors : start + chunk_size;

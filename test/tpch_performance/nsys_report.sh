@@ -113,6 +113,10 @@ if [ -z "$SF" ] && [ -z "$PROFILE_DIR" ]; then
     usage
 fi
 
+# Dataset labels may include a suffix (e.g. 300_rg2m), but SQL parameters
+# need the numeric scale factor.
+SCALE_FACTOR="${SF%%_*}"
+
 if [ -n "$PROFILE_DIR" ] && [ ! -d "$PROFILE_DIR" ]; then
     echo "ERROR: Profile directory not found: $PROFILE_DIR" >&2
     exit 1
@@ -193,8 +197,9 @@ else
 
     PY_CMD=(
         pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
-        --mode nsys-profile
+        --precmd nsys
         --input "$INPUT"
+        --scale-factor "$SCALE_FACTOR"
         --data-source "$DATA_SOURCE"
         --engine gpu
         --iterations "$ITERATIONS"
@@ -216,7 +221,7 @@ else
     # Flatten <REPORT_DIR>/<bench>_profiles_tree/sirius/q<N>/ → <REPORT_DIR>/profiles/q<N>.<ext>
     # so nsys_analyze.sh and Phase 4 metric extraction (which read flat
     # profiles/q<N>.sqlite + q<N>_timings.csv) continue to work unchanged.
-    # performance_test.py prefixes --name with tpch_<ts>_<mode>_<engine>_iter<N>_, so the
+    # performance_test.py prefixes --name with tpch_<ts>_<execution>_<engine>_iter<N>_, so the
     # per-query tree is `<REPORT_DIR>/*profiles_tree/sirius`, not a bare `profiles_tree/`.
     PROFILES_TREE=""
     for _d in "$REPORT_DIR"/*profiles_tree/sirius; do

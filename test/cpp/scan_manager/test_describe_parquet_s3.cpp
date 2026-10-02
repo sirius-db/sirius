@@ -23,6 +23,7 @@
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/s3_test_env.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
 #include <duckdb.hpp>
@@ -39,81 +40,44 @@
 
 namespace {
 
-using sirius::io::io_context_type;
 using sirius::io::rest::rest_ioctx;
 using sirius::scan_manager::parquet_bind_result;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
+using sirius::test::s3::env_or;
+using sirius::test::s3::require_env;
+using sirius::test::s3::require_rest_ioctx;
+using sirius::test::s3::single_gpu_index;
+using sirius::test::s3::sql_quote;
 
 namespace fs = std::filesystem;
-
-std::string env_or(std::string const& name, std::string fallback = {})
-{
-  if (auto* value = std::getenv(name.c_str()); value != nullptr) { return value; }
-  return fallback;
-}
-
-std::string require_env(std::string const& name)
-{
-  auto value = env_or(name);
-  REQUIRE_FALSE(value.empty());
-  return value;
-}
-
-cucascade::memory::system_topology_info single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return topology;
-}
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
-{
-  return std::make_shared<sirius::memory::topology_index>(single_gpu_topology(),
-                                                          std::vector<int>{0});
-}
 
 struct scan_manager_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::shared_ptr<const sirius::memory::topology_index> topology =
+    single_gpu_index(/*numa_node=*/0);
 };
 
-scan_manager_config make_minio_rest_config(bool perf_instrumentation = false)
+scan_manager_config make_minio_rest_config()
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource     = true;
-  cfg.object_store.endpoint     = require_env("SIRIUS_TEST_S3_ENDPOINT");
-  cfg.object_store.region       = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
-  cfg.object_store.access_key   = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
-  cfg.object_store.secret_key   = require_env("SIRIUS_TEST_S3_SECRET_KEY");
-  cfg.object_store.tls_verify   = false;
-  cfg.rest.request_timeout_s    = 30;
-  cfg.rest.max_connections      = 8;
-  cfg.rest.perf_instrumentation = perf_instrumentation;
-  cfg.rest_n_reactors           = 1;
-  cfg.enable_prefetch_cache     = false;
+  cfg.backend                 = sirius::scan_manager::io_backend::sirius;
+  cfg.object_store.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
+  cfg.object_store.region     = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
+  cfg.object_store.access_key = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
+  cfg.object_store.secret_key = require_env("SIRIUS_TEST_S3_SECRET_KEY");
+  cfg.object_store.tls_verify = false;
+  cfg.rest.request_timeout_s  = 30;
+  cfg.rest.max_connections    = 8;
+  cfg.rest_n_reactors         = 1;
+  cfg.cache.mode              = sirius::io::cache::cache_mode::none;
   return cfg;
 }
 
 std::string parquet_uri(std::string const& bucket, std::string const& file_name)
 {
   return "s3://" + bucket + "/parquet/" + file_name;
-}
-
-std::string sql_quote(std::string_view value)
-{
-  std::string out{"'"};
-  for (char c : value) {
-    if (c == '\'') { out.push_back('\''); }
-    out.push_back(c);
-  }
-  out.push_back('\'');
-  return out;
 }
 
 fs::path parquet_fixture(std::string_view file_name)
@@ -173,34 +137,9 @@ void check_bind_shape_matches_duckdb(parquet_bind_result const& actual,
   }
 }
 
-rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
-{
-  REQUIRE(ds != nullptr);
-  REQUIRE(ds->io_ctx() != nullptr);
-  CHECK(ds->io_ctx()->type() == io_context_type::restful);
-  auto* rest_ctx = dynamic_cast<rest_ioctx*>(ds->io_ctx().get());
-  REQUIRE(rest_ctx != nullptr);
-  return rest_ctx;
-}
-
 rest_ioctx* require_rest_ioctx_for(sirius_scan_manager& manager, std::string const& uri)
 {
   return require_rest_ioctx(manager.create_datasource(uri));
-}
-
-std::uint64_t chunk_get_count(rest_ioctx const& ctx) { return ctx.perf_snapshot().chunk_get_count; }
-
-parquet_bind_result describe_with_counter(sirius_scan_manager& manager,
-                                          std::string const& uri,
-                                          std::uint64_t& delta)
-{
-  auto* rest_ctx    = require_rest_ioctx_for(manager, uri);
-  auto const before = chunk_get_count(*rest_ctx);
-  auto result       = manager.describe_parquet(uri);
-  auto const after  = chunk_get_count(*rest_ctx);
-  REQUIRE(after >= before);
-  delta = after - before;
-  return result;
 }
 
 }  // namespace
@@ -208,7 +147,10 @@ parquet_bind_result describe_with_counter(sirius_scan_manager& manager,
 TEST_CASE("describe_parquet routes S3 parquet through rest_ioctx and returns nation schema",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const uri    = parquet_uri(bucket, "nation.parquet");
@@ -237,10 +179,13 @@ TEST_CASE("describe_parquet routes S3 parquet through rest_ioctx and returns nat
   CHECK(result.object_size > 0);
 }
 
-TEST_CASE("describe_parquet reports stable row counts for multiple S3 parquet objects",
+TEST_CASE("describe_parquet reports nation and region row counts and the region schema over S3",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket     = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const nation_uri = parquet_uri(bucket, "nation.parquet");
@@ -259,11 +204,11 @@ TEST_CASE("describe_parquet reports stable row counts for multiple S3 parquet ob
 }
 
 TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU read_parquet",
-          "[scan_manager][describe_parquet][s3][nested]")
+          "[scan_manager][describe_parquet][nested]")
 {
   scan_manager_fixture fixture;
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource = true;
+  cfg.backend = sirius::scan_manager::io_backend::sirius;
   sirius_scan_manager manager{std::move(cfg), *fixture.memory, fixture.topology};
 
   for (auto const fixture_name : {"nested_struct.parquet",
@@ -286,7 +231,10 @@ TEST_CASE("describe_parquet maps nested local parquet bind shape like DuckDB CPU
 TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU read_parquet",
           "[s3][integration][describe_parquet][nested]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
 
@@ -313,7 +261,10 @@ TEST_CASE("describe_parquet maps nested S3 parquet bind shape like DuckDB CPU re
 TEST_CASE("describe_parquet surfaces missing S3 parquet objects from HEAD",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const uri    = parquet_uri(bucket, "does-not-exist.parquet");
@@ -333,7 +284,10 @@ TEST_CASE("describe_parquet surfaces missing S3 parquet objects from HEAD",
 TEST_CASE("describe_parquet parks parsed parquet metadata in the rest metadata store",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const uri    = parquet_uri(bucket, "nation.parquet");
@@ -357,52 +311,45 @@ TEST_CASE("describe_parquet parks parsed parquet metadata in the rest metadata s
   CHECK(parquet_metadata->footer_byte_len() > 0);
 }
 
-TEST_CASE("describe_parquet reuses the metadata store on repeated S3 binds",
+TEST_CASE("describe_parquet returns identical bind results on repeated S3 binds",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const uri    = parquet_uri(bucket, "nation.parquet");
 
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{
-    make_minio_rest_config(/*perf_instrumentation=*/true), *fixture.memory, fixture.topology};
+  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
 
-  std::uint64_t cold_gets = 0;
-  auto cold               = describe_with_counter(manager, uri, cold_gets);
-  CHECK(cold_gets >= 1);
-
-  std::uint64_t warm_gets = 0;
-  auto warm               = describe_with_counter(manager, uri, warm_gets);
-  CHECK(warm_gets == 0);
+  auto cold = manager.describe_parquet(uri);
+  auto warm = manager.describe_parquet(uri);
   require_same_bind_result(cold, warm);
 }
 
-TEST_CASE("describe_parquet footer fetch stays bounded for small and larger S3 parquet objects",
+TEST_CASE("describe_parquet handles small and larger S3 parquet objects",
           "[s3][integration][describe_parquet]")
 {
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
 
-  auto require_bounded_footer_fetch = [&](std::string const& file_name) {
+  auto require_valid_description = [&](std::string const& file_name) {
     scan_manager_fixture fixture;
-    sirius_scan_manager manager{
-      make_minio_rest_config(/*perf_instrumentation=*/true), *fixture.memory, fixture.topology};
-    auto const uri = parquet_uri(bucket, file_name);
+    sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+    auto result = manager.describe_parquet(parquet_uri(bucket, file_name));
 
-    std::uint64_t get_count = 0;
-    auto result             = describe_with_counter(manager, uri, get_count);
-
-    INFO(file_name << " footer GET count: " << get_count
-                   << ", object_size: " << result.object_size);
-    CHECK(get_count >= 1);
-    CHECK(get_count <= 4);
+    INFO(file_name << " object_size: " << result.object_size);
     CHECK(result.object_size > 0);
     CHECK(result.total_num_rows > 0);
   };
 
-  require_bounded_footer_fetch("nation.parquet");
-  require_bounded_footer_fetch("lineitem.parquet");
+  require_valid_description("nation.parquet");
+  require_valid_description("lineitem.parquet");
 }

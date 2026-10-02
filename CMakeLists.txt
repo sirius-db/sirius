@@ -94,9 +94,14 @@ foreach(_sirius_link_flags CMAKE_EXE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS
       CACHE STRING "" FORCE)
 endforeach()
 
+include(cmake/sirius-duckdb-provider.cmake)
+
 include(cmake/sirius-dependencies.cmake)
 
-include(cmake/sirius-sources.cmake)
+add_library(sirius_objects OBJECT)
+add_subdirectory(src)
+
+include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)
 

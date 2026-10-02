@@ -162,7 +162,9 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     for (auto const batch_id : *plan) {
       input_batch.push_back(port_ptr->repo->pop_data_batch_by_id(batch_id, i));
     }
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch), i);
+    // Run on the partition's GPU so the join above finds its input already there.
+    auto const placement = this->placement();
+    return std::make_unique<partitioned_operator_data>(std::move(input_batch), i, *placement);
   }
   return nullptr;
 }
@@ -183,10 +185,11 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   if (!partition_idx_opt.has_value()) {
     throw std::runtime_error("sirius_physical_concat: input_data carries no partition index");
   }
-  auto partition_idx = *partition_idx_opt;
+  auto partition_idx   = *partition_idx_opt;
+  auto const placement = this->placement();
   if (input_batches.empty()) {
     return std::make_unique<partitioned_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
+      std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx, *placement);
   }
 
   cucascade::memory::memory_space* space = input_batches[0].get_memory_space();
@@ -201,7 +204,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
     output_batches.push_back(std::move(merged_batch));
   }
-  return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
+  return std::make_unique<partitioned_operator_data>(output_batches, partition_idx, *placement);
 }
 
 void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stream_ref stream)

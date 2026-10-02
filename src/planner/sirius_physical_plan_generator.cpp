@@ -314,13 +314,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->storage = &table.GetStorage();
   info->context = &context;
   info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
-  // Qualified-name identity for the pin cache — derived from the resolved
-  // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info)
-  // exactly. Without these a pin_table(format='duckdb', ...) query silently misses
-  // the pinned cache and falls through to disk.
+  // Derive the cache identity from the resolved entry on both pin and scan paths.
   info->catalog_name           = table.ParentCatalog().GetName();
   info->schema_name            = table.ParentSchema().name;
   info->table_name             = table.name;
+  info->table_identity         = {table.oid, table.GetStorage().GetRowGroupCollection()};
   info->approximate_batch_size = op_params.scan_task_batch_size;
 
   std::vector<std::size_t> source_ids_fallback;
@@ -1238,7 +1236,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
                           ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                           : nullptr;
       if (sirius_ctx) {
-        sirius_ctx->record_compressed_materialization_scan_narrow_targets_retracted(retracted);
+        sirius_ctx->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_narrow_targets_retracted,
+          retracted);
       }
     }
   }

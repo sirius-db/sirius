@@ -20,6 +20,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
@@ -103,7 +104,11 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
     }
 
     return cudf::make_strings_column(
-      size, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
+      size,
+      std::move(offsets_col),
+      std::move(chars_buf),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   }
   // Handle decimal types
   else if constexpr (Traits::is_decimal) {

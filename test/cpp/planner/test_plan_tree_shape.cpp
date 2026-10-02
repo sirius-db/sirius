@@ -45,6 +45,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
 
@@ -355,10 +356,7 @@ struct plan_tree_shape_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(_db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     // big_left is larger so the optimizer keeps small_right as the build side.
@@ -385,8 +383,6 @@ struct plan_tree_shape_fixture {
     con->Query("CREATE TABLE items (fk INTEGER, qty INTEGER)");
     con->Query("INSERT INTO items SELECT range % 500, range * 7 % 23 FROM range(10000)");
   }
-
-  ~plan_tree_shape_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;
@@ -421,9 +417,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(create);
   REQUIRE_FALSE(create->HasError());
 
-  REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
-                      Catch::Contains("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
-                                      "carrier"));
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
+    Catch::Matchers::ContainsSubstring("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
+                                       "carrier"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -1442,8 +1439,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
-  CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
-                    Catch::Contains("Unsupported filter predicate on column 'id'"));
+  CHECK_THROWS_WITH(
+    generator.create_plan(std::move(logical)),
+    Catch::Matchers::ContainsSubstring("Unsupported filter predicate on column 'id'"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

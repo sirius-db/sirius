@@ -452,7 +452,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("ARRAY"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("ARRAY"));
 
   // A subset pin that leaves the ARRAY column out still works.
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");
@@ -656,7 +656,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['a']);");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("CHECKPOINT"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("CHECKPOINT"));
 
   // Folding the append into the base clears the guard; the ARRAY-only pin then
   // succeeds and serves from cache.
@@ -686,7 +686,7 @@ TEST_CASE_METHOD(PinMvccInsertFixture,
   auto refused = con->Query("CALL pin_table(format='duckdb', name='t', tier='gpu');");
   REQUIRE(refused);
   REQUIRE(refused->HasError());
-  REQUIRE_THAT(refused->GetError(), Catch::Contains("fixed-width"));
+  REQUIRE_THAT(refused->GetError(), Catch::Matchers::ContainsSubstring("fixed-width"));
 
   // Pinning the scalar subset (leaving the ARRAY out) still works.
   run_ok("CALL pin_table(format='duckdb', name='t', tier='gpu', cols=['k']);");

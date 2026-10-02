@@ -85,19 +85,18 @@ namespace duckdb {
 
 namespace {
 
-static constexpr std::string_view CONFIG_FILE_NAME        = "sirius.yaml";
-static constexpr std::string_view LEGACY_CONFIG_FILE_NAME = "sirius.cfg";
-static constexpr std::string_view CONFIG_FILE_DIR         = ".sirius";
-static constexpr std::string_view CONFIG_FILE_ENV_NAME    = "SIRIUS_CONFIG_FILE";
+static constexpr std::string_view CONFIG_FILE_NAME     = "sirius.yaml";
+static constexpr std::string_view CONFIG_FILE_DIR      = ".sirius";
+static constexpr std::string_view CONFIG_FILE_ENV_NAME = "SIRIUS_CONFIG_FILE";
 
-optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const& op)
+optional_ptr<TableCatalogEntry> find_update_target(PhysicalOperator const& op)
 {
   switch (op.type) {
     case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
     case PhysicalOperatorType::INSERT: {
       auto const& insert = op.Cast<PhysicalInsert>();
       if (insert.action_type == OnConflictAction::UPDATE && insert.insert_table) {
-        return &*insert.insert_table;
+        return insert.insert_table.get_mutable();
       }
       break;
     }
@@ -118,13 +117,17 @@ optional_ptr<TableCatalogEntry const> find_update_target(PhysicalOperator const&
   return nullptr;
 }
 
+/// Find the pin for this table incarnation. A recreated same-name table does not match.
 std::optional<std::string> pinned_name_for_table(
-  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry const& table)
+  sirius::scan_manager::sirius_scan_manager const& scan_manager, TableCatalogEntry& table)
 {
+  if (!table.IsDuckTable()) { return std::nullopt; }
+  sirius::duckdb_table_identity const identity{table.oid,
+                                               table.GetStorage().GetRowGroupCollection()};
   std::optional<std::string> result;
   scan_manager.visit_pinned_entries([&](std::string_view name, auto const& entry) {
     if (!entry.cache_info.matches_duckdb_table(
-          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name)) {
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name, identity)) {
       return true;
     }
     result = name;
@@ -199,25 +202,6 @@ std::optional<std::string> get_config_file_path()
   return std::nullopt;
 }
 
-/// Check whether a legacy sirius.cfg file exists in any of the search locations.
-/// Returns the path if found, std::nullopt otherwise.
-std::optional<std::string> find_legacy_config_file()
-{
-  // Current working directory
-  auto cwd_path = std::filesystem::current_path() / std::string(LEGACY_CONFIG_FILE_NAME);
-  if (std::filesystem::exists(cwd_path)) { return cwd_path.string(); }
-
-  // Home directory
-  const char* home_dir = std::getenv("HOME");
-  if (home_dir != nullptr) {
-    auto home_path = std::filesystem::path(home_dir) / std::string(CONFIG_FILE_DIR) /
-                     std::string(LEGACY_CONFIG_FILE_NAME);
-    if (std::filesystem::exists(home_path)) { return home_path.string(); }
-  }
-
-  return std::nullopt;
-}
-
 }  // namespace
 
 // ================= sirius_context ================= //
@@ -226,7 +210,10 @@ SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
 {
-  if (!is_initialized_) { return; }
+  if (!is_initialized_) {
+    event_publisher_->stop();
+    return;
+  }
 
   try {
     terminate();
@@ -241,6 +228,7 @@ SiriusContext::~SiriusContext() noexcept
     } catch (...) {
     }
   }
+  event_publisher_->stop();
 }
 
 // Log host and GPU memory pool stats at a labeled point.
@@ -394,8 +382,7 @@ void SiriusContext::begin_execution_window(ClientContext& context,
                                            std::string_view window_label,
                                            std::string_view pool_tag)
 {
-  // Runs inside the held slot, after acquire and the health check and before
-  // the final create_plan.
+  // Runs inside the held slot, after acquire and the health check.
   // Logging around the mutations is best-effort: a logging failure must never
   // leave the runtime half-begun (the mutations themselves are the only
   // throwing steps that matter; a throw here is handled by the scope ctor's
@@ -428,10 +415,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
-  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
-  // before this window's finish(). So this is not "clean up before the plan dies" — it is
-  // "stop touching a plan that has died".
+  // On the transparent path the plan those pointers target is already gone: sirius_interface::
+  // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
+  // engine outlives the window, so its plan is still alive. Either way this only stops task
+  // creation from touching the plan; it never frees it.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -478,10 +465,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     }
   }
 
-  // Drop scan-manager providers for this query. Repositories are already
-  // cleared above, so downstream data_batches that referenced sliced
-  // host_data_representation are gone before the providers go away.
-  if (scan_manager_) { scan_manager_->reset(); }
+  // Drop THIS query's scan-manager providers; any other in-flight query keeps scanning.
+  // Repositories are already cleared above, so downstream data_batches that referenced
+  // sliced host_data_representation are gone before the providers go away.
+  if (scan_manager_) { scan_manager_->reset(query_id); }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
@@ -538,6 +525,14 @@ void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t quer
   }
   try {
     if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+  } catch (...) {
+  }
+  // The scan manager needs the same backstop. prepare_for_query no longer performs a global
+  // reset (it would tear down concurrently-running queries), so nothing else will ever drop
+  // this query's scan state: without this, a failed query leaks its dispatcher, coalescer and
+  // split providers until terminate().
+  try {
+    if (scan_manager_) { scan_manager_->reset(query_id); }
   } catch (...) {
   }
 }
@@ -815,6 +810,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   }
 
+  // cucascade topology exposes hw-decompression availability as a runtime attribute populated
+  // only when discovery is asked to touch the CUDA driver. sirius_config seeds topology with
+  // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
+  auto enable_hw_decompression =
+    config_.get_operator_params().use_hw_decompression && topo.num_gpus > 0 &&
+    std::all_of(topo.gpus.begin(), topo.gpus.end(), [](auto const& gpu) {
+      return gpu.runtime_attributes.has_value() && gpu.runtime_attributes->hw_decomp;
+    });
+  if (enable_hw_decompression) {
+    hw_decompression_env_guard_.emplace("LIBCUDF_HW_DECOMPRESSION", "ON");
+    SIRIUS_LOG_INFO(
+      "SiriusContext: hardware decompression supported on all {} GPU(s); "
+      "exported LIBCUDF_HW_DECOMPRESSION=ON",
+      topo.num_gpus);
+  }
+
   // Configure cuDF to use our pinned slab allocator for small internal host buffers
   // (e.g. column_device_view metadata arrays in cudf::concatenate).  This eliminates
   // the pageable H2D transfers that cuDF issues by default.
@@ -912,8 +923,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  query_event_publisher_ = std::make_shared<sirius::event::query_event_publisher>();
+  task_creator_->set_query_event_publisher(*query_event_publisher_);
+  task_scheduler_->set_query_event_publisher(*query_event_publisher_);
+
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
     config_.get_scan_manager_config(), *memory_manager_, topology_index_);
+  scan_manager_->set_query_event_publisher(*query_event_publisher_);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.
@@ -935,6 +951,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 void SiriusContext::terminate()
 {
   throw_if_not_initialized();
+
+  // Restore LIBCUDF_HW_DECOMPRESSION to its prior state (unset it if we exported it). Paired with
+  // the emplace in initialize(); the RAII env_guard would also restore on destruction, but reset
+  // here keeps the variable scoped to the initialized lifetime so a re-initialize starts clean.
+  hw_decompression_env_guard_.reset();
+
+  // Before the reporters, so nothing published during teardown reaches a
+  // subscriber whose subject is already half gone; the publish_* calls below this
+  // point are no-ops.
+  if (query_event_publisher_) { query_event_publisher_->stop(); }
 
   // task_creator_ and downgrade_executors_ hold non-owning pointers into task_scheduler_. Stop and
   // join every borrower before destroying the scheduler and its task queue.
@@ -1222,63 +1248,6 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-SiriusContext::compressed_materialization_stats
-SiriusContext::get_compressed_materialization_stats() const noexcept
-{
-  return compressed_materialization_stats{
-    .scan_columns_narrowed =
-      compressed_materialization_scan_columns_narrowed_count_.load(std::memory_order_relaxed),
-    .scan_columns_restored =
-      compressed_materialization_scan_columns_restored_count_.load(std::memory_order_relaxed),
-    .pin_columns_narrowed =
-      compressed_materialization_pin_columns_narrowed_count_.load(std::memory_order_relaxed),
-    .scan_sidecars_installed =
-      compressed_materialization_scan_sidecars_installed_count_.load(std::memory_order_relaxed),
-    .partition_narrow_columns =
-      compressed_materialization_partition_narrow_columns_count_.load(std::memory_order_relaxed),
-    .scan_narrow_targets_retracted =
-      compressed_materialization_scan_narrow_targets_retracted_count_.load(
-        std::memory_order_relaxed),
-  };
-}
-
-void SiriusContext::record_compressed_materialization_scan_columns_narrowed(uint64_t count) noexcept
-{
-  compressed_materialization_scan_columns_narrowed_count_.fetch_add(count,
-                                                                    std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_columns_restored(uint64_t count) noexcept
-{
-  compressed_materialization_scan_columns_restored_count_.fetch_add(count,
-                                                                    std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_pin_columns_narrowed(uint64_t count) noexcept
-{
-  compressed_materialization_pin_columns_narrowed_count_.fetch_add(count,
-                                                                   std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_sidecar_installed() noexcept
-{
-  compressed_materialization_scan_sidecars_installed_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_partition_narrow_columns(
-  uint64_t count) noexcept
-{
-  compressed_materialization_partition_narrow_columns_count_.fetch_add(count,
-                                                                       std::memory_order_relaxed);
-}
-
-void SiriusContext::record_compressed_materialization_scan_narrow_targets_retracted(
-  uint64_t count) noexcept
-{
-  compressed_materialization_scan_narrow_targets_retracted_count_.fetch_add(
-    count, std::memory_order_relaxed);
 }
 
 namespace {
@@ -1661,6 +1630,9 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
 
 void SiriusContext::release_query_lifecycle_slot() noexcept
 {
+  // Unlocking a std::mutex from a thread that does not hold it is undefined behaviour.
+  D_ASSERT(holder_thread_hash_.load(std::memory_order_relaxed) ==
+           (std::hash<std::thread::id>{}(std::this_thread::get_id()) | 1));
   holder_thread_hash_.store(0, std::memory_order_relaxed);
   query_lifecycle_held_.store(false, std::memory_order_release);
   query_lifecycle_mutex_.unlock();
@@ -1811,21 +1783,9 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_ERROR("{}", msg);
     throw std::runtime_error(msg);
   } else {
-    // Check if the user has a legacy .cfg file they may need to migrate
-    if (auto legacy_path = find_legacy_config_file()) {
-      SIRIUS_LOG_WARN(
-        "Found legacy config file '{}'. Sirius now uses YAML configuration "
-        "(sirius.yaml). Please migrate your settings to the new format. "
-        "See docs/super-sirius/configuration.md for details.",
-        *legacy_path);
-    }
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    SIRIUS_LOG_WARN(
-      "Super Sirius will allocate most GPU and pinned host memory on startup. "
-      "If you are using the legacy code path (gpu_buffer_init / gpu_processing), "
-      "set SIRIUS_DISABLE=1 to prevent this.");
     config_.apply_defaults();
   }
 }

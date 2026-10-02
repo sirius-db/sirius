@@ -1,329 +1,252 @@
 # Fragments
 
-A **fragment** is one runnable piece of a (possibly multi-node) query: a bound plan, its declared
-input/output streams, and the machinery to build, run, and drain it. [Streaming
-Sessions](streaming-sessions.md) covers the low-level primitives a fragment is built on
-(`exec::batch_stream`, `STREAMING_SOURCE`/`STREAMING_SINK`, the id-addressed `exec::stream_session`
-router). This document covers the layer above: how a Substrait or DuckDB plan becomes a fragment,
-how its declared streams get a schema before the plan is even bound, and how multiple fragments —
-possibly owned by different processes — chain together via `relay_from()`.
+A fragment is one runnable piece of a query: a bound plan, the input and output streams it
+declares, and the code that builds, runs, and drains it. [Streaming
+Sessions](streaming-sessions.md) covers the primitives underneath (`exec::batch_stream`,
+`STREAMING_SOURCE` / `STREAMING_SINK`, `exec::stream_session`). This document covers how a plan
+becomes a fragment, how declared streams get a schema before bind, and how `relay_from()` chains
+fragments.
 
-Two classes do this, at two different layers:
+The **embedder** is the process that embeds Sirius through `sirius::ffi::Context` plus
+`sirius::ffi::Fragment` (the Rust compute node, C++ tests).
 
 | | `exec::streaming_fragment` | `sirius::ffi::Fragment` |
 |---|---|---|
-| **Files** | `src/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp` | `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp` |
-| **Caller** | C++ code already inside a live `duckdb::ClientContext` and transaction (e.g. the transparent path, `Context::execute_substrait`) | Any caller that must not include DuckDB/cuDF headers — the Rust bindings, or a standalone C++ embedder |
-| **Owns the connection?** | No — borrows the caller's `ClientContext` | Yes — brings up its own embedded `duckdb::DuckDB` + `Connection` (`Context`) |
-| **Transaction / query window** | Caller's responsibility to bracket | Manages its own, internally, across two phases (see below) |
-| **Shape** | One output-only or gather sink; `spec.plan_source` is a `LogicalOperator` factory | Declare → build → relay → run, addressable by stream id from outside the process |
+| **Files** | `src/exec/streaming_fragment.{hpp,cpp}` | `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp` |
+| **Caller** | C++ with a live `duckdb::ClientContext`: `sirius::ffi` and tests | Code that must not include DuckDB or cuDF headers, such as the Rust bindings |
+| **Connection** | Borrows the caller's `ClientContext` | `Context` owns an embedded `duckdb::DuckDB` and `Connection` |
+| **Transaction** | The caller supplies one for `build()` and `run()` | `build()` and `run()` each run in their own |
+| **Query window** | `run()` opens and closes it | Same; `Fragment` forwards to `streaming_fragment` |
 
-`sirius::ffi::Fragment` is a PIMPL wrapper around exactly one `exec::streaming_fragment` (or, for a
-result fragment, around the single-shot `sirius_interface` path) — it exists to give a
-cross-language caller everything `streaming_fragment` needs (a connection, a transaction, a query
-window, a bind catalog) without exposing any of it.
+`sirius::ffi::Fragment` and `Context::execute_substrait` hold no plan of their own: both lower
+Substrait and hand it to one `streaming_fragment`, which builds either terminal.
+
+```mermaid
+flowchart LR
+  HP["Embedder<br/>sirius::ffi::Context + Fragment"]
+  SF["streaming_fragment"]
+  HP -->|always one| SF
+
+  subgraph ResultPath["Result · zero outputs"]
+    RC["RESULT_COLLECTOR"]
+    AR["Arrow"]
+    RC --> AR
+  end
+
+  subgraph Intermediate["Intermediate · local GPU pipeline"]
+    SES["stream_session"]
+    OP["SOURCE / SINK"]
+    REPO["shared_data_repository"]
+    SES --> OP --> REPO
+  end
+
+  SF -->|zero outputs| RC
+  SF -->|declare_output| SES
+```
 
 ## Quick path
 
 ```cpp
-// exec::streaming_fragment — caller already owns the transaction/window.
+// exec::streaming_fragment: the caller owns the DuckDB transaction.
 fragment_spec spec;
-spec.plan_source = my_plan_source;     // ClientContext& -> LogicalOperator
-spec.outputs     = {0};                // one output stream
+spec.plan_source = my_plan_source;     // ClientContext& -> bound_plan
+spec.outputs     = {0};                // omit for a result fragment
 streaming_fragment frag(client, std::move(spec));
-frag.build(query_id);
-frag.run();                            // blocks
-drain(frag.session(), 0);              // pull() until drained
+frag.build();                          // plans; holds the slot only for create_plan
+frag.run();                            // opens the query window, blocks, closes it
+drain(frag, 0);                        // pull() until drained
 ```
 
 ```cpp
-// sirius::ffi::Fragment — cross-language, owns everything.
+// Embedder: owns the connection.
 auto ctx = make_context();
 auto sender = make_fragment(*ctx);
 sender->declare_output(0);
-sender->build(substrait_plan_bytes);   // opens + closes its own setup transaction
-sender->run();                         // blocks; closes the query lifecycle
+sender->build(substrait_plan_bytes);
 
-auto receiver = make_fragment(*ctx);
+auto receiver = make_fragment(*ctx);   // may be built before the sender runs
 receiver->declare_input_column(0, "a", "BIGINT");
-receiver->build(other_plan_bytes);     // this plan reads sirius_stream_source(0) / view sirius_stream_0
+receiver->build(other_plan_bytes);     // reads view sirius_stream_0
+
+sender->run();
 receiver->relay_from(*sender, /*source_stream_id=*/0, /*input_stream_id=*/0, /*sender_id=*/0);
-receiver->run();
+receiver->run();                       // every input must be closed; relay_from closed sender 0
 ```
 
-## `stream_bind_catalog` + `sirius_stream_source` — bridging bind time and plan time
+## `stream_bind_catalog` and `sirius_stream_source`
 
-**Files:** `src/exec/stream_bind_catalog.hpp`, `src/exec/stream_bind_catalog.cpp`,
-`src/exec/stream_plan_bindings.hpp`, `src/exec/stream_plan_bindings.cpp`
+**Files:** `src/exec/stream_bind_catalog.{hpp,cpp}`, `src/exec/stream_plan_bindings.{hpp,cpp}`
 
-A fragment's input streams do not exist as DuckDB tables — there is nothing in the catalog for the
-binder to look up. `sirius_stream_source(id)`, a table function, stands in for one: its **bind**
-resolves a declared stream's schema (names + types) so the binder is satisfied; its **body never
-runs** — the physical plan generator replaces every `sirius_stream_source` scan with a
-`STREAMING_SOURCE` operator before execution. A plan does not call the function directly; it reads
-`CREATE OR REPLACE VIEW main.sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)`, so a
-Substrait or SQL plan sees an ordinary-looking view name (`stream_view_name(id)` gives callers that
-exact string).
+Input streams are not DuckDB tables, so the binder has nothing to look up.
+`sirius_stream_source(id)` is a table function that stands in: bind resolves the declared names
+and types, the body never runs, and the physical plan generator replaces the scan with a
+`STREAMING_SOURCE`. Plans read it through a view, whose name `stream_view_name(id)` returns:
 
-Bind time and plan time are far apart — DuckDB binds a table function long before physical planning
-runs — so both sides need a shared place to look up a declared stream's schema. That place is
-`stream_bind_catalog`, a `duckdb::ClientContextState` registered per-connection:
+```sql
+CREATE OR REPLACE VIEW main.sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)
+```
+
+Bind and physical planning both look up the schema in `stream_bind_catalog`, a per-connection
+`duckdb::ClientContextState`:
 
 ```cpp
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
   static constexpr const char* kStateKey = "sirius_stream_catalog";
-
   void declare(stream_id_t id, stream_input_binding binding);  // overwrites same-id entry
-  void clear();                                                 // drop every declaration
-  void erase(stream_id_t id);                                   // drop one; no-op if absent
-
+  void erase(stream_id_t id);                                   // no-op if absent
   const stream_input_binding& get(stream_id_t id) const;        // @throws if undeclared
   void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
 };
 
-// Shared by every call site that needs "the catalog on this connection, or a clear error why not".
 duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context);
 ```
 
-The round trip:
-
 ```
-declare_input_column(id, name, type) × N   ── caller-side, before build() ──►  stream_bind_catalog::declare(id, ...)
-                                                                                          │
-stream_source_bind()  (DuckDB bind, resolves the CREATE VIEW's schema)  ◄── catalog_for(context)->get(id)
-                                                                                          │
-create_streaming_source_plan()  (physical planning, builds STREAMING_SOURCE)  ◄── catalog_for(context)->get(id)
-                                                                                          │
-                                                                                catalog->set_built(id, source.get())
-                                                                                          │
-streaming_fragment::build() / Fragment::build()  ── reads catalog->get(id).built ──►  session().add_source(id, *built)
+streaming_fragment::build()      ── declare(id) ──►  catalog
+stream_source_bind()             ◄── get(id) ──      catalog   (DuckDB bind)
+create_streaming_source_plan()   ◄── get(id) ──      catalog   (builds STREAMING_SOURCE, set_built)
+streaming_fragment::build()      ◄── get(id).built   → session add_source(id, *built)
+streaming_fragment::build() exit ── erase(id) ──►    catalog   (success or failure)
 ```
 
-`set_built()` is how the physical operator (created deep inside `create_plan()`, which does not
-otherwise return anything the fragment layer can see) gets back to the session that wires it up.
+`create_plan()` does not return the operator to the fragment layer; `set_built()` is how it reaches
+the session.
 
-### Contracts
+- **A declaration lives only for its fragment's `build()`.** `build()` erases its ids on every
+  exit, so fragments on one connection can reuse an id without seeing a stale schema.
+- **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind.
+  Otherwise the first leaf would never see a push or close, and its pipeline would wait forever.
+  Give each reader its own stream id.
+- **The catalog must exist before bind.** `SiriusContextExtensionCallback::OnConnectionOpened`
+  installs it on transparent-path connections (and removes it on close);
+  `sirius::ffi::Context::Impl::bring_up()` installs it for the embedder. Without it, `catalog_for()`
+  throws.
 
-- **Multiple fragments may share one connection at once.** A `Context` in the FFI layer can host
-  several live `Fragment` objects — that is the whole point of `relay_from()` chaining several
-  fragments together. `clear()` drops *every* declaration on the connection and is only safe for a
-  caller that owns the whole catalog outright; a fragment that shares a connection with a peer must
-  use `erase()`, which touches only the ids it declared itself. Both `streaming_fragment` (its
-  destructor and the start of `build()`, for idempotent rebuilds) and `sirius::ffi::Fragment::Impl`
-  follow this discipline — neither ever calls `clear()`.
-- **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind
-  for an id that already has one, instead of silently overwriting the pointer. Without this guard,
-  a plan that reads the same declared stream twice (a self-join, or two independent scans of one
-  shared subexpression) would silently orphan the first leaf: only the *last* bind's operator ends
-  up registered with the session, so the earlier one never receives a push or a close and its
-  pipeline waits forever with no error anywhere. Fan-out reads of one declared stream are not
-  supported; if a plan genuinely needs that, feed each reader its own stream id instead.
-- **The catalog must exist before any bind can succeed.** Both the transparent (normal SQL)
-  connection path and the FFI's own embedded connection install a `stream_bind_catalog` when the
-  connection opens — `SiriusContextExtensionCallback::OnConnectionOpened` for the former,
-  `Context::Impl::bring_up()` for the latter — and remove it on close/teardown. Without this,
-  `catalog_for()` throws immediately on the first `sirius_stream_source` bind or
-  `streaming_fragment::build()` call.
-
-## `exec::streaming_fragment` — plan builder + blocking runner
-
-Owns one fragment's complete life cycle: declares inputs into the catalog, plans, constructs the
-sink, runs, and keeps the output pullable after `run()` returns.
+## `exec::streaming_fragment`
 
 ```cpp
+struct bound_plan {
+  duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;  // optional; result names/types
+};
+
 struct fragment_spec {
-  logical_plan_source plan_source;                    // ClientContext& -> LogicalOperator
-  std::map<stream_id_t, stream_input_spec> inputs;     // schema + expected senders per input
-  std::vector<stream_id_t> outputs;                    // positional: outputs[i] = partition i
-  std::optional<op::partition_spec> partitioning;       // absent = single destination
+  logical_plan_source plan_source;                   // ClientContext& -> bound_plan, called once
+  std::map<stream_id_t, stream_input_spec> inputs;    // schema + expected senders per input
+  std::vector<stream_id_t> outputs;                   // outputs[i] = partition i; empty = result
+  std::optional<op::partition_spec> partitioning;     // illegal when outputs.size() < 2
 };
 ```
 
-**Construction validates the spec eagerly:** a plan source is required, at least one output stream
-is required (a fragment with none is not this class's job — see the FFI's *result fragment* below),
-and more than one output requires a `partitioning` mode (a bare `N`-output gather sink would leave
-`N-1` streams permanently empty with no way to tell a caller why).
+**Constructor.** A plan source is required. Empty `outputs` is a `RESULT_COLLECTOR`. More than one
+output requires `partitioning` (a gather to N outputs would leave N-1 empty). `partitioning` on
+fewer than two outputs is rejected, so `declare_output_broadcast()` or `declare_output_hash_key()`
+on 0 or 1 outputs fails at `build()` instead of silently routing every row to one destination.
 
-**`build(query_id)`** erases (not clears — see above) this fragment's own catalog ids, redeclares
-them so a rebuild after a caught, corrected failure is idempotent, runs `plan_source` to get a
-bound `LogicalOperator`, lowers it to a physical plan, and roots that plan in one
-`sirius_physical_streaming_sink`:
+**`build()`** declares the inputs on fresh repositories, runs `plan_source`, generates the
+physical plan, and roots it in a `sirius_physical_streaming_sink` or
+`sirius_physical_materialized_collector`. The root waits in `_plan_root` until `run()`.
 
-- **Hash-key cast normalization.** When `partitioning`'s `key_cast_types` is left empty, `build()`
-  derives one per key column so independently-planned senders always hash the same logical value
-  identically — cuDF's `murmur3` hashes raw bytes, and an `INT32` sender vs. an `INT64` sender for
-  the same column would otherwise split matching keys across different partitions. `TINYINT`/
-  `SMALLINT`/`INTEGER` normalize to `INT64`; `BIGINT`/`BOOLEAN`/`VARCHAR` need no cast (`EMPTY`);
-  `DECIMAL` normalizes to `FLOAT64`; anything else throws. A key column outside the sink's own
-  column range throws before any cast is even attempted.
-- Every declared input is checked against the catalog's `built` pointer after planning: a stream
-  declared but never read by the plan throws immediately (a silent hang otherwise — nothing would
-  ever close it).
-- The engine owns the plan and the fragment owns the engine, so the sink (and its output
-  repositories) stay pullable after `run()` returns — the query window's mandatory cleanup never
-  touches them.
+- **No query window.** It holds the query-lifecycle slot (`SlotGuard`) only around
+  `create_plan()`, which reads the pinned-table registry, and records that registry's epoch. The
+  transparent path usually plans this way too, but re-plans inside the window when the epoch
+  changed or a prepared statement executes again. Any number of fragments can be built before any runs.
+- **A failed `build()` cannot be retried.** The session keeps partial registrations; create a new
+  fragment.
+- **Every declared input must be read by the plan.** An unread input throws; nothing would ever
+  close it.
+- **`prepared` types must match the plan's output types**, because the collector decodes GPU
+  output with them. One exception: HUGEINT over a BIGINT plan column. DuckDB types `SUM(BIGINT)` as
+  HUGEINT, the planner narrows it to BIGINT, and the collector casts it back.
+- **Hash-key cast types.** cuDF `murmur3` hashes raw bytes, so an `INT32` and an `INT64` sender
+  would split matching keys. When `partitioning.key_cast_types` is empty, `build()` fills one per
+  key: `TINYINT`, `SMALLINT`, `INTEGER` → `INT64`; `BIGINT`, `BOOLEAN`, `VARCHAR` → `EMPTY` (as-is);
+  `DECIMAL` → `FLOAT64`; any other type throws. An out-of-range key column throws first.
 
-**Member declaration order is the lifetime contract.** C++ destroys members in reverse declaration
-order, and `streaming_fragment` relies on it: repositories are declared first (so they outlive
-everything that could still be writing to or reading from them), the engine next (it owns the
-physical plan, which holds raw pointers into the operators the session also points at), and
-`_session` last — so it is torn down *first*, before the engine it borrows operator pointers from
-can go away. Reordering these members is a use-after-free waiting to happen, not a style choice.
+**`run()`**
 
-**`run()`** reuses the caller's query window rather than opening a second one (a second
-`StandaloneQueryScope` would reset the task creator and scan manager `build()` already populated,
-and the fragment would run zero tasks). On any exception from the engine, it poisons every declared
-output (`_session.fail_output(id, ...)`, swallowing secondary failures per id) **before**
-rethrowing — otherwise a peer parked in `wait()` on that stream would block forever with no error
-anywhere, the same S2/S3 hazard [Streaming Sessions](streaming-sessions.md#execbatch_stream)
-documents for `batch_stream` itself. `fail_output()` is idempotent (first failure wins), so this is
-safe to do at this layer even when a caller above it (`sirius::ffi::Fragment::run()`) also poisons
-the same outputs — see [Other contracts](#other-contracts) below.
+- Requires every input closed; otherwise it throws and the fragment stays runnable. Waiting inside
+  the window would block every other query on the engine.
+- Opens a `StandaloneQueryScope`, rejects the plan if a table was pinned or unpinned since
+  `build()`, builds the `sirius_engine` on the window's query id, executes, and calls `finish()`
+  before returning. Another fragment's concurrent `run()` waits for the slot; a second `run()` of
+  the same fragment throws.
+- On an exception it poisons every output, then closes the window and rethrows; otherwise a peer
+  in `wait()` would block forever (the S2/S3 hazard in
+  [Streaming Sessions](streaming-sessions.md#execbatch_stream)). A result whose `QueryResult`
+  carries an error also fails the run. A failed `run()` is final, and `pull()` rethrows its cause.
+- After `run()` the engine owns the plan and the fragment owns the engine, so outputs stay
+  pullable; query-window cleanup does not destroy them.
 
-**`sink_types()`** exposes the plan root's output column types, set during `build()`. Relay steps
-use it to validate schema agreement (column count and type ids) against a target fragment's
-declared input types before any batch moves.
+Do not open a `StandaloneQueryScope` around `build()` or `run()`: on the same thread both fail
+with "nested execution window"; on another thread they wait for the slot.
 
-## `sirius::ffi::Fragment` — the cross-language lifecycle
+**`relay_from(source, source_stream, input_stream, sender)`** moves every batch parked on
+`source`'s output into this fragment's input, then closes `sender`. Before anything moves it
+checks: both fragments built, the source has run successfully, this fragment has not run, a shared
+`ClientContext`, the source is not a result fragment, the input is declared, the sender is in the
+input's expected set (when one is declared), and column count and types match
+`source.sink_types()`. The source must have run because "nothing parked" on an open stream looks
+the same as "ended"; relaying early would close the input after zero batches. One failure comes
+after a batch moves: if the input already ended, the first push is refused and that batch is lost.
+`pull`, `close_input`, and `drained` wrap the session, which is not public.
+
+**Member declaration order is the lifetime contract** (C++ destroys in reverse; reordering is a
+use-after-free): repositories, then `_result_plan` (a `RESULT_COLLECTOR` references it), then
+`_plan_root` and the engine (one owns the plan, whose operators the session points at), then
+`_session`, which is destroyed first.
+
+## Embedder API: `sirius::ffi::Context` plus `Fragment`
 
 **Files:** `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp`
 
-`Context` is an RAII handle to one embedded engine: its own `duckdb::SiriusContext`, its own
-`duckdb::DuckDB` + `Connection`, and its own `stream_bind_catalog` — everything a fragment needs,
-brought up once and shared by every `Fragment` created on it via `make_fragment(context)`.
-
-`Fragment` is either an **intermediate** fragment (has declared output streams, rooted in a
-`STREAMING_SINK`, wraps one `exec::streaming_fragment`) or a **result** fragment (no declared
-outputs, executes once via `sirius_interface` and produces Arrow through `result_to_arrow()`).
-Which one a `Fragment` becomes is decided implicitly, by whether `declare_output()` was ever
-called (`is_result() == outputs.empty()`) — there is no separate constructor flag.
-
-### `build()`: two phases, two different windows
+`Context` owns one engine (`duckdb::SiriusContext`), an embedded `duckdb::DuckDB` plus
+`Connection`, and a `stream_bind_catalog`, shared by every `Fragment` from `make_fragment()`.
+`Fragment` is a PIMPL around one `streaming_fragment` and keeps only its declarations; built, run,
+and result state, the relay checks, and output poisoning all live in `streaming_fragment`. No
+declared output means a result fragment, drained with `result_to_arrow()`.
 
 ```
-declare_input_column / declare_input_sender / declare_output / declare_output_broadcast / declare_output_hash_key
-                                          │
-                                          ▼
-                          ┌─── Phase 1: setup transaction ───┐
-                          │  BeginTransaction()               │
-                          │  resolve_inputs()   (type-name parsing — needs a catalog lookup)
-                          │  declare_streams()  (populate stream_bind_catalog)
-                          │  create_stream_views()  (CREATE OR REPLACE VIEW per input, real DDL)
-                          │  Commit()                          │
-                          └────────────────────────────────────┘
-                                          │
-                                          ▼
-                          ┌─── Phase 2: query window ─────────┐
-                          │  StandaloneQueryScope acquired     │
-                          │  partition-mode guard               │
-                          │  is_result() ? single-shot execute-plan path
-                          │              : construct + build() an exec::streaming_fragment
-                          └────────────────────────────────────┘
+build():  ┌─ in_transaction ──────────────────────────────────────────────────┐
+          │ resolve_inputs()           type-name parsing needs a catalog lookup
+          │ streaming_fragment ctor    validates outputs and partition mode
+          │ streaming_fragment::build()
+          │   declare inputs; plan source: create_stream_views(), lower_substrait()
+          │   create_plan under the slot; erase the declared ids
+          └───────────────────────────────────────────────────────────────────┘
+run():    ┌─ in_transaction ─ streaming_fragment::run() ───────────────────────┐
+          └───────────────────────────────────────────────────────────────────┘
 ```
 
-Phase 1 exists because parsing a DuckDB type name and creating a view both need an active
-transaction, and that transaction **must be committed before Phase 2 begins** — `StandaloneQueryScope`
-acquires the engine's single-flight lifecycle slot, and the two are sequential, not nested. This is
-also why a `Fragment::build()` failure can fall into two different states depending on *which*
-phase it fails in:
-
-- A failure during Phase 1 (a bad type name, a stream id that fails to bind at `CREATE VIEW` time)
-  leaves the transaction open — `transaction_open` was set the instant `BeginTransaction()` returned
-  and is only cleared once `Commit()` itself succeeds.
-- A failure during Phase 2 happens with the transaction already closed; only the query-window slot
-  needs releasing.
-
-`end_lifecycle()` (called from the catch blocks of both phases, and unconditionally from
-`~Fragment::Impl()`) handles both uniformly and is `noexcept`:
-
-```cpp
-void end_lifecycle() noexcept
-{
-  if (lifecycle) { lifecycle.reset(); }               // release the query-window slot, if held
-  if (transaction_open) {
-    transaction_open = false;
-    ctx.conn->Rollback();                              // NOT Commit — see below
-  }
-}
-```
-
-**Why rollback, not commit, on the failure path.** `transaction_open` is true here only because
-setup failed partway through Phase 1 — `build()` clears the flag the instant its *own* `Commit()`
-succeeds, so this branch is reachable only on the failure path, never on a success. If
-`create_stream_views()`'s per-input loop has already created some views by the time a later input
-fails to bind, those `CREATE VIEW` statements are real, uncommitted DuckDB catalog writes sitting in
-the still-open transaction. Committing here would durably persist that half-declared fragment even
-though `build()` as a whole failed; rolling back discards it, which is what "the embedded connection
-is left in a clean state on failure" actually requires. (DuckDB's own `TransactionContext::Commit()`
-and `::Rollback()` both clear the active-transaction slot before doing their real work, regardless
-of outcome — so this distinction is not about whether a *second* `BeginTransaction()` would succeed
-afterward, which it would either way. It is specifically about whether that half-declared catalog
-state survives. See commit `4431213a` for the original fix and its Copilot-review origin.)
-
-### `relay_from()` — moving batches between fragments
-
-```cpp
-std::size_t relay_from(Fragment& source, std::uint64_t source_stream_id,
-                        std::uint64_t input_stream_id, std::uint32_t sender_id);
-```
-
-Drains every batch currently on `source`'s output stream `source_stream_id`, pushes each into this
-fragment's input stream `input_stream_id`, then closes `sender_id` on it. Two preconditions are
-enforced before anything moves:
-
-- **`source` must have already `run()`.** The drain loop pulls until it gets nothing back, and
-  "nothing right now" (stream still open, just empty) is indistinguishable from "stream ended" —
-  see [`exec::batch_stream`'s S1–S5 contracts](streaming-sessions.md#execbatch_stream) for why.
-  Calling `relay_from()` before the source has run would close the input after zero batches and
-  silently truncate the result.
-- **`input_stream_id` must be a declared input on this fragment, and `source` must be an
-  intermediate fragment (not a result fragment).** A result fragment produces Arrow via
-  `result_to_arrow()`, not a relayable stream, so it is rejected explicitly rather than falling
-  through to undefined behavior.
-
-Only then does the schema check run — column count and type-id agreement between the target's
-declared types and the source's `sink_types()` — before any batch actually moves, so a mismatch
-throws instead of silently corrupting a downstream cuDF operation.
-
-### Other contracts
-
-- **A partition mode needs at least two destinations.** `declare_output_broadcast()` /
-  `declare_output_hash_key()` may be called with 0 or 1 declared outputs (they do not themselves
-  check `outputs`), but `build()` rejects that combination outright — checked once, before the
-  result/intermediate split, so it catches a 0-output result fragment the same as a 1-output
-  gather fragment. Without this, every row would go to the single destination either way while the
-  call looked like it had configured routing.
-- **`run()` poisons every declared output on failure, redundantly with `streaming_fragment::run()`.**
-  Both layers call `fail_output()` for every id in `outputs` before rethrowing; because
-  `fail_output()` is first-failure-wins, doing it at both the FFI wrapper and the core
-  `streaming_fragment` is safe, not double-poisoning in any harmful sense — it just means a direct
-  `streaming_fragment` caller (a unit test, or any future caller that bypasses the FFI) gets the
-  same protection a `Fragment` caller does.
+- **One transaction each.** Type-name parsing, `CREATE VIEW`, lowering, and scans (which read
+  DuckDB MVCC state) need one. `execute_substrait` wraps build, run, and `take_result()` in a single
+  transaction. Views are created after `build()` declares the streams, so they bind against the
+  real schemas.
+- **Rollback on failure.** `in_transaction(serial, conn, body)` commits on success and otherwise
+  rolls back and rethrows the original error, even if the rollback fails. Rolling back discards
+  views a failed `build()` already created. The `streaming_fragment` is handed to `Fragment` only
+  after the commit, so a failed FFI `build()` leaves the `Fragment` unbuilt and retryable.
+- **One transaction at a time per `Context`.** Fragments share the connection, and a second
+  `BEGIN` would fail and invalidate the open transaction. `in_transaction` holds the `Context`'s
+  `conn_mutex`, so concurrent `build()`, `run()`, and `execute_substrait` calls wait for each other.
 
 ## Tests
 
-| File | Catch2 tags |
-|---|---|
-| `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
-| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
-| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
+| File | Catch2 tags | Covers |
+|---|---|---|
+| `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` | Catalog verbs |
+| `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` | Spec errors; relay preconditions (FRAG-7); failed runs and single-use calls (FRAG-8); hash partitioning (FRAG-9), with INTEGER and BIGINT senders (FRAG-9b); out-of-order builds and runs (FRAG-10); a window between `build()` and `run()` (FRAG-11); `run()` guards (FRAG-12); runs from two threads (FRAG-13) |
+| `test/cpp/exec/test_sirius_ffi_embedder.cpp` | `[isolated_context][sirius_ffi]` | Public FFI with Substrait built in the test: leaf result, `relay_from` chain, builds before runs (one and two threads), `build()` and `run()` on different threads, drop after `build()`, a failed `build()`, a hash key on one output, concurrent `run()` and `execute_substrait` |
+| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` | Rollback of a `build()` that fails while resolving input types |
 
-The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
-`SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
-the shared test environments around any test with that tag so it doesn't contend with them for GPU
-memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
-FFI-level tests are necessarily built around observable, public-API behavior (a failed `build()`
-throws, and a subsequent independent `Fragment` on the same `Context` can attempt its own `build()`
-right after) rather than inspecting DuckDB catalog state directly.
+`[isolated_context]` tests bring up their own `SiriusContext` and GPU pools; the listener in
+`test/cpp/unittest.cpp` pauses the shared test environments around them.
 
 ## Not yet ported
 
-`Fragment::run()` blocks — it goes through `streaming_fragment::run()` → `sirius_engine::execute()`,
-which takes the future from `start_query()` and waits immediately. Fragments therefore run
-store-and-forward, one at a time (`relay_from(...)` orders strictly before `run()`, and only one
-fragment may sit between its own `build()` and `run()`). The `Fragment` surface exposes no
-`push`/`pull`/`wait`, so a genuinely remote sender cannot feed a fragment yet — `relay_from()` only
-moves batches that are already sitting in a *local*, already-finished source fragment's output
-repository. Non-blocking scheduling and a `push`/`pull`/`wait` FFI are tracked separately, not
-claimed here.
+`Fragment::run()` blocks until `sirius_engine::execute()` finishes, so fragments run
+store-and-forward and every input must be closed first. `relay_from()` only moves batches parked
+on a finished local source. Remote senders need `push_arrow`, `pull_arrow`, and `drained` on
+`sirius::ffi::Fragment`, plus non-blocking execution, tracked in
+[#1590](https://github.com/sirius-db/sirius/issues/1590).

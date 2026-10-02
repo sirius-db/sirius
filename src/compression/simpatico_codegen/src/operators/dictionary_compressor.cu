@@ -237,7 +237,12 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
                          }
                        });
   }
-  return cudf::make_strings_column(n_rows, std::move(offsets), chars.release(), 0, {});
+  return cudf::make_strings_column(
+    n_rows,
+    std::move(offsets),
+    chars.release(),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
@@ -351,8 +356,9 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   // Only the *row* validity needs carrying: the keys are non-null (checked
   // above), so a matching code is unambiguously true.
   auto const null_count = dict_column->null_count();
-  rmm::device_buffer null_mask =
-    null_count > 0 ? cudf::copy_bitmask(dict_column->view(), stream, mr) : rmm::device_buffer{};
+  auto null_mask        = null_count > 0
+                            ? cudf::copy_bitmask(dict_column->view(), stream, mr)
+                            : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   auto out =
     cudf::make_fixed_width_column(bool_t, n_rows, std::move(null_mask), null_count, stream, mr);
 

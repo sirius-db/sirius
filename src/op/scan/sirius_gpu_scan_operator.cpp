@@ -285,9 +285,11 @@ void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan
     auto const narrowing = conversion.kind == carrier_conversion_kind::NARROW;
     if (observer != nullptr) {
       if (narrowing) {
-        observer->record_compressed_materialization_scan_columns_narrowed();
+        observer->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_columns_narrowed);
       } else {
-        observer->record_compressed_materialization_scan_columns_restored();
+        observer->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_columns_restored);
       }
     }
     SIRIUS_LOG_DEBUG("[compressed_materialization] scan column {} {}: {} -> {}",
@@ -421,7 +423,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
-    scan_input->prefetch(io::cache::prefetching_stage::immediate);
+    scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }

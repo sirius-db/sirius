@@ -76,7 +76,6 @@ rmm::device_buffer copy_bitmask(column_view const& view, ...);
 ```
 
 **Our usage**:
-- `src/operator/gpu_physical_result_collector.cpp` — Extracting validity masks
 
 ### `cudf::contiguous_split`
 

@@ -87,6 +87,7 @@ struct test_env {
 
 test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }
@@ -238,7 +239,8 @@ TEST_CASE("scan construction rejects an incomplete native carrier schema",
   types.push_back(sirius::logical_type::make_decimal(4, 2));
 
   REQUIRE_THROWS_WITH(sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr),
-                      Catch::Contains("output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
+                      Catch::Matchers::ContainsSubstring(
+                        "output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
 }
 
 TEST_CASE("scan execute rejects a materialized column count its output types do not describe",
@@ -260,7 +262,7 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("output schema width mismatch"));
+                      Catch::Matchers::ContainsSubstring("output schema width mismatch"));
 }
 
 TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its output type",
@@ -283,7 +285,7 @@ TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("native schema carrier mismatch"));
+                      Catch::Matchers::ContainsSubstring("native schema carrier mismatch"));
 }
 
 TEST_CASE("scan execute restores a narrowed resident carrier to its native output type",
