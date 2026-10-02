@@ -319,16 +319,6 @@ TEST_CASE_METHOD(PinMvccFixture,
   run_ok("CALL unpin_table('mvcc_dml_t');");
 }
 
-TEST_CASE_METHOD(PinMvccFixture,
-                 "pin_table mvcc - attach_mvcc_metadata without an entry throws",
-                 "[integration][pin_table_mvcc]")
-{
-  auto sirius_ctx = sirius::test::get_registered_sirius_context(*con);
-  REQUIRE(sirius_ctx != nullptr);
-  REQUIRE_THROWS_AS(sirius_ctx->get_scan_manager().attach_mvcc_metadata("mvcc_no_such_entry", {}),
-                    std::invalid_argument);
-}
-
 //===----------------------------------------------------------------------===//
 // validate_duckdb_pin_chunk failure paths (pure unit tests, no GPU / fixture)
 //===----------------------------------------------------------------------===//

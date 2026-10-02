@@ -24,3 +24,22 @@ Validation: `pixi run make` passed; 114 targeted cases / 1,110 assertions and
 6 standalone plan/merge cases / 311 assertions passed. Formatting/lint passed.
 Logs: `/tmp/simplification-1-build.log`, `/tmp/simplification-1-tests.log`, and
 `/tmp/simplification-1-plan-tests.log`. Multi-GPU cases require a multi-GPU host.
+
+## 2. Publish complete pin metadata
+
+- Removed `attach_mvcc_metadata()` and `attach_proven_unique_columns()` from the
+  production interface. All metadata now enters through `pinned_entry_metadata`
+  and the existing `apply_pin_metadata()` publication helper.
+- Migrated uniqueness tests to publish proofs with data. The merge regression now
+  supplies a proof for discarded incoming bytes and verifies it is ignored, while
+  an existing proof for retained data survives.
+- Replaced the mutation/epoch test with complete-publication checks. Replacement
+  tests retain an old reader and verify both failure atomicity and stable old
+  metadata after a successful replacement.
+- Removed the missing-entry test specific to the deleted mutation API; SQL MVCC
+  tests and publication tests cover the supported interface. Kept source identity,
+  merge shape checks and generation ownership unchanged.
+
+Validation: build and formatting/lint passed; 49 pin/uniqueness/MVCC cases passed
+with 1,045 assertions. Logs: `/tmp/simplification-2-build.log` and
+`/tmp/simplification-2-tests.log`.

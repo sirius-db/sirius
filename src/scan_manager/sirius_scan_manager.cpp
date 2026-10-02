@@ -2495,7 +2495,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       // index alone — identical memory_spaces. Merging such chunks would corrupt
       // the entry positionally (columns disagreeing on chunk boundaries) and
       // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
-      // via attach_mvcc_metadata. Reject loudly instead.
+      // in its publication metadata. Reject loudly instead.
       if (!entry.data_batches_by_column.empty()) {
         auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
         if (existing_chunks.size() != data_tables.size()) {
@@ -2806,56 +2806,6 @@ void sirius_scan_manager::insert_pinned_entry_device(
   std::lock_guard pin_lk{_pinned_entries_mutex};
   apply_pin_metadata(entry, std::move(metadata), entry.cache_info.names);
   publish_pinned_entry(name, std::move(entry));
-}
-
-void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
-                                               duckdb_mvcc_metadata metadata)
-{
-  pin_registry_mutation_scope const registry_mutation{*this};
-  std::lock_guard pin_lk{_pinned_entries_mutex};
-  auto it = _pinned_entries.find(name);
-  if (it == _pinned_entries.end()) {
-    throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
-  }
-  // In-place mutation of a live entry, same hazard (and same guard) as the re-pin merge in
-  // insert_pinned_entry. In practice this always fires on an entry the caller's own insert
-  // just installed, so use_count() is 1 and the guard never trips.
-  if (it->second.use_count() > 1) {
-    throw std::runtime_error("[attach_mvcc_metadata] cannot attach MVCC metadata to '" + name +
-                             "': a query is currently reading the pinned entry");
-  }
-  it->second->mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
-  // A (re-)pin resets the chunk layout the masks are indexed by.
-  it->second->mvcc_mask_cache.reset();
-}
-
-void sirius_scan_manager::attach_proven_unique_columns(
-  const std::string& name, std::span<std::string const> unique_column_names)
-{
-  pin_registry_mutation_scope const registry_mutation{*this};
-  std::lock_guard pin_lk{_pinned_entries_mutex};
-  auto it = _pinned_entries.find(name);
-  if (it == _pinned_entries.end()) {
-    throw std::invalid_argument("[attach_proven_unique_columns] no pinned entry named '" + name +
-                                "'");
-  }
-  // In-place mutation of a live entry, same hazard (and same guard) as attach_mvcc_metadata:
-  // in practice this always fires on an entry the caller's own insert just installed, so
-  // use_count() is 1 and the guard never trips.
-  if (it->second.use_count() > 1) {
-    throw std::runtime_error("[attach_proven_unique_columns] cannot attach uniqueness facts to '" +
-                             name + "': a query is currently reading the pinned entry");
-  }
-  auto& entry       = *it->second;
-  auto const& names = entry.cache_info.names;
-  // The merge path appends columns after the previous attach sized this vector,
-  // so grow it (with "unknown") rather than assume it already covers the entry.
-  entry.proven_unique_columns.resize(names.size(), false);
-  for (auto const& unique_name : unique_column_names) {
-    for (std::size_t i = 0; i < names.size(); ++i) {
-      if (names[i] == unique_name) { entry.proven_unique_columns[i] = true; }
-    }
-  }
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)

@@ -111,7 +111,8 @@ struct epoch_fixture {
   /// with the merge branch and the erase-then-rebuild branch.
   void insert(std::vector<std::size_t> const& primary_indices,
               cudf::size_type n_rows,
-              std::size_t n_table_columns)
+              std::size_t n_table_columns,
+              sirius::scan_manager::pinned_entry_metadata metadata = {})
   {
     static_cast<void>(
       manager.insert_pinned_entry(kTable,
@@ -120,7 +121,8 @@ struct epoch_fixture {
                                   std::vector<cucascade::memory::memory_space*>{space},
                                   {},
                                   {},
-                                  storage_for(primary_indices.size())));
+                                  storage_for(primary_indices.size()),
+                                  std::move(metadata)));
   }
 
   [[nodiscard]] std::uint64_t epoch() const { return manager.pin_registry_epoch(); }
@@ -175,32 +177,64 @@ TEST_CASE("the same-row-count merge path moves the pin-registry epoch",
   CHECK(f.snapshot() != old_snapshot);
 }
 
-TEST_CASE("a failed replacement preserves the previous pin generation",
+TEST_CASE("failed and successful replacement preserve old pin metadata for readers",
           "[scan_manager][pin_registry_epoch]")
 {
   epoch_fixture f;
-  f.insert({0}, 8, 1);
-  REQUIRE(f.has_entry());
-
+  f.insert({0},
+           8,
+           1,
+           {.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7},
+            .proven_unique_columns = {"c0"}});
+  auto lookup = [&] {
+    return f.manager.find_pinned_entry_for_duckdb_table(
+      "memory", "main", kTable, sirius::test::test_table_identity(42));
+  };
+  auto previous = lookup();
+  REQUIRE(previous);
+  REQUIRE(previous->mvcc);
   auto const before_failed_repin = f.epoch();
-  // The replacement declares two columns but carries one. Construction fails before
-  // publication, leaving the old generation available. The conservative epoch still advances.
-  REQUIRE_THROWS_AS(f.insert({0, 1}, 4, 1), std::runtime_error);
-  CHECK(f.has_entry());
-  CHECK(f.entry_column_count() == 1);
+  // Invalid data must not publish either the replacement or its newer metadata.
+  REQUIRE_THROWS_AS(
+    f.insert({0, 1}, 4, 1, {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8}}),
+    std::runtime_error);
+  CHECK(lookup() == previous);
+  CHECK(previous->mvcc->v_base == 42);
+  CHECK(previous->proven_unique_columns == std::vector<bool>{true});
   CHECK(f.epoch() > before_failed_repin);
+
+  // A successful replacement changes the visible generation; a reader of the old
+  // generation keeps its original data and metadata together.
+  f.insert({0}, 9, 1, {.mvcc = sirius::scan_manager::duckdb_mvcc_metadata{99, {}, 8}});
+  auto current = lookup();
+  REQUIRE(current);
+  CHECK(current != previous);
+  REQUIRE(current->mvcc);
+  CHECK(current->mvcc->v_base == 99);
+  CHECK(current->proven_unique_columns.empty());
+  CHECK(previous->num_rows == 8);
+  CHECK(previous->mvcc->v_base == 42);
+  CHECK(previous->proven_unique_columns == std::vector<bool>{true});
 }
 
-TEST_CASE("attaching proven-unique columns moves the pin-registry epoch",
+TEST_CASE("pin publication includes metadata and advances the epoch",
           "[scan_manager][pin_registry_epoch]")
 {
-  // The comparison-join planner reads proven uniqueness at plan time, so it is plan-visible
-  // registry state like any other.
   epoch_fixture f;
-  f.insert({0, 1}, 8, 2);
-  auto const before_attach = f.epoch();
-  f.manager.attach_proven_unique_columns(kTable, std::vector<std::string>{"c0"});
-  CHECK(f.epoch() > before_attach);
+  auto const before = f.epoch();
+  f.insert({0, 1},
+           8,
+           2,
+           {.mvcc                  = sirius::scan_manager::duckdb_mvcc_metadata{42, {}, 7},
+            .proven_unique_columns = {"c0"}});
+  auto entry = f.manager.find_pinned_entry_for_duckdb_table(
+    "memory", "main", kTable, sirius::test::test_table_identity(42));
+  REQUIRE(entry);
+  REQUIRE(entry->mvcc);
+  CHECK(entry->mvcc->v_base == 42);
+  CHECK(entry->mvcc->checkpoint_iteration == 7);
+  CHECK(entry->proven_unique_columns == std::vector<bool>{true, false});
+  CHECK(f.epoch() > before);
 }
 
 TEST_CASE("removing a pinned entry moves the pin-registry epoch",

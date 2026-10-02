@@ -185,6 +185,7 @@ class cache_entry_info {
 /// Facts are constructed with the data and published in the same registry transaction.
 struct pinned_entry_metadata {
   std::optional<duckdb_mvcc_metadata> mvcc;
+  // Proofs describe incoming data. Merges apply them only to columns actually stored.
   std::vector<std::string> proven_unique_columns;
 };
 
@@ -627,8 +628,8 @@ class sirius_scan_manager {
   ///         path that is every column; on the merge path it is only the newly added ones —
   ///         a column already cached keeps its previous chunks and the incoming ones are
   ///         dropped, so anything derived from this materialization (uniqueness verdicts,
-  ///         say) describes data that never entered the cache. See
-  ///         @ref attach_proven_unique_columns.
+  ///         say) describes data that never entered the cache. Insertion filters the supplied
+  ///         uniqueness proofs to this set before publishing the new generation.
   [[nodiscard]] std::vector<std::string> insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
@@ -704,41 +705,6 @@ class sirius_scan_manager {
                                   cucascade::memory::memory_space& memory_space,
                                   sirius::pinned_column_storage_matrix column_storage,
                                   pinned_entry_metadata metadata = {});
-
-  /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
-  ///
-  /// Compatibility helper for direct API users/tests. SQL passes metadata into insertion.
-  /// Overwrites any previous metadata: on a re-pin that merged into an existing entry, the
-  /// refreshed (newer) v_base is the more conservative snapshot fence for every cached column, and
-  /// the refreshed per-chunk counts stay valid for every column because the merge path rejects
-  /// materializations whose per-chunk row counts differ from the existing
-  /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
-  void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
-
-  /// \brief Record which of @p name 's pinned columns were proven distinct at pin time.
-  ///
-  /// Compatibility helper for direct API users/tests. Takes NAMES, not
-  /// positions: a re-pin that merges into an existing entry appends its new
-  /// columns to the entry's own order, which is not the incoming pin's order,
-  /// so a positional attach could mark the wrong column unique — and a false
-  /// positive here is wrong query results, not a slow query.
-  ///
-  /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
-  /// columns' data untouched, so a proof taken against THAT data still holds,
-  /// while a replacing re-pin builds a fresh entry with no facts at all. Names
-  /// absent from @p unique_column_names are left as they were — absence is
-  /// "unknown", so nothing is asserted by omission. A name that matches no
-  /// pinned column is ignored. Throws std::invalid_argument when no entry
-  /// exists for @p name.
-  ///
-  /// The caller must pass only columns whose data the accompanying insert
-  /// actually STORED (@ref insert_pinned_entry returns exactly that set). A
-  /// verdict describes the values the pin driver read; the merge path keeps an
-  /// already-cached column's earlier chunks and drops the incoming ones, so
-  /// attaching that verdict to the retained column would assert distinctness
-  /// about bytes nothing ever examined — and this flag admits a group key.
-  void attach_proven_unique_columns(const std::string& name,
-                                    std::span<std::string const> unique_column_names);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
