@@ -20,7 +20,7 @@ from .artifacts import provenance, seal, verify, write_json
 from .isolation import supervise
 from . import __version__
 from .classify import Verdict
-from .config import FUZZ_DIR, FuzzConfig, load_config, resolve_repo_path
+from .config import FUZZ_DIR, MODES, FuzzConfig, load_config, resolve_repo_path
 from .report import Report, default_known_issues_path, load_known_issues
 from .runner import Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
@@ -62,6 +62,19 @@ def _common_config_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _mode_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--mode",
+        choices=MODES,
+        default="correctness",
+        help="correctness (default): fuzz the configuration's enabled features, where any "
+        "fallback is a finding. gaps: find what Sirius does not run on the GPU yet; "
+        "every generator feature is on regardless of the configuration, setting variants "
+        "are skipped, and each plan/runtime fallback is reduced to the smallest query "
+        "that still falls back",
+    )
+
+
 def _common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--extension", help="path to sirius.duckdb_extension (default: from config)"
@@ -86,7 +99,7 @@ def _common_engine_args(p: argparse.ArgumentParser) -> None:
 
 
 def _load(args: argparse.Namespace) -> FuzzConfig:
-    return load_config(args.config, args.set)
+    return load_config(args.config, args.set, getattr(args, "mode", "correctness"))
 
 
 def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> tuple[str | None, list[str]]:
@@ -144,7 +157,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         {k: v for k, v in vars(args).items() if k != "func"},
     )
     known = load_known_issues(default_known_issues_path(cfg))
-    report = Report(run_dir, cfg, known, seed)
+    report = Report(run_dir, cfg, known, seed, mode=args.mode)
     opts = OrchestratorOptions(
         workers=args.workers,
         duration=parse_duration(args.duration),
@@ -159,14 +172,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if opts.duration is None and opts.max_queries is None:
         opts.max_queries = 500
     print(
-        f"siriusfuzz {__version__}: config={cfg.config_hash()} seed={seed} workers={opts.workers} "
+        f"siriusfuzz {__version__}: mode={args.mode} config={cfg.config_hash()} seed={seed} workers={opts.workers} "
         f"{'cpu-only' if extension is None else extension} -> {run_dir}",
         file=sys.stderr,
     )
     summary = Orchestrator(cfg, report, seed, opts).run()
     print(report.render_summary(summary))
+    # Gaps are the expected output of a gaps run, not a failure of it.
     findings = [
-        f for f in summary["findings"] if f["verdict"] != Verdict.KNOWN_ISSUE.value
+        f
+        for f in summary["findings"]
+        if f["verdict"] != Verdict.KNOWN_ISSUE.value
+        and not (args.mode == "gaps" and Verdict(f["verdict"]).is_gap())
     ]
     if summary["status"] == "cancelled":
         return 130
@@ -454,6 +471,7 @@ def cmd_replay_file(args: argparse.Namespace) -> int:
 def cmd_show_config(args: argparse.Namespace) -> int:
     cfg = _load(args)
     print(cfg.to_toml())
+    print(f"# mode: {args.mode}")
     print(f"# config hash: {cfg.config_hash()}")
     return 0
 
@@ -490,6 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="generate, run and compare queries")
     _common_config_args(run)
+    _mode_arg(run)
     _common_engine_args(run)
     run.add_argument("--seed", type=int)
     run.add_argument("--duration", help="time budget, e.g. 30m, 2h, 90s")
@@ -574,10 +593,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sc = sub.add_parser("show-config", help="print the effective configuration")
     _common_config_args(sc)
+    _mode_arg(sc)
     sc.set_defaults(func=cmd_show_config)
 
     stp = sub.add_parser("selftest", help="CPU-only harness check (no GPU needed)")
     _common_config_args(stp)
+    _mode_arg(stp)
     stp.add_argument("--seed", type=int)
     stp.add_argument("--queries", type=int)
     stp.add_argument("--workers", type=int, default=1)

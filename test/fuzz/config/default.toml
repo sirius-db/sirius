@@ -5,6 +5,10 @@
 # is expected to stay on the GPU, so a plan-time fallback is a finding (a generator
 # bug or an undocumented gap). When Sirius gains a feature, flip its flag to true
 # here. Keys mirror siriusfuzz/config.py; unknown keys are rejected.
+#
+# `fuzz run --mode gaps` ignores the false feature flags, generates everything the
+# generator knows, and reduces each fallback to the smallest query that still falls
+# back: that is how to see what Sirius declines today.
 
 [features]
 window_functions = false

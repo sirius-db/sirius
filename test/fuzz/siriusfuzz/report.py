@@ -34,6 +34,7 @@ class QueryRecord:
     labels: list[str] = field(default_factory=list)
     reduced_sql: str | None = None
     reduced_labels: list[str] = field(default_factory=list)
+    reduced_reason: str = ""  # error reason reported by the reduced query
     elapsed_cpu: float = 0.0
     elapsed_gpu: float = 0.0
     variant: dict[str, Any] | None = None
@@ -141,13 +142,14 @@ class Report:
         config: FuzzConfig,
         known_issues: list[KnownIssue],
         seed: int,
+        mode: str = "correctness",
     ):
         self.run_dir = run_dir
         self.cfg = config
         self.known = known_issues
         self.seed = seed
+        self.mode = mode
         self.counts: collections.Counter[str] = collections.Counter()
-        self.fallback_reasons: collections.Counter[str] = collections.Counter()
         self.cpu_error_reasons: collections.Counter[str] = collections.Counter()
         self.findings: dict[str, dict[str, Any]] = {}
         self.feature_stats: collections.Counter[str] = collections.Counter()
@@ -157,6 +159,7 @@ class Report:
         self.stop_reason = "budget completed"
         self.worker_context: dict[int, dict[str, Any]] = {}
         self.record_paths: dict[tuple[str, str], pathlib.Path] = {}
+        self.record_signatures: dict[tuple[str, str], str] = {}
         self.datasets = 0
         (run_dir / "findings").mkdir(parents=True, exist_ok=True)
         (run_dir / "datasets").mkdir(parents=True, exist_ok=True)
@@ -168,7 +171,7 @@ class Report:
     def add(self, rec: QueryRecord) -> str | None:
         """Record a query; returns the finding directory name when a new finding was written."""
         self.queries += 1
-        observed = verdict = Verdict(rec.verdict)
+        verdict = Verdict(rec.verdict)
         for ki in self.known:
             if verdict.is_finding() and ki.matches(rec):
                 rec.reason = f"{ki.issue}: {rec.reason}"
@@ -176,8 +179,6 @@ class Report:
                 verdict = Verdict.KNOWN_ISSUE
                 break
         self.counts[rec.verdict] += 1
-        if observed == Verdict.PLAN_FALLBACK:
-            self.fallback_reasons[normalize_reason(rec.reason)] += 1
         if verdict == Verdict.CPU_ERROR:
             self.cpu_error_reasons[normalize_reason(rec.reason)] += 1
         self._log.write(json.dumps(asdict(rec), default=str) + "\n")
@@ -185,6 +186,7 @@ class Report:
         if not verdict.is_finding() and verdict != Verdict.KNOWN_ISSUE:
             return None
         sig = signature(rec)
+        self.record_signatures[(rec.dataset, rec.sql)] = sig
         if sig in self.findings:
             entry = self.findings[sig]
             entry["count"] += 1
@@ -199,6 +201,11 @@ class Report:
             "verdict": rec.verdict,
             "reason": rec.reason,
             "worker": rec.worker,
+            "sql": rec.sql,
+            "labels": rec.labels,
+            "reduced_sql": None,
+            "reduced_labels": [],
+            "reduced_reason": "",
         }
         self._write_finding(name, rec, sig)
         return name
@@ -306,18 +313,65 @@ class Report:
 
     def add_reduction(self, rec: QueryRecord) -> None:
         d = self.record_paths.get((rec.dataset, rec.sql))
-        if d is not None and rec.reduced_sql:
-            (d / "reduced.sql").write_text(rec.reduced_sql.rstrip() + ";\n")
-            write_json(
-                d / "reduction.json",
+        if d is None or not rec.reduced_sql:
+            return
+        (d / "reduced.sql").write_text(rec.reduced_sql.rstrip() + ";\n")
+        write_json(
+            d / "reduction.json",
+            {
+                "sql": rec.reduced_sql,
+                "reason": rec.reduced_reason,
+                "steps": rec.reduction_steps,
+                "comparison": "multiset",
+                "variant": rec.variant,
+                "note": "Original evidence retained in meta.json; reduced SQL requires a fresh replay.",
+            },
+        )
+        # The summary shows the smallest reproducer seen for the signature.
+        entry = self.findings.get(
+            self.record_signatures.get((rec.dataset, rec.sql), "")
+        )
+        if entry is not None and (
+            entry["reduced_sql"] is None
+            or len(rec.reduced_sql) < len(entry["reduced_sql"])
+        ):
+            entry.update(
+                reduced_sql=rec.reduced_sql,
+                reduced_labels=rec.reduced_labels,
+                reduced_reason=rec.reduced_reason,
+            )
+
+    @staticmethod
+    def gaps(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Gap findings grouped by the reason their smallest reproducer reports.
+
+        Reduction narrows an "Unsupported <expression>" rejection to the function
+        Sirius cannot translate, so findings that started from different
+        expressions around the same function end up in one group.
+        """
+        groups: dict[str, dict[str, Any]] = {}
+        for f in findings:
+            if not Verdict(f["verdict"]).is_gap():
+                continue
+            reason = f["reduced_reason"] or f["reason"]
+            sql = f["reduced_sql"] or f["sql"]
+            labels = f["reduced_labels"] or f["labels"]
+            group = groups.setdefault(
+                normalize_reason(reason),
                 {
-                    "sql": rec.reduced_sql,
-                    "steps": rec.reduction_steps,
-                    "comparison": "multiset",
-                    "variant": rec.variant,
-                    "note": "Original evidence retained in meta.json; reduced SQL requires a fresh replay.",
+                    "verdict": f["verdict"],
+                    "reason": reason,
+                    "count": 0,
+                    "sql": sql,
+                    "labels": labels,
+                    "findings": [],
                 },
             )
+            group["count"] += f["count"]
+            group["findings"].append(f["name"])
+            if len(sql) < len(group["sql"]):
+                group.update(reason=reason, sql=sql, labels=labels)
+        return sorted(groups.values(), key=lambda g: (-g["count"], g["reason"]))
 
     def finish(self) -> dict[str, Any]:
         self._log.close()
@@ -336,6 +390,7 @@ class Report:
         summary = {
             "status": self.status,
             "stop_reason": self.stop_reason,
+            "mode": self.mode,
             "seed": self.seed,
             "config_hash": self.cfg.config_hash(),
             "config_path": self.cfg.source_path,
@@ -344,7 +399,7 @@ class Report:
             "datasets": self.datasets,
             "counts": dict(self.counts),
             "findings": ordered,
-            "plan_fallback_reasons": self.fallback_reasons.most_common(),
+            "gaps": self.gaps(ordered),
             "cpu_error_reasons": self.cpu_error_reasons.most_common(20),
             "feature_stats": dict(sorted(self.feature_stats.items())),
         }
@@ -359,24 +414,44 @@ class Report:
         lines = [
             f"siriusfuzz run: {self.run_dir}",
             f"status={summary.get('status', 'unknown')}: {summary.get('stop_reason', '')}",
-            f"seed={summary['seed']} config={summary['config_hash']} "
+            f"mode={summary.get('mode', 'correctness')} seed={summary['seed']} config={summary['config_hash']} "
             f"queries={summary['queries']} datasets={summary['datasets']} elapsed={summary['elapsed_seconds']}s",
             "",
             "verdict counts:",
         ]
         for k, v in sorted(summary["counts"].items(), key=lambda kv: -kv[1]):
             lines.append(f"  {k:20s} {v}")
+        gaps = summary.get("gaps", [])
+        if gaps:
+            total = sum(g["count"] for g in gaps)
+            lines.append("")
+            lines.append(
+                f"gaps ({len(gaps)} unsupported features, {total} queries fell back to CPU);"
+                " smallest query that still falls back, and its features:"
+            )
+            for g in gaps:
+                lines.append(
+                    f"  [{g['verdict']}] x{g['count']:<4d} {g['reason'][:110]}"
+                )
+                lines.append(f"      {' '.join(g['sql'].split())[:220]}")
+                lines.append(
+                    f"      features: {', '.join(g['labels'])}"
+                    f"   findings: {', '.join(g['findings'][:3])}"
+                    + (
+                        f" (+{len(g['findings']) - 3})"
+                        if len(g["findings"]) > 3
+                        else ""
+                    )
+                )
+        findings = [
+            f for f in summary["findings"] if not Verdict(f["verdict"]).is_gap()
+        ]
         lines.append("")
-        lines.append(f"findings ({len(summary['findings'])} unique):")
-        for f in summary["findings"]:
+        lines.append(f"findings ({len(findings)} unique):")
+        for f in findings:
             lines.append(
                 f"  [{f['verdict']}] x{f['count']:<4d} {f['name']}  {f['reason'][:100]}"
             )
-        if summary["plan_fallback_reasons"]:
-            lines.append("")
-            lines.append("plan-time fallback reasons:")
-            for reason, n in summary["plan_fallback_reasons"]:
-                lines.append(f"  {n:5d}  {reason}")
         if summary["cpu_error_reasons"]:
             lines.append("")
             lines.append("skipped (CPU error) reasons, top 20:")
@@ -399,14 +474,26 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
     if f.aggregates.functions:
         claimed += ["group_by", "ungrouped_aggregate"]
     claimed += [f"join:{jt}" for jt in f.joins.types]
+    if f.full_join:
+        claimed.append("join:full")
+    if f.cross_join:
+        claimed.append("join:cross")
+    if f.grouping_sets:
+        claimed.append("grouping_sets")
     if f.order_by.enabled:
         claimed.append("order_by")
     if f.limit.enabled:
         claimed.append("limit")
     if f.cte.materialized:
         claimed.append("cte")
-    if f.set_ops.union_all:
-        claimed.append("setop:UNION ALL")
+    for op, on in (
+        ("UNION ALL", f.set_ops.union_all),
+        ("UNION", f.set_ops.union),
+        ("EXCEPT", f.set_ops.except_),
+        ("INTERSECT", f.set_ops.intersect),
+    ):
+        if on:
+            claimed.append(f"setop:{op}")
     if f.subqueries.exists:
         claimed.append("subquery:exists")
     if f.subqueries.in_:
