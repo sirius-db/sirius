@@ -320,7 +320,7 @@ jobs:
           gh release delete "$PENDING_TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$PENDING_TAG" --target "$TARGET_SHA" --draft --title "$PENDING_TAG" --notes "staging"
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
           TARGET_SHA: ${{ steps.target.outputs.sha }}
 
@@ -330,7 +330,7 @@ jobs:
           gh release upload "$PENDING_TAG" \
             renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 --clobber
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Verify staged assets
@@ -344,7 +344,7 @@ jobs:
           # are improperly formatted" that reads like a real problem in the logs.
           (cd "$tmp" && grep -v '^#' MANIFEST.sha256 | sha256sum -c -)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Publish the live release
@@ -378,7 +378,7 @@ jobs:
             exit 1
           fi
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.tag.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
@@ -387,7 +387,7 @@ jobs:
         if: always() && github.event_name == 'workflow_dispatch'
         run: gh release delete "$PENDING_TAG" --yes --cleanup-tag 2>/dev/null || true
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Post-publish assertion
@@ -409,7 +409,7 @@ jobs:
             exit 1
           fi
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.tag.outputs.tag }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
