@@ -136,6 +136,14 @@ void downgrade_executor::stop()
 
 void downgrade_executor::drain()
 {
+  pause();
+  _pool->resume();
+  _request_queue.reactivate();
+  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+}
+
+void downgrade_executor::pause()
+{
   _pool->interrupt();
   _request_queue.interrupt();
 
@@ -143,9 +151,12 @@ void downgrade_executor::drain()
 
   _pool->wait_all();
   cancel_pending_requests();
+}
+
+void downgrade_executor::resume()
+{
   _pool->resume();
   _request_queue.reactivate();
-
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 

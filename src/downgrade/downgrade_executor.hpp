@@ -115,6 +115,22 @@ class downgrade_executor {
   void drain();
 
   /**
+   * @brief Quiesce the processing thread without tearing down the pool.
+   *
+   * Interrupts and joins the processing thread, drains in-flight pool work, and cancels
+   * any queued requests. After returning, no sweep can observe mutations to borrowed
+   * resources (notably @ref set_prefetching_cache). @ref resume relaunches the processing
+   * thread; the pair exists so a caller rebinding borrowed state during cache reset can
+   * stand between the two safely.
+   */
+  void pause();
+
+  /**
+   * @brief Reactivate the request queue and relaunch the processing thread after @ref pause.
+   */
+  void resume();
+
+  /**
    * @brief Get the memory space this executor is responsible for.
    */
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }

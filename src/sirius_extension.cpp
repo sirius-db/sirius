@@ -1693,7 +1693,7 @@ void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
     // same way pinned-registry mutation is.  A lock-only guard suffices --
     // rebuilding a cache creates no per-query runtime state to clean up.
     duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
-    sirius_ctx->get_scan_manager().reset_caches();
+    sirius_ctx->reset_caches();
   }
 
   output.SetCardinality(1);
