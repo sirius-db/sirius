@@ -4,9 +4,11 @@ if(PROJECT_IS_TOP_LEVEL)
   set(sirius_test_library sirius_core)
   add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                  test/cpp/utils/sirius_extension_loader.cpp)
+  target_compile_definitions(sirius_unittest PRIVATE SIRIUS_STANDALONE_TESTS)
 else()
   set(sirius_test_library sirius_extension)
   add_executable(sirius_unittest ${TEST_SOURCES})
+  add_dependencies(sirius_unittest sirius_loadable_extension)
   link_extension_libraries(sirius_unittest "")
 endif()
 

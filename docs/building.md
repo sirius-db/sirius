@@ -65,7 +65,8 @@ The root can also build Sirius directly, with DuckDB as a source dependency.
 Use the existing Makefile for the integrated DuckDB extension build.
 
 ```bash
-pixi run cmake -S . -B build/standalone -G Ninja -DCMAKE_BUILD_TYPE=Release
+pixi run cmake -S . -B build/standalone -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=native
 pixi run cmake --build build/standalone --target sirius_library
 pixi run cmake --install build/standalone --component sirius_library --prefix "$PWD/build/install"
 ```
