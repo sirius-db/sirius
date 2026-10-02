@@ -41,9 +41,8 @@ For the legacy Sirius implementation used for the ClickBench results, see the
 
 Getting started? Download one of our prebuilt extensions instead of building from source:
 
-- [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): maintainer-selected build with passing benchmarks.
-- [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): newest successful build of `main`, moves forward automatically
-  - Expect to encounter breaking changes and in-development work
+- [`stable`](https://github.com/sirius-db/sirius/releases/tag/stable): a maintainer-selected build, promoted manually
+- [`latest`](https://github.com/sirius-db/sirius/releases/tag/latest): tracks the newest successful build on `main` automatically, possible to encounter breaking changes
 
 Both include full install instructions in the release notes: installing a matching DuckDB
 version, downloading the right binary for your platform, and a sample query to try it with.

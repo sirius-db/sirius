@@ -58,10 +58,12 @@ jobs:
     concurrency:
       # workflow_dispatch runs serialize by mode (real publishers to the same tag must queue
       # behind each other). workflow_run (automatic latest) joins the same "release-latest"
-      # bucket as a manual `mode: latest` dispatch, so an automatic publish and a manual latest
-      # recovery can never race each other. pull_request dry-runs use the PR number instead of a
-      # shared "pr-dry-run" bucket, so unrelated PRs touching this file don't queue behind each
-      # other, only re-pushes to the *same* PR do.
+      # bucket as a manual `mode: latest` dispatch, so an automatic publish and a manual
+      # `mode: latest` dispatch (e.g. someone re-running this workflow by hand after the
+      # automatic workflow_run publish failed or was skipped) can never race each other.
+      # pull_request dry-runs use the PR number instead of a shared "pr-dry-run" bucket, so
+      # unrelated PRs touching this file don't queue behind each other, only re-pushes to the
+      # *same* PR do.
       group: release-${{ inputs.mode || (github.event_name == 'workflow_run' && 'latest') || format('pr-{0}', github.event.pull_request.number) }}
       queue: max
       # Do not add cancel-in-progress here, even by copying a pattern from another workflow:
@@ -181,9 +183,10 @@ jobs:
           else
             # Target is older than, or has diverged from, what's currently live. Only reachable
             # via workflow_run (a manually re-run old Distribution build, or a race with a newer
-            # publish that already landed) - manual dispatches always resolve to live main HEAD,
-            # which can never be older than itself. Skip, don't error: expected no-op, not a
-            # failure.
+            # publish that already landed) - manual dispatches always resolve to the live
+            # origin/main HEAD (see the "Resolve target SHA" step above), which - since the
+            # published latest tag always points at some earlier commit on main - can never be
+            # older than that tag. Skip, don't error: expected no-op, not a failure.
             echo "::warning::Target ${TARGET_SHA} is not newer than the currently-published latest (${current_sha}). Skipping publish."
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
