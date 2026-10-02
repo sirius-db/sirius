@@ -16,6 +16,7 @@ target_sources(
           sirius_plan_cte.cpp
           sirius_plan_delim_get.cpp
           sirius_plan_delim_join.cpp
+          sirius_plan_distinct.cpp
           sirius_plan_dummy_scan.cpp
           sirius_plan_empty_result.cpp
           sirius_plan_expression_get.cpp
