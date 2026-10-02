@@ -49,7 +49,17 @@ target_include_directories(
 target_compile_definitions(
   sirius_duckdb_dependency
   INTERFACE $<$<OR:$<CONFIG:Debug>,$<BOOL:${FORCE_DEBUG}>>:DEBUG>
-            $<$<BOOL:${FORCE_ASSERT}>:DUCKDB_FORCE_ASSERT>)
+            $<$<BOOL:${FORCE_ASSERT}>:DUCKDB_FORCE_ASSERT>
+            $<$<BOOL:${DISABLE_STR_INLINE}>:DUCKDB_DEBUG_NO_INLINE>
+            $<$<BOOL:${FORCE_ASYNC_SINK_SOURCE}>:DUCKDB_DEBUG_ASYNC_SINK_SOURCE>
+            $<$<BOOL:${DISABLE_POINTER_SALT}>:DUCKDB_DISABLE_POINTER_SALT>
+            $<$<BOOL:${HASH_ZERO}>:DUCKDB_HASH_ZERO>)
+# These options change DuckDB's header layouts or data representation.
+if(DEFINED STANDARD_VECTOR_SIZE AND NOT STANDARD_VECTOR_SIZE STREQUAL "")
+  target_compile_definitions(
+    sirius_duckdb_dependency
+    INTERFACE STANDARD_VECTOR_SIZE=${STANDARD_VECTOR_SIZE})
+endif()
 target_link_libraries(
   sirius_duckdb_dependency INTERFACE duckdb_static core_functions_extension
                                      parquet_extension)
