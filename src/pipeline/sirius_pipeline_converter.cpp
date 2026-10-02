@@ -59,7 +59,7 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   setup_pipeline_parents();
   finalize_pipeline_structure();
   link_join_partition_siblings();
-  configure_partition_min_partitions();
+  configure_partition_consumers();
   restrict_dynamic_filter_replicas();
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
@@ -445,36 +445,46 @@ void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
   }
 }
 
-void sirius_pipeline_converter::configure_partition_min_partitions()
+void sirius_pipeline_converter::configure_partition_consumers()
 {
-  // Pull num_gpus from the build context (derived from sirius_engine's configured GPU set at
-  // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
-  // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
-  // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
-  // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
-  // partitions rather than only one.
-  const int num_gpus = build_ctx_.num_gpus();
-  if (num_gpus <= 1) return;
+  // The engine-backed context always carries the admitted ids; only the engine-free test
+  // constructor leaves them empty, and it cannot say which GPUs a multi-GPU count refers to.
+  auto const& active_gpu_ids = build_ctx_.active_gpu_ids();
+  if (active_gpu_ids.empty() && build_ctx_.num_gpus() > 1) {
+    throw sirius::internal_exception(
+      "configure_partition_consumers: a {}-GPU plan needs the admitted GPU ids to place partitions",
+      build_ctx_.num_gpus());
+  }
 
-  auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (!op) return;
-    if (op->type != op::SiriusPhysicalOperatorType::PARTITION) return;
-    auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
-    // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to its
-    // partition slot (inverse of task_creator's partition_idx -> GPU routing).
-    partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
-    // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
-    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
-          partition_op->get_downstream_consumer_op())) {
-      consumer->set_num_gpus(num_gpus);
+  // Every partition consumer gets the list: sizing consumers choose each exchange's placement
+  // from it, and every emitter then treats a missing placement as a bug instead of silently
+  // leaving its partitions unpinned.
+  auto set_ids = [&](op::sirius_physical_operator* op) {
+    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(op)) {
+      consumer->set_active_gpu_ids(active_gpu_ids);
     }
   };
   for (auto& pipe : scheduled_) {
     if (!pipe) continue;
+    for (auto op_ref : pipe->get_operators()) {
+      set_ids(&op_ref.get());
+    }
     auto sink   = pipe->get_sink();
     auto source = pipe->get_source();
-    if (sink) apply_to_op(sink.get());
-    if (source) apply_to_op(source.get());
+    if (sink) set_ids(sink.get());
+    if (source) set_ids(source.get());
+    if (sink && sink->type == op::SiriusPhysicalOperatorType::PARTITION) {
+      set_ids(sink->Cast<op::sirius_physical_partition>().get_downstream_consumer_op());
+    }
+  }
+  // Sub-operators that emit or receive through a wiring without being a pipeline boundary (build
+  // CONCATs, delim-join internals), resolved the way materialize_repository_wiring resolves them.
+  for (auto const& wiring : repository_wirings_) {
+    set_ids(wiring.source_op);
+    auto const& dest = wiring.dest_pipeline;
+    if (!dest) continue;
+    set_ids(dest->get_operators().empty() ? dest->get_sink().get()
+                                          : &dest->get_operators()[0].get());
   }
 }
 

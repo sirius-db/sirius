@@ -291,9 +291,9 @@ TEST_CASE("a cached device read retires its pin through the stream completion po
   // completion poll observes the stream ticket, releases the chunk pin, and
   // settles the cached-copy coordinator credit.
   rmm::cuda_stream stream;
-  rmm::device_buffer destination{read_size, stream.view()};
+  rmm::device_buffer destination{read_size, stream};
   auto read = fixture.datasource->device_read_async(
-    0, read_size, static_cast<std::uint8_t*>(destination.data()), stream.view());
+    0, read_size, static_cast<std::uint8_t*>(destination.data()), stream);
 
   REQUIRE(read.wait_for(2s) == std::future_status::ready);
   CHECK(read.get() == read_size);
@@ -353,7 +353,7 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   // Its prepared slice writes into the cache allocation.
   std::uint8_t first_destination{};
   auto first = fixture.datasource->device_read_async(
-    chunk_size, read_size, &first_destination, rmm::cuda_stream_default);
+    chunk_size, read_size, &first_destination, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   auto cache_load = fixture.context->reactor().take_next();
   REQUIRE(cache_load != nullptr);
   CHECK(cache_load->front().h_buffer.is_fragmented());
@@ -365,7 +365,10 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   std::uint8_t second_destination{};
   auto second_call                   = std::async(std::launch::async, [&] {
     return fixture.datasource->device_read_async(
-      chunk_size, read_size, &second_destination, rmm::cuda_stream_default);
+      chunk_size,
+      read_size,
+      &second_destination,
+      ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
   });
   auto const returned_without_loader = second_call.wait_for(100ms) == std::future_status::ready;
   CHECK(returned_without_loader);

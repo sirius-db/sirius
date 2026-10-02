@@ -62,7 +62,7 @@ liburing = "*"
 openssl = "*"
 libcurl = "*"
 pnpm = "*"
-python = "3.*"
+python = ">=3.10"
 pyarrow = ">=14"
 # Go toolchain (with cgo) to build the patched testcontainers-native bridge used
 # by the C++ S3 integration tests (fetched at configure time; see

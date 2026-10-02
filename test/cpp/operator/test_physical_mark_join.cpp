@@ -409,6 +409,10 @@ TEST_CASE("MARK join drains probe batches when its build pipeline emits no batch
   REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
   REQUIRE(hint->producer == f.hash_join->children[1].get());
 
+  // The upstream PARTITION normally installs this for an empty build side.
+  f.hash_join->set_placement(
+    std::make_shared<const partition_placement>(partition_placement::unpinned(1)));
+
   // The build finishes without ever publishing a batch. The join must switch to the probe
   // producer, then process each probe batch without trying to build a hash table.
   build_pipeline->finished = true;

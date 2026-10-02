@@ -87,20 +87,24 @@ configure_ci:
 set_duckdb_version:
 	@echo "DuckDB version is pinned by the submodule; skipping checkout of $(DUCKDB_GIT_VERSION)."
 
+# The C++ unit tests run through scripts/run_unit_tests.py, as in CI. Pass options through
+# UNITTEST_ARGS, e.g. `make test UNITTEST_ARGS="--steps shards -- --order rand"`.
+RUN_UNIT_TESTS = python3 scripts/run_unit_tests.py
+
 test: test_release
 
 test_release: release
-	./build/release/extension/sirius/test/cpp/sirius_unittest
+	$(RUN_UNIT_TESTS) --build-dir build/release $(UNITTEST_ARGS)
 
 test_debug: debug
-	./build/debug/extension/sirius/test/cpp/sirius_unittest
+	$(RUN_UNIT_TESTS) --build-dir build/debug $(UNITTEST_ARGS)
 
 test_reldebug: relwithdebinfo
-	./build/relwithdebinfo/extension/sirius/test/cpp/sirius_unittest
+	$(RUN_UNIT_TESTS) --build-dir build/relwithdebinfo $(UNITTEST_ARGS)
 
 test_ci-release: ci-release
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset ci-release --target $(TEST_BUILD_TARGET)
-	./build/ci-release/extension/sirius/test/cpp/sirius_unittest
+	$(RUN_UNIT_TESTS) --build-dir build/ci-release $(UNITTEST_ARGS)
 
 clean:
 	rm -rf build

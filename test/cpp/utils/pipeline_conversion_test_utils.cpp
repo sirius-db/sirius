@@ -253,8 +253,7 @@ void with_initialized_engine(duckdb::Connection& con,
       duckdb::make_uniq_base<op::sirius_physical_result_collector,
                              op::sirius_physical_materialized_collector>(*prepared, context);
 
-    sirius_interface iface(context);
-    sirius_engine engine(context, iface, *query_id);
+    sirius_engine engine(context, *query_id);
     engine.initialize(std::move(collector));
     consume(engine);
 
@@ -270,7 +269,7 @@ exec::logical_plan_source sql_plan_source(const std::string& query)
   return [query](duckdb::ClientContext& context) {
     optimizer_disable_guard guard(context);
     auto extracted = extract_logical_plan_sirius_order(context, query);
-    return std::move(extracted.logical_plan);
+    return exec::bound_plan{std::move(extracted.logical_plan), nullptr};
   };
 }
 
@@ -331,8 +330,7 @@ void with_initialized_streaming_fragment(
     }
     sink->children.push_back(std::move(sirius_plan));
 
-    sirius_interface iface(context);
-    sirius_engine engine(context, iface, window.query_id());
+    sirius_engine engine(context, window.query_id());
     // The fragment owns the plan; the engine borrows it. initialize() would take ownership and
     // destroy the sink with the engine, leaving nothing to pull from afterwards.
     engine.initialize_internal(*sink);

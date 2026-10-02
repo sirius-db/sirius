@@ -26,6 +26,7 @@ set(TEST_SOURCES
     test/cpp/event/test_query_event_publisher.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
+    test/cpp/exec/test_sirius_ffi_embedder.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -149,6 +150,7 @@ set(TEST_SOURCES
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp

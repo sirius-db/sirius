@@ -249,7 +249,7 @@ struct staged_chunks {
 
 staged_chunks stage_column_chunks(cudf::io::datasource& source,
                                   std::span<cudf::io::text::byte_range_info const> ranges,
-                                  rmm::cuda_stream_view stream)
+                                  ::cuda::stream_ref stream)
 {
   staged_chunks staged;
   staged.buffers.reserve(ranges.size());
@@ -287,7 +287,7 @@ cudf::io::parquet_reader_options filtered_options(std::vector<std::string> const
 /// Rows the single-file bulk route produces for @p options.
 cudf::size_type bulk_row_count(fs::path const& path,
                                cudf::io::parquet_reader_options const& options,
-                               rmm::cuda_stream_view stream)
+                               ::cuda::stream_ref stream)
 {
   auto source = cudf::io::datasource::create(path.string());
   auto footer = read_parquet_footer(*source);
