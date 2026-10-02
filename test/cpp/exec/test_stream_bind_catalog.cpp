@@ -232,3 +232,29 @@ TEST_CASE("stream_bind_catalog CAT-9: no catalog on the connection is an error",
   auto prepared = con.Prepare("SELECT * FROM sirius_stream_source(0)");
   REQUIRE(prepared->HasError());
 }
+
+// ============================================================================
+// CAT-10: a declared row count is the scan's cardinality estimate
+// ============================================================================
+
+TEST_CASE("stream_bind_catalog CAT-10: a declared row count reaches the optimizer",
+          "[stream_bind_catalog]")
+{
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  register_stream_source_function(*db.instance);
+
+  auto catalog = duckdb::make_shared_ptr<stream_bind_catalog>();
+  con.context->registered_state->Insert(stream_bind_catalog::kStateKey, catalog);
+
+  auto counted           = make_binding();
+  counted.estimated_rows = 1'000'000;
+  catalog->declare(0, std::move(counted));
+  catalog->declare(1, make_binding());
+
+  auto estimate = [&](const std::string& query) {
+    return con.ExtractPlan(query)->EstimateCardinality(*con.context);
+  };
+  REQUIRE(estimate("SELECT * FROM sirius_stream_source(0)") == 1'000'000);
+  REQUIRE(estimate("SELECT * FROM sirius_stream_source(1)") == 1);
+}

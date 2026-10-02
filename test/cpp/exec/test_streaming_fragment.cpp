@@ -185,7 +185,9 @@ TEST_CASE_METHOD(fragment_fixture,
     fragment.run();
 
     REQUIRE(fragment.output_batch_count(0) > 0);
+    REQUIRE(fragment.output_row_count(0) == kLeafRows);
     REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
+    REQUIRE(fragment.output_row_count(0) == 0);
 
     con->Rollback();
   } catch (...) {
@@ -1302,6 +1304,43 @@ TEST_CASE_METHOD(fragment_fixture,
     }
 
     REQUIRE(got == expected);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-15: a declared input row count is what the optimizer plans the stream scan with
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-15: a declared input row count reaches the optimizer",
+                 "[integration][streaming_fragment]")
+{
+  auto plan_sql = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+  duckdb::idx_t planned_rows = 0;
+
+  fragment_spec spec;
+  spec.plan_source = [&](duckdb::ClientContext& context) {
+    auto bound   = plan_sql(context);
+    planned_rows = bound.plan->EstimateCardinality(context);
+    return bound;
+  };
+  spec.inputs[0] = stream_input_spec{
+    {"a"},
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+    {0},
+    1'000'000};
+  spec.outputs = {1};
+
+  con->BeginTransaction();
+  try {
+    streaming_fragment fragment(*con->context, std::move(spec));
+    fragment.build();
+    REQUIRE(planned_rows == 1'000'000);
 
     con->Rollback();
   } catch (...) {
