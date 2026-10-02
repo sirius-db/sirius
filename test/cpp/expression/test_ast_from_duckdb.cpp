@@ -865,3 +865,25 @@ TEST_CASE("ast_from_duckdb - real Binder output translates to non-null trees",
   REQUIRE(saw_like);
   REQUIRE(saw_is_not_null);
 }
+
+TEST_CASE("ast_from_duckdb - case conversion functions translate", "[ast_from_duckdb][string_case]")
+{
+  auto const id = GENERATE(sirius::function_id::upper, sirius::function_id::lower);
+  auto expr     = duckdb::make_uniq<BoundFunctionExpression>(
+    LogicalType::VARCHAR,
+    ScalarFunction(std::string(sirius::to_duckdb_function_name(id)),
+                       {LogicalType::VARCHAR},
+                   LogicalType::VARCHAR,
+                   nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  expr->children.push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
+  auto out = sirius::ast::from_duckdb(*expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<function_call>());
+  auto const& function = out->get<function_call>();
+  REQUIRE(function.function() == id);
+  REQUIRE(function.arguments().size() == 1);
+  REQUIRE(function.return_type().id() == sirius::type_id::VARCHAR);
+  REQUIRE(out->cudf_ast_op_count() == 0);
+}
