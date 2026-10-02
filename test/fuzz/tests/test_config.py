@@ -10,17 +10,21 @@ from siriusfuzz.config import (
     ConfigError,
     FuzzConfig,
     load_config,
+    mode_overrides,
     schema_keys,
 )
 
 
-def present(data, dotted):
+MISSING = object()
+
+
+def lookup(data, dotted):
     cur = data
     for key in dotted.split("."):
         if not isinstance(cur, dict) or key not in cur:
-            return False
+            return MISSING
         cur = cur[key]
-    return True
+    return cur
 
 
 class ConfigTests(unittest.TestCase):
@@ -35,8 +39,46 @@ class ConfigTests(unittest.TestCase):
         # so every knob must be visible there.
         with open(DEFAULT_CONFIG, "rb") as fh:
             data = tomllib.load(fh)
-        missing = [key for key in schema_keys() if not present(data, key)]
+        missing = [key for key in schema_keys() if lookup(data, key) is MISSING]
         self.assertEqual(missing, [])
+
+    def test_gaps_mode_turns_every_support_switch_on(self):
+        default = load_config(None)
+        cfg = load_config(None, mode="gaps")
+        f = cfg.features
+        for switch in (
+            f.window_functions,
+            f.distinct,
+            f.grouping_sets,
+            f.full_join,
+            f.cross_join,
+            f.set_ops.union,
+            f.set_ops.except_,
+            f.set_ops.intersect,
+            f.subqueries.uncorrelated_scalar,
+            f.subqueries.uncorrelated_exists,
+            f.expressions.try_,
+            f.casts.temporal_numeric,
+        ):
+            self.assertTrue(switch)
+        self.assertEqual(f.aggregates.distinct, "on")
+        self.assertEqual(cfg.variants.per_query, 0)
+        # Correctness knobs, data shape and the CPU-vs-GPU oracle are untouched.
+        self.assertFalse(f.casts.to_varchar)
+        self.assertEqual(f.types, default.features.types)
+        self.assertEqual(cfg.oracle, default.oracle)
+        # Every preset names a real key and changes it from the shipped default.
+        keys = set(schema_keys())
+        for key, value in mode_overrides("gaps").items():
+            self.assertIn(key, keys)
+            self.assertNotEqual(lookup(default.to_dict(), key), value, key)
+        self.assertEqual(mode_overrides("correctness"), {})
+        # Explicit --set values still win over the mode's presets.
+        narrowed = load_config(None, ["features.window_functions=false"], mode="gaps")
+        self.assertFalse(narrowed.features.window_functions)
+        self.assertTrue(narrowed.features.distinct)
+        with self.assertRaises(ConfigError):
+            load_config(None, mode="frontier")
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ConfigError):

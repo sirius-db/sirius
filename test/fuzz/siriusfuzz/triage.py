@@ -59,6 +59,7 @@ FAILURES = {
     "gpu_internal_error",
     "gpu_oom",
     "plan_fallback",
+    "runtime_fallback",
 }
 
 

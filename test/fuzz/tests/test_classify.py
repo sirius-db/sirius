@@ -1,7 +1,12 @@
 import unittest
 
 from . import conftest_path  # noqa: F401
-from siriusfuzz.classify import Verdict, classify_gpu_error, normalize_reason
+from siriusfuzz.classify import (
+    Verdict,
+    classify_gpu_error,
+    narrows_gap,
+    normalize_reason,
+)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -18,6 +23,58 @@ class ClassifyTests(unittest.TestCase):
         )
         self.assertEqual(v, Verdict.GPU_ERROR)
         self.assertEqual(reason, "something odd")
+
+    def test_runtime_unsupported_is_a_gap(self):
+        for message, reason in (
+            (
+                "Invalid Error: Sirius GPU execution failed: Distinct aggregates not supported in GPU path yet",
+                "Distinct aggregates not supported in GPU path yet",
+            ),
+            (
+                "Invalid Error: Sirius GPU execution failed: sirius_physical_hash_join: unsupported join type: RIGHT_SEMI",
+                "sirius_physical_hash_join: unsupported join type: RIGHT_SEMI",
+            ),
+            (
+                "Not implemented Error: Sirius GPU execution failed: Range partitioning",
+                "Range partitioning",
+            ),
+        ):
+            v, got = classify_gpu_error(message)
+            self.assertEqual(v, Verdict.RUNTIME_FALLBACK, message)
+            self.assertEqual(got, reason)
+            self.assertTrue(v.is_gap())
+        self.assertTrue(Verdict.PLAN_FALLBACK.is_gap())
+        self.assertFalse(Verdict.GPU_ERROR.is_gap())
+
+    def test_narrows_gap(self):
+        kind = "Unsupported expression in projection (falling back to CPU): "
+        both = kind + 'regexp_matches(concat("a0"."c1", "a0"."c2"), \'x\')'
+        one = kind + 'regexp_matches("a0"."c1", \'x\')'
+        self.assertTrue(narrows_gap(both, one))
+        self.assertTrue(narrows_gap(one, kind + "regexp_matches('q', 'x')"))
+        self.assertFalse(narrows_gap(one, both), "the function set may not grow")
+        self.assertFalse(
+            narrows_gap(one, kind + 'upper("a0"."c1")'), "another function"
+        )
+        self.assertFalse(narrows_gap(one, kind + '"a0"."c1" + 1'), "no function left")
+        self.assertTrue(narrows_gap(kind + '"a0"."c1" + 1', kind + '"a0"."c2" + 2'))
+        self.assertFalse(
+            narrows_gap(
+                one,
+                "Unsupported filter predicate (falling back to CPU): "
+                + "regexp_matches('q', 'x')",
+            ),
+            "a different rejection kind",
+        )
+        self.assertTrue(
+            narrows_gap(
+                "Join type RIGHT_SEMI not supported",
+                "Join type RIGHT_SEMI not supported",
+            )
+        )
+        self.assertFalse(
+            narrows_gap("Join type RIGHT_SEMI not supported", "Window not supported")
+        )
 
     def test_internal_and_oom(self):
         v, _ = classify_gpu_error(

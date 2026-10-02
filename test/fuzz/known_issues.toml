@@ -8,4 +8,4 @@ pattern = "Distinct aggregates not supported in GPU path"
 sql_pattern = "count\\(DISTINCT"
 issue = "sirius-db/sirius#1218"
 note = "ungrouped COUNT(DISTINCT) is not supported by the GPU runtime (thrown by sirius_physical_ungrouped_aggregate)"
-verdicts = ["gpu_error"]
+verdicts = ["runtime_fallback"]

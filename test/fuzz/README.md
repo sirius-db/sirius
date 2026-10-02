@@ -23,6 +23,7 @@ disagreement as a replayable finding. It is a plain command-line tool; no AI age
 - [Verdicts](#verdicts)
 - [Running a campaign](#running-a-campaign)
 - [Configuration](#configuration)
+- [Finding unsupported features](#finding-unsupported-features)
 - [Saved evidence](#saved-evidence)
 - [Replaying a finding](#replaying-a-finding)
 - [Triage and issue drafts](#triage-and-issue-drafts)
@@ -76,6 +77,10 @@ pixi run -e duckdb-python fuzz run --seed 42 --duration 30m --workers 2
 # Steer generation toward specific features (others that are enabled can still appear)
 pixi run -e duckdb-python fuzz run --queries 100 \
   --set 'features.scalar_functions.enabled=["substring","like"]'
+
+# Find what Sirius does not run on the GPU yet: every generator feature on, each
+# fallback reduced to the smallest query that still falls back
+pixi run -e duckdb-python fuzz run --mode gaps --seed 42 --duration 30m
 ```
 
 Results land in `test/fuzz/out/run-<timestamp>-seed<seed>-<unique>/`; see
@@ -102,7 +107,7 @@ All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
 | Command | What it does | GPU? |
 |---------|--------------|------|
 | `doctor` | Verify build, config, interception and a GPU answer before a run | yes |
-| `run` | Generate, execute and compare queries; save findings | yes |
+| `run` | Generate, execute and compare queries; save findings. `--mode gaps` hunts unsupported features | yes |
 | `replay <finding-or-sql>` | Re-run one finding directory or your own `.sql` file | yes (`--cpu-only` for CPU) |
 | `replay-file <file.sql>` | Classify every `SELECT` in a file, each in its own supervised process | yes |
 | `triage <run-or-finding>...` | Re-validate findings, shrink them, write `REPORT.md` and issue drafts | yes |
@@ -154,7 +159,8 @@ Two implementation details worth knowing:
 | `known_issue` | matches an entry in `known_issues.toml`; counted, not failed | no |
 | `mismatch` | GPU rows differ from CPU rows | **yes** |
 | `variant_mismatch` | same query, one Sirius setting changed, different rows | **yes** |
-| `plan_fallback` | Sirius declined the plan: an enabled feature does not run on the GPU; the reason is recorded | **yes** |
+| `plan_fallback` | Sirius declined the plan; the reason is recorded. A *gap* | **yes** |
+| `runtime_fallback` | the GPU run raised an error that says the operation is not supported; with fallback enabled the query would have run on the CPU. A *gap* | **yes** |
 | `gpu_error` / `gpu_internal_error` / `gpu_oom` | the GPU run raised | **yes** |
 | `timeout` | the GPU run exceeded `oracle.query_timeout_seconds` | **yes** (hang candidate) |
 | `crash` | the worker process died during the query | **yes** |
@@ -216,6 +222,55 @@ feature, flip its flag to `true` there. `--set key.path=value` overrides any key
 `show-config` prints the effective result.
 
 `known_issues.toml` quarantines confirmed divergences by regex. Every entry carries an issue link.
+
+---
+
+## Finding unsupported features
+
+`fuzz run --mode gaps` answers a different question from the default run: not "does the GPU
+get the right answer" but "what does Sirius hand back to the CPU". It differs from the default
+`correctness` mode in three ways:
+
+- **Everything is generated.** Every feature switch the configuration keeps off because Sirius
+  does not run it yet (window functions, `DISTINCT`, grouping sets, `FULL`/`CROSS` joins,
+  `UNION`/`EXCEPT`/`INTERSECT`, uncorrelated subqueries, ungrouped `COUNT(DISTINCT)`, `TRY`,
+  temporal-numeric casts) is turned on, and setting variants are skipped. `--set` still applies
+  afterwards, so `--set features.window_functions=false` narrows the survey. `show-config
+  --mode gaps` prints the effective configuration.
+- **Fallbacks are reduced to the unsupported feature.** A `plan_fallback` or `runtime_fallback`
+  is shrunk like any other finding, but the reducer accepts a smaller query as long as it is
+  rejected for the same *kind* of reason, with the rejected expression's function set allowed
+  to shrink. Dropping a supported `concat` from an unsupported `regexp_matches(concat(..))`
+  therefore keeps going until only the function Sirius cannot translate is left.
+- **Gaps are the output, not a failure.** `--fail-on-findings` ignores gap verdicts in this
+  mode; mismatches, errors, hangs and crashes still fail the run and are reported as usual.
+
+The summary groups gaps by the reason their smallest reproducer reports, so rejections of
+different expressions around the same function merge into one line:
+
+```text
+gaps (3 unsupported features, 212 queries fell back to CPU); smallest query that still falls back, and its features:
+  [plan_fallback] x180  Window not supported
+      SELECT row_number() OVER (ORDER BY "a0"."k") AS c0 FROM "t1" AS "a0"
+      features: ColumnRef, Select, TableRef, Window(row_number)   findings: 000-plan_fallback-1f2e3d4c
+  [plan_fallback] x27   Unsupported expression in projection (falling back to CPU): regexp_matches("a0"."c2", 'a+')
+      SELECT regexp_matches("a0"."c2", 'a+') AS c0 FROM "t0" AS "a0"
+      features: ColumnRef, Func(regexp_matches), Literal, Select, TableRef   findings: 003-plan_fallback-9a8b7c6d, 011-plan_fallback-5e6f7a8b
+  [runtime_fallback] x5  Distinct aggregates not supported in GPU path yet
+      SELECT count(DISTINCT "a0"."c1") AS c0 FROM "t2" AS "a0"
+      features: Agg(count,distinct), ColumnRef, Select, TableRef   findings: 007-runtime_fallback-2b3c4d5e
+```
+
+`summary.json` carries the same table under `gaps`, with every contributing finding directory.
+Each finding keeps its own `reduced.sql` and `reduction.json` (which records the reduced query's
+reason), and replays like any other finding; the gap in a correctness run is the same evidence
+without the all-features generation. A query is reported for the first rejection Sirius hits, so
+a long run finds more than a short one; the "features emitted" line in the summary shows how much
+of the generator's surface a run covered.
+
+Other GPU errors (`gpu_error`, `gpu_internal_error`, `gpu_oom`) also fall back to the CPU in
+production, but their messages do not say "unsupported", so they stay findings to investigate
+rather than gaps to record.
 
 ---
 
