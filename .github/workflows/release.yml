@@ -38,7 +38,7 @@ jobs:
   manual-release:
     name: manual-release (${{ inputs.mode || 'pr-dry-run' }})
     if: github.repository == 'sirius-db/sirius'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     concurrency:
       # workflow_dispatch runs serialize by mode (real publishers to the same tag must queue
       # behind each other). pull_request dry-runs use the PR number instead of a shared
