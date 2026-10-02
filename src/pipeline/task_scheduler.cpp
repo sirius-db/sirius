@@ -27,6 +27,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "pipeline/task_submission.hpp"
 #include "planner/query.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -114,18 +115,9 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> input)
   // that query's queue drain already ran, and the task would then sit in the shared queue holding
   // raw repository pointers into a manager about to be erased.
   if (task) {
-    const auto query_id = sirius::make_query_id(index_keys_for(*task).query_id);
-    submission          = _query_lifecycle.try_begin_submission(query_id);
-    if (submission.status() == exec::query_submission_status::unknown) {
-      if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
-        if (auto handler = gpu_task->get_completion_handler()) {
-          handler->report_error("task_scheduler: query lifecycle registration is missing");
-        }
-      }
-      SIRIUS_LOG_ERROR("task_scheduler: refusing work for unknown query {}", query_id);
-    }
+    submission = begin_submission(
+      _query_lifecycle, *task, "task_scheduler: query lifecycle registration is missing");
     if (!submission) { return; }
-    task->retain_work(submission.take_work_lease());
   }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({

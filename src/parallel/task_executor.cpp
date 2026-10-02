@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "pipeline/task_submission.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <memory>
@@ -59,18 +60,9 @@ bool itask_executor::schedule(std::unique_ptr<itask> input)
     // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
     // drain for this query may already have passed. Refuse rather than re-arm work behind it.
 
-    const auto query_id = sirius::make_query_id(pipeline::index_keys_for(*task).query_id);
-    submission          = _query_lifecycle.try_begin_submission(query_id);
-    if (submission.status() == exec::query_submission_status::unknown) {
-      if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
-        if (auto handler = gpu_task->get_completion_handler()) {
-          handler->report_error("task_executor: query lifecycle registration is missing");
-        }
-      }
-      SIRIUS_LOG_ERROR("task_executor: refusing work for unknown query {}", query_id);
-    }
+    submission = pipeline::begin_submission(
+      _query_lifecycle, *task, "task_executor: query lifecycle registration is missing");
     if (!submission) { return false; }
-    task->retain_work(submission.take_work_lease());
 
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({

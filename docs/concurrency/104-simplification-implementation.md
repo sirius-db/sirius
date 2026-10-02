@@ -71,3 +71,26 @@ requiring an unset `SIRIUS_TEST_TPCH_DIR`. Re-running that case with the reposit
 Logs: `/tmp/simplification-3-build.log`, `/tmp/simplification-3-tests.log`, and
 `/tmp/simplification-3-pressure-tests.log`. This is regression coverage with the
 bundled fixture, not a throughput qualification.
+
+## 4. Share publication admission
+
+- Added a small `pipeline::begin_submission()` adapter used by creator, scheduler,
+  executor and spill-return paths. It returns the existing submission guard;
+  admission accounting remains in the lifecycle registry.
+- The task overload attaches a first work lease and preserves an existing lease
+  across handoffs. Callers keep ownership on refusal and declare their guard
+  before the owned task, so task destruction and callbacks precede guard release.
+  Queue ownership APIs are unchanged.
+- Unknown-ID completion lookup and diagnostics are shared outside the low-level
+  registry. Completion lookup is lazy, avoiding another creator-state lock on
+  accepted work. Logging is best effort, including destructor-driven spill return.
+- Spill-return fixtures now keep their registry alive through queued-task
+  destruction; first publication of an unleased standalone task also gets a lease.
+- Added regression coverage for lease preservation on handoff/refusal, destruction
+  during exception unwinding, and completion lookup only for unknown IDs.
+
+Validation: build and formatting/lint passed; 88 targeted cases passed with
+1,066 assertions, including the lifecycle watchdog subprocess scenarios.
+Logs: `/tmp/simplification-4-build.log`, `/tmp/simplification-4-tests.log`, and
+`/tmp/simplification-4-final-format.log`. Multi-GPU behavior remains unqualified
+on this single-GPU host.

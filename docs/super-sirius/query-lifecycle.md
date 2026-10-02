@@ -23,6 +23,12 @@ the guard's work claim into a request or task; the guard then accounts only for 
 Runtime components require a registry reference at construction, including standalone test
 fixtures. The registry must outlive their workers and queues; there is no ungated mode.
 
+`pipeline::begin_submission()` shares admission/unknown-ID diagnostics across creators,
+schedulers, executors and spill returns. Its task overload attaches the first work lease while
+preserving an existing one. The caller owns rejected tasks and declares its guard before the
+owned task so disposal (including callbacks) precedes publication release. Completion-handler
+lookup occurs only for an unknown ID, avoiding extra creator-state locking on accepted work.
+
 Creator requests keep their lease through hint traversal and the creation worker. Execution
 tasks keep theirs through scheduler routing, executor dispatch, retries and destruction. The
 GPU worker transfers the lease to its completion epilogue when it destroys the task before

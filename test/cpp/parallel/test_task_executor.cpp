@@ -17,12 +17,15 @@
 #include "catch.hpp"
 #include "exec/config.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/task_submission.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
 #include <chrono>
+#include <future>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 
 using namespace sirius::parallel;
@@ -58,6 +61,28 @@ class dummy_task : public itask {
     g->counter.fetch_add(1 + l->_id);
   }
 };
+
+namespace {
+class observing_task : public dummy_task {
+ public:
+  observing_task(sirius::exec::query_lifecycle_registry& registry, std::size_t& observed)
+    : dummy_task(1,
+                 std::make_unique<dummy_task_local_state>(1),
+                 std::make_shared<dummy_task_global_state>()),
+      registry_(registry),
+      observed_(observed)
+  {
+  }
+  ~observing_task() override
+  {
+    observed_ = registry_.activity(sirius::make_query_id(0)).submissions;
+  }
+
+ private:
+  sirius::exec::query_lifecycle_registry& registry_;
+  std::size_t& observed_;
+};
+}  // namespace
 
 /**
  * Minimal concrete executor for tests.
@@ -141,29 +166,88 @@ TEST_CASE("executor retains submission through rejected task destruction",
   dummy_task_executor executor(lifecycle, {1, "submission-test"});
   executor.interrupt_queue_for_test();
   std::size_t publishers_at_destruction = 99;
-  class observing_task : public dummy_task {
-   public:
-    observing_task(sirius::exec::query_lifecycle_registry& registry, std::size_t& observed)
-      : dummy_task(1,
-                   std::make_unique<dummy_task_local_state>(1),
-                   std::make_shared<dummy_task_global_state>()),
-        registry_(registry),
-        observed_(observed)
-    {
-    }
-    ~observing_task() override
-    {
-      observed_ = registry_.activity(sirius::make_query_id(0)).submissions;
-    }
 
-   private:
-    sirius::exec::query_lifecycle_registry& registry_;
-    std::size_t& observed_;
-  };
   executor.schedule(std::make_unique<observing_task>(lifecycle, publishers_at_destruction));
   REQUIRE(publishers_at_destruction == 1);
   REQUIRE(lifecycle.activity(q).submissions == 0);
   REQUIRE(lifecycle.activity(q).work == 0);
   lifecycle.quiesce_and_wait_for_submissions(q);
   lifecycle.close(q);
+}
+
+TEST_CASE("task submission retains the caller's lease on handoff and refusal",
+          "[task_executor][query_lifecycle_gate]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  sirius::exec::query_lifecycle_registry::submission_guard submission;
+  auto task = std::make_unique<dummy_task>(
+    1, std::make_unique<dummy_task_local_state>(1), std::make_shared<dummy_task_global_state>());
+  task->retain_work(lifecycle.try_acquire_work(q));
+  submission = sirius::pipeline::begin_submission(lifecycle, *task, "test submission");
+  REQUIRE(submission);
+  CHECK(lifecycle.activity(q).submissions == 1);
+  CHECK(lifecycle.activity(q).work == 1);
+  submission.finish();
+
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  submission = sirius::pipeline::begin_submission(lifecycle, *task, "test submission");
+  CHECK_FALSE(submission);
+  CHECK(lifecycle.activity(q).work == 1);
+  task.reset();
+  lifecycle.wait_for_work(q);
+  lifecycle.close(q);
+}
+
+TEST_CASE("task submission settles after task destruction during exception unwind",
+          "[task_executor][query_lifecycle_gate]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  std::size_t publishers_at_destruction = 99;
+  auto publish_and_throw                = [&] {
+    sirius::exec::query_lifecycle_registry::submission_guard submission;
+    auto task  = std::make_unique<observing_task>(lifecycle, publishers_at_destruction);
+    submission = sirius::pipeline::begin_submission(lifecycle, *task, "test submission");
+    REQUIRE(submission);
+    throw std::runtime_error("failure before queue publication");
+  };
+  REQUIRE_THROWS_AS(publish_and_throw(), std::runtime_error);
+  CHECK(publishers_at_destruction == 1);
+  CHECK(lifecycle.activity(q).submissions == 0);
+  CHECK(lifecycle.activity(q).work == 0);
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  lifecycle.close(q);
+}
+
+TEST_CASE("submission diagnostics resolve completion only for missing registration",
+          "[task_executor][query_lifecycle_gate]")
+{
+  sirius::exec::query_lifecycle_registry lifecycle;
+  auto const q = sirius::make_query_id(0);
+  lifecycle.open_query(q);
+  auto completion = std::make_shared<sirius::pipeline::completion_handler>();
+  auto result     = completion->get_awaitable();
+  int resolutions = 0;
+  auto resolve    = [&] {
+    ++resolutions;
+    return completion;
+  };
+  auto submission = sirius::pipeline::begin_submission(lifecycle, q, "test submission", resolve);
+  REQUIRE(submission);
+  CHECK(resolutions == 0);
+  submission.finish();
+  lifecycle.quiesce_and_wait_for_submissions(q);
+  submission = sirius::pipeline::begin_submission(lifecycle, q, "test submission", resolve);
+  CHECK_FALSE(submission);
+  CHECK(resolutions == 0);
+  CHECK_FALSE(completion->has_error());
+  lifecycle.close(q);
+  submission = sirius::pipeline::begin_submission(lifecycle, q, "test submission", resolve);
+  CHECK_FALSE(submission);
+  CHECK(resolutions == 1);
+  CHECK(result.wait_for(0ms) == std::future_status::ready);
+  REQUIRE_THROWS_AS(result.get(), std::runtime_error);
 }

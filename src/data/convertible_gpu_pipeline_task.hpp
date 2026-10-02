@@ -25,6 +25,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/task_submission.hpp"
 
 #include <cuda/stream>
 
@@ -97,22 +98,10 @@ class convertible_gpu_pipeline_task : public convertible_data {
     // Destroy a refused/unsubmitted task before releasing an admitted publisher on unwind.
     auto task = std::move(_task);
 
-    const auto query_id = sirius::make_query_id(sirius::pipeline::index_keys_for(*task).query_id);
-    submission          = _query_lifecycle.try_begin_submission(query_id);
-    if (submission.status() == sirius::exec::query_submission_status::unknown) {
-      try {
-        SIRIUS_LOG_ERROR("convertible_gpu_pipeline_task: refusing work for unknown query {}",
-                         query_id);
-      } catch (...) {
-        // Destructors must not throw while unwinding a failed query.
-      }
-      if (auto* gpu_task = dynamic_cast<sirius::pipeline::gpu_pipeline_task*>(task.get())) {
-        if (auto handler = gpu_task->get_completion_handler()) {
-          handler->report_error(
-            "convertible_gpu_pipeline_task: query lifecycle registration is missing");
-        }
-      }
-    }
+    submission = sirius::pipeline::begin_submission(
+      _query_lifecycle,
+      *task,
+      "convertible_gpu_pipeline_task: query lifecycle registration is missing");
     if (!submission) {
       return;  // query is tearing down or has already closed; do not resurrect its task
     }

@@ -22,6 +22,7 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
+#include "pipeline/task_submission.hpp"
 #include "planner/query.hpp"
 #include "planner/query_index.hpp"
 #include "sirius/exception.hpp"
@@ -496,16 +497,11 @@ void task_creator::report_if_dropped(bool pushed, sirius::query_id_t query_id) c
 sirius::exec::query_lifecycle_registry::submission_guard task_creator::begin_submission(
   sirius::query_id_t query_id) const
 {
-  auto submission = _query_lifecycle.try_begin_submission(query_id);
-  if (submission.status() == sirius::exec::query_submission_status::unknown) {
-    if (auto query_state = get_query_task_global_state(query_id);
-        query_state && query_state->completion_handler) {
-      query_state->completion_handler->report_error(
-        "task_creator: query lifecycle registration is missing");
-    }
-    SIRIUS_LOG_ERROR("task_creator: refusing work for unknown query {}", query_id);
-  }
-  return submission;
+  return pipeline::begin_submission(
+    _query_lifecycle, query_id, "task_creator: query lifecycle registration is missing", [&] {
+      auto state = get_query_task_global_state(query_id);
+      return state ? state->completion_handler : nullptr;
+    });
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
