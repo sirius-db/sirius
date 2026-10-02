@@ -40,6 +40,10 @@
 #include <thread>
 #include <vector>
 
+namespace sirius::io::cache {
+class prefetching_cache;
+}  // namespace sirius::io::cache
+
 namespace sirius {
 namespace parallel {
 
@@ -111,6 +115,22 @@ class downgrade_executor {
   void drain();
 
   /**
+   * @brief Quiesce the processing thread without tearing down the pool.
+   *
+   * Interrupts and joins the processing thread, drains in-flight pool work, and cancels
+   * any queued requests. After returning, no sweep can observe mutations to borrowed
+   * resources (notably @ref set_prefetching_cache). @ref resume relaunches the processing
+   * thread; the pair exists so a caller rebinding borrowed state during cache reset can
+   * stand between the two safely.
+   */
+  void pause();
+
+  /**
+   * @brief Reactivate the request queue and relaunch the processing thread after @ref pause.
+   */
+  void resume();
+
+  /**
    * @brief Get the memory space this executor is responsible for.
    */
   cucascade::memory::memory_space_id get_space_id() const { return _space_id; }
@@ -146,6 +166,18 @@ class downgrade_executor {
    */
   void set_pipeline_task_queue(
     sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue);
+
+  /**
+   * @brief Wire the process-wide prefetching cache in for HOST->DISK reclaim.
+   *
+   * When this executor is bound to a HOST memory space, the processing loop consults the
+   * cache twice per request: an @c idle sweep before repository/pipeline downgrades to skim
+   * chunks with no future demand, and a @c forced sweep afterwards if the byte target is
+   * still short. Non-HOST executors ignore this pointer.
+   *
+   * May be nullptr; must be called before @ref start().
+   */
+  void set_prefetching_cache(sirius::io::cache::prefetching_cache* cache);
 
   /**
    * @brief Asynchronously request a predicate-driven downgrade.
@@ -216,6 +248,9 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  // Non-owning. SiriusContext outlives this executor and destroys the cache after stop().
+  // Only consulted when this executor is bound to a HOST source tier.
+  sirius::io::cache::prefetching_cache* _prefetching_cache{nullptr};
 };
 
 }  // namespace parallel

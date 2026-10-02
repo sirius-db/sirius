@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -74,6 +75,19 @@ namespace sirius::io::cache {
     return s >= chunk_state::allocated && s != chunk_state::evicting;
   });
 }
+
+namespace eviction {
+/// Policy for @c prefetching_cache::evict.
+///
+/// @c idle mirrors the background eviction policy: only chunks with no pending future
+/// demand (tier 0) are reclaimed. Safe under normal memory pressure.
+///
+/// @c forced reclaims every chunk that is not currently pinned by an active reader,
+/// regardless of future demand. Used as a last-resort reclaim step (e.g. when the
+/// downgrade executor has exhausted repository/pipeline candidates and still owes
+/// the caller bytes).
+enum class mode { idle, forced };
+}  // namespace eviction
 
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
@@ -334,6 +348,20 @@ class prefetching_cache {
   [[nodiscard]] std::string summary() const;
 
   void prepare_for_query() noexcept;
+
+  /// Synchronously reclaim resident cache chunks back to the buffer pool.
+  ///
+  /// Sweeps @c _file_cache directly (independent of the async @c _eviction_queue) and
+  /// returns as soon as @p target_bytes worth of buffers have been freed, or every
+  /// evictable chunk has been visited.  Chunks currently pinned by a reader (@c
+  /// entry_state::in_use with pin_count > 0) are always skipped; @c mode::idle
+  /// additionally spares chunks that still have pending demand in the current query
+  /// epoch (tier > 0), while @c mode::forced ignores demand and only respects the
+  /// pin gate.
+  ///
+  /// @return bytes actually returned to the pool.
+  std::size_t evict(eviction::mode mode,
+                    std::size_t target_bytes = std::numeric_limits<std::size_t>::max());
 
   [[nodiscard]] uint32_t query_epoch() const noexcept
   {
