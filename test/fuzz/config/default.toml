@@ -7,8 +7,9 @@
 # here. Keys mirror siriusfuzz/config.py; unknown keys are rejected.
 #
 # `fuzz run --mode gaps` ignores the false feature flags, generates everything the
-# generator knows, and reduces each fallback to the smallest query that still falls
-# back: that is how to see what Sirius declines today.
+# generator knows, and reduces each runtime fallback to the smallest query that
+# passes the planner and still fails on the GPU: that is how to find checks worth
+# moving to plan time.
 
 [features]
 window_functions = false

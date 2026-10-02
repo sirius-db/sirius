@@ -29,7 +29,7 @@ from siriusfuzz.runner import (
     Evaluator,
     Orchestrator,
     OrchestratorOptions,
-    first_of_signature,
+    wants_reduction,
 )
 from siriusfuzz.session import RunResult, Session
 from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem, TableRef
@@ -245,11 +245,28 @@ class EvaluatorTests(unittest.TestCase):
             dataset="d1",
             reason="Unsupported expression: f(y)",
         )
-        self.assertTrue(first_of_signature(error, seen))
-        self.assertFalse(first_of_signature(same_reason, seen))
+        self.assertTrue(wants_reduction(error, "correctness", seen))
+        self.assertFalse(wants_reduction(same_reason, "correctness", seen))
         mismatch = QueryRecord(0, "d0", 1, "SELECT 1", "mismatch", reason="1 vs 2")
-        self.assertTrue(first_of_signature(mismatch, seen))
-        self.assertTrue(first_of_signature(replace(mismatch, sql="SELECT 2"), seen))
+        self.assertTrue(wants_reduction(mismatch, "correctness", seen))
+        self.assertTrue(
+            wants_reduction(replace(mismatch, sql="SELECT 2"), "correctness", seen)
+        )
+        self.assertFalse(
+            wants_reduction(replace(mismatch, verdict="ok"), "gaps", set())
+        )
+
+    def test_gaps_mode_reduces_runtime_but_not_plan_fallbacks(self):
+        plan = QueryRecord(0, "d0", 1, "SELECT 1", "plan_fallback", reason="Window")
+        runtime = replace(plan, verdict="runtime_fallback", reason="x not supported")
+        self.assertFalse(wants_reduction(plan, "gaps", set()))
+        self.assertTrue(wants_reduction(plan, "correctness", set()))
+        seen = set()
+        self.assertTrue(wants_reduction(runtime, "gaps", seen))
+        # Runtime fallbacks dedup by reason, like plan rejections and errors.
+        again = replace(runtime, sql="SELECT 2", labels=["Select(group_by)"])
+        self.assertFalse(wants_reduction(again, "gaps", seen))
+        self.assertEqual(signature(runtime), signature(again))
 
     def test_variant_mismatch(self):
         rec, _ = evaluate(gpu_variant_wrong, **{"variants.per_query": "1"})
@@ -594,8 +611,12 @@ class ReportTests(unittest.TestCase):
             summary = runner.report.finish()
             self.assertEqual(summary["counts"], {"plan_fallback": 1})
             self.assertEqual(len(summary["findings"]), 1)
-            self.assertEqual(summary["gaps"][0]["reason"], "Window not supported")
-            self.assertEqual(summary["gaps"][0]["sql"], "SELECT 1")
+            self.assertEqual(summary["gaps"]["runtime"], [])
+            self.assertEqual(
+                summary["gaps"]["plan"][0]["reason"], "Window not supported"
+            )
+            self.assertEqual(summary["gaps"]["plan"][0]["sql"], "SELECT 1")
+            self.assertEqual(runner.opts.mode, summary["mode"])
             return summary
 
         for mode, exit_code in (("correctness", 1), ("gaps", 0)):
@@ -618,8 +639,9 @@ class ReportTests(unittest.TestCase):
     def test_summary_groups_gaps_by_their_reduced_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Report(pathlib.Path(tmp), load_config(None), [], 0, mode="gaps")
-            # Two rejections of different expressions around the same function, plus
-            # one unrelated plan rejection and one mismatch.
+            # Two rejections of different expressions around the same function, one
+            # unrelated plan rejection, two runtime fallbacks with one reason but
+            # different shapes, and a mismatch.
             records = []
             for expression, sql in (
                 (
@@ -637,9 +659,25 @@ class ReportTests(unittest.TestCase):
                 records.append(rec)
             other, _ = evaluate(gpu_plan_fallback, sql="SELECT w() OVER () FROM t")
             report.add(other)
+            for sql, seconds, labels in (
+                (
+                    "SELECT count(DISTINCT c1) FROM t",
+                    0.5,
+                    ["Agg(count,distinct)", "Select"],
+                ),
+                (
+                    "SELECT count(DISTINCT c2) FROM t WHERE k > 1",
+                    0.25,
+                    ["Agg(count,distinct)", "Compare(>)", "Select"],
+                ),
+            ):
+                runtime, _ = evaluate(gpu_count_distinct_error, sql=sql)
+                runtime.elapsed_gpu = seconds
+                runtime.labels = labels
+                report.add(runtime)
             wrong, _ = evaluate(gpu_wrong, sql="SELECT c1 FROM t")
             report.add(wrong)
-            self.assertEqual(len(report.findings), 4)
+            self.assertEqual(len(report.findings), 5)
             for rec, reduced in zip(
                 records, ("SELECT f(c1) FROM t", "SELECT f(c1) FROM t_2")
             ):
@@ -650,18 +688,34 @@ class ReportTests(unittest.TestCase):
                 )
                 report.add_reduction(rec)
             summary = report.finish()
-            gaps = summary["gaps"]
-            self.assertEqual([g["count"] for g in gaps], [2, 1])
-            self.assertEqual(gaps[0]["sql"], "SELECT f(c1) FROM t")
-            self.assertEqual(gaps[0]["labels"], ["Func(regexp_matches)", "Select"])
-            self.assertEqual(len(gaps[0]["findings"]), 2)
-            self.assertEqual(gaps[1]["reason"], "Window not supported")
+            plan = summary["gaps"]["plan"]
+            self.assertEqual([g["count"] for g in plan], [2, 1])
+            self.assertEqual(plan[0]["sql"], "SELECT f(c1) FROM t")
+            self.assertEqual(plan[0]["labels"], ["Func(regexp_matches)", "Select"])
+            self.assertEqual(len(plan[0]["findings"]), 2)
+            self.assertTrue(plan[0]["reduced"])
+            self.assertEqual(plan[1]["reason"], "Window not supported")
+            self.assertFalse(plan[1]["reduced"])
+            runtime = summary["gaps"]["runtime"]
+            self.assertEqual(len(runtime), 1)
+            self.assertEqual(runtime[0]["count"], 2)
+            self.assertAlmostEqual(runtime[0]["gpu_seconds"], 0.75)
+            self.assertEqual(runtime[0]["sql"], "SELECT count(DISTINCT c1) FROM t")
             text = report.render_summary(summary)
             self.assertIn(
-                "gaps (2 unsupported features, 3 queries fell back to CPU)", text
+                "runtime fallbacks (1 reason, 2 queries, 0.8s of GPU work thrown away)",
+                text,
             )
+            self.assertIn("   0.8s  Distinct aggregates not supported", text)
+            self.assertIn("plan-time fallbacks (2 reasons, 3 queries):", text)
+            self.assertLess(
+                text.index("runtime fallbacks ("), text.index("plan-time fallbacks (")
+            )
+            # A reduced plan group shows its smallest query; an unreduced one only
+            # its normalized reason.
             self.assertIn("SELECT f(c1) FROM t\n", text)
             self.assertIn("features: Func(regexp_matches), Select", text)
+            self.assertNotIn("SELECT w() OVER ()", text)
             # The mismatch is listed as a finding; the gaps are not listed twice.
             self.assertIn("findings (1 unique):", text)
             self.assertEqual(text.count("Window not supported"), 1)
