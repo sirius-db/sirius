@@ -19,6 +19,9 @@ target_include_directories(
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB
                       Catch2::Catch2)
 
+# Vendored Substrait protobuf must beat conda protobuf: sirius_extension
+# compiles the generated .pb.cc against these headers, so a test that includes
+# plan.pb.h has to see the same ones (ODR).
 target_include_directories(
   sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
                                  ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)

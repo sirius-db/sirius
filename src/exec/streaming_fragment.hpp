@@ -118,6 +118,11 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Push one batch into input `id`. Legal between build() and run(); does not close a sender.
+  /// @return false when the input had already ended.
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
+  bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 

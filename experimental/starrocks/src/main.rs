@@ -8,8 +8,9 @@ use sirius_starrocks_cn::SiriusEngine;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
+    HeartbeatServer, LocalExchange, NixlMdHandler, SharedHeartbeatState, SiriusComputeNodeService,
+    StagingLeaseHandler, register_node, report_to_frontend_once, start_backend_server,
     start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -43,6 +44,28 @@ struct Args {
     /// Sirius engine bring-up settings.
     #[command(flatten, next_help_heading = "Engine")]
     engine: EngineConfig,
+
+    /// All-to-all NIXL bandwidth benchmark (no FE).
+    #[command(flatten, next_help_heading = "Bench")]
+    bench: BenchConfig,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+/// All-to-all NIXL bandwidth benchmark against one peer CN, without an FE. When
+/// `--bench-a2a-bytes` is set, the CN serves brpc, runs the benchmark, prints the result, exits.
+struct BenchConfig {
+    /// Bytes per GPU per round (split across the two workers), e.g. 2048000000.
+    #[arg(long)]
+    bench_a2a_bytes: Option<u64>,
+    /// Peer brpc endpoint `host:port`.
+    #[arg(long)]
+    bench_peer: Option<String>,
+    /// Bytes per packed frame (one NIXL WRITE).
+    #[arg(long, default_value_t = 15 << 20)]
+    bench_chunk_bytes: u64,
+    /// Timed rounds after one warm-up.
+    #[arg(long, default_value_t = 4)]
+    bench_rounds: u32,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -69,14 +92,72 @@ impl Args {
         // before FE can route work here); otherwise it is a stub. The handle is held for the
         // process lifetime and torn down after the servers stop, below.
         #[cfg(feature = "sirius-engine")]
-        let executor: Arc<dyn FragmentExecutor> = Arc::new(
+        let engine = Arc::new(
             SiriusEngine::start(self.engine.sirius_config.clone()).map_err(|err| anyhow!(err))?,
         );
+        #[cfg(feature = "sirius-engine")]
+        let executor: Arc<dyn FragmentExecutor> = engine.clone();
         #[cfg(not(feature = "sirius-engine"))]
         let executor: Arc<dyn FragmentExecutor> = {
             warn_engine_disabled(&self.engine);
             Arc::new(StubExecutor)
         };
+
+        let exchange = Arc::new(LocalExchange::default());
+        let identity = ExchangeIdentity {
+            host: self.compute_node.advertise_host.to_string(),
+            brpc_port: self.compute_node.brpc_port,
+            http_port: self.compute_node.http_port,
+        };
+
+        #[cfg(feature = "nixl-transport")]
+        let transport =
+            {
+                let arena = engine.staging_arena().map_err(|err| anyhow!(err))?.ok_or_else(|| {
+                anyhow!(
+                    "SIRIUS_EXCHANGE_STAGING_BYTES is required for the nixl hop (set it before \
+                     starting this CN, e.g. 1073741824 for 1GiB)"
+                )
+            })?;
+                let agent_name = format!(
+                    "{}:{}",
+                    self.compute_node.advertise_host, self.compute_node.brpc_port
+                );
+                Some(Arc::new(
+                    sirius_starrocks_cn::NixlTransport::start(agent_name, arena)
+                        .map_err(|err| anyhow!(err))?,
+                ))
+            };
+        #[cfg(not(feature = "nixl-transport"))]
+        let transport = None;
+
+        let service = SiriusComputeNodeService::with_executor_and_exchange(
+            executor.clone(),
+            exchange.clone(),
+            identity,
+            transport.clone(),
+        );
+
+        #[cfg(feature = "nixl-transport")]
+        let md: Option<Arc<dyn NixlMdHandler>> = transport
+            .as_ref()
+            .map(|handle| Arc::clone(handle) as Arc<dyn NixlMdHandler>);
+        #[cfg(not(feature = "nixl-transport"))]
+        let md: Option<Arc<dyn NixlMdHandler>> = None;
+        let leases: Option<Arc<dyn StagingLeaseHandler>> = Some(Arc::new(executor.clone()));
+        let service = service.with_nixl_control(md, leases);
+
+        if let Some(bytes) = self.bench.bench_a2a_bytes {
+            return run_bench_a2a(
+                &self.bench,
+                bytes,
+                &self.compute_node,
+                service,
+                transport,
+                executor,
+            )
+            .await;
+        }
 
         let state = SharedHeartbeatState::new();
 
@@ -90,7 +171,7 @@ impl Args {
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone())?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node, service)?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -114,14 +195,60 @@ impl Args {
         .wait_until_shutdown()
         .await;
 
-        // The servers have stopped by the time `wait_until_shutdown` returns, so no in-flight RPC
-        // can touch the engine. Drop the executor last for an ordered teardown — the engine closes
-        // its thread and tears down the context (joined) here.
+        // BRPC has stopped, so no in-flight hop can touch the agent or engine.
+        #[cfg(feature = "nixl-transport")]
+        {
+            info!("tearing down nixl transport");
+            drop(transport);
+        }
         #[cfg(feature = "sirius-engine")]
         info!("tearing down Sirius engine");
         drop(executor);
         result
     }
+}
+
+/// Serves brpc (Md, Lease, Packed from the peer), runs the all-to-all bench, prints one line.
+async fn run_bench_a2a(
+    bench: &BenchConfig,
+    bytes: u64,
+    compute_node: &ComputeNodeConfig,
+    service: SiriusComputeNodeService,
+    transport: Option<Arc<sirius_starrocks_cn::NixlTransport>>,
+    executor: Arc<dyn FragmentExecutor>,
+) -> Result<()> {
+    let peer_text = bench
+        .bench_peer
+        .clone()
+        .ok_or_else(|| anyhow!("--bench-a2a-bytes needs --bench-peer host:port"))?;
+    let peer = std::net::ToSocketAddrs::to_socket_addrs(peer_text.as_str())?
+        .next()
+        .ok_or_else(|| anyhow!("cannot resolve --bench-peer {peer_text}"))?;
+    let transport =
+        transport.ok_or_else(|| anyhow!("--bench-a2a-bytes needs the nixl-transport feature"))?;
+    let brpc_runtime = BrpcRuntime::start(compute_node, service)?;
+    let config = sirius_starrocks_cn::BenchA2a {
+        peer,
+        peer_agent_name: peer_text,
+        bytes,
+        chunk: bench.bench_chunk_bytes,
+        rounds: bench.bench_rounds,
+    };
+    #[cfg(feature = "nixl-transport")]
+    let outcome = tokio::task::spawn_blocking(move || config.run(transport, executor))
+        .await
+        .map_err(|err| anyhow!("bench task failed: {err}"))?;
+    #[cfg(not(feature = "nixl-transport"))]
+    let outcome: std::result::Result<String, String> = {
+        let _ = (config, transport, executor);
+        Err("built without nixl-transport".to_string())
+    };
+    brpc_runtime.shutdown.cancel();
+    let _ = brpc_runtime.join.await;
+    let line = outcome.map_err(|err| anyhow!(err))?;
+    println!("{line}");
+    info!("{line}");
+    Ok(())
 }
 
 /// Warns when an engine config is supplied but the engine was compiled out, so the flag is
@@ -261,12 +388,8 @@ struct BrpcRuntime {
 }
 
 impl BrpcRuntime {
-    /// Binds the BRPC listener and starts serving it on a dedicated runtime, dispatching fragments
-    /// to `executor`.
-    fn start(
-        compute_node: &ComputeNodeConfig,
-        executor: Arc<dyn FragmentExecutor>,
-    ) -> Result<Self> {
+    /// Binds the BRPC listener and starts serving it on a dedicated runtime.
+    fn start(compute_node: &ComputeNodeConfig, service: SiriusComputeNodeService) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
@@ -276,7 +399,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor)
+                BrpcServer::with_service(service)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

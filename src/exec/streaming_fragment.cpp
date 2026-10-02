@@ -429,6 +429,12 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
   return moved;
 }
 
+bool streaming_fragment::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
+{
+  require_built("push()");
+  return _session.push(id, std::move(batch));
+}
+
 void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 {
   require_built("close_input()");
