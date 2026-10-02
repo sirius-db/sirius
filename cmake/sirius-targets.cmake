@@ -45,7 +45,7 @@ if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_sirius_cuda_link_script
       "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld")
   set(_sirius_cuda_link_interface
-      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/cmake/sirius/sirius-cuda-fatbin.ld>"
+      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_DATADIR}/sirius/sirius-cuda-fatbin.ld>"
   )
   foreach(_target sirius_core sirius_extension)
     if(NOT TARGET ${_target})
@@ -104,9 +104,10 @@ foreach(_target sirius_objects sirius_core sirius_extension
   if(NOT TARGET ${_target})
     continue()
   endif()
-  set(_link_scope "")
-  if(_target STREQUAL "sirius_shared")
-    set(_link_scope PRIVATE)
+  set(_link_scope PRIVATE)
+  if(_target STREQUAL "sirius_extension" OR _target STREQUAL
+                                            "sirius_loadable_extension")
+    set(_link_scope "")
   endif()
   set_target_properties(
     ${_target}
@@ -178,6 +179,10 @@ foreach(_target sirius_objects sirius_core sirius_extension
 
 endforeach()
 
+# Internal tests include engine headers; installed consumers use the public API.
+target_link_libraries(sirius_core
+                      PUBLIC "$<BUILD_INTERFACE:${SIRIUS_LINK_LIBRARIES}>")
+
 # `sirius_core` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
 # perform a final link. Carry the concrete Rust archive as a transitive
 # WHOLE_ARCHIVE item instead; DuckDB and every other final consumer then retain
@@ -186,7 +191,11 @@ foreach(_target sirius_core sirius_extension)
   if(NOT TARGET ${_target})
     continue()
   endif()
-  target_link_libraries(${_target}
+  set(_link_scope PRIVATE)
+  if(_target STREQUAL "sirius_extension")
+    set(_link_scope "")
+  endif()
+  target_link_libraries(${_target} ${_link_scope}
                         "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
 endforeach()
 
@@ -240,42 +249,46 @@ target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
 # discovers the Sirius headers (repo + conda) and links the libsirius artifact
 # this build produces under build/<preset>/; see rust/crates/sirius-sys.
 
-# cucascade upstream PRs #126/#128/#130 moved cucascade to static-CUDA linkage
-# and pulled the NVML *static stub* (libnvidia-ml.a) into libcucascade.a via the
-# `CUDA::nvml_static` imported target. Upstream's
-# `LINKER:--exclude-libs,libnvidia-ml` workaround (PR #130) keeps cucascade's
-# own tests happy by hiding the bundled stub symbols from the dynamic export
-# table (NVIDIA bug 6174166: libnvidia-ml.so dlsyms into the host process and
-# recurses into the stub). For sirius's larger transitive graph, hiding the
-# symbols segfaults at runtime — DuckDB/RMM call nvml directly before nvmlInit's
-# jump-table patch fires — while leaving them visible deadlocks in stubSpinLock
-# when the real driver loads.
-#
-# The robust fix for sirius: override CUDA::nvml_static's IMPORTED location to
-# point at the *shared* stub (libnvidia-ml.so) in the same pixi env. The shared
-# stub uses normal dynamic linking via ld.so, which resolves to the real
-# libnvidia-ml.so.1 at runtime, matching the working Phase-24 configuration.
-# This bypasses both failure modes (no stub symbols bundled, no dynamic-export
-# conflict).
-if(TARGET CUDA::nvml_static)
-  get_target_property(_nvml_static_loc CUDA::nvml_static IMPORTED_LOCATION)
-  if(_nvml_static_loc AND _nvml_static_loc MATCHES "libnvidia-ml\\.a$")
-    string(REGEX REPLACE "libnvidia-ml\\.a$" "libnvidia-ml.so" _nvml_shared_loc
-                         "${_nvml_static_loc}")
-    if(EXISTS "${_nvml_shared_loc}")
-      set_target_properties(
-        CUDA::nvml_static
-        PROPERTIES IMPORTED_LOCATION "${_nvml_shared_loc}"
-                   IMPORTED_LOCATION_RELEASE "${_nvml_shared_loc}")
-      message(
-        STATUS
-          "Sirius: redirected CUDA::nvml_static from ${_nvml_static_loc} to ${_nvml_shared_loc}"
-      )
-    endif()
+# NVML's static stub cannot be embedded safely; the real library is supplied by
+# the NVIDIA driver. Keep this requirement in the exported support target.
+foreach(property LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+  get_target_property(nvml_links cucascade_topology_discovery_static
+                      ${property})
+  if(nvml_links)
+    string(REPLACE "CUDA::nvml_static" "CUDA::nvml" nvml_links "${nvml_links}")
+    set_property(TARGET cucascade_topology_discovery_static
+                 PROPERTY ${property} "${nvml_links}")
   endif()
+endforeach()
+
+if(NOT SIRIUS_BUILD_SHARED)
+  set_target_properties(sirius_shared PROPERTIES EXCLUDE_FROM_ALL ON)
+endif()
+add_custom_target(sirius_library ALL)
+if(SIRIUS_BUILD_SHARED)
+  add_dependencies(sirius_library sirius_shared)
+endif()
+if(SIRIUS_BUILD_STATIC)
+  add_dependencies(sirius_library sirius_core)
 endif()
 
-add_custom_target(sirius_library ALL DEPENDS sirius_shared)
+if(SIRIUS_BUILD_STATIC)
+  add_library(sirius::sirius_static ALIAS sirius_core)
+  set_target_properties(sirius_core PROPERTIES OUTPUT_NAME sirius EXPORT_NAME
+                                                                  sirius_static)
+  target_link_libraries(
+    sirius_core
+    PRIVATE
+      duckdb_static
+      core_functions_extension
+      parquet_extension
+      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
+  )
+  target_compile_features(sirius_core PUBLIC cxx_std_20)
+  target_link_options(
+    sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
+    "LINKER:--allow-multiple-definition")
+endif()
 
 if(NOT PROJECT_IS_TOP_LEVEL)
   target_link_options(sirius_loadable_extension PRIVATE
