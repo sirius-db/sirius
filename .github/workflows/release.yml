@@ -182,11 +182,11 @@ jobs:
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
             # Target is older than, or has diverged from, what's currently live. Only reachable
-            # via workflow_run (a manually re-run old Distribution build, or a race with a newer
-            # publish that already landed) - manual dispatches always resolve to the live
-            # origin/main HEAD (see the "Resolve target SHA" step above), which - since the
-            # published latest tag always points at some earlier commit on main - can never be
-            # older than that tag. Skip, don't error: expected no-op, not a failure.
+            # via workflow_run - e.g. a manually re-run old Distribution build, or a race with a
+            # newer publish that already landed. Manual `mode: latest` dispatches can't hit this
+            # branch: they always resolve to live origin/main HEAD (see the "Resolve target SHA"
+            # step above), which can never be older than the already-published latest tag.
+            # Skip, don't error: expected no-op, not a failure.
             echo "::warning::Target ${TARGET_SHA} is not newer than the currently-published latest (${current_sha}). Skipping publish."
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi

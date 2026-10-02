@@ -40,15 +40,15 @@ manually re-run old `Distribution` build to never regress `latest` backward.
   builds can take over an hour, this is expected if you dispatch right after a merge.
 - **A dispatch 403s with "Resource not accessible by integration"**: the `SIRIUS_RELEASE_TOKEN`
   repo secret (a fine-grained PAT, `Contents: Read and write` only) is missing, expired, or scoped
-  incorrectly. The org's default Actions permissions are read-only with no per-repo override on
-  this plan, so this token is required, `GITHUB_TOKEN` alone isn't sufficient for the
-  release-mutating steps.
+  incorrectly. The default `GITHUB_TOKEN` doesn't have write access to Releases in this repo, so
+  `SIRIUS_RELEASE_TOKEN` is required for the release-mutating steps. The token for this secret is
+  managed by the `siriusdbbot` GitHub user.
 - **A dispatch or the `pull_request` dry-run skips/fails with no clear reason**: check the job's
   `if:` condition in the Actions log, for `workflow_run` events specifically, only a successful,
   `push`-triggered `Distribution` run on `main` actually publishes, everything else is a
   deliberate no-op.
 
-## First-time setup note
+## Changelog fallback behavior
 
 The `latest` changelog uses `stable..<sha>` when a `stable` tag exists, and falls back to the
 last 50 commits of the entire repo history when it doesn't. If `stable` is ever deleted, promote
