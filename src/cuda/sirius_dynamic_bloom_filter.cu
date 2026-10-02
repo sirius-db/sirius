@@ -19,7 +19,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <cuco/bloom_filter.cuh>
-#include <cuco/bloom_filter_policies.cuh>
+#include <cuco/bloom_filter_policy.cuh>
 #include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
