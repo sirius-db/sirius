@@ -19,6 +19,8 @@
 
 #include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
+#include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
+#include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
@@ -33,16 +35,20 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/exchange_direct.hpp"                        // sirius::exec::direct_exchange
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
-#include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "log/logging.hpp"                // SIRIUS_LOG_INFO
-#include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "exec/stream_plan_bindings.hpp"    // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"      // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"               // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"      // sirius::from_duckdb
+#include "log/logging.hpp"                  // SIRIUS_LOG_INFO
+#include "memory/slab_memory_resource.hpp"  // sirius::memory::find_slab
+#include "parquet_extension.hpp"            // duckdb::ParquetExtension
 #include "sirius/ffi.hpp"
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
+
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -96,6 +102,30 @@ double elapsed_ms(std::chrono::steady_clock::time_point since)
 {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
     .count();
+}
+
+void check_declared_schema(const sirius::exec::stream_input_spec& declared,
+                           const cudf::table_view& view,
+                           std::uint64_t stream_id,
+                           const char* what)
+{
+  if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    throw sirius::invalid_input_exception(
+      std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " carries " +
+      std::to_string(view.num_columns()) + " columns but the stream declares " +
+      std::to_string(declared.types.size()));
+  }
+  for (std::size_t i = 0; i < declared.types.size(); ++i) {
+    const auto expected = sirius::get_cudf_type(declared.types[i]);
+    const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+    if (actual != expected) {
+      throw sirius::invalid_input_exception(
+        std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " column " +
+        std::to_string(i) + " (" + declared.names[i] + ") is declared " +
+        declared.types[i].to_string() + " (" + cudf::type_to_name(expected) + ") but carries " +
+        cudf::type_to_name(actual));
+    }
+  }
 }
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
@@ -159,6 +189,23 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   // Serializes transactions on `conn`; see in_transaction().
   std::mutex conn_mutex;
+  // Shared with every DirectExchange handle, which may outlive this Context.
+  std::shared_ptr<sirius::exec::direct_exchange> exchange;
+
+  // Frees the exchange's buffers while the memory space they come from still exists.
+  ~Impl()
+  {
+    if (exchange) { exchange->close(); }
+  }
+
+  sirius::exec::direct_exchange& require_exchange() const
+  {
+    if (!exchange) {
+      throw sirius::invalid_input_exception(
+        "Fragment: direct exchange requires a single GPU memory space with allocator: slab");
+    }
+    return *exchange;
+  }
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -166,6 +213,15 @@ struct Context::Impl {
     sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
+    auto& memory    = context->get_memory_manager();
+    auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    if (gpus.size() == 1) {
+      if (auto slab = sirius::memory::find_slab(*gpus.front())) {
+        exchange = std::make_shared<sirius::exec::direct_exchange>(
+          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()),
+          std::move(*slab));
+      }
+    }
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
@@ -268,6 +324,37 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
 }
+
+std::unique_ptr<DirectExchange> Context::direct_exchange() const
+{
+  if (!impl_->exchange) { return nullptr; }
+  return std::make_unique<DirectExchange>(impl_->exchange);
+}
+
+DirectExchange::DirectExchange(std::shared_ptr<sirius::exec::direct_exchange> exchange)
+  : exchange_(std::move(exchange))
+{
+}
+
+int DirectExchange::device() const noexcept { return exchange_->region().device; }
+
+std::uintptr_t DirectExchange::region_base() const noexcept { return exchange_->region().base; }
+
+std::uint64_t DirectExchange::region_len() const noexcept { return exchange_->region().len; }
+
+std::unique_ptr<std::vector<std::uint64_t>> DirectExchange::allocate(std::uintptr_t layout_addr,
+                                                                     std::size_t layout_len,
+                                                                     std::uint64_t& token) const
+{
+  auto [allocated, dst] =
+    exchange_->allocate({reinterpret_cast<const std::uint8_t*>(layout_addr), layout_len});
+  token = allocated;
+  return std::make_unique<std::vector<std::uint64_t>>(std::move(dst));
+}
+
+void DirectExchange::release(std::uint64_t token) const { exchange_->release(token); }
+
+std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
 
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
@@ -459,6 +546,40 @@ std::size_t Fragment::relay_from(Fragment& source,
   }
   return impl_->fragment->relay_from(
     *source.impl_->fragment, source_stream_id, input_stream_id, sender_id);
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_direct(std::uint64_t stream_id,
+                                                                   std::uint64_t& token,
+                                                                   std::uint64_t& rows,
+                                                                   std::vector<std::uint64_t>& src)
+{
+  impl_->require_built("export_direct()");
+  auto& exchange = impl_->ctx.require_exchange();
+  while (auto batch = impl_->fragment->pull(stream_id)) {
+    if (auto exported = exchange.export_batch(std::move(*batch))) {
+      token = exported->token;
+      rows  = exported->rows;
+      src   = std::move(exported->src);
+      return std::make_unique<std::vector<std::uint8_t>>(std::move(exported->layout));
+    }
+  }
+  return nullptr;
+}
+
+void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
+{
+  impl_->require_built("push_received()");
+  auto& exchange       = impl_->ctx.require_exchange();
+  const auto& declared = impl_->fragment->input_spec(stream_id);
+  auto table           = exchange.take(token);
+  check_declared_schema(declared, table->view(), stream_id, "received batch");
+  auto& gpu  = exchange.space();
+  auto batch = sirius::make_data_batch(
+    std::move(table), gpu, gpu.acquire_stream(), telemetry::batch_telemetry_info{});
+  if (!impl_->fragment->push(stream_id, std::move(batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused a received batch; it had already ended");
+  }
 }
 
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)

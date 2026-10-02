@@ -16,16 +16,36 @@
 
 #include "exec/exchange_direct.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "sirius/exception.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/aligned.hpp>
+#include <rmm/cuda_device.hpp>
+#include <rmm/detail/error.hpp>
+#include <rmm/error.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <absl/cleanup/cleanup.h>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <format>
+#include <functional>
 #include <limits>
+#include <numeric>
 #include <string_view>
 
 namespace sirius::exec {
@@ -67,6 +87,38 @@ bool is_sendable(cudf::data_type type)
 {
   // EMPTY is checked first: is_fixed_width throws on it, since the type dispatcher omits it.
   return is_string(type) || (type.id() != cudf::type_id::EMPTY && cudf::is_fixed_width(type));
+}
+
+bool is_sliced(cudf::table_view const& table)
+{
+  // One level of children is enough: the deepest sendable column is STRING (one offsets child).
+  // A nested column may be checked here, but describe_table() refuses it whichever way this
+  // answers, so a deeper slice is never sent.
+  return std::any_of(table.begin(), table.end(), [](cudf::column_view const& c) {
+    return c.offset() != 0 ||
+           std::any_of(c.child_begin(), c.child_end(), [](cudf::column_view const& child) {
+             return child.offset() != 0;
+           });
+  });
+}
+
+std::uintptr_t address(void const* p) { return reinterpret_cast<std::uintptr_t>(p); }
+
+/// The [address, length] of each non-empty buffer of @p table, or nullopt if one is outside
+/// @p region.
+std::optional<std::vector<std::uint64_t>> sources(direct_export const& table,
+                                                  memory::slab_region const& region)
+{
+  auto const plan = plan_buffers(table.layout, std::numeric_limits<std::size_t>::max());
+  std::vector<std::uint64_t> src;
+  for (std::size_t i = 0; i < plan.size(); ++i) {
+    if (plan[i].wire == 0) { continue; }
+    auto const at = address(table.buffers[i]);
+    if (!region.covers(at, plan[i].wire)) { return std::nullopt; }
+    src.push_back(at);
+    src.push_back(plan[i].wire);
+  }
+  return src;
 }
 
 }  // namespace
@@ -186,6 +238,173 @@ direct_export describe_table(cudf::table_view const& table, rmm::cuda_stream_vie
     out.layout.columns.push_back(d);
   }
   return out;
+}
+
+direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region)
+  : _gpu{gpu}, _region{std::move(region)}
+{
+}
+
+std::optional<direct_exchange::exported> direct_exchange::export_batch(
+  std::shared_ptr<cucascade::data_batch> batch)
+{
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  require_open();
+  rmm::cuda_stream_view const stream{_gpu.acquire_stream()};
+  direct_export described;
+  std::optional<std::vector<std::uint64_t>> src;
+  std::unique_ptr<cudf::table> copy;
+  {
+    // Dropped before returning: it holds the batch's shared lock, which only this thread may
+    // unlock.
+    auto const ro = batch->to_read_only();
+    if (ro.get_current_tier() != cucascade::memory::Tier::GPU) {
+      throw sirius::invalid_input_exception("direct exchange: the batch is not on the GPU");
+    }
+    auto const view = get_cudf_table_view(ro);
+    if (view.num_rows() == 0) { return std::nullopt; }
+    if (cudaEvent_t writer = ro.get_writer_event()) {
+      RMM_CUDA_TRY(cudaStreamWaitEvent(stream.value(), writer, 0));
+    }
+    if (!is_sliced(view)) {
+      described = describe_table(view, stream);
+      src       = sources(described, _region);
+    }
+    if (!src) {
+      copy      = std::make_unique<cudf::table>(view, stream, _gpu.get_default_allocator());
+      described = describe_table(copy->view(), stream);
+      src       = sources(described, _region);
+    }
+    // The NIC reads outside stream order, so the producer and the copy must be done.
+    stream.synchronize();
+  }
+  if (!src) {
+    throw sirius::internal_exception(
+      "direct exchange: a batch copied for sending is not in the slab");
+  }
+  std::shared_ptr<void const> keepalive = std::move(batch);
+  if (copy) { keepalive = std::move(copy); }
+  auto const token = _next++;
+  _entries.emplace(token, std::move(keepalive));
+  return exported{token,
+                  static_cast<std::uint64_t>(described.layout.rows),
+                  encode_layout(described.layout),
+                  std::move(*src)};
+}
+
+std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
+  std::span<std::uint8_t const> bytes)
+{
+  auto layout     = decode_layout(bytes);
+  auto const plan = plan_buffers(layout, _region.len);
+  // The tracker charges each allocation rounded up on its own; plan_buffers bounded this sum.
+  auto const total = std::transform_reduce(
+    plan.begin(), plan.end(), std::size_t{0}, std::plus<>{}, [](direct_buffer const& b) {
+      return rmm::align_up(b.alloc, alignment);
+    });
+
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  require_open();
+  // Never the blocking make_reservation: a receiver waiting for memory could hold up the senders
+  // whose batches would free it.
+  auto reservation = _gpu.make_reservation_or_null(total);
+  if (!reservation) {
+    throw rmm::out_of_memory(std::format(
+      "direct exchange: {} bytes requested, {} available", total, _gpu.get_available_memory()));
+  }
+  auto const stream = _gpu.acquire_stream();
+  auto* tracker     = _gpu.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!tracker->attach_reservation_to_tracker(
+        stream,
+        std::move(reservation),
+        std::make_unique<cucascade::memory::fail_reservation_limit_policy>())) {
+    throw sirius::internal_exception("direct exchange: this thread already tracks a reservation");
+  }
+  absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
+  received entry{std::move(layout), {}};
+  entry.buffers.reserve(plan.size());
+  for (auto const& b : plan) {
+    entry.buffers.emplace_back(b.alloc, stream, _gpu.get_default_allocator());
+  }
+  // The pool reuses a block freed on another stream behind a stream wait, which the NIC ignores.
+  rmm::cuda_stream_view{stream}.synchronize();
+
+  std::vector<std::uint64_t> dst;
+  for (std::size_t i = 0; i < plan.size(); ++i) {
+    if (plan[i].wire == 0) { continue; }
+    auto const at = address(entry.buffers[i].data());
+    if (!_region.covers(at, plan[i].wire)) {
+      throw sirius::internal_exception("direct exchange: a receive buffer is not in the slab");
+    }
+    dst.push_back(at);
+    dst.push_back(plan[i].wire);
+  }
+  auto const token = _next++;
+  _entries.emplace(token, std::move(entry));
+  return {token, std::move(dst)};
+}
+
+std::unique_ptr<cudf::table> direct_exchange::take(std::uint64_t token)
+{
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  require_open();
+  auto const it     = _entries.find(token);
+  auto* const entry = it == _entries.end() ? nullptr : std::get_if<received>(&it->second);
+  if (entry == nullptr) {
+    throw sirius::invalid_input_exception("direct exchange: token {} holds no received batch",
+                                          token);
+  }
+  auto taken = std::move(*entry);
+  _entries.erase(it);
+
+  auto const rows = taken.layout.rows;
+  auto buffer     = taken.buffers.begin();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (auto const& c : taken.layout.columns) {
+    rmm::device_buffer mask = c.has_mask ? std::move(*buffer++) : rmm::device_buffer{};
+    rmm::device_buffer data = std::move(*buffer++);
+    if (is_string(c.type)) {
+      auto offsets = std::make_unique<cudf::column>(
+        cudf::data_type{c.offsets}, rows + 1, std::move(*buffer++), rmm::device_buffer{}, 0);
+      columns.push_back(cudf::make_strings_column(
+        rows, std::move(offsets), std::move(data), c.null_count, std::move(mask)));
+    } else {
+      columns.push_back(std::make_unique<cudf::column>(
+        c.type, rows, std::move(data), std::move(mask), c.null_count));
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+void direct_exchange::release(std::uint64_t token)
+{
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  require_open();
+  _entries.erase(token);
+}
+
+std::size_t direct_exchange::outstanding() const
+{
+  std::lock_guard const lock{_mutex};
+  require_open();
+  return _entries.size();
+}
+
+void direct_exchange::close()
+{
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  _entries.clear();
+  _closed = true;
+}
+
+void direct_exchange::require_open() const
+{
+  if (_closed) { throw sirius::invalid_input_exception("direct exchange: already closed"); }
 }
 
 }  // namespace sirius::exec

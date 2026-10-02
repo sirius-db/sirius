@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-// Public sirius::ffi Context and Fragment methods only.
+// Public sirius::ffi Context, Fragment and DirectExchange methods only.
 // Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, several fragments built before any runs (on one
 // and on two threads), build() and run()/drop on different threads, drop after build(), a build()
-// that fails after setup, and execute_substrait. Spec errors and failed-build rollback live in
-// test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
+// that fails after setup, execute_substrait, and a direct exchange round trip. Spec errors and
+// failed-build rollback live in test_streaming_fragment.cpp and test_sirius_ffi_fragment.cpp.
 
+#include "exec/exchange_direct.hpp"
 #include "sirius/exception.hpp"
 #include "sirius/ffi.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+
+#include <cuda_runtime_api.h>
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -32,6 +35,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <source_location>
@@ -364,4 +368,80 @@ TEST_CASE("FFI concurrent run() and execute_substrait on one Context wait for ea
   REQUIRE(result_i64s(*first) == expected);
   REQUIRE(result_i64s(*second) == expected);
   REQUIRE(collect_i64_column(direct) == expected);
+}
+
+TEST_CASE("FFI direct exchange needs the slab allocator", "[isolated_context][sirius_ffi]")
+{
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  CHECK(ctx->direct_exchange() == nullptr);
+}
+
+TEST_CASE("FFI direct exchange delivers what relay_from does", "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_direct_exchange");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const config = scratch.file("slab.yaml");
+  std::ofstream(config) << "sirius:\n"
+                           "  topology:\n"
+                           "    num_gpus: 1\n"
+                           "  space:\n"
+                           "    gpu:\n"
+                           "      - device_id: 0\n"
+                           "        memory_capacity: 2147483648\n"
+                           "        allocator: slab\n"
+                           "    host:\n"
+                           "      - numa_id: 0\n"
+                           "        memory_capacity: 4294967296\n";
+  auto ctx      = sirius::ffi::make_context_from_config(config);
+  auto exchange = ctx->direct_exchange();
+  REQUIRE(exchange != nullptr);
+
+  // Scans the parquet file into a receiver, `deliver` moving the scan's batches across.
+  auto const receive = [&](auto const& deliver) {
+    auto sender = sirius::ffi::make_fragment(*ctx);
+    sender->declare_output(0);
+    sender->build(local_files_plan(path));
+    sender->run();
+    auto receiver = sirius::ffi::make_fragment(*ctx);
+    receiver->declare_input_column(0, "a", "BIGINT");
+    receiver->build(stream_read_plan(0));
+    deliver(*sender, *receiver);
+    receiver->run();
+    return result_i64s(*receiver);
+  };
+  auto const relayed = receive(
+    [](auto& sender, auto& receiver) { REQUIRE(receiver.relay_from(sender, 0, 0, 0) > 0); });
+  auto const direct = receive([&](auto& sender, auto& receiver) {
+    std::uint64_t token = 0;
+    std::uint64_t rows  = 0;
+    std::vector<std::uint64_t> src;
+    while (auto const layout = sender.export_direct(0, token, rows, src)) {
+      std::uint64_t remote = 0;
+      auto const dst       = exchange->allocate(
+        reinterpret_cast<std::uintptr_t>(layout->data()), layout->size(), remote);
+      REQUIRE(dst->size() == src.size());
+      // Stands in for the transport's write.
+      for (std::size_t i = 0; i < src.size(); i += 2) {
+        REQUIRE((*dst)[i + 1] == src[i + 1]);
+        REQUIRE(cudaMemcpy(reinterpret_cast<void*>((*dst)[i]),
+                           reinterpret_cast<void const*>(src[i]),
+                           src[i + 1],
+                           cudaMemcpyDeviceToDevice) == cudaSuccess);
+      }
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      exchange->release(token);
+      receiver.push_received(0, remote);
+    }
+
+    auto const ints =
+      sirius::exec::encode_layout({1, {{cudf::data_type{cudf::type_id::INT32}, 0, false}}});
+    std::uint64_t mismatched = 0;
+    exchange->allocate(reinterpret_cast<std::uintptr_t>(ints.data()), ints.size(), mismatched);
+    CHECK_THROWS_WITH(receiver.push_received(0, mismatched),
+                      Catch::Matchers::ContainsSubstring("is declared BIGINT"));
+    receiver.close_input(0, 0);
+  });
+  CHECK(direct == relayed);
+  CHECK(exchange->outstanding() == 0);
 }
