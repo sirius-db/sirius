@@ -29,6 +29,9 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace sirius::op::scan {
 namespace {
@@ -47,6 +50,10 @@ class crypto_reader {
     return result_;
   }
   std::vector<uint8_t> const& original_schema() const { return original_schema_; }
+  std::vector<uint8_t> const& original_logical_annotations() const
+  {
+    return original_logical_annotations_;
+  }
 
  private:
   uint8_t byte()
@@ -86,7 +93,12 @@ class crypto_reader {
       // FileMetaData.encryption_algorithm and ColumnChunk crypto/metadata fields.
       if ((context == 1 && field == 8) || (context == 3 && (field == 8 || field == 9)))
         result_.columns_encrypted = true;
-      unsigned child         = context == 1 && field == 4 ? 2 : context == 2 && field == 1 ? 3 : 0;
+      unsigned child = context == 1 && field == 4   ? 2
+                       : context == 2 && field == 1 ? 3
+                       : context == 1 && field == 2 ? 4
+                                                    : 0;
+      if (context == 4 && field == 10 && !original_logical_annotations_.empty())
+        original_logical_annotations_.back() = 1;
       auto const value_start = offset_;
       skip(type, child, depth + 1, true);
       if (context == 1 && field == 2) {
@@ -114,8 +126,10 @@ class crypto_reader {
         uint64_t count = header >> 4;
         if (count == 15) count = varint();
         if (count > bytes_.size() - offset_) throw std::runtime_error("invalid compact list");
-        for (uint64_t i = 0; i < count; ++i)
+        for (uint64_t i = 0; i < count; ++i) {
+          if (context == 4) original_logical_annotations_.push_back(0);
           skip(header & 15, context, depth + 1, false);
+        }
         return;
       }
       case 11: {
@@ -137,6 +151,7 @@ class crypto_reader {
   std::size_t offset_ = 0;
   parquet_encryption_evidence result_;
   std::vector<uint8_t> original_schema_;
+  std::vector<uint8_t> original_logical_annotations_;
 };
 }  // namespace
 parquet_encryption_evidence inspect_parquet_encryption(std::span<uint8_t const> footer)
@@ -175,8 +190,12 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
       break;
     }
   }
-  auto result = std::make_shared<parquet_metadata>(
-    parsed, footer->size(), encryption, probe.original_schema(), std::move(arrow_schema));
+  auto result = std::make_shared<parquet_metadata>(parsed,
+                                                   footer->size(),
+                                                   encryption,
+                                                   probe.original_schema(),
+                                                   std::move(arrow_schema),
+                                                   probe.original_logical_annotations());
   std::ignore = source.store_metadata(result);
   return result;
 }
@@ -300,7 +319,8 @@ physical_profile_result check_parquet_split_profile(cudf::io::parquet::FileMetaD
                                                     bound_table_scan const& contract,
                                                     effective_reader_projection const& projection,
                                                     std::span<std::size_t const> retained,
-                                                    leaf_set const& semantic)
+                                                    leaf_set const& semantic,
+                                                    std::span<uint8_t const> original_annotations)
 {
   physical_profile_result result;
   auto refuse = [&](verdict_reason why, std::string text) {
@@ -308,11 +328,26 @@ physical_profile_result check_parquet_split_profile(cudf::io::parquet::FileMetaD
     result.text   = std::move(text);
     return result;
   };
+  // Build the top-level name index once. Repeatedly walking every path for
+  // each projected name makes a wide all-column scan quadratic in leaf count.
+  std::unordered_map<std::string, std::vector<std::size_t>> leaves_by_name;
+  if (!metadata.row_groups.empty()) {
+    auto const& columns = metadata.row_groups.front().columns;
+    for (std::size_t leaf = 0; leaf < columns.size(); ++leaf) {
+      auto const& path = columns[leaf].meta_data.path_in_schema;
+      if (!path.empty()) leaves_by_name[path.front()].push_back(leaf);
+    }
+  }
+  std::vector<std::vector<std::size_t>> leaves_by_column(projection.names.size());
+  for (std::size_t d = 0; d < projection.names.size(); ++d) {
+    if (auto found = leaves_by_name.find(projection.names[d]); found != leaves_by_name.end())
+      leaves_by_column[d] = found->second;
+  }
   std::set<std::size_t> decoded;
   auto add = [&](auto const& inputs) {
     for (auto d : inputs) {
       if (d >= projection.names.size()) throw std::logic_error("invalid effective projection");
-      auto leaves = detail::leaf_indices_for_column(metadata, projection.names[d]);
+      auto const& leaves = leaves_by_column[d];
       decoded.insert(leaves.begin(), leaves.end());
     }
   };
@@ -324,6 +359,12 @@ physical_profile_result check_parquet_split_profile(cudf::io::parquet::FileMetaD
       decoded.insert(i);
   physical_profile profile;
   std::vector<std::size_t> profile_leaves;
+  // Most row groups have the same evidence for a given leaf. Keep a short
+  // per-leaf chain so each checked chunk avoids a tree lookup and tuple copy.
+  auto const absent = std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> first_by_leaf(
+    metadata.row_groups.empty() ? 0 : metadata.row_groups.front().columns.size(), absent);
+  std::vector<std::size_t> next_profile;
   for (auto rg : retained) {
     if (rg >= metadata.row_groups.size()) throw std::logic_error("invalid retained row group");
     auto const& group = metadata.row_groups[rg];
@@ -342,48 +383,75 @@ physical_profile_result check_parquet_split_profile(cudf::io::parquet::FileMetaD
                         "Parquet encoding is not supported by pinned libcudf");
         encodings |= uint64_t{1} << static_cast<unsigned>(encoding);
       }
-      profile_leaves.push_back(leaf);
-      profile.columns.push_back({static_cast<uint32_t>(column.type),
-                                 uint64_t{1} << static_cast<unsigned>(column.codec),
-                                 encodings,
-                                 false});
+      physical_column_profile entry{static_cast<uint32_t>(column.type),
+                                    uint64_t{1} << static_cast<unsigned>(column.codec),
+                                    encodings,
+                                    false};
       auto const schema_index = group.columns[leaf].schema_idx;
       if (schema_index >= 0 && static_cast<std::size_t>(schema_index) < metadata.schema.size()) {
         auto const& schema = metadata.schema[schema_index];
-        auto& entry        = profile.columns.back();
-        entry.logical_annotation =
-          schema.logical_type ? static_cast<uint32_t>(schema.logical_type->type) : 0;
+        auto const original_logical =
+          original_annotations.empty() ||
+              static_cast<std::size_t>(schema_index) >= original_annotations.size()
+            ? schema.logical_type.has_value()
+            : original_annotations[schema_index] != 0;
+        entry.logical_annotation = schema.logical_type && original_logical
+                                     ? static_cast<uint32_t>(schema.logical_type->type)
+                                     : 0;
         entry.converted_annotation =
           schema.converted_type ? static_cast<uint32_t>(*schema.converted_type) + 1 : 0;
         entry.scale     = schema.decimal_scale;
         entry.precision = schema.decimal_precision;
       }
+      auto same_evidence = [&](physical_column_profile const& candidate) {
+        return candidate.type == entry.type && candidate.data_codecs == entry.data_codecs &&
+               candidate.validity_or_encodings == entry.validity_or_encodings &&
+               candidate.logical_annotation == entry.logical_annotation &&
+               candidate.converted_annotation == entry.converted_annotation &&
+               candidate.scale == entry.scale && candidate.precision == entry.precision;
+      };
+      auto found = first_by_leaf[leaf];
+      while (found != absent && !same_evidence(profile.columns[found]))
+        found = next_profile[found];
+      if (found == absent) {
+        next_profile.push_back(first_by_leaf[leaf]);
+        first_by_leaf[leaf] = profile.columns.size();
+        profile_leaves.push_back(leaf);
+        profile.columns.push_back(entry);
+      } else {
+        auto& count = profile.columns[found].checked_chunks;
+        if (count != std::numeric_limits<uint32_t>::max()) ++count;
+      }
     }
   }
   if (!retained.empty() && !decoded.empty()) {
-    auto schema = io::parquet_helpers::extract_schema(metadata, true);
+    auto schema = io::parquet_helpers::extract_schema(metadata, true, original_annotations);
+    std::unordered_map<std::string, std::size_t> type_by_name;
+    for (std::size_t index = 0; index < schema.names.size(); ++index)
+      type_by_name.emplace(schema.names[index], index);
     for (std::size_t d = 0; d < projection.names.size(); ++d) {
-      auto leaves = detail::leaf_indices_for_column(metadata, projection.names[d]);
+      auto const& leaves = leaves_by_column[d];
       if (std::none_of(
             leaves.begin(), leaves.end(), [&](auto leaf) { return decoded.contains(leaf); }))
         continue;
-      auto it = std::find(schema.names.begin(), schema.names.end(), projection.names[d]);
-      if (it == schema.names.end() || d >= projection.bound_types.size())
+      auto it = type_by_name.find(projection.names[d]);
+      if (it == type_by_name.end() || d >= projection.bound_types.size())
         return refuse(verdict_reason::parquet_type_unqualified,
                       "Parquet input has no bound type evidence");
-      auto const& actual   = schema.types[std::distance(schema.names.begin(), it)];
+      auto const& actual   = schema.types[it->second];
       auto const& expected = projection.bound_types[d];
       if (actual == expected) continue;
       ++result.type_mismatches;
       bool semantic_input = d >= semantic.size() || semantic[d];
-      if (semantic_input || !export_casts(actual, expected, false))
+      if (semantic_input || !contract.host_export_available ||
+          !export_casts(actual, expected, false))
         return refuse(verdict_reason::parquet_type_unqualified,
                       "Parquet column '" + projection.names[d] +
                         "' has unqualified type drift from " + actual.ToString() + " to " +
                         expected.ToString());
+      std::unordered_set<std::size_t> column_leaves(leaves.begin(), leaves.end());
       for (std::size_t i = 0; i < profile.columns.size(); ++i)
-        if (std::find(leaves.begin(), leaves.end(), profile_leaves[i]) != leaves.end())
-          profile.columns[i].type_mismatch = true;
+        if (column_leaves.contains(profile_leaves[i])) profile.columns[i].type_mismatch = true;
     }
   }
   if (encryption.footer_encrypted || encryption.columns_encrypted)
@@ -401,7 +469,8 @@ physical_profile_result check_parquet_split_profile(cudf::io::parquet::FileMetaD
 
 physical_profile_result check_iceberg_file_schema(cudf::io::parquet::FileMetaData const& metadata,
                                                   iceberg_table_schema const& table,
-                                                  std::string_view probe_path)
+                                                  std::string_view probe_path,
+                                                  std::span<uint8_t const> original_annotations)
 {
   physical_profile_result result;
   result.approved = true;
@@ -424,13 +493,19 @@ physical_profile_result check_iceberg_file_schema(cudf::io::parquet::FileMetaDat
     table_schema.emplace(std::make_pair(field.name, field.id), field.type);
     table_field_order.push_back(field.id);
   }
-  for (auto const& element : metadata.schema) {
+  for (std::size_t index = 0; index < metadata.schema.size(); ++index) {
+    auto const& element = metadata.schema[index];
     if (!element.field_id) continue;
     file_schema.emplace(
       std::make_pair(element.name, *element.field_id),
       element.num_children > 0 || element.type == cudf::io::parquet::Type::UNDEFINED
         ? std::string{}
-        : io::parquet_helpers::leaf_schema_type(element).ToString());
+        : io::parquet_helpers::leaf_schema_type(
+            element,
+            original_annotations.empty() || index >= original_annotations.size()
+              ? element.logical_type.has_value()
+              : original_annotations[index] != 0)
+            .ToString());
     file_field_order.push_back(*element.field_id);
   }
   if (file_schema.empty()) {

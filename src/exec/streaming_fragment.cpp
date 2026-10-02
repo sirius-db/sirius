@@ -147,8 +147,9 @@ void streaming_fragment::build(sirius::query_id_t query_id)
     throw sirius::invalid_input_exception("streaming_fragment: plan source produced no plan");
   }
 
-  sirius::planner::sirius_physical_plan_generator generator(_context,
-                                                            {{sirius::value_of(query_id)}, 0});
+  sirius::planner::scan_contract_provenance provenance{{sirius::value_of(query_id)}, 0};
+  provenance.host_export_available = false;
+  sirius::planner::sirius_physical_plan_generator generator(_context, std::move(provenance));
   auto subtree = generator.create_plan(std::move(logical_plan));
 
   // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).

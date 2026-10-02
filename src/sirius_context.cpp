@@ -402,6 +402,23 @@ struct SiriusContext::internal_connection::implementation {
     }
   }
 
+  unique_ptr<SQLStatement> parse(const string& sql)
+  {
+    auto& context = *connection.context;
+    if (!context.transaction.HasActiveTransaction() ||
+        !MetaTransaction::Get(context).IsReadOnly()) {
+      throw InvalidInputException("Sirius internal connection lost its read-only transaction");
+    }
+    Parser parser(context.GetParserOptions());
+    parser.ParseQuery(sql);
+    if (parser.statements.size() != 1 ||
+        (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
+         parser.statements[0]->type != StatementType::SET_STATEMENT)) {
+      throw InvalidInputException("Sirius internal connection accepts one SELECT or SET statement");
+    }
+    return std::move(parser.statements[0]);
+  }
+
   Connection connection;
   InternalQueryGuard guard;
   bool transaction_open = false;
@@ -419,20 +436,14 @@ SiriusContext::internal_connection::~internal_connection() noexcept = default;
 
 unique_ptr<MaterializedQueryResult> SiriusContext::internal_connection::Query(const string& sql)
 {
-  auto& context = *impl_->connection.context;
-  if (!context.transaction.HasActiveTransaction() || !MetaTransaction::Get(context).IsReadOnly()) {
-    throw InvalidInputException("Sirius internal connection lost its read-only transaction");
-  }
-  // Accept only the metadata queries and session settings used by the two callers. In
-  // particular, no transaction control, prepared EXECUTE or multi-statement escape is exposed.
-  Parser parser(context.GetParserOptions());
-  parser.ParseQuery(sql);
-  if (parser.statements.size() != 1 ||
-      (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
-       parser.statements[0]->type != StatementType::SET_STATEMENT)) {
-    throw InvalidInputException("Sirius internal connection accepts one SELECT or SET statement");
-  }
-  return impl_->connection.Query(std::move(parser.statements[0]));
+  return impl_->connection.Query(impl_->parse(sql));
+}
+
+unique_ptr<QueryResult> SiriusContext::internal_connection::SendQuery(const string& sql)
+{
+  // Keep the same read-only transaction and statement restrictions while the
+  // caller drains chunks under this connection's InternalQueryGuard.
+  return impl_->connection.SendQuery(impl_->parse(sql));
 }
 
 SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)

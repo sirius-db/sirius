@@ -26,6 +26,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -415,7 +416,9 @@ TEST_CASE_METHOD(fragment_fixture,
     std::size_t relayed_batches = 0;
     std::size_t relayed_rows    = 0;
     while (auto batch = sender.session().pull(0)) {
-      relayed_rows += static_cast<std::size_t>(sirius::get_cudf_table_view(**batch).num_rows());
+      auto view = sirius::get_cudf_table_view(**batch);
+      REQUIRE(view.column(0).type().id() == cudf::type_id::INT64);
+      relayed_rows += static_cast<std::size_t>(view.num_rows());
       REQUIRE(receiver.session().push(0, *batch));
       ++relayed_batches;
     }
@@ -429,6 +432,48 @@ TEST_CASE_METHOD(fragment_fixture,
 
     REQUIRE(drain_row_count(receiver, 1) == expected_rows);
 
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-4b: an export-only Parquet drift cannot publish a GPU stream",
+                 "[integration][streaming_fragment]")
+{
+  sirius::test::scratch_dir directory("fragment_export_drift");
+  auto write = [&](std::string const& sql) {
+    auto result = con->Query(sql);
+    if (result->HasError()) INFO(result->GetError());
+    REQUIRE_FALSE(result->HasError());
+  };
+  write("SET gpu_execution=false");
+  write("COPY (SELECT 0::INTEGER keep, 1::INTEGER x) TO " + directory.file_literal("a.parquet") +
+        " (FORMAT PARQUET)");
+  write("COPY (SELECT 1::INTEGER keep, 2.5::DOUBLE x) TO " + directory.file_literal("b.parquet") +
+        " (FORMAT PARQUET)");
+  write("SET gpu_execution=true");
+  auto state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(state);
+  auto query =
+    "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ") WHERE keep=1";
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source(query);
+    spec.outputs     = {0};
+    streaming_fragment sender(*con->context, std::move(spec));
+    query_window window(*state, *con->context, "frag4b_sender");
+    sender.build(window.query_id());
+    REQUIRE(sender.sink_types().size() == 1);
+    REQUIRE(sender.sink_types()[0].id() == sirius::type_id::INTEGER);
+    REQUIRE_THROWS(sender.run());
+    // The only retained file carries DOUBLE. It must fail qualification before
+    // the reader or sink can publish a mismatched payload.
+    REQUIRE_THROWS(sender.session().pull(0));
+    window.finish();
     con->Rollback();
   } catch (...) {
     con->Rollback();

@@ -77,6 +77,8 @@ struct scan_contract_provenance {
   uint64_t certification_scan_index = 0;
   uint64_t lineage_time_us          = 0;
   std::optional<std::pair<op::scan::verdict_reason, std::string>> first_pre_decline;
+  // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
+  bool host_export_available = true;
 };
 
 /// Resolved parquet file set identifying a parquet-family scan

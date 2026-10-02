@@ -33,7 +33,6 @@
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
-#include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -904,9 +903,25 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
   if (_info->injections.strip_encryption_evidence) encryption = {};
   auto const& metadata = *file_metadata;
+  std::unordered_map<std::string, std::vector<std::size_t>> leaves_by_name;
+  if (!metadata.row_groups.empty()) {
+    auto const& columns = metadata.row_groups.front().columns;
+    for (std::size_t leaf = 0; leaf < columns.size(); ++leaf) {
+      auto const& path = columns[leaf].meta_data.path_in_schema;
+      if (!path.empty()) leaves_by_name[path.front()].push_back(leaf);
+    }
+  }
+  auto leaves_for = [&](std::string const& name) -> std::vector<std::size_t> const& {
+    static std::vector<std::size_t> const empty;
+    auto found = leaves_by_name.find(name);
+    return found == leaves_by_name.end() ? empty : found->second;
+  };
   validation_set schema_validation;
   if (_info->physical_schema) {
-    auto checked = check_iceberg_file_schema(metadata, *_info->physical_schema, file_path);
+    auto checked = check_iceberg_file_schema(metadata,
+                                             *_info->physical_schema,
+                                             file_path,
+                                             resolved_metadata->original_logical_annotations);
     if (!checked.approved) {
       if (_info->profiles->counters) _info->profiles->counters->record(checked.reason);
       throw unsupported_physical_input(_info->contract_id, file_path, checked.reason, checked.text);
@@ -936,8 +951,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // batch.
   bool const carrier_unavailable =
     _plan->carrier_batch_index.has_value() &&
-    detail::leaf_indices_for_column(metadata, _plan->data_columns[*_plan->carrier_batch_index].name)
-      .empty();
+    leaves_for(_plan->data_columns[*_plan->carrier_batch_index].name).empty();
   if (carrier_unavailable) { opts = *_natural_reader_options; }
   bool const file_projected = _plan->is_projected() && !carrier_unavailable;
 
@@ -969,7 +983,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   for (auto const& predicate : _null_prune_predicates)
     pruning_columns.insert(predicate.batch_index);
   if (!pruning_columns.empty() && !metadata.row_groups.empty()) {
-    auto schema = sirius::io::parquet_helpers::extract_schema(metadata, true);
+    auto schema = sirius::io::parquet_helpers::extract_schema(
+      metadata, true, resolved_metadata->original_logical_annotations);
     for (auto d : pruning_columns) {
       if (d >= effective.names.size()) continue;  // virtual predicate, never footer-pruned
       auto found = std::find(schema.names.begin(), schema.names.end(), effective.names[d]);
@@ -1067,7 +1082,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     selected_chunk_indices.reserve(data_column_names.size());
     selected_chunk_decoded_width.reserve(data_column_names.size());
     for (std::size_t k = 0; k < data_column_names.size(); ++k) {
-      auto leaves = detail::leaf_indices_for_column(metadata, data_column_names[k]);
+      auto const& leaves = leaves_for(data_column_names[k]);
       if (leaves.empty()) {
         if (_info->profiles->counters)
           _info->profiles->counters->record(verdict_reason::parquet_type_unqualified);
@@ -1151,8 +1166,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
         continue;
       }
 
-      auto const leaves =
-        detail::leaf_indices_for_column(metadata, _plan->batch_column_name(pred.batch_index));
+      auto const& leaves = leaves_for(_plan->batch_column_name(pred.batch_index));
       if (leaves.size() != 1) { continue; }
       auto const chunk_index = leaves.front();
       auto const& first_rg   = metadata.row_groups.front();
@@ -1196,8 +1210,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   std::vector<std::size_t> retained(row_group_indices.begin(), row_group_indices.end());
-  auto profile = check_parquet_split_profile(
-    metadata, encryption, physical_contract, effective, retained, _info->semantic_columns);
+  auto profile = check_parquet_split_profile(metadata,
+                                             encryption,
+                                             physical_contract,
+                                             effective,
+                                             retained,
+                                             _info->semantic_columns,
+                                             resolved_metadata->original_logical_annotations);
   if (_info->profiles->counters)
     _info->profiles->counters->record(profile.reason, profile.type_mismatches);
   profile.validation |= schema_validation;

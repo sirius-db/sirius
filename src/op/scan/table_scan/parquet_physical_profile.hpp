@@ -51,7 +51,8 @@ physical_profile_result check_parquet_split_profile(
   bound_table_scan const&,
   effective_reader_projection const&,
   std::span<std::size_t const> retained_row_groups,
-  leaf_set const& semantic_columns);
+  leaf_set const& semantic_columns,
+  std::span<uint8_t const> original_logical_annotations = {});
 
 struct iceberg_table_schema {
   struct field {
@@ -61,7 +62,9 @@ struct iceberg_table_schema {
   };
   std::vector<field> fields;  // Preorder, containers included with empty type.
 };
-physical_profile_result check_iceberg_file_schema(cudf::io::parquet::FileMetaData const&,
-                                                  iceberg_table_schema const&,
-                                                  std::string_view probe_path);
+physical_profile_result check_iceberg_file_schema(
+  cudf::io::parquet::FileMetaData const&,
+  iceberg_table_schema const&,
+  std::string_view probe_path,
+  std::span<uint8_t const> original_logical_annotations = {});
 }  // namespace sirius::op::scan

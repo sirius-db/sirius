@@ -28,6 +28,7 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -136,7 +137,15 @@ TEST_CASE("Parquet profiles inspect only retained decoded chunks", "[scan][parqu
   REQUIRE(ok.approved);
   REQUIRE(ok.profile != 0);
   CHECK(ok.validation.test(static_cast<unsigned>(later_check::profile_per_file)));
-  CHECK(f.contract.profiles->get(ok.profile).columns.size() == 2);
+  auto retained_profile = f.contract.profiles->get(ok.profile);
+  REQUIRE(retained_profile.columns.size() == 1);
+  CHECK(retained_profile.columns.front().checked_chunks == 2);
+  f.metadata.row_groups[1].columns[0].meta_data.encodings = {pq::Encoding::RLE};
+  auto distinct                                           = f.check();
+  REQUIRE(distinct.approved);
+  CHECK(f.contract.profiles->get(distinct.profile).columns.size() == 2);
+  f.metadata.row_groups[1].columns[0].meta_data.encodings =
+    f.metadata.row_groups[0].columns[0].meta_data.encodings;
   f.metadata.row_groups[0].columns[0].meta_data.codec = pq::Compression::LZO;
   CHECK(f.check().reason == verdict_reason::parquet_codec_unsupported);
   f.retained = {1};
@@ -148,6 +157,22 @@ TEST_CASE("Parquet profiles inspect only retained decoded chunks", "[scan][parqu
   CHECK(f.check().reason == verdict_reason::parquet_codec_unsupported);
   f.retained.clear();
   CHECK(f.check().approved);
+}
+
+TEST_CASE("Parquet wide schema indexes all leaves and retains one record per signature",
+          "[scan][parquet][profile]")
+{
+  footer_fixture f("schema_variants/wide-many-groups.parquet");
+  REQUIRE(f.projection.names.size() == 128);
+  REQUIRE(f.retained.size() == 16);
+  auto result = f.check(leaf_set(128, true));
+  REQUIRE(result.approved);
+  auto profile = f.contract.profiles->get(result.profile);
+  REQUIRE(profile.columns.size() == 128);
+  for (auto const& column : profile.columns)
+    CHECK(column.checked_chunks == 16);
+  f.metadata.row_groups.back().columns.back().meta_data.codec = pq::Compression::LZO;
+  CHECK(f.check(leaf_set(128, true)).reason == verdict_reason::parquet_codec_unsupported);
 }
 
 TEST_CASE("Parquet footer encoding union accepts levels and empty lists",
@@ -173,6 +198,9 @@ TEST_CASE("Parquet D6 requires both export-only usage and an actual export cast"
   REQUIRE(exported.approved);
   CHECK(exported.type_mismatches == 1);
   CHECK(f.contract.profiles->get(exported.profile).columns[0].type_mismatch);
+  f.contract.host_export_available = false;
+  CHECK(f.check({false}).reason == verdict_reason::parquet_type_unqualified);
+  f.contract.host_export_available = true;
   CHECK(f.check({true}).reason == verdict_reason::parquet_type_unqualified);
   CHECK(f.check({}).reason ==
         verdict_reason::parquet_type_unqualified);  // direct pin: no exception
@@ -254,6 +282,40 @@ TEST_CASE("Parquet D6 refuses nested name order count and ARRAY child drift",
   CHECK(f.check({true}).reason == verdict_reason::parquet_type_unqualified);
 }
 
+TEST_CASE("Parquet schema mapping distinguishes repeated leaves from annotated lists",
+          "[scan][parquet][profile]")
+{
+  footer_fixture scalar;
+  CHECK(sirius::io::parquet_helpers::extract_schema(scalar.metadata, true).types[0] ==
+        duckdb::LogicalType::INTEGER);
+  scalar.metadata.schema[1].repetition_type = pq::FieldRepetitionType::REPEATED;
+  CHECK(sirius::io::parquet_helpers::extract_schema(scalar.metadata, true).types[0] ==
+        duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER));
+
+  footer_fixture list("schema_variants/list-three-level.parquet");
+  auto mapped = sirius::io::parquet_helpers::extract_schema(list.metadata, true);
+  REQUIRE(mapped.types.size() == 2);
+  CHECK(mapped.types[0] == duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER));
+  CHECK(mapped.types[1] == duckdb::LogicalType::INTEGER);
+
+  footer_fixture nested("schema_variants/list-nested.parquet");
+  mapped = sirius::io::parquet_helpers::extract_schema(nested.metadata, true);
+  REQUIRE(mapped.types.size() == 2);
+  CHECK(mapped.types[0] ==
+        duckdb::LogicalType::LIST(duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER)));
+  CHECK(mapped.types[1] == duckdb::LogicalType::INTEGER);
+
+  // Checked-in 464-byte file: REPEATED INT32 x plus REQUIRED INT32 next.
+  // PyArrow always writes an annotated three-level LIST for these values.
+  auto one_level = std::filesystem::path(SIRIUS_PROJECT_ROOT) /
+                   "test/cpp/scan/data/physical_profile/repeated-leaf.parquet";
+  footer_fixture repeated(one_level.string());
+  mapped = sirius::io::parquet_helpers::extract_schema(repeated.metadata, true);
+  REQUIRE(mapped.types.size() == 2);
+  CHECK(mapped.types[0] == duckdb::LogicalType::LIST(duckdb::LogicalType::INTEGER));
+  CHECK(mapped.types[1] == duckdb::LogicalType::INTEGER);
+}
+
 TEST_CASE("Iceberg per-file schema comparison preserves field ids and reasons",
           "[scan][parquet][profile][iceberg_schema]")
 {
@@ -287,6 +349,105 @@ TEST_CASE("Iceberg per-file schema comparison preserves field ids and reasons",
   f.metadata.schema.clear();
   table.fields.push_back({"x", 1, "INTEGER"});
   CHECK(check().reason == verdict_reason::iceberg_schema_no_rows);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet annotated lists keep their bound types and adjacent fields on GPU",
+                 "[scan][parquet][profile][integration]")
+{
+  for (auto const* name : {"list-three-level.parquet", "list-nested.parquet"}) {
+    auto path   = (corpus() / "schema_variants" / name).string();
+    auto query  = "SELECT x, next FROM read_parquet(" + sirius::test::sql_literal(path) + ")";
+    auto before = sirius::test::get_transparent_execution_stats(*con);
+    compare_gpu_vs_cpu(query);
+    auto after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.parquet_reader_calls[path] == before.parquet_reader_calls[path] + 1);
+  }
+  auto one_level = (std::filesystem::path(SIRIUS_PROJECT_ROOT) /
+                    "test/cpp/scan/data/physical_profile/repeated-leaf.parquet")
+                     .string();
+  auto before = sirius::test::get_transparent_execution_stats(*con);
+  compare_gpu_vs_cpu("SELECT x, next FROM read_parquet(" + sirius::test::sql_literal(one_level) +
+                     ")");
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.parquet_reader_calls[one_level] == before.parquet_reader_calls[one_level] + 1);
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Legacy converted timestamp keeps raw annotation provenance across cache hits",
+                 "[scan][parquet][profile][integration]")
+{
+  sirius::test::scratch_dir directory("parquet_legacy_timestamp");
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto& manager = state->get_scan_manager();
+  auto counters = state->physical_counters();
+  std::atomic<int> hits{0};
+  counters->parquet_metadata_for_testing = [&](std::string const&, bool hit) {
+    if (hit) hits.fetch_add(1, std::memory_order_relaxed);
+  };
+  struct hook_guard {
+    std::shared_ptr<physical_check_counters> counters;
+    ~hook_guard() { counters->parquet_metadata_for_testing = {}; }
+  } guard{counters};
+  for (bool describe_first : {false, true}) {
+    auto path = directory.file(describe_first ? "described.parquet" : "cold.parquet");
+    std::filesystem::copy_file(corpus() / "schema_variants/timestamp-legacy.parquet", path);
+    if (describe_first) {
+      auto described = manager.describe_parquet(path);
+      REQUIRE(described.names.size() == 1);
+    }
+    auto query = "SELECT x FROM read_parquet(" + sirius::test::sql_literal(path) + ")";
+    run_ok("SET gpu_execution=false");
+    auto cpu = con->Query(query);
+    REQUIRE_FALSE(cpu->HasError());
+    run_ok("SET gpu_execution=true");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      auto before = sirius::test::get_transparent_execution_stats(*con);
+      auto result = con->Query(query);
+      if (result->HasError()) INFO(result->GetError());
+      REQUIRE_FALSE(result->HasError());
+      CHECK(collect_rows(*result) == collect_rows(*cpu));
+      auto after = sirius::test::get_transparent_execution_stats(*con);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.parquet_reader_calls[path] == before.parquet_reader_calls[path] + 1);
+    }
+    auto datasource = manager.create_datasource(path);
+    REQUIRE(datasource);
+    auto stored = std::dynamic_pointer_cast<parquet_metadata>(datasource->metadata());
+    REQUIRE(stored);
+    REQUIRE(stored->original_logical_annotations.size() > 1);
+    CHECK(stored->original_logical_annotations[1] == 0);
+    REQUIRE(stored->file_metadata()->schema[1].logical_type);
+    CHECK(stored->file_metadata()->schema[1].logical_type->timestamp_type->isAdjustedToUTC);
+  }
+  CHECK(hits.load(std::memory_order_relaxed) >= 2);
+
+  auto utc_path = directory.file("genuine-utc.parquet");
+  std::filesystem::copy_file(corpus() / "schema_variants/timestamp-utc.parquet", utc_path);
+  auto utc_described = manager.describe_parquet(utc_path);
+  REQUIRE(utc_described.names.size() == 1);
+  auto utc_query = "SELECT x FROM read_parquet(" + sirius::test::sql_literal(utc_path) + ")";
+  run_ok("SET gpu_execution=false");
+  auto utc_cpu = con->Query(utc_query);
+  REQUIRE_FALSE(utc_cpu->HasError());
+  run_ok("SET gpu_execution=true");
+  auto before     = sirius::test::get_transparent_execution_stats(*con);
+  auto utc_result = con->Query(utc_query);
+  REQUIRE_FALSE(utc_result->HasError());
+  CHECK(collect_rows(*utc_result) == collect_rows(*utc_cpu));
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.parquet_reader_calls[utc_path] == before.parquet_reader_calls[utc_path]);
+  auto utc_source = manager.create_datasource(utc_path);
+  REQUIRE(utc_source);
+  auto utc_stored = std::dynamic_pointer_cast<parquet_metadata>(utc_source->metadata());
+  REQUIRE(utc_stored);
+  REQUIRE(utc_stored->original_logical_annotations.size() > 1);
+  CHECK(utc_stored->original_logical_annotations[1] == 1);
+  footer_fixture utc_profile("schema_variants/timestamp-utc.parquet");
+  utc_profile.projection.bound_types[0] = duckdb::LogicalType::TIMESTAMP_TZ;
+  CHECK(utc_profile.check({true}).reason == verdict_reason::parquet_type_unqualified);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
@@ -388,6 +549,87 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.parquet_reader_calls == before.parquet_reader_calls);
   run_ok("SET sirius_test_lineage_unmodelled=false");
+}
+
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Parquet D7 separates repetition decimal and logical footer variants",
+                 "[scan][parquet][profile][integration][d7]")
+{
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto& manager = state->get_scan_manager();
+  for (auto const* pair : {"pair-repetition",
+                           "pair-decimal-scale",
+                           "pair-legacy-decimal-scale",
+                           "pair-legacy-decimal-precision",
+                           "pair-type-length",
+                           "pair-logical-unit"}) {
+    auto folder = corpus() / "schema_variants" / pair;
+    auto first  = (folder / "a.parquet").string();
+    auto second = (folder / "b.parquet").string();
+    auto query  = "SELECT x FROM read_parquet(" +
+                 sirius::test::sql_literal((folder / "*.parquet").string()) + ")";
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      CAPTURE(pair, attempt);
+      auto before = sirius::test::get_transparent_execution_stats(*con);
+      compare_gpu_vs_cpu(query);
+      auto after = sirius::test::get_transparent_execution_stats(*con);
+      INFO(pair);
+      CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+      CHECK(after.split_flushed_for_schema == before.split_flushed_for_schema + 1);
+      for (auto const& path : {first, second}) {
+        CHECK(after.parquet_reader_calls[path] == before.parquet_reader_calls[path] + 1);
+      }
+    }
+    auto first_source  = manager.create_datasource(first);
+    auto second_source = manager.create_datasource(second);
+    REQUIRE(first_source);
+    REQUIRE(second_source);
+    auto first_metadata  = std::dynamic_pointer_cast<parquet_metadata>(first_source->metadata());
+    auto second_metadata = std::dynamic_pointer_cast<parquet_metadata>(second_source->metadata());
+    REQUIRE(first_metadata);
+    REQUIRE(second_metadata);
+    CHECK(first_metadata->original_schema != second_metadata->original_schema);
+    if (std::string_view(pair).starts_with("pair-legacy-decimal-")) {
+      REQUIRE(first_metadata->original_logical_annotations.size() > 1);
+      REQUIRE(second_metadata->original_logical_annotations.size() > 1);
+      CHECK(first_metadata->original_logical_annotations[1] == 0);
+      CHECK(second_metadata->original_logical_annotations[1] == 0);
+      if (std::string_view(pair) == "pair-legacy-decimal-precision") {
+        auto const& a = first_metadata->file_metadata()->schema[1];
+        auto const& b = second_metadata->file_metadata()->schema[1];
+        CHECK(a.type_length == b.type_length);
+        CHECK(a.decimal_scale == b.decimal_scale);
+        CHECK(a.decimal_precision != b.decimal_precision);
+        CHECK(first_metadata->arrow_schema.empty());
+        CHECK(second_metadata->arrow_schema.empty());
+        auto const& first_schema  = first_metadata->original_schema;
+        auto const& second_schema = second_metadata->original_schema;
+        REQUIRE(first_schema.size() == second_schema.size());
+        std::size_t differences = 0;
+        for (std::size_t i = 0; i < first_schema.size(); ++i)
+          differences += first_schema[i] != second_schema[i];
+        CHECK(differences == 1);
+      }
+    }
+  }
+  auto utc_folder = corpus() / "schema_variants/pair-logical-utc";
+  auto utc_a      = manager.describe_parquet((utc_folder / "a.parquet").string());
+  auto utc_b      = manager.describe_parquet((utc_folder / "b.parquet").string());
+  REQUIRE(utc_a.return_types.size() == 1);
+  REQUIRE(utc_b.return_types.size() == 1);
+  auto utc_a_source = manager.create_datasource((utc_folder / "a.parquet").string());
+  auto utc_b_source = manager.create_datasource((utc_folder / "b.parquet").string());
+  REQUIRE(utc_a_source);
+  REQUIRE(utc_b_source);
+  auto utc_a_meta = std::dynamic_pointer_cast<parquet_metadata>(utc_a_source->metadata());
+  auto utc_b_meta = std::dynamic_pointer_cast<parquet_metadata>(utc_b_source->metadata());
+  REQUIRE(utc_a_meta);
+  REQUIRE(utc_b_meta);
+  CHECK(utc_a_meta->original_schema != utc_b_meta->original_schema);
+  REQUIRE(utc_a_meta->original_logical_annotations.size() > 1);
+  REQUIRE(utc_b_meta->original_logical_annotations.size() > 1);
+  CHECK(utc_a_meta->original_logical_annotations[1] == 1);
+  CHECK(utc_b_meta->original_logical_annotations[1] == 1);
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

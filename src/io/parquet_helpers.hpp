@@ -21,6 +21,8 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
 
+#include <cstdint>
+#include <span>
 #include <string>
 
 namespace sirius::io::parquet_helpers {
@@ -56,9 +58,12 @@ struct schema_info {
 ///
 /// @throws std::runtime_error on a malformed / truncated nested subtree or an
 ///         unsupported physical type.
-duckdb::LogicalType leaf_schema_type(cudf::io::parquet::SchemaElement const& element);
+duckdb::LogicalType leaf_schema_type(cudf::io::parquet::SchemaElement const& element,
+                                     bool original_logical_annotation = true);
 
 /// With decoded=true, preserve cuDF temporal units and mark unexportable durations SQLNULL.
-schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta, bool decoded = false);
+schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta,
+                           bool decoded                                          = false,
+                           std::span<uint8_t const> original_logical_annotations = {});
 
 }  // namespace sirius::io::parquet_helpers

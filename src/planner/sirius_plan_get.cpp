@@ -960,6 +960,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     node->table_index                  = op.table_index;
     node->contract_window_id           = contract_provenance.window_id;
     node->contract_finalize_generation = contract_provenance.finalize_generation;
+    node->host_export_available        = contract_provenance.host_export_available;
     node->delete_preparation_time_us   = pre_capture.cost.delete_preparation_time_us;
     node->pre_declined                 = marked_decline;
     node->delete_inventory             = std::move(pre_capture.inventory);
@@ -1043,6 +1044,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   node->table_index                  = op.table_index;
   node->contract_window_id           = contract_provenance.window_id;
   node->contract_finalize_generation = contract_provenance.finalize_generation;
+  node->host_export_available        = contract_provenance.host_export_available;
   node->delete_preparation_time_us   = pre_capture.cost.delete_preparation_time_us;
   node->pre_declined                 = marked_decline;
   node->delete_inventory             = std::move(pre_capture.inventory);

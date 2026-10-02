@@ -194,6 +194,19 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   REQUIRE_FALSE(cpu->HasError());
   auto expected = cpu->GetValue(0, 0).ToString();
   run_ok("SET gpu_execution=true");
+  auto previous_batch = con->Query("SELECT current_setting('scan_task_batch_size')::UBIGINT");
+  REQUIRE_FALSE(previous_batch->HasError());
+  struct restore_batch_size {
+    duckdb::Connection& con;
+    uint64_t value;
+    ~restore_batch_size()
+    {
+      try {
+        con.Query("SET scan_task_batch_size=" + std::to_string(value));
+      } catch (...) { /* preserve the test failure */
+      }
+    }
+  } restore{*con, previous_batch->GetValue(0, 0).GetValue<uint64_t>()};
   run_ok("SET scan_task_batch_size=1");
   run_ok("SET sirius_test_hold_footer_index=2");
   auto state = sirius::test::get_registered_sirius_context(*con);

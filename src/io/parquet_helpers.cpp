@@ -155,9 +155,21 @@ duckdb::LogicalType map_byte_array(pq::SchemaElement const& el)
   return duckdb::LogicalType::BLOB;
 }
 
-duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el, bool decoded = false)
+duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el,
+                                        bool decoded                     = false,
+                                        bool original_logical_annotation = true)
 {
   if (decoded) {
+    // The pinned cuDF reader synthesizes a UTC TIMESTAMP logical annotation
+    // for converted-type-only legacy timestamps. DuckDB binds those as plain
+    // TIMESTAMP; only a logicalType present in the raw footer means UTC here.
+    if (!original_logical_annotation && el.converted_type) {
+      switch (*el.converted_type) {
+        case pq::ConvertedType::TIMESTAMP_MILLIS: return duckdb::LogicalType::TIMESTAMP_MS;
+        case pq::ConvertedType::TIMESTAMP_MICROS: return duckdb::LogicalType::TIMESTAMP;
+        default: break;
+      }
+    }
     if (el.logical_type && el.logical_type->type == pq::LogicalType::UNDEFINED)
       return duckdb::LogicalType::SQLNULL;  // annotation unsupported by the pinned decoder
     // Match the pinned cuDF decoder's temporal units. Duration columns have
@@ -170,7 +182,8 @@ duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el, bool decode
         el.logical_type->timestamp_type) {
       // cuDF drops the UTC annotation. Exporting that timezone-free column
       // cannot implement DuckDB's TIMESTAMPTZ conversion, so do not qualify it.
-      if (el.logical_type->timestamp_type->isAdjustedToUTC) return duckdb::LogicalType::SQLNULL;
+      if (el.logical_type->timestamp_type->isAdjustedToUTC && original_logical_annotation)
+        return duckdb::LogicalType::SQLNULL;
       switch (el.logical_type->timestamp_type->unit.type) {
         case pq::TimeUnit::MILLIS: return duckdb::LogicalType::TIMESTAMP_MS;
         case pq::TimeUnit::MICROS: return duckdb::LogicalType::TIMESTAMP;
@@ -222,70 +235,122 @@ bool is_map_annotated(pq::SchemaElement const& el)
   return el.converted_type.has_value() && *el.converted_type == pq::ConvertedType::MAP;
 }
 
-// One mapped subtree: the DuckDB type plus the index of the next sibling in the
-// preorder-flattened schema array.
-struct mapped_subtree {
-  duckdb::LogicalType type;
-  std::size_t next;
-};
-
-// Map the subtree rooted at `idx` (preorder) to a DuckDB LogicalType, advancing
-// past it so the caller resumes at the next sibling. Throws on a truncated or
-// malformed nested subtree.
-mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx, bool decoded)
+// A normalized cuDF schema can append nodes to the original preorder array.
+// Its children_idx links are authoritative. Hand-built test metadata has no
+// links, so derive children from the original preorder layout in that case.
+std::size_t preorder_end(pq::FileMetaData const& meta, std::size_t idx)
 {
-  if (idx >= meta.schema.size()) {
+  if (idx >= meta.schema.size())
     throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
+  auto next = idx + 1;
+  for (int c = 0; c < meta.schema[idx].num_children; ++c)
+    next = preorder_end(meta, next);
+  return next;
+}
+
+std::vector<std::size_t> children(pq::FileMetaData const& meta, std::size_t idx)
+{
+  auto const& el = meta.schema.at(idx);
+  std::vector<std::size_t> out;
+  out.reserve(el.num_children);
+  if (!el.children_idx.empty()) {
+    for (auto child : el.children_idx) {
+      if (child < 0 || static_cast<std::size_t>(child) >= meta.schema.size())
+        throw std::runtime_error("[parquet_helpers] malformed parquet schema: child index");
+      out.push_back(static_cast<std::size_t>(child));
+    }
+  } else {
+    auto next = idx + 1;
+    for (int c = 0; c < el.num_children; ++c) {
+      if (next >= meta.schema.size())
+        throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
+      out.push_back(next);
+      next = preorder_end(meta, next);
+    }
   }
+  if (out.size() != static_cast<std::size_t>(el.num_children))
+    throw std::runtime_error("[parquet_helpers] malformed parquet schema: child count");
+  return out;
+}
+
+bool has_original_logical(pq::SchemaElement const& el,
+                          std::size_t idx,
+                          std::span<uint8_t const> original_annotations)
+{
+  return original_annotations.empty() || idx >= original_annotations.size()
+           ? el.logical_type.has_value()
+           : original_annotations[idx] != 0;
+}
+
+duckdb::LogicalType map_subtree(pq::FileMetaData const& meta,
+                                std::size_t idx,
+                                bool decoded,
+                                std::span<uint8_t const> original_annotations,
+                                bool list_element = false)
+{
+  if (idx >= meta.schema.size())
+    throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
   auto const& el = meta.schema[idx];
 
-  if (el.num_children == 0) { return {leaf_to_duckdb_type(el, decoded), idx + 1}; }
+  if (el.num_children == 0) {
+    auto type =
+      leaf_to_duckdb_type(el, decoded, has_original_logical(el, idx, original_annotations));
+    // Parquet's one-level repeated primitive is a LIST to DuckDB. A repeated
+    // element inside an annotated LIST is already wrapped by its parent.
+    if (el.repetition_type == pq::FieldRepetitionType::REPEATED && !list_element)
+      return duckdb::LogicalType::LIST(std::move(type));
+    return type;
+  }
+
+  auto const child = children(meta, idx);
 
   if (is_map_annotated(el)) {
-    // el -> key_value group (idx+1) -> key (idx+2), value (after key subtree)
-    std::size_t const kv = idx + 1;
-    if (kv >= meta.schema.size() || meta.schema[kv].num_children < 2) {
+    if (child.size() != 1) {
       throw std::runtime_error("[parquet_helpers] malformed parquet MAP schema for column '" +
                                el.name + "'");
     }
-    auto key   = map_subtree(meta, kv + 1, decoded);
-    auto value = map_subtree(meta, key.next, decoded);
-    return {duckdb::LogicalType::MAP(std::move(key.type), std::move(value.type)), value.next};
+    auto const kv = children(meta, child.front());
+    if (kv.size() != 2)
+      throw std::runtime_error("[parquet_helpers] malformed parquet MAP key/value schema");
+    return duckdb::LogicalType::MAP(map_subtree(meta, kv[0], decoded, original_annotations, true),
+                                    map_subtree(meta, kv[1], decoded, original_annotations, true));
   }
 
   if (is_list_annotated(el)) {
-    // el -> repeated middle group (idx+1) -> element (idx+2)
-    std::size_t const mid = idx + 1;
-    if (mid >= meta.schema.size() || meta.schema[mid].num_children < 1) {
+    if (child.size() != 1) {
       throw std::runtime_error("[parquet_helpers] malformed parquet LIST schema for column '" +
                                el.name + "'");
     }
-    auto element = map_subtree(meta, mid + 1, decoded);
-    return {duckdb::LogicalType::LIST(std::move(element.type)), element.next};
+    auto const mid          = child.front();
+    auto const& middle      = meta.schema[mid];
+    auto const mid_children = children(meta, mid);
+    if (middle.repetition_type == pq::FieldRepetitionType::REPEATED && middle.is_stub() &&
+        mid_children.size() == 1)
+      return duckdb::LogicalType::LIST(
+        map_subtree(meta, mid_children.front(), decoded, original_annotations, true));
+    return duckdb::LogicalType::LIST(map_subtree(meta, mid, decoded, original_annotations, true));
   }
 
   // Plain group with no LIST/MAP annotation => STRUCT over its children.
   duckdb::child_list_t<duckdb::LogicalType> children;
-  std::size_t cur = idx + 1;
-  for (int c = 0; c < el.num_children; ++c) {
-    if (cur >= meta.schema.size()) {
-      throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
-    }
-    auto const child_name = meta.schema[cur].name;
-    auto child            = map_subtree(meta, cur, decoded);
-    children.emplace_back(child_name, std::move(child.type));
-    cur = child.next;
+  for (auto position : child) {
+    children.emplace_back(meta.schema[position].name,
+                          map_subtree(meta, position, decoded, original_annotations));
   }
-  return {duckdb::LogicalType::STRUCT(std::move(children)), cur};
+  auto type = duckdb::LogicalType::STRUCT(std::move(children));
+  if (el.repetition_type == pq::FieldRepetitionType::REPEATED && !list_element)
+    return duckdb::LogicalType::LIST(std::move(type));
+  return type;
 }
 
 }  // namespace
 
-duckdb::LogicalType leaf_schema_type(pq::SchemaElement const& element)
+duckdb::LogicalType leaf_schema_type(pq::SchemaElement const& element,
+                                     bool original_logical_annotation)
 {
   // The Iceberg comparison uses DuckDB's parquet_schema type spelling,
   // including UTC annotations that cuDF does not retain in its output type.
-  if (element.logical_type) {
+  if (element.logical_type && original_logical_annotation) {
     auto const& logical = *element.logical_type;
     if (logical.type == pq::LogicalType::TIMESTAMP && logical.timestamp_type &&
         logical.timestamp_type->isAdjustedToUTC)
@@ -298,7 +363,9 @@ duckdb::LogicalType leaf_schema_type(pq::SchemaElement const& element)
   return leaf_to_duckdb_type(element);
 }
 
-schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta, bool decoded)
+schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta,
+                           bool decoded,
+                           std::span<uint8_t const> original_logical_annotations)
 {
   if (meta.schema.empty()) { throw std::runtime_error("[parquet_helpers] empty parquet schema"); }
 
@@ -306,17 +373,10 @@ schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta, bool dec
   // out in preorder. A flat leaf occupies one element; a nested column (STRUCT /
   // LIST / MAP) occupies a whole subtree that map_subtree consumes recursively,
   // advancing `idx` past it so the next top-level column is mapped correctly.
-  auto const& root = meta.schema.front();
   schema_info out;
-  std::size_t idx = 1;
-  for (int col = 0; col < root.num_children; ++col) {
-    if (idx >= meta.schema.size()) {
-      throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
-    }
+  for (auto idx : children(meta, 0)) {
     out.names.push_back(meta.schema[idx].name);
-    auto mapped = map_subtree(meta, idx, decoded);
-    out.types.push_back(std::move(mapped.type));
-    idx = mapped.next;
+    out.types.push_back(map_subtree(meta, idx, decoded, original_logical_annotations));
   }
   return out;
 }

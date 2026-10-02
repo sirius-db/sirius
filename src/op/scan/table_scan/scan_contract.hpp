@@ -82,6 +82,7 @@ struct physical_column_profile {
   uint32_t converted_annotation  = 0;
   int32_t scale                  = 0;
   int32_t precision              = 0;
+  uint32_t checked_chunks        = 1;
 };
 struct physical_profile {
   uint64_t storage_version = 0;
@@ -429,8 +430,9 @@ struct predicate_contract {
 };
 struct bound_table_scan {
   std::shared_ptr<physical_profile_table> profiles;
-  uint64_t scan_node_id     = 0;
-  duckdb::idx_t table_index = duckdb::DConstants::INVALID_INDEX;
+  bool host_export_available = true;
+  uint64_t scan_node_id      = 0;
+  duckdb::idx_t table_index  = duckdb::DConstants::INVALID_INDEX;
   std::shared_ptr<bound_read_view const> view;
   duckdb::vector<duckdb::LogicalType> output_types;
   column_requirements columns;
