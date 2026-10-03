@@ -75,3 +75,7 @@ test/tpch_performance/log/
 
 PR_digests/
 plans/
+
+# Core dumps (debugging concurrency crashes writes these into the repo root)
+core
+core.*

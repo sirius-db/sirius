@@ -103,6 +103,22 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
+  // Refuse work for a query that is tearing down. A task creation worker can land here after
+  // that query's queue drain already ran, and the task would then sit in the shared queue holding
+  // raw repository pointers into a manager about to be erased.
+  if (_query_lifecycle != nullptr && task) {
+    const auto query_id = sirius::make_query_id(index_keys_for(*task).query_id);
+    const auto state    = _query_lifecycle->state(query_id);
+    if (!state) {
+      if (auto* gpu_task = dynamic_cast<gpu_pipeline_task*>(task.get())) {
+        if (auto handler = gpu_task->get_completion_handler()) {
+          handler->report_error("task_scheduler: query lifecycle registration is missing");
+        }
+      }
+      SIRIUS_LOG_ERROR("task_scheduler: refusing work for unknown query {}", query_id);
+    }
+    if (state != sirius::exec::query_lifecycle_state::open) { return; }
+  }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({
       .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -154,6 +170,17 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
   }
 }
 
+void task_scheduler::set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry)
+{
+  _query_lifecycle = registry;
+
+  // Propagated so each device queue refuses a dying query's tasks too — notably the OOM
+  // reschedule, which re-enters itask_executor::schedule from a worker thread.
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->set_query_lifecycle_registry(registry);
+  }
+}
+
 void task_scheduler::start_query(const planner::query& query)
 {
   const auto& scans = query.get_scan_operators();
@@ -171,14 +198,7 @@ void task_scheduler::start_query(const planner::query& query)
 void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& handler,
                                      std::exception_ptr error)
 {
-  // Report-only: this can be reached from a GPU executor's own worker thread (via
-  // notify_downstream_pipelines() in ~gpu_pipeline_task) or from the task_creator's own worker
-  // thread. stop() joins each gpu_pipeline_executor's manager thread and then blocks in that
-  // executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of that
-  // pool's workers, its slot cannot free until this call returns, so wait_all() would never
-  // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
-  // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
-  // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
+  // Report to THIS query's handler and nothing else.
   if (handler) { handler->report_error(std::move(error)); }
 }
 

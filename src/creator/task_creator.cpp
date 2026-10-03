@@ -438,21 +438,43 @@ std::pair<sirius::query_id_t, exec::queue_priority> request_keys_for(
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
   const auto [query_id, priority] = request_keys_for(node);
-  auto request                    = std::make_unique<task_creation_request>();
-  request->node                   = node;
-  request->query_id               = query_id;
-  request->priority               = priority;
+  // Most calls here come from a completion callback (notify_downstream_pipelines, or the GPU
+  // executor scheduling a finished task's consumers). If the query is tearing down, `node` points
+  // into a plan that is about to be destroyed and a drain has very likely already passed this
+  // queue — so refuse rather than enqueue. Previously this was achieved by interrupting the
+  // queue, which refused EVERY query's pushes at once.
+  if (!accepts_work(query_id)) { return; }
+  auto request      = std::make_unique<task_creation_request>();
+  request->node     = node;
+  request->query_id = query_id;
+  request->priority = priority;
   _task_creation_queue.push(std::move(request));
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id_t query_id)
 {
+  if (!accepts_work(query_id)) { return; }
   const auto [_, priority] = request_keys_for(node);
   auto request             = std::make_unique<task_creation_request>();
   request->node            = node;
   request->query_id        = query_id;
   request->priority        = priority;
   _task_creation_queue.push(std::move(request));
+}
+
+bool task_creator::accepts_work(sirius::query_id_t query_id) const
+{
+  if (_query_lifecycle == nullptr) { return true; }
+  const auto state = _query_lifecycle->state(query_id);
+  if (!state) {
+    if (auto query_state = get_query_task_global_state(query_id);
+        query_state && query_state->completion_handler) {
+      query_state->completion_handler->report_error(
+        "task_creator: query lifecycle registration is missing");
+    }
+    SIRIUS_LOG_ERROR("task_creator: refusing work for unknown query {}", query_id);
+  }
+  return state == sirius::exec::query_lifecycle_state::open;
 }
 
 void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
@@ -462,17 +484,18 @@ void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion
   // from inside the dispatched task-creation lambda, or via notify_downstream_pipelines() called
   // from ~gpu_pipeline_task on a GPU executor thread). Calling stop() here would join
   // _manager_thread and then block in _bounded_pool->wait_all() waiting for this very task's slot
-  // to free -- a self-wait deadlock, since the slot can't free until this call returns.
-  // terminate_query() only fulfills the completion future; the query thread (sirius_engine.cpp,
-  // future.get() catch block) observes the error and calls task_scheduler::drain_after_error(),
-  // which drains and restarts every pool from a thread that is never one of their own workers.
+  // to free -- a self-wait deadlock, since the slot can't free until this call returns -- and
+  // would tear down task creation for every other in-flight query besides. terminate_query()
+  // only fulfills the completion future; the query thread (sirius_engine.cpp, future.get() catch
+  // block) observes the error and calls task_scheduler::drain_after_error(), which drains and
+  // restarts every pool from a thread that is never one of their own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
 
 void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error)
 {
-  // A query whose state was already dropped has no handler left to report to; the error is
-  // logged upstream by the caller and there is nothing further to signal.
+  // A query whose state was already dropped has no handler left to report to; the error has
+  // nowhere to go, which is correct — that query is already being torn down.
   auto state = get_query_task_global_state(query_id);
   report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
 }
@@ -494,6 +517,9 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
     state    = it->second;
   }
   if (!state) { return; }
+  // The oldest entry can be a query that has finished and is mid-cleanup but whose state has not
+  // been dropped yet. Warming it up would dereference operators of a plan that is already gone.
+  if (!accepts_work(query_id)) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
   for (; state->index_of_next_lookahead < state->lookahead_queue.size();
