@@ -191,7 +191,8 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
 TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
-  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
 
   CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 100}) ==
         800);
@@ -205,7 +206,7 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
   scan::sirius_gpu_scan_operator native_scan{
-    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
 
   // Five-field aggregate initialization remains source-compatible: the fifth
   // value is working_set_bytes and the trailing conversion marker defaults off. A resident chunk
@@ -236,7 +237,8 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
   scan::sirius_gpu_scan_operator sidecar_scan{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
     /*estimated_cardinality=*/0,
-    /*ingestible=*/{}};
+    /*ingestible=*/{},
+    /*contract_id=*/1};
   sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
 
   // A native cached carrier converting to a narrow plan sidecar the serve site did not size: the
@@ -251,7 +253,8 @@ TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
 TEST_CASE("GPU scan no-history estimates saturate instead of wrapping",
           "[no_history_peak_memory_estimate][gpu_scan]")
 {
-  scan::sirius_gpu_scan_operator scan{/*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}};
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
   auto const max                     = std::numeric_limits<std::size_t>::max();
   auto const multiplication_overflow = max / 8 + 1;
 

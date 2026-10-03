@@ -31,8 +31,12 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "sirius/exception.hpp"
+#include "transparent/read_view_registry.hpp"
+
+#include <duckdb/common/types/blob.hpp>
 
 #include <algorithm>
 #include <functional>
@@ -505,6 +509,48 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
   return "?";
 }
 
+char const* dump_source_kind(op::scan::source_kind kind)
+{
+  switch (kind) {
+    case op::scan::source_kind::duckdb_native: return "duckdb_native";
+    case op::scan::source_kind::parquet_local: return "parquet_local";
+    case op::scan::source_kind::parquet_s3: return "parquet_s3";
+    case op::scan::source_kind::stream_source: return "stream_source";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_depth(op::scan::evidence_depth depth)
+{
+  switch (depth) {
+    case op::scan::evidence_depth::path: return "path";
+    case op::scan::evidence_depth::path_and_size: return "path_and_size";
+    case op::scan::evidence_depth::path_size_and_tag: return "path_size_and_tag";
+  }
+  return "unknown";
+}
+
+char const* dump_verdict(op::scan::eligibility_verdict verdict)
+{
+  switch (verdict) {
+    case op::scan::eligibility_verdict::not_evaluated: return "not_evaluated";
+    case op::scan::eligibility_verdict::supported: return "supported";
+    case op::scan::eligibility_verdict::unsupported: return "unsupported";
+    case op::scan::eligibility_verdict::incomplete: return "incomplete";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_scope(op::scan::certificate_evidence_scope scope)
+{
+  switch (scope) {
+    case op::scan::certificate_evidence_scope::none: return "none";
+    case op::scan::certificate_evidence_scope::binding_correspondence:
+      return "binding_correspondence";
+  }
+  return "unknown";
+}
+
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
@@ -512,8 +558,43 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
+  if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+    auto const& stream = op.Cast<op::sirius_physical_streaming_source>();
+    if (stream.contract_id() != 0 && stream.read_views()) {
+      auto const& entry    = stream.read_views()->entry(stream.contract_id());
+      auto const& contract = entry.contract;
+      auto const* identity =
+        contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+      out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+          << " window="
+          << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+          << " finalize_generation=" << entry.finalize_generation
+          << " source=" << (identity ? identity->source.function_name : "unknown")
+          << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+          << " hash=" << (identity ? identity->fingerprint.hash : 0)
+          << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+          << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+          << (contract.predicates.pushdown_mode.empty() ? "none"
+                                                        : contract.predicates.pushdown_mode)
+          << " scan_cpu_replay="
+          << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                               : "forbidden")
+          << " scan_replay_veto="
+          << (contract.view ? (contract.view->replay_policy.reason.empty()
+                                 ? "none"
+                                 : contract.view->replay_policy.reason)
+                            : "incomplete")
+          << " correspondence="
+          << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
+          << " verdict=" << dump_verdict(entry.eligibility.verdict)
+          << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+          << " outputs=" << contract.output_types.size() << "\n";
+    }
+    return;
+  }
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
+  auto const& scan = op.Cast<op::scan::sirius_gpu_scan_operator>();
+  auto const& info = scan.get_ingestible().table_info();
   // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
   // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
   // identity — two scans of the same files that apply different deletes are not the same scan.
@@ -536,6 +617,85 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
     out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
         << nat->table_name << " oid=" << nat->table_identity.oid << "\n";
   }
+
+  if (scan.contract_id() != 0 && scan.read_views()) {
+    auto const& entry    = scan.read_views()->entry(scan.contract_id());
+    auto const& contract = entry.contract;
+    auto const* identity =
+      contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+    out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+        << " window=" << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+        << " finalize_generation=" << entry.finalize_generation
+        << " source=" << (identity ? identity->source.function_name : "unknown")
+        << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+        << " hash=" << (identity ? identity->fingerprint.hash : 0)
+        << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+        << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+        << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+        << " scan_cpu_replay="
+        << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                             : "forbidden")
+        << " scan_replay_veto="
+        << (contract.view
+              ? (contract.view->replay_policy.reason.empty() ? "none"
+                                                             : contract.view->replay_policy.reason)
+              : "incomplete")
+        << " correspondence="
+        << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
+        << " verdict=" << dump_verdict(entry.eligibility.verdict)
+        << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+        << " outputs=" << contract.output_types.size()
+        << " columns=" << contract.columns.column_ids.size()
+        << " projections=" << contract.columns.projection_ids.size()
+        << " rowid=" << contract.columns.requires_row_id;
+    if (contract.view && contract.view->selector_evidence_required) {
+      auto const& evidence = contract.view->logical_selector_evidence;
+      out << " selector_evidence=\""
+          << (evidence ? duckdb::Blob::ToString(duckdb::string_t(*evidence)) : "missing") << "\"";
+    }
+    out << "\n";
+  }
+}
+
+// Aggregate every GPU-plan scan, independently of whichever pipeline is printed first.
+void dump_plan_replay_policy(std::ostringstream& out, pipeline_conversion_result const& result)
+{
+  bool s3 = false, stream = false, incomplete = false;
+  auto visit = [&](op::sirius_physical_operator const& node) {
+    std::shared_ptr<transparent::read_view_registry> registry;
+    op::scan::scan_contract_id id = 0;
+    if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+      auto const& scan = node.Cast<op::scan::sirius_gpu_scan_operator>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+      auto const& scan = node.Cast<op::sirius_physical_streaming_source>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else
+      return;
+    if (!registry || !id || !registry->entry(id).contract.view) {
+      incomplete = true;
+      return;
+    }
+    auto const& policy = registry->entry(id).contract.view->replay_policy;
+    if (policy.permits_cpu_replay) return;
+    s3 |= policy.source == transparent::byte_source_class::sirius_owned_s3;
+    stream |= policy.source == transparent::byte_source_class::stream;
+    incomplete |= policy.source != transparent::byte_source_class::sirius_owned_s3 &&
+                  policy.source != transparent::byte_source_class::stream;
+  };
+  for (auto const& pipeline : result.scheduled_pipelines) {
+    if (pipeline->get_source()) visit(*pipeline->get_source());
+    for (auto const& node : pipeline->get_operators())
+      visit(node.get());
+  }
+  out << "plan_cpu_replay=" << (s3 || stream || incomplete ? "forbidden" : "permitted") << " veto=";
+  if (!s3 && !stream && !incomplete) out << "none";
+  if (s3) out << "s3";
+  if (stream) out << (s3 ? ",stream" : "stream");
+  if (incomplete) out << (s3 || stream ? ",incomplete" : "incomplete");
+  out << " scope=gpu_plan\n";
 }
 
 //! One `[pipeline N]` block: source/sink/operators with per-scan identity, shared by the
@@ -544,6 +704,7 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
 {
   out << "[pipeline " << index << "]\n";
   out << "  source: " << dump_op_name(p.get_source().get()) << "\n";
+  if (p.get_source()) { dump_scan_identity(out, *p.get_source()); }
   out << "  sink: " << dump_op_name(p.get_sink().get()) << "\n";
   const auto ops = p.get_operators();
   out << "  operators (" << ops.size() << "):\n";
@@ -649,6 +810,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== pipelines (" << ordered.size() << ") ===\n";
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     dump_pipeline_block(out, i, *ordered[i]);
@@ -676,6 +838,7 @@ std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== scheduled pipelines (" << scheduled.size() << ") ===\n";
   for (std::size_t i = 0; i < scheduled.size(); ++i) {
     dump_pipeline_block(out, i, *scheduled[i]);

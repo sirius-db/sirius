@@ -21,7 +21,7 @@ set_target_properties(
   sirius_duckdb_dependency
   PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES
-    "${_duckdb_headers};${SIRIUS_DUCKDB_SOURCE_DIR}/extension/core_functions/include;${SIRIUS_DUCKDB_SOURCE_DIR}/extension/parquet/include"
+    "${_duckdb_headers};${SIRIUS_DUCKDB_SOURCE_DIR}/extension/core_functions/include;${SIRIUS_DUCKDB_SOURCE_DIR}/extension/parquet/include;${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/parquet;${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/thrift"
     INTERFACE_COMPILE_DEFINITIONS "${_duckdb_definitions}"
     INTERFACE_LINK_LIBRARIES
     "duckdb_static;core_functions_extension;parquet_extension")

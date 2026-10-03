@@ -23,19 +23,21 @@
 #include <optional>
 
 namespace sirius {
+namespace transparent {
+class read_view_registry;
+}
 
 class sirius_prepared_statement_data {
  public:
   sirius_prepared_statement_data(
     duckdb::shared_ptr<duckdb::PreparedStatementData> _prepared,
-    duckdb::unique_ptr<op::sirius_physical_operator> _sirius_physical_plan)
-    : sirius_physical_plan(std::move(_sirius_physical_plan)), prepared(_prepared)
-  {
-  }
+    duckdb::unique_ptr<op::sirius_physical_operator> _sirius_physical_plan);
   //! The sirius physical plan
   duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan;
   //! The prepared statement data
   duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;
+  //! Query-local contracts collected from the finalized GPU plan.
+  std::shared_ptr<transparent::read_view_registry> read_views;
 };
 
 struct sirius_active_query_context {
