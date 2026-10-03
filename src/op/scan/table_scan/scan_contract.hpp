@@ -51,7 +51,8 @@ class sirius_datasource;
 
 namespace sirius::op::scan {
 class scan_info;
-}
+struct iceberg_delete_set;
+}  // namespace sirius::op::scan
 namespace sirius::transparent {
 class read_view_registry;
 }
@@ -184,7 +185,8 @@ enum class verdict_reason : uint16_t {
   bind_data_mismatch,
   catalog_entry_missing,
   no_trusted_reference,
-  callback_mismatch
+  callback_mismatch,
+  iceberg_delete_corrupt
 };
 
 struct scan_publication_observation {
@@ -245,7 +247,8 @@ struct physical_check_counters {
     ++native_decoder_calls[group];
   }
   std::atomic<uint64_t> checks{0};
-  std::array<std::atomic<uint64_t>, static_cast<std::size_t>(verdict_reason::callback_mismatch) + 1>
+  std::array<std::atomic<uint64_t>,
+             static_cast<std::size_t>(verdict_reason::iceberg_delete_corrupt) + 1>
     rejections{};
   std::atomic<uint64_t> type_mismatches{0};
   std::atomic<uint64_t> type_refusals{0};
@@ -462,6 +465,7 @@ struct split_dependencies {
   std::optional<uint64_t> checkpoint_iteration;
   std::shared_ptr<physical_profile_table> profiles;
   std::shared_ptr<parquet_input_approval const> parquet_approval;
+  std::shared_ptr<iceberg_delete_set const> delete_set;
 };
 enum class certificate_evidence_scope : uint8_t { none, binding_correspondence };
 struct eligibility_certificate {

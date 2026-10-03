@@ -1309,7 +1309,7 @@ sirius_scan_manager::sirius_scan_manager(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
-  : _config(config),
+  : _config(validate_scan_manager_config(config)),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
@@ -1322,7 +1322,7 @@ sirius_scan_manager::sirius_scan_manager(
     _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
-    _ioctx_registry(config, reservation_manager)
+    _ioctx_registry(_config, reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
@@ -1479,7 +1479,8 @@ void sirius_scan_manager::prepare_for_query(
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
-  auto state               = std::make_shared<query_scan_manager_state>();
+  auto state = std::make_shared<query_scan_manager_state>(
+    _config.preparation.resolve(_config.thread_pool.num_threads));
   state->query_token       = sirius::value_of(query_id);
   state->physical_counters = _physical_counters;
   state->pruning_enabled   = enable_pinned_zone_map_pruning;

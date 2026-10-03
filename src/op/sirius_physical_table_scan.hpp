@@ -28,6 +28,10 @@
 #include <memory>
 #include <optional>
 
+namespace sirius::scan_manager {
+class preparation_admission;
+}
+
 namespace sirius {
 namespace transparent {
 class read_view_registry;
@@ -81,6 +85,9 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              duckdb::vector<duckdb::Value> parameters,
                              duckdb::virtual_column_map_t virtual_columns,
                              duckdb::vector<duckdb::LogicalType> duckdb_types = {});
+
+  // All scans reference one statement admission owner.
+  std::shared_ptr<scan_manager::preparation_admission> preparation_admission;
 
   //! The table function
   duckdb::TableFunction function;

@@ -40,6 +40,13 @@ class ioctx;
 
 namespace sirius::op::scan {
 
+/// Independent input for a DV preparation task; contains no borrowed context/provider.
+struct dv_descriptor {
+  std::string referenced_data_file;
+  int64_t content_offset, content_size_in_bytes, record_count, file_size_in_bytes;
+  std::string puffin_path;
+};
+
 /// One file entry from an Iceberg manifest: equality-delete files and V3 deletion vectors.
 struct IcebergDeleteFileEntry {
   std::string file_path;

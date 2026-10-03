@@ -931,7 +931,9 @@ class sirius_scan_manager {
   struct query_scan_manager_state {
     ~query_scan_manager_state() { drain(); }
 
-    query_scan_manager_state()                                           = default;
+    explicit query_scan_manager_state(preparation_options options) : preparation(std::move(options))
+    {
+    }
     query_scan_manager_state(const query_scan_manager_state&)            = delete;
     query_scan_manager_state& operator=(const query_scan_manager_state&) = delete;
     query_scan_manager_state(query_scan_manager_state&&)                 = delete;
@@ -941,6 +943,7 @@ class sirius_scan_manager {
     //! call outside the state mutex — it can block for as long as an in-flight read.
     void drain() noexcept;
 
+    preparation_options const preparation;  // Immutable attempt snapshot.
     uint64_t query_token = 0;
     std::shared_ptr<op::scan::physical_check_counters> physical_counters;
 

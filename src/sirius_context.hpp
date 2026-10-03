@@ -343,7 +343,7 @@ class SiriusContext : public ClientContextState {
     uint64_t checkpoint_revalidation_failures = 0;
     uint64_t lease_held_at_replay             = 0;
     static constexpr std::size_t semantic_reason_count =
-      static_cast<std::size_t>(sirius::op::scan::verdict_reason::callback_mismatch) + 1;
+      static_cast<std::size_t>(sirius::op::scan::verdict_reason::iceberg_delete_corrupt) + 1;
     std::array<uint64_t, semantic_reason_count> semantic_declines{};
     std::array<uint64_t, 3> semantic_verdicts{};
     uint64_t certification_added_time_us_sum = 0;
@@ -354,8 +354,8 @@ class SiriusContext : public ClientContextState {
     uint64_t delete_preparation_time_us      = 0;
     std::array<uint64_t, 2> budget_exceeded{};
     uint64_t setting_lookups_per_attempt = 0;
-    std::array<uint64_t, 8> late_failures{};
-    std::array<uint64_t, 8> late_replays{};
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_failures{};
+    std::array<uint64_t, sirius::transparent::late_failure_cause_count> late_replays{};
     std::array<uint64_t, 6> late_failure_no_replay{};
     uint64_t late_replay_not_read_only  = 0;
     uint64_t discarded_speculative_work = 0;
@@ -958,8 +958,8 @@ class SiriusContext : public ClientContextState {
   mutable std::mutex window_completions_mutex_;
   std::optional<active_execution_window> active_window_;
   std::map<uint64_t, std::shared_ptr<sirius::pipeline::completion_handler>> window_completions_;
-  std::array<std::atomic<uint64_t>, 8> late_failures_{};
-  std::array<std::atomic<uint64_t>, 8> late_replays_{};
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_failures_{};
+  std::array<std::atomic<uint64_t>, sirius::transparent::late_failure_cause_count> late_replays_{};
   std::array<std::atomic<uint64_t>, 6> late_failure_no_replay_{};
   std::atomic<uint64_t> late_replay_not_read_only_{0};
   std::atomic<uint64_t> discarded_speculative_work_{0};
