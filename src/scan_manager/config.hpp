@@ -37,7 +37,7 @@
 namespace sirius::scan_manager {
 
 /// Default uring reactor count; counted in the scan-manager sizing budget below.
-inline constexpr std::size_t default_uring_n_reactors = 1;
+inline constexpr std::size_t default_uring_n_reactors = 4;
 
 /// Default scan-manager pool size: every core left after the other default pools
 /// (downgrade, task_creator, pipeline, uring reactor), never below 4.
@@ -290,6 +290,11 @@ struct scan_manager_config {
     // Without a cache the readahead has nowhere to read into: a prefetched
     // chunk would be dropped before its scan ever asked for it.
     if (!cache.enabled()) { return plan; }
+    // A backend budget of zero is the backend opting out of readahead entirely
+    // (see io::uring::config::n_max_concurrent_scans).  Honor it even under the
+    // opportunistic strategy, which would otherwise substitute the pipeline
+    // width and run a readahead the backend asked not to have.
+    if (backend_budget == 0) { return plan; }
     // Opportunistic schedules against what the executor can run, not what the
     // device can queue: one prefetch per non-scan deployment is only useful
     // while a pipeline thread could still pick up another scan.

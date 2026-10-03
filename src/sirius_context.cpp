@@ -212,6 +212,13 @@ SiriusContext::SiriusContext() = default;
 SiriusContext::~SiriusContext() noexcept
 {
   if (!is_initialized_) {
+    // A context that threw during initialize() may have installed the cuDF
+    // pinned resource before failing; restore it before the slab allocator
+    // members unwind so cuDF is not left with a dangling reference. No-op when
+    // nothing was installed, and the in-initialize() rollback already covers
+    // the common path -- this is the backstop for any other drop-while-
+    // uninitialized route.
+    restore_cudf_pinned_memory_resource();
     event_publisher_->stop();
     return;
   }
@@ -663,9 +670,35 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
   state_ = scope_state::FAILED;
 }
 
+void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
+{
+  // Guarded by prev_pinned_mr_ so this is a no-op when initialize() threw before
+  // installing the resource (or after terminate() already restored it), which is
+  // what makes it safe to call from every teardown and rollback path. noexcept:
+  // runs during stack unwinding and in ~SiriusContext.
+  if (!prev_pinned_mr_.has_value()) { return; }
+  cudf::set_pinned_memory_resource(*prev_pinned_mr_);
+  cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
+  prev_pinned_mr_.reset();
+}
+
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
+
+  // A throw anywhere after the cuDF pinned resource is installed (and before
+  // is_initialized_ is set) must restore cuDF's global pinned resource before
+  // small_pinned_allocator_(_view_) unwind, or cuDF is left holding a dangling
+  // reference to freed slab storage. Idempotent + guarded, so arming it here
+  // (before the install) is safe; dismissed once initialization commits.
+  struct pinned_rollback_guard {
+    SiriusContext* self;
+    bool dismissed = false;
+    ~pinned_rollback_guard()
+    {
+      if (!dismissed) { self->restore_cudf_pinned_memory_resource(); }
+    }
+  } pinned_rollback{this};
 
   config_            = config;
   auto quent_context = sirius::telemetry::make_quent_context(config_.get_telemetry_config());
@@ -957,7 +990,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   scan_manager_->start();
   task_scheduler_->start();
 
-  is_initialized_ = true;
+  is_initialized_           = true;
+  pinned_rollback.dismissed = true;
 }
 
 void SiriusContext::terminate()
@@ -1019,11 +1053,7 @@ void SiriusContext::terminate()
 
   // Restore the previous cuDF pinned memory resource and threshold before destroying the
   // slab allocator — cuDF holds a non-owning reference and would dangle after reset().
-  if (prev_pinned_mr_.has_value()) {
-    cudf::set_pinned_memory_resource(*prev_pinned_mr_);
-    cudf::set_allocate_host_as_pinned_threshold(prev_pinned_threshold_);
-    prev_pinned_mr_.reset();
-  }
+  restore_cudf_pinned_memory_resource();
 
   // Release the slab allocator before tearing down the memory manager, since
   // its owned_allocations_ will return blocks back to the fixed_size_host_memory_resource.
