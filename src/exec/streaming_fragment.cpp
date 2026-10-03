@@ -435,6 +435,46 @@ void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
   _session.close_input(id, sender);
 }
 
+void streaming_fragment::push(stream_id_t id,
+                              sender_id_t sender,
+                              std::shared_ptr<cucascade::data_batch> batch)
+{
+  check_push(id, sender);
+  // The stream can still end between check_push() and here; the session refuses it then.
+  if (!_session.push(id, std::move(batch))) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " refused a batch; it had already ended");
+  }
+}
+
+void streaming_fragment::check_push(stream_id_t id, sender_id_t sender) const
+{
+  require_built("push()");
+  if (_phase != phase::built) {
+    throw sirius::invalid_input_exception("streaming_fragment: push() must happen before run()");
+  }
+  const auto& senders = input_spec(id).expected_senders;
+  if (!senders.empty() && senders.count(sender) == 0) {
+    throw sirius::invalid_input_exception("streaming_fragment: sender " + std::to_string(sender) +
+                                          " is not in the expected set for input stream " +
+                                          std::to_string(id));
+  }
+  if (_session.input_closed(id)) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " refused a batch; it had already ended");
+  }
+}
+
+const stream_input_spec& streaming_fragment::input_spec(stream_id_t id) const
+{
+  auto it = _spec.inputs.find(id);
+  if (it == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no input stream with id " +
+                                          std::to_string(id));
+  }
+  return it->second;
+}
+
 std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(stream_id_t id)
 {
   require_built("pull()");

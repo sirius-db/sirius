@@ -85,13 +85,15 @@ class SIRIUS_FFI_EXPORT Context {
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
 /// streams fed by other fragments without copying.
 ///
-/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
-/// drain via relay_from or result_to_arrow.
+/// Usage order: declare inputs/outputs → build → feed every input (relay_from, or push_arrow then
+/// close_input) → run → drain via relay_from or result_to_arrow.
 ///
 /// Any number of fragments may be built before any runs; run them in any order where each
 /// source runs before its receiver's relay_from. build(), run() and Context::execute_substrait
 /// execute one at a time per Context: a concurrent call waits for the one in progress. run() and
-/// destruction may happen on a thread other than build()'s.
+/// destruction may happen on a thread other than build()'s. Once build() has returned, push_arrow
+/// and close_input may be called from any thread until run(), concurrently with each other and
+/// with other fragments' calls; the Fragment must outlive them.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
@@ -157,6 +159,24 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// (relay_from closes its own sender). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Import one host-memory Arrow record batch (Arrow C Data Interface, a struct array) into
+  /// input stream `stream_id` as sender `sender_id`. The buffers are copied to the GPU before
+  /// this returns, so the caller may release `*array_addr` and `*schema_addr` at once; they are
+  /// never released here. Does not close the sender. Legal between build() and run(). The copy
+  /// takes no memory reservation, and queued batches are not spillable: everything pushed before
+  /// run() must fit in GPU memory beside whatever else runs on the GPU. A sender that already
+  /// closed may still push while another sender of the stream is open.
+  /// Column types must match the declared ones; a decimal128 is narrowed to the declared
+  /// precision's width.
+  /// @throws before build(), once run() started, on an undeclared stream or sender, null or
+  /// released structs, a column-count or type mismatch, a decimal with a different scale or a
+  /// larger precision, dictionary encoding, 64-bit offsets, a timezone-aware timestamp, a
+  /// decimal256, struct-level nulls, a column declared HUGEINT, or a stream that already ended.
+  void push_arrow(std::uint64_t stream_id,
+                  std::uint32_t sender_id,
+                  std::uintptr_t array_addr,
+                  std::uintptr_t schema_addr);
 
   /// Execute the fragment and block until pipelines finish. Every input must be closed first
   /// (relay_from and close_input close their sender). Runs once; after a failure, build a new
