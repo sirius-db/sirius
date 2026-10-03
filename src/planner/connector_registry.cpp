@@ -41,6 +41,7 @@
 
 #include <array>
 #include <mutex>
+#include <tuple>
 #include <typeinfo>
 
 namespace sirius::planner {
@@ -55,72 +56,102 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
-std::array<connector, 6> const entries{{{"seq_scan",
-                                         kind::duckdb_native,
-                                         "duckdb.seq_scan.v1",
-                                         matches_bind<duckdb::TableScanBindData>,
-                                         lower_native_scan,
-                                         mode::include_ast_row_masks,
-                                         bytes::duckdb_native,
-                                         true,
-                                         false,
-                                         nullptr,
-                                         std::nullopt},
-                                        {"parquet_scan",
-                                         kind::parquet_local,
-                                         "duckdb.parquet_scan.v1",
-                                         matches_bind<duckdb::MultiFileBindData>,
-                                         lower_parquet_scan,
-                                         mode::membership_masks_only,
-                                         bytes::local_file,
-                                         true,
-                                         false,
-                                         nullptr,
-                                         std::nullopt},
-                                        {"read_parquet",
-                                         kind::parquet_local,
-                                         "duckdb.read_parquet.v1",
-                                         matches_bind<duckdb::MultiFileBindData>,
-                                         lower_parquet_scan,
-                                         mode::membership_masks_only,
-                                         bytes::local_file,
-                                         true,
-                                         false,
-                                         nullptr,
-                                         std::nullopt},
-                                        {"sirius_read_parquet",
-                                         kind::parquet_s3,
-                                         "sirius.read_parquet.v1",
-                                         matches_bind<duckdb::SiriusReadParquetBindData>,
-                                         lower_parquet_scan,
-                                         mode::membership_masks_only,
-                                         bytes::sirius_owned_s3,
-                                         false,
-                                         false,
-                                         nullptr,
-                                         std::nullopt},
-                                        {"iceberg_scan",
-                                         kind::parquet_local,
-                                         "duckdb.iceberg_scan.v1",
-                                         matches_bind<duckdb::MultiFileBindData>,
-                                         lower_iceberg_scan,
-                                         mode::membership_masks_only,
-                                         bytes::local_file,
-                                         true,
-                                         true,
-                                         registered_iceberg_decline_reason,
-                                         std::nullopt},
-                                        {"sirius_stream_source",
-                                         kind::stream_source,
-                                         "sirius.stream_source.v1",
-                                         matches_bind<exec::stream_source_bind_data>,
-                                         nullptr,
-                                         mode::membership_masks_only,
-                                         bytes::stream,
-                                         false,
-                                         false,
-                                         nullptr,
-                                         std::nullopt}}};
+connector make_seq_scan_connector()
+{
+  return {.function_name              = "seq_scan",
+          .kind                       = kind::duckdb_native,
+          .registry_profile           = "duckdb.seq_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::TableScanBindData>,
+          .lower                      = lower_native_scan,
+          .filter_mode                = mode::include_ast_row_masks,
+          .byte_source                = bytes::duckdb_native,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt};
+}
+
+connector make_parquet_scan_connector()
+{
+  return {.function_name              = "parquet_scan",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.parquet_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::membership_masks_only,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt};
+}
+
+connector make_read_parquet_connector()
+{
+  return {.function_name              = "read_parquet",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.read_parquet.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::membership_masks_only,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt};
+}
+
+connector make_sirius_read_parquet_connector()
+{
+  return {.function_name              = "sirius_read_parquet",
+          .kind                       = kind::parquet_s3,
+          .registry_profile           = "sirius.read_parquet.v1",
+          .bind_data_matches          = matches_bind<duckdb::SiriusReadParquetBindData>,
+          .lower                      = lower_parquet_scan,
+          .filter_mode                = mode::membership_masks_only,
+          .byte_source                = bytes::sirius_owned_s3,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt};
+}
+
+connector make_iceberg_scan_connector()
+{
+  return {.function_name              = "iceberg_scan",
+          .kind                       = kind::parquet_local,
+          .registry_profile           = "duckdb.iceberg_scan.v1",
+          .bind_data_matches          = matches_bind<duckdb::MultiFileBindData>,
+          .lower                      = lower_iceberg_scan,
+          .filter_mode                = mode::membership_masks_only,
+          .byte_source                = bytes::local_file,
+          .permits_cpu_replay         = true,
+          .selector_outside_bind_data = true,
+          .decline_reason             = registered_iceberg_decline_reason,
+          .provider                   = std::nullopt};
+}
+
+connector make_sirius_stream_source_connector()
+{
+  return {.function_name              = "sirius_stream_source",
+          .kind                       = kind::stream_source,
+          .registry_profile           = "sirius.stream_source.v1",
+          .bind_data_matches          = matches_bind<exec::stream_source_bind_data>,
+          .lower                      = nullptr,
+          .filter_mode                = mode::membership_masks_only,
+          .byte_source                = bytes::stream,
+          .permits_cpu_replay         = false,
+          .selector_outside_bind_data = false,
+          .decline_reason             = nullptr,
+          .provider                   = std::nullopt};
+}
+
+std::array<connector, 6> const entries{make_seq_scan_connector(),
+                                       make_parquet_scan_connector(),
+                                       make_read_parquet_connector(),
+                                       make_sirius_read_parquet_connector(),
+                                       make_iceberg_scan_connector(),
+                                       make_sirius_stream_source_connector()};
 
 #ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
 void* host_factory(duckdb::DatabaseInstance& db, char const* symbol);
@@ -243,54 +274,99 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
   return {};
 }
 
+/// Compares a candidate scan against an independently obtained trusted function definition.
 struct verified_callbacks {
   explicit verified_callbacks(duckdb::TableFunction const& value) : reference(value) {}
+  /// Borrowed trusted definition; it must outlive this comparison object.
   duckdb::TableFunction const& reference;
 
   bool matches(duckdb::TableFunction const& candidate) const
   {
     // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
     // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
-    return reference.function == candidate.function && reference.bind == candidate.bind &&
-           reference.bind_replace == candidate.bind_replace &&
-           reference.bind_operator == candidate.bind_operator &&
-           reference.init_global == candidate.init_global &&
-           reference.init_local == candidate.init_local &&
-           reference.in_out_function == candidate.in_out_function &&
-           reference.in_out_function_final == candidate.in_out_function_final &&
-           reference.statistics == candidate.statistics &&
-           reference.statistics_extended == candidate.statistics_extended &&
-           reference.dependency == candidate.dependency &&
-           reference.cardinality == candidate.cardinality &&
-           reference.pushdown_complex_filter == candidate.pushdown_complex_filter &&
-           reference.pushdown_expression == candidate.pushdown_expression &&
-           reference.get_partition_data == candidate.get_partition_data &&
-           reference.get_bind_info == candidate.get_bind_info &&
-           reference.type_pushdown == candidate.type_pushdown &&
-           reference.get_multi_file_reader == candidate.get_multi_file_reader &&
-           reference.supports_pushdown_type == candidate.supports_pushdown_type &&
-           reference.supports_pushdown_extract == candidate.supports_pushdown_extract &&
-           reference.get_partition_info == candidate.get_partition_info &&
-           reference.get_partition_stats == candidate.get_partition_stats &&
-           reference.get_virtual_columns == candidate.get_virtual_columns &&
-           reference.get_row_id_columns == candidate.get_row_id_columns &&
-           reference.set_scan_order == candidate.set_scan_order &&
-           reference.serialize == candidate.serialize &&
-           reference.deserialize == candidate.deserialize &&
-           reference.projection_pushdown == candidate.projection_pushdown &&
-           reference.filter_pushdown == candidate.filter_pushdown &&
-           reference.filter_prune == candidate.filter_prune &&
-           reference.sampling_pushdown == candidate.sampling_pushdown &&
-           reference.late_materialization == candidate.late_materialization &&
-           reference.order_preservation_type == candidate.order_preservation_type &&
-           reference.global_initialization == candidate.global_initialization &&
-           reference.arguments == candidate.arguments && reference.varargs == candidate.varargs &&
-           reference.named_parameters == candidate.named_parameters;
+    return std::tie(reference.function,
+                    reference.bind,
+                    reference.bind_replace,
+                    reference.bind_operator,
+                    reference.init_global,
+                    reference.init_local,
+                    reference.in_out_function,
+                    reference.in_out_function_final,
+                    reference.statistics,
+                    reference.statistics_extended,
+                    reference.dependency,
+                    reference.cardinality,
+                    reference.pushdown_complex_filter,
+                    reference.pushdown_expression,
+                    reference.get_partition_data,
+                    reference.get_bind_info,
+                    reference.type_pushdown,
+                    reference.get_multi_file_reader,
+                    reference.supports_pushdown_type,
+                    reference.supports_pushdown_extract,
+                    reference.get_partition_info,
+                    reference.get_partition_stats,
+                    reference.get_virtual_columns,
+                    reference.get_row_id_columns,
+                    reference.set_scan_order,
+                    reference.serialize,
+                    reference.deserialize,
+                    reference.projection_pushdown,
+                    reference.filter_pushdown,
+                    reference.filter_prune,
+                    reference.sampling_pushdown,
+                    reference.late_materialization,
+                    reference.order_preservation_type,
+                    reference.global_initialization,
+                    reference.arguments,
+                    reference.varargs,
+                    reference.named_parameters) == std::tie(candidate.function,
+                                                            candidate.bind,
+                                                            candidate.bind_replace,
+                                                            candidate.bind_operator,
+                                                            candidate.init_global,
+                                                            candidate.init_local,
+                                                            candidate.in_out_function,
+                                                            candidate.in_out_function_final,
+                                                            candidate.statistics,
+                                                            candidate.statistics_extended,
+                                                            candidate.dependency,
+                                                            candidate.cardinality,
+                                                            candidate.pushdown_complex_filter,
+                                                            candidate.pushdown_expression,
+                                                            candidate.get_partition_data,
+                                                            candidate.get_bind_info,
+                                                            candidate.type_pushdown,
+                                                            candidate.get_multi_file_reader,
+                                                            candidate.supports_pushdown_type,
+                                                            candidate.supports_pushdown_extract,
+                                                            candidate.get_partition_info,
+                                                            candidate.get_partition_stats,
+                                                            candidate.get_virtual_columns,
+                                                            candidate.get_row_id_columns,
+                                                            candidate.set_scan_order,
+                                                            candidate.serialize,
+                                                            candidate.deserialize,
+                                                            candidate.projection_pushdown,
+                                                            candidate.filter_pushdown,
+                                                            candidate.filter_prune,
+                                                            candidate.sampling_pushdown,
+                                                            candidate.late_materialization,
+                                                            candidate.order_preservation_type,
+                                                            candidate.global_initialization,
+                                                            candidate.arguments,
+                                                            candidate.varargs,
+                                                            candidate.named_parameters);
   }
 };
+/// Process-wide verification state for one connector, indexed alongside entries.
+/// Catalog entries are checked against this independent reference and never grant trust.
 struct accepted_callbacks {
+  /// Serializes reference resolution/publication and the one-time warning state.
   std::mutex mutex;
+  /// Caches trusted definitions, including an unavailable resolution result.
   detail::connector_reference_cache reference;
+  /// Prevents repeated warnings when a connector has no trusted definition.
   bool missing_reference_reported = false;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
@@ -316,6 +392,7 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
   }
 }
 
+/// Publishes trusted Iceberg callbacks when Iceberg loads after Sirius.
 class scan_source_extension_callback final : public duckdb::ExtensionCallback {
  public:
   void OnExtensionLoaded(duckdb::DatabaseInstance& db, std::string const& name) override
