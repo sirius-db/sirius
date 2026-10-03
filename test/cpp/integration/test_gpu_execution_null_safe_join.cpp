@@ -331,3 +331,66 @@ TEST_CASE_METHOD(MixedKeyNullSafeJoinFixture,
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.b IN (SELECT mnr.b FROM mnr) AS in_b FROM mnl");
   compare_gpu_vs_cpu("SELECT mnl.id, mnl.a IN (SELECT mnr.a FROM mnr) AS in_a FROM mnl");
 }
+
+// Below, every key is IS NOT DISTINCT FROM, the join a set operation lowers to. Each case disables
+// BUILD_SIDE_PROBE_SIDE so the join keeps its left-side type instead of flipping to a RIGHT_ form.
+
+// Two-column keys where a NULL in either column must still match the same NULL on the other side.
+class PartialNullKeyJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  PartialNullKeyJoinFixture()
+  {
+    run_ok("CREATE TABLE pl (id INTEGER, a INTEGER, b INTEGER);");
+    run_ok("CREATE TABLE pr (id INTEGER, a INTEGER, b INTEGER);");
+    run_ok("INSERT INTO pl VALUES (1, 1, NULL), (2, NULL, NULL), (3, 1, 2);");
+    run_ok("INSERT INTO pr VALUES (100, 1, NULL), (101, NULL, NULL), (102, 1, 3);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+// DuckDB compares -0.0 equal to 0.0 and NaN equal to NaN; the GPU join must too.
+class FloatKeyJoinFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  FloatKeyJoinFixture()
+  {
+    run_ok("CREATE TABLE fl (id INTEGER, k DOUBLE);");
+    run_ok("CREATE TABLE fr (id INTEGER, k DOUBLE);");
+    run_ok("INSERT INTO fl VALUES (1, -(0.0::DOUBLE)), (2, 'NaN'::DOUBLE), (3, 1.5);");
+    run_ok("INSERT INTO fr VALUES (100, 0.0), (101, 'NaN'::DOUBLE), (102, 2.5);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(NullSafeJoinFixture,
+                 "gpu_execution all-null-safe SEMI join matches NULL to NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Ids 1, 2 and 3 survive: l's NULL keys match r's NULL key.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT l.id, l.k FROM l SEMI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM l SEMI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+}
+
+TEST_CASE_METHOD(PartialNullKeyJoinFixture,
+                 "gpu_execution two-key all-null-safe SEMI join matches partial NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Ids 1 and 2 survive; id 3 differs from (1, 3) in its non-NULL column.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT pl.id, pl.a, pl.b FROM pl SEMI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM pl SEMI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+}
+
+TEST_CASE_METHOD(FloatKeyJoinFixture,
+                 "gpu_execution all-null-safe SEMI join on DOUBLE keys matches signed zero and NaN",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The CPU keeps ids 1 and 2. Ids only, so the comparison does not depend on how -0.0 prints.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT fl.id FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+}
