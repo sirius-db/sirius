@@ -238,7 +238,8 @@ class GpuExecutionFixture {
   /// plan, returning exactly the CPU results. Distinct from expect_gpu_fallback, which asserts a
   /// fallback *after* GPU execution started: a plan-time rejection moves `fallbacks` and never
   /// increments `executions`. Use for shapes Sirius screens out at plan time on purpose.
-  void expect_plan_fallback_matches_cpu(const std::string& query)
+  /// Set `ordered` for queries whose deterministic output order must also match.
+  void expect_plan_fallback_matches_cpu(const std::string& query, bool ordered = false)
   {
     run_ok("SET gpu_execution = true;");
     auto const before = sirius::test::get_transparent_execution_stats(*con);
@@ -261,8 +262,8 @@ class GpuExecutionFixture {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
-    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
-    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>(), true);
+    auto gpu_rows = collect_rows(gpu_result->Cast<duckdb::MaterializedQueryResult>(), !ordered);
+    auto cpu_rows = collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>(), !ordered);
     REQUIRE(gpu_rows == cpu_rows);
   }
 

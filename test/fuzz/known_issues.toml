@@ -1,0 +1,11 @@
+# Findings matching an entry are reported as known_issue (counted, not failed).
+# Every entry needs an issue link. `pattern` is a case-insensitive regex over the
+# finding's reason and detail; optional `sql_pattern` must also match the (reduced)
+# query; optional `verdicts` restricts the verdict kinds.
+
+[[issue]]
+pattern = "Distinct aggregates not supported in GPU path"
+sql_pattern = "count\\(DISTINCT"
+issue = "sirius-db/sirius#1218"
+note = "ungrouped COUNT(DISTINCT) is not supported by the GPU runtime (thrown by sirius_physical_ungrouped_aggregate)"
+verdicts = ["runtime_fallback"]
