@@ -198,6 +198,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
+    test/cpp/planner/test_set_operation_lowering.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
     test/cpp/planner/test_query_id.cpp
     test/cpp/planner/test_query_index.cpp
