@@ -142,9 +142,9 @@ class ReferenceHarnessTests(unittest.TestCase):
                     [
                         sys.executable,
                         "-c",
-                        "import sys,time; print('out-marker',flush=True); print('err-marker',file=sys.stderr,flush=True); time.sleep(10)",
+                        "import sys,time; print('out-marker',flush=True); print('err-marker',file=sys.stderr,flush=True); time.sleep(60)",
                     ],
-                    timeout=1,
+                    timeout=5,
                     cwd=tmp,
                     log=log,
                 )
@@ -269,6 +269,13 @@ class ReferenceHarnessTests(unittest.TestCase):
     def test_malformed_output_is_not_ignored(self):
         with self.assertRaises(ValueError):
             decode_results('warning or corrupted output\n[{"v":1}]')
+
+
+class ColumnOrderTests(unittest.TestCase):
+    def test_result_object_column_order_is_checked(self):
+        case = {"columns": [["a", "BIGINT"], ["b", "BIGINT"]], "rows": [[1, 2]]}
+        with self.assertRaisesRegex(AssertionError, "Column names/order"):
+            compare_rows(case, [{"b": 2, "a": 1}])
 
 
 if __name__ == "__main__":

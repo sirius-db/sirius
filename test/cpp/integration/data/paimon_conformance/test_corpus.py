@@ -119,6 +119,8 @@ class CorpusTests(unittest.TestCase):
             "partitions",
             "partition_columns",
             "snapshot",
+            "partition_value",
+            "live_file",
         ):
             with self.subTest(mutation=mutation):
                 manifest = copy.deepcopy(self.manifest)
@@ -139,3 +141,19 @@ class CorpusTests(unittest.TestCase):
                     table["snapshots"]["B"] = True
                 with self.assertRaises(ValueError):
                     validate_table_metadata(HERE, manifest)
+
+    def test_stored_snapshot_identity_is_checked(self):
+        for key, value in (("id", 99), ("schemaId", 1)):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                corpus = Path(tmp)
+                shutil.copytree(HERE / "warehouse", corpus / "warehouse")
+                path = (
+                    corpus / "warehouse/reference.db/append_basic/snapshot/snapshot-1"
+                )
+                stored = json.loads(path.read_text())
+                stored[key] = value
+                path.write_text(json.dumps(stored))
+                with self.assertRaisesRegex(
+                    ValueError, "Unexpected snapshot/schema identity"
+                ):
+                    validate_table_metadata(corpus, self.manifest)

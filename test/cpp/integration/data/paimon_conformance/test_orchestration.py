@@ -67,6 +67,8 @@ if 'SET enable_duckdb_fallback=false;' in sql:
         resource.setrlimit(resource.RLIMIT_CORE, (0,0))
         os.kill(os.getpid(), signal.SIGSEGV)
     sys.exit(1)
+if fault == 'mutate_warehouse':
+    with open(corpus+'/warehouse/reader-added-file', 'w') as f: f.write('mutation')
 attached = 'ATTACH ' in sql
 case = None
 for candidate in spec['cases']:
@@ -235,3 +237,41 @@ for result in results: print(json.dumps(result))
         self.assertIn("No qualified Paimon artifact", str(error))
         self.assertEqual(report["not_run_cases"], 5)
         self.assertEqual(len(self.trace.read_text().splitlines()), 1)
+
+    def test_tampered_extension_fails_before_load(self):
+        self.extension.write_bytes(b"tampered after registry creation")
+        report, error = self.run_suite(["empty_rows"])
+        self.assertIn("Unqualified Paimon artifact", str(error))
+        self.assertEqual((report["executed_cases"], report["not_run_cases"]), (0, 5))
+        self.assertEqual(len(self.trace.read_text().splitlines()), 1)
+
+    def test_reader_side_warehouse_mutation_fails_postflight(self):
+        report, error = self.run_suite(["empty_rows"], "mutate_warehouse")
+        self.assertIn("Warehouse inventory differs", str(error))
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual(report["executed_cases"], 5)
+        self.assertTrue(all(c["passed"] for c in report["cases"]))
+
+    def test_output_cannot_be_inside_corpus(self):
+        (self.corpus / "expectations.json").write_text(canonical_json(self.spec))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+            SystemExit
+        ) as error:
+            main(
+                [
+                    str(self.corpus),
+                    "--duckdb",
+                    str(self.cli),
+                    "--paimon-extension",
+                    str(self.extension),
+                    "--registry",
+                    str(self.registry),
+                    "--case",
+                    "empty_rows",
+                    "--output",
+                    str(self.corpus / "reports"),
+                ]
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse((self.corpus / "reports").exists())
+        self.assertFalse(self.trace.exists())
