@@ -16,6 +16,7 @@
 
 #include "../operator/operator_test_utils.hpp"
 #include "exec/streaming_fragment.hpp"
+#include "helper/logical_type.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
@@ -28,13 +29,16 @@
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/materialized_query_result.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -129,6 +133,35 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
     rows += static_cast<std::size_t>(sirius::get_cudf_table_view(**batch).num_rows());
   }
   return rows;
+}
+
+//! region → SUM(amount) from a gather stream of VARCHAR + BIGINT.
+std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
+{
+  std::map<std::string, std::int64_t> groups;
+  while (auto batch = fragment.pull(id)) {
+    auto view = sirius::get_cudf_table_view(**batch);
+    REQUIRE(view.num_columns() == 2);
+    auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
+    auto amounts = sirius::test::operator_utils::copy_column_to_host<std::int64_t>(view.column(1));
+    REQUIRE(regions.size() == amounts.size());
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+      groups[regions[i]] += amounts[i];
+    }
+  }
+  return groups;
+}
+
+void merge_disjoint_groups(std::map<std::string, std::int64_t>& dst,
+                           std::map<std::string, std::int64_t> src)
+{
+  for (auto& [region, amount] : src) {
+    // Hash partitioning sends each key to one destination; a split would mean the
+    // sink hashed the same region onto both roots.
+    INFO("region=" << region);
+    REQUIRE(dst.count(region) == 0);
+    dst[region] = amount;
+  }
 }
 
 }  // namespace
@@ -1114,6 +1147,115 @@ TEST_CASE_METHOD(fragment_fixture,
     con->Rollback();
   } catch (...) {
     other_con->Rollback();
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-14: two-shard GROUP BY (partial SUM → hash N=2 → merge SUM). Same process,
+// relay_from, sender-set EOS. No FFI, no Arrow — the GPU seam the CN will
+// later hop with Arrow.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-14: two-shard GROUP BY via hash sink and sender-set EOS",
+                 "[integration][streaming_fragment]")
+{
+  sirius::test::scratch_dir sales("frag6_sales");
+  auto const sales_0 = sales.file("sales_0.parquet");
+  auto const sales_1 = sales.file("sales_1.parquet");
+
+  {
+    auto off = con->Query("SET gpu_execution = false");
+    REQUIRE(off);
+    REQUIRE_FALSE(off->HasError());
+
+    auto write = [&](const std::string& path, const char* values_sql) {
+      auto copied = con->Query(std::string("COPY (SELECT * FROM (VALUES ") + values_sql +
+                               ") t(region, amount)) TO " + sirius::test::sql_literal(path) +
+                               " (FORMAT PARQUET)");
+      REQUIRE(copied);
+      REQUIRE_FALSE(copied->HasError());
+    };
+    // Distinct keys so a 2-way hash is likely to populate both destinations.
+    write(sales_0,
+          "('east'::VARCHAR, 10::BIGINT), ('west'::VARCHAR, 20::BIGINT), "
+          "('east'::VARCHAR, 5::BIGINT), ('north'::VARCHAR, 3::BIGINT), "
+          "('south'::VARCHAR, 8::BIGINT)");
+    write(sales_1,
+          "('west'::VARCHAR, 7::BIGINT), ('east'::VARCHAR, 3::BIGINT), "
+          "('north'::VARCHAR, 11::BIGINT), ('south'::VARCHAR, 1::BIGINT), "
+          "('midwest'::VARCHAR, 4::BIGINT)");
+  }
+
+  auto expected_result = con->Query(
+    "SELECT region, CAST(SUM(amount) AS BIGINT) FROM ("
+    "SELECT * FROM read_parquet(" +
+    sirius::test::sql_literal(sales_0) + ") UNION ALL SELECT * FROM read_parquet(" +
+    sirius::test::sql_literal(sales_1) + ")) t GROUP BY region");
+  REQUIRE(expected_result);
+  REQUIRE_FALSE(expected_result->HasError());
+  std::map<std::string, std::int64_t> expected;
+  for (std::size_t i = 0; i < expected_result->RowCount(); ++i) {
+    expected[expected_result->GetValue(0, i).ToString()] =
+      expected_result->GetValue(1, i).GetValue<std::int64_t>();
+  }
+  REQUIRE(expected == (std::map<std::string, std::int64_t>{
+                        {"east", 18}, {"west", 27}, {"north", 14}, {"south", 9}, {"midwest", 4}}));
+
+  con->BeginTransaction();
+  try {
+    auto make_leaf = [&](const std::string& path) {
+      fragment_spec spec;
+      spec.plan_source =
+        sirius::test::sql_plan_source("SELECT region, SUM(amount) FROM read_parquet(" +
+                                      sirius::test::sql_literal(path) + ") GROUP BY region");
+      spec.outputs      = {0, 1};
+      spec.partitioning = sirius::op::partition_spec{{0}};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto leaf0 = make_leaf(sales_0);
+    auto leaf1 = make_leaf(sales_1);
+
+    for (auto* leaf : {leaf0.get(), leaf1.get()}) {
+      leaf->build();
+      leaf->run();
+    }
+
+    REQUIRE(leaf0->sink_types().size() == 2);
+    REQUIRE(leaf0->sink_types()[0].id() == sirius::type_id::VARCHAR);
+    REQUIRE(leaf0->sink_types()[1].id() == sirius::type_id::BIGINT);
+    REQUIRE(leaf1->sink_types() == leaf0->sink_types());
+
+    // Stream names match the root SQL (`SUM(amount)`); types come from the leaf sink
+    // so the hop cannot silently widen/narrow.
+    duckdb::vector<sirius::logical_type> hop_types = leaf0->sink_types();
+
+    std::map<std::string, std::int64_t> got;
+    for (stream_id_t dest : {stream_id_t{0}, stream_id_t{1}}) {
+      fragment_spec root_spec;
+      root_spec.plan_source = sirius::test::sql_plan_source(
+        "SELECT region, SUM(amount) FROM sirius_stream_source(0) GROUP BY region");
+      root_spec.inputs[0] = stream_input_spec{{"region", "amount"}, hop_types, {0, 1}};
+      root_spec.outputs   = {1};
+      streaming_fragment root(*con->context, std::move(root_spec));
+
+      root.build();
+      root.relay_from(*leaf0, dest, 0, 0);
+      root.relay_from(*leaf1, dest, 0, 1);
+      root.run();
+
+      auto part = drain_groups(root, 1);
+      INFO("dest=" << dest << " groups=" << part.size());
+      merge_disjoint_groups(got, std::move(part));
+    }
+
+    REQUIRE(got == expected);
+
+    con->Rollback();
+  } catch (...) {
     con->Rollback();
     throw;
   }

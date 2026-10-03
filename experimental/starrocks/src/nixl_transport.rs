@@ -1,0 +1,969 @@
+//! The nixl exchange transport thread.
+//!
+//! One dedicated thread owns the nixl [`nixl_sys::Agent`] — the Rust binding documents a
+//! multithreading deadlock caveat, so every agent touch funnels through the request channel.
+//! The [`NixlTransport`] handle and its request types compile in every build so later CN
+//! wiring can name the seam; only [`NixlTransport::start`] and the thread body need libnixl
+//! and are gated on the `nixl-transport` feature.
+//!
+//! This commit brings the agent up, registers the engine's `cudaMalloc` staging arena as
+//! VRAM, caches local agent metadata for kind Md, and loads a peer's metadata on the
+//! agent thread. Packed send (`SendFragment`) drains a parked sender: lease, WRITE,
+//! `transmit_chunk` Packed frame, release.
+//!
+//! ONE CN PER GPU: the staging arena is registered with nixl as CUDA device 0 of this
+//! process, because that is where the engine allocates it. Device 0 is the engine's GPU
+//! only when the process sees exactly one — later `--gpu-device` exports
+//! `CUDA_VISIBLE_DEVICES` to make that so — and neither nixl nor UCX reports a mismatch,
+//! so bring-up refuses a `CUDA_VISIBLE_DEVICES` that names several devices (see
+//! [`check_single_visible_device`]).
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc::{Sender, channel};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use crate::fragment_executor::{FragmentExecutor, SenderSlot};
+
+/// A bare `nixl_capi_is_stub()` build would dlopen-fail at agent creation; every startup
+/// error message points here so the fix is discoverable.
+#[cfg(feature = "nixl-transport")]
+const ENV_HINT: &str = "export TOOLS_DIR=/home/ubuntu/sirius-wt/tools and source \
+                        experimental/starrocks/scripts/cn-env.sh \
+                        (NIXL_PREFIX/NIXL_PLUGIN_DIR/LD_LIBRARY_PATH); \
+                        set UCX_TLS=cuda_copy,cuda_ipc,tcp,self";
+
+/// One parked sender output to transmit to a remote receiver.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) struct RemoteSendSpec {
+    /// Peer brpc address (unpatched `transmit_chunk` control).
+    pub(crate) peer: SocketAddr,
+    /// Peer nixl agent name (`{advertise_host}:{brpc_port}`).
+    pub(crate) peer_agent_name: String,
+    /// Exchange stream the receiver will attach this hop to.
+    pub(crate) dest_stream: i32,
+    /// Sender ordinal inside that stream.
+    pub(crate) sender_id: i32,
+    /// Sender output column names carried on every frame.
+    pub(crate) names: Vec<String>,
+    /// Parked output this hop drains.
+    pub(crate) slot: SenderSlot,
+}
+
+/// One message to the transport thread.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+pub(crate) enum TransportRequest {
+    /// Load a peer's serialized agent metadata. Returns the remote agent name nixl
+    /// assigned. Idempotent for a given blob. nixl 1.3.2 refuses loading an agent's own
+    /// metadata, so the caller must use a distinct peer.
+    LoadPeerMd {
+        peer_metadata: Vec<u8>,
+        respond: Sender<Result<String, String>>,
+    },
+    /// Drain one parked sender output to a remote receiver: per-batch lease, WRITE, frame.
+    SendFragment {
+        spec: RemoteSendSpec,
+        executor: Arc<dyn FragmentExecutor>,
+        respond: Sender<Result<(), String>>,
+    },
+}
+
+/// Handle to the transport thread. Constructible only with the `nixl-transport` feature
+/// (via [`NixlTransport::start`]); without it the type still exists so the service seam
+/// compiles everywhere.
+#[derive(Debug)]
+pub struct NixlTransport {
+    /// Sender to the transport thread. `Mutex<Option<..>>` makes the `!Sync` sender
+    /// shareable and lets `Drop` close the channel before joining; sends are brief.
+    requests: Mutex<Option<Sender<TransportRequest>>>,
+    /// Transport thread handle, taken and joined on drop.
+    thread: Mutex<Option<JoinHandle<()>>>,
+    /// Cached `get_local_md` blob. The outbound Md leg serves this from the
+    /// caller's thread; only `load_remote_md` goes through the agent thread.
+    #[allow(dead_code)]
+    local_md: Mutex<Option<Arc<Vec<u8>>>>,
+    /// This CN's nixl agent name.
+    #[allow(dead_code)]
+    agent_name: String,
+}
+
+impl NixlTransport {
+    /// Sends one request to the transport thread and blocks for its answer.
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+    fn transport_call<T>(
+        &self,
+        make_request: impl FnOnce(Sender<Result<T, String>>) -> TransportRequest,
+    ) -> Result<T, String> {
+        let (respond_tx, respond_rx) = channel();
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "nixl transport is shutting down".to_string())?
+            .send(make_request(respond_tx))
+            .map_err(|_| "nixl transport thread is not running".to_string())?;
+        respond_rx
+            .recv()
+            .map_err(|_| "nixl transport thread dropped the response".to_string())?
+    }
+
+    /// Cached local agent metadata. Readable from any thread; never touches the agent.
+    #[cfg(feature = "nixl-transport")]
+    pub fn local_md(&self) -> Result<Arc<Vec<u8>>, String> {
+        self.local_md
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| "nixl transport has no cached local metadata".to_string())
+    }
+
+    /// This CN's nixl agent name, set at [`start`](Self::start).
+    #[cfg(feature = "nixl-transport")]
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
+    /// Load a peer's agent metadata on the agent thread. Returns the remote agent name.
+    #[cfg(feature = "nixl-transport")]
+    pub fn load_peer_md(&self, peer_metadata: &[u8]) -> Result<String, String> {
+        self.transport_call(|respond| TransportRequest::LoadPeerMd {
+            peer_metadata: peer_metadata.to_vec(),
+            respond,
+        })
+    }
+
+    /// Packed send path: export parked batches, WRITE them into a peer lease, announce the
+    /// frame over `transmit_chunk`.
+    #[cfg(feature = "nixl-transport")]
+    pub(crate) fn send_fragment(
+        &self,
+        spec: RemoteSendSpec,
+        executor: Arc<dyn FragmentExecutor>,
+    ) -> Result<(), String> {
+        self.transport_call(|respond| TransportRequest::SendFragment {
+            spec,
+            executor,
+            respond,
+        })
+    }
+
+    /// Packed send path. Errors in a build that did not link libnixl.
+    #[cfg(not(feature = "nixl-transport"))]
+    pub(crate) fn send_fragment(
+        &self,
+        spec: RemoteSendSpec,
+        _executor: Arc<dyn FragmentExecutor>,
+    ) -> Result<(), String> {
+        Err(format!(
+            "send_fragment requires the nixl-transport feature (peer={}, dest_stream={}, \
+             sender_id={})",
+            spec.peer_agent_name, spec.dest_stream, spec.sender_id
+        ))
+    }
+}
+
+impl Drop for NixlTransport {
+    fn drop(&mut self) {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(feature = "nixl-transport")]
+impl crate::nixl_chunk::NixlMdHandler for NixlTransport {
+    /// Replies with the cached local blob without touching the agent thread. Only the WRITE
+    /// initiator needs the target's metadata; loading the caller's here would block on this
+    /// CN's transport thread, which deadlocks when both CNs open a hop to each other at once.
+    fn on_peer_md(&self, _peer_metadata: &[u8]) -> Result<Vec<u8>, String> {
+        Ok((*self.local_md()?).to_vec())
+    }
+}
+
+/// The one-CN-per-GPU invariant behind the arena's nixl device ordinal
+/// (`ArenaRegion::device_id` in the agent tier): the staging arena is registered as CUDA
+/// device 0 of this process, which is the device the engine allocated it on only when the
+/// process sees exactly one GPU. An export naming several devices would register the arena
+/// against the wrong one with no error from nixl or UCX, so it is refused. Unset (`None`)
+/// is accepted: the process then sees every GPU and the single-GPU engine uses device 0,
+/// which is what the arena is registered as.
+// Pure, so its tests run in every build; the agent tier that calls it compiles in no CI job.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn check_single_visible_device(exported: Option<&str>) -> Result<(), String> {
+    let Some(visible) = exported else {
+        return Ok(());
+    };
+    let devices = visible
+        .split(',')
+        .map(str::trim)
+        .filter(|device| !device.is_empty())
+        .count();
+    if devices > 1 {
+        return Err(format!(
+            "CUDA_VISIBLE_DEVICES={visible:?} names {devices} devices, but the nixl tier \
+             registers the staging arena as CUDA device 0 of this process (one CN per GPU): \
+             pin each CN to one MIG"
+        ));
+    }
+    Ok(())
+}
+
+/// Bytes of the log-only first-contact bandwidth canary. Tunable via
+/// `SIRIUS_CN_NIXL_CANARY_BYTES`. The GROUP BY shuffle path never gates on the measured GiB/s
+/// (MIG 0→1 host-bounces on this box).
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn canary_bytes() -> u64 {
+    parse_u64_env("SIRIUS_CN_NIXL_CANARY_BYTES").unwrap_or(16 << 20)
+}
+
+/// A small first WRITE settles UCX connection wireup so a later timed WRITE measures the
+/// steady link, not the handshake. Not tunable: it is a wireup settle, not a measurement.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+const WARMUP_BYTES: u64 = 1 << 20;
+
+/// Bound on waiting for one posted WRITE to reach DONE. Tunable via
+/// `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn xfer_timeout() -> Duration {
+    parse_u64_env("SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS")
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(30))
+}
+
+/// Packed WRITEs in flight per hop. Tunable via `SIRIUS_CN_NIXL_WINDOW` (1 = stop-and-wait).
+/// Every in-flight batch holds a local and a receiver lease, so the arena must fit
+/// `window` batches on both sides.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn write_window() -> usize {
+    parse_u64_env("SIRIUS_CN_NIXL_WINDOW").map_or(4, |n| n as usize)
+}
+
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn parse_u64_env(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|&n| n > 0)
+}
+
+#[cfg(feature = "nixl-transport")]
+mod agent_tier {
+    //! Everything that touches libnixl: the transport thread body and its helpers.
+
+    use std::sync::mpsc::Receiver;
+    use std::time::{Duration, Instant};
+
+    use nixl_sys::{
+        Agent, MemType, MemoryRegion, NixlDescriptor, OptArgs, RegistrationHandle, XferDescList,
+        XferOp, XferRequest, XferStatus,
+    };
+    use tracing::info;
+
+    use super::*;
+
+    impl NixlTransport {
+        /// Brings up the transport on a dedicated thread (fail-fast): nixl agent named
+        /// `agent_name`, UCX backend, and `arena` registered as VRAM. Blocks until the
+        /// agent is ready — or bring-up fails — so a missing libnixl, plugin dir, or
+        /// arena surfaces here, before any cross-node query is accepted.
+        ///
+        /// Takes the [`sirius::StagingArena`] handle directly (not a `FragmentExecutor`)
+        /// so bring-up does not need executor staging verbs.
+        pub fn start(agent_name: String, arena: sirius::StagingArena) -> Result<Self, String> {
+            let (request_tx, request_rx) = channel::<TransportRequest>();
+            let (ready_tx, ready_rx) = channel::<Result<Vec<u8>, String>>();
+            let thread_agent_name = agent_name.clone();
+            let thread = std::thread::Builder::new()
+                .name("nixl-transport".to_string())
+                .spawn(move || transport_thread(thread_agent_name, arena, request_rx, ready_tx))
+                .map_err(|err| format!("failed to spawn nixl-transport thread: {err}"))?;
+            match ready_rx.recv() {
+                Ok(Ok(local_md)) => Ok(Self {
+                    requests: Mutex::new(Some(request_tx)),
+                    thread: Mutex::new(Some(thread)),
+                    local_md: Mutex::new(Some(Arc::new(local_md))),
+                    agent_name,
+                }),
+                Ok(Err(err)) => {
+                    let _ = thread.join();
+                    Err(err)
+                }
+                Err(_) => Err("nixl-transport thread exited during bring-up".to_string()),
+            }
+        }
+    }
+
+    /// Transport-thread body: bring the agent up, signal readiness, then serve requests
+    /// until the channel closes.
+    fn transport_thread(
+        agent_name: String,
+        arena: sirius::StagingArena,
+        requests: Receiver<TransportRequest>,
+        ready: Sender<Result<Vec<u8>, String>>,
+    ) {
+        let mut state = match TransportState::bring_up(agent_name, arena) {
+            Ok(state) => {
+                if ready.send(Ok(state.local_md.clone())).is_err() {
+                    return;
+                }
+                state
+            }
+            Err(err) => {
+                let _ = ready.send(Err(err));
+                return;
+            }
+        };
+
+        while let Ok(request) = requests.recv() {
+            match request {
+                TransportRequest::LoadPeerMd {
+                    peer_metadata,
+                    respond,
+                } => {
+                    let _ = respond.send(state.load_peer_md(&peer_metadata));
+                }
+                TransportRequest::SendFragment {
+                    spec,
+                    executor,
+                    respond,
+                } => {
+                    let _ = respond.send(state.send_fragment(&spec, executor.as_ref()));
+                }
+            }
+        }
+        info!("nixl-transport thread shutting down");
+    }
+
+    /// The staging arena as a nixl memory descriptor: device-resident (`cudaMalloc` by
+    /// the arena's contract — pool memory silently degrades over cuda_ipc), device
+    /// ordinal 0 of this process — which [`check_single_visible_device`] holds
+    /// `bring_up_agent` to.
+    #[derive(Debug)]
+    struct ArenaRegion {
+        base: usize,
+        len: usize,
+    }
+
+    impl MemoryRegion for ArenaRegion {
+        unsafe fn as_ptr(&self) -> *const u8 {
+            self.base as *const u8
+        }
+
+        fn size(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl NixlDescriptor for ArenaRegion {
+        fn mem_type(&self) -> MemType {
+            MemType::Vram
+        }
+
+        fn device_id(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Thread-local transport state; the agent never leaves this thread.
+    struct TransportState {
+        agent: Agent,
+        #[allow(dead_code)]
+        agent_name: String,
+        local_md: Vec<u8>,
+        /// Device base of the registered arena; local WRITE addresses are `base + offset`.
+        staging_base: u64,
+        /// Peers that have already run the log-only first-contact canary.
+        canaried: std::collections::HashSet<String>,
+        /// Remote agent name per peer brpc address, once its metadata is loaded.
+        peer_agents: std::collections::HashMap<SocketAddr, String>,
+        /// Keeps the arena registered with the agent for the thread's lifetime.
+        _arena_registration: RegistrationHandle,
+        /// Kept so the `cudaMalloc` region cannot be freed while registered.
+        _arena: sirius::StagingArena,
+    }
+
+    /// Creates one nixl agent with a UCX backend and the staging arena registered as VRAM.
+    /// Returns the agent, the registration (kept alive for the agent's lifetime), and the
+    /// serialized local metadata peers load.
+    ///
+    /// Reachable from the tests so they can register an arena the engine does not own via
+    /// a transport handle.
+    pub(super) fn bring_up_agent(
+        agent_name: &str,
+        staging_base: u64,
+        staging_capacity: u64,
+    ) -> Result<(Agent, RegistrationHandle, Vec<u8>), String> {
+        let visible = std::env::var_os("CUDA_VISIBLE_DEVICES")
+            .map(|exported| exported.to_string_lossy().into_owned());
+        check_single_visible_device(visible.as_deref())?;
+        if visible.is_none() {
+            info!(
+                "CUDA_VISIBLE_DEVICES is unset; registering the staging arena as CUDA device 0 \
+                 (the single-GPU engine's device)"
+            );
+        }
+        let agent = Agent::new(agent_name).map_err(|err| {
+            format!("failed to create nixl agent '{agent_name}': {err} — {ENV_HINT}")
+        })?;
+        let (_mem_types, params) = agent
+            .get_plugin_params("UCX")
+            .map_err(|err| format!("nixl UCX plugin unavailable: {err} — {ENV_HINT}"))?;
+        let backend = agent
+            .create_backend("UCX", &params)
+            .map_err(|err| format!("failed to create the nixl UCX backend: {err} — {ENV_HINT}"))?;
+        let mut opt_args =
+            OptArgs::new().map_err(|err| format!("failed to create nixl opt args: {err}"))?;
+        opt_args
+            .add_backend(&backend)
+            .map_err(|err| format!("failed to select the UCX backend: {err}"))?;
+        let arena = ArenaRegion {
+            base: staging_base as usize,
+            len: staging_capacity as usize,
+        };
+        let arena_registration = agent.register_memory(&arena, Some(&opt_args)).map_err(|err| {
+            format!(
+                "failed to register the {staging_capacity}-byte staging arena with nixl: {err} — \
+                 UCX_TLS must include cuda_copy for VRAM detection ({ENV_HINT})"
+            )
+        })?;
+        let local_md = agent
+            .get_local_md()
+            .map_err(|err| format!("failed to serialize nixl agent metadata: {err}"))?;
+        Ok((agent, arena_registration, local_md))
+    }
+
+    impl TransportState {
+        fn bring_up(agent_name: String, arena: sirius::StagingArena) -> Result<Self, String> {
+            let staging_base = arena.base() as u64;
+            let staging_capacity = arena.capacity();
+            let (agent, arena_registration, local_md) =
+                bring_up_agent(&agent_name, staging_base, staging_capacity)?;
+            info!(
+                agent = %agent_name,
+                staging_base,
+                staging_capacity,
+                md_bytes = local_md.len(),
+                "nixl transport ready; staging arena registered"
+            );
+            Ok(Self {
+                agent,
+                agent_name,
+                local_md,
+                staging_base,
+                canaried: std::collections::HashSet::new(),
+                peer_agents: std::collections::HashMap::new(),
+                _arena_registration: arena_registration,
+                _arena: arena,
+            })
+        }
+
+        fn load_peer_md(&mut self, peer_metadata: &[u8]) -> Result<String, String> {
+            self.agent
+                .load_remote_md(peer_metadata)
+                .map_err(|err| format!("failed to load nixl peer metadata: {err}"))
+        }
+
+        /// Drain one parked sender: first-contact metadata + canary, then per-batch hop.
+        fn send_fragment(
+            &mut self,
+            spec: &RemoteSendSpec,
+            executor: &dyn FragmentExecutor,
+        ) -> Result<(), String> {
+            use crate::nixl_chunk::{PackedExchangeFrame, exchange_md, request_staging_lease};
+
+            let hop_start_us = crate::timing::unix_us();
+            let hop_started = Instant::now();
+            let mut hop = HopTiming::default();
+            let remote_agent = match self.peer_agents.get(&spec.peer) {
+                Some(agent) => agent.clone(),
+                None => {
+                    let peer_md = exchange_md(spec.peer, &self.local_md)?;
+                    let agent = self.load_peer_md(&peer_md)?;
+                    if agent != spec.peer_agent_name {
+                        tracing::warn!(
+                            expected = %spec.peer_agent_name,
+                            loaded = %agent,
+                            "nixl peer agent name differs from the advertised brpc identity"
+                        );
+                    }
+                    self.peer_agents.insert(spec.peer, agent.clone());
+                    agent
+                }
+            };
+            if self.canaried.insert(remote_agent.clone()) {
+                self.first_contact_canary(spec, executor, &remote_agent)?;
+            }
+            hop.md_us = crate::timing::us(hop_started.elapsed());
+
+            let window = write_window();
+            let peer = spec.peer;
+            let names = spec.names.clone();
+            let frame = |seq: i64, eos: bool| PackedExchangeFrame {
+                fragment_instance_id: spec.slot.fragment_instance_id,
+                dest_stream: spec.dest_stream,
+                sender_id: spec.sender_id,
+                seq,
+                eos,
+                names: names.clone(),
+                offset: 0,
+                length: 0,
+                rows: None,
+                metadata: Vec::new(),
+            };
+
+            // Announces leave in seq order on one FIFO thread, so a WRITE never waits on the
+            // previous batch's brpc round trip; the receiver requires seq order.
+            let (frames, bytes, rows) = std::thread::scope(|scope| {
+                let (announce_tx, announce_rx) = channel::<PackedExchangeFrame>();
+                let announcer = scope.spawn(move || {
+                    let mut announce_us = 0u64;
+                    let mut first_error: Option<String> = None;
+                    for frame in announce_rx {
+                        if first_error.is_some() {
+                            continue;
+                        }
+                        let started = Instant::now();
+                        if let Err(err) = frame.transmit_blocking(peer) {
+                            first_error = Some(err);
+                        }
+                        announce_us += crate::timing::us(started.elapsed());
+                    }
+                    (first_error, announce_us)
+                });
+
+                let mut inflight: std::collections::VecDeque<InFlightWrite> =
+                    std::collections::VecDeque::new();
+                let mut seq = 0i64;
+                let mut frames: u64 = 0;
+                let mut bytes: u64 = 0;
+                let mut rows: u64 = 0;
+                let mut drained = false;
+                let pumped = (|| -> Result<(), String> {
+                    loop {
+                        while !drained && inflight.len() < window {
+                            let pack_started = Instant::now();
+                            let next = executor.export_packed_next(spec.slot)?;
+                            hop.pack_us += crate::timing::us(pack_started.elapsed());
+                            let Some(mut batch) = next else {
+                                drained = true;
+                                break;
+                            };
+                            let mut announce = frame(seq, false);
+                            announce.rows = batch.rows;
+                            announce.metadata = std::mem::take(&mut batch.metadata);
+                            seq += 1;
+                            let mut write = InFlightWrite {
+                                request: None,
+                                local_offset: batch.offset,
+                                len: batch.len,
+                                posted: Instant::now(),
+                                posted_us: 0,
+                                frame: announce,
+                            };
+                            if batch.len > 0 {
+                                let lease_started = Instant::now();
+                                let lease = request_staging_lease(peer, batch.len);
+                                hop.lease_us += crate::timing::us(lease_started.elapsed());
+                                let lease = match lease {
+                                    Ok(lease) => lease,
+                                    Err(err) => {
+                                        release_local(executor, batch.offset);
+                                        return Err(err);
+                                    }
+                                };
+                                write.frame.offset = lease.offset;
+                                write.frame.length = batch.len;
+                                write.posted = Instant::now();
+                                write.posted_us = crate::timing::unix_us();
+                                match post_write(
+                                    &self.agent,
+                                    &remote_agent,
+                                    self.staging_base + batch.offset,
+                                    lease.remote_addr,
+                                    batch.len,
+                                ) {
+                                    Ok(request) => write.request = request,
+                                    Err(err) => {
+                                        release_local(executor, batch.offset);
+                                        return Err(err);
+                                    }
+                                }
+                            }
+                            inflight.push_back(write);
+                        }
+                        let Some(mut front) = inflight.pop_front() else {
+                            return Ok(());
+                        };
+                        let waited = wait_write(&self.agent, &remote_agent, &mut front);
+                        if front.len > 0 {
+                            let elapsed = crate::timing::us(front.posted.elapsed());
+                            hop.write_us += elapsed;
+                            hop.write_max_us = hop.write_max_us.max(elapsed);
+                            hop.writes += 1;
+                            hop.write_intervals
+                                .push((front.posted_us, front.posted_us + elapsed));
+                            release_local(executor, front.local_offset);
+                        }
+                        waited?;
+                        frames += 1;
+                        bytes += front.len;
+                        rows += front.frame.rows.unwrap_or(0);
+                        announce_tx
+                            .send(front.frame)
+                            .map_err(|_| "packed announce thread stopped".to_string())?;
+                    }
+                })();
+                // A failed hop still has to let every posted WRITE finish before its local
+                // lease is reused.
+                for mut write in inflight.drain(..) {
+                    let _ = wait_write(&self.agent, &remote_agent, &mut write);
+                    if write.len > 0 {
+                        release_local(executor, write.local_offset);
+                    }
+                }
+                if pumped.is_ok() {
+                    let _ = announce_tx.send(frame(seq, true));
+                }
+                drop(announce_tx);
+                let (announce_error, announce_us) = announcer
+                    .join()
+                    .unwrap_or_else(|_| (Some("packed announce thread panicked".to_string()), 0));
+                hop.announce_us = announce_us;
+                pumped?;
+                if let Some(err) = announce_error {
+                    return Err(err);
+                }
+                Ok::<_, String>((frames, bytes, rows))
+            })?;
+
+            executor.drop_parked(spec.slot)?;
+            info!(
+                peer = %spec.peer,
+                dest_stream = spec.dest_stream,
+                sender_id = spec.sender_id,
+                frames,
+                bytes,
+                rows,
+                window,
+                "shipping packed exchange hop"
+            );
+            if crate::timing::enabled() {
+                hop.log(spec, hop_start_us, hop_started.elapsed(), bytes);
+            }
+            Ok(())
+        }
+
+        fn first_contact_canary(
+            &mut self,
+            spec: &RemoteSendSpec,
+            executor: &dyn FragmentExecutor,
+            remote_agent: &str,
+        ) -> Result<(), String> {
+            use crate::nixl_chunk::{canary_release, request_staging_lease};
+
+            let nbytes = canary_bytes();
+            let local_offset = executor
+                .staging_lease(nbytes)
+                .map_err(|err| format!("failed to lease canary staging bytes locally: {err}"))?;
+            let result = (|| {
+                let lease = request_staging_lease(spec.peer, nbytes)?;
+                let local_addr = self.staging_base + local_offset;
+                bandwidth_canary(
+                    &self.agent,
+                    remote_agent,
+                    local_addr,
+                    lease.remote_addr,
+                    nbytes,
+                )?;
+                canary_release(spec.peer, lease.offset)?;
+                Ok(())
+            })();
+            if let Err(err) = executor.staging_release(local_offset) {
+                tracing::warn!(error = %err, "failed to release the local canary lease");
+            }
+            result
+        }
+    }
+
+    /// Per-hop phase totals for the `SIRIUS_CN_TIMING` "packed hop timing" line.
+    #[derive(Default)]
+    struct HopTiming {
+        md_us: u64,
+        pack_us: u64,
+        lease_us: u64,
+        write_us: u64,
+        write_max_us: u64,
+        announce_us: u64,
+        writes: u64,
+        write_intervals: Vec<(u64, u64)>,
+    }
+
+    impl HopTiming {
+        fn log(&mut self, spec: &RemoteSendSpec, start_us: u64, span: Duration, bytes: u64) {
+            let span_us = crate::timing::us(span).max(1);
+            let wire_busy_us = crate::timing::busy_us(&mut self.write_intervals);
+            info!(
+                peer = %spec.peer,
+                dest_stream = spec.dest_stream,
+                sender_id = spec.sender_id,
+                start_us,
+                span_us,
+                md_us = self.md_us,
+                pack_us = self.pack_us,
+                lease_us = self.lease_us,
+                write_us = self.write_us,
+                write_max_us = self.write_max_us,
+                announce_us = self.announce_us,
+                writes = self.writes,
+                bytes,
+                wire_busy_us,
+                wire_busy_pct = wire_busy_us * 100 / span_us,
+                write_gbs = bytes as f64 / (self.write_us.max(1) as f64 * 1e3),
+                wire_gbs = bytes as f64 / (wire_busy_us.max(1) as f64 * 1e3),
+                "packed hop timing"
+            );
+        }
+    }
+
+    /// One posted packed WRITE and the announce that follows it.
+    struct InFlightWrite {
+        /// `None` once DONE, or for a zero-length batch that never posted.
+        request: Option<XferRequest>,
+        local_offset: u64,
+        len: u64,
+        posted: Instant,
+        posted_us: u64,
+        frame: crate::nixl_chunk::PackedExchangeFrame,
+    }
+
+    fn release_local(executor: &dyn FragmentExecutor, offset: u64) {
+        if let Err(err) = executor.staging_release(offset) {
+            tracing::warn!(error = %err, offset, "failed to release the local packed hop lease");
+        }
+    }
+
+    /// Posts one WRITE `[local_addr, +len)` → `[remote_addr, +len)`. `None` when it completed
+    /// inside the post.
+    fn post_write(
+        agent: &Agent,
+        remote_agent: &str,
+        local_addr: u64,
+        remote_addr: u64,
+        len: u64,
+    ) -> Result<Option<XferRequest>, String> {
+        let mut local = XferDescList::new(MemType::Vram)
+            .map_err(|err| format!("failed to create the local descriptor list: {err}"))?;
+        local.add_desc(local_addr as usize, len as usize, 0);
+        let mut remote = XferDescList::new(MemType::Vram)
+            .map_err(|err| format!("failed to create the remote descriptor list: {err}"))?;
+        remote.add_desc(remote_addr as usize, len as usize, 0);
+        let request = agent
+            .create_xfer_req(XferOp::Write, &local, &remote, remote_agent, None)
+            .map_err(|err| {
+                format!("failed to create a {len}-byte WRITE to agent '{remote_agent}': {err}")
+            })?;
+        let in_progress = agent
+            .post_xfer_req(&request, None)
+            .map_err(|err| format!("failed to post a {len}-byte WRITE: {err}"))?;
+        Ok(in_progress.then_some(request))
+    }
+
+    /// Polls `write` to DONE within [`xfer_timeout`] of its post.
+    fn wait_write(
+        agent: &Agent,
+        remote_agent: &str,
+        write: &mut InFlightWrite,
+    ) -> Result<(), String> {
+        let timeout = xfer_timeout();
+        while let Some(request) = &write.request {
+            if write.posted.elapsed() > timeout {
+                return Err(format!(
+                    "a {}-byte nixl WRITE to agent '{remote_agent}' did not complete within \
+                     {timeout:?} (SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS)",
+                    write.len
+                ));
+            }
+            match agent
+                .get_xfer_status(request)
+                .map_err(|err| format!("failed to poll a nixl WRITE: {err}"))?
+            {
+                XferStatus::Success => write.request = None,
+                XferStatus::InProgress => std::thread::yield_now(),
+            }
+        }
+        Ok(())
+    }
+
+    /// Posts one WRITE and polls it to DONE. Returns the elapsed post-to-done time.
+    pub(super) fn write_and_wait(
+        agent: &Agent,
+        remote_agent: &str,
+        local_addr: u64,
+        remote_addr: u64,
+        len: u64,
+    ) -> Result<Duration, String> {
+        if len == 0 {
+            return Ok(Duration::ZERO);
+        }
+        let posted = Instant::now();
+        let request = post_write(agent, remote_agent, local_addr, remote_addr, len)?;
+        let mut write = InFlightWrite {
+            request,
+            local_offset: 0,
+            len,
+            posted,
+            posted_us: 0,
+            frame: crate::nixl_chunk::PackedExchangeFrame {
+                fragment_instance_id: crate::bench_a2a::BENCH_FRAGMENT_INSTANCE,
+                dest_stream: 0,
+                sender_id: 0,
+                seq: 0,
+                eos: false,
+                names: Vec::new(),
+                offset: 0,
+                length: 0,
+                rows: None,
+                metadata: Vec::new(),
+            },
+        };
+        wait_write(agent, remote_agent, &mut write)?;
+        Ok(posted.elapsed())
+    }
+
+    /// Log-only first-contact WRITE. Returns observed GiB/s; the caller must not treat a
+    /// low number as failure (MIG 0→1 on this box host-bounces).
+    pub(super) fn bandwidth_canary(
+        agent: &Agent,
+        remote_agent: &str,
+        local_addr: u64,
+        remote_addr: u64,
+        nbytes: u64,
+    ) -> Result<f64, String> {
+        write_and_wait(agent, remote_agent, local_addr, remote_addr, WARMUP_BYTES)?;
+        let elapsed = write_and_wait(agent, remote_agent, local_addr, remote_addr, nbytes)?;
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        let gbs = nbytes as f64 / secs / 1e9;
+        info!(
+            remote_agent,
+            nbytes, gbs, "nixl bandwidth canary (log-only; not a gate)"
+        );
+        Ok(gbs)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// GPU + libnixl smoke for the agent tier in one process: two real agents come up
+        /// over the engine's `cudaMalloc` staging arena (registered as VRAM by both, like
+        /// the two CNs of a GROUP BY shuffle), the metadata handshake loads, and a cross-agent
+        /// WRITE between two leases reaches DONE. The measured bandwidth is logged only
+        /// — this test does not assert a floor (MIG 0→1 host-bounces). It does NOT verify
+        /// the transferred bytes (Rust has no view into the device leases). nixl 1.3.2
+        /// refuses loading an agent's own metadata, so the "two processes" are two agents
+        /// here.
+        #[test]
+        #[ignore = "GPU + libnixl smoke: source cn-env.sh, set UCX_TLS, run with --ignored"]
+        fn nixl_cross_agent_write_between_arena_leases() {
+            let _guard = crate::GPU_ENGINE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            // The arena is constructed at context bring-up, only when this is set.
+            // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+            unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "67108864") };
+
+            let ctx = sirius::SiriusContext::new().expect("bring up sirius engine");
+            let arena = ctx
+                .staging_arena()
+                .expect("staging arena (SIRIUS_EXCHANGE_STAGING_BYTES)");
+            let base = arena.base() as u64;
+            let capacity = arena.capacity();
+
+            let (sender_agent, _sender_registration, _sender_md) =
+                bring_up_agent("127.0.0.1:18060", base, capacity)
+                    .expect("bring up the sender-side nixl agent");
+            let (receiver_agent, _receiver_registration, receiver_md) =
+                bring_up_agent("127.0.0.1:18061", base, capacity)
+                    .expect("bring up the receiver-side nixl agent");
+
+            let receiver_name = sender_agent
+                .load_remote_md(&receiver_md)
+                .expect("load the receiver agent's metadata");
+            assert_eq!(receiver_name, "127.0.0.1:18061");
+
+            let nbytes = WARMUP_BYTES.max(canary_bytes().min(capacity / 4));
+            let source = arena.lease(nbytes).expect("source lease");
+            let target = arena.lease(nbytes).expect("target lease");
+            assert_ne!(source, target, "two live leases must not alias");
+
+            let gbs = bandwidth_canary(
+                &sender_agent,
+                &receiver_name,
+                base + source,
+                base + target,
+                nbytes,
+            )
+            .expect("canary WRITE");
+            eprintln!(
+                "nixl cross-agent WRITE: {nbytes} bytes = {gbs:.1} GB/s (log-only; not a gate)"
+            );
+            // gbs is informational. Do not assert a floor.
+            let _ = gbs;
+
+            arena.release(target).expect("release target");
+            arena.release(source).expect("release source");
+            drop(sender_agent);
+            drop(receiver_agent);
+            drop(arena);
+            drop(ctx);
+            // SAFETY: the GPU lock is still held.
+            unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canary_bytes, check_single_visible_device, parse_u64_env, xfer_timeout};
+    use std::time::Duration;
+
+    #[test]
+    fn unset_cuda_visible_devices_is_accepted() {
+        assert_eq!(check_single_visible_device(None), Ok(()));
+    }
+
+    #[test]
+    fn one_visible_device_is_accepted() {
+        assert_eq!(check_single_visible_device(Some("3")), Ok(()));
+        assert_eq!(check_single_visible_device(Some(" 3, ")), Ok(()));
+    }
+
+    #[test]
+    fn several_visible_devices_are_refused() {
+        let err = check_single_visible_device(Some("0,1")).unwrap_err();
+        assert!(err.contains("names 2 devices"), "{err}");
+        assert!(err.contains("pin each CN to one MIG"), "{err}");
+    }
+
+    #[test]
+    fn canary_bytes_defaults_to_16mib_when_unset() {
+        // parse_u64_env is what canary_bytes() uses; avoid mutating process env here.
+        assert_eq!(parse_u64_env("__SIRIUS_CN_NIXL_CANARY_BYTES_UNSET__"), None);
+        let _ = canary_bytes();
+        let _ = xfer_timeout();
+        assert_eq!(super::WARMUP_BYTES, 1 << 20);
+        assert!(Duration::from_secs(30) >= Duration::from_secs(1));
+    }
+}

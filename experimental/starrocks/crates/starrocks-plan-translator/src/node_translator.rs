@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
@@ -20,7 +20,10 @@ use crate::error::{Result, TranslateError};
 use crate::expr_translator::{self, ExprContext, TranslateExpr};
 use crate::scan_paths::ScanFilePaths;
 use crate::type_mapper;
-use crate::{ExtensionRegistry, URN_AGGREGATE, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON};
+use crate::{
+    ExchangeInput, ExtensionRegistry, StreamInputColumn, StreamInputSchema, URN_AGGREGATE,
+    URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON,
+};
 
 /// Partially translated relation plus the StarRocks row layout it emits.
 pub(crate) struct TranslatedRel {
@@ -41,6 +44,24 @@ pub(crate) struct TranslatedRel {
     /// that silently produced a wrong offset the moment an unknown relation
     /// appeared mid-tree. Every relation built here MUST set its true width.
     pub output_width: usize,
+    /// Common-expr columns past the descriptor row. Indices are into this relation's output.
+    pub carried_slots: Vec<CarriedSlot>,
+}
+
+/// A common-expr column a project emits because an ancestor reads it.
+#[derive(Clone)]
+pub(crate) struct CarriedSlot {
+    pub tuple_id: i32,
+    pub slot_id: i32,
+    pub column: usize,
+}
+
+/// One translated fragment: its relation tree plus the stream schemas the caller must declare.
+pub(crate) struct TranslatedFragment {
+    /// Root relation and its row layout.
+    pub root: TranslatedRel,
+    /// Schema of every exchange lowered to a stream read, in translation order.
+    pub stream_inputs: Vec<StreamInputSchema>,
 }
 
 /// Mutable state shared by plan-node translators.
@@ -51,8 +72,14 @@ struct PlanContext<'a> {
     /// scan ranges. Scans with paths emit a `local_files` read; path-less scans
     /// fall back to a named-table read.
     scan_paths: &'a ScanFilePaths,
+    /// Input streams bound to exchange nodes, keyed by receiver node id.
+    exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
     /// Substrait extension registry shared across the whole plan.
     registry: &'a mut ExtensionRegistry,
+    /// Stream schemas recorded as exchanges are lowered, in translation order.
+    stream_inputs: Vec<StreamInputSchema>,
+    /// Common-expr slots each project must emit because an ancestor consumes them.
+    consumed_above: HashMap<i32, Vec<i32>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -60,12 +87,16 @@ impl<'a> PlanContext<'a> {
     fn new(
         desc: &'a DescriptorTable,
         scan_paths: &'a ScanFilePaths,
+        exchange_inputs: &'a HashMap<i32, &'a ExchangeInput>,
         registry: &'a mut ExtensionRegistry,
     ) -> Self {
         Self {
             desc,
             scan_paths,
+            exchange_inputs,
             registry,
+            stream_inputs: Vec::new(),
+            consumed_above: HashMap::new(),
         }
     }
 
@@ -96,6 +127,7 @@ impl TranslatePlan for TPlan {
         if self.nodes.is_empty() {
             return Err(TranslateError::malformed("TPlan.nodes is empty"));
         }
+        ctx.consumed_above = common_slots_consumed_above(self, ctx.desc)?;
         let mut cursor = PlanNodeCursor::new(&self.nodes);
         let translated = cursor.translate_next(ctx)?;
         cursor.ensure_consumed()?;
@@ -164,6 +196,7 @@ fn translate_plan_node(
         TPlanNodeType::SELECT_NODE => translate_select(node, children, ctx),
         TPlanNodeType::PROJECT_NODE => translate_project(node, children, ctx),
         TPlanNodeType::AGGREGATION_NODE => translate_aggregation(node, children, ctx),
+        TPlanNodeType::EXCHANGE_NODE => translate_exchange(node, children, ctx),
         TPlanNodeType::SORT_NODE => translate_sort(node, children, ctx),
         TPlanNodeType::HASH_JOIN_NODE => translate_hash_join(node, children, ctx),
         TPlanNodeType::NESTLOOP_JOIN_NODE => translate_nestloop_join(node, children, ctx),
@@ -185,6 +218,11 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         .sort_node
         .as_ref()
         .and_then(|sort| sort.offset)
+        .or_else(|| {
+            node.exchange_node
+                .as_ref()
+                .and_then(|exchange| exchange.offset)
+        })
         .unwrap_or(0);
     if node.limit < 0 && offset == 0 {
         return input;
@@ -193,6 +231,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         rel,
         row_tuples,
         output_width,
+        carried_slots,
     } = input;
     TranslatedRel {
         rel: Rel {
@@ -205,6 +244,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         },
         row_tuples,
         output_width,
+        carried_slots,
     }
 }
 
@@ -262,6 +302,7 @@ fn translate_scan(
         rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
         row_tuples: vec![tuple_id],
         output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+        carried_slots: Vec::new(),
     };
     apply_conjuncts(input, node, ctx)
 }
@@ -325,18 +366,237 @@ pub(crate) fn translate_plan(
     plan: &TPlan,
     desc: &DescriptorTable,
     scan_paths: &ScanFilePaths,
+    exchange_inputs: &HashMap<i32, &ExchangeInput>,
     registry: &mut ExtensionRegistry,
-) -> Result<TranslatedRel> {
-    let mut ctx = PlanContext::new(desc, scan_paths, registry);
-    plan.translate(&mut ctx)
+) -> Result<TranslatedFragment> {
+    let mut ctx = PlanContext::new(desc, scan_paths, exchange_inputs, registry);
+    let root = plan.translate(&mut ctx)?;
+    Ok(TranslatedFragment {
+        root,
+        stream_inputs: ctx.stream_inputs,
+    })
 }
 
-/// Translates a one-phase `AGGREGATION_NODE` into a Substrait aggregate relation.
+/// Translates an `EXCHANGE_NODE` into a read of the engine stream its senders' batches arrive on.
 ///
-/// Only finalized single-phase aggregation is supported (run StarRocks with
-/// `new_planner_agg_stage = 1`); merge/update phases would require modeling partial aggregate
-/// states. The output row layout is the aggregation output tuple, whose materialized slots are
-/// the grouping keys followed by the aggregate results (StarRocks allocates them in that order).
+/// An exchange is a fragment boundary: the receiver has nothing of its own to read, so the
+/// compute node binds one [`ExchangeInput`] per exchange node, naming the engine view
+/// (`sirius_stream_<node_id>`) the input stream is read through. The read's schema comes from
+/// the FE's `input_row_tuples`; its column names are the sender's, bound positionally.
+///
+/// Common-expr slots an ancestor reads even though the project's output tuple does not
+/// materialize them. Q14's aggregate reads such a slot.
+fn common_slots_consumed_above(
+    plan: &TPlan,
+    desc: &DescriptorTable,
+) -> Result<HashMap<i32, Vec<i32>>> {
+    let mut consumed = HashMap::new();
+    let mut stack: Vec<(usize, i32)> = Vec::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type == TPlanNodeType::PROJECT_NODE
+            && let Some(common) = node
+                .project_node
+                .as_ref()
+                .and_then(|project| project.common_slot_map.as_ref())
+                .filter(|common| !common.is_empty())
+        {
+            let mut candidates = BTreeSet::new();
+            for &slot_id in common.keys() {
+                let mut materialized = false;
+                for &tuple_id in &node.row_tuples {
+                    if desc.materialized_slot_ids(tuple_id)?.contains(&slot_id) {
+                        materialized = true;
+                        break;
+                    }
+                }
+                if !materialized {
+                    candidates.insert(slot_id);
+                }
+            }
+            if !candidates.is_empty() {
+                let mut hits = BTreeSet::new();
+                for &(ancestor, _) in &stack {
+                    collect_slot_ref_hits(&plan.nodes[ancestor], &candidates, &mut hits);
+                }
+                if !hits.is_empty() {
+                    consumed.insert(node.node_id, hits.into_iter().collect());
+                }
+            }
+        }
+        if node.num_children > 0 {
+            stack.push((index, node.num_children));
+        } else {
+            while let Some(top) = stack.last_mut() {
+                top.1 -= 1;
+                if top.1 == 0 {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(consumed)
+}
+
+fn collect_slot_ref_hits(node: &TPlanNode, candidates: &BTreeSet<i32>, hits: &mut BTreeSet<i32>) {
+    let mut exprs: Vec<&TExpr> = Vec::new();
+    exprs.extend(node.conjuncts.as_deref().unwrap_or_default());
+    if let Some(agg) = node.agg_node.as_ref() {
+        exprs.extend(agg.grouping_exprs.as_deref().unwrap_or_default());
+        exprs.extend(&agg.aggregate_functions);
+    }
+    if let Some(project) = node.project_node.as_ref() {
+        exprs.extend(
+            project
+                .slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+        exprs.extend(
+            project
+                .common_slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+    }
+    for expr in exprs {
+        for expr_node in &expr.nodes {
+            if expr_node.node_type == starrocks_thrift::exprs::TExprNodeType::SLOT_REF
+                && let Some(slot_ref) = expr_node.slot_ref.as_ref()
+                && candidates.contains(&slot_ref.slot_id)
+            {
+                hits.insert(slot_ref.slot_id);
+            }
+        }
+    }
+}
+
+/// A merging exchange (`sort_info` present) is a stream read wrapped in a sort.
+fn translate_exchange(
+    node: &TPlanNode,
+    children: Vec<TranslatedRel>,
+    ctx: &mut PlanContext<'_>,
+) -> Result<TranslatedRel> {
+    expect_children(node, &children, 0)?;
+    let exchange = node
+        .exchange_node
+        .as_ref()
+        .ok_or(TranslateError::MissingField {
+            context: "EXCHANGE_NODE",
+            field: "exchange_node",
+        })?;
+    if exchange.input_row_tuples.is_empty() {
+        return Err(TranslateError::MissingField {
+            context: "TExchangeNode",
+            field: "input_row_tuples",
+        });
+    }
+    let input =
+        ctx.exchange_inputs
+            .get(&node.node_id)
+            .ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "exchange node has no bound input stream; the compute node binds one per \
+                         receiver exchange",
+            })?;
+    if input.stream_view.is_empty() {
+        return Err(TranslateError::malformed(format!(
+            "exchange node {} is bound to an input stream with an empty view name",
+            node.node_id
+        )));
+    }
+    let mut schema = ctx
+        .desc
+        .named_struct_for_tuples(&exchange.input_row_tuples)?;
+    let output_width = schema
+        .r#struct
+        .as_ref()
+        .map(|structure| structure.types.len())
+        .unwrap_or(0);
+    if input.names.len() != output_width {
+        return Err(TranslateError::descriptor(format!(
+            "row layout {:?} has {} fields but exchange input has {} names",
+            exchange.input_row_tuples,
+            output_width,
+            input.names.len()
+        )));
+    }
+    schema.names = input.names.clone();
+
+    let columns = schema
+        .names
+        .iter()
+        .cloned()
+        .zip(
+            schema
+                .r#struct
+                .as_ref()
+                .map(|structure| structure.types.as_slice())
+                .unwrap_or_default(),
+        )
+        .map(|(name, ty)| {
+            Ok(StreamInputColumn {
+                name,
+                ty: type_mapper::duckdb_type_name(ty)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctx.stream_inputs.push(StreamInputSchema {
+        node_id: node.node_id,
+        stream_view: input.stream_view.clone(),
+        columns,
+    });
+
+    let mut translated = TranslatedRel {
+        rel: stream_read_rel(schema, &input.stream_view),
+        row_tuples: exchange.input_row_tuples.clone(),
+        output_width,
+        carried_slots: Vec::new(),
+    };
+    if let Some(sort_info) = &exchange.sort_info {
+        let sorts = sort_fields(sort_info, &translated, ctx)?;
+        let row_tuples = translated.row_tuples.clone();
+        translated = TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(translated.rel)),
+                    sorts,
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+            carried_slots: Vec::new(),
+        };
+    }
+    apply_conjuncts(translated, node, ctx)
+}
+
+/// Builds a read of an engine stream view with an explicit schema.
+fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::NamedTable(NamedTable {
+                names: vec![stream_view.to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
+}
+
+/// Translates an `AGGREGATION_NODE` into a Substrait aggregate relation.
+///
+/// The node's phase (one-shot / partial / merge, see [`agg_phase::classify`]) decides whether
+/// two-phase SUM is accepted. One-phase keeps the existing aggregate surface; partial and merge
+/// accept **SUM only**. The output row layout is the aggregation output tuple.
 fn translate_aggregation(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -348,11 +608,12 @@ fn translate_aggregation(
         context: "AGGREGATION_NODE",
         field: "agg_node",
     })?;
-    if !agg.need_finalize || agg.intermediate_tuple_id != agg.output_tuple_id {
+    let phase = crate::agg_phase::classify(node.node_id, node.node_type, agg)?;
+    if agg.intermediate_tuple_id != agg.output_tuple_id {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
             node_type: node.node_type,
-            reason: "only finalized one-phase aggregation is supported (new_planner_agg_stage=1)",
+            reason: "aggregation node has distinct intermediate and output tuples",
         });
     }
     let output_tuple = agg.output_tuple_id;
@@ -360,7 +621,9 @@ fn translate_aggregation(
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
     let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
     for expr in grouping_exprs {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&child.row_tuples)
+            .with_carried(&child.carried_slots);
         grouping_expressions.push(expr.translate(&mut expr_ctx)?);
     }
 
@@ -410,7 +673,9 @@ fn translate_aggregation(
         .iter()
         .zip(&output_slots[grouping_expressions.len()..])
     {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&child.row_tuples)
+            .with_carried(&child.carried_slots);
         let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
@@ -419,6 +684,13 @@ fn translate_aggregation(
                 node_id: node.node_id,
                 node_type: node.node_type,
                 reason: "distinct aggregates without grouping keys are not supported",
+            });
+        }
+        if phase != crate::agg_phase::AggPhase::OneShot && (call.distinct || call.name != "sum") {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "two-phase aggregation supports SUM only",
             });
         }
         let output_type = ctx
@@ -482,6 +754,7 @@ fn translate_aggregation(
         },
         row_tuples: vec![output_tuple],
         output_width,
+        carried_slots: Vec::new(),
     };
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(aggregated, node, ctx)
@@ -590,10 +863,12 @@ fn translate_sort(
         }
         let mut expressions = Vec::with_capacity(slot_exprs.len());
         for expr in slot_exprs {
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            let mut expr_ctx = ctx
+                .expr_context(&child.row_tuples)
+                .with_carried(&child.carried_slots);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
-        project_rel(child, expressions, vec![sort_tuple])
+        project_rel(child, expressions, vec![sort_tuple], Vec::new())
     } else {
         child
     };
@@ -611,6 +886,7 @@ fn translate_sort(
         },
         row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     };
     apply_conjuncts(sorted, node, ctx)
 }
@@ -633,7 +909,9 @@ fn sort_fields(
         .iter()
         .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
         .map(|(expr, (asc, nulls_first))| {
-            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let mut expr_ctx = ctx
+                .expr_context(&input.row_tuples)
+                .with_carried(&input.carried_slots);
             let expr = expr.translate(&mut expr_ctx)?;
             let direction = match (asc, nulls_first) {
                 (true, true) => sort_field::SortDirection::AscNullsFirst,
@@ -789,6 +1067,7 @@ fn translate_hash_join(
         },
         row_tuples,
         output_width,
+        carried_slots: Vec::new(),
     };
     let joined = match output {
         JoinOutput::LeftAnti => {
@@ -924,6 +1203,7 @@ fn translate_nestloop_join(
                     rel,
                     row_tuples,
                     output_width,
+                    carried_slots,
                 } = cross;
                 TranslatedRel {
                     rel: Rel {
@@ -935,6 +1215,7 @@ fn translate_nestloop_join(
                     },
                     row_tuples,
                     output_width,
+                    carried_slots,
                 }
             }
             None => cross,
@@ -1060,7 +1341,34 @@ fn translate_project_node(
         }
     }
 
-    Ok(project_rel(input, expressions, output_tuples))
+    let materialized_count = expressions.len();
+    let consumed = ctx
+        .consumed_above
+        .get(&node.node_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut carried = Vec::with_capacity(consumed.len());
+    for (position, &slot_id) in consumed.iter().enumerate() {
+        let expression = if let Some(expr) = slot_map.get(&slot_id) {
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            expr.translate(&mut expr_ctx)?
+        } else if let Some(&column) = common_slots.get(&(output_tuple, slot_id)) {
+            field_selection(column as i32)
+        } else {
+            return Err(TranslateError::descriptor(format!(
+                "PROJECT_NODE {} common slot {slot_id} is consumed above but has no slot_map entry",
+                node.node_id
+            )));
+        };
+        expressions.push(expression);
+        carried.push(CarriedSlot {
+            tuple_id: output_tuple,
+            slot_id,
+            column: materialized_count + position,
+        });
+    }
+
+    Ok(project_rel(input, expressions, output_tuples, carried))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -1073,7 +1381,8 @@ pub(crate) fn project_exprs(
     // Root projections evaluate over already-translated inputs, so there are no
     // scan nodes to resolve file paths for.
     let scan_paths = ScanFilePaths::default();
-    let mut ctx = PlanContext::new(desc, &scan_paths, registry);
+    let exchange_inputs = HashMap::new();
+    let mut ctx = PlanContext::new(desc, &scan_paths, &exchange_inputs, registry);
     project_exprs_with_context(input, exprs, &mut ctx)
 }
 
@@ -1085,12 +1394,14 @@ fn project_exprs_with_context(
 ) -> Result<TranslatedRel> {
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
     // A root projection over fragment output expressions keeps the input layout.
     let row_tuples = input.row_tuples.clone();
-    Ok(project_rel(input, expressions, row_tuples))
+    Ok(project_rel(input, expressions, row_tuples, Vec::new()))
 }
 
 /// Builds a Substrait project that emits exactly `expressions`.
@@ -1103,6 +1414,7 @@ fn project_rel(
     input: TranslatedRel,
     expressions: Vec<Expression>,
     row_tuples: Vec<i32>,
+    carried_slots: Vec<CarriedSlot>,
 ) -> TranslatedRel {
     let base = input.output_width as i32;
     let output_mapping = (base..base + expressions.len() as i32).collect();
@@ -1123,6 +1435,7 @@ fn project_rel(
         },
         row_tuples,
         output_width,
+        carried_slots,
     }
 }
 
@@ -1145,6 +1458,7 @@ fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1166,6 +1480,7 @@ fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> T
         },
         row_tuples,
         output_width,
+        carried_slots: Vec::new(),
     }
 }
 
@@ -1234,6 +1549,7 @@ fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1285,7 +1601,9 @@ fn apply_conjuncts(
     let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let mut conditions = Vec::with_capacity(conjuncts.len());
     for expr in conjuncts {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
     let Some(condition) = and_conditions(conditions, ctx) else {
@@ -1304,6 +1622,7 @@ fn apply_conjuncts(
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     })
 }
 

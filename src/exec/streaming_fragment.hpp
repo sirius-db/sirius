@@ -50,6 +50,8 @@ struct stream_input_spec {
   duckdb::vector<sirius::logical_type> types;
   /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
+  /// Optional caller-declared row count forwarded to the bind catalog. nullopt = undeclared.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Bound, optimized DuckDB logical plan from Substrait bytes, SQL, or similar.
@@ -118,6 +120,13 @@ class streaming_fragment {
                          stream_id_t input_stream_id,
                          sender_id_t sender_id);
 
+  /// Push one batch into input `id`, for batches that arrive from outside this process. Does not
+  /// close a sender.
+  /// @return false when the input already ended.
+  /// @throws sirius::invalid_input_exception before build(), after run() started, or on an
+  ///         undeclared input.
+  bool push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
+
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
@@ -144,6 +153,15 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build() or on an unknown id, including
   ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
+
+  /// Total rows parked on output stream `id`, without draining it.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a parked
+  ///         batch that is not GPU-resident.
+  [[nodiscard]] std::uint64_t output_row_count(stream_id_t id) const;
+
+  /// The declared spec of input `id`.
+  /// @throws sirius::invalid_input_exception on an undeclared input.
+  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
 
   [[nodiscard]] bool is_result() const { return _spec.outputs.empty(); }
 

@@ -20,6 +20,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_staging_arena.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -27,6 +28,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_sirius_ffi_embedder.cpp
+    test/cpp/exec/test_sirius_ffi_packed.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp

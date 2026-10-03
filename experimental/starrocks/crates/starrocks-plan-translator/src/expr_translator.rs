@@ -23,6 +23,8 @@ pub(crate) struct ExprContext<'a> {
     row_tuples: &'a [i32],
     /// Synthetic StarRocks slots appended while evaluating common project expressions.
     slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
+    /// Common-expr columns the input relation already emits past its descriptor row.
+    carried: Option<&'a [crate::node_translator::CarriedSlot]>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -37,7 +39,17 @@ impl<'a> ExprContext<'a> {
             registry,
             row_tuples,
             slot_overrides: None,
+            carried: None,
         }
+    }
+
+    /// Resolves slot refs against common-expr columns the input already emits.
+    pub(crate) fn with_carried(
+        mut self,
+        carried: &'a [crate::node_translator::CarriedSlot],
+    ) -> Self {
+        self.carried = Some(carried);
+        self
     }
 
     /// Creates an expression context that can resolve synthetic slots not present
@@ -53,6 +65,7 @@ impl<'a> ExprContext<'a> {
             registry,
             row_tuples,
             slot_overrides: Some(slot_overrides),
+            carried: None,
         }
     }
 }
@@ -148,6 +161,7 @@ fn translate_expr_node(
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
             reason: "expression node is outside the v1 StarRocks slice",
@@ -166,18 +180,51 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field = ctx
+    let key = (slot_ref.tuple_id, slot_ref.slot_id);
+    let exact_override = ctx
         .slot_overrides
-        .and_then(|overrides| {
-            overrides
-                .get(&(slot_ref.tuple_id, slot_ref.slot_id))
-                .copied()
-        })
-        .map(Ok)
-        .unwrap_or_else(|| {
-            ctx.desc
+        .and_then(|overrides| overrides.get(&key).copied());
+    let exact_carried = ctx.carried.and_then(|carried| {
+        carried
+            .iter()
+            .find(|slot| (slot.tuple_id, slot.slot_id) == key)
+            .map(|slot| slot.column)
+    });
+    let field = match exact_override.or(exact_carried) {
+        Some(column) => column,
+        None => {
+            match ctx
+                .desc
                 .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
-        })? as i32;
+            {
+                Ok(index) => index,
+                Err(descriptor_error) => {
+                    let candidates = ctx
+                        .carried
+                        .map(|carried| {
+                            carried
+                                .iter()
+                                .filter(|slot| slot.slot_id == key.1)
+                                .map(|slot| slot.column)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    match candidates.as_slice() {
+                        [column] => *column,
+                        [] => return Err(descriptor_error),
+                        _ => {
+                            return Err(TranslateError::descriptor(format!(
+                                "slot {} (tuple {}) matches {} carried common columns by slot id",
+                                key.1,
+                                key.0,
+                                candidates.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    } as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
@@ -522,6 +569,13 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
     })
 }
 
+/// Unwraps a StarRocks `CLONE_EXPR`. The FE inserts it when two slots share one column;
+/// the value is the child, so the clone itself is not a cast.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
+}
+
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
 ///
 /// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
@@ -613,6 +667,15 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    // DuckDB returns BIGINT for year/month/day and length/char_length. The FE slot is narrower
+    // (year SMALLINT, month/day TINYINT, length INT). Cast back so the next hop's schema matches.
+    if matches!(name, "year" | "month" | "day" | "length" | "char_length") {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(cast_to(
+            scalar_function(anchor, children, produced),
+            output_type,
+        ));
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
@@ -668,18 +731,6 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
             reason: "aggregate function root is not an aggregate expression",
-        });
-    }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
         });
     }
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
@@ -897,6 +948,17 @@ fn integer_literal_type(
             node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
             reason: "INT_LITERAL has non-integer scalar type",
         }),
+    }
+}
+
+/// Wraps an expression in a throwing cast to `ty`.
+pub(crate) fn cast_to(input: Expression, ty: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
     }
 }
 
