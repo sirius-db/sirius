@@ -37,6 +37,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
+#include <cudf/strings/case.hpp>
 #include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
@@ -371,6 +372,19 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
 
   //----------Unary Functions----------//
+  // TODO: Handle scalar inputs to these column-only string functions when DuckDB
+  // cannot constant-fold them (e.g. when expression rewriting is disabled).
+  if (resolved_id == function_id::upper || resolved_id == function_id::lower) {
+    D_ASSERT(args.size() == 1);
+    auto input         = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    auto const strings = cudf::strings_column_view(input.get_column_view());
+    // Use cuDF's Unicode mappings, including multi-character expansions. These can
+    // differ from DuckDB's single-code-point mappings (e.g. upper('ß'), lower('İ')).
+    auto result_column = resolved_id == function_id::upper
+                           ? cudf::strings::to_upper(strings, _stream, _mr)
+                           : cudf::strings::to_lower(strings, _stream, _mr);
+    return evaluate_result(std::move(result_column));
+  }
   if (resolved_id == function_id::strlen) {
     D_ASSERT(args.size() == 1);
     auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);

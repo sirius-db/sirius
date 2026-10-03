@@ -48,7 +48,9 @@
 
 // cudf, etc.
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 #include <cuda_runtime_api.h>
@@ -2997,5 +2999,83 @@ TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
     for (size_t i = 0; i < values.size(); ++i) {
       REQUIRE(out_host[i] == ((valids[i] && values[i] == 30) ? 0U : 1U));
     }
+  }
+}
+
+TEMPLATE_TEST_CASE("evaluate string case conversion",
+                   "[expression_evaluator][string_case]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto string_type        = logical_type::make(type_id::VARCHAR);
+  auto const id           = GENERATE(sirius::function_id::upper, sirius::function_id::lower);
+
+  // Include ASCII, empty strings, NULL, Unicode, and mappings that expand into
+  // multiple code points. The expectations deliberately follow cuDF semantics.
+  std::vector<std::string> const values{"HeLLo 123!", "", "", "é", "ß", "İ"};
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    cudf::string_scalar scalar(values[i], i != 2, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto input_column = cudf::concatenate(row_views, stream, mr);
+  cudf::table_view input({input_column->view()});
+
+  auto case_expr = [&](std::unique_ptr<ast_node> child) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(child));
+    return make_func(id, std::move(args), string_type);
+  };
+  auto evaluate = [&](ast_node const& expr, cudf::table_view table) {
+    sirius::expression_evaluator evaluator(expr, mr, stream, strategy);
+    return evaluator.evaluate(table);
+  };
+
+  SECTION("column inputs preserve NULLs and use cuDF Unicode mappings")
+  {
+    auto expr           = case_expr(make_ref_typed(0, string_type));
+    auto result         = evaluate(*expr, input);
+    auto const output   = result->view().column(0);
+    auto const expected = id == sirius::function_id::upper
+                            ? std::vector<std::string>{"HELLO 123!", "", "", "É", "SS", "İ"}
+                            : std::vector<std::string>{"hello 123!", "", "", "é", "ß", "i\u0307"};
+    REQUIRE(copy_string_column_to_host(output) == expected);
+    REQUIRE(copy_valids_to_host(output) == std::vector<bool>{true, true, false, true, true, true});
+  }
+  SECTION("case conversion composes inside an AST predicate")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::equal,
+               case_expr(make_ref_typed(0, string_type)),
+               make_str_const(id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+    sirius::expression_evaluator evaluator(*expr, mr, stream, strategy, /*min_ast_size=*/1);
+    auto result = evaluator.select(input);
+    REQUIRE(copy_string_column_to_host(result->view().column(0)) ==
+            std::vector<std::string>{"HeLLo 123!"});
+  }
+  SECTION("nested case conversion")
+  {
+    auto expr   = case_expr(case_expr(make_ref_typed(0, string_type)));
+    auto result = evaluate(*expr, input);
+    REQUIRE(result->num_rows() == input.num_rows());
+    REQUIRE(copy_valids_to_host(result->view().column(0)) == copy_valids_to_host(input.column(0)));
+    REQUIRE(copy_string_column_to_host(result->view().column(0))[0] ==
+            (id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+  }
+  SECTION("empty input")
+  {
+    auto empty_column = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    cudf::table_view empty({empty_column->view()});
+    auto expr   = case_expr(make_ref_typed(0, string_type));
+    auto result = evaluate(*expr, empty);
+    REQUIRE(result->num_rows() == 0);
+    REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
   }
 }
