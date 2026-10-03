@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       build_run_id:
-        description: Completed Test workflow run for this exact revision (CUDA 13 artifact must be retained)
+        description: Completed Test run for this source head (PR runs use the recorded merge build)
         required: true
         type: string
 
@@ -48,13 +48,9 @@ jobs:
           with urlopen(request, timeout=30) as response:
               run = json.load(response)
           Path("build/paimon-conformance/build-run.json").write_text(json.dumps(run, indent=2) + "\n")
-          assert run["head_sha"] == os.environ["GITHUB_SHA"], "Build revision does not match dispatch revision"
-          assert run["path"] == ".github/workflows/test.yml", "Expected a Test workflow build"
-          assert run["status"] == "completed", "Build workflow must have finished"
-          # Other suites may have failed: the successfully uploaded build artifact
-          # is sufficient. Do not couple Paimon to their conclusions.
-          print("Build workflow/revision verified")
           PY
+            python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
+              --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA"
           } 2>&1 | tee -a build/paimon-conformance/setup.log
 
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
@@ -77,6 +73,10 @@ jobs:
           set -euo pipefail
           {
             tar -xf build/paimon-conformance/artifact/build.tar
+            pixi run python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
+              --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA" \
+              --checkout-sha-file build/release/sirius-build-sha.txt \
+              | tee build/paimon-conformance/build-provenance.json
             pixi run python3 test/cpp/integration/data/paimon_conformance/qualified_extension.py \
               --duckdb build/release/duckdb --output build/paimon-conformance/extensions
           } 2>&1 | tee -a build/paimon-conformance/setup.log
@@ -100,6 +100,7 @@ jobs:
             echo 'If no case report exists, provisioning/build retrieval did not complete; cases are NOT RUN.'
             echo 'Build artifacts expire after one day. An expired/missing artifact requires a new matching build, never substitution with another revision.'
             echo '```'
+            cat build/paimon-conformance/build-provenance.json 2>/dev/null || true
             tail -60 build/paimon-conformance/setup.log 2>/dev/null || true
             tail -60 build/paimon-conformance/conformance.log 2>/dev/null || true
             echo '```'

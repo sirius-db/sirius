@@ -19,16 +19,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  lint:
+  paimon-harness:
     runs-on: ubuntu-24.04
-    env:
-      # CPU runner: no GPU/driver, so pixi can't detect `__cuda` to match the
-      # CUDA-pinned platform. Assert it so the (cuda13) environment resolves.
-      CONDA_OVERRIDE_CUDA: "13"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Test Paimon conformance harness (CPU only)
+        id: harness
         # ubuntu-24.04 supplies Python 3.12; these tests need no native build,
         # extension download, Paimon dependencies, or GPU.
         run: |
@@ -45,6 +42,28 @@ jobs:
           path: /tmp/paimon-harness.log
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Summarize Paimon harness
+        if: always()
+        env:
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+        run: |
+          {
+            echo '## Paimon harness'
+            printf 'Outcome: %s\n' "$HARNESS_OUTCOME"
+            echo '```'
+            tail -60 /tmp/paimon-harness.log 2>/dev/null || echo 'Harness did not produce a log.'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver, so pixi can't detect `__cuda` to match the
+      # CUDA-pinned platform. Assert it so the (cuda13) environment resolves.
+      CONDA_OVERRIDE_CUDA: "13"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Test thread sweep harness
         run: |
@@ -274,12 +293,12 @@ jobs:
 
   check:
     runs-on: ubuntu-slim
-    needs: [lint, build]
+    needs: [lint, build, paimon-harness]
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' }}
+        if: ${{ needs.lint.result == 'success' && needs.build.result == 'success' && needs['paimon-harness'].result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success') }}
+        if: ${{ !(needs.lint.result == 'success' && needs.build.result == 'success' && needs['paimon-harness'].result == 'success') }}
         run: exit 1

@@ -29,7 +29,8 @@ other merge engines, remote storage, and statement-bound snapshot guarantees.
 ## Routine checks and reading
 
 The standard-library harness tests require Python 3.11 or later; CI uses Python
-3.12. They need no native build, extension, GPU, network, or corpus regeneration:
+3.12. They need no native build, extension, GPU, external network, or corpus
+regeneration. Download tests use a temporary loopback HTTP server:
 
 ```bash
 pixi run python3 -m unittest discover \
@@ -49,9 +50,11 @@ pixi run python3 test/cpp/integration/data/paimon_conformance/qualified_extensio
 ```
 
 The downloader requires a public HTTPS URL with the artifact SHA256 as a path
-component and serves uncompressed `.duckdb_extension` bytes. It verifies before
-atomically publishing the file, retries transient retrieval failures up to three
-times, and rejects a bad hash without retrying. A matching existing artifact is
+component and serves uncompressed `.duckdb_extension` bytes. The qualification
+record must include the measured `size_bytes` before downloading. It verifies
+length and hash before atomically publishing the file. Short/long bodies and
+transport/read failures receive up to three attempts; a complete body of the
+qualified length with the wrong hash fails without retrying. A matching existing artifact is
 reusable, but a local cache alone is not a reproducible distribution source.
 
 Then read the committed corpus with the normal Sirius executable:
@@ -80,13 +83,29 @@ and child stdout/stderr, including partial timeout output. Shared setup failure
 leaves cases NOT RUN and the command fails. Case-local failure does not suppress
 later independent cases. Interrupts still terminate the run.
 
-The optional `Paimon conformance` workflow accepts an existing completed `Test`
-workflow run ID for the exact dispatched revision and downloads its CUDA 13 build.
-It does not rebuild or rerun the ordinary test matrix. Artifacts expire after one
-day; missing/expired or wrong-revision builds fail explicitly. Provisioning/case
-diagnostics are uploaded even on failure. Normal PR/merge-group checks separately
-run the CPU harness tests. Workflow execution itself remains unvalidated until an
-actual run is completed.
+The optional `Paimon conformance` workflow accepts a completed `Test` run whose
+source head matches the dispatched revision. The CUDA 13 artifact must contain
+`build/release/sirius-build-sha.txt`, written from the build checkout before
+packaging. Old artifacts without this marker are rejected.
+
+For PR runs, that checkout is the synthetic PR-plus-base merge at build time,
+not the PR head alone. `build-provenance.json`, the setup log, and the workflow
+summary explicitly distinguish the source head and actual build checkout SHA.
+For manual/merge-group builds, the recorded checkout must equal the dispatched
+revision. Workflow paths with or without an `@ref` suffix are accepted.
+
+This workflow does not rebuild or rerun the ordinary test matrix. It waits until
+the selected Test run completes, which can mean waiting for its full 90-minute
+job budget even when the build artifact is already available. Artifacts expire
+after one day; missing/expired builds fail explicitly. Running this workflow in
+the base repository requires a branch/tag there: a maintainer must first make a
+fork PR's head available on a base-repository ref. Dispatching in the fork is a
+separate option only if its workflow and runner access are available.
+
+Provisioning/case diagnostics are uploaded even on failure. Normal PR/merge-group
+checks run the CPU harness in its own required job, independently of lint and
+thread-sweep checks, with a Paimon-specific summary. Actual workflow execution
+remains unvalidated until a real run completes.
 
 ## Explicit regeneration
 
@@ -140,7 +159,7 @@ both expected answers and recorded observations still require independent review
 ## Requalifying a reader
 
 Retain candidate bytes outside the corpus; record their actual version, platform,
-source/native revisions and SHA256. Use a separate candidate registry via
+source/native revisions, uncompressed byte size, and SHA256. Use a separate candidate registry via
 `--registry` for investigation, without treating the candidate as accepted.
 Run native conformance, relocation/offline checks, and appropriate Sirius GPU
 fallback/regressions. Investigate disagreements against authored answers and
