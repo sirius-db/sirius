@@ -1327,8 +1327,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalComparisonJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-      throw duckdb::NotImplementedException("Cross product not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalCrossProduct>());
+      plan = create_plan(op.Cast<duckdb::LogicalCrossProduct>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
       throw duckdb::NotImplementedException("Positional join not supported");

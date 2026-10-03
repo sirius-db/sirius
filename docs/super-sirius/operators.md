@@ -212,6 +212,7 @@ Implements LIMIT/OFFSET using atomic counters for parallel execution.
 
 - **Key members:** `_remaining_offset` (atomic), `_remaining_limit` (atomic), `_limit_exhausted` (atomic)
 - **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
+- **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ## Blocking Operators
 
@@ -306,6 +307,8 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 **File:** `src/op/sirius_physical_nested_loop_join.hpp`
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
+
+Without conditions it runs a cross product: `cudf::cross_join` on each pair of left and right batches. Before allocating, `execute` computes the output size of the pair and throws when it exceeds the GPU memory space, so the query falls back to CPU instead. An output beyond the cuDF row limit fails in `cudf::cross_join`.
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 

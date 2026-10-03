@@ -42,6 +42,7 @@ class LogicalOperator;
 class LogicalAggregate;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
+class LogicalCrossProduct;
 class LogicalDelimGet;
 class LogicalDummyScan;
 class LogicalEmptyResult;
@@ -129,8 +130,8 @@ class sirius_physical_plan_generator {
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreateIndex
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalCreateSecret &op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-  // create_plan(duckdb::LogicalCrossProduct &op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCrossProduct& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);
