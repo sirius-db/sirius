@@ -27,13 +27,16 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/execution/column_binding_resolver.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
@@ -175,6 +178,33 @@ void require_null_safe_column_key(sirius::join_condition const& condition,
     CHECK(side->as_reference().column_index == column);
     CHECK(side->return_type() == type);
   }
+}
+
+bool subtree_contains(sirius_physical_operator const& root, SiriusPhysicalOperatorType type)
+{
+  if (root.type == type) { return true; }
+  for (auto const& child : root.children) {
+    if (subtree_contains(*child, type)) { return true; }
+  }
+  return false;
+}
+
+//! Name of the catalog table read by the first table scan under @p root.
+std::string scanned_table(sirius_physical_operator& root)
+{
+  if (root.type == SiriusPhysicalOperatorType::TABLE_SCAN) {
+    auto const& scan = root.Cast<sirius::op::sirius_physical_table_scan>();
+    auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(scan.bind_data.get());
+    REQUIRE(bind != nullptr);
+    return bind->table.name;
+  }
+  for (auto& child : root.children) {
+    if (subtree_contains(*child, SiriusPhysicalOperatorType::TABLE_SCAN)) {
+      return scanned_table(*child);
+    }
+  }
+  FAIL("no table scan under the operator");
+  return {};
 }
 
 class set_operation_lowering_fixture {
@@ -326,4 +356,55 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
   // DuckDB types sum(INTEGER) as HUGEINT; the Sirius aggregate plans it as BIGINT.
   REQUIRE_THROWS_WITH(lower("SELECT sum(k) FROM ia INTERSECT SELECT sum(k) FROM ib"),
                       ContainsSubstring("INTERSECT input 0 plans column 0 as BIGINT, not HUGEINT"));
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - EXCEPT lowers to a null-safe ANTI hash join",
+                 "[planner][set_operation][isolated_context]")
+{
+  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const plan  = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib");
+  auto& join       = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
+  REQUIRE(join.conditions.size() == 1);
+  require_null_safe_column_key(join.conditions[0], 0, types[0]);
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - EXCEPT keeps its left input on the probe side",
+                 "[planner][set_operation][isolated_context]")
+{
+  // Input 0 stays on the probe side whatever the inputs' estimated sizes.
+  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  {
+    auto const plan = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib WHERE k > 2");
+    auto& join      = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
+    CHECK(scanned_table(*join.children[0]) == "ia");
+    CHECK(scanned_table(*join.children[1]) == "ib");
+  }
+  {
+    auto const plan = lower("SELECT k FROM ib WHERE k > 2 EXCEPT SELECT k FROM ia");
+    auto& join      = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
+    CHECK(scanned_table(*join.children[0]) == "ib");
+    CHECK(scanned_table(*join.children[1]) == "ia");
+  }
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - EXCEPT ALL is refused",
+                 "[planner][set_operation][isolated_context]")
+{
+  REQUIRE_THROWS_WITH(lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib"),
+                      ContainsSubstring("EXCEPT ALL not supported"));
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - EXCEPT keeps a statically empty right input as the build side",
+                 "[planner][set_operation][isolated_context]")
+{
+  // DuckDB folds an empty INTERSECT input away but keeps the EXCEPT node.
+  auto const types = sirius_types({duckdb::LogicalType::INTEGER});
+  auto const plan  = lower("SELECT k FROM ia EXCEPT SELECT k FROM ib WHERE false");
+  auto& join       = require_hash_join(*plan, duckdb::JoinType::ANTI, types);
+  CHECK(subtree_contains(*join.children[1], SiriusPhysicalOperatorType::EMPTY_RESULT));
+  CHECK(scanned_table(*join.children[0]) == "ia");
 }

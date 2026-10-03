@@ -41,6 +41,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 {
   switch (op.type) {
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: return plan_except_intersect(op);
     case duckdb::LogicalOperatorType::LOGICAL_UNION: break;
     default: throw duckdb::InternalException("Unrecognized operator type for LogicalSetOperation");
@@ -100,6 +101,7 @@ struct filtering_set_operation {
 filtering_set_operation filtering_set_operation_of(duckdb::LogicalOperatorType type)
 {
   switch (type) {
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return {duckdb::JoinType::ANTI, "EXCEPT"};
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
       return {duckdb::JoinType::SEMI, "INTERSECT"};
     default: throw duckdb::InternalException("Unrecognized filtering set operation type");
