@@ -19,7 +19,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <cuco/bloom_filter.cuh>
-#include <cuco/bloom_filter_policies.cuh>
+#include <cuco/bloom_filter_policy.cuh>
 #include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
@@ -62,7 +62,7 @@ template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
                                         cuda::thread_scope_device,
-                                        cuco::default_filter_policy<KeyT>,
+                                        cuco::bloom_filter_policy<KeyT>,
                                         bloom_alloc>;
 
 template <class Filter>
