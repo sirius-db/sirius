@@ -22,12 +22,15 @@
 #include "utils/data_utils.hpp"
 #include "utils/test_validation_utility.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/unary.hpp>
 
 #include <catch.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 using namespace duckdb;
@@ -174,22 +177,7 @@ TEMPLATE_TEST_CASE(
     grouped_aggregate_merger.execute(pipelineable_operator_data(agg_outputs), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  // need to cast the expected table column 4 (which is the count column) to int64_t since at the
-  // merge stage, we end up doing a sum of int32_t which becomes an int64_t
-  auto expected_columns = expected_table->release();
-
-  // Validate that column 4 is of type int32
-  REQUIRE(expected_columns[4]->type().id() == cudf::type_id::INT32);
-
-  // Cast column 4 from int32 to int64
-  auto casted_column =
-    cudf::cast(expected_columns[4]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-
-  // Replace column 4 with the casted version
-  expected_columns[4] = std::move(casted_column);
-
-  // Recreate the expected_table with the updated columns
-  expected_table = std::make_unique<cudf::table>(std::move(expected_columns));
+  REQUIRE(expected_table->get_column(4).type().id() == cudf::type_id::INT64);
 
   // Compare output with expected using the validation utility
   // Sort both tables before comparison since aggregation order is not guaranteed
@@ -266,17 +254,71 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
     grouped_aggregate_merger.execute(pipelineable_operator_data(agg_outputs), default_stream());
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
 
-  // Cast expected count column from int32 to int64 (merge sums int32 counts -> int64)
-  auto expected_columns = expected_table->release();
-  auto count_col_idx    = 3;  // column 0=group, 1=min, 2=max, 3=count, 4=avg
-  REQUIRE(expected_columns[count_col_idx]->type().id() == cudf::type_id::INT32);
-  expected_columns[count_col_idx] = cudf::cast(
-    expected_columns[count_col_idx]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
-  expected_table = std::make_unique<cudf::table>(std::move(expected_columns));
+  REQUIRE(expected_table->get_column(3).type().id() == cudf::type_id::INT64);
 
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
     dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0],
     expected_table->view(),
     true);
   REQUIRE(tables_match);
+}
+
+TEST_CASE("stddev_samp merges singleton states and preserves NULL groups",
+          "[stddev_samp][physical_grouped_aggregate_merge]")
+{
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto stream = default_stream();
+  auto mr     = get_resource_ref(*space);
+  auto defs   = sirius::test::create_aggregate_expressions<gpu_type_traits<double>>(
+    {0}, {"stddev_samp", "avg"}, {1, 1});
+  sirius_physical_grouped_aggregate local(
+    std::move(defs.output_types), std::move(defs.aggregates), std::move(defs.groups), 4);
+  sirius_physical_grouped_aggregate_merge merge(&local);
+  REQUIRE(local.local_types.size() == 4);  // key, stddev STRUCT, AVG sum, AVG count
+  REQUIRE(local.local_types[1].id() == sirius::type_id::STRUCT);
+  bool const multiple_values_per_partial = GENERATE(false, true);
+  std::vector<std::shared_ptr<data_batch>> batches;
+  for (int i = 1; i <= 4; ++i) {
+    std::vector<double> raw_values{1e12 + i, 0, 42, 7};
+    std::vector<bool> valid{true, false, i == 1, true};
+    std::vector<double> raw_keys{0, 1, 2, 3};
+    if (multiple_values_per_partial) {
+      raw_values.push_back(1e12 + i + 4);
+      valid.push_back(true);
+      raw_keys.push_back(0);
+    }
+    auto values =
+      make_numeric_batch_with_nulls<double>(*space, raw_values, valid, cudf::type_id::FLOAT64);
+    auto ro    = values->to_read_only();
+    auto table = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(vector_to_cudf_column<gpu_type_traits<double>>(raw_keys, stream, mr));
+    cols.push_back(std::make_unique<cudf::column>(table.column(0), stream, mr));
+    batches.push_back(sirius::make_data_batch(std::make_unique<cudf::table>(std::move(cols)),
+                                              *space,
+                                              stream,
+                                              sirius::telemetry::batch_telemetry_info{}));
+  }
+  auto partial        = local.execute(pipelineable_operator_data(batches), stream);
+  auto result         = merge.execute(*partial, stream);
+  auto const& outputs = dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches();
+  REQUIRE(outputs.size() == 1);
+  auto ro   = outputs[0]->to_read_only();
+  auto view = ro.get_data()->cast<gpu_table_representation>().get_table_view();
+  auto keys = copy_column_to_host<double>(view.column(0));
+  REQUIRE(view.num_rows() == 4);
+  for (int row = 0; row < 4; ++row) {
+    auto sd = cudf::get_element(view.column(1), row, stream, mr);
+    if (keys[row] == 1 || keys[row] == 2) {
+      REQUIRE_FALSE(sd->is_valid(stream));
+    } else {
+      REQUIRE(sd->is_valid(stream));
+      auto expected =
+        keys[row] == 0 ? std::sqrt(multiple_values_per_partial ? 6.0 : 5.0 / 3.0) : 0.0;
+      REQUIRE(static_cast<cudf::numeric_scalar<double> const&>(*sd).value(stream) ==
+              Approx(expected).margin(1e-9));
+    }
+  }
 }

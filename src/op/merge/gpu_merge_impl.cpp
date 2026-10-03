@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/stddev.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
@@ -88,6 +89,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
   // Aggregate on the concatenated table
   std::vector<std::unique_ptr<cudf::column>> output_cudf_cols;
   for (size_t c = 0; c < aggregates.size(); ++c) {
+    if (aggregates[c] == cudf::aggregation::Kind::M2) {
+      output_cudf_cols.push_back(merge_stddev_states(
+        concatenated->get_column(c).view(), stream, memory_space.get_default_allocator()));
+      continue;
+    }
     std::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
     cudf::data_type output_type = concatenated->get_column(c).type();
     switch (aggregates[c]) {
@@ -260,6 +266,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
       case cudf::aggregation::Kind::COUNT_ALL:
       case cudf::aggregation::Kind::COUNT_VALID: {
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
+      case cudf::aggregation::Kind::M2: {
+        request.aggregations.push_back(
+          cudf::make_merge_m2_aggregation<cudf::groupby_aggregation>());
         break;
       }
       case cudf::aggregation::Kind::COLLECT_SET: {

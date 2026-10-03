@@ -24,6 +24,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/aggregate/stddev.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
@@ -91,7 +92,7 @@ std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type typ
   return out;
 }
 
-enum class aggregate_kind { SUM, MIN, MAX, COUNT, COUNT_STAR, AVG, FIRST };
+enum class aggregate_kind { SUM, MIN, MAX, COUNT, COUNT_STAR, AVG, FIRST, STDDEV_SAMP };
 
 struct aggregate_spec {
   aggregate_kind kind;
@@ -107,7 +108,8 @@ struct aggregate_layout {
   std::vector<cudf::aggregation::Kind> merge_kinds;
   std::vector<std::optional<cudf::size_type>>
     merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
-  bool has_avg = false;
+  bool has_avg    = false;
+  bool has_stddev = false;
 };
 
 aggregate_layout build_aggregate_layout(
@@ -217,6 +219,16 @@ aggregate_layout build_aggregate_layout(
         layout.has_avg = true;
         break;
       }
+      case sirius::aggregate_id::stddev_samp:
+        if (children.empty()) throw not_implemented_exception("stddev_samp() requires an argument");
+        spec.kind          = aggregate_kind::STDDEV_SAMP;
+        spec.input_idx     = child_ref_index();
+        spec.local_sum_idx = local_idx++;
+        layout.local_types.push_back(duckdb::LogicalType::STRUCT({}));
+        layout.merge_kinds.push_back(cudf::aggregation::Kind::M2);
+        layout.merge_nth_index.push_back(std::nullopt);
+        layout.has_stddev = true;
+        break;
       case sirius::aggregate_id::first:
         spec.kind          = aggregate_kind::FIRST;
         spec.input_idx     = child_ref_index();
@@ -331,6 +343,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar =
             cudf::reduce(col, *agg_op, cudf::data_type(cudf::type_id::INT64), std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
+          break;
+        }
+        case aggregate_kind::STDDEV_SAMP: {
+          cols.push_back(local_stddev_state(
+            view.column(spec.input_idx), stream, space->get_default_allocator()));
           break;
         }
         case aggregate_kind::FIRST: {
@@ -506,7 +523,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
   }
 
-  if (!layout.has_avg) {
+  if (!layout.has_avg && !layout.has_stddev) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
@@ -524,6 +541,9 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       auto count_view = merged_view.column(static_cast<cudf::size_type>(spec.local_count_idx));
       output_cols.push_back(make_avg_column(
         sum_view, count_view, spec.return_type, stream, cudf::get_current_device_resource_ref()));
+    } else if (spec.kind == aggregate_kind::STDDEV_SAMP) {
+      output_cols.push_back(finalize_stddev(
+        merged_view.column(spec.local_sum_idx), stream, space->get_default_allocator()));
     } else {
       auto col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
       output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));
