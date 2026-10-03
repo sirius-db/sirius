@@ -394,3 +394,51 @@ TEST_CASE_METHOD(FloatKeyJoinFixture,
   compare_gpu_vs_cpu("SELECT fl.id FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
   compare_gpu_vs_cpu("SELECT count(*) FROM fl SEMI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
 }
+
+TEST_CASE_METHOD(NullSafeJoinFixture,
+                 "gpu_execution all-null-safe ANTI join removes NULL matched by NULL",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Only id 4 survives: l's NULL keys match r's NULL key and are removed.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT l.id, l.k FROM l ANTI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM l ANTI JOIN r ON l.k IS NOT DISTINCT FROM r.k");
+}
+
+TEST_CASE_METHOD(PartialNullKeyJoinFixture,
+                 "gpu_execution two-key all-null-safe ANTI join matches partial NULLs",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // Only id 3 survives.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT pl.id, pl.a, pl.b FROM pl ANTI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM pl ANTI JOIN pr "
+    "ON pl.a IS NOT DISTINCT FROM pr.a AND pl.b IS NOT DISTINCT FROM pr.b");
+}
+
+TEST_CASE_METHOD(FloatKeyJoinFixture,
+                 "gpu_execution all-null-safe ANTI join on DOUBLE keys matches signed zero and NaN",
+                 "[integration][gpu_execution][join][nulls]")
+{
+  // The CPU keeps only id 3.
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu("SELECT fl.id FROM fl ANTI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+  compare_gpu_vs_cpu("SELECT count(*) FROM fl ANTI JOIN fr ON fl.k IS NOT DISTINCT FROM fr.k");
+}
+
+TEST_CASE_METHOD(
+  NullSafeJoinFixture,
+  "gpu_execution all-null-safe ANTI join against an empty right side keeps every row",
+  "[integration][gpu_execution][join][nulls]")
+{
+  run_ok("CREATE TABLE r_empty (id INTEGER, k INTEGER);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT l.id, l.k FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+}
