@@ -470,10 +470,9 @@ struct VariantLaunchArgs {
   CUdeviceptr chunk_ids     = 0;  // chunk_csr: the chunk each block serves
   CUdeviceptr block_offsets = 0;  // chunk_csr: per-block output bases
   CUdeviceptr in_chunk_rows = 0;  // chunk_csr: uint16 positions within the chunk
-  // Blocks to launch. 0 = one per chunk of the batch; chunk_csr sets it to the
-  // TOUCHED chunk count, which is the whole point of that enumerator. The
-  // per-chunk metadata bounds check still uses the batch's full chunk count,
-  // since a listed chunk may be any of them.
+  // Blocks to launch. 0 = the renderer's dense grid (see cdj::chunks_per_block); chunk_csr sets it
+  // to the TOUCHED chunk count, which is the whole point of that enumerator. The per-chunk metadata
+  // bounds check still uses the batch's full chunk count, since a listed chunk may be any of them.
   std::int32_t grid_blocks = 0;
   CUdeviceptr len_out      = 0;  // str_split_meta: per-survivor byte lengths (output)
 };
@@ -742,11 +741,14 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
   if (!maybe_raise_smem(kernel.func_for_current_device(), static_cast<int>(spec.shared_bytes), ctx))
     return -1;
 
-  CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
-  CUfunction fn_dec = kernel.func_for_current_device();
+  // A dense grid follows the renderer's block-to-chunk mapping; a row set brings its own.
+  auto const cpb        = cdj::chunks_per_block(va.shape);
+  auto const dense_grid = cuda::ceil_div(num_chunks, cpb);
+  auto stream           = reinterpret_cast<CUstream>(stream_ptr);
+  auto fn_dec           = kernel.func_for_current_device();
   SIMPATICO_CU_CHECK(
     cuLaunchKernel(fn_dec,
-                   static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : num_chunks),
+                   static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
                    1,
                    1,
                    static_cast<unsigned>(spec.block_x),
@@ -964,7 +966,9 @@ void report_enumeration(char const* what,
   if (!::sirius::codegen::decompression_pushdown_diag_enabled()) { return; }
   auto const chunks = (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
   char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
-  auto const blocks = static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks);
+  auto const cpb    = cdj::chunks_per_block(va.shape);
+  auto const blocks =
+    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : cuda::ceil_div(chunks, cpb));
   if (survivors < 0) {
     // Before the CNT wave the count is not known yet; printing the -1 sentinel
     // as a survivor count (and dividing by it) is how a trace misleads.
@@ -977,7 +981,7 @@ void report_enumeration(char const* what,
                  static_cast<long long>(chunks));
     return;
   }
-  // On the mask and index walks every chunk gets a block, so `blocks` says
+  // On the mask and index walks every chunk gets a block (or a warp), so `blocks` says
   // nothing about how many did work — the touched count is what would have
   // been launched instead, and the difference is the empty-block tax.
   auto const touched = va.grid_blocks > 0
@@ -1000,19 +1004,16 @@ void report_enumeration(char const* what,
       touched > 0 ? static_cast<double>(survivors) / static_cast<double>(touched) : 0.0);
     return;
   }
-  std::fprintf(
-    stderr,
-    "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
-    "(%.4f of rows, %.1f per block)\n",
-    what,
-    how,
-    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks),
-    static_cast<long long>(chunks),
-    static_cast<long long>(survivors),
-    num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
-    va.grid_blocks > 0
-      ? static_cast<double>(survivors) / static_cast<double>(va.grid_blocks)
-      : (chunks > 0 ? static_cast<double>(survivors) / static_cast<double>(chunks) : 0.0));
+  std::fprintf(stderr,
+               "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
+               "(%.4f of rows, %.1f per block)\n",
+               what,
+               how,
+               blocks,
+               static_cast<long long>(chunks),
+               static_cast<long long>(survivors),
+               num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
+               blocks > 0 ? static_cast<double>(survivors) / static_cast<double>(blocks) : 0.0);
 }
 
 }  // namespace
