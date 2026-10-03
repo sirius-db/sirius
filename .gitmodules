@@ -1,5 +1,5 @@
-# When changing the duckdb submodule, also update OVERRIDE_GIT_DESCRIBE
-# in cmake/CMakePresets.json and the DuckDB package in pixi.toml.
+# When changing the duckdb submodule, update OVERRIDE_GIT_DESCRIBE in
+# cmake/sirius-duckdb-provider.cmake and cmake/CMakePresets.json, plus pixi.toml.
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/duckdb/duckdb.git

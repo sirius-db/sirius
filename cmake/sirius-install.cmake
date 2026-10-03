@@ -8,17 +8,19 @@ if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
           DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
 endif()
 
-install(
-  TARGETS sirius_extension
-          sirius_core
-          cucascade_static
-          cucascade_cudf_static
-          cucascade_topology_discovery_static
-          telemetry_bridge
-          simpatico
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+if(NOT PROJECT_IS_TOP_LEVEL)
+  install(
+    TARGETS sirius_extension
+            sirius_core
+            cucascade_static
+            cucascade_cudf_static
+            cucascade_topology_discovery_static
+            telemetry_bridge
+            simpatico
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
 
 install(
   DIRECTORY include/sirius

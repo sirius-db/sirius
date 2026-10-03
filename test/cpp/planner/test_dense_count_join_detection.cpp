@@ -886,6 +886,9 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamically loaded extension",
           "[dense_count_join][plan][dynamic_load]")
 {
+#ifdef SIRIUS_STANDALONE_TESTS
+  SKIP("The standalone build does not produce a loadable extension.");
+#endif
   scoped_temp_directory temp;
   auto const executable = std::filesystem::canonical("/proc/self/exe");
   auto const extension =

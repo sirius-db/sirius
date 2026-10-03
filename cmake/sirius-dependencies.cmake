@@ -105,34 +105,20 @@ else()
   set(SIRIUS_CURL_TARGET PkgConfig::CURL)
 endif()
 
-# cuCascade - GPU Memory Reservation Library (submodule)
-set(BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_BENCHMARKS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_SHARED_LIBS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_STATIC_LIBS
-    ON
-    CACHE BOOL "" FORCE)
-# Sirius consumes cucascade's cudf-coupled representations and converters (PR
-# #150 split these into the optional cucascade_cudf target), so build it.
-set(CUCASCADE_BUILD_CUDF
-    ON
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_WARNINGS_AS_ERRORS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_IO
-    OFF
-    CACHE BOOL "" FORCE)
+# Scope dependency options without changing the caller's cache.
+block()
+set(CUCASCADE_BUILD_TESTS OFF)
+set(CUCASCADE_BUILD_BENCHMARKS OFF)
+set(CUCASCADE_BUILD_SHARED_LIBS OFF)
+set(CUCASCADE_BUILD_STATIC_LIBS ON)
+set(CUCASCADE_BUILD_CUDF ON)
+set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
+set(CUCASCADE_BUILD_IO OFF)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+endblock()
+foreach(target cucascade_objects cucascade_cudf_objects)
+  target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+endforeach()
 
 # Name of the NVTX domain every Sirius range is published into. Derived from the
 # project name so it has a single authoritative source; simpatico turns it into
@@ -145,38 +131,7 @@ set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 add_subdirectory(src/compression/simpatico_codegen
                  "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
 
-if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
-  function(sirius_prefer_static_cudart target_name)
-    foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
-      get_target_property(_libs "${target_name}" "${_prop}")
-      if(NOT _libs OR _libs STREQUAL "_libs-NOTFOUND")
-        continue()
-      endif()
-
-      set(_patched_libs "${_libs}")
-      list(TRANSFORM _patched_libs REPLACE "^CUDA::cudart$"
-                                           "CUDA::cudart_static")
-      list(TRANSFORM _patched_libs REPLACE "^\\$<LINK_ONLY:CUDA::cudart>$"
-                                           "$<LINK_ONLY:CUDA::cudart_static>")
-
-      if(NOT _patched_libs STREQUAL _libs)
-        set_target_properties("${target_name}" PROPERTIES "${_prop}"
-                                                          "${_patched_libs}")
-      endif()
-    endforeach()
-
-    set_target_properties("${target_name}" PROPERTIES CUDA_RUNTIME_LIBRARY
-                                                      Static)
-  endfunction()
-
-  foreach(_target
-          cucascade_objects cucascade_static cucascade_shared
-          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
-    if(TARGET "${_target}")
-      sirius_prefer_static_cudart("${_target}")
-    endif()
-  endforeach()
-
+if(VCPKG_BUILD)
   # cucascade's topology discovery gained rmm includes (NUMA capacity
   # detection), so it needs the same vcpkg-over-toolkit include priority as
   # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
@@ -199,25 +154,22 @@ add_subdirectory(rust/crates/telemetry/bridge)
 # start MinIO containers from the test binary. Builds a Go c-archive, so a Go
 # toolchain (provided by pixi) and network access on the first configure/build
 # are required — hence gated behind SIRIUS_BUILD_S3_TESTS.
-if(SIRIUS_BUILD_S3_TESTS)
+if(SIRIUS_BUILD_S3_TESTS AND (SIRIUS_BUILD_TESTS OR NOT PROJECT_IS_TOP_LEVEL))
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
 endif()
 
 find_package(kvikio REQUIRED CONFIG)
 
-# kvikio::kvikio's interface pulls in BS::thread_pool, whose
-# INTERFACE_COMPILE_FEATURES include `cuda_std_17`. That requirement propagates
-# through sirius_extension into duckdb_static, whose project() scope enables
-# only C/CXX, and CMake then fails to generate with "No known features for CUDA
-# compiler". Sirius only uses kvikIO's host-side API, so drop the CUDA feature
-# from the imported target.
-if(TARGET BS::thread_pool)
-  get_target_property(_bs_thread_pool_features BS::thread_pool
-                      INTERFACE_COMPILE_FEATURES)
-  if(_bs_thread_pool_features)
-    list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
-    set_target_properties(
-      BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
-                                 "${_bs_thread_pool_features}")
+# The legacy DuckDB parent enables only C/CXX.
+if(NOT PROJECT_IS_TOP_LEVEL)
+  if(TARGET BS::thread_pool)
+    get_target_property(_bs_thread_pool_features BS::thread_pool
+                        INTERFACE_COMPILE_FEATURES)
+    if(_bs_thread_pool_features)
+      list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+      set_target_properties(
+        BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                   "${_bs_thread_pool_features}")
+    endif()
   endif()
 endif()
