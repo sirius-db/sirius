@@ -211,6 +211,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
@@ -275,6 +276,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
@@ -298,6 +300,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 1);
+    REQUIRE(setting_count(con, "sirius_test_internal_start_mode") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);

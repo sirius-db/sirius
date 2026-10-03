@@ -2369,6 +2369,17 @@ bool sirius_scan_manager::holds_checkpoint_key(
   return false;
 }
 
+bool sirius_scan_manager::holds_checkpoint_key(
+  sirius::query_id_t query_id, duckdb::AttachedDatabase const& database) const noexcept
+{
+  std::lock_guard lk{_checkpoint_locks_mutex};
+  auto const it = _checkpoint_locks.find(query_id);
+  return it != _checkpoint_locks.end() &&
+         std::any_of(it->second.begin(), it->second.end(), [&](auto const& entry) {
+           return entry.database == &database;
+         });
+}
+
 std::size_t sirius_scan_manager::checkpoint_key_count(sirius::query_id_t query_id) const noexcept
 {
   std::lock_guard lk{_checkpoint_locks_mutex};

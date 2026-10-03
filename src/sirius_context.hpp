@@ -436,6 +436,10 @@ class SiriusContext : public ClientContextState {
    * state (Sirius not registered) makes the guard a no-op.
    */
   struct InternalQueryGuard {
+    /// Check the owning execution window before DuckDB starts a database transaction.
+    static void before_transaction_start(ClientContext& outer,
+                                         AttachedDatabase const& database,
+                                         bool read_only);
     explicit InternalQueryGuard(ClientContext& context) noexcept
       : state_(get_sirius_connection_state(context))
     {
@@ -944,7 +948,15 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::shared_ptr<sirius::op::scan::physical_check_counters> physical_counters_ =
     std::make_shared<sirius::op::scan::physical_check_counters>();
+  // The existing lifecycle slot permits one active window. This borrowed outer
+  // context is valid only within that scope; release clears the association.
+  struct active_execution_window {
+    ClientContext const* outer;
+    sirius::query_id_t query_id;
+    bool internal_start_read_only;  // Test mode, captured once before window entry.
+  };
   mutable std::mutex window_completions_mutex_;
+  std::optional<active_execution_window> active_window_;
   std::map<uint64_t, std::shared_ptr<sirius::pipeline::completion_handler>> window_completions_;
   std::array<std::atomic<uint64_t>, 8> late_failures_{};
   std::array<std::atomic<uint64_t>, 8> late_replays_{};

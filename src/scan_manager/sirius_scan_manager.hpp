@@ -611,6 +611,9 @@ class sirius_scan_manager {
   /// keys without registering scan providers, so their lifetime is tracked separately.
   void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
   [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  /// Query-local check for transaction-start ordering; never borrows another window's key.
+  [[nodiscard]] bool holds_checkpoint_key(sirius::query_id_t query_id,
+                                          duckdb::AttachedDatabase const& database) const noexcept;
   [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count() const noexcept;
   [[nodiscard]] std::size_t checkpoint_key_count(sirius::query_id_t query_id) const noexcept;
