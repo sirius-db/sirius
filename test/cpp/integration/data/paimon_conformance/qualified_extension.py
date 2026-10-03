@@ -5,10 +5,10 @@ import argparse
 import json
 from pathlib import Path
 import re
-import shutil
+from http.client import HTTPException
 import tempfile
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -41,6 +41,40 @@ def select_qualification(path, identity):
     return record
 
 
+class DownloadFailure(RuntimeError):
+    """Transport or body-length failure; never a completed hash mismatch."""
+
+
+def download(url, candidate, size, opener):
+    # Local file errors must not be classified as transient network failures.
+    with candidate.open("wb") as output:
+        try:
+            response = opener(url, timeout=30)
+        except (OSError, HTTPException) as error:
+            if isinstance(error, HTTPError):
+                error.close()
+            raise DownloadFailure(str(error)) from error
+        with response:
+            received = 0
+            while True:
+                try:
+                    chunk = response.read(min(65536, size - received + 1))
+                except (OSError, HTTPException) as error:
+                    raise DownloadFailure(str(error)) from error
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > size:
+                    raise DownloadFailure(
+                        f"Artifact body exceeds qualified size {size}"
+                    )
+                output.write(chunk)
+            if received != size:
+                raise DownloadFailure(
+                    f"Truncated artifact body: expected {size} bytes, received {received}"
+                )
+
+
 def provision(record, destination, *, attempts=3, delay=time.sleep, opener=urlopen):
     if not 1 <= attempts <= 3:
         raise ValueError("Provisioning supports one to three attempts")
@@ -67,6 +101,9 @@ def provision(record, destination, *, attempts=3, delay=time.sleep, opener=urlop
         raise ValueError(
             "Expected a public HTTPS artifact URL with its SHA256 as a path component"
         )
+    size = record.get("size_bytes")
+    if type(size) is not int or size <= 0:
+        raise ValueError("Record a positive qualified size_bytes before downloading")
     destination.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, attempts + 1):
         # Same-directory staging prevents partially downloaded bytes becoming the artifact.
@@ -76,15 +113,13 @@ def provision(record, destination, *, attempts=3, delay=time.sleep, opener=urlop
             candidate = Path(temporary) / "paimon.duckdb_extension"
             try:
                 print(f"Artifact fetch attempt {attempt}/{attempts}", flush=True)
-                with opener(url, timeout=30) as response, candidate.open(
-                    "wb"
-                ) as output:
-                    shutil.copyfileobj(response, output)
-            except (URLError, TimeoutError, ConnectionError) as error:
+                download(url, candidate, size, opener)
+            except DownloadFailure as error:
+                cause = error.__cause__
                 transient = (
-                    not isinstance(error, HTTPError)
-                    or error.code in (408, 429)
-                    or 500 <= error.code < 600
+                    not isinstance(cause, HTTPError)
+                    or cause.code in (408, 429)
+                    or 500 <= cause.code < 600
                 )
                 print(f"Artifact fetch failed: {error}", flush=True)
                 if not transient or attempt == attempts:
