@@ -986,9 +986,6 @@ class Orchestrator:
             rec.context = active
             rec.sql = active.get("sql", rec.sql)
             rec.variant = active.get("settings") or None
-            observed = path.with_suffix(".observed.json")
-            if observed.exists():
-                rec.evidence = json.loads(observed.read_text())
 
     @staticmethod
     def _reducer_outside_query(rec: QueryRecord) -> bool:

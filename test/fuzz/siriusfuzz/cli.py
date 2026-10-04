@@ -31,6 +31,7 @@ from .config import (
 from .report import Report, default_known_issues_path, load_known_issues
 from .runner import Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
+from .session import discover_sirius_yaml
 
 SELFTEST_DEFAULT_OVERRIDES = (
     "data.rows=[8,16]",
@@ -173,6 +174,14 @@ def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> tuple[str | None, list
             if not p.exists():
                 raise ValueError(f"Sirius config not found: {p}")
             resolved.append(str(p))
+        if not resolved:
+            ambient, source = discover_sirius_yaml()
+            if ambient:
+                print(
+                    f"Using the Sirius YAML from {source}: {ambient} (copied into the run)",
+                    file=sys.stderr,
+                )
+                resolved = [ambient]
     return str(ext), resolved
 
 

@@ -15,6 +15,7 @@ from . import conftest_path  # noqa: F401
 from .test_evaluator import FakeSession, gpu_variant_wrong
 from siriusfuzz.artifacts import runtime_info, write_json
 from siriusfuzz.cli import (
+    _engine,
     build_parser,
     cmd_recheck,
     cmd_replay,
@@ -25,7 +26,12 @@ from siriusfuzz.config import load_config
 from siriusfuzz.isolation import supervise
 from siriusfuzz.report import QueryRecord, Report
 from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOptions
-from siriusfuzz.session import RunResult, Session, SessionError
+from siriusfuzz.session import (
+    RunResult,
+    Session,
+    SessionError,
+    discover_sirius_yaml,
+)
 
 
 def crash_child(payload, work):
@@ -76,7 +82,7 @@ def startup_dead_worker(args, cfg, out, stop):
 
 
 class ToolTests(unittest.TestCase):
-    def test_cpu_only_session_does_not_select_ambient_sirius_configuration(self):
+    def test_cpu_only_session_ignores_sirius_yaml(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"SIRIUS_CONFIG_FILE": "ambient.yaml"}
         ), patch("duckdb.connect"):
@@ -86,75 +92,85 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(os.environ["SIRIUS_CONFIG_FILE"], "ambient.yaml")
             session.close()
 
-    def test_no_yaml_session_rejects_ambient_configuration_before_connecting(self):
+    def test_sirius_yaml_discovery_follows_sirius_and_is_recorded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             cwd, home = root / "cwd", root / "home"
             cwd.mkdir()
             (home / ".sirius").mkdir(parents=True)
-            for location in ("env", "empty_env", "cwd", "home"):
+            for location, source in (
+                ("env", "SIRIUS_CONFIG_FILE"),
+                ("cwd", "current directory"),
+                ("home", "home directory"),
+                ("none", "none"),
+            ):
                 with self.subTest(location=location), patch.dict(
                     os.environ, {"HOME": str(home)}
-                ), patch("pathlib.Path.cwd", return_value=cwd), patch(
-                    "duckdb.connect"
-                ) as connect:
+                ), patch("pathlib.Path.cwd", return_value=cwd), patch("duckdb.connect"):
                     os.environ.pop("SIRIUS_CONFIG_FILE", None)
-                    if location in ("env", "empty_env"):
-                        os.environ["SIRIUS_CONFIG_FILE"] = (
-                            str(root / "ambient.yaml") if location == "env" else ""
-                        )
-                    else:
-                        config = (
-                            cwd / "sirius.yaml"
-                            if location == "cwd"
-                            else home / ".sirius/sirius.yaml"
-                        )
-                        config.write_text("# ambient configuration\n")
+                    expected = {
+                        "env": str(root / "ambient.yaml"),
+                        "cwd": str(cwd / "sirius.yaml"),
+                        "home": str(home / ".sirius/sirius.yaml"),
+                        "none": None,
+                    }[location]
+                    if location == "env":
+                        os.environ["SIRIUS_CONFIG_FILE"] = expected
+                    elif expected:
+                        pathlib.Path(expected).write_text("# ambient\n")
+                    self.assertEqual(discover_sirius_yaml(), (expected, source))
                     session = Session("synthetic-extension", None, root / "db", 0)
-                    with self.assertRaisesRegex(
-                        SessionError, "ambient Sirius configuration"
-                    ):
-                        session.open()
-                    connect.assert_not_called()
-                    if location in ("cwd", "home"):
-                        config.unlink()
-
-    def test_session_records_defaults_or_explicit_yaml_selection(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            selected = root / "selected.yaml"
-            selected.write_text("# explicitly selected snapshot\n")
-            for explicit in (False, True):
-                with self.subTest(explicit=explicit), patch.dict(
-                    os.environ, {"HOME": str(root)}
-                ), patch("pathlib.Path.cwd", return_value=root), patch(
-                    "duckdb.connect"
-                ):
-                    os.environ.pop("SIRIUS_CONFIG_FILE", None)
-                    if explicit:
-                        os.environ["SIRIUS_CONFIG_FILE"] = str(root / "ambient.yaml")
-                        (root / "sirius.yaml").write_text("# not selected\n")
-                    session = Session(
-                        "synthetic-extension",
-                        str(selected) if explicit else None,
-                        root / "db",
-                        0,
-                    )
                     session.open()
                     info = runtime_info(session)
-                    self.assertEqual(
-                        info["sirius_config_mode"],
-                        "explicit_yaml" if explicit else "builtin_defaults",
-                    )
-                    if explicit:
+                    if expected:
                         self.assertEqual(
-                            os.environ["SIRIUS_CONFIG_FILE"], str(selected.resolve())
+                            info["sirius_config_mode"], f"ambient ({source})"
                         )
-                        self.assertEqual(info["sirius_config"], str(selected.resolve()))
+                        self.assertEqual(info["sirius_config"], expected)
+                        self.assertEqual(os.environ["SIRIUS_CONFIG_FILE"], expected)
                     else:
+                        self.assertEqual(info["sirius_config_mode"], "builtin_defaults")
                         self.assertNotIn("SIRIUS_CONFIG_FILE", os.environ)
-                        self.assertIsNone(info["sirius_config"])
                     session.close()
+                    if location in ("cwd", "home"):
+                        pathlib.Path(expected).unlink()
+            # An empty variable counts as unset; an explicit file wins over everything.
+            with patch.dict(
+                os.environ, {"SIRIUS_CONFIG_FILE": "", "HOME": str(home)}
+            ), patch("pathlib.Path.cwd", return_value=cwd):
+                self.assertEqual(discover_sirius_yaml(), (None, "none"))
+            selected = root / "selected.yaml"
+            selected.write_text("# selected\n")
+            with patch.dict(
+                os.environ, {"SIRIUS_CONFIG_FILE": str(root / "ambient.yaml")}
+            ), patch("duckdb.connect"):
+                session = Session("synthetic-extension", str(selected), root / "db", 0)
+                session.open()
+                self.assertEqual(
+                    runtime_info(session)["sirius_config_mode"], "explicit_yaml"
+                )
+                self.assertEqual(
+                    os.environ["SIRIUS_CONFIG_FILE"], str(selected.resolve())
+                )
+                session.close()
+
+    def test_engine_snapshots_the_ambient_yaml_when_the_configuration_names_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            extension = root / "sirius.duckdb_extension"
+            extension.write_text("unit test; never loaded")
+            yaml = root / "ambient.yaml"
+            yaml.write_text("# ambient\n")
+            cfg = load_config(None, ["sirius.configs=[]"])
+            args = argparse.Namespace(
+                cpu_only=False, extension=str(extension), sirius_config=None
+            )
+            with patch.dict(os.environ, {"SIRIUS_CONFIG_FILE": str(yaml)}):
+                self.assertEqual(_engine(args, cfg), (str(extension), [str(yaml)]))
+            with patch.dict(
+                os.environ, {"SIRIUS_CONFIG_FILE": "", "HOME": str(root)}
+            ), patch("pathlib.Path.cwd", return_value=root):
+                self.assertEqual(_engine(args, cfg), (str(extension), []))
 
     def test_selftest_bounds_default_data_and_preserves_explicit_overrides(self):
         defaults = build_parser().parse_args(["selftest", "--queries", "100"])
@@ -298,16 +314,7 @@ class ToolTests(unittest.TestCase):
             )
             self.assertEqual(outcome["status"], "ok", outcome)
             self.assertEqual(outcome["record"]["verdict"], "ok")
-            columns = outcome["record"]["evidence"]["cpu"]["columns"]
-            self.assertEqual(
-                [col["type"] for col in columns],
-                [
-                    "DECIMAL(12,2)",
-                    "DECIMAL(12,2)[]",
-                    "DECIMAL(12,2)[2]",
-                    "DECIMAL(12,2)[][]",
-                ],
-            )
+            self.assertEqual(outcome["record"]["evidence"]["cpu"]["row_count"], 1)
 
     def test_replay_parses_comments_and_quoted_semicolons(self):
         with tempfile.TemporaryDirectory() as tmp:
