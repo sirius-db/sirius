@@ -45,6 +45,7 @@ from .schema_gen import Dataset
 
 CANARY_SETTING = "sirius_test_inject_transparent_gpu_error"
 SHELL_ENV = "SIRIUSFUZZ_SHELL"
+TEARDOWN_SECONDS = 90.0  # a killed shell can take a while to release a large GPU pool
 UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
 _SENTINEL = "siriusfuzz"
 _ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
@@ -316,11 +317,7 @@ class Shell:
     def _died(self, start: float, err: list[str]) -> ShellResult:
         """The process ended mid-statement: collect the rest of stderr (the backtrace)."""
         assert self.proc is not None
-        try:
-            self.exitcode = self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.exitcode = self.proc.wait(timeout=5)
+        self.exitcode = self._reap(10)
         until = time.monotonic() + 2
         while time.monotonic() < until:
             try:
@@ -337,15 +334,28 @@ class Shell:
             exitcode=self.exitcode,
         )
 
-    def kill(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
+    def _reap(self, grace: float) -> int | None:
+        """Wait for the process to end, SIGKILL after ``grace`` seconds; never raises.
+
+        A killed shell keeps running until the driver has released its GPU pool,
+        which can take tens of seconds; the next shell must not start before that.
+        """
+        assert self.proc is not None
+        if grace > 0:
             try:
-                self.proc.wait(timeout=10)
+                return self.proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
                 pass
-        if self.proc is not None:
-            self.exitcode = self.proc.poll()
+        self.proc.kill()
+        try:
+            return self.proc.wait(timeout=TEARDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def kill(self) -> None:
+        if self.proc is None:
+            return
+        self.exitcode = self._reap(0) if self.proc.poll() is None else self.proc.poll()
 
     def stop(self) -> None:
         if self.proc is None:
@@ -353,10 +363,11 @@ class Shell:
         if self.proc.poll() is None:
             try:
                 self.proc.stdin.close()  # type: ignore[union-attr]
-                self.proc.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                self.kill()
-        self.exitcode = self.proc.poll()
+            except OSError:
+                pass
+            self.exitcode = self._reap(10)
+        else:
+            self.exitcode = self.proc.poll()
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
