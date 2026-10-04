@@ -188,6 +188,8 @@ class Report:
             "observed": observed.value,  # the verdict before a known issue claimed it
             "issue": issue,
             "reason": reason,
+            "detail": rec.detail,
+            "diffs": list(rec.diffs[:3]),
             "worker": rec.worker,
             "sql": rec.sql,
             "labels": rec.labels,
@@ -485,21 +487,45 @@ class Report:
         def known(g: dict[str, Any]) -> str:
             return f"   known: {', '.join(g['issues'])}" if g.get("issues") else ""
 
+        def one_line(sql: str) -> str:
+            return " ".join(sql.split())[:220]
+
+        # Findings first: a crash or a wrong answer outranks any gap, in either mode.
+        # Gaps, known or not, are in the tables below.
+        findings = [
+            f
+            for f in summary["findings"]
+            if not Verdict(f.get("observed", f["verdict"])).is_gap()
+        ]
+        lines.append("")
+        lines.append(
+            f"findings ({len(findings)} unique); smallest query that reproduces:"
+        )
+        for f in findings:
+            reason = f"{f['issue']}: {f['reason']}" if f.get("issue") else f["reason"]
+            lines.append(
+                f"  [{f['verdict']}] x{f['count']:<4d} {f['name']}  {reason[:100]}"
+            )
+            lines.append(f"      {one_line(f.get('reduced_sql') or f.get('sql', ''))}")
+            labels = f.get("reduced_labels") or f.get("labels") or []
+            if labels:
+                lines.append(f"      features: {', '.join(labels)}")
+            for diff in f.get("diffs", [])[:2]:
+                lines.append(f"      {diff[:160]}")
         if runtime:
             seconds = sum(g["gpu_seconds"] for g in runtime)
             lines.append("")
             lines.append(
                 f"runtime fallbacks ({reasons(runtime)}, "
                 f"{sum(g['count'] for g in runtime)} queries, {seconds:.1f}s of GPU work "
-                "thrown away); smallest query that passes the planner and still fails, "
-                "and its features:"
+                "thrown away); smallest query that passes the planner and still fails:"
             )
             for g in runtime:
                 lines.append(
                     f"  x{g['count']:<4d} {g['gpu_seconds']:6.1f}s  {g['reason'][:110]}"
                     + known(g)
                 )
-                lines.append(f"      {' '.join(g['sql'].split())[:220]}")
+                lines.append(f"      {one_line(g['sql'])}")
                 lines.append(f"      features: {', '.join(g['labels'])}   {names(g)}")
         if plan:
             lines.append("")
@@ -513,21 +539,8 @@ class Report:
                     f"  x{g['count']:<4d} {shown[:110]}{known(g)}   {names(g)}"
                 )
                 if g["reduced"]:
-                    lines.append(f"      {' '.join(g['sql'].split())[:220]}")
+                    lines.append(f"      {one_line(g['sql'])}")
                     lines.append(f"      features: {', '.join(g['labels'])}")
-        # Gaps, known or not, are in the tables above; everything else is listed here.
-        findings = [
-            f
-            for f in summary["findings"]
-            if not Verdict(f.get("observed", f["verdict"])).is_gap()
-        ]
-        lines.append("")
-        lines.append(f"findings ({len(findings)} unique):")
-        for f in findings:
-            reason = f"{f['issue']}: {f['reason']}" if f.get("issue") else f["reason"]
-            lines.append(
-                f"  [{f['verdict']}] x{f['count']:<4d} {f['name']}  {reason[:100]}"
-            )
         if summary["cpu_error_reasons"]:
             lines.append("")
             lines.append("skipped (CPU error) reasons, top 20:")

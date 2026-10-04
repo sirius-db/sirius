@@ -209,12 +209,19 @@ A runtime error counts as a gap only when its message says *not supported*, *uns
 so it is listed under `findings`. If one turns out to be an unsupported feature phrased
 differently, widen the pattern in `siriusfuzz/classify.py`.
 
-Runtime fallbacks come first, ordered by the GPU time they threw away, which is the order in which
-to move their checks to plan time (fuzz datasets are small, so read the figures as relative). Both
-tables group by the reason the smallest reproducer reports:
+The summary lists findings first, since a crash or a wrong answer found during a gaps run still
+outranks any gap, then runtime fallbacks ordered by the GPU time they threw away, which is the
+order in which to move their checks to plan time (fuzz datasets are small, so read the figures as
+relative), then plan-time fallbacks. Every entry shows its smallest query; both gap tables group by
+the reason that query reports:
 
 ```text
-runtime fallbacks (1 reason, 5 queries, 3.2s of GPU work thrown away); smallest query that passes the planner and still fails, and its features:
+findings (1 unique); smallest query that reproduces:
+  [mismatch] x1    012-mismatch-7c8d9e0f  row count 41 vs 40
+      SELECT "a0"."k" AS c0 FROM "t0" AS "a0" LEFT JOIN "t1" AS "a1" ON ("a0"."k" > "a1"."k")
+      features: ColumnRef, Compare(>), Join(left), Select, TableRef
+
+runtime fallbacks (1 reason, 5 queries, 3.2s of GPU work thrown away); smallest query that passes the planner and still fails:
   x5      3.2s  Distinct aggregates not supported in GPU path yet   known: sirius-db/sirius#1218
       SELECT count(DISTINCT "a0"."c1") AS c0 FROM "t2" AS "a0"
       features: Agg(count,distinct), ColumnRef, Select, TableRef   findings: 007-runtime_fallback-2b3c4d5e
@@ -222,9 +229,6 @@ runtime fallbacks (1 reason, 5 queries, 3.2s of GPU work thrown away); smallest 
 plan-time fallbacks (2 reasons, 207 queries):
   x180  Window not supported   findings: 000-plan_fallback-1f2e3d4c
   x27   Unsupported expression in projection: {concat, regexp_matches}   findings: 003-plan_fallback-9a8b7c6d, 011-plan_fallback-5e6f7a8b
-
-findings (1 unique):
-  [mismatch] x1    012-mismatch-7c8d9e0f  row count 41 vs 40
 ```
 
 `summary.json` carries the same tables under `gaps.runtime` and `gaps.plan`. A query is reported

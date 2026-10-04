@@ -45,7 +45,7 @@ Read the run directory the command printed. Report the host, tested extension id
 command and limits, completion status and exit code, verdict counts, and paths to `summary.txt`
 and the finding bundles. Separate setup failures, skipped CPU errors, gaps and findings; dedup
 signatures are grouping hints, not confirmed defect counts. Exit 0 does not mean zero findings.
-In a gaps run, report the runtime-fallback table first (reason, GPU time thrown away, smallest
-query, features), then the plan-time table. After a `recheck`, report which findings cleared,
+In a gaps run, report findings first, then the runtime-fallback table (reason, GPU time thrown
+away, smallest query, features), then the plan-time table. After a `recheck`, report which findings cleared,
 which changed verdict, and which still reproduce. Preserve the evidence; do not edit the engine
 or publish issues as part of a fuzzing request.
