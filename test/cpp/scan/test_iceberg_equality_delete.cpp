@@ -313,3 +313,39 @@ TEST_CASE("iceberg delete pipeline - refuses a batch that is all appended keys",
   REQUIRE_THROWS_AS(pipeline.apply(std::move(batch), batch_layout{runs}, test_stream(), test_mr()),
                     std::invalid_argument);
 }
+
+TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",
+          "[r2b][iceberg][positional_filter]")
+{
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(legacy);
+  auto payload                             = std::make_shared<IcebergDeleteData>();
+  payload->positional_deletes["a.parquet"] = {1, 1, 6};
+  payload->positional_deletes["b.parquet"] = {2};
+  std::unique_ptr<positional_delete_filter> filter;
+  if (legacy) {
+    filter = std::make_unique<positional_delete_filter>(payload);
+  } else {
+    iceberg_delete_sets sets;
+    for (auto const& [path, positions] : payload->positional_deletes) {
+      auto owner = std::shared_ptr<std::vector<int64_t> const>(payload, &positions);
+      sets.emplace(path, std::make_shared<iceberg_delete_set const>(path, std::move(owner)));
+    }
+    sets.emplace("c.parquet", std::make_shared<iceberg_delete_set const>("c.parquet"));
+    filter = std::make_unique<positional_delete_filter>(std::move(sets));
+  }
+  std::weak_ptr<IcebergDeleteData const> owner = payload;
+  payload.reset();
+  CHECK_FALSE(owner.expired());
+  std::vector<batch_row_run> layout{
+    {"a.parquet", 5, 0, 4}, {"b.parquet", 0, 4, 3}, {"c.parquet", 0, 7, 3}};
+  CHECK(filter->affects(layout));
+  CHECK_FALSE(filter->affects(std::vector<batch_row_run>{{"c.parquet", 0, 0, 3}}));
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(int32_column({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+  auto result = filter->apply(
+    std::make_unique<cudf::table>(std::move(columns)), layout, test_stream(), test_mr());
+  CHECK(to_host(result->view().column(0)) == std::vector<int32_t>{0, 2, 3, 4, 5, 7, 8, 9});
+  filter.reset();
+  CHECK(owner.expired());
+}

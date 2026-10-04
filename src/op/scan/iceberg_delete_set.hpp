@@ -18,14 +18,25 @@
 #include "scan_manager/preparation_ledger.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius::op::scan {
+// For deferred results:
 // Positions use the charged allocation itself; no separately allocated vector or shadow charge.
 // Publish only shared_ptr<const iceberg_delete_set>. The backing outlives every consumer.
 struct iceberg_delete_set {
   explicit iceberg_delete_set(std::string file) : data_file(std::move(file)) {}
+  // Legacy positions alias the completed payload; they are outside the preparation ledger.
+  iceberg_delete_set(std::string file, std::shared_ptr<std::vector<int64_t> const> positions_owner)
+    : data_file(std::move(file)), legacy_positions_(std::move(positions_owner))
+  {
+    if (!legacy_positions_) throw std::invalid_argument("legacy delete positions require backing");
+    positions = *legacy_positions_;
+  }
   iceberg_delete_set(std::string file,
                      scan_manager::charged_block backing,
                      uint64_t count,
@@ -50,5 +61,8 @@ struct iceberg_delete_set {
 
  private:
   scan_manager::charged_block backing_;
+  std::shared_ptr<std::vector<int64_t> const> legacy_positions_;
 };
+using iceberg_delete_sets =
+  std::unordered_map<std::string, std::shared_ptr<iceberg_delete_set const>>;
 }  // namespace sirius::op::scan

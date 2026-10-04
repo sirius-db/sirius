@@ -16,6 +16,7 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -233,6 +234,7 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->certificates()[0].input_identity == file.certificates()[0].input_identity);
   CHECK(split->certificates()[0].split_id == split_id);
   CHECK(split->dependencies()[0].footer == file.file_metadata);
+  CHECK(split->dependencies()[0].delete_set == file.dependencies()[0].delete_set);
   CHECK(split->rg_slices[0].file_metadata == file.file_metadata);
   CHECK(split->rg_slices[0].file_path == file.file_path);
   CHECK(split->rg_slices[0].file_index == file.file_index);
@@ -581,7 +583,7 @@ TEST_CASE("File bounded cursors preserve batching and partial emission never fab
   auto metadata = work();
   auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
   REQUIRE(file.row_groups.size() > 1);
-  REQUIRE_FALSE(file.disable_filter_pushdown);
+  CHECK(file.disable_filter_pushdown == iceberg);
   auto expected                     = copy_parquet_file_metadata(file);
   expected->disable_filter_pushdown = iceberg;
   auto coalescer                    = ingestible->create_batch_coalescer();
@@ -1401,4 +1403,293 @@ TEST_CASE("Production scan preparation runs and publishes on the execute owner",
   CHECK(execution_after.executions == execution_before.executions + 2);
   CHECK(execution_after.runtime_fallbacks == execution_before.runtime_fallbacks);
   CHECK(context->get_scan_manager().num_active_queries() == 0);
+}
+
+namespace {
+std::unique_ptr<iceberg_ingestible_table_info> iceberg_info(
+  std::vector<std::string> paths, std::shared_ptr<IcebergDeleteData const> payload = nullptr)
+{
+  auto base                 = parquet_info(53);
+  auto info                 = std::make_unique<iceberg_ingestible_table_info>();
+  info->contract_id         = base->contract_id;
+  info->names               = std::move(base->names);
+  info->returned_types      = std::move(base->returned_types);
+  info->column_ids          = std::move(base->column_ids);
+  info->scan_output_arity   = base->scan_output_arity;
+  info->resolved_file_paths = std::move(paths);
+  info->delete_data         = std::move(payload);
+  info->table_path          = "test-table";
+  return info;
+}
+}  // namespace
+
+TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
+          "[r2b][iceberg][delete_set][parquet_certificate]")
+{
+  auto const alias  = std::string{GENERATE("exact", "file_uri", "suffix")};
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(alias, legacy);
+  sirius::test::scoped_sirius_disable disable;
+  temporary_directory files;
+  auto base         = parquet_info(53);
+  auto const source = base->resolved_file_paths.front();
+  auto deleted      = (files.path / "deleted.parquet").string();
+  auto intact       = (files.path / "intact.parquet").string();
+  std::filesystem::copy_file(source, deleted);
+  std::filesystem::copy_file(source, intact);
+  auto payload                                        = std::make_shared<IcebergDeleteData>();
+  auto key                                            = alias == "file_uri" ? "file://" + deleted
+                                                        : alias == "suffix" ? "deleted.parquet"
+                                                                            : deleted;
+  payload->positional_deletes[key]                    = {0, 0, 4};
+  payload->positional_deletes["unreferenced.parquet"] = {1};
+  auto const* positions                               = payload->positional_deletes[key].data();
+  std::weak_ptr<IcebergDeleteData const> owner        = payload;
+  auto info = iceberg_info({deleted, intact}, legacy ? payload : nullptr);
+  if (!legacy) {
+    info->delete_sets.emplace();
+    for (auto const& [path, positions] : payload->positional_deletes) {
+      auto backing = std::shared_ptr<std::vector<int64_t> const>(payload, &positions);
+      info->delete_sets->emplace(
+        path, std::make_shared<iceberg_delete_set const>(path, std::move(backing)));
+    }
+    info->delete_sets->emplace(intact, std::make_shared<iceberg_delete_set const>(intact));
+  }
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  auto coalescer = ingestible->create_batch_coalescer();
+  for (auto const& path : {deleted, intact}) {
+    auto work = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    REQUIRE(work);
+    auto metadata = work();
+    REQUIRE(metadata->dependencies().size() == 1);
+    auto const set = metadata->dependencies().front().delete_set;
+    REQUIRE(set);
+    CHECK(set->positions.empty() == (path == intact));
+    if (path == deleted) {
+      CHECK(set->positions.data() == positions);
+      CHECK(std::vector<int64_t>(set->positions.begin(), set->positions.end()) ==
+            std::vector<int64_t>{0, 0, 4});
+    }
+    auto const& file = dynamic_cast<parquet_file_scan_info const&>(*metadata);
+    CHECK(file.disable_filter_pushdown == (path == deleted));
+    auto batches = coalescer->push(std::move(metadata));
+    CHECK(batches.size() == (path == intact ? 1 : 0));
+    for (auto& batch : batches)
+      splits.push_back(std::move(batch));
+  }
+  auto tail = coalescer->flush();
+  REQUIRE(tail.size() == 1);
+  splits.push_back(std::move(tail.front()));
+  REQUIRE(splits.size() == 2);
+  for (size_t i = 0; i < splits.size(); ++i) {
+    REQUIRE(splits[i]->dependencies().size() == 1);
+    auto const& set = splits[i]->dependencies().front().delete_set;
+    REQUIRE(set);
+    CHECK(set->positions.empty() == (i == 1));
+    CHECK(dynamic_cast<parquet_split_info const&>(*splits[i]).disable_filter_pushdown == (i == 0));
+  }
+  coalescer.reset();
+  ingestible.reset();
+  payload.reset();
+  CHECK_FALSE(owner.expired());
+  CHECK(splits.front()->dependencies().front().delete_set->positions.front() == 0);
+  splits.clear();
+  CHECK(owner.expired());
+}
+
+TEST_CASE("Iceberg per-file input distinguishes complete empty results from missing results",
+          "[r2b][iceberg][delete_set][parquet_certificate]")
+{
+  sirius::test::scoped_sirius_disable disable;
+  auto const path = parquet_info(53)->resolved_file_paths.front();
+  auto info       = iceberg_info({path});
+  info->delete_sets.emplace();
+  SECTION("complete empty result needs no table-wide payload")
+  {
+    auto set = std::make_shared<iceberg_delete_set const>(path);
+    info->delete_sets->emplace(path, set);
+    auto ingestible = make_ingestible(std::move(info));
+    auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+    auto work       = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    auto metadata = work();
+    CHECK(metadata->dependencies().front().delete_set == set);
+    CHECK_FALSE(dynamic_cast<parquet_file_scan_info&>(*metadata).disable_filter_pushdown);
+    auto coalescer = ingestible->create_batch_coalescer();
+    CHECK(coalescer->push(std::move(metadata)).empty());
+    auto splits = coalescer->flush();
+    REQUIRE(splits.size() == 1);
+    CHECK(splits.front()->dependencies().front().delete_set == set);
+  }
+  SECTION("missing result must not become empty")
+  {
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      "[iceberg_gpu_ingestible] no complete delete set for '" + path + "'");
+  }
+  SECTION("pending result must not become empty")
+  {
+    info->delete_sets->emplace(path, nullptr);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'");
+  }
+  SECTION("wrong file identity is refused")
+  {
+    info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>("other.parquet"));
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'");
+  }
+  SECTION("two input modes cannot silently bypass legacy checks")
+  {
+    info->delete_sets->emplace(path, std::make_shared<iceberg_delete_set const>(path));
+    auto payload = std::make_shared<IcebergDeleteData>();
+    payload->equality_delete_groups.emplace_back();
+    info->delete_data = std::move(payload);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      "[iceberg_gpu_ingestible] both legacy and per-file delete inputs were supplied");
+  }
+}
+
+TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-delete errors",
+          "[r2b][iceberg][delete_set][parquet_certificate]")
+{
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(legacy);
+  sirius::test::scoped_sirius_disable disable;
+  auto make_info = [&](std::vector<std::string> paths, std::vector<std::string> keys) {
+    auto info = iceberg_info(std::move(paths));
+    if (legacy) {
+      auto payload = std::make_shared<IcebergDeleteData>();
+      for (auto const& key : keys)
+        payload->positional_deletes[key] = {1};
+      info->delete_data = std::move(payload);
+    } else {
+      info->delete_sets.emplace();
+      for (auto const& key : keys) {
+        auto positions = std::make_shared<std::vector<int64_t> const>(std::vector<int64_t>{1});
+        info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, positions));
+      }
+    }
+    return info;
+  };
+  SECTION("one manifest key must not name two scanned files")
+  {
+    auto info = make_info({"/a/data.parquet", "/b/data.parquet"}, {"data.parquet"});
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      Catch::Matchers::ContainsSubstring(
+                        "delete file entry '{}' matches more than one scanned data file, "
+                        "so its deleted rows cannot be attributed"));
+  }
+  SECTION("an exact path must not hide a second alias")
+  {
+    auto info = make_info({"/a/data.parquet"}, {"/a/data.parquet", "file:///a/data.parquet"});
+    CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                      Catch::Matchers::ContainsSubstring(
+                        "scanned data file '{}' is named by {} different manifest entries"));
+  }
+  SECTION("suffix matching requires a path component boundary")
+  {
+    auto info = make_info({"/a/notdata.parquet"}, {"data.parquet"});
+    if (legacy)
+      CHECK_NOTHROW(make_ingestible(std::move(info)));
+    else
+      CHECK_THROWS_WITH(make_ingestible(std::move(info)),
+                        "[iceberg_gpu_ingestible] no complete delete set for '/a/notdata.parquet'");
+  }
+  SECTION("hive and positional deletes retain the original refusal")
+  {
+    auto info = make_info({"/a/data.parquet"}, {"/a/data.parquet"});
+    info->partition_indices.emplace_back("p", 1);
+    CHECK_THROWS_WITH(
+      make_ingestible(std::move(info)),
+      Catch::Matchers::ContainsSubstring(
+        "iceberg table '{}' combines hive partition columns with positional deletes, "
+        "which the GPU scan path cannot order correctly"));
+  }
+  if (legacy) {
+    SECTION("unresolved legacy payload retains the original refusal")
+    {
+      CHECK_THROWS_WITH(
+        make_ingestible(iceberg_info({"/a/data.parquet"})),
+        "[iceberg_gpu_ingestible] no delete data for 'test-table'; the planner must resolve it "
+        "(or decline the scan) before building the ingestible");
+    }
+    SECTION("equality deletes retain the original refusal")
+    {
+      auto info    = make_info({"/a/data.parquet"}, {});
+      auto payload = std::make_shared<IcebergDeleteData>();
+      payload->equality_delete_groups.emplace_back();
+      info->delete_data = std::move(payload);
+      CHECK_THROWS_WITH(
+        make_ingestible(std::move(info)),
+        Catch::Matchers::ContainsSubstring("iceberg table '{}' carries equality deletes, which the "
+                                           "GPU scan path does not apply yet"));
+    }
+  }
+}
+
+TEST_CASE("Iceberg materialization refuses missing or replaced delete dependencies before decode",
+          "[r2b][iceberg][consumer_guard][integration]")
+{
+  auto const defect =
+    std::string{GENERATE("valid", "missing", "wrong_file", "replacement", "pushdown")};
+  auto const legacy = GENERATE(false, true);
+  CAPTURE(defect, legacy);
+  native_database fixture;
+  auto context = sirius::test::get_registered_sirius_context(*fixture.connection);
+  auto* space =
+    sirius::scan_test_utils::get_space(context->get_memory_manager(), cucascade::memory::Tier::GPU);
+  REQUIRE(space);
+  auto const path                  = parquet_info(53)->resolved_file_paths.front();
+  auto const key                   = "file://" + path;
+  auto payload                     = std::make_shared<IcebergDeleteData>();
+  payload->positional_deletes[key] = {0, 4};
+  auto info                        = iceberg_info({path}, legacy ? payload : nullptr);
+  if (!legacy) {
+    info->delete_sets.emplace();
+    auto backing =
+      std::shared_ptr<std::vector<int64_t> const>(payload, &payload->positional_deletes.at(key));
+    info->delete_sets->emplace(key, std::make_shared<iceberg_delete_set const>(key, backing));
+  }
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto work       = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto coalescer = ingestible->create_batch_coalescer();
+  CHECK(coalescer->push(work()).empty());
+  auto batches = coalescer->flush();
+  REQUIRE(batches.size() == 1);
+  auto& split = dynamic_cast<parquet_split_info&>(*batches.front());
+  auto dependencies =
+    std::vector<split_dependencies>(split.dependencies().begin(), split.dependencies().end());
+  std::string expected =
+    "[iceberg_gpu_ingestible] incomplete or misbound delete set for '" + path + "'";
+  if (defect == "missing") {
+    dependencies.front().delete_set.reset();
+  } else if (defect == "wrong_file") {
+    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>("other.parquet");
+  } else if (defect == "replacement") {
+    dependencies.front().delete_set = std::make_shared<iceberg_delete_set const>(key);
+  } else if (defect == "pushdown") {
+    split.disable_filter_pushdown = false;
+    expected = "[iceberg_gpu_ingestible] positional deletes require pushdown suppression";
+  }
+  split.set_contract_payload(split.contract_id(),
+                             std::vector<split_materializer_certificate>(
+                               split.certificates().begin(), split.certificates().end()),
+                             std::move(dependencies));
+  rmm::cuda_stream stream;
+  if (defect == "valid") {
+    auto result = ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr);
+    CHECK(result.table.num_rows() == 23);
+    CHECK(result.state == filter_state::UNFILTERED);
+  } else {
+    CHECK_THROWS_WITH(
+      ingestible->materialize_metadata_to_table(split, *space, stream, false, nullptr), expected);
+  }
 }
