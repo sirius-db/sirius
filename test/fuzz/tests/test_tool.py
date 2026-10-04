@@ -5,8 +5,10 @@ import json
 import os
 import pathlib
 import signal
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import asdict
 from unittest.mock import patch
@@ -29,6 +31,7 @@ from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOpti
 from siriusfuzz.session import (
     RunResult,
     Session,
+    Shell,
     _normalize_shell_json_nulls,
     _strip_fallback_banners,
     discover_sirius_yaml,
@@ -36,6 +39,30 @@ from siriusfuzz.session import (
 )
 
 SHELL = conftest_path.available_shell()
+
+
+class ShellTeardownTests(unittest.TestCase):
+    def test_slow_death_after_a_crash_is_recorded_not_raised(self):
+        class SlowProc:
+            killed = False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("duckdb", timeout)
+
+        shell = Shell("duckdb-under-test")
+        shell.proc = SlowProc()  # type: ignore[assignment]
+        with patch("siriusfuzz.session.TEARDOWN_SECONDS", 0.01):
+            result = shell._died(time.monotonic(), ["*** SIGSEGV ***\n"])
+        self.assertEqual(result.status, "crash")
+        self.assertIsNone(result.exitcode)
+        self.assertTrue(shell.proc.killed)
+        self.assertIn("SIGSEGV", result.error)
 
 
 class ShellOutputTests(unittest.TestCase):

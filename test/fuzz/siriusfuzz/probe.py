@@ -25,6 +25,7 @@ DOCTOR_CHECKS = [
     "Sirius session opened",
     "file-backed dataset loaded",
     "query result verified",
+    "join result verified",
 ]
 
 
@@ -85,19 +86,24 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
             if not ok:
                 raise SessionError(f"GPU interception check failed: {why}")
         if payload["operation"] == "doctor":
-            probe = session.run(
-                "SELECT CAST(sum(k) AS BIGINT), count(*) FROM fuzz_probe",
-                session.gpu_available,
-                timeout,
-            )
-            if (
-                probe.status != "ok"
-                or probe.result is None
-                or probe.result.rows != [(3, 3)]
+            # The join covers a second pipeline and a hash build and probe, which
+            # the aggregate does not.
+            for sql, expected in (
+                ("SELECT CAST(sum(k) AS BIGINT), count(*) FROM fuzz_probe", [(3, 3)]),
+                (
+                    "SELECT count(*) FROM fuzz_probe a JOIN fuzz_probe b ON a.k = b.k",
+                    [(2,)],
+                ),
             ):
-                raise SessionError(
-                    f"GPU execution probe failed: {probe.error or probe.status}"
-                )
+                probe = session.run(sql, session.gpu_available, timeout)
+                if (
+                    probe.status != "ok"
+                    or probe.result is None
+                    or probe.result.rows != expected
+                ):
+                    raise SessionError(
+                        f"GPU execution probe failed ({sql}): {probe.error or probe.status}"
+                    )
             result = {
                 "status": "ok",
                 "gpu_verified": session.gpu_available,
