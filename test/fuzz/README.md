@@ -43,8 +43,9 @@ pixi run make
 fuzzes the enabled features for 10 minutes with one worker and prints the summary:
 
 ```bash
-pixi run fuzz run               # correctness: GPU answers against CPU answers
-pixi run fuzz run --mode gaps   # what Sirius hands back to the CPU at runtime
+pixi run fuzz run                                     # correctness: GPU answers against CPU answers
+pixi run fuzz run --mode gaps                         # what Sirius hands back to the CPU at runtime
+pixi run fuzz run --mode gaps --features configured   # the same, over the supported features only
 ```
 
 Results land in `test/fuzz/out/run-<timestamp>-seed<seed>-<unique>/`. The summary names the
@@ -174,9 +175,12 @@ pipeline up to the failing operator and then runs the CPU plan from scratch, so 
 thrown away. The mode exists to find the runtime ones so their checks can move to plan time. It
 changes three things:
 
-- **Everything is generated.** Every feature switch the configuration keeps off because Sirius
-  does not run it yet is turned on, and setting variants are skipped. Known-unsupported features
-  stay on because the shapes that slip past the planner are exactly what is being looked for.
+- **Everything is generated, unless you say otherwise.** Every feature switch the configuration
+  keeps off because Sirius does not run it yet is turned on, and setting variants are skipped.
+  Known-unsupported features stay on because the shapes that slip past the planner are exactly
+  what is being looked for. `--features configured` keeps the configuration's own flags instead:
+  every query then reaches runtime, so the whole budget probes the supported surface for runtime
+  fallbacks and plan rejections appear only when something inside that surface is declined.
   `--set` still applies afterwards; `show-config --mode gaps` prints the result.
 - **Runtime fallbacks are reduced to the unsupported feature.** The reducer accepts a smaller
   query as long as it still fails at runtime for the same *kind* of reason, with the rejected

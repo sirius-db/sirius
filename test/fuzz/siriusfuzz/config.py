@@ -513,6 +513,7 @@ def schema_keys(cls: type = FuzzConfig, prefix: str = "") -> list[str]:
 
 
 MODES = ("correctness", "gaps")
+FEATURE_SETS = ("configured", "all")
 
 
 def _gap_switches(cls: type = FuzzConfig, prefix: str = "") -> dict[str, Any]:
@@ -527,24 +528,34 @@ def _gap_switches(cls: type = FuzzConfig, prefix: str = "") -> dict[str, Any]:
     return out
 
 
-def mode_overrides(mode: str) -> dict[str, Any]:
+def mode_overrides(mode: str, features: str | None = None) -> dict[str, Any]:
     """Values a run mode forces before ``--set`` overrides apply.
 
-    ``gaps`` turns on every switch the configuration keeps off because Sirius
-    does not run the feature on the GPU yet, and skips setting variants, which
-    look for bugs rather than gaps.
+    ``features="all"`` turns on every switch the configuration keeps off because
+    Sirius does not run the feature on the GPU yet; ``"configured"`` leaves the
+    file's flags alone. A gaps run defaults to ``all`` and skips setting
+    variants, which look for bugs rather than gaps; a correctness run defaults
+    to ``configured``.
     """
     if mode not in MODES:
         raise ConfigError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+    if features is None:
+        features = "all" if mode == "gaps" else "configured"
+    if features not in FEATURE_SETS:
+        raise ConfigError(
+            f"features must be one of {', '.join(FEATURE_SETS)}, got {features!r}"
+        )
+    over: dict[str, Any] = _gap_switches() if features == "all" else {}
     if mode == "gaps":
-        return {**_gap_switches(), "variants.per_query": 0}
-    return {}
+        over["variants.per_query"] = 0
+    return over
 
 
 def load_config(
     path: str | pathlib.Path | None,
     overrides: list[str] | None = None,
     mode: str = "correctness",
+    features: str | None = None,
 ) -> FuzzConfig:
     """Load a TOML file (``config/default.toml`` when ``path`` is None), apply the
     mode's presets, then ``key.path=value`` overrides."""
@@ -552,7 +563,7 @@ def load_config(
         path = DEFAULT_CONFIG
     with open(path, "rb") as fh:
         data: dict[str, Any] = tomllib.load(fh)
-    for key, value in mode_overrides(mode).items():
+    for key, value in mode_overrides(mode, features).items():
         _set_dotted(data, key, value)
     for item in overrides or []:
         if "=" not in item:

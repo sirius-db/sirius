@@ -22,6 +22,7 @@ from .probe import execute_probe
 from . import __version__
 from .classify import Verdict
 from .config import (
+    FEATURE_SETS,
     FUZZ_DIR,
     MODES,
     REPO_ROOT,
@@ -96,10 +97,17 @@ def _mode_arg(p: argparse.ArgumentParser) -> None:
         default="correctness",
         help="correctness (default): fuzz the configuration's enabled features, where any "
         "fallback is a finding. gaps: find the queries Sirius accepts at plan time and "
-        "hands to the CPU at runtime; every generator feature is on regardless of the "
-        "configuration, setting variants are skipped, each runtime fallback is reduced to "
-        "the smallest query that passes the planner and still fails, and plan-time "
-        "rejections are listed by reason without reduction",
+        "hands to the CPU at runtime; setting variants are skipped, each runtime fallback "
+        "is reduced to the smallest query that passes the planner and still fails, and "
+        "plan-time rejections are listed by reason without reduction",
+    )
+    p.add_argument(
+        "--features",
+        choices=FEATURE_SETS,
+        default=None,
+        help="configured: generate only what the configuration's flags enable; all: also "
+        "turn on every feature the configuration keeps off for lack of GPU support. "
+        "Default: configured in correctness mode, all in gaps mode. --set applies after",
     )
 
 
@@ -139,7 +147,12 @@ class Engine:
 
 def _load(args: argparse.Namespace) -> FuzzConfig:
     path = cli_path(args.config, "configuration") if args.config else None
-    return load_config(path, args.set, getattr(args, "mode", "correctness"))
+    return load_config(
+        path,
+        args.set,
+        getattr(args, "mode", "correctness"),
+        getattr(args, "features", None),
+    )
 
 
 def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> Engine:
@@ -237,7 +250,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         budget = f"{opts.max_queries} queries"
     print(
-        f"siriusfuzz {__version__}: mode={args.mode} config={cfg.config_hash()} seed={seed} "
+        f"siriusfuzz {__version__}: mode={args.mode} features="
+        f"{args.features or ('all' if args.mode == 'gaps' else 'configured')} "
+        f"config={cfg.config_hash()} seed={seed} "
         f"workers={opts.workers} budget={budget} "
         f"{'cpu-only ' if engine.cpu_only else ''}{engine.shell} -> {run_dir}",
         file=sys.stderr,
@@ -567,6 +582,9 @@ def cmd_show_config(args: argparse.Namespace) -> int:
     cfg = _load(args)
     print(cfg.to_toml())
     print(f"# mode: {args.mode}")
+    print(
+        f"# features: {args.features or ('all' if args.mode == 'gaps' else 'configured')}"
+    )
     print(f"# config hash: {cfg.config_hash()}")
     return 0
 
