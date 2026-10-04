@@ -24,6 +24,7 @@
 #include <duckdb.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 
 namespace {
 
@@ -437,6 +438,24 @@ TEST_CASE_METHOD(
   run_ok("CREATE TABLE r_empty (id INTEGER, k INTEGER);");
   run_ok("CHECKPOINT;");
   disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  compare_gpu_vs_cpu(
+    "SELECT l.id, l.k FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
+}
+
+TEST_CASE_METHOD(
+  NullSafeJoinFixture,
+  "gpu_execution all-null-safe ANTI join against an empty right side keeps every row without "
+  "BUILD_PROBE",
+  "[integration][gpu_execution][join][nulls]")
+{
+  // A zero budget turns BUILD_PROBE, and with it broadcast, off even for a zero-byte build.
+  run_ok("CREATE TABLE r_empty (id INTEGER, k INTEGER);");
+  run_ok("CHECKPOINT;");
+  disabled_optimizer_guard guard(*con->context, duckdb::OptimizerType::BUILD_SIDE_PROBE_SIDE);
+  sirius::test::scoped_sirius_setting no_build_probe{
+    *con, "max_build_hash_table_bytes", std::uint64_t{0}};
   compare_gpu_vs_cpu(
     "SELECT l.id, l.k FROM l ANTI JOIN r_empty ON l.k IS NOT DISTINCT FROM r_empty.k");
   compare_gpu_vs_cpu(
