@@ -37,6 +37,7 @@
 #include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/mvcc_mask_job.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
+#include "scan_manager/preparation_coordinator.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
 
@@ -529,9 +530,9 @@ class sirius_scan_manager {
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
   /// scan source, the factory builds a split_provider from the operator's
   /// scan_info, installs a fresh split_connector on the operator, and stores
-  /// the provider in a map keyed by the operator. A driver thread then runs
-  /// the providers SEQUENTIALLY in registration order: provider[0] starts,
-  /// when its future completes provider[1] starts, and so on. Consumers (the
+  /// the provider in the per-query state. Preparation is armed here; after GPU
+  /// consumers start, execute runs it on the same query owner. Cached providers
+  /// continue to run on the existing worker executor. Consumers (the
   /// gpu scan operators) block in split_connector::get_next_split until splits
   /// arrive or the connector is closed, so no separate wake-up channel is
   /// needed.
@@ -554,6 +555,9 @@ class sirius_scan_manager {
                          bool enable_pinned_zone_map_pruning,
                          const std::vector<int>& allocated_gpu_ids,
                          std::shared_ptr<pipeline::completion_handler> completion = nullptr);
+  // Called by execute after task_scheduler starts the GPU consumers.
+  void run_preparation_on_query_thread(sirius::query_id_t);
+  void close_preparation(sirius::query_id_t, stop_reason) noexcept;
   void release_footer_hold_for_testing(uint64_t file_number)
   {
     if (auto completion = _execution_completion.load())
@@ -1012,9 +1016,11 @@ class sirius_scan_manager {
     //! request_stop() here stops only this query's work; the shared pool and every other
     //! query keep running.
     std::unique_ptr<exec::scoped_dispatcher> dispatcher;
+    // Destroyed before the dispatcher; drain has already quiesced the owner loop.
+    std::unique_ptr<preparation_coordinator> coordinator;
   };
 
-  /// \brief Enqueue @p state's metadata producers before starting its coalescer consumers.
+  /// \brief Register scan sources and arm the completion gate without submitting disk work.
   void start_metadata_processing(query_scan_manager_state& state);
 
   //! Resolve a query's state, or nullptr when it has already been reset.

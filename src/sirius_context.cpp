@@ -595,8 +595,9 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   //
   // On the transparent path the plan those pointers target is already gone: sirius_interface::
   // cleanup_internal destroys the engine before this window's finish(). A streaming_fragment's
-  // engine outlives the window, so its plan is still alive. Either way this only stops task
-  // creation from touching the plan; it never frees it.
+  // engine outlives the window, so its plan is still alive. Engine completion and its destructor
+  // drain plan users before releasing the plan; this reset covers setup paths and already-quiescent
+  // queries. Either way this only stops task creation from touching the plan; it never frees it.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same

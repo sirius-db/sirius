@@ -355,9 +355,24 @@ class parquet_batch_coalescer : public batch_coalescer {
 
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
-    std::vector<std::unique_ptr<scan_info>> emitted;
-    auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
-    if (file == nullptr) { return emitted; }
+    std::vector<std::unique_ptr<scan_info>> out;
+    if (!info) return out;
+    size_t cursor = 0;
+    for (;;) {
+      auto step = advance(*info, cursor, std::numeric_limits<size_t>::max());
+      if (step.batch) out.push_back(std::move(step.batch));
+      if (step.finished) return out;
+    }
+  }
+  std::unique_ptr<scan_info> partial_emit() override
+  {
+    if (_slices.empty()) return {};
+    return emit_current();
+  }
+  cursor_step advance(scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    auto* file = dynamic_cast<parquet_file_scan_info*>(&input);
+    if (file == nullptr) { return {nullptr, true}; }
 
     // Reject invalid ownership or coverage before recording a fallback or flushing pending work.
     if (file->contract_id() != _contract_id) {
@@ -386,15 +401,19 @@ class parquet_batch_coalescer : public batch_coalescer {
         std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
+    // A pruned file supplies an EOS fallback, but cannot change a live batch or its deadline.
+    if (file->row_groups.empty()) return {nullptr, true};
+
     bool const schema_changed =
       !file->row_groups.empty() && !_slices.empty() &&
       (_run_original_schema != file->original_schema || _run_arrow_schema != file->arrow_schema);
     if (!_slices.empty() && (schema_changed || _partition_values != file->partition_values ||
                              _disable_pushdown != file->disable_filter_pushdown ||
                              _run_reader_options != file->reader_options)) {
-      emitted.push_back(emit_current());
+      auto batch = emit_current();
       if (schema_changed && _counters)
         _counters->split_flushed_for_schema.fetch_add(1, std::memory_order_relaxed);
+      return {std::move(batch), false};
     }
     if (!file->row_groups.empty()) {
       _run_original_schema = file->original_schema;
@@ -405,32 +424,51 @@ class parquet_batch_coalescer : public batch_coalescer {
     _disable_pushdown   = file->disable_filter_pushdown;
 
     std::vector<cudf::size_type> cur_rgs;
-    std::size_t cur_output  = 0;
-    std::size_t cur_working = 0;
-    std::size_t cur_comp    = 0;
-    int64_t cur_rows        = 0;
-    auto seal_file          = [&]() {
+    std::size_t cur_output      = 0;
+    std::size_t cur_working     = 0;
+    std::size_t cur_comp        = 0;
+    int64_t cur_rows            = 0;
+    auto const continuing_input = cursor != 0;
+    auto seal_file              = [&]() {
       if (cur_rgs.empty()) { return; }
       auto const run_count = cur_rgs.size();
       // A file's row groups can span multiple splits, each sealed into its own
       // slice. fadvise stores a per-scan prefetch handle on the datasource, so
       // each slice gets its own datasource (sharing the io_object) — otherwise
       // a later split's fadvise would stomp an earlier one's handle.
-      auto slice_ds = file->datasource
-                                 ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
-                                 : std::shared_ptr<io::sirius_datasource>{};
-      _slices.emplace_back(file->file_metadata,
-                           file->file_path,
-                           std::move(cur_rgs),
-                           cur_output,
-                           cur_working,
-                           cur_comp,
-                           std::move(slice_ds),
-                           file->file_index);
-      auto certificate     = file->certificates().front();
-      certificate.split_id = _next_split_id++;
-      _certificates.push_back(std::move(certificate));
-      _dependencies.push_back(file->dependencies().front());
+      // A control quantum is not a batch boundary. Extend this input's prior slice,
+      // preserving the legacy reader/certificate shape until a real cap/deadline flush.
+      bool const continuation = continuing_input && !_slices.empty() &&
+                                _slices.back().file_index == file->file_index &&
+                                _slices.back().file_path == file->file_path &&
+                                _slices.back().file_metadata == file->file_metadata;
+      if (continuation) {
+        auto& slice = _slices.back();
+        slice.row_group_indices.insert(
+          slice.row_group_indices.end(), cur_rgs.begin(), cur_rgs.end());
+        slice.estimated_output_bytes =
+          memory::saturating_add(slice.estimated_output_bytes, cur_output);
+        slice.estimated_decode_working_bytes =
+          memory::saturating_add(slice.estimated_decode_working_bytes, cur_working);
+        slice.reserved_compressed_bytes =
+          memory::saturating_add(slice.reserved_compressed_bytes, cur_comp);
+      } else {
+        auto slice_ds = file->datasource
+                                       ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
+                                       : std::shared_ptr<io::sirius_datasource>{};
+        _slices.emplace_back(file->file_metadata,
+                             file->file_path,
+                             std::move(cur_rgs),
+                             cur_output,
+                             cur_working,
+                             cur_comp,
+                             std::move(slice_ds),
+                             file->file_index);
+        auto certificate     = file->certificates().front();
+        certificate.split_id = _next_split_id++;
+        _certificates.push_back(std::move(certificate));
+        _dependencies.push_back(file->dependencies().front());
+      }
       _produced_any      = true;
       _acc_working_bytes = memory::saturating_add(_acc_working_bytes, cur_working);
       _acc_run_count     = memory::saturating_add(_acc_run_count, run_count);
@@ -445,7 +483,9 @@ class parquet_batch_coalescer : public batch_coalescer {
     // cuDF tables are limited to cudf::size_type (int32_t) rows per call.
     static constexpr int64_t cudf_max_rows = std::numeric_limits<cudf::size_type>::max();
 
-    for (auto const& rg : file->row_groups) {
+    size_t processed = 0;
+    for (; cursor < file->row_groups.size() && processed < quantum; ++cursor, ++processed) {
+      auto const& rg                 = file->row_groups[cursor];
       auto const prospective_working = memory::saturating_add(
         memory::saturating_add(_acc_working_bytes, cur_working), rg.decode_working_bytes);
       auto const prospective_runs = memory::saturating_add(
@@ -459,8 +499,9 @@ class parquet_batch_coalescer : public batch_coalescer {
                                _acc_rows + cur_rows + rg.num_rows > cudf_max_rows;
       if (byte_cap_hit || row_cap_hit) {
         seal_file();
-        emitted.push_back(emit_current());
+        return {emit_current(), false};
       }
+      note_retained();
       cur_output  = memory::saturating_add(cur_output, rg.output_bytes);
       cur_working = memory::saturating_add(cur_working, rg.decode_working_bytes);
       cur_comp    = memory::saturating_add(cur_comp, rg.compressed_bytes);
@@ -468,7 +509,7 @@ class parquet_batch_coalescer : public batch_coalescer {
       cur_rows += rg.num_rows;
     }
     seal_file();
-    return emitted;
+    return {nullptr, cursor == file->row_groups.size()};
   }
 
   std::vector<std::unique_ptr<scan_info>> flush() override
@@ -526,6 +567,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     _acc_working_bytes = 0;
     _acc_run_count     = 0;
     _acc_rows          = 0;
+    clear_retained();
     return split;
   }
 
@@ -895,8 +937,8 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // parquet_batch_coalescer.
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
-  auto io_ctx = resolve(file_path);
-  return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+  return [this, file_path, idx, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+    auto io_ctx = resolve(file_path);
     try {
       return build_file_scan_info(file_path, idx, io_ctx);
     } catch (unsupported_physical_input const&) {

@@ -29,8 +29,10 @@ transparent::failure_cause classify_failure(preparation_failure const& failure)
   failure.validate();
   return {failure.cause, failure.detail};
 }
-preparation_unit::preparation_unit(unit_key key, required_input_set required)
-  : key_(key), required_(required)
+preparation_unit::preparation_unit(unit_key key,
+                                   required_input_set required,
+                                   std::shared_ptr<preparation_gate> gate)
+  : gate_(std::move(gate)), key_(key), required_(required)
 {
   if (required_.none()) {
     record_.state = unit_state::ready;
@@ -52,9 +54,15 @@ void preparation_unit::finish_input(required_input input)
     record_.state = unit_state::ready;
   }
   record_.completed = completed;
+  if (gate_) gate_->cv.notify_all();
 }
 bool preparation_unit::complete_input(footer_input input)
 {
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) {
+    gate_lock = std::unique_lock(gate_->mutex);
+    if (gate_->closed) return false;
+  }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::footer)) return false;
   if (!input.footer || !input.approval) throw std::invalid_argument("footer input lacks approval");
@@ -66,6 +74,11 @@ bool preparation_unit::complete_input(footer_input input)
 }
 bool preparation_unit::complete_input(segments_input input)
 {
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) {
+    gate_lock = std::unique_lock(gate_->mutex);
+    if (gate_->closed) return false;
+  }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::segments)) return false;
   if (!input.profiles) throw std::invalid_argument("segments input is absent");
@@ -75,6 +88,11 @@ bool preparation_unit::complete_input(segments_input input)
 }
 bool preparation_unit::complete_input(delete_set_input input)
 {
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) {
+    gate_lock = std::unique_lock(gate_->mutex);
+    if (gate_->closed) return false;
+  }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::delete_set)) return false;
   if (!input.value) throw std::invalid_argument("pending delete set is not an empty result");
@@ -84,6 +102,11 @@ bool preparation_unit::complete_input(delete_set_input input)
 }
 bool preparation_unit::complete_input(checkpoint_input input)
 {
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) {
+    gate_lock = std::unique_lock(gate_->mutex);
+    if (gate_->closed) return false;
+  }
   std::lock_guard lock(mutex_);
   if (!accept(required_input::checkpoint_iteration)) return false;
   deps_.checkpoint_iteration = input.iteration;
@@ -92,20 +115,54 @@ bool preparation_unit::complete_input(checkpoint_input input)
 }
 bool preparation_unit::fail(preparation_failure failure)
 {
-  std::lock_guard lock(mutex_);
-  if (record_.state != unit_state::pending) return false;
-  failure.validate();
-  record_.failure = std::move(failure);
-  record_.state   = unit_state::failed;
-  deps_           = {};
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) {
+    gate_lock = std::unique_lock(gate_->mutex);
+    if (gate_->closed) return false;
+  }
+  {
+    std::lock_guard lock(mutex_);
+    if (record_.state != unit_state::pending) return false;
+    failure.validate();
+    record_.failure = failure;
+    record_.state   = unit_state::failed;
+    deps_           = {};
+  }
+  if (gate_) {
+    // arm binds once; this callback stays stable until accepted users have drained.
+    auto* report = gate_->report_failure ? &gate_->report_failure : nullptr;
+    if (report) ++gate_->callbacks;
+    gate_->cv.notify_all();
+    gate_lock.unlock();
+    if (report) {
+      struct callback_use {
+        std::shared_ptr<preparation_gate> gate;
+        ~callback_use()
+        {
+          std::lock_guard lock(gate->mutex);
+          --gate->callbacks;
+          gate->cv.notify_all();
+        }
+      } use{gate_};
+      (*report)(failure);
+    }
+  }
+
   return true;
 }
 bool preparation_unit::cancel()
+{
+  std::unique_lock<std::mutex> gate_lock;
+  if (gate_) gate_lock = std::unique_lock(gate_->mutex);
+  return cancel_under_gate();
+}
+bool preparation_unit::cancel_under_gate()
 {
   std::lock_guard lock(mutex_);
   if (record_.state != unit_state::pending) return false;
   record_.state = unit_state::cancelled;
   deps_         = {};
+  if (gate_) gate_->cv.notify_all();
   return true;
 }
 unit_record preparation_unit::record() const

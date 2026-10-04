@@ -20,8 +20,10 @@
 
 #include <bitset>
 #include <compare>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -67,11 +69,21 @@ struct checkpoint_input {
   uint64_t iteration;
 };
 
+struct preparation_gate {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool closed      = false;
+  size_t callbacks = 0;
+  std::function<void(std::exception_ptr)> report_error;
+  std::function<void(preparation_failure const&)> report_failure;
+};
 // The attempt owns registration; workers receive only this unit and independent inputs.
 // Readiness is not publication: the attempt's publication gate is checked separately.
 class preparation_unit {
  public:
-  preparation_unit(unit_key key, required_input_set required);
+  preparation_unit(unit_key key,
+                   required_input_set required,
+                   std::shared_ptr<preparation_gate> gate = {});
   unit_key key() const noexcept { return key_; }
   required_input_set required() const noexcept { return required_; }
   bool complete_input(footer_input);
@@ -83,8 +95,11 @@ class preparation_unit {
   unit_record record() const;
 
  private:
+  friend class preparation_coordinator;
+  bool cancel_under_gate();
   bool accept(required_input);
   void finish_input(required_input);
+  std::shared_ptr<preparation_gate> gate_;
   unit_key key_;
   required_input_set required_;
   mutable std::mutex mutex_;

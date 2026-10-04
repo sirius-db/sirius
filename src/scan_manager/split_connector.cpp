@@ -34,6 +34,16 @@ void split_connector::push_split(std::unique_ptr<op::operator_data> split)
   // Sized before the lock: a cached-batch split reads its size through the blocking
   // to_read_only(), which waits on a downgrade — under _mutex that stalls every consumer pop.
   auto const split_bytes = split->get_estimated_size_in_bytes();
+  push_split_sized(std::move(split), split_bytes);
+}
+void split_connector::set_consumption_callback(std::function<void()> callback)
+{
+  auto owning = std::make_shared<std::function<void()> const>(std::move(callback));
+  std::lock_guard lock(_mutex);
+  _on_consumption = std::move(owning);
+}
+void split_connector::push_split_sized(std::unique_ptr<op::operator_data> split, size_t split_bytes)
+{
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
@@ -71,6 +81,9 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
                          std::chrono::steady_clock::now().time_since_epoch())
                          .count(),
                        std::memory_order_relaxed);
+    auto consumed = _on_consumption;
+    lock.unlock();
+    if (consumed) (*consumed)();
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
   }
   return std::nullopt;

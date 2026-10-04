@@ -34,6 +34,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -192,6 +193,8 @@ enum class verdict_reason : uint16_t {
 struct scan_publication_observation {
   std::map<std::string, uint64_t> readahead_registrations;
   uint64_t prefetcher_conversions = 0;
+  std::thread::id execute_owner, preparation_owner, preparation_runner, preparation_publisher;
+  uint64_t preparation_runs = 0;
 };
 
 struct physical_check_counters {

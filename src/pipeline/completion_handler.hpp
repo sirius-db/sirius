@@ -24,9 +24,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace sirius::pipeline {
 
@@ -103,6 +105,19 @@ class completion_handler {
   }
 
   // Register once before any worker/GPU submission. Late registration cannot retract success.
+  void set_preparation_stop_callback(std::function<void(bool)> callback)
+  {
+    auto observer = std::make_shared<std::function<void(bool)> const>(std::move(callback));
+    bool terminal = false, error = false;
+    {
+      std::lock_guard lock(terminal_mutex_);
+      if (preparation_stop_) throw std::logic_error("preparation observer already bound");
+      preparation_stop_ = observer;
+      terminal          = gpu_done_ || _completed.load();
+      error             = _has_error.load();
+    }
+    if (terminal) (*observer)(error);
+  }
   void begin_preparation()
   {
     std::lock_guard lock(terminal_mutex_);
@@ -132,9 +147,20 @@ class completion_handler {
    */
   void mark_completed() noexcept
   {
-    std::lock_guard lock(terminal_mutex_);
-    gpu_done_ = true;
-    maybe_complete();
+    std::shared_ptr<std::function<void(bool)> const> stop;
+    {
+      std::lock_guard lock(terminal_mutex_);
+      gpu_done_ = true;
+      stop      = preparation_stop_;
+      maybe_complete();
+    }
+    if (stop) {
+      try {
+        (*stop)(false);
+      } catch (...) {
+        report_error(std::current_exception());
+      }
+    }
   }
 
   /**
@@ -198,6 +224,7 @@ class completion_handler {
   std::shared_ptr<op::scan::test_injections const> injections;
   std::atomic<uint64_t> injected_oom_attempts{0};
   std::atomic<uint64_t> injected_launch_attempts{0};
+  std::thread::id execution_owner;      // Set by execute before scan preparation is armed.
   bool non_rollbackable_state = false;  // Latched by the query thread before task submission.
 
  private:
@@ -206,7 +233,7 @@ class completion_handler {
                     transparent::late_failure_cause fallback,
                     scan_manager::preparation_failure const* preparation) noexcept
   {
-    std::lock_guard terminal_lock(terminal_mutex_);
+    std::unique_lock terminal_lock(terminal_mutex_);
     if (_completed.load()) return;
     {
       std::lock_guard lock(failure_mutex_);
@@ -230,6 +257,14 @@ class completion_handler {
       _promise.set_exception(error);
     } catch (...) {
     }
+    auto stop = preparation_stop_;
+    terminal_lock.unlock();
+    if (stop) {
+      try {
+        (*stop)(true);
+      } catch (...) {
+      }
+    }
   }
   // Called with terminal_mutex_. Errors and cancellation do not wait for preparation closure.
   void maybe_complete() noexcept
@@ -243,6 +278,7 @@ class completion_handler {
     } catch (...) {
     }
   }
+  std::shared_ptr<std::function<void(bool)> const> preparation_stop_;
   std::mutex terminal_mutex_;
   bool gpu_done_              = false;
   bool preparation_active_    = false;

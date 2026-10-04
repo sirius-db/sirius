@@ -110,6 +110,8 @@ class sirius_engine {
 
  private:
   void cancel_dynamic_filter_publications() noexcept;
+  void quiesce_plan_users();
+  bool plan_users_quiescent_ = true;
   sirius::query_id_t query_id_;
   /// The planner query for this execution: the pipeline set plus the operator->pipeline and
   /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this

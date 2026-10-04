@@ -1484,7 +1484,8 @@ void sirius_scan_manager::prepare_for_query(
   state->query_token       = sirius::value_of(query_id);
   state->physical_counters = _physical_counters;
   state->pruning_enabled   = enable_pinned_zone_map_pruning;
-  state->completion        = completion;
+  if (!completion) completion = std::make_shared<pipeline::completion_handler>();
+  state->completion = completion;
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
   // whole pool. Dispatchers yield between tasks; the shared pool selects older queries
   // first and preserves FIFO order within each query's priority.
@@ -1977,18 +1978,40 @@ void sirius_scan_manager::prepare_for_query(
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state)
 {
-  // ORDER IS LOAD-BEARING: every producer must be enqueued before the first
-  // consumer. The slot loops block in wait_dequeue until their metadata arrives,
-  // so consumers dispatched first can occupy every slot while the producers
-  // they await remain queued behind them.
-  for (auto& scan : state.scans) {
-    auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source);
-    if (disk == nullptr) { continue; }
-    disk->provider->run(*state.dispatcher,
-                        state.metadata_processor->get_split_provider_bridge(scan.op));
+  state.coordinator = std::make_unique<preparation_coordinator>(
+    *state.completion, *state.dispatcher, state.preparation);
+  for (auto& scan : state.scans)
+    if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
+      state.metadata_processor->register_coordinator_source(
+        scan.op, *disk->provider, *state.coordinator);
+  state.coordinator->arm();
+}
+
+void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
+{
+  auto state = get_query_state(id);
+  if (!state || !state->coordinator) return;
+  auto cached = state->metadata_processor->prepare_cached_workers(*state->coordinator);
+  for (auto& work : cached)
+    state->dispatcher->enqueue(std::move(work));
+  maybe_start_memory_prefetcher(*state);
+  state->coordinator->run_on_query_thread();
+  if (state->physical_counters && state->physical_counters->track_units) {
+    auto stats = state->coordinator->snapshot();
+    std::lock_guard lock(state->physical_counters->units_mutex);
+    auto& observation         = state->physical_counters->publications_by_query[state->query_token];
+    observation.execute_owner = state->completion->execution_owner;
+    observation.preparation_owner     = stats.owner;
+    observation.preparation_runner    = stats.runner;
+    observation.preparation_publisher = stats.publisher;
+    observation.preparation_runs      = stats.runs;
   }
-  state.metadata_processor->spawn_workers(*state.dispatcher);
-  maybe_start_memory_prefetcher(state);
+}
+
+void sirius_scan_manager::close_preparation(sirius::query_id_t id, stop_reason reason) noexcept
+{
+  if (auto state = get_query_state(id); state && state->coordinator)
+    state->coordinator->request_stop(reason);
 }
 
 void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state& state)
@@ -2173,6 +2196,7 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
 {
+  if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
   if (completion && completion->injections)
     completion->release_footer_for_testing(completion->injections->hold_footer_index);
   // Stop the prefetcher first: it holds shared_ptrs to the operators'
@@ -2187,9 +2211,11 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
     }
     prefetcher.reset();
   }
+  if (coordinator) coordinator->drain();
   if (!dispatcher) { return; }
   dispatcher->request_stop();
   dispatcher->wait_for_all();
+  if (metadata_processor) metadata_processor->close_all_slots();
   // Stop explicitly rather than relying on the destructor: the coalescer's
   // slots and in-flight splits may still own shared_ptr copies.
   if (readahead) { readahead->stop(); }
@@ -2228,8 +2254,8 @@ void sirius_scan_manager::drain_query(sirius::query_id_t query_id)
   // Order matters: stop and join FIRST, then let `state` die. The sequencer task captures the
   // coalescer by `this` and the split tasks captured the providers, so destroying either with
   // a task still running is a use-after-free (scoped_dispatcher's dtor asserts on it).
-  // ~query_scan_manager_state then runs: dispatcher (already idle) first, then the coalescer,
-  // then the providers.
+  // ~query_scan_manager_state then runs: coordinator first, then dispatcher (already idle),
+  // then the coalescer and providers.
   if (state) { state->drain(); }
   state.reset();
 }

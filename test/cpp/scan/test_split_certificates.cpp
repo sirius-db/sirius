@@ -16,6 +16,7 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
@@ -540,6 +541,101 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   CHECK(position == paths.size());
 }
 
+TEST_CASE("File bounded cursors preserve batching and partial emission never fabricates EOS",
+          "[r2b][coalescer][parquet_certificate]")
+{
+  auto const iceberg = GENERATE(false, true);
+  CAPTURE(iceberg);
+  sirius::test::scoped_sirius_disable disable;
+  temporary_directory files;
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto path = (files.path / "multi.parquet").string();
+  exec_ok(con,
+          "COPY (SELECT i::INTEGER n_nationkey,'name' n_name,0::INTEGER n_regionkey,'comment' "
+          "n_comment FROM range(10000) t(i)) TO " +
+            sirius::test::sql_literal(path) + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  auto info                    = parquet_info(53);
+  info->resolved_file_paths    = {path};
+  info->approximate_batch_size = 64 * 1024 * 1024;
+  std::shared_ptr<gpu_ingestible> ingestible;
+  if (iceberg) {
+    auto bind                         = std::make_unique<iceberg_ingestible_table_info>();
+    bind->contract_id                 = info->contract_id;
+    bind->names                       = std::move(info->names);
+    bind->returned_types              = std::move(info->returned_types);
+    bind->column_ids                  = std::move(info->column_ids);
+    bind->scan_output_arity           = info->scan_output_arity;
+    bind->resolved_file_paths         = std::move(info->resolved_file_paths);
+    bind->approximate_batch_size      = info->approximate_batch_size;
+    auto deletes                      = std::make_shared<IcebergDeleteData>();
+    deletes->positional_deletes[path] = {0};
+    bind->delete_data                 = std::move(deletes);
+    ingestible                        = make_ingestible(std::move(bind));
+  } else {
+    ingestible = make_ingestible(std::move(info));
+  }
+  auto ioctx = std::make_shared<sirius::io::kvikio_context>();
+  auto work  = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto metadata = work();
+  auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
+  REQUIRE(file.row_groups.size() > 1);
+  REQUIRE_FALSE(file.disable_filter_pushdown);
+  auto expected                     = copy_parquet_file_metadata(file);
+  expected->disable_filter_pushdown = iceberg;
+  auto coalescer                    = ingestible->create_batch_coalescer();
+  size_t cursor                     = 0;
+  std::optional<batch_coalescer::clock::time_point> first;
+  while (cursor < file.row_groups.size()) {
+    auto before = cursor;
+    auto step   = coalescer->advance(file, cursor, 1);
+    CHECK(cursor - before <= 1);
+    CHECK_FALSE(step.batch);
+    REQUIRE(coalescer->first_retained_time());
+    if (!first) first = coalescer->first_retained_time();
+    CHECK(coalescer->first_retained_time() == first);
+  }
+  auto unrelated_pruned = copy_parquet_file_metadata(file);
+  unrelated_pruned->row_groups.clear();
+  unrelated_pruned->partition_values = {"pruned"};
+  size_t pruned_cursor               = 0;
+  auto pruned_step                   = coalescer->advance(*unrelated_pruned, pruned_cursor, 1);
+  CHECK(pruned_step.finished);
+  CHECK_FALSE(pruned_step.batch);
+  CHECK(coalescer->first_retained_time() == first);
+  auto partial = coalescer->partial_emit();
+  REQUIRE(partial);
+  check_parquet_file_split(*partial, *expected, 1);
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK_FALSE(coalescer->partial_emit());
+  auto next_file = copy_parquet_file_metadata(file);
+  cursor         = 0;
+  while (cursor < next_file->row_groups.size()) {
+    auto step = coalescer->advance(*next_file, cursor, 1);
+    CHECK_FALSE(step.batch);
+  }
+  REQUIRE(coalescer->first_retained_time());
+  auto tail = coalescer->flush();
+  REQUIRE(tail.size() == 1);
+  check_parquet_file_split(*tail.front(), *expected, 2);
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK_FALSE(coalescer->partial_emit());
+  CHECK(coalescer->flush().empty());
+  auto pruned = ingestible->create_batch_coalescer();
+  auto empty  = copy_parquet_file_metadata(file);
+  empty->row_groups.clear();
+  cursor = 0;
+  CHECK(pruned->advance(*empty, cursor, 1).finished);
+  CHECK_FALSE(pruned->first_retained_time());
+  CHECK_FALSE(pruned->partial_emit());
+  auto final_empty = pruned->flush();
+  REQUIRE(final_empty.size() == 1);
+  REQUIRE(dynamic_cast<parquet_split_info&>(*final_empty.front())
+            .rg_slices.front()
+            .row_group_indices.empty());
+  CHECK(pruned->flush().empty());
+}
 TEST_CASE("Parquet coalescing rejects malformed files without changing pending work",
           "[scan][certificate][parquet_certificate]")
 {
@@ -840,6 +936,8 @@ TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
 TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
           "[scan][certificate][integration]")
 {
+  auto const bounded = GENERATE(false, true);
+  CAPTURE(bounded);
   constexpr scan_contract_id contract_id = 61;
   native_database fixture;
   exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
@@ -865,12 +963,34 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     REQUIRE(range->certificates().size() == native_range->row_groups.size());
     REQUIRE(range->dependencies().size() == range->certificates().size());
     input_slices += range->certificates().size();
-    auto emitted = coalescer->push(std::move(range));
-    for (auto& split : emitted) {
-      splits.push_back(std::move(split));
+    if (bounded) {
+      size_t cursor = 0;
+      for (;;) {
+        auto before = cursor;
+        auto step   = coalescer->advance(*range, cursor, 1);
+        CHECK(cursor - before <= 1);
+        CHECK((step.batch || step.finished || cursor > before));
+        if (step.batch) splits.push_back(std::move(step.batch));
+        if (step.finished) break;
+      }
+    } else {
+      auto emitted = coalescer->push(std::move(range));
+      for (auto& split : emitted) {
+        splits.push_back(std::move(split));
+      }
     }
   }
+  if (bounded) {
+    REQUIRE(coalescer->first_retained_time());
+    auto partial = coalescer->partial_emit();
+    REQUIRE(partial);
+    splits.push_back(std::move(partial));
+    CHECK_FALSE(coalescer->first_retained_time());
+    CHECK_FALSE(coalescer->partial_emit());
+  }
   auto tail = coalescer->flush();
+  CHECK_FALSE(coalescer->first_retained_time());
+  CHECK(coalescer->flush().empty());
   for (auto& split : tail) {
     splits.push_back(std::move(split));
   }
@@ -878,7 +998,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   REQUIRE(input_slices > 1);
   REQUIRE(input_ranges > 1);
   REQUIRE(splits.size() > 1);
-  std::size_t output_slices = 0;
+  std::size_t output_slices = 0, output_rows = 0;
   for (auto const& split : splits) {
     auto const* native_split = dynamic_cast<duckdb_native_scan_info const*>(split.get());
     REQUIRE(native_split);
@@ -890,6 +1010,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
       auto const& dependency  = split->dependencies()[i];
       CHECK(certificate.contract_id == contract_id);
       auto const& group = native_split->row_groups[i];
+      output_rows += group.row_count;
       CHECK(certificate.split_id == static_cast<uint64_t>(group.row_group_index));
       REQUIRE(dependency.checkpoint_iteration.has_value());
       CHECK(certificate.input_identity == fixture.path.string() + "|checkpoint=" +
@@ -912,6 +1033,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     output_slices += split->certificates().size();
   }
   CHECK(output_slices == input_slices);
+  CHECK(output_rows == 1000000);
 }
 
 TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
@@ -965,6 +1087,8 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
     auto emitted = coalescer->push(provider());
+    CHECK_FALSE(coalescer->first_retained_time());
+    CHECK_FALSE(coalescer->partial_emit());
     for (auto& split : emitted) {
       splits.push_back(std::move(split));
     }
@@ -1228,4 +1352,53 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
   }
   split->set_contract_payload(81, std::move(certificates), std::move(dependencies));
   REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
+}
+
+TEST_CASE("Production scan preparation runs and publishes on the execute owner",
+          "[integration][scan][certificate][r2b_production_owner]")
+{
+  sirius::test::GpuExecutionFixture fixture;
+  auto& con = *fixture.con;
+  exec_ok(con, "SET gpu_execution=false");
+  exec_ok(con, "CREATE TABLE owner_items AS SELECT i FROM range(1000) t(i)");
+  exec_ok(con, "CHECKPOINT");
+  auto context          = sirius::test::get_registered_sirius_context(con);
+  auto counters         = context->physical_counters();
+  counters->track_units = true;
+  auto execution_before = context->get_transparent_execution_stats();
+  exec_ok(con, "SET gpu_execution=true");
+  for (auto const* sql : {"SELECT sum(i) FROM owner_items", "SELECT i FROM owner_items LIMIT 1"}) {
+    auto before = [&] {
+      std::lock_guard lock(counters->units_mutex);
+      return counters->publications_by_query;
+    }();
+    auto result = con.Query(sql);
+    REQUIRE(result);
+    if (result->HasError()) { INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->RowCount() == 1);
+    if (std::string_view(sql).starts_with("SELECT sum"))
+      CHECK(result->GetValue(0, 0).ToString() == "499500");
+    else {
+      auto value = result->GetValue(0, 0).GetValue<int64_t>();
+      CHECK(value >= 0);
+      CHECK(value < 1000);
+    }
+    {
+      std::lock_guard lock(counters->units_mutex);
+      REQUIRE(counters->publications_by_query.size() > before.size());
+      for (auto const& [token, observation] : counters->publications_by_query) {
+        if (before.contains(token)) continue;
+        REQUIRE(observation.preparation_runs == 1);
+        CHECK(observation.execute_owner != std::thread::id{});
+        CHECK(observation.preparation_owner == observation.execute_owner);
+        CHECK(observation.preparation_runner == observation.execute_owner);
+        CHECK(observation.preparation_publisher == observation.execute_owner);
+      }
+    }
+  }
+  auto execution_after = context->get_transparent_execution_stats();
+  CHECK(execution_after.executions == execution_before.executions + 2);
+  CHECK(execution_after.runtime_fallbacks == execution_before.runtime_fallbacks);
+  CHECK(context->get_scan_manager().num_active_queries() == 0);
 }

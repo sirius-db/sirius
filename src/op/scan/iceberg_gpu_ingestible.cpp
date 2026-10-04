@@ -54,24 +54,45 @@ class iceberg_batch_coalescer : public batch_coalescer {
     return suppress_pushdown(_inner->push(std::move(info)));
   }
 
+  cursor_step advance(scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    auto step = _inner->advance(input, cursor, quantum);
+    if (step.batch) step.batch = suppress_pushdown(std::move(step.batch));
+    clear_retained();
+    if (auto first = _inner->first_retained_time()) note_retained(*first);
+    return step;
+  }
+  std::unique_ptr<scan_info> partial_emit() override
+  {
+    auto batch = _inner->partial_emit();
+    clear_retained();
+    if (!batch) return {};
+    return suppress_pushdown(std::move(batch));
+  }
   std::vector<std::unique_ptr<scan_info>> flush() override
   {
-    return suppress_pushdown(_inner->flush());
+    auto batches = _inner->flush();
+    clear_retained();
+    return suppress_pushdown(std::move(batches));
   }
 
  private:
+  static std::unique_ptr<scan_info> suppress_pushdown(std::unique_ptr<scan_info> batch)
+  {
+    auto* split = dynamic_cast<parquet_split_info*>(batch.get());
+    if (split == nullptr) {
+      throw sirius::internal_exception(
+        "[iceberg_gpu_ingestible] parquet coalescer emitted a split that is not a "
+        "parquet_split_info; the iceberg path cannot guarantee delete positions for it");
+    }
+    split->disable_filter_pushdown = true;
+    return batch;
+  }
   static std::vector<std::unique_ptr<scan_info>> suppress_pushdown(
     std::vector<std::unique_ptr<scan_info>> batches)
   {
-    for (auto& batch : batches) {
-      auto* split = dynamic_cast<parquet_split_info*>(batch.get());
-      if (split == nullptr) {
-        throw sirius::internal_exception(
-          "[iceberg_gpu_ingestible] parquet coalescer emitted a split that is not a "
-          "parquet_split_info; the iceberg path cannot guarantee delete positions for it");
-      }
-      split->disable_filter_pushdown = true;
-    }
+    for (auto& batch : batches)
+      batch = suppress_pushdown(std::move(batch));
     return batches;
   }
 

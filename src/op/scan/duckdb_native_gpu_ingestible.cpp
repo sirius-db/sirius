@@ -75,9 +75,24 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   /// been coalesced, each of which represents the metadata for a data batch.
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
-    std::vector<std::unique_ptr<scan_info>> emitted;
-    auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(info.get());
-    if (scan_info == nullptr) { return emitted; }
+    std::vector<std::unique_ptr<scan_info>> out;
+    if (!info) return out;
+    size_t cursor = 0;
+    for (;;) {
+      auto step = advance(*info, cursor, std::numeric_limits<size_t>::max());
+      if (step.batch) out.push_back(std::move(step.batch));
+      if (step.finished) return out;
+    }
+  }
+  std::unique_ptr<scan_info> partial_emit() override
+  {
+    if (_acc.empty()) return {};
+    return emit_current();
+  }
+  cursor_step advance(scan_info& input, size_t& cursor, size_t quantum) override
+  {
+    auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(&input);
+    if (scan_info == nullptr) { return {nullptr, true}; }
 
     if (scan_info->certificates().size() != scan_info->row_groups.size() ||
         scan_info->dependencies().size() != scan_info->row_groups.size()) {
@@ -99,9 +114,10 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       _have_template = true;
     }
 
-    std::size_t row_group_position = 0;
-    for (auto& rg : scan_info->row_groups) {
-      auto const certificate_position = row_group_position++;
+    size_t processed = 0;
+    for (; cursor < scan_info->row_groups.size() && processed < quantum; ++cursor, ++processed) {
+      auto& rg                        = scan_info->row_groups[cursor];
+      auto const certificate_position = cursor;
       if (rg.row_count == 0) { continue; }
 
       auto const rg_bytes = rg.decoded_bytes_budget;
@@ -117,9 +133,10 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
             }
           }
         }
-        if (exceed_total || exceed_varchar) { emitted.push_back(emit_current()); }
+        if (exceed_total || exceed_varchar) { return {emit_current(), false}; }
       }
 
+      note_retained();
       _acc_bytes += rg_bytes;
       if (_any_varchar) {
         for (std::size_t c = 0; c < _is_varchar.size(); ++c) {
@@ -135,7 +152,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       dependency.datasource = _datasource;
       _dependencies.push_back(std::move(dependency));
     }
-    return emitted;
+    return {nullptr, cursor == scan_info->row_groups.size()};
   }
 
   std::vector<std::unique_ptr<scan_info>> flush() override
@@ -168,6 +185,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
     _produced_any = true;
+    clear_retained();
     return split;
   }
 
@@ -398,9 +416,9 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 
   // All ranges read the one `.duckdb` file; the resolver returns a valid ioctx or
   // throws if no backend supports the path.
-  auto io_ctx = resolve(_info->db_path);
   // Runs on a scan-manager dispatcher thread:
-  return [this, rg_begin, rg_end, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+  return [this, rg_begin, rg_end, resolve = std::move(resolve)]() -> std::unique_ptr<scan_info> {
+    auto io_ctx = resolve(_info->db_path);
     duckdb_native_row_group_range range;
     try {
       range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
