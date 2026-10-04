@@ -29,11 +29,33 @@ from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOpti
 from siriusfuzz.session import (
     RunResult,
     Session,
+    _strip_fallback_banners,
     discover_sirius_yaml,
     single_select,
 )
 
 SHELL = conftest_path.available_shell()
+
+
+class ShellOutputTests(unittest.TestCase):
+    def test_sirius_fallback_banner_does_not_corrupt_json_result(self):
+        output, banners = _strip_fallback_banners(
+            [
+                '[{"1":1}]\n',
+                "=============================================\n",
+                "Error in Sirius GPU execution, fallback to DuckDB\n",
+                "=============================================\n",
+            ]
+        )
+        self.assertEqual(json.loads("".join(output)), [{"1": 1}])
+        self.assertIn("fallback to DuckDB", "".join(banners))
+
+    def test_other_stdout_is_not_discarded(self):
+        output, banners = _strip_fallback_banners(
+            ['[{"1":1}]\n', "unexpected output\n"]
+        )
+        self.assertEqual(output, ['[{"1":1}]\n', "unexpected output\n"])
+        self.assertEqual(banners, [])
 
 
 class fake_shell:

@@ -6,12 +6,15 @@
 
 The shell is the one built next to the Sirius extension (``build/release/duckdb``),
 so nothing has to be built besides Sirius and no version metadata can disagree.
-Every statement is followed by two sentinels, one per stream, so a result (JSON
-on stdout) and its error text (stderr) are delimited exactly. A query that
-overruns its timeout gets the shell killed and restarted, because the shell
-exits on SIGINT when stdin is a pipe; a GPU fault takes the shell down the same
-way and is reported as a crash. The next statement starts a fresh shell and
-re-attaches the datasets, which are files on disk.
+Every statement is followed by a marker on each stream, written with the shell's
+own dot commands (``.print``, and ``.output /dev/stderr`` for the stderr one) so
+the markers never pass through SQL or Sirius; a result (JSON on stdout) and its
+error text (stderr) are therefore delimited exactly. Sirius prints a banner on
+stdout when it falls back to the CPU; it is removed from the result and kept
+as log. A query that overruns its timeout gets the shell killed and restarted,
+because the shell exits on SIGINT when stdin is a pipe; a GPU fault takes the
+shell down the same way and is reported as a crash. The next statement starts a
+fresh shell and re-attaches the datasets, which are files on disk.
 
 Generated tables live in an ATTACHed file-backed database (in-memory tables
 never reach the GPU native scan) and are CHECKPOINTed so the scan sees them on
@@ -45,6 +48,11 @@ SHELL_ENV = "SIRIUSFUZZ_SHELL"
 UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
 _SENTINEL = "siriusfuzz"
 _ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
+_FALLBACK_BANNER = (
+    "=============================================\n",
+    "Error in Sirius GPU execution, fallback to DuckDB\n",
+    "=============================================\n",
+)
 
 
 class SessionError(RuntimeError):
@@ -187,7 +195,9 @@ class Shell:
                 target=self._pump, args=(stream, name, self.events), daemon=True
             ).start()
         # Startup chatter (an extension banner, driver messages) belongs to no statement.
-        first = self.execute("SELECT 1", timeout=300)
+        # A SET is never intercepted by Sirius; a SELECT here would run on the GPU with
+        # fallback still enabled.
+        first = self.execute("SET enable_progress_bar = false", timeout=300)
         if first.status != "ok":
             raise SessionError(
                 f"the DuckDB shell {self.binary} did not start: "
@@ -219,10 +229,13 @@ class Shell:
         assert self.proc is not None
         self.counter += 1
         tag = f"{_SENTINEL}-{self.counter}"
+        stderr_tag = f"{tag}-stderr"
+        # Dot commands never reach SQL, so the markers cannot be intercepted by
+        # Sirius or fail with it; a SELECT marker did both when GPU execution was on.
         text = (
             f"{sql.rstrip().rstrip(';')}\n;\n"
-            f"SELECT error('{tag}-stderr');\n"
-            f"SELECT '{tag}' AS {_SENTINEL};\n"
+            f".output /dev/stderr\n.print {stderr_tag}\n.output\n"
+            f".print {tag}\n"
         )
         start = time.monotonic()
         try:
@@ -256,13 +269,13 @@ class Shell:
                     break
                 return self._died(start, err)
             if name == "out":
-                if line.strip() == f'[{{"{_SENTINEL}":"{tag}"}}]':
+                if line.strip() == tag:
                     got_out = True
                 else:
                     out.append(line)
             else:
                 self.tail.append(line)
-                if f"{tag}-stderr" in line:
+                if line.strip() == stderr_tag:
                     got_err = True
                 else:
                     err.append(line)
@@ -277,6 +290,9 @@ class Shell:
                 exitcode=self.exitcode,
             )
         error, log = _split_stderr(err)
+        out, banners = _strip_fallback_banners(out)
+        if banners:
+            log = "\n".join(part for part in (log, "".join(banners).strip()) if part)
         body = "".join(out).strip()
         if body:
             try:
@@ -344,6 +360,21 @@ def _split_stderr(lines: list[str]) -> tuple[str, str]:
         if _ERROR_LINE.match(line):
             return "".join(lines[index:]).strip(), "".join(lines[:index]).strip()
     return "", "".join(lines).strip()
+
+
+def _strip_fallback_banners(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Keep Sirius's stdout-only fallback notice out of the shell's JSON result."""
+    output: list[str] = []
+    banners: list[str] = []
+    index = 0
+    while index < len(lines):
+        if tuple(lines[index : index + len(_FALLBACK_BANNER)]) == _FALLBACK_BANNER:
+            banners.extend(_FALLBACK_BANNER)
+            index += len(_FALLBACK_BANNER)
+        else:
+            output.append(lines[index])
+            index += 1
+    return output, banners
 
 
 # --------------------------------------------------------------------------
@@ -422,17 +453,23 @@ class Session:
         self.sirius_config_mode = "builtin_defaults"
 
     def _start(self) -> None:
-        """Start the shell and restore the session state a previous shell had."""
+        """Start the shell and restore the session state a previous shell had.
+
+        No SELECT runs before GPU execution is switched off: with Sirius built in,
+        a query would otherwise run on the GPU with fallback still enabled.
+        """
         self.shell.start()
         self.sqlsmith_loaded = False
-        self.execute("SET enable_progress_bar = false")
-        self.duckdb_version = self.scalar("SELECT version()")
-        built_in = self._sirius_built_in()
+        present = self._disable_gpu()
         if self.gpu_available:
-            if built_in:
+            if present:
                 self.sirius = "built-in"
             elif self.extension:
                 self._load_extension()
+                if not self._disable_gpu():
+                    raise SessionError(
+                        f"{self.extension} loaded but has no gpu_execution setting"
+                    )
                 self.sirius = "loaded"
             else:
                 raise SessionError(
@@ -442,10 +479,7 @@ class Session:
                 )
             # Strict mode: a fallback surfaces as an error instead of a silent CPU run.
             self.execute("SET enable_duckdb_fallback = false")
-            self.set_gpu(False)
-        elif built_in:
-            # A CPU-only reference must stay on the CPU even in the Sirius shell.
-            self.execute("SET gpu_execution = false")
+        self.duckdb_version = self.scalar("SELECT version()")
         for alias, path in self.attached.items():
             self.execute(f"ATTACH {sql_literal(str(path))} AS {alias}")
         if self.current_alias:
@@ -453,11 +487,14 @@ class Session:
         for name, value in self.active_settings.items():
             self._set(name, value)
 
-    def _sirius_built_in(self) -> bool:
-        rows = self.query(
-            "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'sirius'"
-        )
-        return bool(rows) and bool(rows[0]["loaded"])
+    def _disable_gpu(self) -> bool:
+        """Switch GPU execution off; False when the shell has no Sirius in it."""
+        result = self.shell.execute("SET gpu_execution = false", timeout=120)
+        if result.status == "ok":
+            return True
+        if "unrecognized configuration parameter" in result.error:
+            return False
+        raise SessionError(result.error or result.log or f"shell {result.status}")
 
     def _load_extension(self) -> None:
         try:
