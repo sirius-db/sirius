@@ -35,7 +35,8 @@ pixi run fuzz recheck "$run_dir" --shell "$shell"            # after a fix
 
 Respect a supplied budget rather than adding these defaults to it. For a request to find
 unsupported features or what falls back to the CPU at runtime, use `--mode gaps` and keep
-reduction on: the reduced query is what names the unsupported feature. For long runs use a
+reduction on: the reduced query is what names the unsupported feature. Add
+`--features configured` when the question is about the supported surface only. For long runs use a
 persistent session and reconnect to it rather than starting a duplicate campaign.
 
 ## Report

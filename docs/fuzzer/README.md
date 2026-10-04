@@ -455,7 +455,10 @@ evidence but must not be presented as a completed campaign.
 `--mode gaps` broadens generation by enabling feature switches marked for the
 mode, including constructs disabled in the default correctness profile. It still
 uses the generator's implemented surface; it does not generate arbitrary SQL or
-every possible function. Explicit `--set` overrides apply afterwards.
+every possible function. `--features configured` keeps the configuration's own
+flags instead, so every query reaches runtime and the budget goes to the
+supported surface; `--features all` enables the same switches in a correctness
+run. Explicit `--set` overrides apply afterwards.
 
 The goal is to discover shapes that pass planning but fail at runtime. For example,
 a query might contain an unsupported expression nested inside several supported

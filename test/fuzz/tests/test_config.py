@@ -81,6 +81,19 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(narrowed.features.distinct)
         with self.assertRaises(ConfigError):
             load_config(None, mode="frontier")
+        # The feature set is its own switch: gaps policy over the configured flags,
+        # or every feature in a correctness run.
+        configured = load_config(None, mode="gaps", features="configured")
+        self.assertEqual(configured.features, default.features)
+        self.assertEqual(configured.variants.per_query, 0)
+        everything = load_config(None, mode="correctness", features="all")
+        self.assertTrue(everything.features.window_functions)
+        self.assertEqual(everything.variants.per_query, default.variants.per_query)
+        self.assertEqual(
+            mode_overrides("gaps", "configured"), {"variants.per_query": 0}
+        )
+        with self.assertRaises(ConfigError):
+            load_config(None, features="some")
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ConfigError):
