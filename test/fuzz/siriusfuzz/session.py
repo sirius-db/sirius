@@ -177,6 +177,8 @@ class Shell:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self) -> None:
+        if self.proc is not None:
+            self.stop()
         self.events = queue.Queue()
         self.tail.clear()
         self.exitcode = None
@@ -296,7 +298,10 @@ class Shell:
         body = "".join(out).strip()
         if body:
             try:
-                parsed = json.loads(body, object_pairs_hook=lambda pairs: pairs)
+                parsed = json.loads(
+                    _normalize_shell_json_nulls(body),
+                    object_pairs_hook=lambda pairs: pairs,
+                )
             except ValueError as exc:
                 return ShellResult(
                     "error", error=f"unreadable shell output: {exc}", log=body[:500]
@@ -352,6 +357,41 @@ class Shell:
             except (OSError, subprocess.TimeoutExpired):
                 self.kill()
         self.exitcode = self.proc.poll()
+        for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
+def _normalize_shell_json_nulls(body: str) -> str:
+    """The DuckDB shell prints bare ``NULL`` inside nested LIST/ARRAY JSON values."""
+    result: list[str] = []
+    quoted = escaped = False
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if quoted:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            result.append(char)
+        elif (
+            body.startswith("NULL", index)
+            and (index == 0 or body[index - 1] in "[:, \t\r\n")
+            and (index + 4 == len(body) or body[index + 4] in ",]} \t\r\n")
+        ):
+            result.append("null")
+            index += 4
+            continue
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def _split_stderr(lines: list[str]) -> tuple[str, str]:
