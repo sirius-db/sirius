@@ -66,7 +66,6 @@ class Session:
         sirius_config: str | None,
         db_dir: pathlib.Path,
         worker_id: int,
-        strict: bool = True,
         allow_metadata_mismatch: bool = False,
         evidence_path: pathlib.Path | None = None,
     ):
@@ -75,7 +74,6 @@ class Session:
         self.sirius_config_mode: str | None = None
         self.db_dir = db_dir
         self.worker_id = worker_id
-        self.strict = strict
         self.allow_metadata_mismatch = bool(allow_metadata_mismatch)
         self.evidence_path = evidence_path
         self.active_settings: dict[str, Any] = {}
@@ -100,8 +98,8 @@ class Session:
         self.con.execute("SET enable_progress_bar = false")
         if self.extension:
             self._load_extension()
-            if self.strict:
-                self.con.execute("SET enable_duckdb_fallback = false")
+            # Strict mode: a fallback surfaces as an error instead of a silent CPU run.
+            self.con.execute("SET enable_duckdb_fallback = false")
         self.set_gpu(False)
 
     def _configure_sirius(self) -> None:

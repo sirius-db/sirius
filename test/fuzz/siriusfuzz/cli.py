@@ -417,8 +417,6 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
     else:
         config_path = cli_path(args.config, "configuration") if args.config else None
         query = target
-    if getattr(args, "query_override", None):
-        query = pathlib.Path(args.query_override)
     cfg = load_config(config_path, args.set)
     extension, configs = _engine(args, cfg)
     dataset = (
@@ -529,7 +527,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
     work = _make_run_dir(args.out, 0)
     print(f"Replay evidence: {work}", flush=True)
     result = replay(args, target, work)
-    print(json.dumps(result, indent=2, default=str))
+    record = result.get("record", {})
+    print(
+        f"verdict: {replay_verdict(result)}"
+        + (f"  reason: {record['reason']}" if record.get("reason") else "")
+        + (f"  error: {result['error']}" if result.get("error") else "")
+    )
+    for line in record.get("diffs", [])[:10]:
+        print(f"  {line}")
+    print(f"Full outcome: {work / 'outcome.json'}")
     if result["status"] == "cancelled":
         return 130
     if result["status"] == "setup_error":
@@ -734,13 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=180,
         help="hard deadline per finding, including setup (seconds)",
     )
-    rc.set_defaults(
-        func=cmd_recheck,
-        dataset=None,
-        dataset_seed=None,
-        ordered=False,
-        query_override=None,
-    )
+    rc.set_defaults(func=cmd_recheck, dataset=None, dataset_seed=None, ordered=False)
 
     sc = sub.add_parser("show-config", help="print the effective configuration")
     _common_config_args(sc)
