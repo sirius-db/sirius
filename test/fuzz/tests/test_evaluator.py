@@ -700,7 +700,7 @@ class ReportTests(unittest.TestCase):
             self.assertIn("known: sirius-db/sirius#1218", text)
             # In the table once; not repeated under findings.
             self.assertEqual(text.count("Distinct aggregates not supported"), 1)
-            self.assertIn("findings (1 unique):", text)
+            self.assertIn("findings (1 unique)", text)
             self.assertIn("[known_issue]", text)
             self.assertIn("sirius-db/sirius#9999: ", text)
 
@@ -779,13 +779,22 @@ class ReportTests(unittest.TestCase):
             self.assertLess(
                 text.index("runtime fallbacks ("), text.index("plan-time fallbacks (")
             )
+            # Findings outrank gaps: listed first, with their query and difference.
+            self.assertLess(
+                text.index("findings (1 unique)"), text.index("runtime fallbacks (")
+            )
+            self.assertIn("      SELECT c1 FROM t\n", text)
+            self.assertRegex(
+                text,
+                r"findings \(1 unique\).*\n.*mismatch.*\n      SELECT c1 FROM t\n(?:      features: .*\n)?      row 1 col 0",
+            )
             # A reduced plan group shows its smallest query; an unreduced one only
             # its normalized reason.
             self.assertIn("SELECT f(c1) FROM t\n", text)
             self.assertIn("features: Func(regexp_matches), Select", text)
             self.assertNotIn("SELECT w() OVER ()", text)
             # The mismatch is listed as a finding; the gaps are not listed twice.
-            self.assertIn("findings (1 unique):", text)
+            self.assertIn("findings (1 unique)", text)
             self.assertEqual(text.count("Window not supported"), 1)
 
     def test_dedup_known_issue_and_artifacts(self):

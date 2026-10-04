@@ -482,11 +482,12 @@ function should not prevent useful reduction merely because the printed reason
 changes. The rejection kind must still match, and new unrelated functions cannot
 replace the original ones.
 
-Reports put runtime gaps first and sum elapsed GPU-attempt time by reason. This
-is a relative prioritization signal for wasted execution on small fuzz inputs,
-not a benchmark of production performance or pure device-kernel time. Queries
-show only the first rejection reached, so later unsupported operations can remain
-hidden until earlier checks change.
+Reports list findings first, then runtime gaps ordered by the elapsed GPU-attempt
+time summed by reason, then plan-time gaps. The time is a relative prioritization
+signal for wasted execution on small fuzz inputs, not a benchmark of production
+performance or pure device-kernel time. Queries show only the first rejection
+reached, so later unsupported operations can remain hidden until earlier checks
+change.
 
 A reduced runtime fallback is useful as a regression reproducer: after its check
 moves to planning time, replay should classify it as `plan_fallback`.
