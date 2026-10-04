@@ -306,7 +306,7 @@ class EvaluatorTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
-    def test_finding_dedup_preserves_distinct_inputs_and_evidence(self):
+    def test_finding_dedup_keys_mismatches_on_their_inputs(self):
         for verdict in ("mismatch", "variant_mismatch", "timeout"):
             with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
                 report = Report(pathlib.Path(tmp), load_config(None), [], 1)
@@ -319,39 +319,26 @@ class ReportTests(unittest.TestCase):
                     labels=["Select"],
                     variant={"hash_partition_bytes": 123},
                 )
-                records = [original] + [
+                distinct = [
                     replace(original, **change)
                     for change in (
                         {"sql": "SELECT k + 1 FROM t"},
                         {"dataset": "d1"},
                         {"comparison": "ordered"},
                         {"variant": {"hash_partition_bytes": 456}},
-                        {"detail": "row count 1 vs 2"},
-                        {"reason": "GPU run exceeded 120s"},
-                        {"context": {"phase": "gpu", "stage": "reduction"}},
-                        {"diffs": ["row 0 col 0: 1 vs 2"]},
-                        {
-                            "evidence": {
-                                "operations": [
-                                    {
-                                        "phase": "gpu",
-                                        "fingerprint_multiset": "different",
-                                    }
-                                ]
-                            }
-                        },
                     )
                 ]
-                for record in records:
-                    name = report.add(record)
-                    self.assertIsNotNone(name)
-                # Reduction is additional evidence, not a new observation or key.
-                reduced = replace(
-                    original, reduced_sql="SELECT k", reduced_labels=["ColumnRef"]
-                )
-                self.assertEqual(signature(original), signature(reduced))
-                self.assertIsNone(report.add(reduced))
-                self.assertEqual(len(report.finish()["findings"]), len(records))
+                for record in [original, *distinct]:
+                    self.assertIsNotNone(report.add(record))
+                # The same input seen again, with other detail, is the same finding.
+                for change in (
+                    {"detail": "row count 1 vs 2"},
+                    {"reason": "GPU run exceeded 120s"},
+                    {"diffs": ["row 0 col 0: 1 vs 2"]},
+                    {"reduced_sql": "SELECT k", "reduced_labels": ["ColumnRef"]},
+                ):
+                    self.assertIsNone(report.add(replace(original, **change)))
+                self.assertEqual(len(report.finish()["findings"]), 1 + len(distinct))
 
     def test_reduction_compares_each_candidate_in_its_own_order_mode(self):
         cfg = load_config(None, ["oracle.ambiguity_filter=false"])
@@ -389,15 +376,11 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             active = root / "w0-s1.active.json"
-            # The previous query finished: its last run is in both evidence files.
+            # The previous query finished: its last run is still in the active file.
             session = Session(None, None, root, 0, evidence_path=active)
             session.stage = "reduction"
-            session.evidence = {"cpu": {"sql": "SELECT previous"}}
             active.write_text(
                 json.dumps({"sql": "SELECT previous", "phase": "cpu", "status": "ok"})
-            )
-            active.with_suffix(".observed.json").write_text(
-                json.dumps(session.evidence)
             )
             session.begin_query("SELECT current")
             self.assertEqual(session.evidence, {})
@@ -415,7 +398,6 @@ class ReportTests(unittest.TestCase):
             record = json.loads(report.log_path.read_text().splitlines()[0])
             self.assertEqual(record["verdict"], "crash")
             self.assertEqual(record["sql"], "SELECT current")
-            self.assertEqual(record["evidence"], {})
             self.assertFalse(record["reason"].startswith("CPU phase"))
             report.finish()
 

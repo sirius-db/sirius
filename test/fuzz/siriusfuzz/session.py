@@ -13,7 +13,6 @@ runtime fallbacks surface as errors instead of silent CPU runs.
 from __future__ import annotations
 
 import os
-import hashlib
 import pathlib
 import threading
 import time
@@ -22,7 +21,7 @@ from typing import Any
 
 from . import sqltypes as st
 from .artifacts import sql_literal, write_json
-from .compare import ColumnInfo, ResultSet, canonical
+from .compare import ColumnInfo, ResultSet
 from .schema_gen import Dataset
 
 CANARY_SETTING = "sirius_test_inject_transparent_gpu_error"
@@ -30,6 +29,26 @@ CANARY_SETTING = "sirius_test_inject_transparent_gpu_error"
 
 class SessionError(RuntimeError):
     pass
+
+
+def discover_sirius_yaml() -> tuple[str | None, str]:
+    """The Sirius YAML Sirius itself would pick up, and where it comes from.
+
+    Mirrors Sirius's order: ``SIRIUS_CONFIG_FILE``, then ``./sirius.yaml``, then
+    ``~/.sirius/sirius.yaml``. An empty environment variable counts as unset.
+    """
+    env = os.environ.get("SIRIUS_CONFIG_FILE", "").strip()
+    if env:
+        return env, "SIRIUS_CONFIG_FILE"
+    candidates = [("current directory", pathlib.Path.cwd() / "sirius.yaml")]
+    if "HOME" in os.environ:
+        candidates.append(
+            ("home directory", pathlib.Path(os.environ["HOME"]) / ".sirius/sirius.yaml")
+        )
+    for source, path in candidates:
+        if path.exists():
+            return str(path), source
+    return None, "none"
 
 
 @dataclass
@@ -97,24 +116,13 @@ class Session:
             os.environ["SIRIUS_CONFIG_FILE"] = self.sirius_config
             self.sirius_config_mode = "explicit_yaml"
             return
-        # Mirror Sirius's discovery order. An absent snapshot must never silently
-        # select settings that the finding cannot carry to another host.
-        ambient = None
-        if "SIRIUS_CONFIG_FILE" in os.environ:
-            ambient = "SIRIUS_CONFIG_FILE"
-        else:
-            candidates = [pathlib.Path.cwd() / "sirius.yaml"]
-            if "HOME" in os.environ:
-                candidates.append(
-                    pathlib.Path(os.environ["HOME"]) / ".sirius/sirius.yaml"
-                )
-            ambient = next((str(path) for path in candidates if path.exists()), None)
-        if ambient is not None:
-            raise SessionError(
-                f"Unrecorded ambient Sirius configuration: {ambient}. "
-                "Select the intended file with --sirius-config so it is saved, "
-                "or remove the ambient configuration to use built-in defaults."
-            )
+        ambient, source = discover_sirius_yaml()
+        if ambient:
+            # Make Sirius's own choice explicit so the session records what it used.
+            self.sirius_config = ambient
+            os.environ["SIRIUS_CONFIG_FILE"] = ambient
+            self.sirius_config_mode = f"ambient ({source})"
+            return
         self.sirius_config_mode = "builtin_defaults"
 
     def _load_extension(self) -> None:
@@ -201,7 +209,6 @@ class Session:
         self.evidence = {}
         self.stage = "evaluation"
         if self.evidence_path:
-            write_json(self.evidence_path.with_suffix(".observed.json"), self.evidence)
             write_json(
                 self.evidence_path,
                 {
@@ -292,31 +299,10 @@ class Session:
     ) -> RunResult:
         state.update(status=result.status, elapsed=result.elapsed, error=result.error)
         if result.result is not None:
-            hashes = [
-                hashlib.sha256(repr(tuple(canonical(v) for v in row)).encode()).digest()
-                for row in result.result.rows
-            ]
-            state.update(
-                fingerprint_ordered=hashlib.sha256(b"".join(hashes)).hexdigest(),
-                fingerprint_multiset=hashlib.sha256(
-                    b"".join(sorted(hashes))
-                ).hexdigest(),
-                row_count=result.result.row_count,
-                columns=[
-                    {"name": c.name, "type": str(c.type)} for c in result.result.columns
-                ],
-                sample_rows=[
-                    [repr(v)[:500] for v in row] for row in result.result.rows[:10]
-                ],
-                sample_note="First 10 rows, values represented as Python literals, truncated to 500 characters.",
-            )
+            state["row_count"] = result.result.row_count
         self.evidence[phase] = state
-        operations = self.evidence.setdefault("operations", [])
-        if self.stage != "reduction" and len(operations) < 32:
-            operations.append(state)
         if self.evidence_path:
             write_json(self.evidence_path, state)
-            write_json(self.evidence_path.with_suffix(".observed.json"), self.evidence)
         return result
 
     def _interrupt(self) -> None:

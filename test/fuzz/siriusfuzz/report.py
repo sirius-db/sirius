@@ -92,31 +92,11 @@ EXTRA_REPRODUCERS = 5  # further query/dataset pairs kept under more/ per findin
 
 
 def signature(rec: QueryRecord) -> str:
-    """Group errors by reason; retain distinct mismatch and timeout observations."""
+    """Group errors by reason; keep each distinct mismatch or timeout input apart."""
     v = rec.verdict
     if v in (Verdict.MISMATCH, Verdict.VARIANT_MISMATCH, Verdict.TIMEOUT):
-        # Findings are persisted before reduction, which may itself crash. Operator
-        # labels are too coarse to discard later examples: retain each input and
-        # observed difference, including the value of a variant setting.
-        evidence = {
-            "dataset": rec.dataset,
-            "sql": rec.sql,
-            "comparison": rec.comparison,
-            "variant": rec.variant,
-            "reason": rec.reason,
-            "detail": rec.detail,
-            "diffs": rec.diffs,
-            "phase": rec.context.get("phase"),
-            "stage": rec.context.get("stage"),
-            "results": [
-                (op.get("phase"), op.get(f"fingerprint_{rec.comparison}"))
-                for op in rec.evidence.get("operations", [])
-            ],
-        }
-        digest = hashlib.sha256(
-            json.dumps(evidence, sort_keys=True, default=str).encode()
-        )
-        key = f"{v}|{digest.hexdigest()}"
+        variant = json.dumps(rec.variant, sort_keys=True) if rec.variant else ""
+        key = f"{v}|{rec.dataset}|{rec.comparison}|{variant}|{rec.sql}"
     elif v in (
         Verdict.PLAN_FALLBACK,
         Verdict.RUNTIME_FALLBACK,

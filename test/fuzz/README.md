@@ -197,15 +197,14 @@ remove them after inspection.
 
 ### Choosing the Sirius YAML configuration
 
-- `--sirius-config` overrides the profile's YAML; the harness sets `SIRIUS_CONFIG_FILE` from it.
-  Repeat the flag to alternate configurations across worker processes.
-- With `sirius.configs = []` and no `--sirius-config`, GPU sessions use built-in defaults.
-- Sessions **refuse to start** if an ambient configuration would silently take effect: when
-  `SIRIUS_CONFIG_FILE` is set (even to an empty string), or when `sirius.yaml` exists in the
-  working directory or `$HOME/.sirius/`. Either select that file explicitly with
-  `--sirius-config` so it is saved with the run, or remove it to use defaults.
-- The same check applies when replaying a finding without YAML on another host. Every session
-  records whether it selected a YAML file or verified that no ambient configuration was present.
+- `--sirius-config` selects the YAML; the harness sets `SIRIUS_CONFIG_FILE` from it. Repeat the
+  flag to alternate configurations across worker processes.
+- Otherwise the configuration file's `sirius.configs` applies; the default names the integration
+  test YAML. With `sirius.configs = []`, the run uses whatever Sirius itself would pick up:
+  `SIRIUS_CONFIG_FILE`, then `./sirius.yaml`, then `~/.sirius/sirius.yaml`, else built-in
+  defaults.
+- Whichever file is used is copied into the run directory and into every finding, and the session
+  records how it was chosen, so a replay on another host restores the same settings.
 
 ---
 
