@@ -393,10 +393,13 @@ Native C++ or CUDA faults terminate the process they run in without raising a
 catchable exception, and a hung GPU call may ignore a normal query interruption.
 The harness therefore never runs Sirius inside the Python process. Each session
 drives the DuckDB shell built with Sirius (`build/release/duckdb`) over pipes, in
-batch JSON mode. Every statement is followed by a sentinel on each stream, a
-`SELECT` on stdout and an `error()` call on stderr, so results and error text are
-delimited exactly. The shell's stderr, including Sirius's backtrace on a fault, is
-kept with the worker's log.
+batch JSON mode. Every statement is followed by a marker on each stream, written
+with the shell's own dot commands (`.print`, and `.output /dev/stderr` for the
+stderr one), so results and error text are delimited exactly and the markers can
+never be intercepted by Sirius the way a `SELECT` would be. The banner Sirius
+prints on stdout when it falls back is removed from the result and kept as log.
+The shell's stderr, including Sirius's backtrace on a fault, is kept with the
+worker's log.
 
 A query that overruns its deadline gets the shell killed; the shell exits on an
 interrupt when its input is a pipe, so interrupting would end it anyway. A GPU

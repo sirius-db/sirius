@@ -305,7 +305,9 @@ GPUs or runtimes is not guaranteed; a bundle without a saved YAML needs an expli
 shell guarantees that. A plain DuckDB CLI that refuses a `LOAD` names the version it wants. The
 `duckdb-python` Pixi environment is no longer needed by the fuzzer.
 
-**Shell protocol.** Every statement is followed by a sentinel on each stream, so results (JSON
-on stdout) and errors (stderr) are delimited exactly. DECIMAL and HUGEINT values arrive as
+**Shell protocol.** Every statement is followed by a marker on each stream, written with the
+shell's own dot commands so they never pass through SQL or Sirius; results (JSON on stdout) and
+errors (stderr) are delimited exactly, and the banner Sirius prints on stdout when it falls back
+is kept out of the result. DECIMAL and HUGEINT values arrive as
 strings and compare exactly; floating-point values arrive as numbers and compare with the
 tolerances. A query whose output columns share a name is still compared positionally.
