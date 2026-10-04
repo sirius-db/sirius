@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 from . import conftest_path  # noqa: F401
 from siriusfuzz import sqltypes as st
-from siriusfuzz.artifacts import verify
 from siriusfuzz.classify import Verdict
 from siriusfuzz.cli import build_parser, cmd_run
 from siriusfuzz.compare import ColumnInfo, ResultSet
@@ -347,7 +346,6 @@ class ReportTests(unittest.TestCase):
                 for record in records:
                     name = report.add(record)
                     self.assertIsNotNone(name)
-                    verify(report.run_dir / "findings" / name)
                 # Reduction is additional evidence, not a new observation or key.
                 reduced = replace(
                     original, reduced_sql="SELECT k", reduced_labels=["ColumnRef"]
@@ -836,8 +834,6 @@ class ReportTests(unittest.TestCase):
             bundles = sorted((run_dir / "findings").rglob("dataset.sql"))
             self.assertEqual(len(bundles), 2)
             self.assertNotEqual(bundles[0].read_text(), bundles[1].read_text())
-            for data in bundles:
-                verify(data.parent)
             rec3, _ = evaluate(
                 gpu_count_distinct_error, sql="SELECT count(DISTINCT k) AS c0 FROM t"
             )

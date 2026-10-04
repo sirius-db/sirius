@@ -15,7 +15,7 @@ decisions behind the harness, read [Understanding the Sirius fuzzer](../../docs/
                                        │ on match: rerun under                   │
                                        │ randomized Sirius settings,             ▼
                                        └ compare with GPU baseline    findings/<n>-<verdict>-<hash>/
-                                                                     replay ▸ triage ▸ issue-draft
+                                                                     replay ▸ fix ▸ recheck
 ```
 
 **Contents**
@@ -29,7 +29,6 @@ decisions behind the harness, read [Understanding the Sirius fuzzer](../../docs/
 - [Finding unsupported features](#finding-unsupported-features)
 - [Saved evidence](#saved-evidence)
 - [Replaying a finding](#replaying-a-finding)
-- [Triage and issue drafts](#triage-and-issue-drafts)
 - [Agent-assisted use](#agent-assisted-use)
 - [Fine print](#fine-print)
 
@@ -109,12 +108,7 @@ All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
 | `doctor` | Verify build, config, interception and a GPU answer (`run` does this first unless `--no-doctor`) | yes |
 | `run` | Generate, execute and compare queries; save findings. `--mode gaps` hunts runtime fallbacks | yes |
 | `replay <finding-or-sql>` | Re-run one finding directory or your own `.sql` file | yes (`--cpu-only` for CPU) |
-| `replay-file <file.sql>` | Classify every `SELECT` in a file, each in its own supervised process | yes |
-| `triage <run-or-finding>...` | Re-validate findings, shrink them, write `REPORT.md` and issue drafts | yes |
-| `triage-report <triage-dir>` | Regenerate reports and drafts from saved evidence, no execution | no |
-| `review <triage-dir> F-ID` | Record a human disposition for a candidate | no |
-| `group <triage-dir> F-ID...` | Group candidates that look related | no |
-| `issue-draft <triage-dir> [F-ID\|--all]` | Export copy-ready Markdown issue drafts | no |
+| `recheck <run-dir>` | Replay every finding of a run against the current build; print old and new verdicts | yes |
 | `show-config` | Print the effective TOML configuration | no |
 | `selftest` | CPU-only end-to-end harness check | no |
 
@@ -325,7 +319,6 @@ run-<timestamp>-seed<seed>-<unique>/
     ├── meta.json                       outcome, variant, comparison, timing, sample evidence
     ├── environment.json, runtime.json  binary/source provenance and session settings
     ├── worker.stderr                   log snapshot at observation
-    ├── bundle.json                     SHA-256 integrity manifest for the original inputs
     ├── reduced.sql, reduction.json     optional reduction evidence
     ├── REPLAY.md, repro.sql            CLI and standalone shell reproduction instructions
     ├── repro_catch2.cpp                regression-test starting point (needs developer review)
@@ -336,14 +329,13 @@ run-<timestamp>-seed<seed>-<unique>/
 Mismatch and timeout signatures include the original SQL, dataset identity, comparison mode,
 variant value and result evidence, so distinct inputs stay separate even when their operator
 labels match. Repeated errors group by normalized reason. This favours keeping
-evidence over compact counts; use triage groups to merge candidates after investigation.
+evidence over compact counts.
 
 **Reduction never replaces the original.** The original observation is saved before reduction
 starts. Each error signature is reduced once per worker; later queries with the same signature
 are kept as additional reproducers without spending another reduction budget. A reducer failure is recorded separately with `stage=reduction` and the active
-candidate. Reduced output is additional evidence and must itself be replayed. `bundle.json`
-detects missing or edited original inputs; to test an edited query, use SQL-file replay with an
-explicit dataset.
+candidate. Reduced output is additional evidence and must itself be replayed; to test an edited
+query, replay it as a SQL file with the bundle's `dataset.sql`.
 
 **Provenance.** Source revisions describe the checkout at run time; the extension fingerprint
 identifies the actual binary, and the revision alone does not prove how it was built. Findings
@@ -377,11 +369,20 @@ pixi run -e duckdb-python fuzz replay /absolute/path/finding \
 # Your own SELECT/WITH query with its CREATE/INSERT dataset
 pixi run -e duckdb-python fuzz replay /absolute/path/query.sql \
   --dataset /absolute/path/dataset.sql
-
-# A stream of SELECT statements, each in its own supervised process
-pixi run -e duckdb-python fuzz replay-file /absolute/path/queries.sql \
-  --dataset /absolute/path/dataset.sql
 ```
+
+**After a fix, recheck the whole run.** `recheck` replays every finding directory of a run
+(reduced query by default, `--original` for the full one) against the current build and prints
+one line per finding with the recorded verdict and the new one. It exits 0 when every finding
+now passes, 1 otherwise, and writes `recheck.json` next to the per-finding replay evidence:
+
+```bash
+pixi run -e duckdb-python fuzz recheck /absolute/path/run-20261002-121126-seed42-m7lb_mer \
+  --extension /path/to/new/sirius.duckdb_extension
+```
+
+A gap that moved to plan time shows as `runtime_fallback -> plan_fallback`; a fixed mismatch
+shows as `mismatch -> ok`; anything that changed to a different failure is worth a look.
 
 **What replay restores:** the saved TOML, YAML, captured baseline session settings, comparison
 mode and the exact failing setting variant. It never picks a new random variant and never
@@ -408,187 +409,7 @@ outcome, and announces a changed extension fingerprint.
   `--sirius-config` on another host.
 - CUDA device visibility comes from the current host's environment and is recorded.
 - Reproducibility across different builds, GPUs or runtimes is not guaranteed.
-- Legacy bundles without saved YAML require an explicit `--sirius-config`; bundles without
-  integrity metadata emit a warning.
-- Additional query files from older runs may lack their own dataset; recover the association
-  from that run's `queries.jsonl` first.
-
----
-
-## Triage and issue drafts
-
-Triage re-validates saved findings, optionally shrinks them, and writes copy-ready Markdown
-issue drafts for candidates that pass an automated policy. Nothing is created on GitHub and
-there is no CI integration; publishing is a separate manual step. Human review is optional.
-
-```text
-  run dir / finding dirs
-          │
-          ▼
-  ┌──────────────┐   3 replays + row-order permutation,   ┌──────────────┐
-  │ fuzz triage  │──▶ optional reduction, per candidate ──▶│  REPORT.md   │  candidate queue
-  └──────────────┘                                        │  report.json │  + batches/ history
-          │                                               └──────────────┘
-          │  optional                                             │
-          ▼                                                       ▼
-  ┌──────────────┐                                        ┌──────────────┐
-  │ fuzz review  │  human disposition, evidence link      │ fuzz         │  DRAFTS.md
-  │ fuzz group   │──────────────────────────────────────▶ │ issue-draft  │  drafts.json
-  └──────────────┘                                        └──────────────┘
-```
-
-Start with a small selection; each replay initializes a fresh GPU process.
-
-```bash
-# One or more finding directories or campaign run directories
-pixi run -e duckdb-python fuzz triage /absolute/path/run-or-finding \
-  --out /absolute/path/triage --attempts 3 --timeout 90 --duration 30m
-
-# Compare against a second, explicitly selected compatible binary
-pixi run -e duckdb-python fuzz triage /absolute/path/finding \
-  --out /absolute/path/triage-comparison --no-reduce \
-  --extension /absolute/path/current/sirius.duckdb_extension \
-  --compare-extension /absolute/path/other/sirius.duckdb_extension
-
-# Refresh reports and eligible drafts from saved evidence, without running queries
-pixi run -e duckdb-python fuzz triage-report /absolute/path/triage
-
-# Export all automatically eligible candidates, or one candidate
-pixi run -e duckdb-python fuzz issue-draft /absolute/path/triage --all
-pixi run -e duckdb-python fuzz issue-draft /absolute/path/triage F-CANDIDATE_ID
-```
-
-### Triage outputs
-
-| File | Contents |
-|------|----------|
-| `REPORT.md` | candidate queue with links to SQL, data, outcomes, logs and provenance |
-| `report.json` | the same queue for other tools |
-| `batches/` | each candidate's replay and reduction history |
-| `DRAFTS.md` | links to eligible local drafts and any separate `.sql` dataset attachments |
-| `drafts.json` | validation checks and reasons a candidate needs investigation |
-
-Original inputs are copied and fingerprinted. Only current links indicate eligibility.
-Regeneration preserves user edits and reports conflicts.
-
-### What triage does per candidate
-
-- **Replays.** Default is three independent replays plus one replay with rows reversed within
-  each supported `INSERT ... VALUES` batch. Exact CPU fingerprints check stability across runs
-  and insertion orders. Floating-point accumulation can change fingerprints, and one permutation
-  cannot prove determinism.
-- **Classifies.** Automatic results: `automatically_reproduced`, `intermittent`,
-  `not_reproduced`, `changed_failure`, `unstable_reference`, `needs_investigation`.
-  Reproduction alone does not qualify a candidate for a draft. Timeouts record their deadline
-  and CPU/GPU phase. Plan rejections are coverage gaps until reviewed.
-- **Suggests groups** from signatures and query structure. These are hints only; they do not
-  establish a shared root cause or transfer review status.
-- **Reduces (optional).** SQL and data are shrunk in fresh supervised processes, including for
-  native crash and timeout candidates. Defaults: 20 proposed edits and 120 s per candidate;
-  tune with `--reduce-steps`, `--reduce-seconds`, or disable with `--no-reduce`. A reduction is
-  accepted only if it preserves the failure signature twice, has a stable CPU reference, and
-  passes the available row-order check. The reducer removes selected clauses, projections and
-  `INSERT` rows; it leaves ordered-query SQL unchanged and declines unsupported quoting. The
-  result is the smallest reproducer seen within budget, not a guaranteed minimum. An unrelated
-  crash cannot substitute for a mismatch.
-
-### Budgets, exit codes and resuming
-
-- Each attempt needs enough remaining budget for its full `--timeout`; choose
-  `--reduce-seconds` greater than `--timeout` for reduction to run. Provenance and report I/O
-  add overhead to `--duration`.
-- Ctrl-C preserves evidence and exits 130. Incomplete work or budget exhaustion exits 2.
-  Completed triage exits 0 even when discrepancies were found.
-- A workspace lock prevents concurrent writers.
-- **Resume** by repeating the same command and output directory. Saved evidence is checked before
-  reuse; edited or missing inputs, outcomes or reductions block reuse and export. An expired
-  reduction time budget leaves an incomplete trial that resumes with a fresh budget; a completed
-  step-limited pass stays complete.
-- A changed binary, runtime, host, harness or configuration starts a **separate batch**. Use
-  `--rerun` to force fresh attempts, including after changes to unrecorded system libraries.
-  Keep binaries unchanged during an investigation.
-
-### Automated validation policy (`saved-evidence-v1`)
-
-The policy recomputes observations from fingerprinted evidence. A candidate is eligible for an
-automatic draft only if **all** of the following hold:
-
-- **Stable reproduction.** At least three distinct original replays with the same failure, a
-  stable CPU fingerprint and successful interception probes. Mismatch evidence must include a
-  completed GPU operation.
-- **Matching provenance.** Extension and DuckDB fingerprints, effective configuration and
-  baseline session settings all match. Replay YAML must match the original finding; adding or
-  changing YAML needs investigation even if every replay uses the same file. A no-YAML source
-  and all its replays must record verified built-in-defaults selection; older no-YAML evidence
-  without that provenance needs investigation, since new replays cannot establish which
-  configuration an older run used. Runs that bypassed extension version metadata need
-  compatibility investigation.
-- **Eligible failure type.** A mismatch or GPU-phase crash under multiset comparison. Timeouts,
-  setup errors, memory exhaustion, plan rejections, intermittent results and unstable references
-  need investigation.
-- **Conservative SQL screening.** Unknown functions, volatile functions, windows, limits,
-  sampling and ordered-result semantics need investigation. Screening does not prove SQL
-  semantics.
-- **Insertion-order check.** Must preserve both the failure and the CPU fingerprint. Only a
-  recognized empty or one-row literal dataset may skip it.
-- **Completed reduction pass.** The selected reduction must preserve the failure in two distinct
-  replays, with a stable CPU fingerprint and the applicable insertion-order check.
-
-Eligible drafts say **automatically validated** and never claim a human reviewed them. Any
-recorded human objection or uncertain disposition blocks automatic drafting, even if its batch
-is stale. Grouping does not transfer eligibility. A current explicit human verification can
-still support a per-candidate draft when the automatic policy declines it.
-
-### Optional human verification
-
-For each candidate: inspect the original and best reduced inputs, the CPU/GPU differences,
-settings, binary hashes and logs. Check expected SQL semantics, NULLs, types, ordering and
-floating-point tolerance. Then run a **separate replay yourself** from the original bundle or a
-retained reduction attempt bundle (each carries its exact query, dataset and settings), and
-inspect that new evidence before recording a disposition. Automated reproduction does not
-perform this step.
-
-```bash
-pixi run -e duckdb-python fuzz replay /absolute/path/candidate/source --original
-
-# Record uncertainty, expected behaviour, a harness problem, or another disposition
-pixi run -e duckdb-python fuzz review /absolute/path/triage F-CANDIDATE_ID \
-  --disposition needs_investigation --reviewer 'Your name' \
-  --notes 'Explain what you checked and what remains unresolved.'
-
-# Only a person who has actually performed the verification should run this
-pixi run -e duckdb-python fuzz review /absolute/path/triage F-CANDIDATE_ID \
-  --disposition manually_verified --reviewer 'Your name' \
-  --evidence /absolute/path/new-replay-attempt \
-  --expected 'Explain the correct CPU result and SQL semantics.' \
-  --actual 'Explain the observed GPU discrepancy.' \
-  --notes 'Describe the checks you personally performed.' \
-  --acknowledge-manual-verification
-
-# Export a draft that incorporates the recorded human verification
-pixi run -e duckdb-python fuzz issue-draft /absolute/path/triage F-CANDIDATE_ID
-```
-
-| Disposition | Notes |
-|-------------|-------|
-| `manually_verified` | requires a completed triage batch, `--evidence` pointing at matching replay evidence (same extension, DuckDB runtime, configuration, CPU fingerprint, and original or accepted reduced inputs), and `--acknowledge-manual-verification` |
-| `needs_investigation` | records uncertainty; blocks automatic drafting |
-| `intermittent`, `not_reproduced` | reproduction outcome as judged by the reviewer |
-| `harness_problem`, `expected_behavior` | not a Sirius bug |
-| `duplicate` | requires `--duplicate-of F-OTHER_ID` |
-
-Review history and evidence are retained. New batches make prior reviews stale; edited or
-missing evidence prevents export. The attestation records the reviewer's statement only:
-software cannot prove that a person inspected the results, and **agents must not supply it on
-the user's behalf**.
-
-**Grouping.** Assign related candidates to a named group; reassign a subset to split it.
-Grouping preserves each candidate's evidence and verification status.
-
-```bash
-pixi run -e duckdb-python fuzz group /absolute/path/triage F-ID1 F-ID2 \
-  --name 'Possible cause' --reviewer 'Your name' --notes 'Why these appear related'
-```
+- Bundles without a saved YAML require an explicit `--sirius-config`.
 
 ---
 

@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import math
 
-from .artifacts import provenance, seal, verify, write_json
+from .artifacts import provenance, write_json
 from .isolation import supervise
 from . import __version__
 from .classify import Verdict
@@ -358,13 +358,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 130 if result["status"] == "cancelled" else 2
 
 
-def cmd_replay(args: argparse.Namespace) -> int:
-    validate_limits(args)
-    target = pathlib.Path(args.target).resolve()
+def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -> dict:
+    """Replay one finding directory or SQL file into ``work``; returns the outcome.
+
+    A finding directory restores its own configuration, Sirius YAML, comparison
+    mode and recorded setting variant. ``args`` may be updated with values the
+    bundle recorded (cpu-only, YAML, metadata override), so pass a copy when
+    replaying several bundles.
+    """
     bundle = target if target.is_dir() else None
     meta = {}
     if bundle:
-        verify(bundle)
         for required in ("query.sql", "dataset.sql", "config.toml", "meta.json"):
             if not (bundle / required).is_file():
                 raise ValueError(f"incomplete reproducer: missing {required}")
@@ -387,7 +391,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 and meta.get("execution", {}).get("sirius_config_required") is not False
             ):
                 raise ValueError(
-                    "incomplete reproducer: missing saved Sirius YAML; supply --sirius-config explicitly for a legacy bundle"
+                    "incomplete reproducer: missing saved Sirius YAML; supply --sirius-config explicitly"
                 )
         args.cpu_only = args.cpu_only or meta.get("execution", {}).get(
             "cpu_only", False
@@ -401,11 +405,6 @@ def cmd_replay(args: argparse.Namespace) -> int:
                     "NOTE restoring the recorded metadata-mismatch override.",
                     file=sys.stderr,
                 )
-        if not (bundle / "bundle.json").exists():
-            print(
-                "WARNING legacy bundle: provenance and input integrity cannot be verified",
-                file=sys.stderr,
-            )
     else:
         config_path = cli_path(args.config, "configuration") if args.config else None
         query = target
@@ -424,7 +423,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         )
     if not query.is_file() or (dataset is not None and not dataset.is_file()):
         raise ValueError("incomplete reproducer: query or dataset file missing")
-    work = _make_run_dir(args.out, 0)
+    work.mkdir(parents=True, exist_ok=True)
     configs = snapshot_configs(work, configs)
     (work / "config.toml").write_text(cfg.to_toml())
     shutil.copy(query, work / "query.sql")
@@ -455,12 +454,6 @@ def cmd_replay(args: argparse.Namespace) -> int:
     comparison = meta.get("comparison", "multiset")
     if bundle and query.name == "reduced.sql" and (bundle / "reduction.json").exists():
         reduction = json.loads((bundle / "reduction.json").read_text())
-        if query.read_text().strip().rstrip(";") != reduction["sql"].strip().rstrip(
-            ";"
-        ):
-            raise ValueError(
-                "modified reduced query does not match reduction evidence; replay as a SQL file to test edits"
-            )
         comparison = reduction.get("comparison", "multiset")
     if args.ordered:
         comparison = "ordered"
@@ -479,7 +472,6 @@ def cmd_replay(args: argparse.Namespace) -> int:
         if bundle and (bundle / "runtime.json").exists()
         else {}
     )
-    print(f"Replay evidence: {work}", flush=True)
     result = supervise(
         {
             "operation": "replay",
@@ -514,7 +506,20 @@ def cmd_replay(args: argparse.Namespace) -> int:
     write_json(work / "meta.json", replay_meta)
     if configs:
         shutil.copy(configs[0], work / "sirius.yaml")
-    seal(work)
+    return result
+
+
+def replay_verdict(result: dict) -> str:
+    """The verdict a replay produced, or the supervisor status when it did not run."""
+    return result.get("record", {}).get("verdict", result["status"])
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    validate_limits(args)
+    target = pathlib.Path(args.target).resolve()
+    work = _make_run_dir(args.out, 0)
+    print(f"Replay evidence: {work}", flush=True)
+    result = replay(args, target, work)
     print(json.dumps(result, indent=2, default=str))
     if result["status"] == "cancelled":
         return 130
@@ -522,53 +527,68 @@ def cmd_replay(args: argparse.Namespace) -> int:
         return 2
     if result["status"] != "ok":
         return 1
-    verdict = result["record"]["verdict"]
-    return 0 if verdict == Verdict.OK.value else 1
+    return 0 if replay_verdict(result) == Verdict.OK.value else 1
 
 
-def cmd_replay_file(args: argparse.Namespace) -> int:
-    """Replay a SQL stream, each SELECT in a separately supervised process."""
-    import duckdb
-
+def cmd_recheck(args: argparse.Namespace) -> int:
+    """Replay every finding of a run against the current build; print old and new verdicts."""
     validate_limits(args)
-    work = _make_run_dir(args.out, args.dataset_seed or 0)
-    with duckdb.connect() as parser:
-        statements = parser.extract_statements(pathlib.Path(args.file).read_text())
-    attempts = []
-    status = "complete"
-    for index, statement in enumerate(statements):
-        if str(statement.type).split(".")[-1] != "SELECT":
-            continue
-        query = work / f"query-{index}.sql"
-        query.write_text(statement.query)
-        replay_args = argparse.Namespace(**vars(args))
-        replay_args.target = str(query)
-        replay_args.original = True
-        replay_args.ordered = False
-        replay_args.out = str(work / "attempts")
-        rc = cmd_replay(replay_args)
-        attempts.append({"query": str(query), "exit_code": rc})
-        if rc in (2, 130):
-            status = "cancelled" if rc == 130 else "incomplete"
+    run_dir = pathlib.Path(args.run_dir).resolve()
+    findings_dir = run_dir / "findings"
+    bundles = (
+        sorted(p for p in findings_dir.iterdir() if p.is_dir())
+        if findings_dir.is_dir()
+        else []
+    )
+    if not bundles:
+        raise ValueError(f"no findings under {run_dir}")
+    work = _make_run_dir(args.out, 0)
+    print(f"Recheck of {len(bundles)} findings from {run_dir}; evidence in {work}\n")
+    print(f"  {'finding':<40} {'recorded':>18}    {'now':<18} reason")
+    rows = []
+    cancelled = False
+    for bundle in bundles:
+        meta_path = bundle / "meta.json"
+        before = (
+            json.loads(meta_path.read_text()).get("verdict", "?")
+            if meta_path.exists()
+            else "?"
+        )
+        attempt = argparse.Namespace(**vars(args))
+        result = replay(attempt, bundle, work / bundle.name)
+        after = replay_verdict(result)
+        reason = result.get("record", {}).get("reason") or result.get("error") or ""
+        rows.append(
+            {
+                "finding": bundle.name,
+                "recorded": before,
+                "now": after,
+                "reason": reason,
+                "evidence": str(work / bundle.name),
+            }
+        )
+        print(
+            f"  {bundle.name:<40} {before:>18} -> {after:<18} {reason[:60]}", flush=True
+        )
+        if result["status"] == "cancelled":
+            cancelled = True
             break
+    cleared = sum(r["now"] == Verdict.OK.value for r in rows)
     write_json(
-        work / "summary.json",
+        work / "recheck.json",
         {
-            "status": status,
-            "attempts": attempts,
-            "statements_skipped": len(statements) - len(attempts),
+            "run": str(run_dir),
+            "status": "cancelled" if cancelled else "complete",
+            "cleared": cleared,
+            "findings": rows,
         },
     )
-    print(f"Replay-file summary: {work / 'summary.json'}")
-    return (
-        130
-        if status == "cancelled"
-        else (
-            2
-            if status == "incomplete"
-            else 1 if any(a["exit_code"] for a in attempts) else 0
-        )
+    print(
+        f"\n{cleared} of {len(rows)} findings no longer reproduce; details in {work / 'recheck.json'}"
     )
+    if cancelled:
+        return 130
+    return 0 if cleared == len(rows) else 1
 
 
 def cmd_show_config(args: argparse.Namespace) -> int:
@@ -686,23 +706,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rp.set_defaults(func=cmd_replay)
 
-    rf = sub.add_parser(
-        "replay-file", help="classify every SELECT in a SQL file (e.g. a sqlsmith log)"
+    rc = sub.add_parser(
+        "recheck",
+        help="replay every finding of a run against the current build and compare verdicts",
     )
-    _common_config_args(rf)
-    _common_engine_args(rf)
-    rf.add_argument("file")
-    rf.add_argument("--dataset")
-    rf.add_argument("--dataset-seed", type=int)
-    rf.add_argument("--out")
-    rf.add_argument(
+    _common_config_args(rc)
+    _common_engine_args(rc)
+    rc.add_argument("run_dir", help="a run directory with a findings/ subdirectory")
+    rc.add_argument(
+        "--original",
+        action="store_true",
+        help="replay each finding's query.sql instead of its reduced.sql",
+    )
+    rc.add_argument("--out")
+    rc.add_argument(
         "--timeout",
         type=float,
         default=180,
-        help="hard deadline per statement including setup (seconds)",
+        help="hard deadline per finding, including setup (seconds)",
     )
-    rf.add_argument("--verbose", action="store_true")
-    rf.set_defaults(func=cmd_replay_file)
+    rc.set_defaults(
+        func=cmd_recheck,
+        dataset=None,
+        dataset_seed=None,
+        ordered=False,
+        query_override=None,
+    )
 
     sc = sub.add_parser("show-config", help="print the effective configuration")
     _common_config_args(sc)
@@ -717,9 +746,6 @@ def build_parser() -> argparse.ArgumentParser:
     stp.add_argument("--workers", type=int, default=1)
     stp.add_argument("--out")
     stp.set_defaults(func=cmd_selftest)
-    from .triage import add_commands
-
-    add_commands(sub)
     return p
 
 

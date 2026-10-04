@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .classify import SEVERITY, Verdict, normalize_reason
-from .artifacts import seal, write_json, sql_literal
+from .artifacts import write_json, sql_literal
 from .config import FuzzConfig, FUZZ_DIR
 
 
@@ -317,7 +317,6 @@ class Report:
             "LOAD the matching Sirius extension, then `.read repro.sql`. Use a fresh directory/database for each attempt. "
             "repro.sql prints CPU, strict GPU and recorded variant results as applicable; it does not compare them.\n"
         )
-        seal(d)
 
     def add_reduction(self, rec: QueryRecord) -> None:
         d = self.record_paths.get((rec.dataset, rec.sql))

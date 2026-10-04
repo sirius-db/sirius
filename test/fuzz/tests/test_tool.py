@@ -13,8 +13,14 @@ from unittest.mock import patch
 
 from . import conftest_path  # noqa: F401
 from .test_evaluator import FakeSession, gpu_variant_wrong
-from siriusfuzz.artifacts import runtime_info, seal, verify, write_json
-from siriusfuzz.cli import build_parser, cmd_replay, cmd_selftest, validate_limits
+from siriusfuzz.artifacts import runtime_info, write_json
+from siriusfuzz.cli import (
+    build_parser,
+    cmd_recheck,
+    cmd_replay,
+    cmd_selftest,
+    validate_limits,
+)
 from siriusfuzz.config import load_config
 from siriusfuzz.isolation import supervise
 from siriusfuzz.report import QueryRecord, Report
@@ -368,20 +374,6 @@ class ToolTests(unittest.TestCase):
             result = supervise({}, pathlib.Path(tmp), 10, crash_child)
             self.assertEqual(result["status"], "crash")
 
-    def test_integrity_rejects_missing_and_modified_inputs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            query = root / "query.sql"
-            query.write_text("SELECT 1")
-            seal(root)
-            verify(root)
-            query.write_text("SELECT 2")
-            with self.assertRaisesRegex(ValueError, "modified"):
-                verify(root)
-            query.unlink()
-            with self.assertRaises(ValueError):
-                verify(root)
-
     def test_replay_restores_bundle_and_does_not_modify_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -401,7 +393,6 @@ class ToolTests(unittest.TestCase):
                     "execution": {"cpu_only": True},
                 },
             )
-            seal(bundle)
             before = {p.name: p.read_bytes() for p in bundle.iterdir()}
             args = build_parser().parse_args(
                 ["replay", str(bundle), "--out", str(root / "out")]
@@ -451,7 +442,6 @@ class ToolTests(unittest.TestCase):
                 if required != "legacy":
                     execution["sirius_config_required"] = required
                 write_json(bundle / "meta.json", {"execution": execution})
-                seal(bundle)
                 before = {p.name: p.read_bytes() for p in bundle.iterdir()}
                 extension = root / "synthetic-extension"
                 extension.write_text("unit test; never loaded")
@@ -501,6 +491,68 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(
                     before, {p.name: p.read_bytes() for p in bundle.iterdir()}
                 )
+
+    def test_recheck_replays_every_finding_and_reports_what_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            run = root / "run"
+            for name, verdict in (
+                ("000-mismatch-aa", "mismatch"),
+                ("001-gpu_error-bb", "gpu_error"),
+            ):
+                bundle = run / "findings" / name
+                bundle.mkdir(parents=True)
+                (bundle / "query.sql").write_text("SELECT k FROM t;")
+                (bundle / "reduced.sql").write_text("SELECT k FROM t WHERE k = 1;")
+                (bundle / "dataset.sql").write_text(
+                    "CREATE TABLE t(k INT); INSERT INTO t VALUES (1);"
+                )
+                (bundle / "config.toml").write_text(load_config(None).to_toml())
+                write_json(
+                    bundle / "meta.json",
+                    {"verdict": verdict, "execution": {"cpu_only": True}},
+                )
+            (run / "findings" / "000-mismatch-aa" / "additional").mkdir()
+            outcomes = iter(
+                [
+                    {"status": "ok", "record": {"verdict": "ok", "reason": ""}},
+                    {
+                        "status": "ok",
+                        "record": {"verdict": "gpu_error", "reason": "still broken"},
+                    },
+                ]
+            )
+            args = build_parser().parse_args(
+                ["recheck", str(run), "--cpu-only", "--out", str(root / "out")]
+            )
+            with patch(
+                "siriusfuzz.cli.supervise", side_effect=lambda *a, **k: next(outcomes)
+            ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
+                self.assertEqual(cmd_recheck(args), 1)
+            self.assertEqual(probe.call_count, 2)
+            # reduced.sql is what gets replayed, each bundle on its own copy of args.
+            for call in probe.call_args_list:
+                payload = call.args[0]
+                self.assertEqual(
+                    pathlib.Path(payload["query"]).read_text(),
+                    "SELECT k FROM t WHERE k = 1;",
+                )
+            report = json.loads(
+                next((root / "out").glob("run-*/recheck.json")).read_text()
+            )
+            self.assertEqual(report["cleared"], 1)
+            self.assertEqual(
+                [(r["recorded"], r["now"]) for r in report["findings"]],
+                [("mismatch", "ok"), ("gpu_error", "gpu_error")],
+            )
+            with patch(
+                "siriusfuzz.cli.supervise",
+                return_value={
+                    "status": "ok",
+                    "record": {"verdict": "ok", "reason": ""},
+                },
+            ), patch("siriusfuzz.cli.provenance", return_value={}):
+                self.assertEqual(cmd_recheck(args), 0)
 
     def test_forced_variant_ignores_random_variant_budget(self):
         cfg = load_config(
