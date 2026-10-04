@@ -105,6 +105,7 @@ struct physical_check_counters;
 }  // namespace sirius::op::scan
 
 namespace sirius::scan_manager {
+class preparation_ledger;
 class load_balancing_scan_batch_coalescer;
 }  // namespace sirius::scan_manager
 
@@ -949,6 +950,7 @@ class sirius_scan_manager {
 
     preparation_options const preparation;  // Immutable attempt snapshot.
     uint64_t query_token = 0;
+    std::shared_ptr<preparation_ledger> ledger;
     std::shared_ptr<op::scan::physical_check_counters> physical_counters;
 
     //! A disk-backed scan owns the provider that feeds file metadata into the coalescer.

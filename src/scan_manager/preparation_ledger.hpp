@@ -79,8 +79,9 @@ struct reservation_provider {
 };
 class host_reservation_provider final : public reservation_provider {
  public:
-  explicit host_reservation_provider(cucascade::memory::memory_reservation_manager& manager)
-    : manager_(manager)
+  explicit host_reservation_provider(cucascade::memory::memory_reservation_manager& manager,
+                                     std::shared_ptr<void> lifetime = {})
+    : manager_(manager), lifetime_(std::move(lifetime))
   {
   }
   std::optional<reservation_grant> request(memory_space_id, uint64_t bytes) override;
@@ -88,6 +89,7 @@ class host_reservation_provider final : public reservation_provider {
 
  private:
   cucascade::memory::memory_reservation_manager& manager_;
+  std::shared_ptr<void> lifetime_;
 };
 class preparation_resource_error : public transparent::classified_execution_error {
  public:
@@ -174,6 +176,8 @@ class preparation_ledger {
   admission_decision admit(std::span<scan_envelope const>, memory_space_id);
   // Bind file-local retained limits during registration, before any execution work.
   void register_unit(unit_key, uint64_t retained_limit);
+  void retire_unit(unit_key key) noexcept;
+  size_t tracked_units() const;
   w_permit acquire_permit(
     unit_key);  // Nonblocking; empty means coordinator must wait for an event.
   charging_allocator allocator(w_permit const&);
@@ -206,6 +210,7 @@ struct scan_dv_count {
   uint64_t live_positions;
 };
 bool statement_dv_route_allowed(std::span<scan_dv_count const>);
+bool statement_dv_route_allowed(std::span<scan_dv_count const>, uint64_t limit);
 // Parser-specific proofs are supplied only by a qualified profile; absent proofs stay legacy.
 using envelope_bound = std::function<std::optional<uint64_t>(uint64_t, uint64_t)>;
 std::optional<uint64_t> footer_envelope(uint64_t file_size, envelope_bound const& proof = {});

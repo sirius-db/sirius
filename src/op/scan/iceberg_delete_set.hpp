@@ -29,11 +29,17 @@ namespace sirius::op::scan {
 // Positions use the charged allocation itself; no separately allocated vector or shadow charge.
 // Publish only shared_ptr<const iceberg_delete_set>. The backing outlives every consumer.
 struct iceberg_delete_set {
-  explicit iceberg_delete_set(std::string file) : data_file(std::move(file)) {}
+  iceberg_delete_set(iceberg_delete_set const&)            = delete;
+  iceberg_delete_set& operator=(iceberg_delete_set const&) = delete;
+  explicit iceberg_delete_set(std::string file) : file_owner_(std::move(file))
+  {
+    data_file = file_owner_;
+  }
   // Legacy positions alias the completed payload; they are outside the preparation ledger.
   iceberg_delete_set(std::string file, std::shared_ptr<std::vector<int64_t> const> positions_owner)
-    : data_file(std::move(file)), legacy_positions_(std::move(positions_owner))
+    : file_owner_(std::move(file)), legacy_positions_(std::move(positions_owner))
   {
+    data_file = file_owner_;
     if (!legacy_positions_) throw std::invalid_argument("legacy delete positions require backing");
     positions = *legacy_positions_;
   }
@@ -41,7 +47,30 @@ struct iceberg_delete_set {
                      scan_manager::charged_block backing,
                      uint64_t count,
                      uint64_t sources)
-    : data_file(std::move(file)), source_dv_count(sources), backing_(std::move(backing))
+    : source_dv_count(sources), file_owner_(std::move(file)), backing_(std::move(backing))
+  {
+    data_file = file_owner_;
+    validate(count);
+  }
+  iceberg_delete_set(std::string_view file,
+                     scan_manager::charged_block backing,
+                     uint64_t count,
+                     uint64_t sources,
+                     std::shared_ptr<void const> owner)
+    : data_file(file),
+      source_dv_count(sources),
+      path_owner_(std::move(owner)),
+      backing_(std::move(backing))
+  {
+    if (!path_owner_) throw std::invalid_argument("borrowed delete path requires ownership");
+    validate(count);
+  }
+  std::string_view data_file;
+  std::span<int64_t const> positions;
+  uint64_t source_dv_count = 0;
+
+ private:
+  void validate(uint64_t count)
   {
     if (count && (!backing_ || !backing_.retained()))
       throw std::invalid_argument("delete positions require retained backing");
@@ -55,11 +84,8 @@ struct iceberg_delete_set {
         (!positions.empty() && positions.front() < 0))
       throw std::invalid_argument("delete positions must be sorted, unique and nonnegative");
   }
-  std::string data_file;
-  std::span<int64_t const> positions;
-  uint64_t source_dv_count = 0;
-
- private:
+  std::string file_owner_;
+  std::shared_ptr<void const> path_owner_;
   scan_manager::charged_block backing_;
   std::shared_ptr<std::vector<int64_t> const> legacy_positions_;
 };

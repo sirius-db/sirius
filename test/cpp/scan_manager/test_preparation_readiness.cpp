@@ -19,7 +19,9 @@
 #include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan_manager/preparation_coordinator.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 
+#include <array>
 #include <condition_variable>
 #include <future>
 #include <mutex>
@@ -1052,4 +1054,94 @@ TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner
   f.finish();
   CHECK(unit->record().state == unit_state::cancelled);
   CHECK_FALSE(unit->cancel());
+}
+
+TEST_CASE(
+  "W exhaustion delays claims without closing the source, and cancellation drains charged results",
+  "[r2b][coordinator][ledger]")
+{
+  auto cancel = GENERATE(false, true);
+  fixture f;
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  sirius::scan_manager::test::test_reservation_provider provider;
+  provider.grant_bytes = 48;
+  preparation_ledger ledger(provider);
+  std::array envelope{scan_envelope{{{16, 0, 0, 16}, {16, 0, 0, 16}}, 0, 0, true}};
+  REQUIRE(ledger.admit(envelope, memory_space_id(cucascade::memory::Tier::HOST, 0)).n_permits == 1);
+  struct input : tagged {
+    std::shared_ptr<sirius::op::scan::iceberg_delete_set const> deletes;
+    input(int id, decltype(deletes) set) : tagged(id), deletes(std::move(set)) {}
+  };
+  int next = 0;
+  w_permit pending;
+  bool registered = false;
+  preparation_coordinator::source source;
+  source.coalescer = std::make_shared<accumulator>(1);
+  source.can_claim = [&] {
+    if (next >= 2) return true;
+    if (!registered) {
+      ledger.register_unit({1, next + 1u}, 16);
+      registered = true;
+    }
+    if (!pending) pending = ledger.acquire_permit({1, next + 1u});
+    return bool(pending);
+  };
+  source.claim = [&]() -> std::optional<preparation_coordinator::job> {
+    if (next >= 2) return {};
+    auto id     = next++;
+    registered  = false;
+    auto permit = std::make_shared<w_permit>(std::move(pending));
+    return preparation_coordinator::job{
+      [&, id, permit] {
+        auto allocator = ledger.allocator(*permit);
+        auto positions = allocator.allocate_retained(16);
+        auto* data     = reinterpret_cast<int64_t*>(positions.data());
+        data[0]        = 1;
+        data[1]        = 3;
+        auto set       = std::make_shared<sirius::op::scan::iceberg_delete_set const>(
+          "file", std::move(positions), 2, 1);
+        if (id == 0) blocked->wait();
+        return std::make_unique<input>(id, std::move(set));
+      },
+      {}};
+  };
+  source.construct = [](std::unique_ptr<sirius::op::scan::scan_info> batch) {
+    return preparation_coordinator::publication{
+      std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch)), 0};
+  };
+  source.publish = [out](preparation_coordinator::publication) {
+    std::lock_guard lock(out->mutex);
+    out->published.push_back(1);
+    out->cv.notify_all();
+  };
+  source.close = [out] {
+    std::lock_guard lock(out->mutex);
+    out->closed = true;
+    out->cv.notify_all();
+  };
+  source.bind_consumption = [out](std::function<void()> callback) {
+    out->consumed = std::move(callback);
+  };
+  f.coordinator.add_source(std::move(source));
+  auto guard = f.shutdown_guard();
+  f.start();
+  REQUIRE(blocked->await());
+  CHECK(ledger.permits_in_flight() == 1);
+  CHECK(out->count() == 0);
+  CHECK_FALSE(out->closed);
+  if (cancel) f.coordinator.request_stop(stop_reason::user_cancel);
+  blocked->release();
+  if (!cancel) {
+    REQUIRE(out->await(1));
+    out->consume();
+    REQUIRE(out->await(2));
+    out->consume();
+    REQUIRE(out->await_closed());
+  }
+  f.finish();
+  f.coordinator.drain();
+  CHECK(out->count() == (cancel ? 0 : 2));
+  CHECK(ledger.permits_in_flight() == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
 }

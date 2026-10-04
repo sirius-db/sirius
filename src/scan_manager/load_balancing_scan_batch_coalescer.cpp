@@ -19,6 +19,7 @@
 #include "exec/try.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
@@ -55,6 +56,42 @@ load_balancing_scan_batch_coalescer::register_pipeline(
   return state_ptr;
 }
 
+namespace {
+preparation_coordinator::job bind_preparation_unit(
+  std::function<std::unique_ptr<op::scan::scan_info>()> work,
+  std::shared_ptr<preparation_unit> unit,
+  required_input_set required)
+{
+  return {
+    [work = std::move(work), unit, required] {
+      try {
+        auto input       = work();
+        auto const& deps = input->dependencies().front();
+        unit->complete_input(footer_input{deps.footer, deps.parquet_approval, deps.datasource});
+        unit->complete_input(delete_set_input{deps.delete_set});
+        if (required.test(static_cast<size_t>(required_input::segments)))
+          unit->complete_input(segments_input{deps.profiles});
+        if (required.test(static_cast<size_t>(required_input::checkpoint_iteration)))
+          unit->complete_input(checkpoint_input{deps.checkpoint_iteration.value()});
+        return input;
+      } catch (...) {
+        auto error = std::current_exception();
+        auto cause = transparent::classify_failure(error);
+        std::optional<op::scan::verdict_reason> reason;
+        try {
+          std::rethrow_exception(error);
+        } catch (op::scan::unsupported_physical_input const& e) {
+          reason = e.reason;
+        } catch (...) {
+        }
+        unit->fail(preparation_failure{cause.cause, reason, cause.detail, error});
+        throw;
+      }
+    },
+    unit};
+}
+}  // namespace
+
 void load_balancing_scan_batch_coalescer::register_coordinator_source(
   op::scan::sirius_gpu_scan_operator* scan,
   split_provider& provider,
@@ -67,31 +104,48 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
     dynamic_cast<op::scan::duckdb_native_gpu_ingestible const*>(&scan->get_ingestible());
   if (native && native->metadata_walk_pending())
     throw std::logic_error("native metadata must be prepared on the statement path before start");
-  coordinator.add_source({slot->coalescer,
-                          [&provider]() -> std::optional<preparation_coordinator::job> {
-                            if (!provider.has_more_splits()) return {};
-                            auto work = provider.next_split_provider();
-                            if (!work) return {};
-                            return preparation_coordinator::job{std::move(work), {}};
-                          },
-                          [slot](std::unique_ptr<op::scan::scan_info> batch) {
-                            auto device = slot->balancer->get_next_gpu(slot->pipeline_id);
-                            auto input  = std::make_unique<op::scan::scan_operator_input>(
-                              std::move(batch), slot->readahead, slot->op_id, device);
-                            auto bytes = input->get_estimated_size_in_bytes();
-                            return preparation_coordinator::publication{std::move(input), bytes};
-                          },
-                          [slot](preparation_coordinator::publication publication) {
-                            slot->connector->push_split_sized(std::move(publication.input),
-                                                              publication.bytes);
-                          },
-                          [slot] {
-                            if (slot->readahead) slot->readahead->mark_operator_closed(slot->op_id);
-                            slot->connector->close();
-                          },
-                          [slot](std::function<void()> callback) {
-                            slot->connector->set_consumption_callback(std::move(callback));
-                          }});
+
+  auto* iceberg    = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&provider.get_ingestible());
+  auto const* bind = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(
+    &provider.get_ingestible().table_info());
+  auto deferred = iceberg && bind && bind->deferred;
+
+  preparation_coordinator::source source;
+  source.coalescer = slot->coalescer;
+  source.claim     = [&provider, &coordinator, iceberg, bind, deferred]()
+    -> std::optional<preparation_coordinator::job> {
+    if (!provider.has_more_splits()) return {};
+    std::optional<unit_key> key;
+    if (deferred) key = iceberg->next_preparation_unit();
+    auto work = provider.next_split_provider();
+    if (!work) return {};
+    if (!key) return preparation_coordinator::job{std::move(work), {}};
+
+    auto required =
+      required_inputs(bind->read_views->entry(bind->contract_id).eligibility.later_checks, true);
+    auto unit = coordinator.admit_unit(*key, required);
+    if (!unit) return {};
+    return bind_preparation_unit(std::move(work), std::move(unit), required);
+  };
+  source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
+    auto device = slot->balancer->get_next_gpu(slot->pipeline_id);
+    auto input  = std::make_unique<op::scan::scan_operator_input>(
+      std::move(batch), slot->readahead, slot->op_id, device);
+    auto bytes = input->get_estimated_size_in_bytes();
+    return preparation_coordinator::publication{std::move(input), bytes};
+  };
+  source.publish = [slot](preparation_coordinator::publication publication) {
+    slot->connector->push_split_sized(std::move(publication.input), publication.bytes);
+  };
+  source.close = [slot] {
+    if (slot->readahead) slot->readahead->mark_operator_closed(slot->op_id);
+    slot->connector->close();
+  };
+  source.bind_consumption = [slot](std::function<void()> callback) {
+    slot->connector->set_consumption_callback(std::move(callback));
+  };
+  source.can_claim = [iceberg] { return !iceberg || iceberg->can_claim_preparation(); };
+  coordinator.add_source(std::move(source));
   slot->publication = coordinator.publication_gate();
 }
 

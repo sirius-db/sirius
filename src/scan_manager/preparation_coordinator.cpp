@@ -118,6 +118,7 @@ struct preparation_coordinator::state {
     --source.outstanding;
     if (source.active_result == index) source.active_result.reset();
     s.input.reset();
+    if (s.unit) units.erase(s.unit->key());
     s.unit.reset();
     s.status = slot::phase::free;
   }
@@ -451,6 +452,9 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
     return s.status == source_state::phase::enumerating;
   });
   if (source == sources.end()) return false;
+  // The nonblocking W check shares the wait lock: settlement cannot be lost between
+  // observing exhausted credit and sleeping. It allocates no payload and performs no I/O.
+  if (source->hooks.can_claim && !source->hooks.can_claim()) return false;
   auto ticket   = std::make_shared<job_ticket>();
   auto index    = static_cast<size_t>(free - slots.begin());
   ticket->st    = self;

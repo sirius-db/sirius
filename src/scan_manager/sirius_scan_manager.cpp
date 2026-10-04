@@ -36,6 +36,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/iceberg_dv_preparation.hpp"
 #include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_materialize.hpp"
@@ -1978,6 +1979,19 @@ void sirius_scan_manager::prepare_for_query(
 
 void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state)
 {
+  std::shared_ptr<preparation_admission> admission;
+  for (auto const& entry : state.scans) {
+    auto const* info = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(
+      &entry.op->get_ingestible().table_info());
+    if (!info || !info->deferred) continue;
+    if (!admission) {
+      admission    = info->deferred->admission;
+      state.ledger = admission->consume();
+    } else if (admission != info->deferred->admission) {
+      throw std::logic_error("Iceberg scans must share the statement admission");
+    }
+    info->deferred->ledger = state.ledger;
+  }
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);
   for (auto& scan : state.scans)
@@ -2220,6 +2234,11 @@ void sirius_scan_manager::query_scan_manager_state::drain() noexcept
   // slots and in-flight splits may still own shared_ptr copies.
   if (readahead) { readahead->stop(); }
   readahead.reset();
+  if (ledger) ledger->close();
+  for (auto const& entry : scans)
+    if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&entry.op->get_ingestible()))
+      ice->stop_preparation();
+  ledger.reset();
 }
 
 std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manager::get_query_state(
@@ -2531,7 +2550,12 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // cache would return rows the table logically deleted, and would look like a cache hit rather
   // than a correctness bug — so an iceberg scan with deletes always reads from disk.
   if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
-    if (ice->delete_data && !ice->delete_data->empty()) { return {}; }
+    if (ice->deferred || (ice->delete_data && !ice->delete_data->empty()) ||
+        (ice->delete_sets && std::ranges::any_of(*ice->delete_sets, [](auto const& e) {
+           return !e.second || !e.second->positions.empty();
+         }))) {
+      return {};
+    }
   }
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     // Cached parquet batches have no per-row file provenance.

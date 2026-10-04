@@ -41,8 +41,10 @@ uint64_t round(uint64_t n, uint64_t quantum)
 }
 class host_backing final : public reservation_backing {
  public:
-  explicit host_backing(std::unique_ptr<cucascade::memory::reservation> reservation)
-    : reservation_(std::move(reservation)),
+  explicit host_backing(std::unique_ptr<cucascade::memory::reservation> reservation,
+                        std::shared_ptr<void> lifetime)
+    : lifetime_(std::move(lifetime)),
+      reservation_(std::move(reservation)),
       resource_(reservation_->get_memory_resource_of<cucascade::memory::Tier::HOST>())
   {
   }
@@ -69,6 +71,7 @@ class host_backing final : public reservation_backing {
   }
 
  private:
+  std::shared_ptr<void> lifetime_;
   std::unique_ptr<cucascade::memory::reservation> reservation_;
   cucascade::memory::fixed_size_host_memory_resource* resource_;
 };
@@ -92,11 +95,13 @@ std::optional<reservation_grant> host_reservation_provider::request(memory_space
   auto reservation = memory->make_reservation_or_null(bytes);
   if (!reservation) return std::nullopt;
   auto capacity = reservation->size();
-  return reservation_grant{capacity, space, std::make_shared<host_backing>(std::move(reservation))};
+  return reservation_grant{
+    capacity, space, std::make_shared<host_backing>(std::move(reservation), lifetime_)};
 }
 struct unit_account {
   uint64_t retained_limit = 0, retained = 0;
   std::weak_ptr<permit_state> permit;
+  bool retired = false;
 };
 struct ledger_state {
   mutable std::mutex mutex;
@@ -107,6 +112,15 @@ struct ledger_state {
   bool closed = false;
   std::map<unit_key, unit_account> units;
 };
+namespace {
+void erase_retired(ledger_state& ledger, unit_key key)
+{
+  auto it = ledger.units.find(key);
+  if (it != ledger.units.end() && it->second.retired && !it->second.retained &&
+      it->second.permit.expired())
+    ledger.units.erase(it);
+}
+}  // namespace
 struct permit_state {
   std::shared_ptr<ledger_state> ledger;
   unit_key key;
@@ -116,6 +130,7 @@ struct permit_state {
   {
     std::lock_guard lock(ledger->mutex);
     --ledger->active;
+    erase_retired(*ledger, key);
   }
 };
 namespace {
@@ -133,6 +148,7 @@ struct allocation_owner {
     if (retained) {
       ledger->retained -= charge;
       ledger->units.at(key).retained -= charge;
+      erase_retired(*ledger, key);
     } else
       permit->temporary -= charge;
   }
@@ -212,6 +228,21 @@ void preparation_ledger::register_unit(unit_key key, uint64_t retained_limit)
   state_->units.emplace(key, unit_account{charge, 0, {}});
   state_->registered += charge;
 }
+void preparation_ledger::retire_unit(unit_key key) noexcept
+{
+  if (!state_) return;
+  std::lock_guard lock(state_->mutex);
+  auto it = state_->units.find(key);
+  if (it == state_->units.end()) return;
+  it->second.retired = true;
+  erase_retired(*state_, key);
+}
+size_t preparation_ledger::tracked_units() const
+{
+  if (!state_) return 0;
+  std::lock_guard lock(state_->mutex);
+  return state_->units.size();
+}
 w_permit preparation_ledger::acquire_permit(unit_key key)
 {
   w_permit result;
@@ -220,7 +251,7 @@ w_permit preparation_ledger::acquire_permit(unit_key key)
   if (state_->closed || !state_->w || state_->active == state_->permits) return result;
   auto it = state_->units.find(key);
   if (it == state_->units.end()) throw std::logic_error("unregistered preparation unit");
-  if (!it->second.permit.expired()) return result;
+  if (it->second.retired || !it->second.permit.expired()) return result;
   auto permit    = std::make_shared<permit_state>();
   permit->ledger = state_;
   permit->key    = key;
@@ -375,6 +406,10 @@ void preparation_admission::finish() noexcept
 }
 bool statement_dv_route_allowed(std::span<scan_dv_count const> scans)
 {
+  return statement_dv_route_allowed(scans, op::scan::kMaxDeletionVectorPositionsPerStatement);
+}
+bool statement_dv_route_allowed(std::span<scan_dv_count const> scans, uint64_t limit)
+{
   std::map<op::scan::scan_contract_id, uint64_t> seen;
   uint64_t total = 0;
   for (auto const& scan : scans) {
@@ -383,9 +418,7 @@ bool statement_dv_route_allowed(std::span<scan_dv_count const> scans)
       if (it->second != scan.live_positions) return false;
       continue;
     }
-    if (scan.live_positions >
-        static_cast<uint64_t>(op::scan::kMaxDeletionVectorPositionsPerStatement) - total)
-      return false;
+    if (total > limit || scan.live_positions > limit - total) return false;
     total += scan.live_positions;
   }
   return true;

@@ -24,11 +24,15 @@
 //
 // No GPU: file IO and parsing only.
 
+#include "op/scan/iceberg_delete_set.hpp"
 #include "op/scan/puffin_reader.hpp"
+#include "scan_manager/preparation_test_support.hpp"
 
 #include <catch.hpp>
+#include <roaring/roaring.hh>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -85,6 +89,33 @@ DeletionVectorRef fixture_ref()
           .content_size_in_bytes = kBlobSize,
           .referenced_data_file  = fixture_data_file_path(),
           .record_count          = kCardinality};
+}
+
+std::vector<int64_t> read_for_test(DeletionVectorRef ref, bool charged)
+{
+  if (!charged) return read_deletion_vector(ref);
+  using namespace sirius::scan_manager;
+  test::test_reservation_provider provider;
+  auto path = ref.puffin_path;
+  if (path.starts_with("file://")) path.erase(0, 7);
+  std::error_code error;
+  auto size              = fs::file_size(path, error);
+  ref.file_size_in_bytes = error ? 0 : size;
+  auto positions =
+    static_cast<uint64_t>(std::clamp<int64_t>(ref.record_count, 0, kMaxDeletionVectorPositions)) *
+    8;
+  auto blob            = static_cast<uint64_t>(std::max<int64_t>(ref.content_size_in_bytes, 0));
+  auto parser          = static_cast<uint64_t>(ref.file_size_in_bytes) * 14 + 512;
+  provider.grant_bytes = positions + blob + parser;
+  preparation_ledger ledger(provider);
+  std::array scans{scan_envelope{{{blob, parser, 0, positions}}, 0, 0, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, positions);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto result    = read_deletion_vector_charged(ref, allocator);
+  return {result->positions.begin(), result->positions.end()};
 }
 
 //===----------------------------------------------------------------------===//
@@ -253,7 +284,9 @@ DeletionVectorRef synthetic_ref(std::string const& path,
 
 TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
 {
-  auto const positions = read_deletion_vector(fixture_ref());
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
+  auto const positions = read(fixture_ref());
 
   // The fixture deletes 2 of its 5 rows — the same 3 survivors the integration case asserts.
   REQUIRE(positions.size() == 2);
@@ -262,38 +295,44 @@ TEST_CASE("puffin reader reads the fixture deletion vector", "[scan][iceberg]")
 
 TEST_CASE("puffin reader accepts a file:// URI", "[scan][iceberg]")
 {
-  auto const expected = read_deletion_vector(fixture_ref());
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
+  auto const expected = read(fixture_ref());
 
   // What an Apache writer records: an absolute file:// URI. Before the reader stripped the
   // scheme, std::ifstream simply failed to open this and the whole table declined to CPU.
   auto ref        = fixture_ref();
   ref.puffin_path = "file://" + fs::absolute(fixture_puffin_path()).string();
-  REQUIRE(read_deletion_vector(ref) == expected);
+  REQUIRE(read(ref) == expected);
 }
 
 TEST_CASE("puffin reader accepts a file:// URI on the referenced data file", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // The manifest and the Puffin footer are free to disagree about the SCHEME while naming the
   // same file. Comparing them literally would refuse tables that are entirely well formed.
   //
   // Only the scheme: the comparison is textual otherwise, so a manifest and a footer that
   // disagreed about absolute versus relative form would still be refused. Iceberg writers put
   // the same location string in both, so that shape does not arise in a table anyone wrote.
-  auto const expected = read_deletion_vector(fixture_ref());
+  auto const expected = read(fixture_ref());
 
   auto ref                 = fixture_ref();
   ref.referenced_data_file = "file://" + fixture_data_file_path();
-  REQUIRE(read_deletion_vector(ref) == expected);
+  REQUIRE(read(ref) == expected);
 }
 
 TEST_CASE("puffin reader rejects a non-Puffin file", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // A parquet data file is not a Puffin container. Pointing the reader at one must fail rather
   // than return an empty position list, which would read as "this data file has no deletes".
   auto ref        = fixture_ref();
   ref.puffin_path = require_fixture(fixture_data_file_path());
 
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 //===----------------------------------------------------------------------===//
@@ -306,38 +345,46 @@ TEST_CASE("puffin reader rejects a non-Puffin file", "[scan][iceberg]")
 
 TEST_CASE("puffin reader rejects an entry naming a different data file", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // The misbinding case: the blob is intact and its position count is whatever the manifest
   // claims, but the footer says it deletes from some other data file. Nothing else can catch it.
   auto ref                 = fixture_ref();
   ref.referenced_data_file = "some/other/data/file.parquet";
 
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 TEST_CASE("puffin reader rejects an offset with no blob", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // Off by one byte: still inside a real Puffin container, still passes the container magic
   // check, but no descriptor claims it. Reading on would decode whatever happened to be there.
   auto ref           = fixture_ref();
   ref.content_offset = kBlobOffset + 1;
 
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 TEST_CASE("puffin reader rejects a length the footer does not agree with", "[scan][iceberg]")
 {
-  auto ref                  = fixture_ref();
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
+  auto ref     = fixture_ref();
   ref.content_size_in_bytes = kBlobSize - 1;
 
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 TEST_CASE("puffin reader rejects a cardinality the footer does not agree with", "[scan][iceberg]")
 {
-  auto ref         = fixture_ref();
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
+  auto ref     = fixture_ref();
   ref.record_count = kCardinality + 1;
 
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 //===----------------------------------------------------------------------===//
@@ -350,11 +397,13 @@ TEST_CASE("puffin reader rejects a cardinality the footer does not agree with", 
 
 TEST_CASE("puffin reader rejects a bitmap key with bit 31 set", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // First: the same synthesized blob under key 0 must READ. Without this the case below proves
   // only that the builder produces something unreadable.
   auto const good_blob = build_dv_blob(0);
   auto const good_path = write_puffin(good_blob, "key_zero", 1);
-  auto const positions = read_deletion_vector(synthetic_ref(good_path, good_blob));
+  auto const positions = read(synthetic_ref(good_path, good_blob));
   REQUIRE(positions == std::vector<int64_t>{5});
 
   // Now the same vector under INT32_MIN. Widening the key to uint32_t and shifting it left by 32
@@ -363,11 +412,13 @@ TEST_CASE("puffin reader rejects a bitmap key with bit 31 set", "[scan][iceberg]
   // The count is still 1, so the record_count cross-check cannot see it.
   auto const bad_blob = build_dv_blob(std::numeric_limits<int32_t>::min());
   auto const bad_path = write_puffin(bad_blob, "key_int32_min", 1);
-  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(bad_path, bad_blob)));
+  REQUIRE_THROWS(read(synthetic_ref(bad_path, bad_blob)));
 }
 
 TEST_CASE("puffin reader rejects a bitset declaring fewer values than it holds", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // Declared 4098, actually all 65,536 bits set. `bitset_container_read` trusts the declared
   // number, so cardinality() answers 4098 and the destination is sized to 4098 -- then
   // toUint32Array(), which takes no capacity argument, emits 65,536 values into it. The
@@ -376,11 +427,13 @@ TEST_CASE("puffin reader rejects a bitset declaring fewer values than it holds",
   auto const blob              = build_dv_blob_bitset(kDeclared, 8192 * 8);
   auto const path              = write_puffin(blob, "bitset_under_declared", kDeclared);
 
-  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(path, blob, kDeclared)));
+  REQUIRE_THROWS(read(synthetic_ref(path, blob, kDeclared)));
 }
 
 TEST_CASE("puffin reader rejects a bitset declaring more values than it holds", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // The mirror image, and the one that returns a WRONG ANSWER rather than corrupting memory:
   // declared 4098 with a single bit set. resize() leaves 4097 zero-initialized tail entries,
   // extraction writes only the value 5, and every remaining zero reads as delete position 0. The
@@ -390,11 +443,13 @@ TEST_CASE("puffin reader rejects a bitset declaring more values than it holds", 
   auto const blob              = build_dv_blob_bitset(kDeclared, 1);
   auto const path              = write_puffin(blob, "bitset_over_declared", kDeclared);
 
-  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(path, blob, kDeclared)));
+  REQUIRE_THROWS(read(synthetic_ref(path, blob, kDeclared)));
 }
 
 TEST_CASE("puffin reader rejects an entry with no record_count", "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // record_count is a required manifest field. Absent, the footer-to-manifest and
   // decoded-to-manifest checks both compare against nothing and the expansion is unbounded.
   auto const blob = build_dv_blob(0);
@@ -402,12 +457,14 @@ TEST_CASE("puffin reader rejects an entry with no record_count", "[scan][iceberg
 
   auto ref         = synthetic_ref(path, blob);
   ref.record_count = -1;
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 TEST_CASE("puffin reader rejects a record_count above the materialization ceiling",
           "[scan][iceberg]")
 {
+  auto charged = GENERATE(false, true);
+  auto read    = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   // A vector declaring more positions than the reader will materialize is DECLINED (the table
   // falls back to DuckDB, which streams) rather than being allowed to size a plan-time allocation.
   // The footer agrees with the manifest here, so the two cardinality checks both pass.
@@ -416,22 +473,114 @@ TEST_CASE("puffin reader rejects a record_count above the materialization ceilin
 
   auto ref         = synthetic_ref(path, blob);
   ref.record_count = kMaxDeletionVectorPositions + 1;
-  REQUIRE_THROWS(read_deletion_vector(ref));
+  REQUIRE_THROWS(read(ref));
 }
 
 TEST_CASE("puffin reader rejects a descriptor whose 'fields' is not a list of integers",
           "[scan][iceberg]")
 {
+  auto charged    = GENERATE(false, true);
+  auto read       = [charged](DeletionVectorRef const& ref) { return read_for_test(ref, charged); };
   auto const blob = build_dv_blob(0);
 
   auto const object_fields = write_puffin(blob, "fields_object", 1, "{}");
-  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(object_fields, blob)));
+  REQUIRE_THROWS(read(synthetic_ref(object_fields, blob)));
 
   auto const string_element = write_puffin(blob, "fields_string", 1, R"(["1"])");
-  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(string_element, blob)));
+  REQUIRE_THROWS(read(synthetic_ref(string_element, blob)));
 
   // The spec requires the key to exist and to be a list of field ids; it does not require the list
   // to be empty, so a populated one must still read.
   auto const populated = write_puffin(blob, "fields_populated", 1, "[1,2]");
-  REQUIRE(read_deletion_vector(synthetic_ref(populated, blob)) == std::vector<int64_t>{5});
+  REQUIRE(read(synthetic_ref(populated, blob)) == std::vector<int64_t>{5});
+}
+
+TEST_CASE("Charged Puffin results use retained backing and free temporary buffers before W returns",
+          "[r2b][iceberg][charged_reader]")
+{
+  using namespace sirius::scan_manager;
+  test::test_reservation_provider provider;
+  provider.grant_bytes = 1024 * 1024;
+  preparation_ledger ledger(provider);
+  auto ref               = fixture_ref();
+  ref.file_size_in_bytes = fs::file_size(ref.puffin_path);
+  std::array scans{scan_envelope{{{44, 64 * 1024, 0, 16}}, 0, 0, true}};
+  REQUIRE(ledger.admit(scans, memory_space_id(cucascade::memory::Tier::HOST, 0)).deferred);
+  ledger.register_unit({1, 1}, 16);
+  auto permit = ledger.acquire_permit({1, 1});
+  REQUIRE(permit);
+  auto allocator = ledger.allocator(permit);
+  auto set       = read_deletion_vector_charged(ref, allocator);
+  REQUIRE(set);
+  CHECK(std::vector<int64_t>(set->positions.begin(), set->positions.end()) ==
+        read_deletion_vector(ref));
+  CHECK(ledger.charged_bytes({1, 1}) == 16);
+  CHECK(set->source_dv_count == 1);
+  permit.release();
+  CHECK(ledger.permits_in_flight() == 0);
+  CHECK(provider.seen->allocated_bytes == 16);
+  set.reset();
+  CHECK(ledger.charged_bytes({1, 1}) == 0);
+  CHECK(provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets and runs",
+          "[r2b][iceberg][charged_reader]")
+{
+  auto shape = GENERATE(0, 1, 2, 3);
+  roaring::Roaring bitmap;
+  if (shape == 0)
+    for (uint32_t i : {1u, 5u, 65537u, 0xfffffffeu})
+      bitmap.add(i);
+  else if (shape == 1)
+    for (uint32_t i = 0; i < 65536; i += 2)
+      bitmap.add(i);
+  else {
+    bitmap.addRange(0, 65536);
+    if (shape == 3)
+      for (uint32_t i : {65537u, 131073u, 196609u})
+        bitmap.add(i);
+    REQUIRE(bitmap.runOptimize());
+  }
+  std::vector<uint8_t> serial(bitmap.getSizeInBytes());
+  REQUIRE(bitmap.write(reinterpret_cast<char*>(serial.data())) == serial.size());
+  std::vector<uint8_t> checksummed{0xD1, 0xD3, 0x39, 0x64};
+  for (int i = 0; i < 8; ++i)
+    checksummed.push_back(i == 0 ? 1 : 0);
+  push_u32_le(checksummed, 1);  // nonzero 64-bit high key
+  checksummed.insert(checksummed.end(), serial.begin(), serial.end());
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, checksummed.size());
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  auto path = write_puffin(blob, "charged_roaring_" + std::to_string(shape), bitmap.cardinality());
+  auto ref  = synthetic_ref(path, blob, bitmap.cardinality());
+  CHECK(read_for_test(ref, true) == read_deletion_vector(ref));
+}
+
+TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files",
+          "[r2b][iceberg][charged_reader][failure]")
+{
+  auto corrupt = GENERATE(false, true);
+  auto ref     = fixture_ref();
+  if (corrupt)
+    ref.referenced_data_file = "wrong.parquet";
+  else
+    ref.puffin_path += ".missing";
+  try {
+    read_for_test(ref, true);
+    FAIL("invalid Puffin input was accepted");
+  } catch (std::exception const& error) {
+    auto failure = sirius::transparent::classify_failure(std::current_exception());
+    CHECK(failure.cause == (corrupt ? sirius::transparent::late_failure_cause::physical_input
+                                    : sirius::transparent::late_failure_cause::reader_io));
+    if (corrupt) {
+      auto const* physical =
+        dynamic_cast<sirius::op::scan::unsupported_physical_input const*>(&error);
+      REQUIRE(physical);
+      CHECK(physical->reason == sirius::op::scan::verdict_reason::iceberg_delete_corrupt);
+      CHECK(std::string(error.what()).find("referenced-data-file") != std::string::npos);
+    } else
+      CHECK(std::string(error.what()).find("Cannot open file") != std::string::npos);
+  }
 }

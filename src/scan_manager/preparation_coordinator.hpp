@@ -42,6 +42,7 @@ class preparation_coordinator {
     std::function<void(publication)> publish;
     std::function<void()> close;
     std::function<void(std::function<void()>)> bind_consumption;
+    std::function<bool()> can_claim;
   };
   enum class lifecycle { constructed, armed, running, quiescent };
   struct statistics {

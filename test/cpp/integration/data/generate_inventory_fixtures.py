@@ -135,4 +135,79 @@ meta["location"] = str(dest)
 (dest / "metadata" / "v1.metadata.json").write_text(json.dumps(meta, indent=2))
 (dest / "metadata" / "version-hint.text").write_text("1")
 
+# Three independent DV/data-file pairs exercise preparation/GPU overlap without a
+# multi-scan read-view correspondence dependency. Footer references are absolute.
+for variant, names in (("dv_bounded", ("a",)), ("dv_three", ("a", "b", "c"))):
+    dest = out / variant
+    (dest / "metadata").mkdir(parents=True, exist_ok=True)
+    (dest / "data").mkdir(parents=True, exist_ok=True)
+    meta = json.loads((source / "metadata/v1.metadata.json").read_text())
+    meta["location"] = str(dest)
+    for snapshot in meta["snapshots"]:
+        snapshot["manifest-list"] = str(
+            dest / "metadata" / Path(snapshot["manifest-list"]).name
+        )
+    source_puffin = next((source / "data").glob("*.puffin")).read_bytes()
+    import struct
+
+    footer_length = struct.unpack("<i", source_puffin[-12:-8])[0]
+    source_footer = json.loads(source_puffin[-12 - footer_length : -12])
+    for path in (source / "metadata").glob("*.avro"):
+        schema, metadata, rows = read(path)
+        if "manifest_path" in rows[0]:
+            for row in rows:
+                row["manifest_path"] = str(
+                    dest / "metadata" / Path(row["manifest_path"]).name
+                )
+                row["added_files_count"] *= len(names)
+                row["added_rows_count"] *= len(names)
+        else:
+            expanded = []
+            for original in rows:
+                for name in names:
+                    row = copy.deepcopy(original)
+                    data = dest / "data" / (name + ".parquet")
+                    df = row["data_file"]
+                    if df["content"] == 0:
+                        shutil.copyfile(repo / df["file_path"], data)
+                        if variant == "dv_three":
+                            pq.write_table(
+                                pq.read_table(data),
+                                data,
+                                row_group_size=3,
+                                compression="snappy",
+                            )
+                        df["file_path"] = str(data)
+                        df["file_size_in_bytes"] = data.stat().st_size
+                    else:
+                        sidecar = dest / "data" / (name + ".puffin")
+                        footer = copy.deepcopy(source_footer)
+                        footer["blobs"][0]["properties"]["referenced-data-file"] = str(
+                            data
+                        )
+                        payload = json.dumps(footer, separators=(",", ":")).encode()
+                        framing = (
+                            b"PFA1"
+                            + payload
+                            + struct.pack("<i", len(payload))
+                            + bytes(4)
+                            + b"PFA1"
+                        )
+                        sidecar.write_bytes(
+                            source_puffin[: 4 + df["content_size_in_bytes"]] + framing
+                        )
+                        df["file_path"] = str(sidecar)
+                        df["referenced_data_file"] = str(data)
+                        df["file_size_in_bytes"] = sidecar.stat().st_size
+                    expanded.append(row)
+            rows = expanded
+        write(dest / "metadata" / path.name, schema, metadata, rows)
+    for path in (dest / "metadata").glob("snap-*.avro"):
+        schema, metadata, rows = read(path)
+        for row in rows:
+            row["manifest_length"] = Path(row["manifest_path"]).stat().st_size
+        write(path, schema, metadata, rows)
+    (dest / "metadata/v1.metadata.json").write_text(json.dumps(meta, indent=2))
+    (dest / "metadata/version-hint.text").write_text("1")
+
 print(out)

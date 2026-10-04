@@ -27,6 +27,7 @@
 #include <vector>
 
 namespace sirius::op::scan {
+class iceberg_dv_preparation;
 
 /**
  * @brief Parquet bind data plus the table's materialized Iceberg delete data.
@@ -39,14 +40,16 @@ class iceberg_ingestible_table_info : public parquet_ingestible_table_info {
   /// As passed to @c iceberg_scan.
   std::string table_path;
 
-  /// Legacy adapter input, used only when delete_sets is absent.
-  /// Resolved at plan time, never null: an unreadable manifest must fail planning rather than
-  /// arrive as "no deletes", which is how a V2 table returns rows it deleted while looking fine.
+  /// Legacy adapter input, used only when delete_sets and deferred are absent.
+  /// Resolved at plan time on the legacy path: an unreadable manifest must fail planning rather
+  /// than arrive as "no deletes", which is how a V2 table returns rows it deleted while looking
+  /// fine.
   std::shared_ptr<const IcebergDeleteData> delete_data;
 
   /// Complete per-file results keyed by manifest path, including proved-empty files.
-  /// When absent, L0 adapts delete_data without changing the legacy producer.
+  /// When absent on the legacy path, L0 adapts delete_data without changing the producer.
   std::optional<iceberg_delete_sets> delete_sets;
+  std::shared_ptr<iceberg_dv_preparation> deferred;
 };
 
 /**
@@ -69,6 +72,10 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  bool can_claim_preparation();
+  scan_manager::unit_key next_preparation_unit() const;
+  void stop_preparation() noexcept;
+  void finish_preparation() noexcept;
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
@@ -88,6 +95,10 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
   [[nodiscard]] std::string const& delete_key_for(std::string const& scan_path) const;
 
   std::shared_ptr<iceberg_delete_sets const> _delete_sets;
+  std::shared_ptr<iceberg_dv_preparation> _deferred;
+  scan_manager::w_permit _next_permit;
+  size_t _next_preparation = 0;
+  bool _next_registered    = false;
   std::string _table_path;
   /// Scan path -> delete-map key, only for the paths where the two spellings differ.
   std::unordered_map<std::string, std::string> _delete_key_by_scan_path;

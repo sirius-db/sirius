@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
+#include "op/scan/iceberg_dv_preparation.hpp"
 #include "scan_manager/preparation_ledger.hpp"
 #include "scan_manager/preparation_test_support.hpp"
 
@@ -495,4 +496,102 @@ TEST_CASE("Failure to construct the lowering grant selects the original path onc
   CHECK(provider.requests == 1);
   CHECK_THROWS_AS(ledger.admit(sample(), host), std::logic_error);
   CHECK(provider.requests == 1);
+}
+
+TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-only quota at zero",
+          "[r2b][iceberg][ledger]")
+{
+  using namespace sirius::op::scan;
+  iceberg_delete_discovery discovery;
+  std::vector<std::string> paths{"a.parquet", "b.parquet"};
+  auto empty = iceberg_dv_preparation::envelope(discovery, {});
+  CHECK(empty.qualified);
+  CHECK(empty.units.empty());
+  IcebergDeleteFileEntry dv;
+  dv.file_format           = "puffin";
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.record_count          = 2;
+  dv.file_size_in_bytes    = 400;
+  dv.referenced_data_file  = "a.parquet";
+  discovery.deletion_vector_entries.push_back(dv);
+  auto e = iceberg_dv_preparation::envelope(discovery, paths);
+  REQUIRE(e.qualified);
+  CHECK(e.units.size() == 1);
+  CHECK(e.units.front().positions == 16);
+  CHECK(e.units.front().roaring == 0);  // direct, nonallocating expansion
+  SECTION("a blob length is not a complete container bound")
+  {
+    discovery.deletion_vector_entries.front().file_size_in_bytes = 44;
+    CHECK_FALSE(iceberg_dv_preparation::envelope(discovery, paths).qualified);
+  }
+  SECTION("missing container bound stays legacy")
+  {
+    discovery.deletion_vector_entries.front().file_size_in_bytes = -1;
+    CHECK_FALSE(iceberg_dv_preparation::envelope(discovery, paths).qualified);
+  }
+  SECTION("unprovable JSON size stays legacy")
+  {
+    discovery.deletion_vector_entries.front().file_size_in_bytes =
+      std::numeric_limits<int64_t>::max();
+    CHECK_FALSE(iceberg_dv_preparation::envelope(discovery, paths).qualified);
+  }
+  SECTION("mixed positional input keeps legacy")
+  {
+    discovery.positional_delete_files.push_back("pos.parquet");
+    CHECK_FALSE(iceberg_dv_preparation::envelope(discovery, paths).qualified);
+  }
+}
+
+TEST_CASE("Charged DV descriptor names outlive the plan only while a result actually uses them",
+          "[r2b][iceberg][ledger]")
+{
+  using namespace sirius::op::scan;
+  test_reservation_provider provider;
+  provider.grant_bytes = 64 * 1024;
+  auto ledger          = std::make_shared<preparation_ledger>(provider);
+  auto discovery       = std::make_shared<iceberg_delete_discovery>();
+  IcebergDeleteFileEntry dv;
+  dv.file_format           = "puffin";
+  dv.file_path             = "a.puffin";
+  dv.content_offset        = 4;
+  dv.content_size_in_bytes = 44;
+  dv.record_count          = 2;
+  dv.file_size_in_bytes    = 400;
+  dv.referenced_data_file  = "a.parquet";
+  discovery->deletion_vector_entries.push_back(dv);
+  std::vector<std::string> paths{"a.parquet", "b.parquet"};
+  auto e = iceberg_dv_preparation::envelope(*discovery, paths);
+  REQUIRE(ledger->admit(std::array{e}, host).deferred);
+  auto prepared = std::make_shared<iceberg_dv_preparation>(7, "table", paths, discovery, *ledger);
+  REQUIRE(prepared->files.size() == 2);
+  CHECK(prepared->files[0].dv != nullptr);
+  CHECK(prepared->files[1].dv == nullptr);
+  auto arena_charge = ledger->charged_bytes({7, 0});
+  CHECK(arena_charge == e.retained_descriptors);
+  CHECK(ledger->tracked_units() == 1);
+  ledger->register_unit({7, 1}, 16);
+  auto permit = ledger->acquire_permit({7, 1});
+  REQUIRE(permit);
+  auto allocation = ledger->allocator(permit).allocate_retained(16);
+  auto* values    = reinterpret_cast<int64_t*>(allocation.data());
+  values[0]       = 1;
+  values[1]       = 3;
+  auto result     = std::make_shared<iceberg_delete_set const>(
+    prepared->files[0].path, std::move(allocation), 2, 1, prepared->path_owner());
+  prepared->files[0].result = result;
+  permit.release();
+  ledger->retire_unit({7, 1});
+  CHECK(ledger->tracked_units() == 2);
+  prepared->finish();
+  prepared.reset();
+  ledger->close();
+  CHECK(result->data_file == "a.parquet");
+  CHECK(result->positions[1] == 3);
+  CHECK(provider.seen->allocated_bytes == arena_charge + 16);
+  result.reset();
+  CHECK(ledger->tracked_units() == 0);
+  ledger.reset();
+  CHECK(provider.seen->allocated_bytes == 0);
+  CHECK(provider.outstanding() == 0);
 }

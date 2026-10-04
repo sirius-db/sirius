@@ -46,6 +46,9 @@ struct LogicalType;
 namespace duckdb {
 class AttachedDatabase;
 }
+namespace sirius::scan_manager {
+class reservation_provider;
+}
 namespace sirius::io {
 class sirius_datasource;
 }
@@ -209,6 +212,10 @@ struct physical_check_counters {
   std::function<void(std::string const&, bool)> parquet_phase_for_testing;
   std::function<void(std::string const&, bool)> parquet_metadata_for_testing;
   std::function<void()> after_certify_for_testing;
+  std::function<void(std::string const&, bool)> iceberg_dv_phase_for_testing;
+  std::function<void(scan_contract_id, bool)> iceberg_preparation_route_for_testing;
+  std::shared_ptr<scan_manager::reservation_provider> preparation_provider_for_testing;
+  std::optional<uint64_t> statement_dv_limit_for_testing;
   void parquet_phase(std::string const& file, bool footer) const
   {
     if (track_units && parquet_phase_for_testing) parquet_phase_for_testing(file, footer);

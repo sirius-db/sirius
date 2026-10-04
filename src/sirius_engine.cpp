@@ -22,6 +22,8 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -51,6 +53,15 @@
 namespace sirius {
 
 namespace {
+
+void finish_deferred_preparation(planner::query const* query) noexcept
+{
+  if (!query) return;
+  for (auto* source : query->get_scan_operators())
+    if (auto* scan = dynamic_cast<op::scan::sirius_gpu_scan_operator*>(source))
+      if (auto* ice = dynamic_cast<op::scan::iceberg_gpu_ingestible*>(&scan->get_ingestible()))
+        ice->finish_preparation();
+}
 
 /// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
 /// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
@@ -146,6 +157,7 @@ void sirius_engine::quiesce_plan_users()
     ctx->get_task_scheduler().drain_after_error(query_id_);
     ctx->get_task_creator().reset(query_id_);
   }
+  finish_deferred_preparation(query_.get());
   plan_users_quiescent_ = true;
 }
 
@@ -262,6 +274,7 @@ void sirius_engine::execute()
     sirius_ctx->get_scan_manager().drain_query(query_id_);
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
     sirius_ctx->get_task_creator().reset(query_id_);
+    finish_deferred_preparation(query_.get());
     plan_users_quiescent_ = true;
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());

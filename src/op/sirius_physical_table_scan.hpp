@@ -32,6 +32,10 @@ namespace sirius::scan_manager {
 class preparation_admission;
 }
 
+namespace sirius::op::scan {
+class iceberg_ingestible_table_info;
+}
+
 namespace sirius {
 namespace transparent {
 class read_view_registry;
@@ -86,8 +90,11 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              duckdb::virtual_column_map_t virtual_columns,
                              duckdb::vector<duckdb::LogicalType> duckdb_types = {});
 
+  ~sirius_physical_table_scan() override;
+
   // All scans reference one statement admission owner.
   std::shared_ptr<scan_manager::preparation_admission> preparation_admission;
+  std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
 
   //! The table function
   duckdb::TableFunction function;

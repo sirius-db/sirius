@@ -56,7 +56,8 @@ struct IcebergDeleteFileEntry {
   int64_t content_offset{-1};         // byte offset in Puffin file (V3, -1 if absent)
   int64_t content_size_in_bytes{-1};  // byte length of DV blob (V3, -1 if absent)
   int64_t sequence_number{0};         // manifest entry sequence number (for eq delete filtering)
-  int64_t record_count{-1};           // deleted positions the manifest claims (V3, -1 if absent)
+  int64_t file_size_in_bytes{-1};
+  int64_t record_count{-1};  // deleted positions the manifest claims (V3, -1 if absent)
 
   /// Requires file_format already lowercased by the reader. Format alone: an entry that IS a
   /// deletion vector but describes itself incompletely must be rejected, not reclassified as
@@ -81,6 +82,8 @@ struct iceberg_delete_discovery {
   /// From the data manifests; equality deletes need them to test applicability.
   std::unordered_map<std::string, int64_t> data_file_manifest_sequence_numbers;
 };
+
+void validate_deletion_vector_claims(iceberg_delete_discovery const&);
 
 struct inventory_result {
   std::optional<iceberg_delete_inventory> inventory;
@@ -122,9 +125,8 @@ struct EqualityDeleteGroup {
 /**
  * @brief Fully materialized Iceberg delete data for one table.
  *
- * All delete I/O happens at PLAN time, on internal connections each bracketed by their own
- * InternalQueryGuard — which is also why the memo is cleared on QueryEnd rather than inside the
- * execution window; see clear_iceberg_delete_data_cache(). Immutable after construction.
+ * Legacy producer output, materialized at plan time on internal connections bracketed by
+ * InternalQueryGuard. Each scan owns its supplied discovery and result; no global memo.
  */
 struct IcebergDeleteData {
   /// V2 positional deletes and V3 deletion vectors merged: data_file_path -> sorted positions.
@@ -155,7 +157,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                          std::vector<cudf::table_view> const& views);
 
 /**
- * @brief Load or reuse immutable delete payloads from this scan's supplied discovery.
+ * @brief Load immutable legacy delete payloads from this scan's supplied discovery.
  *
  * Caller must suppress DuckDB side-effects (InternalQueryGuard).
  *
@@ -168,8 +170,8 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  * @param snapshot_id    The snapshot the SCAN was bound to. Callers on the GPU path always pass
  *                       one: an unpinned iceberg_scan is declined at plan time precisely so that
  *                       this pass cannot resolve "current" independently and pair one snapshot's
- *                       data files with another's deletes. It identifies the payload cache entry;
- *                       this function never queries the inventory.
+ *                       data files with another's deletes. This function never queries the
+ * inventory.
  */
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
@@ -178,19 +180,7 @@ std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery);
 
-/**
- * @brief Drop everything the per-query delete-data cache is holding.
- *
- * MUST be called from the QueryEnd hook, not the execution window: a table declined at plan
- * time never opens one, and those entries are exactly the ones that would go stale. An entry
- * outliving its query could serve a previous snapshot's deletes; it also pins the GPU key table
- * and hash join its EqualityDeleteGroups own.
- */
-void clear_iceberg_delete_data_cache();
-
-/// Payload cache misses, independent of inventory walks. Release builds compile the logging
-/// out, so this is what lets a test assert the memo still collapses the repeat reads rather than
-/// merely not corrupting them. Monotonic; tests take a delta around a query.
+/// Legacy payload builds. Monotonic; retained for the existing scan-local read oracle.
 uint64_t iceberg_delete_data_uncached_read_count();
 
 /**
