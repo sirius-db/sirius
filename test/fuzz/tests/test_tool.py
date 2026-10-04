@@ -208,7 +208,9 @@ class ToolTests(unittest.TestCase):
     def test_single_select_accepts_one_query_with_comments(self):
         self.assertTrue(single_select("-- note\nSELECT 'a;b' FROM t; "))
         self.assertTrue(single_select("WITH c AS (SELECT 1) /* x; */ SELECT * FROM c"))
+        self.assertTrue(single_select("(SELECT 1) UNION (SELECT 2)"))
         self.assertFalse(single_select("SELECT 1; SELECT 2"))
+        self.assertFalse(single_select("(SELECT 1); DROP TABLE t"))
         self.assertFalse(single_select("CREATE TABLE t(k INT)"))
 
     def test_selftest_bounds_default_data_and_preserves_explicit_overrides(self):

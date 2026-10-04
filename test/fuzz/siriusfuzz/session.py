@@ -130,7 +130,7 @@ def single_select(sql: str) -> bool:
     """Whether ``sql`` is exactly one SELECT/WITH/FROM statement (comments allowed)."""
     text = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
     text = re.sub(r"--[^\n]*", " ", text).strip().rstrip(";").strip()
-    if not re.match(r"(?is)^(select|with|from)\b", text):
+    if not re.match(r"(?is)^(?:\(\s*)*(select|with|from)\b", text):
         return False
     quote = ""
     for ch in text:
