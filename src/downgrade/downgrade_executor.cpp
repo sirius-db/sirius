@@ -20,6 +20,7 @@
 #include "data/convertible_data_batch.hpp"
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "log/logging.hpp"
 
 #include <nvtx3/nvtx3.hpp>
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -134,6 +136,14 @@ void downgrade_executor::stop()
 
 void downgrade_executor::drain()
 {
+  pause();
+  _pool->resume();
+  _request_queue.reactivate();
+  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+}
+
+void downgrade_executor::pause()
+{
   _pool->interrupt();
   _request_queue.interrupt();
 
@@ -141,9 +151,12 @@ void downgrade_executor::drain()
 
   _pool->wait_all();
   cancel_pending_requests();
+}
+
+void downgrade_executor::resume()
+{
   _pool->resume();
   _request_queue.reactivate();
-
   _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
 }
 
@@ -247,6 +260,26 @@ void downgrade_executor::processing_loop()
         _pool->wait_all();
         return predicate_satisfied(req.get()) || target_completed();
       };
+
+    // === TIER 0: prefetching cache (HOST->DISK only, idle sweep) ===
+    // When downgrading HOST to DISK, the prefetching cache holds pinned host chunks
+    // that are pure cache — freeing them relieves the same pressure repositories
+    // would spill for, without doing any actual I/O to disk. Do an idle pass first
+    // (skip chunks with pending future demand) so the cheapest reclaim runs before
+    // we spill anyone's working set.
+    bool const host_to_disk =
+      _space_id.tier == cucascade::memory::Tier::HOST && _prefetching_cache != nullptr;
+    if (host_to_disk && !predicate_satisfied(req.get())) {
+      std::size_t const idle_target =
+        req->target_bytes.value_or(std::numeric_limits<std::size_t>::max());
+      auto const freed =
+        _prefetching_cache->evict(sirius::io::cache::eviction::mode::idle, idle_target);
+      if (freed > 0) {
+        req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+        planned_bytes.fetch_add(freed, std::memory_order_relaxed);
+        predicate_satisfied(req.get());
+      }
+    }
 
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
@@ -447,6 +480,24 @@ void downgrade_executor::processing_loop()
     // Wait for all in-flight work to finish (predicate also checked in workers)
     _pool->wait_all();
 
+    // === TIER 3: prefetching cache (HOST->DISK only, forced sweep) ===
+    // Repositories and the pipeline queue could not cover the caller's target. Fall back
+    // to a forced cache reclaim — evict every unpinned chunk regardless of future demand
+    // — up to the remaining byte deficit. This trades cache warmth for meeting the
+    // reservation the caller is blocked on.
+    if (host_to_disk && !req->satisfied.load() && req->target_bytes.has_value()) {
+      std::size_t const already_freed = req->bytes_freed.load(std::memory_order_relaxed);
+      if (already_freed < *req->target_bytes) {
+        std::size_t const remaining = *req->target_bytes - already_freed;
+        auto const freed =
+          _prefetching_cache->evict(sirius::io::cache::eviction::mode::forced, remaining);
+        if (freed > 0) {
+          req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+          predicate_satisfied(req.get());
+        }
+      }
+    }
+
     // Monitor requests are gated by has_viable_downgrade_target() and warn once per stall episode
     // in monitor_loop(); only warn here for one-shot (external) requests to avoid log spam.
     if (disk_not_configured && !req->satisfied.load() && !req->is_monitor_request) {
@@ -638,6 +689,11 @@ void downgrade_executor::set_pipeline_task_queue(
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* pipeline_task_queue)
 {
   _pipeline_task_queue = pipeline_task_queue;
+}
+
+void downgrade_executor::set_prefetching_cache(sirius::io::cache::prefetching_cache* cache)
+{
+  _prefetching_cache = cache;
 }
 
 // --- Public request API ---

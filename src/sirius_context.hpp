@@ -562,6 +562,18 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// Drop and rebuild every ioctx's prefetching cache, keeping borrowed cache
+  /// pointers on HOST downgrade executors in sync.
+  ///
+  /// The scan manager's own @c reset_caches() does the shutdown/rebuild, but every
+  /// HOST @c downgrade_executor also holds a raw pointer at the cache it must not
+  /// outlive. The slot guard this call runs under serializes query windows, not
+  /// downgrade sweeps -- those keep running on their own processing threads. This
+  /// wrapper pauses each HOST executor, clears its cache pointer, delegates to the
+  /// scan manager, then rebinds every HOST executor to the newly-built cache before
+  /// resuming it, so no sweep can observe the old address post-destruction.
+  void reset_caches();
+
   /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
@@ -637,6 +649,11 @@ class SiriusContext : public ClientContextState {
   }
 
  private:
+  /// Point every HOST @c downgrade_executor at the current ioctx cache (or
+  /// nullptr if none), without touching GPU-tier executors. Shared by the
+  /// initial wire-up and @ref reset_caches.
+  void rebind_prefetching_cache_on_host_executors();
+
   void throw_if_not_initialized() const;
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring

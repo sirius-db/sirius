@@ -61,6 +61,8 @@
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <io/cache/prefetching_cache.hpp>
+#include <io/io_context.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
@@ -949,6 +951,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     executor->set_pipeline_task_queue(task_scheduler_->get_pipeline_task_queue());
   }
 
+  // Wire the process-wide prefetching cache into HOST-tier downgrade executors so
+  // HOST->DISK reclaim can skim pinned cache chunks before spilling repositories.
+  // Only the local ioctx owns a prefetching_cache today; when it is absent (e.g.
+  // sirius_datasource disabled or an S3-only workload) the pointer stays null and
+  // downgrade_executor falls back to its pre-existing repository-only path.
+  rebind_prefetching_cache_on_host_executors();
+
   // Start everything -- downgrade executors deferred until now
   for (auto& executor : downgrade_executors_) {
     executor->start();
@@ -1133,6 +1142,46 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
 {
   throw_if_not_initialized();
   return *scan_manager_;
+}
+
+void SiriusContext::rebind_prefetching_cache_on_host_executors()
+{
+  sirius::io::cache::prefetching_cache* cache = nullptr;
+  if (auto* io_ctx = scan_manager_->io_ctx()) { cache = io_ctx->cache(); }
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+      executor->set_prefetching_cache(cache);
+    }
+  }
+}
+
+void SiriusContext::reset_caches()
+{
+  throw_if_not_initialized();
+
+  // Pause every HOST executor's processing thread BEFORE destroying the cache it may
+  // currently be sweeping. The slot guard the SQL function holds serializes query
+  // windows; it does nothing about the downgrade executor's own processing/monitor
+  // threads, which could otherwise race the shutdown_cache() below.
+  std::vector<sirius::parallel::downgrade_executor*> paused;
+  paused.reserve(downgrade_executors_.size());
+  for (auto& executor : downgrade_executors_) {
+    if (executor->get_space_id().tier == cucascade::memory::Tier::HOST) {
+      executor->set_prefetching_cache(nullptr);
+      executor->pause();
+      paused.push_back(executor.get());
+    }
+  }
+
+  // Rebuild on the current thread while HOST sweeps are quiescent.
+  scan_manager_->reset_caches();
+
+  // Rebind to whatever the scan manager produced (a fresh cache, or nullptr if the
+  // configuration no longer supports one) and let the executors run again.
+  rebind_prefetching_cache_on_host_executors();
+  for (auto* executor : paused) {
+    executor->resume();
+  }
 }
 
 sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
