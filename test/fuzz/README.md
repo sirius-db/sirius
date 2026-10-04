@@ -28,23 +28,23 @@ For the reasoning behind generation, execution, comparison and reduction, read
 ## Quick start
 
 **Requirements.** A supported Linux GPU host (x86-64 or aarch64) with the repository's CUDA
-environment. The `duckdb-python` Pixi environment does not support macOS. A stock DuckDB wheel
-is fine for the CPU-only harness tests but cannot load Sirius.
+environment. The fuzzer drives the DuckDB shell that the Sirius build produces
+(`build/release/duckdb`, with Sirius built in) over pipes; nothing else has to be built or
+installed. For CPU-only use, any DuckDB CLI works (`--shell`, or `SIRIUSFUZZ_SHELL`).
 
-**1. Build** the extension and the Python module from the same checkout:
+**1. Build** Sirius:
 
 ```bash
 git submodule update --init --recursive
 pixi run make
-pixi run -e duckdb-python build-duckdb-python
 ```
 
-**2. Fuzz.** With no options, `run` checks that the build, the Python module and the GPU are
-ready, then fuzzes the enabled features for 10 minutes with one worker and prints the summary:
+**2. Fuzz.** With no options, `run` checks that the shell, Sirius and the GPU are ready, then
+fuzzes the enabled features for 10 minutes with one worker and prints the summary:
 
 ```bash
-pixi run -e duckdb-python fuzz run               # correctness: GPU answers against CPU answers
-pixi run -e duckdb-python fuzz run --mode gaps   # what Sirius hands back to the CPU at runtime
+pixi run fuzz run               # correctness: GPU answers against CPU answers
+pixi run fuzz run --mode gaps   # what Sirius hands back to the CPU at runtime
 ```
 
 Results land in `test/fuzz/out/run-<timestamp>-seed<seed>-<unique>/`. The summary names the
@@ -53,11 +53,11 @@ directory and ends with the command to replay a finding.
 **3. Shape the run** when you need to:
 
 ```bash
-pixi run -e duckdb-python fuzz run --seed 42 --queries 100 --no-reduce      # quick sample
-pixi run -e duckdb-python fuzz run --seed 42 --duration 30m --workers 2     # longer campaign
-pixi run -e duckdb-python fuzz run --extension /path/to/sirius.duckdb_extension \
+pixi run fuzz run --seed 42 --queries 100 --no-reduce      # quick sample
+pixi run fuzz run --seed 42 --duration 30m --workers 2     # longer campaign
+pixi run fuzz run --shell /path/to/other/build/release/duckdb \
   --sirius-config /path/to/sirius.yaml --out /path/to/results               # another build or YAML
-pixi run -e duckdb-python fuzz run --set features.scalar_functions.enabled=substring,like
+pixi run fuzz run --set features.scalar_functions.enabled=substring,like
 ```
 
 `--no-doctor` skips the readiness check on repeat runs. Check shared GPU availability before
@@ -66,7 +66,7 @@ adding workers; each one holds a Sirius session.
 **4. Fix, then recheck.** After a change, replay every finding of a run against the new build:
 
 ```bash
-pixi run -e duckdb-python fuzz recheck test/fuzz/out/run-<...>
+pixi run fuzz recheck test/fuzz/out/run-<...>
 ```
 
 **No GPU handy?** `fuzz show-config` prints the effective configuration, `fuzz-test` runs the
@@ -77,22 +77,27 @@ harness unit tests, and `fuzz selftest --queries 100` is a small CPU-only end-to
 
 ## Commands
 
-All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
+All commands are invoked as `pixi run fuzz <command>`.
 
 | Command | What it does | GPU? |
 |---------|--------------|------|
 | `run` | Generate, execute and compare queries; save findings. `--mode gaps` hunts runtime fallbacks | yes |
-| `doctor` | The readiness check on its own: build, module, interception and a GPU answer | yes |
+| `doctor` | The readiness check on its own: shell, Sirius, interception and a GPU answer | yes |
 | `replay <finding-or-sql>` | Re-run one finding directory or your own `.sql` file | yes (`--cpu-only` for CPU) |
 | `recheck <run-dir>` | Replay every finding of a run against the current build; print old and new verdicts | yes |
 | `show-config` | Print the effective TOML configuration | no |
 | `selftest` | CPU-only end-to-end harness check | no |
 
-Also: `pixi run -e duckdb-python fuzz-test` runs the harness unit tests.
+Also: `pixi run fuzz-test` runs the harness unit tests.
 
 **Paths.** A relative path on the command line resolves from the directory you run `pixi` in,
 then from the repository root. Paths inside the configuration file resolve from the repository
 root. Outputs default to `test/fuzz/out/`.
+
+**The shell.** `--shell` names the DuckDB binary to drive; the default is the configuration's
+`sirius.shell` (`build/release/duckdb`), then `$SIRIUSFUZZ_SHELL`, then `duckdb` on `PATH`. The
+build's shell has Sirius built in. A plain DuckDB CLI of the same version works with
+`--extension` pointing at the loadable `sirius.duckdb_extension`, or on its own for `--cpu-only`.
 
 **Exit codes.** `0` completed (findings may exist), doctor passed, replay matched, recheck all
 clear. `1` findings with `--fail-on-findings`, a replay that still fails, a recheck with findings
@@ -104,10 +109,10 @@ left. `2` invalid setup or input, incomplete campaign, failed readiness check. `
 
 1. **Generate.** Typed tables, data and SQL come from the TOML configuration, including NULLs and
    edge values. The summary flags enabled features that were never generated.
-2. **Execute.** Each query runs on DuckDB CPU, then on Sirius with
-   `enable_duckdb_fallback = false`, so a fallback surfaces as an error instead of a silent CPU
-   run. After a match, the query is rerun under randomized Sirius settings and compared with the
-   GPU baseline.
+2. **Execute.** Each worker drives one DuckDB shell process over pipes in JSON mode. Each query
+   runs on DuckDB CPU, then on Sirius with `enable_duckdb_fallback = false`, so a fallback
+   surfaces as an error instead of a silent CPU run. After a match, the query is rerun under
+   randomized Sirius settings and compared with the GPU baseline.
 3. **Compare.** Rows compare as a multiset unless `ORDER BY` covers every output column.
    FLOAT/DOUBLE use relative and absolute tolerances; everything else compares exactly, including
    DECIMAL and NULL. A mismatch whose CPU result changes when the input rows are reordered is
@@ -115,8 +120,10 @@ left. `2` invalid setup or input, incomplete campaign, failed readiness check. `
 4. **Save.** Findings are grouped by signature, shrunk, and reported with verdict counts.
 
 Generated tables live in an `ATTACH`ed file-backed database and are `CHECKPOINT`ed, because
-in-memory tables never reach the GPU native scan. Each worker is a separate process: a GPU fault
-or hang costs one worker, which the orchestrator records and respawns (`--max-respawns`, default
+in-memory tables never reach the GPU native scan. A GPU fault or a query that overruns its
+timeout kills the shell process; the worker records the crash or timeout with the shell's
+stderr, starts a fresh shell, re-attaches the dataset files and carries on. The orchestrator
+respawns a worker only if the Python process itself dies or stalls (`--max-respawns`, default
 200). With both `--queries` and `--duration`, whichever is reached first stops the run; Ctrl-C
 keeps completed findings and the summary; a worker that fails at startup or exhausts its
 respawns marks the run `incomplete`.
@@ -259,12 +266,12 @@ runs `INSTALL`; AST reduction works without it.
 Copy the **entire** finding directory; it replays from any compatible Sirius checkout.
 
 ```bash
-pixi run -e duckdb-python fuzz replay /path/finding              # reduced.sql if present
-pixi run -e duckdb-python fuzz replay /path/finding --original   # the full query
-pixi run -e duckdb-python fuzz replay /path/finding \
+pixi run fuzz replay /path/finding              # reduced.sql if present
+pixi run fuzz replay /path/finding --original   # the full query
+pixi run fuzz replay /path/finding \
   --extension /path/new/sirius.duckdb_extension                  # another build (recorded)
-pixi run -e duckdb-python fuzz replay /path/query.sql --dataset /path/dataset.sql
-pixi run -e duckdb-python fuzz recheck /path/run-dir             # every finding of a run
+pixi run fuzz replay /path/query.sql --dataset /path/dataset.sql
+pixi run fuzz recheck /path/run-dir             # every finding of a run
 ```
 
 Replay restores the saved TOML, YAML, baseline session settings, comparison mode and the exact
@@ -290,7 +297,11 @@ GPUs or runtimes is not guaranteed; a bundle without a saved YAML needs an expli
 **Agents.** The [sirius-fuzz skill](../../.agents/skills/sirius-fuzz/SKILL.md) (also linked from
 `.claude/skills/`) runs the same commands on an available GPU host and reports the saved evidence.
 
-**Build metadata.** `build-duckdb-python` uses the extension preset's
-`OVERRIDE_GIT_DESCRIBE=v1.5.6`, and version checks stay enabled. `--allow-metadata-mismatch` is
-only for independently verified matching builds; it cannot fix an ABI mismatch, and its use is
-recorded and restored on replay.
+**Versions.** The shell and the extension must come from the same DuckDB version; the build's
+shell guarantees that. A plain DuckDB CLI that refuses a `LOAD` names the version it wants. The
+`duckdb-python` Pixi environment is no longer needed by the fuzzer.
+
+**Shell protocol.** Every statement is followed by a sentinel on each stream, so results (JSON
+on stdout) and errors (stderr) are delimited exactly. DECIMAL and HUGEINT values arrive as
+strings and compare exactly; floating-point values arrive as numbers and compare with the
+tolerances. A query whose output columns share a name is still compared positionally.

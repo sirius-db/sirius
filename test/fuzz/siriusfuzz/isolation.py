@@ -18,7 +18,7 @@ from typing import Any
 
 from .artifacts import runtime_info, sql_literal, write_json
 from .config import load_config
-from .session import Session, SessionError
+from .session import Session, SessionError, single_select
 
 
 def _child(payload: dict[str, Any], work: str) -> None:
@@ -29,12 +29,14 @@ def _child(payload: dict[str, Any], work: str) -> None:
         os.dup2(fd, number)
         os.close(fd)
     session = Session(
+        payload["shell"],
         payload.get("extension"),
         payload.get("sirius_config"),
         directory / "db",
         0,
-        allow_metadata_mismatch=payload.get("allow_metadata_mismatch", False),
+        cpu_only=payload.get("cpu_only", False),
         evidence_path=directory / "active.json",
+        log_path=directory / "shell.stderr",
     )
     result: dict[str, Any] = {"status": "setup_error"}
     try:
@@ -46,19 +48,19 @@ def _child(payload: dict[str, Any], work: str) -> None:
         session.active_settings.clear()  # baseline settings are saved in runtime.json
         write_json(directory / "runtime.json", runtime_info(session))
         session.db_dir.mkdir(parents=True, exist_ok=True)
-        session.con.execute(
-            f"ATTACH {sql_literal(str(session.db_dir / 'replay.duckdb'))} AS replay"
-        )
-        session.con.execute("USE replay")
+        replay_db = session.db_dir / "replay.duckdb"
+        session.execute(f"ATTACH {sql_literal(str(replay_db))} AS replay")
+        session.execute("USE replay")
         session.current_alias = "replay"
+        session.attached["replay"] = replay_db
         if payload["operation"] == "doctor":
-            session.con.execute(
+            session.execute(
                 "CREATE TABLE fuzz_probe(k INTEGER); INSERT INTO fuzz_probe VALUES (1), (2), (NULL); CHECKPOINT"
             )
         else:
-            # DuckDB parses the entire script; quoted semicolons and comments are preserved.
-            session.con.execute(pathlib.Path(payload["dataset"]).read_text())
-            session.con.execute("CHECKPOINT")
+            # The shell parses the entire script; quoted semicolons and comments survive.
+            session.execute(pathlib.Path(payload["dataset"]).read_text())
+            session.execute("CHECKPOINT")
         if session.gpu_available:
             ok, why = session.check_interception()
             write_json(directory / "canary.json", {"ok": ok, "detail": why})
@@ -66,7 +68,9 @@ def _child(payload: dict[str, Any], work: str) -> None:
                 raise SessionError(f"GPU interception check failed: {why}")
         if payload["operation"] == "doctor":
             probe = session.run(
-                "SELECT sum(k), count(*) FROM fuzz_probe", session.gpu_available, 15
+                "SELECT CAST(sum(k) AS BIGINT), count(*) FROM fuzz_probe",
+                session.gpu_available,
+                120,
             )
             if (
                 probe.status != "ok"
@@ -80,8 +84,8 @@ def _child(payload: dict[str, Any], work: str) -> None:
                 "status": "ok",
                 "gpu_verified": session.gpu_available,
                 "checks": [
-                    "DuckDB imported",
-                    "session opened",
+                    "DuckDB shell started",
+                    "Sirius session opened",
                     "file-backed dataset loaded",
                     "query result verified",
                 ],
@@ -101,11 +105,7 @@ def _child(payload: dict[str, Any], work: str) -> None:
                     if not session.gpu_available or not session.setting_supported(name):
                         raise SessionError(f"saved variant setting unavailable: {name}")
             sql = pathlib.Path(payload["query"]).read_text().strip().rstrip(";")
-            statements = session.con.extract_statements(sql)
-            if (
-                len(statements) != 1
-                or str(statements[0].type).split(".")[-1] != "SELECT"
-            ):
+            if not single_select(sql):
                 raise ValueError("replay requires exactly one SELECT or WITH query")
             session.begin_query(sql)
             record = ev.evaluate(None, sql, 0, "replay", 0)

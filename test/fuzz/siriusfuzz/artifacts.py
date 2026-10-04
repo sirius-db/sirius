@@ -44,7 +44,7 @@ def command(argv: list[str], cwd: pathlib.Path = REPO_ROOT) -> str | None:
         return None
 
 
-def provenance(extension: str | None) -> dict[str, Any]:
+def provenance(shell: str | None, extension: str | None) -> dict[str, Any]:
     source = pathlib.Path(__file__).parent
     return {
         "schema_version": 1,
@@ -58,9 +58,14 @@ def provenance(extension: str | None) -> dict[str, Any]:
         },
         "python": {"executable": sys.executable, "version": sys.version},
         "platform": platform.platform(),
+        "shell": (
+            {"path": shell, **fingerprint(pathlib.Path(shell))}
+            if shell and pathlib.Path(shell).is_file()
+            else None
+        ),
         "extension": (
             {"path": extension, **fingerprint(pathlib.Path(extension))}
-            if extension
+            if extension and pathlib.Path(extension).is_file()
             else None
         ),
         "gpu": command(
@@ -83,25 +88,20 @@ def provenance(extension: str | None) -> dict[str, Any]:
 
 
 def runtime_info(session: Any) -> dict[str, Any]:
-    import duckdb
-    import _duckdb
-
+    rows = session.query(
+        "SELECT name, value FROM duckdb_settings() WHERE name IN "
+        "('threads', 'TimeZone', 'default_null_order', 'default_order', 'preserve_insertion_order', 'disabled_optimizers', "
+        "'expression_evaluator_strategy', 'hash_partition_bytes', 'max_build_hash_table_bytes', 'max_sort_partition_bytes')"
+    )
     return {
-        "duckdb_version": duckdb.__version__,
-        "duckdb_source_id": getattr(duckdb, "__git_revision__", None),
-        "duckdb_module": _duckdb.__file__,
-        "duckdb_binary": fingerprint(pathlib.Path(_duckdb.__file__)),
-        "metadata_mismatch_allowed": session.allow_metadata_mismatch,
-        "metadata_mismatch_bypassed": session.version_mismatch_bypassed,
+        "shell": session.shell_path,
+        "shell_binary": fingerprint(pathlib.Path(session.shell_path)),
+        "duckdb_version": session.duckdb_version,
+        "sirius": session.sirius,
+        "extension": session.extension,
         "sirius_config": session.sirius_config,
         "sirius_config_mode": session.sirius_config_mode,
-        "session_settings": dict(
-            session.con.execute(
-                "SELECT name, value FROM duckdb_settings() WHERE name IN "
-                "('threads', 'TimeZone', 'default_null_order', 'default_order', 'preserve_insertion_order', 'disabled_optimizers', "
-                "'expression_evaluator_strategy', 'hash_partition_bytes', 'max_build_hash_table_bytes', 'max_sort_partition_bytes')"
-            ).fetchall()
-        ),
+        "session_settings": {row["name"]: row["value"] for row in rows},
     }
 
 

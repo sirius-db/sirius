@@ -268,6 +268,7 @@ class Variants:
 
 @dataclass
 class Sirius:
+    shell: str = "build/release/duckdb"  # the DuckDB shell built with the extension
     extension: str = "build/release/extension/sirius/sirius.duckdb_extension"
     configs: list[str] = field(
         default_factory=lambda: ["test/cpp/integration/integration.yaml"]

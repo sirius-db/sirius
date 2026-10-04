@@ -6,14 +6,15 @@ import os
 import pathlib
 import signal
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import asdict
 from unittest.mock import patch
 
-from . import conftest_path  # noqa: F401
+from . import conftest_path
 from .test_evaluator import FakeSession, gpu_variant_wrong
-from siriusfuzz.artifacts import runtime_info, write_json
+from siriusfuzz.artifacts import write_json
 from siriusfuzz.cli import (
     _engine,
     build_parser,
@@ -29,9 +30,27 @@ from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOpti
 from siriusfuzz.session import (
     RunResult,
     Session,
-    SessionError,
     discover_sirius_yaml,
+    single_select,
 )
+
+SHELL = conftest_path.available_shell()
+
+
+class fake_shell:
+    """A shell path that exists but is never run, for CLI tests that patch the subprocess."""
+
+    def __init__(self, root):
+        self.path = root / "duckdb"
+        self.path.write_text("unit test; never run")
+        self.patcher = patch("siriusfuzz.cli.check_shell", return_value="fake")
+
+    def __enter__(self):
+        self.patcher.start()
+        return str(self.path)
+
+    def __exit__(self, *exc):
+        self.patcher.stop()
 
 
 def crash_child(payload, work):
@@ -85,12 +104,11 @@ class ToolTests(unittest.TestCase):
     def test_cpu_only_session_ignores_sirius_yaml(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ, {"SIRIUS_CONFIG_FILE": "ambient.yaml"}
-        ), patch("duckdb.connect"):
-            session = Session(None, None, pathlib.Path(tmp), 0)
-            session.open()
-            self.assertEqual(runtime_info(session)["sirius_config_mode"], "cpu_only")
+        ):
+            session = Session("duckdb", None, None, pathlib.Path(tmp), 0, cpu_only=True)
+            session._configure_sirius()
+            self.assertEqual(session.sirius_config_mode, "cpu_only")
             self.assertEqual(os.environ["SIRIUS_CONFIG_FILE"], "ambient.yaml")
-            session.close()
 
     def test_sirius_yaml_discovery_follows_sirius_and_is_recorded(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +124,7 @@ class ToolTests(unittest.TestCase):
             ):
                 with self.subTest(location=location), patch.dict(
                     os.environ, {"HOME": str(home)}
-                ), patch("pathlib.Path.cwd", return_value=cwd), patch("duckdb.connect"):
+                ), patch("pathlib.Path.cwd", return_value=cwd):
                     os.environ.pop("SIRIUS_CONFIG_FILE", None)
                     expected = {
                         "env": str(root / "ambient.yaml"),
@@ -119,19 +137,17 @@ class ToolTests(unittest.TestCase):
                     elif expected:
                         pathlib.Path(expected).write_text("# ambient\n")
                     self.assertEqual(discover_sirius_yaml(), (expected, source))
-                    session = Session("synthetic-extension", None, root / "db", 0)
-                    session.open()
-                    info = runtime_info(session)
+                    session = Session("duckdb", "synthetic-extension", None, root, 0)
+                    session._configure_sirius()
                     if expected:
                         self.assertEqual(
-                            info["sirius_config_mode"], f"ambient ({source})"
+                            session.sirius_config_mode, f"ambient ({source})"
                         )
-                        self.assertEqual(info["sirius_config"], expected)
+                        self.assertEqual(session.sirius_config, expected)
                         self.assertEqual(os.environ["SIRIUS_CONFIG_FILE"], expected)
                     else:
-                        self.assertEqual(info["sirius_config_mode"], "builtin_defaults")
+                        self.assertEqual(session.sirius_config_mode, "builtin_defaults")
                         self.assertNotIn("SIRIUS_CONFIG_FILE", os.environ)
-                    session.close()
                     if location in ("cwd", "home"):
                         pathlib.Path(expected).unlink()
             # An empty variable counts as unset; an explicit file wins over everything.
@@ -143,19 +159,20 @@ class ToolTests(unittest.TestCase):
             selected.write_text("# selected\n")
             with patch.dict(
                 os.environ, {"SIRIUS_CONFIG_FILE": str(root / "ambient.yaml")}
-            ), patch("duckdb.connect"):
-                session = Session("synthetic-extension", str(selected), root / "db", 0)
-                session.open()
-                self.assertEqual(
-                    runtime_info(session)["sirius_config_mode"], "explicit_yaml"
+            ):
+                session = Session(
+                    "duckdb", "synthetic-extension", str(selected), root, 0
                 )
+                session._configure_sirius()
+                self.assertEqual(session.sirius_config_mode, "explicit_yaml")
                 self.assertEqual(
                     os.environ["SIRIUS_CONFIG_FILE"], str(selected.resolve())
                 )
-                session.close()
 
     def test_engine_snapshots_the_ambient_yaml_when_the_configuration_names_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, fake_shell(
+            pathlib.Path(tmp)
+        ) as shell:
             root = pathlib.Path(tmp)
             extension = root / "sirius.duckdb_extension"
             extension.write_text("unit test; never loaded")
@@ -163,14 +180,29 @@ class ToolTests(unittest.TestCase):
             yaml.write_text("# ambient\n")
             cfg = load_config(None, ["sirius.configs=[]"])
             args = argparse.Namespace(
-                cpu_only=False, extension=str(extension), sirius_config=None
+                cpu_only=False,
+                shell=shell,
+                extension=str(extension),
+                sirius_config=None,
             )
             with patch.dict(os.environ, {"SIRIUS_CONFIG_FILE": str(yaml)}):
-                self.assertEqual(_engine(args, cfg), (str(extension), [str(yaml)]))
+                engine = _engine(args, cfg)
+                self.assertEqual(
+                    (engine.shell, engine.extension), (shell, str(extension))
+                )
+                self.assertEqual(engine.configs, [str(yaml)])
             with patch.dict(
                 os.environ, {"SIRIUS_CONFIG_FILE": "", "HOME": str(root)}
             ), patch("pathlib.Path.cwd", return_value=root):
-                self.assertEqual(_engine(args, cfg), (str(extension), []))
+                self.assertEqual(_engine(args, cfg).configs, [])
+            args.cpu_only = True
+            self.assertEqual(_engine(args, cfg).extension, None)
+
+    def test_single_select_accepts_one_query_with_comments(self):
+        self.assertTrue(single_select("-- note\nSELECT 'a;b' FROM t; "))
+        self.assertTrue(single_select("WITH c AS (SELECT 1) /* x; */ SELECT * FROM c"))
+        self.assertFalse(single_select("SELECT 1; SELECT 2"))
+        self.assertFalse(single_select("CREATE TABLE t(k INT)"))
 
     def test_selftest_bounds_default_data_and_preserves_explicit_overrides(self):
         defaults = build_parser().parse_args(["selftest", "--queries", "100"])
@@ -289,6 +321,7 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(summary["counts"]["mismatch"], 1)
             self.assertTrue((pathlib.Path(tmp) / "summary.json").is_file())
 
+    @unittest.skipUnless(SHELL, "no DuckDB shell available")
     def test_replay_accepts_decimal_lists_and_arrays(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -305,17 +338,20 @@ class ToolTests(unittest.TestCase):
             outcome = supervise(
                 {
                     "operation": "replay",
+                    "shell": SHELL,
+                    "cpu_only": True,
                     "query": str(root / "query.sql"),
                     "dataset": str(root / "dataset.sql"),
                     "config": str(root / "config.toml"),
                 },
                 root,
-                30,
+                60,
             )
             self.assertEqual(outcome["status"], "ok", outcome)
             self.assertEqual(outcome["record"]["verdict"], "ok")
             self.assertEqual(outcome["record"]["evidence"]["cpu"]["row_count"], 1)
 
+    @unittest.skipUnless(SHELL, "no DuckDB shell available")
     def test_replay_parses_comments_and_quoted_semicolons(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -329,13 +365,15 @@ class ToolTests(unittest.TestCase):
             outcome = supervise(
                 {
                     "operation": "replay",
+                    "shell": SHELL,
+                    "cpu_only": True,
                     "query": str(root / "query.sql"),
                     "dataset": str(root / "dataset.sql"),
                     "config": str(root / "config.toml"),
                     "comparison": "ordered",
                 },
                 root,
-                30,
+                60,
             )
             self.assertEqual(outcome["status"], "ok", outcome)
             self.assertEqual(outcome["record"]["verdict"], "ok")
@@ -401,13 +439,20 @@ class ToolTests(unittest.TestCase):
                 },
             )
             before = {p.name: p.read_bytes() for p in bundle.iterdir()}
-            args = build_parser().parse_args(
-                ["replay", str(bundle), "--out", str(root / "out")]
-            )
-            with patch(
+            with fake_shell(root) as shell, patch(
                 "siriusfuzz.cli.supervise",
                 return_value={"status": "ok", "record": {"verdict": "ok"}},
             ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
+                args = build_parser().parse_args(
+                    [
+                        "replay",
+                        str(bundle),
+                        "--shell",
+                        shell,
+                        "--out",
+                        str(root / "out"),
+                    ]
+                )
                 self.assertEqual(cmd_replay(args), 0)
             payload = probe.call_args.args[0]
             self.assertEqual(payload["variant"], {"hash_partition_bytes": 123})
@@ -464,11 +509,11 @@ class ToolTests(unittest.TestCase):
                 if override:
                     yaml.write_text("# synthetic config\n")
                     options += ["--sirius-config", str(yaml)]
-                args = build_parser().parse_args(options)
-                with patch(
+                with fake_shell(root) as shell, patch(
                     "siriusfuzz.cli.supervise",
                     return_value={"status": "ok", "record": {"verdict": "ok"}},
                 ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
+                    args = build_parser().parse_args(options + ["--shell", shell])
                     if required is not False and not override:
                         with self.assertRaisesRegex(
                             ValueError, "missing saved Sirius YAML"
@@ -529,37 +574,41 @@ class ToolTests(unittest.TestCase):
                     },
                 ]
             )
-            args = build_parser().parse_args(
-                ["recheck", str(run), "--cpu-only", "--out", str(root / "out")]
-            )
-            with patch(
-                "siriusfuzz.cli.supervise", side_effect=lambda *a, **k: next(outcomes)
-            ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
-                self.assertEqual(cmd_recheck(args), 1)
-            self.assertEqual(probe.call_count, 2)
-            # reduced.sql is what gets replayed, each bundle on its own copy of args.
-            for call in probe.call_args_list:
-                payload = call.args[0]
-                self.assertEqual(
-                    pathlib.Path(payload["query"]).read_text(),
-                    "SELECT k FROM t WHERE k = 1;",
+            with fake_shell(root) as shell:
+                args = build_parser().parse_args(
+                    ["recheck", str(run), "--cpu-only", "--shell", shell]
+                    + ["--out", str(root / "out")]
                 )
-            report = json.loads(
-                next((root / "out").glob("run-*/recheck.json")).read_text()
-            )
-            self.assertEqual(report["cleared"], 1)
-            self.assertEqual(
-                [(r["recorded"], r["now"]) for r in report["findings"]],
-                [("mismatch", "ok"), ("gpu_error", "gpu_error")],
-            )
-            with patch(
-                "siriusfuzz.cli.supervise",
-                return_value={
-                    "status": "ok",
-                    "record": {"verdict": "ok", "reason": ""},
-                },
-            ), patch("siriusfuzz.cli.provenance", return_value={}):
-                self.assertEqual(cmd_recheck(args), 0)
+                with patch(
+                    "siriusfuzz.cli.supervise",
+                    side_effect=lambda *a, **k: next(outcomes),
+                ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
+                    self.assertEqual(cmd_recheck(args), 1)
+                self.assertEqual(probe.call_count, 2)
+                # reduced.sql is what gets replayed, each bundle on its own copy of args.
+                for call in probe.call_args_list:
+                    payload = call.args[0]
+                    self.assertEqual(
+                        pathlib.Path(payload["query"]).read_text(),
+                        "SELECT k FROM t WHERE k = 1;",
+                    )
+                    self.assertEqual(payload["shell"], shell)
+                report = json.loads(
+                    next((root / "out").glob("run-*/recheck.json")).read_text()
+                )
+                self.assertEqual(report["cleared"], 1)
+                self.assertEqual(
+                    [(r["recorded"], r["now"]) for r in report["findings"]],
+                    [("mismatch", "ok"), ("gpu_error", "gpu_error")],
+                )
+                with patch(
+                    "siriusfuzz.cli.supervise",
+                    return_value={
+                        "status": "ok",
+                        "record": {"verdict": "ok", "reason": ""},
+                    },
+                ), patch("siriusfuzz.cli.provenance", return_value={}):
+                    self.assertEqual(cmd_recheck(args), 0)
 
     def test_forced_variant_ignores_random_variant_budget(self):
         cfg = load_config(
@@ -574,25 +623,73 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(record.variant, ev.forced_variant)
         self.assertEqual(session.settings, {})
 
-    def test_metadata_override_is_explicit(self):
-        class Connection:
-            calls = []
-
-            def execute(self, sql):
-                self.calls.append(sql)
-                if len(self.calls) == 1:
-                    raise RuntimeError("built specifically for DuckDB version abc")
-
-        s = Session("extension", None, pathlib.Path("unused"), 0)
-        s.con = Connection()
-        with self.assertRaises(SessionError):
-            s._load_extension()
-        self.assertEqual(len(s.con.calls), 1)
-
     def test_invalid_limits(self):
         for value in (0, -1, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
                 validate_limits(argparse.Namespace(timeout=value))
+
+
+@unittest.skipUnless(SHELL, "no DuckDB shell available")
+class ShellTests(unittest.TestCase):
+    def test_statements_results_errors_restarts_and_crashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            session = Session(SHELL, None, None, root / "db", 0, cpu_only=True)
+            session.open()
+            try:
+                ok = session.run(
+                    "SELECT 1 AS a, NULL AS b, 'x' AS c, 1.5::DOUBLE AS d, 2.5::DECIMAL(10,2) AS e",
+                    gpu=False,
+                    timeout=60,
+                )
+                self.assertEqual(ok.status, "ok", ok.error)
+                self.assertEqual([c.name for c in ok.result.columns], list("abcde"))
+                self.assertEqual(ok.result.rows, [(1, None, "x", 1.5, "2.50")])
+                empty = session.run("SELECT 1 AS a WHERE false", gpu=False, timeout=60)
+                self.assertEqual((empty.status, empty.result.rows), ("ok", []))
+                described = session.describe("SELECT 1 AS a WHERE false")
+                self.assertEqual(
+                    [(c.name, c.type.name) for c in described], [("a", "INTEGER")]
+                )
+                dup = session.run("SELECT 1 AS k, 2 AS k", gpu=False, timeout=60)
+                self.assertEqual(dup.result.rows, [(1, 2)])
+                err = session.run("SELECT nope", gpu=False, timeout=60)
+                self.assertEqual(err.status, "error")
+                self.assertIn("Binder Error", err.error)
+                data = root / "d.duckdb"
+                session.execute(f"ATTACH '{data}' AS d")
+                session.attached["d"] = data
+                session.use("d")
+                session.execute(
+                    "CREATE TABLE t(k INT); INSERT INTO t VALUES (1), (2); CHECKPOINT"
+                )
+                self.assertEqual(session.scalar("SELECT count(*) FROM t"), 2)
+                # A statement that overruns its timeout costs the shell; the next
+                # statement gets a fresh one with the datasets re-attached.
+                slow = session.run(
+                    "SELECT count(*) FROM range(100000000000)", gpu=False, timeout=0.5
+                )
+                self.assertEqual(slow.status, "timeout")
+                self.assertFalse(session.shell.alive)
+                again = session.run(
+                    "SELECT count(*) AS n FROM t", gpu=False, timeout=60
+                )
+                self.assertEqual((again.status, again.result.rows), ("ok", [(2,)]))
+                self.assertEqual(session.restarts, 1)
+                # A process that dies mid-statement is a crash with its exit status.
+                threading.Timer(
+                    0.3, session.shell.proc.send_signal, args=(signal.SIGSEGV,)
+                ).start()
+                dead = session.run(
+                    "SELECT count(*) FROM range(100000000000)", gpu=False, timeout=60
+                )
+                self.assertEqual(dead.status, "crash")
+                self.assertEqual(dead.exitcode, -signal.SIGSEGV)
+                self.assertEqual(session.scalar("SELECT 1"), 1)
+                self.assertEqual(session.restarts, 2)
+            finally:
+                session.close()
+            self.assertFalse(session.shell.alive)
 
 
 if __name__ == "__main__":

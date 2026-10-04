@@ -140,7 +140,7 @@ class CrashReasonTests(unittest.TestCase):
     def test_no_backtrace(self):
         from siriusfuzz.runner import extract_crash_reason
 
-        self.assertEqual(extract_crash_reason("", -9), "worker exited with code -9")
+        self.assertEqual(extract_crash_reason("", -9), "process exited with code -9")
 
 
 class NormalizeUnsupportedTests(unittest.TestCase):

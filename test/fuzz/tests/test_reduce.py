@@ -1,37 +1,40 @@
+import pathlib
 import random
+import tempfile
 import unittest
 
-from . import conftest_path  # noqa: F401
+from . import conftest_path
 from siriusfuzz.config import load_config
 from siriusfuzz.query_gen import QueryGenerator
 from siriusfuzz.reduce import candidates, reduce_query
 from siriusfuzz.schema_gen import DataGenerator
+from siriusfuzz.session import Session
 from siriusfuzz.sqlast import Select, walk_with_parents
 
-try:
-    import duckdb
-except ImportError:  # pragma: no cover
-    duckdb = None
+SHELL = conftest_path.available_shell()
 
 
-@unittest.skipIf(duckdb is None, "duckdb module not importable")
+@unittest.skipUnless(SHELL, "no DuckDB shell available")
 class ReduceTests(unittest.TestCase):
     def setUp(self):
         self.cfg = load_config(None, ["data.rows=[20,60]"])
         rng = random.Random(3)
         dg = DataGenerator(self.cfg, rng)
         self.ds = dg.generate(3)
-        self.con = duckdb.connect()
-        self.con.execute(self.ds.schema_sql())
-        self.con.execute(self.ds.data_sql())
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session = Session(
+            SHELL, None, None, pathlib.Path(self.tmp.name) / "db", 0, cpu_only=True
+        )
+        self.session.open()
+        self.session.load_dataset(self.ds, "fz")
         self.qg = QueryGenerator(self.cfg, self.ds, random.Random(99), dg)
 
+    def tearDown(self):
+        self.session.close()
+        self.tmp.cleanup()
+
     def _valid(self, sql):
-        try:
-            self.con.execute(sql).fetchall()
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return self.session.run(sql, gpu=False, timeout=120).status == "ok"
 
     def test_candidates_are_strictly_smaller_or_different(self):
         q = self.qg.generate()

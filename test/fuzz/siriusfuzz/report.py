@@ -239,9 +239,6 @@ class Report:
                 "execution": {
                     "cpu_only": context.get("cpu_only"),
                     "sirius_config_required": bool(yaml),
-                    "allow_metadata_mismatch": context.get(
-                        "allow_metadata_mismatch", False
-                    ),
                 },
                 "environment": self._environment_json(),
                 "runtime": self._runtime_json(context.get("runtime")),
@@ -316,7 +313,7 @@ class Report:
             "## Replay",
             "",
             "```sh",
-            f"pixi run -e duckdb-python fuzz replay {d.resolve()}",
+            f"pixi run fuzz replay {d.resolve()}",
             "```",
             "",
             "Replay restores config.toml, sirius.yaml and the recorded setting variant, writes a new",

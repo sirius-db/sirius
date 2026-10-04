@@ -11,26 +11,26 @@ Read the checkout's `AGENTS.md` and the [fuzzer guide](../../../test/fuzz/README
 
 ## Pick the environment
 
-Fuzzing needs a compatible Linux GPU host with the intended source built there (`pixi run make`
-and `pixi run -e duckdb-python build-duckdb-python` from matching sources). Prefer the host the
-user names; otherwise an accessible development GPU with the least setup. Inspect `nvidia-smi`,
-active workloads, Pixi availability and checkout state; a remote connection alone does not
-establish GPU availability. If no compatible GPU is accessible, report execution as blocked with
-the missing prerequisite. Do not substitute CPU `selftest` or the unit tests unless they were
-explicitly requested; they prove nothing about the GPU. Preserve working changes and existing
-workloads; use a separate worktree for an isolated revision.
+Fuzzing needs a compatible Linux GPU host with the intended source built there (`pixi run make`,
+which produces the `build/release/duckdb` shell the fuzzer drives; no Python module is needed).
+Prefer the host the user names; otherwise an accessible development GPU with the least setup.
+Inspect `nvidia-smi`, active workloads, Pixi availability and checkout state; a remote connection
+alone does not establish GPU availability. If no compatible GPU is accessible, report execution
+as blocked with the missing prerequisite. Do not substitute CPU `selftest` or the unit tests
+unless they were explicitly requested; they prove nothing about the GPU. Preserve working
+changes and existing workloads; use a separate worktree for an isolated revision.
 
 ## Run
 
-Use absolute paths for the extension, YAML and output root so the recorded command is
-unambiguous on a remote host. `run` performs the doctor's readiness checks first and stops on
+Use absolute paths for the shell, YAML and output root so the recorded command is unambiguous
+on a remote host. `run` performs the doctor's readiness checks first and stops on
 failure; `fuzz doctor` on its own is where to look when setup is in doubt.
 
 ```bash
-pixi run -e duckdb-python fuzz run --seed 42 --queries 100 --duration 3m \
+pixi run fuzz run --seed 42 --queries 100 --duration 3m \
   --no-reduce --max-respawns 0 --out "$out/campaign"          # default: a short readiness sample
-pixi run -e duckdb-python fuzz run --mode gaps --duration 30m --out "$out/gaps"
-pixi run -e duckdb-python fuzz recheck "$run_dir" --extension "$extension"   # after a fix
+pixi run fuzz run --mode gaps --duration 30m --out "$out/gaps"
+pixi run fuzz recheck "$run_dir" --shell "$shell"            # after a fix
 ```
 
 Respect a supplied budget rather than adding these defaults to it. For a request to find

@@ -134,6 +134,7 @@ max_build_hash_table_bytes = [1048576, 90000000]
 max_sort_partition_bytes = [0, 1048576]
 
 [sirius]
-extension = "build/release/extension/sirius/sirius.duckdb_extension"
+shell = "build/release/duckdb"      # the DuckDB shell `pixi run make` builds, with Sirius built in
+extension = "build/release/extension/sirius/sirius.duckdb_extension"   # LOADed only when the shell lacks Sirius
 configs = ["test/cpp/integration/integration.yaml"]
 dataset_queries = 200
