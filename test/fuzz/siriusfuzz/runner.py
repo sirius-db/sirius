@@ -29,6 +29,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
@@ -541,12 +542,17 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     )
                     return
             qgen = QueryGenerator(cfg, ds, random.Random(ds_seed * 31 + 7), data_gen)
+            reported_stats: Counter[str] = Counter()
             for i in range(cfg.sirius.dataset_queries):
                 if stop.is_set() or (args.deadline and time.time() >= args.deadline):
                     break
                 if args.max_queries is not None and done_queries >= args.max_queries:
                     break
                 query = qgen.generate()
+                new_stats = qgen.stats - reported_stats
+                if new_stats:
+                    send({"type": "stats", "stats": dict(new_stats)})
+                    reported_stats = qgen.stats.copy()
                 sql = query.sql()
                 send(
                     {
@@ -577,7 +583,6 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
                     return
                 send({"type": "idle"})
                 done_queries += 1
-            send({"type": "stats", "stats": dict(qgen.stats)})
             session.drop_dataset(alias)
             if evaluator.perm_alias:
                 session.drop_dataset(evaluator.perm_alias)

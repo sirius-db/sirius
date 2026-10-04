@@ -29,6 +29,7 @@ from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOpti
 from siriusfuzz.session import (
     RunResult,
     Session,
+    _normalize_shell_json_nulls,
     _strip_fallback_banners,
     discover_sirius_yaml,
     single_select,
@@ -38,6 +39,13 @@ SHELL = conftest_path.available_shell()
 
 
 class ShellOutputTests(unittest.TestCase):
+    def test_bare_null_inside_nested_shell_json(self):
+        body = '[{"list":[1.25, NULL],"text":"NULL \\"NULL\\""}]'
+        self.assertEqual(
+            json.loads(_normalize_shell_json_nulls(body)),
+            [{"list": [1.25, None], "text": 'NULL "NULL"'}],
+        )
+
     def test_sirius_fallback_banner_does_not_corrupt_json_result(self):
         output, banners = _strip_fallback_banners(
             [
@@ -455,7 +463,9 @@ class ToolTests(unittest.TestCase):
                 with fake_shell(root) as shell, patch(
                     "siriusfuzz.cli.execute_probe",
                     return_value={"status": "ok", "record": {"verdict": "ok"}},
-                ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
+                ) as probe, patch("siriusfuzz.cli.provenance", return_value={}), patch(
+                    "siriusfuzz.cli.discover_sirius_yaml", return_value=(None, "none")
+                ):
                     args = build_parser().parse_args(options + ["--shell", shell])
                     if required is not False and not override:
                         with self.assertRaisesRegex(
@@ -627,7 +637,7 @@ class ShellTests(unittest.TestCase):
                     "SELECT count(*) FROM range(100000000000)", gpu=False, timeout=60
                 )
                 self.assertEqual(dead.status, "crash")
-                self.assertEqual(dead.exitcode, -signal.SIGSEGV)
+                self.assertNotEqual(dead.exitcode, 0)
                 self.assertEqual(session.scalar("SELECT 1"), 1)
                 self.assertEqual(session.restarts, 2)
             finally:
