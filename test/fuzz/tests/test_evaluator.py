@@ -677,6 +677,43 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(seen["opts"].max_queries, 5)
             self.assertIsNone(seen["opts"].duration)
 
+    def test_known_gaps_stay_in_their_fallback_table(self):
+        known = [
+            KnownIssue(
+                "Distinct aggregates not supported in GPU path",
+                "sirius-db/sirius#1218",
+                verdicts=["runtime_fallback"],
+                sql_pattern="count\\(DISTINCT",
+            ),
+            KnownIssue(".", "sirius-db/sirius#9999", verdicts=["mismatch"]),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Report(pathlib.Path(tmp), load_config(None), known, 0, mode="gaps")
+            tagged, _ = evaluate(
+                gpu_count_distinct_error, sql="SELECT count(DISTINCT c1) FROM t"
+            )
+            tagged.labels = ["Agg(count,distinct)", "Select"]
+            untagged, _ = evaluate(gpu_count_distinct_error, sql="SELECT 1 AS c0")
+            untagged.labels = ["Select"]
+            wrong, _ = evaluate(gpu_wrong, sql="SELECT c1 FROM t")
+            for rec in (tagged, untagged, wrong):
+                report.add(rec)
+            self.assertEqual(tagged.verdict, Verdict.KNOWN_ISSUE.value)
+            self.assertEqual(untagged.verdict, Verdict.RUNTIME_FALLBACK.value)
+            self.assertEqual(wrong.verdict, Verdict.KNOWN_ISSUE.value)
+            summary = report.finish()
+            runtime = summary["gaps"]["runtime"]
+            self.assertEqual(len(runtime), 1)
+            self.assertEqual(runtime[0]["count"], 2)
+            self.assertEqual(runtime[0]["issues"], ["sirius-db/sirius#1218"])
+            text = report.render_summary(summary)
+            self.assertIn("known: sirius-db/sirius#1218", text)
+            # In the table once; not repeated under findings.
+            self.assertEqual(text.count("Distinct aggregates not supported"), 1)
+            self.assertIn("findings (1 unique):", text)
+            self.assertIn("[known_issue]", text)
+            self.assertIn("sirius-db/sirius#9999: ", text)
+
     def test_summary_groups_gaps_by_their_reduced_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Report(pathlib.Path(tmp), load_config(None), [], 0, mode="gaps")

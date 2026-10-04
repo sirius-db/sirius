@@ -266,10 +266,12 @@ query that fails for any other reason is still reported. Where each outcome ends
 | any other GPU error | `gpu_error`, `gpu_internal_error`, `gpu_oom` | `findings`, reduced as in a correctness run | fails |
 | the GPU run hung, or the worker died | `timeout`, `crash` | `findings` | fails |
 | the query failed on the CPU | `cpu_error`, `cpu_timeout` | skipped and counted; the top reasons are listed | ignored |
-| matches `known_issues.toml` | `known_issue` | `findings`, with the issue link | ignored |
+| matches `known_issues.toml` | `known_issue` | a known gap stays in its fallback table, tagged `known: <issue>`; anything else under `findings` with the issue link | ignored |
 
 So a bug that only shows up once window functions or `EXCEPT` are generated is not lost: it sits
 in the `findings` section of the same summary with its own replayable bundle, below the gaps.
+And a runtime fallback you have already filed stays in the runtime table with its issue, so the
+table remains the complete list of what still falls back.
 
 The line between a gap and an error is the message. A runtime error counts as a gap only when it
 says *not supported*, *unsupported* or *not implemented*; any other GPU error would also fall back

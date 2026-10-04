@@ -172,9 +172,12 @@ class Report:
     def add(self, rec: QueryRecord) -> str | None:
         """Record a query; returns the finding directory name when a new finding was written."""
         self.queries += 1
-        verdict = Verdict(rec.verdict)
+        observed = verdict = Verdict(rec.verdict)
+        reason = rec.reason
+        issue = None
         for ki in self.known:
             if verdict.is_finding() and ki.matches(rec):
+                issue = ki.issue
                 rec.reason = f"{ki.issue}: {rec.reason}"
                 rec.verdict = Verdict.KNOWN_ISSUE.value
                 verdict = Verdict.KNOWN_ISSUE
@@ -201,7 +204,9 @@ class Report:
             "name": name,
             "count": 1,
             "verdict": rec.verdict,
-            "reason": rec.reason,
+            "observed": observed.value,  # the verdict before a known issue claimed it
+            "issue": issue,
+            "reason": reason,
             "worker": rec.worker,
             "sql": rec.sql,
             "labels": rec.labels,
@@ -354,14 +359,16 @@ class Report:
         rejection to the function Sirius cannot translate, so findings that
         started from different expressions around the same function share a
         group. A group shows the smallest reduced query it has, or an original
-        query when nothing in it was reduced.
+        query when nothing in it was reduced. A gap that matched known_issues.toml
+        stays in its table, tagged with the issue, so the list is complete after
+        the issue is filed.
         """
         groups: dict[str, dict[str, dict[str, Any]]] = {"runtime": {}, "plan": {}}
         for f in findings:
-            verdict = Verdict(f["verdict"])
-            if not verdict.is_gap():
+            observed = Verdict(f.get("observed", f["verdict"]))
+            if not observed.is_gap():
                 continue
-            kind = "runtime" if verdict == Verdict.RUNTIME_FALLBACK else "plan"
+            kind = "runtime" if observed == Verdict.RUNTIME_FALLBACK else "plan"
             reduced = f["reduced_sql"] is not None
             reason = f["reduced_reason"] or f["reason"]
             sql = f["reduced_sql"] or f["sql"]
@@ -370,7 +377,7 @@ class Report:
             group = groups[kind].setdefault(
                 key,
                 {
-                    "verdict": f["verdict"],
+                    "verdict": observed.value,
                     "key": key,
                     "reason": reason,
                     "count": 0,
@@ -379,11 +386,14 @@ class Report:
                     "labels": labels,
                     "reduced": reduced,
                     "findings": [],
+                    "issues": [],
                 },
             )
             group["count"] += f["count"]
             group["gpu_seconds"] += f.get("gpu_seconds", 0.0)
             group["findings"].append(f["name"])
+            if f.get("issue") and f["issue"] not in group["issues"]:
+                group["issues"].append(f["issue"])
             if (reduced, -len(sql)) > (group["reduced"], -len(group["sql"])):
                 group.update(reason=reason, sql=sql, labels=labels, reduced=reduced)
         return {
@@ -458,6 +468,9 @@ class Report:
         def reasons(groups: list[dict[str, Any]]) -> str:
             return f"{len(groups)} reason" + ("" if len(groups) == 1 else "s")
 
+        def known(g: dict[str, Any]) -> str:
+            return f"   known: {', '.join(g['issues'])}" if g.get("issues") else ""
+
         if runtime:
             seconds = sum(g["gpu_seconds"] for g in runtime)
             lines.append("")
@@ -470,6 +483,7 @@ class Report:
             for g in runtime:
                 lines.append(
                     f"  x{g['count']:<4d} {g['gpu_seconds']:6.1f}s  {g['reason'][:110]}"
+                    + known(g)
                 )
                 lines.append(f"      {' '.join(g['sql'].split())[:220]}")
                 lines.append(f"      features: {', '.join(g['labels'])}   {names(g)}")
@@ -481,18 +495,24 @@ class Report:
             )
             for g in plan:
                 shown = g["reason"] if g["reduced"] else g["key"]
-                lines.append(f"  x{g['count']:<4d} {shown[:110]}   {names(g)}")
+                lines.append(
+                    f"  x{g['count']:<4d} {shown[:110]}{known(g)}   {names(g)}"
+                )
                 if g["reduced"]:
                     lines.append(f"      {' '.join(g['sql'].split())[:220]}")
                     lines.append(f"      features: {', '.join(g['labels'])}")
+        # Gaps, known or not, are in the tables above; everything else is listed here.
         findings = [
-            f for f in summary["findings"] if not Verdict(f["verdict"]).is_gap()
+            f
+            for f in summary["findings"]
+            if not Verdict(f.get("observed", f["verdict"])).is_gap()
         ]
         lines.append("")
         lines.append(f"findings ({len(findings)} unique):")
         for f in findings:
+            reason = f"{f['issue']}: {f['reason']}" if f.get("issue") else f["reason"]
             lines.append(
-                f"  [{f['verdict']}] x{f['count']:<4d} {f['name']}  {f['reason'][:100]}"
+                f"  [{f['verdict']}] x{f['count']:<4d} {f['name']}  {reason[:100]}"
             )
         if summary["cpu_error_reasons"]:
             lines.append("")
