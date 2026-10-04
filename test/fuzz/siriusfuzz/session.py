@@ -2,7 +2,16 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 # See the LICENSE file at the repo root for the full text.
-"""One DuckDB connection with Sirius loaded, in strict mode.
+"""One DuckDB shell process per session, driven over pipes.
+
+The shell is the one built next to the Sirius extension (``build/release/duckdb``),
+so nothing has to be built besides Sirius and no version metadata can disagree.
+Every statement is followed by two sentinels, one per stream, so a result (JSON
+on stdout) and its error text (stderr) are delimited exactly. A query that
+overruns its timeout gets the shell killed and restarted, because the shell
+exits on SIGINT when stdin is a pipe; a GPU fault takes the shell down the same
+way and is reported as a crash. The next statement starts a fresh shell and
+re-attaches the datasets, which are files on disk.
 
 Generated tables live in an ATTACHed file-backed database (in-memory tables
 never reach the GPU native scan) and are CHECKPOINTed so the scan sees them on
@@ -12,23 +21,81 @@ runtime fallbacks surface as errors instead of silent CPU runs.
 
 from __future__ import annotations
 
+import collections
+import json
 import os
 import pathlib
+import queue
+import re
+import shutil
+import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import sqltypes as st
 from .artifacts import sql_literal, write_json
 from .compare import ColumnInfo, ResultSet
+from .config import REPO_ROOT
 from .schema_gen import Dataset
 
 CANARY_SETTING = "sirius_test_inject_transparent_gpu_error"
+SHELL_ENV = "SIRIUSFUZZ_SHELL"
+UNKNOWN_TYPE = st.SqlType("UNKNOWN", "varchar")  # until DESCRIBE supplies the real one
+_SENTINEL = "siriusfuzz"
+_ERROR_LINE = re.compile(r"^[A-Za-z ]+ Error: ")
 
 
 class SessionError(RuntimeError):
     pass
+
+
+# --------------------------------------------------------------------------
+# locating the shell
+# --------------------------------------------------------------------------
+
+
+def find_shell(explicit: str | None, configured: str | None) -> str:
+    """The DuckDB shell to drive: ``--shell``, then ``$SIRIUSFUZZ_SHELL``, then the
+    configured repository-relative path, then ``duckdb`` on PATH."""
+    tried = []
+    for source, candidate in (
+        ("--shell", explicit),
+        (SHELL_ENV, os.environ.get(SHELL_ENV)),
+        ("sirius.shell", configured),
+    ):
+        if not candidate:
+            continue
+        path = pathlib.Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        if path.is_file():
+            return str(path)
+        tried.append(f"{source}={path}")
+    on_path = shutil.which("duckdb")
+    if on_path:
+        return on_path
+    raise SessionError(
+        "no DuckDB shell found (tried " + ", ".join(tried) + " and PATH); "
+        "build Sirius with pixi run make, which produces build/release/duckdb, "
+        "or pass --shell"
+    )
+
+
+def check_shell(shell: str) -> str:
+    """The shell's version string; raises with the fix when it cannot run."""
+    try:
+        out = subprocess.run(
+            [shell, "--version"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SessionError(f"cannot run the DuckDB shell {shell}: {exc}") from exc
+    if out.returncode != 0:
+        raise SessionError(
+            f"{shell} --version failed (exit {out.returncode}): {out.stderr.strip()}"
+        )
+    return out.stdout.strip()
 
 
 def discover_sirius_yaml() -> tuple[str | None, str]:
@@ -51,59 +118,290 @@ def discover_sirius_yaml() -> tuple[str | None, str]:
     return None, "none"
 
 
+def single_select(sql: str) -> bool:
+    """Whether ``sql`` is exactly one SELECT/WITH/FROM statement (comments allowed)."""
+    text = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    text = re.sub(r"--[^\n]*", " ", text).strip().rstrip(";").strip()
+    if not re.match(r"(?is)^(select|with|from)\b", text):
+        return False
+    quote = ""
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == ";":
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# the shell process
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ShellResult:
+    status: str  # ok | error | timeout | crash
+    columns: list[str] = field(default_factory=list)
+    rows: list[tuple[Any, ...]] = field(default_factory=list)
+    error: str = ""  # DuckDB's error text, or the stderr tail after a crash
+    log: str = ""  # other stderr lines printed during the statement
+    elapsed: float = 0.0
+    exitcode: int | None = None
+
+
+class Shell:
+    """A DuckDB shell in batch JSON mode, one statement at a time."""
+
+    def __init__(self, binary: str, log_path: pathlib.Path | None = None):
+        self.binary = binary
+        self.log_path = log_path
+        self.proc: subprocess.Popen | None = None
+        self.events: queue.Queue = queue.Queue()
+        self.counter = 0
+        self.tail: collections.deque[str] = collections.deque(maxlen=400)
+        self.exitcode: int | None = None
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self) -> None:
+        self.events = queue.Queue()
+        self.tail.clear()
+        self.exitcode = None
+        try:
+            self.proc = subprocess.Popen(
+                [self.binary, "-batch", "-json", "-unsigned"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except OSError as exc:
+            raise SessionError(f"cannot start the DuckDB shell {self.binary}: {exc}")
+        for stream, name in ((self.proc.stdout, "out"), (self.proc.stderr, "err")):
+            threading.Thread(
+                target=self._pump, args=(stream, name, self.events), daemon=True
+            ).start()
+        # Startup chatter (an extension banner, driver messages) belongs to no statement.
+        first = self.execute("SELECT 1", timeout=300)
+        if first.status != "ok":
+            raise SessionError(
+                f"the DuckDB shell {self.binary} did not start: "
+                f"{first.error or first.log or first.status}"
+            )
+
+    def _pump(self, stream: Any, name: str, events: queue.Queue) -> None:
+        log = None
+        if self.log_path and name == "err":
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            log = open(self.log_path, "a", encoding="utf-8")
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", "replace")
+                if log:
+                    log.write(line)
+                    log.flush()
+                events.put((name, line))
+        finally:
+            if log:
+                log.close()
+            events.put((name, None))
+
+    def execute(self, sql: str, timeout: float) -> ShellResult:
+        if not self.alive:
+            return ShellResult(
+                "crash", error="shell is not running", exitcode=self.exitcode
+            )
+        assert self.proc is not None
+        self.counter += 1
+        tag = f"{_SENTINEL}-{self.counter}"
+        text = (
+            f"{sql.rstrip().rstrip(';')}\n;\n"
+            f"SELECT error('{tag}-stderr');\n"
+            f"SELECT '{tag}' AS {_SENTINEL};\n"
+        )
+        start = time.monotonic()
+        try:
+            self.proc.stdin.write(text.encode())  # type: ignore[union-attr]
+            self.proc.stdin.flush()  # type: ignore[union-attr]
+        except (BrokenPipeError, OSError):
+            return self._died(start, [])
+        out: list[str] = []
+        err: list[str] = []
+        got_out = got_err = False
+        deadline = start + timeout if timeout > 0 else None
+        killed = False
+        while not (got_out and got_err):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                if killed:
+                    break
+                # The shell leaves its input loop on SIGINT when stdin is a pipe, so
+                # interrupting would end it anyway; kill, and let the next statement
+                # start a fresh one.
+                self.kill()
+                killed = True
+                deadline = time.monotonic() + 5
+                continue
+            try:
+                name, line = self.events.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if line is None:
+                if killed:
+                    break
+                return self._died(start, err)
+            if name == "out":
+                if line.strip() == f'[{{"{_SENTINEL}":"{tag}"}}]':
+                    got_out = True
+                else:
+                    out.append(line)
+            else:
+                self.tail.append(line)
+                if f"{tag}-stderr" in line:
+                    got_err = True
+                else:
+                    err.append(line)
+        elapsed = time.monotonic() - start
+        if killed:
+            self.exitcode = self.proc.poll()
+            return ShellResult(
+                "timeout",
+                error="killed after exceeding the timeout",
+                log="".join(err),
+                elapsed=elapsed,
+                exitcode=self.exitcode,
+            )
+        error, log = _split_stderr(err)
+        body = "".join(out).strip()
+        if body:
+            try:
+                parsed = json.loads(body, object_pairs_hook=lambda pairs: pairs)
+            except ValueError as exc:
+                return ShellResult(
+                    "error", error=f"unreadable shell output: {exc}", log=body[:500]
+                )
+            columns = [key for key, _ in parsed[0]] if parsed else []
+            rows = [tuple(value for _, value in pairs) for pairs in parsed]
+            return ShellResult("ok", columns, rows, error, log, elapsed)
+        if error:
+            return ShellResult("error", error=error, log=log, elapsed=elapsed)
+        return ShellResult("ok", [], [], "", log, elapsed)
+
+    def _died(self, start: float, err: list[str]) -> ShellResult:
+        """The process ended mid-statement: collect the rest of stderr (the backtrace)."""
+        assert self.proc is not None
+        try:
+            self.exitcode = self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.exitcode = self.proc.wait(timeout=5)
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            try:
+                name, line = self.events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is not None and name == "err":
+                self.tail.append(line)
+                err.append(line)
+        return ShellResult(
+            "crash",
+            error="".join(err)[-16000:],
+            elapsed=time.monotonic() - start,
+            exitcode=self.exitcode,
+        )
+
+    def kill(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+        if self.proc is not None:
+            self.exitcode = self.proc.poll()
+
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()  # type: ignore[union-attr]
+                self.proc.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                self.kill()
+        self.exitcode = self.proc.poll()
+
+
+def _split_stderr(lines: list[str]) -> tuple[str, str]:
+    """DuckDB's error message (from its first ``<Type> Error:`` line on) and the rest."""
+    for index, line in enumerate(lines):
+        if _ERROR_LINE.match(line):
+            return "".join(lines[index:]).strip(), "".join(lines[:index]).strip()
+    return "", "".join(lines).strip()
+
+
+# --------------------------------------------------------------------------
+# the session
+# --------------------------------------------------------------------------
+
+
 @dataclass
 class RunResult:
-    status: str  # ok | error | timeout
+    status: str  # ok | error | timeout | crash
     result: ResultSet | None = None
     error: str = ""
     elapsed: float = 0.0
+    exitcode: int | None = None
 
 
 class Session:
     def __init__(
         self,
+        shell: str,
         extension: str | None,
         sirius_config: str | None,
         db_dir: pathlib.Path,
         worker_id: int,
-        allow_metadata_mismatch: bool = False,
+        cpu_only: bool = False,
         evidence_path: pathlib.Path | None = None,
+        log_path: pathlib.Path | None = None,
     ):
+        self.shell_path = shell
         self.extension = extension
         self.sirius_config = sirius_config
         self.sirius_config_mode: str | None = None
         self.db_dir = db_dir
         self.worker_id = worker_id
-        self.allow_metadata_mismatch = bool(allow_metadata_mismatch)
+        self.gpu_available = not cpu_only
         self.evidence_path = evidence_path
+        self.shell = Shell(shell, log_path)
         self.active_settings: dict[str, Any] = {}
         self.evidence: dict[str, Any] = {}
         self.stage = "evaluation"
-        self.con: Any = None
-        self.gpu_available = extension is not None
         self.current_alias: str | None = None
+        self.attached: dict[str, pathlib.Path] = {}
         self._setting_defaults: dict[str, Any] = {}
         self.sqlsmith_loaded = False
-        self.version_mismatch_bypassed = False
+        self.duckdb_version: str | None = None
+        self.sirius: str = "none"  # built-in | loaded | none
+        self.restarts = 0
 
     # -- lifecycle -----------------------------------------------------------
 
     def open(self) -> None:
-        import duckdb
-
         self._configure_sirius()
         # Registers the TEST ONLY fault-injection option used as the interception canary.
         os.environ.setdefault("SIRIUS_ENABLE_TEST_OPTIONS", "1")
-        self.con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-        self.con.execute("SET enable_progress_bar = false")
-        if self.extension:
-            self._load_extension()
-            # Strict mode: a fallback surfaces as an error instead of a silent CPU run.
-            self.con.execute("SET enable_duckdb_fallback = false")
-        self.set_gpu(False)
+        self._start()
 
     def _configure_sirius(self) -> None:
-        if not self.extension:
+        if not self.gpu_available:
             self.sirius_config_mode = "cpu_only"
             return
         if self.sirius_config:
@@ -123,36 +421,92 @@ class Session:
             return
         self.sirius_config_mode = "builtin_defaults"
 
+    def _start(self) -> None:
+        """Start the shell and restore the session state a previous shell had."""
+        self.shell.start()
+        self.sqlsmith_loaded = False
+        self.execute("SET enable_progress_bar = false")
+        self.duckdb_version = self.scalar("SELECT version()")
+        built_in = self._sirius_built_in()
+        if self.gpu_available:
+            if built_in:
+                self.sirius = "built-in"
+            elif self.extension:
+                self._load_extension()
+                self.sirius = "loaded"
+            else:
+                raise SessionError(
+                    f"{self.shell_path} has no Sirius built in and no --extension was "
+                    "given; use build/release/duckdb from the Sirius build, or pass "
+                    "--extension, or --cpu-only"
+                )
+            # Strict mode: a fallback surfaces as an error instead of a silent CPU run.
+            self.execute("SET enable_duckdb_fallback = false")
+            self.set_gpu(False)
+        elif built_in:
+            # A CPU-only reference must stay on the CPU even in the Sirius shell.
+            self.execute("SET gpu_execution = false")
+        for alias, path in self.attached.items():
+            self.execute(f"ATTACH {sql_literal(str(path))} AS {alias}")
+        if self.current_alias:
+            self.execute(f"USE {self.current_alias}")
+        for name, value in self.active_settings.items():
+            self._set(name, value)
+
+    def _sirius_built_in(self) -> bool:
+        rows = self.query(
+            "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'sirius'"
+        )
+        return bool(rows) and bool(rows[0]["loaded"])
+
     def _load_extension(self) -> None:
         try:
-            self.con.execute(f"LOAD {sql_literal(self.extension)}")
-        except Exception as e:  # noqa: BLE001
-            if "built specifically for DuckDB version" not in str(e):
-                raise
-            if not self.allow_metadata_mismatch:
-                raise SessionError(
-                    f"{e}\nRebuild the Python module and extension from matching sources. "
-                    "Only for a verified matching build, use --allow-metadata-mismatch."
-                ) from e
-            self.con.execute("SET allow_extensions_metadata_mismatch = true")
-            self.con.execute(f"LOAD {sql_literal(self.extension)}")
-            self.version_mismatch_bypassed = True
+            self.execute(f"LOAD {sql_literal(self.extension)}")
+        except SessionError as exc:
+            hint = ""
+            if "built specifically for DuckDB version" in str(exc):
+                hint = (
+                    " (the shell and the extension come from different DuckDB "
+                    "versions; use build/release/duckdb from the same build)"
+                )
+            raise SessionError(f"cannot load {self.extension}: {exc}{hint}") from exc
 
     def close(self) -> None:
-        if self.con is not None:
+        if self.shell.alive:
             try:
                 self.drop_dataset()
             except Exception:
                 pass
-            try:
-                self.con.close()
-            except Exception:
-                pass
-            self.con = None
+        self.shell.stop()
 
     def set_gpu(self, enabled: bool) -> None:
         if self.gpu_available:
-            self.con.execute(f"SET gpu_execution = {'true' if enabled else 'false'}")
+            self.execute(f"SET gpu_execution = {'true' if enabled else 'false'}")
+
+    # -- statements -------------------------------------------------------------
+
+    def _ensure_alive(self) -> None:
+        if not self.shell.alive:
+            self.restarts += 1
+            self._start()
+
+    def execute(self, sql: str, timeout: float = 600.0) -> ShellResult:
+        """Run a statement that must succeed (setup, settings, data loading)."""
+        self._ensure_alive()
+        result = self.shell.execute(sql, timeout)
+        if result.status != "ok":
+            raise SessionError(
+                result.error or result.log or f"shell {result.status}: {sql[:120]}"
+            )
+        return result
+
+    def query(self, sql: str) -> list[dict[str, Any]]:
+        result = self.execute(sql)
+        return [dict(zip(result.columns, row)) for row in result.rows]
+
+    def scalar(self, sql: str) -> Any:
+        result = self.execute(sql)
+        return result.rows[0][0] if result.rows else None
 
     # -- datasets -------------------------------------------------------------
 
@@ -165,44 +519,41 @@ class Session:
             if p.exists():
                 p.unlink()
         self.set_gpu(False)
-        self.con.execute(f"ATTACH {sql_literal(str(path))} AS {alias}")
-        self.con.execute(f"USE {alias}")
-        self.con.execute(ds.schema_sql())
-        self.con.execute(ds.data_sql(permutation_seed))
-        self.con.execute("CHECKPOINT")
+        self.execute(f"ATTACH {sql_literal(str(path))} AS {alias}")
+        self.attached[alias] = path
+        self.execute(f"USE {alias}")
         self.current_alias = alias
+        self.execute(ds.schema_sql())
+        self.execute(ds.data_sql(permutation_seed))
+        self.execute("CHECKPOINT")
 
     def use(self, alias: str) -> None:
-        self.con.execute(f"USE {alias}")
+        self.execute(f"USE {alias}")
         self.current_alias = alias
 
     def drop_dataset(self, alias: str | None = None) -> None:
-        aliases = [alias] if alias else list(self._attached())
+        aliases = [alias] if alias else list(self.attached)
         for a in aliases:
-            try:
-                self.con.execute("USE memory")
-                self.con.execute(f"DETACH {a}")
-            except Exception:
-                pass
+            if self.shell.alive:
+                try:
+                    self.execute("USE memory")
+                    self.execute(f"DETACH {a}")
+                except SessionError:
+                    pass
             for suffix in ("", ".wal"):
                 p = self.db_dir / f"{a}.duckdb{suffix}"
                 if p.exists():
                     p.unlink()
+            self.attached.pop(a, None)
         self.current_alias = None
-
-    def _attached(self) -> list[str]:
-        rows = self.con.execute(
-            "SELECT database_name FROM duckdb_databases() WHERE NOT internal AND database_name NOT IN ('memory','system','temp')"
-        ).fetchall()
-        return [r[0] for r in rows]
 
     # -- queries --------------------------------------------------------------
 
     def begin_query(self, sql: str) -> None:
         """Replace the previous query's evidence before evaluating ``sql``.
 
-        The supervisor attributes a crash to the SQL in the active file, so it must
-        name this query even if the worker dies before the first run rewrites it.
+        The supervisor attributes a worker death to the SQL in the active file, so
+        it must name this query even if the worker dies before the first run.
         """
         self.evidence = {}
         self.stage = "evaluation"
@@ -232,8 +583,6 @@ class Session:
             )
 
     def run(self, sql: str, gpu: bool, timeout: float) -> RunResult:
-        import duckdb
-
         phase = "gpu" if gpu else "cpu"
         state = {
             "sql": sql,
@@ -246,51 +595,24 @@ class Session:
         }
         if self.evidence_path:
             write_json(self.evidence_path, state)
+        self._ensure_alive()
         self.set_gpu(gpu)
-        timer = threading.Timer(timeout, self._interrupt) if timeout > 0 else None
-        start = time.monotonic()
-        interrupted = False
-        try:
-            if timer:
-                timer.start()
-            cur = self.con.execute(sql)
-            rows = cur.fetchall()
-            desc = cur.description or []
-        except duckdb.InterruptException:
-            interrupted = True
-            return self._record(
-                phase,
-                state,
-                RunResult(
-                    "timeout", elapsed=time.monotonic() - start, error="interrupted"
-                ),
+        res = self.shell.execute(sql, timeout)
+        if res.status == "ok":
+            columns = [ColumnInfo(name, UNKNOWN_TYPE) for name in res.columns]
+            out = RunResult("ok", ResultSet(columns, res.rows), elapsed=res.elapsed)
+        elif res.status == "error":
+            status = "timeout" if "INTERRUPT" in res.error.upper() else "error"
+            out = RunResult(status, error=res.error, elapsed=res.elapsed)
+        elif res.status == "timeout":
+            out = RunResult("timeout", error=res.error, elapsed=res.elapsed)
+        else:
+            out = RunResult(
+                "crash", error=res.error, elapsed=res.elapsed, exitcode=res.exitcode
             )
-        except (
-            Exception
-        ) as e:  # noqa: BLE001 - every DuckDB error type is a query error here
-            msg = str(e)
-            if "INTERRUPT" in msg.upper() or "interrupted" in msg.lower():
-                return self._record(
-                    phase,
-                    state,
-                    RunResult("timeout", elapsed=time.monotonic() - start, error=msg),
-                )
-            return self._record(
-                phase,
-                state,
-                RunResult("error", error=msg, elapsed=time.monotonic() - start),
-            )
-        finally:
-            if timer:
-                timer.cancel()
-            if not interrupted:
-                self.set_gpu(False)
-        cols = [ColumnInfo(d[0], st.parse_duckdb_type(str(d[1]))) for d in desc]
-        return self._record(
-            phase,
-            state,
-            RunResult("ok", ResultSet(cols, rows), elapsed=time.monotonic() - start),
-        )
+        if self.shell.alive:
+            self.set_gpu(False)
+        return self._record(phase, state, out)
 
     def _record(
         self, phase: str, state: dict[str, Any], result: RunResult
@@ -303,88 +625,91 @@ class Session:
             write_json(self.evidence_path, state)
         return result
 
-    def _interrupt(self) -> None:
-        try:
-            self.con.interrupt()
-        except Exception:
-            pass
-
     def describe(self, sql: str) -> list[ColumnInfo] | None:
         """Exact output types (CPU side); None when DESCRIBE itself fails."""
-        self.set_gpu(False)
-        try:
-            rows = self.con.execute(f"DESCRIBE {sql}").fetchall()
-        except Exception:
+        if not self.shell.alive:
             return None
-        return [ColumnInfo(r[0], st.parse_duckdb_type(str(r[1]))) for r in rows]
+        self.set_gpu(False)
+        res = self.shell.execute(f"DESCRIBE {sql}", timeout=120)
+        if res.status != "ok":
+            return None
+        rows = [dict(zip(res.columns, row)) for row in res.rows]
+        return [
+            ColumnInfo(r["column_name"], st.parse_duckdb_type(str(r["column_type"])))
+            for r in rows
+        ]
 
     # -- settings ---------------------------------------------------------------
 
     def setting_supported(self, name: str) -> bool:
-        row = self.con.execute(
-            "SELECT value FROM duckdb_settings() WHERE name = ?", [name]
-        ).fetchone()
-        if row is None:
+        rows = self.query(
+            f"SELECT value FROM duckdb_settings() WHERE name = {sql_literal(name)}"
+        )
+        if not rows:
             return False
-        self._setting_defaults.setdefault(name, row[0])
+        self._setting_defaults.setdefault(name, rows[0]["value"])
         return True
 
-    def set(self, name: str, value: Any) -> None:
-        import re
-
+    def _set(self, name: str, value: Any) -> None:
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*", name):
             raise ValueError(f"invalid setting name: {name}")
-        if isinstance(value, str):
-            self.con.execute(f"SET {name} = {sql_literal(value)}")
-        else:
-            self.con.execute(f"SET {name} = {value}")
+        literal = sql_literal(value) if isinstance(value, str) else value
+        self.execute(f"SET {name} = {literal}")
+
+    def set(self, name: str, value: Any) -> None:
+        self._set(name, value)
         self.active_settings[name] = value
 
     def restore(self, name: str) -> None:
         default = self._setting_defaults.get(name)
+        self.active_settings.pop(name, None)
         if default is None:
             return
-        # Settings are stored as text in duckdb_settings(); numeric defaults round-trip as-is.
+        # Settings are text in duckdb_settings(); numeric defaults round-trip as-is.
         try:
-            self.con.execute(f"SET {name} = {int(default)}")
-        except Exception:
-            self.con.execute(f"SET {name} = {sql_literal(str(default))}")
-        self.active_settings.pop(name, None)
+            self.execute(f"SET {name} = {int(default)}")
+        except (ValueError, SessionError):
+            self.execute(f"SET {name} = {sql_literal(str(default))}")
 
     def load_sqlsmith(self) -> bool:
         if self.sqlsmith_loaded:
             return True
         try:
-            self.con.execute("LOAD sqlsmith")
-        except Exception:
+            self.execute("LOAD sqlsmith")
+        except SessionError:
             return False
         self.sqlsmith_loaded = True
         return True
 
+    def sqlsmith_candidates(self, sql: str) -> list[str]:
+        rows = self.query(f"SELECT sql FROM reduce_sql_statement({sql_literal(sql)})")
+        return [r["sql"] for r in rows if r.get("sql")]
+
     # -- canary -----------------------------------------------------------------
 
     def check_interception(self) -> tuple[bool, str]:
-        """Prove Sirius intercepts plain SQL on this connection.
+        """Prove Sirius intercepts plain SQL in this shell.
 
         Injects a runtime GPU error via the TEST ONLY option; a query that then fails
         with the injected text went through the GPU operator. Falls back to a probe
         query that Sirius rejects at plan time when the option is unavailable.
         """
         if not self.gpu_available:
-            return False, "no extension loaded (cpu-only mode)"
+            return False, "cpu-only mode"
         if self.current_alias is None:
             return False, "no dataset attached"
-        table = self.con.execute(
-            "SELECT table_name FROM duckdb_tables() WHERE database_name = ? LIMIT 1",
-            [self.current_alias],
-        ).fetchone()
-        if table is None:
+        tables = self.query(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = "
+            f"{sql_literal(self.current_alias)} LIMIT 1"
+        )
+        if not tables:
             return False, "dataset has no tables"
-        probe = f'SELECT count(*) FROM "{table[0]}"'
+        table = tables[0]["table_name"]
+        probe = f'SELECT count(*) FROM "{table}"'
         if self.setting_supported(CANARY_SETTING):
             try:
                 self.set(CANARY_SETTING, "fuzz-canary")
-                res = self.run(probe, gpu=True, timeout=30)
+                res = self.run(probe, gpu=True, timeout=120)
             finally:
                 self.set(CANARY_SETTING, "")
                 self.active_settings.pop(CANARY_SETTING, None)
@@ -394,7 +719,7 @@ class Session:
                 False,
                 f"canary not observed (status={res.status}: {res.error[:120]})",
             )
-        res = self.run(f'SELECT DISTINCT "k" FROM "{table[0]}"', gpu=True, timeout=30)
+        res = self.run(f'SELECT DISTINCT "k" FROM "{table}"', gpu=True, timeout=120)
         if res.status == "error" and "GPU plan generation failed" in res.error:
             return True, "plan-time rejection observed"
         return (

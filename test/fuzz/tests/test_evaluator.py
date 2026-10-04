@@ -13,7 +13,7 @@ from unittest.mock import patch
 from . import conftest_path  # noqa: F401
 from siriusfuzz import sqltypes as st
 from siriusfuzz.classify import Verdict
-from siriusfuzz.cli import build_parser, cmd_run
+from siriusfuzz.cli import Engine, build_parser, cmd_run
 from siriusfuzz.compare import ColumnInfo, ResultSet
 from siriusfuzz.config import FUZZ_DIR, load_config
 from siriusfuzz.report import (
@@ -36,13 +36,13 @@ from siriusfuzz.sqlast import Alias, ColumnRef, OrderItem, Select, SelectItem, T
 class FakeSession:
     """Scripted stand-in for Session: `gpu_behaviour` decides what the GPU run returns."""
 
+    extension = None
+
     def __init__(self, gpu_behaviour):
         self.gpu_available = True
         self.gpu_behaviour = gpu_behaviour
         self.settings = {}
         self.current_alias = "main"
-        self.con = self
-        self.calls = []
 
     # Session API used by Evaluator
     def setting_supported(self, name):
@@ -54,15 +54,8 @@ class FakeSession:
     def restore(self, name):
         self.settings.pop(name, None)
 
-    def execute(self, sql, *a):
-        self.calls.append(sql)
-        return self
-
     def mark_auxiliary(self, operation, input_sql):
         self.auxiliary = {"operation": operation, "input_sql": input_sql}
-
-    def fetchall(self):
-        return []
 
     def load_dataset(self, ds, alias, permutation_seed=None):
         pass
@@ -72,6 +65,9 @@ class FakeSession:
 
     def load_sqlsmith(self):
         return False
+
+    def sqlsmith_candidates(self, sql):
+        return []
 
     def describe(self, sql):
         return [ColumnInfo("c0", st.INTEGER), ColumnInfo("c1", st.DOUBLE)]
@@ -180,7 +176,13 @@ class EvaluatorTests(unittest.TestCase):
                 json.dumps({"sql": "SELECT old_candidate", "status": "ok"})
             )
             session = Session(
-                None, None, pathlib.Path(tmp), 0, evidence_path=active_path
+                "duckdb",
+                None,
+                None,
+                pathlib.Path(tmp),
+                0,
+                cpu_only=True,
+                evidence_path=active_path,
             )
             session.stage = "reduction"
             session.mark_auxiliary("sqlsmith_reduction", "SELECT candidate")
@@ -265,6 +267,37 @@ class EvaluatorTests(unittest.TestCase):
         again = replace(runtime, sql="SELECT 2", labels=["Select(group_by)"])
         self.assertFalse(wants_reduction(again, "gaps", seen))
         self.assertEqual(signature(runtime), signature(again))
+
+    def test_a_dead_shell_is_a_crash_finding_with_its_backtrace_reason(self):
+        tail = (
+            "*** SIGSEGV received\n#0 /x/build/release/duckdb(+0x1)\n"
+            "#1 /x/build/release/duckdb(+0x2)\n*** end backtrace ***\n"
+        )
+        rec, _ = evaluate(lambda *a: RunResult("crash", error=tail, exitcode=-11))
+        self.assertEqual(rec.verdict, Verdict.CRASH.value)
+        self.assertTrue(rec.reason.startswith("SIGSEGV"), rec.reason)
+        self.assertIn("end backtrace", rec.detail)
+        # A death during the CPU reference run is marked as such.
+        session = FakeSession(gpu_ok)
+        session.run = lambda sql, gpu, timeout: RunResult(
+            "crash", error="*** SIGABRT\n", exitcode=-6
+        )
+        rec = Evaluator(load_config(None), session, lambda m: None).evaluate(
+            None, "SELECT 1", 0, "d", 0
+        )
+        self.assertEqual(rec.verdict, Verdict.CRASH.value)
+        self.assertTrue(rec.reason.startswith("CPU phase: SIGABRT"), rec.reason)
+        # Under a setting variant the variant is recorded with the crash.
+        rec, _ = evaluate(
+            lambda sql, cols, rows, s: (
+                RunResult("crash", error="*** SIGSEGV\n", exitcode=-11)
+                if s.settings
+                else RunResult("ok", ResultSet(cols, list(rows)))
+            ),
+            **{"variants.per_query": "1"},
+        )
+        self.assertEqual(rec.verdict, Verdict.CRASH.value)
+        self.assertEqual(list(rec.variant), ["hash_partition_bytes"])
 
     def test_variant_mismatch(self):
         rec, _ = evaluate(gpu_variant_wrong, **{"variants.per_query": "1"})
@@ -377,7 +410,9 @@ class ReportTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             active = root / "w0-s1.active.json"
             # The previous query finished: its last run is still in the active file.
-            session = Session(None, None, root, 0, evidence_path=active)
+            session = Session(
+                "duckdb", None, None, root, 0, cpu_only=True, evidence_path=active
+            )
             session.stage = "reduction"
             active.write_text(
                 json.dumps({"sql": "SELECT previous", "phase": "cpu", "status": "ok"})
@@ -577,7 +612,10 @@ class ReportTests(unittest.TestCase):
                     + ["--fail-on-findings", "--no-doctor", "--out", tmp]
                 )
                 with patch(
-                    "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
+                    "siriusfuzz.cli._engine",
+                    return_value=Engine(
+                        "synthetic-shell", "synthetic-extension", False, []
+                    ),
                 ), patch("siriusfuzz.cli.provenance", return_value={}), patch.object(
                     Orchestrator, "run", autospec=True, side_effect=run_campaign
                 ):
@@ -595,7 +633,8 @@ class ReportTests(unittest.TestCase):
             return runner.report.finish()
 
         engine = patch(
-            "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
+            "siriusfuzz.cli._engine",
+            return_value=Engine("synthetic-shell", "synthetic-extension", False, []),
         )
         provenance = patch("siriusfuzz.cli.provenance", return_value={})
         campaign = patch.object(

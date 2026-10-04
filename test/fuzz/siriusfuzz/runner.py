@@ -4,11 +4,12 @@
 # See the LICENSE file at the repo root for the full text.
 """Worker processes and the orchestrator.
 
-A worker owns one Sirius session and a stream of generated datasets; for each
-query it runs CPU, then GPU, classifies, filters ambiguity, runs setting
-variants and reduces findings. The orchestrator spawns workers, consumes their
-messages, detects crashes (worker exit) and hangs (no progress past the
-timeout), respawns, and feeds the report.
+A worker owns one Sirius session (a DuckDB shell process) and a stream of
+generated datasets; for each query it runs CPU, then GPU, classifies, filters
+ambiguity, runs setting variants and reduces findings. A GPU fault or hang
+kills the shell, which the session reports and restarts. The orchestrator
+spawns workers, consumes their messages, detects a dead or stalled worker
+process as a last line of defence, respawns, and feeds the report.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from .schema_gen import DataGenerator, Dataset
 from .session import RunResult, Session
 from .sqlast import Query, labels
 
-HANG_GRACE_SECONDS = 30.0
+HANG_GRACE_SECONDS = 60.0  # beyond the worker's own timeout handling and shell restart
 
 
 class Mailbox:
@@ -87,13 +88,14 @@ class WorkerArgs:
     worker_id: int
     seed: int
     run_dir: str
+    shell: str
     extension: str | None
     sirius_config: str | None
     max_queries: int | None  # per worker
     deadline: float | None  # time.time() at which to stop
     reduce: bool = True
-    stderr_path: str | None = None  # per-worker capture of native backtraces
-    allow_metadata_mismatch: bool = False
+    stderr_path: str | None = None  # the shell's stderr and the worker's own
+    cpu_only: bool = False
     spawn_id: int = 0
     mode: str = "correctness"
 
@@ -149,6 +151,8 @@ class Evaluator:
         rec.labels = labels(query) if query is not None else []
         cpu = self.s.run(sql, gpu=False, timeout=self.timeout)
         rec.elapsed_cpu = cpu.elapsed
+        if cpu.status == "crash":
+            return self._crashed(rec, cpu, "CPU phase: ")
         if cpu.status == "timeout":
             rec.verdict = Verdict.CPU_TIMEOUT.value
             return rec
@@ -158,7 +162,13 @@ class Evaluator:
             return rec
         assert cpu.result is not None
         cols = self.s.describe(sql)
-        if cols is not None and len(cols) == len(cpu.result.columns):
+        # The shell's JSON carries names only (and none for an empty result); the
+        # exact types come from DESCRIBE.
+        if (
+            cols is not None
+            and len(cols) in (len(cpu.result.columns), 0)
+            or (cols is not None and not cpu.result.rows)
+        ):
             cpu.result.columns = cols
         if not self.s.gpu_available:
             # cpu-only harness check: a second CPU run must agree with the first.
@@ -166,6 +176,8 @@ class Evaluator:
         else:
             gpu = self.s.run(sql, gpu=True, timeout=self.timeout)
         rec.elapsed_gpu = gpu.elapsed
+        if gpu.status == "crash":
+            return self._crashed(rec, gpu, "")
         if gpu.status == "timeout":
             rec.verdict = Verdict.TIMEOUT.value
             rec.reason = f"GPU run exceeded {self.timeout}s"
@@ -195,6 +207,14 @@ class Evaluator:
         return rec
 
     # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _crashed(rec: QueryRecord, res: RunResult, prefix: str) -> QueryRecord:
+        """The shell died during this run; the session restarts it on the next one."""
+        rec.verdict = Verdict.CRASH.value
+        rec.reason = prefix + extract_crash_reason(res.error, res.exitcode)
+        rec.detail = res.error[-4000:]
+        return rec
 
     def _is_ambiguous(self, sql: str, cpu_result: ResultSet, mode: str) -> bool:
         """DQP filter: re-run on CPU over the same rows inserted in a different order."""
@@ -238,6 +258,10 @@ class Evaluator:
                 res = self.s.run(sql, gpu=True, timeout=self.timeout)
             finally:
                 self.s.restore(name)
+            if res.status == "crash":
+                self._crashed(rec, res, f"variant {name}={value}: ")
+                rec.variant = {name: value}
+                return
             if res.status == "timeout":
                 rec.verdict = Verdict.TIMEOUT.value
                 rec.reason = f"variant {name}={value} exceeded {self.timeout}s"
@@ -287,12 +311,9 @@ class Evaluator:
     def _sqlsmith_candidates(self, sql: str) -> list[str]:
         self.s.mark_auxiliary("sqlsmith_reduction", sql)
         try:
-            rows = self.s.con.execute(
-                "SELECT sql FROM reduce_sql_statement(?)", [sql]
-            ).fetchall()
+            return self.s.sqlsmith_candidates(sql)
         except Exception:
             return []
-        return [r[0] for r in rows if r and r[0]]
 
     def _make_still_fails(self, rec: QueryRecord) -> Callable[..., bool] | None:
         """Predicate ``(sql, query=None) -> bool`` for the reducer.
@@ -454,12 +475,14 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
         else None
     )
     session = Session(
+        args.shell,
         args.extension,
         args.sirius_config,
         run_dir / "db",
         w,
-        allow_metadata_mismatch=args.allow_metadata_mismatch,
+        cpu_only=args.cpu_only,
         evidence_path=evidence_path,
+        log_path=pathlib.Path(args.stderr_path) if args.stderr_path else None,
     )
     try:
         session.open()
@@ -571,17 +594,26 @@ def worker_main(args: WorkerArgs, cfg: FuzzConfig, out: Any, stop: Any) -> None:
 _SIGNAL_RE = re.compile(r"\*\*\* (SIG[A-Z]+)")
 _WHAT_RE = re.compile(r"what\(\):\s*(.+)")
 _TERMINATE_RE = re.compile(r"terminate called after throwing an instance of '([^']+)'")
-_EXT_FRAME_RE = re.compile(r"#\d+\s+\S*?sirius\.duckdb_extension\((\+0x[0-9a-f]+)\)")
+# Backtrace frames inside the Sirius binary: the loadable extension, or the shell
+# it is built into. Offsets are stable within one build.
+_EXT_FRAME_RE = re.compile(
+    r"#\d+\s+(\S*?(?:sirius\.duckdb_extension|/duckdb))\((\+0x[0-9a-f]+)\)"
+)
 _HANDLER_NAMES = ("segfault_handler", "signal_handler", "sigaction", "backtrace")
 
 
-def symbolize(extension: str | None, offsets: list[str]) -> list[str]:
-    """Function names for extension offsets via addr2line; offsets when unavailable."""
-    if not extension or not offsets or shutil.which("addr2line") is None:
+def symbolize(binary: str | None, offsets: list[str]) -> list[str]:
+    """Function names for offsets via addr2line; offsets when unavailable."""
+    if (
+        not binary
+        or not offsets
+        or not pathlib.Path(binary).is_file()
+        or shutil.which("addr2line") is None
+    ):
         return offsets
     try:
         out = subprocess.run(
-            ["addr2line", "-f", "-C", "-e", extension, *offsets],
+            ["addr2line", "-f", "-C", "-e", binary, *offsets],
             capture_output=True,
             text=True,
             timeout=20,
@@ -593,14 +625,12 @@ def symbolize(extension: str | None, offsets: list[str]) -> list[str]:
     return [n if n and n != "??" else off for n, off in zip(names, offsets)] or offsets
 
 
-def extract_crash_reason(
-    stderr_tail: str, exitcode: int | None, extension: str | None = None
-) -> str:
-    """Short, dedup-friendly description of a worker death from its captured stderr.
+def extract_crash_reason(stderr_tail: str, exitcode: int | None) -> str:
+    """Short, dedup-friendly description of a native death from its captured stderr.
 
     Prefers the std::terminate what() text, then the signal plus the first frames inside
-    the extension below Sirius's own signal handler (symbolized when addr2line exists;
-    offsets are stable within one build), then the bare exit code.
+    the Sirius binary below its own signal handler (symbolized when addr2line exists),
+    then the bare exit code.
     """
     blocks = stderr_tail.split("*** end backtrace ***")
     text = blocks[-2] if len(blocks) >= 2 else stderr_tail  # last crash block only
@@ -612,8 +642,9 @@ def extract_crash_reason(
         exc = f" ({term.group(1)})" if term else ""
         return f"{prefix}{exc}: {what.group(1).strip()}"
     if sig:
-        offsets = _EXT_FRAME_RE.findall(text)[:5]
-        names = symbolize(extension, offsets)
+        frames_found = _EXT_FRAME_RE.findall(text)[:5]
+        offsets = [offset for _, offset in frames_found]
+        names = symbolize(frames_found[0][0] if frames_found else None, offsets)
         frames = [n for n in names if not any(h in n for h in _HANDLER_NAMES)]
         if frames and frames == names and len(frames) > 1:
             frames = frames[
@@ -621,7 +652,7 @@ def extract_crash_reason(
             ]  # unsymbolized: the first extension frame is the handler
         where = " in " + " < ".join(f[:80] for f in frames[:3]) if frames else ""
         return f"{sig.group(1)}{where}"
-    return f"worker exited with code {exitcode}"
+    return f"process exited with code {exitcode}"
 
 
 # --------------------------------------------------------------------------
@@ -634,14 +665,15 @@ class OrchestratorOptions:
     workers: int = 1
     duration: float | None = None  # seconds
     max_queries: int | None = None  # total
+    shell: str = ""
     extension: str | None = None
+    cpu_only: bool = False
     sirius_configs: list[str] = dataclasses.field(default_factory=list)
     reduce: bool = True
     progress_every: float = 10.0
     quiet: bool = False
     max_respawns: int = 200  # crashes are findings, not a reason to stop the run
-    allow_metadata_mismatch: bool = False
-    startup_timeout: float = 120.0
+    startup_timeout: float = 300.0  # a Sirius shell initialises the GPU on start
     mode: str = "correctness"
 
 
@@ -687,13 +719,14 @@ class Orchestrator:
             worker_id,
             seed,
             str(self.report.run_dir),
+            self.opts.shell,
             self.opts.extension,
             cfg_path,
             per_worker,
             deadline,
             self.opts.reduce,
             stderr_path,
-            self.opts.allow_metadata_mismatch,
+            self.opts.cpu_only,
             self.spawn_count,
             mode=self.opts.mode,
         )
@@ -705,8 +738,7 @@ class Orchestrator:
             "sirius_config": cfg_path,
             "stderr": stderr_path,
             "runtime": str(pathlib.Path(stderr_path).with_suffix(".runtime.json")),
-            "cpu_only": self.opts.extension is None,
-            "allow_metadata_mismatch": self.opts.allow_metadata_mismatch,
+            "cpu_only": self.opts.cpu_only,
         }
         p = self.ctx.Process(
             target=worker_main,
@@ -885,7 +917,7 @@ class Orchestrator:
         info = self.inflight.pop(w, None)
         finished.add(w)
         tail = self._stderr_tail(w)
-        reason = extract_crash_reason(tail, p.exitcode, self.opts.extension)
+        reason = extract_crash_reason(tail, p.exitcode)
         if info is not None:
             sql, stem, _, query_labels = info
             rec = QueryRecord(

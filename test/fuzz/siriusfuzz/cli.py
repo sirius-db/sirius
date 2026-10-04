@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import pathlib
 import random
@@ -31,7 +32,7 @@ from .config import (
 from .report import Report, default_known_issues_path, load_known_issues
 from .runner import Orchestrator, OrchestratorOptions
 from .schema_gen import DataGenerator
-from .session import discover_sirius_yaml
+from .session import check_shell, discover_sirius_yaml, find_shell
 
 SELFTEST_DEFAULT_OVERRIDES = (
     "data.rows=[8,16]",
@@ -40,9 +41,6 @@ SELFTEST_DEFAULT_OVERRIDES = (
 )
 DEFAULT_DURATION_SECONDS = 600.0  # a run given neither --duration nor --queries
 DOCTOR_TIMEOUT_SECONDS = 120.0
-BUILD_MODULE_HINT = (
-    "build it from the submodule with: pixi run -e duckdb-python build-duckdb-python"
-)
 
 
 def cli_path(text: str, what: str) -> pathlib.Path:
@@ -59,25 +57,6 @@ def cli_path(text: str, what: str) -> pathlib.Path:
     raise ValueError(
         f"{what} not found: {given} (looked in {' and '.join(map(str, bases))})"
     )
-
-
-def check_duckdb_module() -> None:
-    """Fail early, with the fix, when the DuckDB Python module is missing.
-
-    From the repository root a bare ``import duckdb`` can resolve to the
-    ``duckdb/`` source checkout as a namespace package instead of failing.
-    """
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise ValueError(
-            f"the duckdb Python module is not importable ({exc}); {BUILD_MODULE_HINT}"
-        ) from exc
-    if not hasattr(duckdb, "connect"):
-        where = getattr(duckdb, "__path__", None) or getattr(duckdb, "__file__", "?")
-        raise ValueError(
-            f"'import duckdb' found {where}, not the Python module; {BUILD_MODULE_HINT}"
-        )
 
 
 def parse_duration(text: str | None) -> float | None:
@@ -126,7 +105,14 @@ def _mode_arg(p: argparse.ArgumentParser) -> None:
 
 def _common_engine_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--extension", help="path to sirius.duckdb_extension (default: from config)"
+        "--shell",
+        help="DuckDB shell to drive (default: build/release/duckdb from the configuration, "
+        "then $SIRIUSFUZZ_SHELL, then duckdb on PATH)",
+    )
+    p.add_argument(
+        "--extension",
+        help="loadable sirius.duckdb_extension, for a shell without Sirius built in "
+        "(default: the configuration's path when it exists)",
     )
     p.add_argument(
         "--sirius-config",
@@ -135,16 +121,20 @@ def _common_engine_args(p: argparse.ArgumentParser) -> None:
         help="Sirius YAML config; repeat to round-robin across workers",
     )
     p.add_argument(
-        "--allow-metadata-mismatch",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="explicitly bypass version metadata only for independently verified matching builds",
-    )
-    p.add_argument(
         "--cpu-only",
         action="store_true",
-        help="do not load Sirius; compare CPU against CPU (harness self-check)",
+        help="run without Sirius; compare CPU against CPU (harness self-check)",
     )
+
+
+@dataclasses.dataclass
+class Engine:
+    """What a session runs on: the DuckDB shell, Sirius, and its YAML."""
+
+    shell: str
+    extension: str | None  # LOADed only when the shell has no Sirius built in
+    cpu_only: bool
+    configs: list[str]
 
 
 def _load(args: argparse.Namespace) -> FuzzConfig:
@@ -152,19 +142,17 @@ def _load(args: argparse.Namespace) -> FuzzConfig:
     return load_config(path, args.set, getattr(args, "mode", "correctness"))
 
 
-def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> tuple[str | None, list[str]]:
-    check_duckdb_module()
+def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> Engine:
+    explicit = str(cli_path(args.shell, "DuckDB shell")) if args.shell else None
+    shell = find_shell(explicit, cfg.sirius.shell)
+    check_shell(shell)
     if args.cpu_only:
-        return None, []
+        return Engine(shell, None, True, [])
+    extension: str | None = None
     if args.extension:
-        ext = cli_path(args.extension, "extension")
-    else:
-        ext = resolve_repo_path(cfg.sirius.extension)
-        if not ext.exists():
-            raise ValueError(
-                f"extension not found: {ext} (build Sirius first with pixi run make, "
-                "or pass --extension / --cpu-only)"
-            )
+        extension = str(cli_path(args.extension, "extension"))
+    elif resolve_repo_path(cfg.sirius.extension).is_file():
+        extension = str(resolve_repo_path(cfg.sirius.extension))
     if args.sirius_config:
         resolved = [str(cli_path(c, "Sirius config")) for c in args.sirius_config]
     else:
@@ -182,7 +170,7 @@ def _engine(args: argparse.Namespace, cfg: FuzzConfig) -> tuple[str | None, list
                     file=sys.stderr,
                 )
                 resolved = [ambient]
-    return str(ext), resolved
+    return Engine(shell, extension, False, resolved)
 
 
 def _make_run_dir(out: str | None, seed: int) -> pathlib.Path:
@@ -203,7 +191,7 @@ def _make_run_dir(out: str | None, seed: int) -> pathlib.Path:
 def cmd_run(args: argparse.Namespace) -> int:
     cfg = _load(args)
     validate_limits(args)
-    extension, sirius_configs = _engine(args, cfg)
+    engine = _engine(args, cfg)
     seed = (
         args.seed
         if args.seed is not None
@@ -211,21 +199,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     run_dir = _make_run_dir(args.out, seed)
     (run_dir / "config.toml").write_text(cfg.to_toml())
-    sirius_configs = snapshot_configs(run_dir, sirius_configs)
-    write_json(run_dir / "environment.json", provenance(extension))
+    engine.configs = snapshot_configs(run_dir, engine.configs)
+    write_json(run_dir / "environment.json", provenance(engine.shell, engine.extension))
     write_json(
         run_dir / "invocation.json",
         {k: v for k, v in vars(args).items() if k != "func"},
     )
     if not getattr(args, "no_doctor", False):
         print("Readiness check (skip with --no-doctor):", flush=True)
-        result = run_doctor(
-            extension,
-            sirius_configs,
-            run_dir / "doctor",
-            DOCTOR_TIMEOUT_SECONDS,
-            getattr(args, "allow_metadata_mismatch", False),
-        )
+        result = run_doctor(engine, run_dir / "doctor", DOCTOR_TIMEOUT_SECONDS)
         if result["status"] != "ok":
             return 130 if result["status"] == "cancelled" else 2
     known = load_known_issues(default_known_issues_path(cfg))
@@ -234,12 +216,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         workers=args.workers,
         duration=parse_duration(args.duration),
         max_queries=args.queries,
-        extension=extension,
-        sirius_configs=sirius_configs,
+        shell=engine.shell,
+        extension=engine.extension,
+        cpu_only=engine.cpu_only,
+        sirius_configs=engine.configs,
         reduce=not args.no_reduce,
         quiet=args.quiet,
         max_respawns=args.max_respawns,
-        allow_metadata_mismatch=getattr(args, "allow_metadata_mismatch", False),
         mode=args.mode,
     )
     if opts.duration is None and opts.max_queries is None:
@@ -256,7 +239,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(
         f"siriusfuzz {__version__}: mode={args.mode} config={cfg.config_hash()} seed={seed} "
         f"workers={opts.workers} budget={budget} "
-        f"{'cpu-only' if extension is None else extension} -> {run_dir}",
+        f"{'cpu-only ' if engine.cpu_only else ''}{engine.shell} -> {run_dir}",
         file=sys.stderr,
     )
     summary = Orchestrator(cfg, report, seed, opts).run()
@@ -265,7 +248,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         first = run_dir / "findings" / summary["findings"][0]["name"]
         print(
             f"Findings: {run_dir / 'findings'}\n"
-            f"Replay one with: pixi run -e duckdb-python fuzz replay {first}"
+            f"Replay one with: pixi run fuzz replay {first}"
         )
     # Gaps are the expected output of a gaps run, not a failure of it.
     findings = [
@@ -306,23 +289,18 @@ def validate_limits(args: argparse.Namespace) -> None:
         raise ValueError("--max-respawns must be nonnegative")
 
 
-def run_doctor(
-    extension: str | None,
-    configs: list[str],
-    work: pathlib.Path,
-    timeout: float,
-    allow_metadata_mismatch: bool | None,
-) -> dict:
+def run_doctor(engine: Engine, work: pathlib.Path, timeout: float) -> dict:
     """Readiness checks in a disposable subprocess; prints one line per check."""
     work.mkdir(parents=True, exist_ok=True)
-    configs = snapshot_configs(work, configs)
-    write_json(work / "environment.json", provenance(extension))
+    configs = snapshot_configs(work, engine.configs)
+    write_json(work / "environment.json", provenance(engine.shell, engine.extension))
     result = supervise(
         {
             "operation": "doctor",
-            "extension": extension,
+            "shell": engine.shell,
+            "extension": engine.extension,
+            "cpu_only": engine.cpu_only,
             "sirius_config": configs[0] if configs else None,
-            "allow_metadata_mismatch": allow_metadata_mismatch,
         },
         work,
         timeout,
@@ -340,9 +318,9 @@ def run_doctor(
             f"FAIL  {result['status']}: {result.get('error', result.get('exitcode', ''))}"
         )
         print(
-            f"Check stderr.log and outcome.json in {work}. Build matching sources with "
-            "pixi run make and pixi run -e duckdb-python build-duckdb-python. Check the "
-            "GPU and selected Sirius YAML if initialization failed."
+            f"Check stderr.log, shell.stderr and outcome.json in {work}. Build Sirius "
+            "with pixi run make (it produces build/release/duckdb). Check the GPU and "
+            "the selected Sirius YAML if initialization failed."
         )
     return result
 
@@ -350,13 +328,12 @@ def run_doctor(
 def cmd_doctor(args: argparse.Namespace) -> int:
     validate_limits(args)
     cfg = _load(args)
-    extension, configs = _engine(args, cfg)
+    engine = _engine(args, cfg)
     work = _make_run_dir(args.out, 0)
     (work / "config.toml").write_text(cfg.to_toml())
     print(f"PASS  TOML configuration and output directory: {work}", flush=True)
-    result = run_doctor(
-        extension, configs, work, args.timeout, args.allow_metadata_mismatch
-    )
+    print(f"PASS  DuckDB shell {engine.shell}", flush=True)
+    result = run_doctor(engine, work, args.timeout)
     if result["status"] == "ok":
         print(
             "Ready to fuzz."
@@ -405,20 +382,11 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
         args.cpu_only = args.cpu_only or meta.get("execution", {}).get(
             "cpu_only", False
         )
-        if args.allow_metadata_mismatch is None:
-            args.allow_metadata_mismatch = meta.get("execution", {}).get(
-                "allow_metadata_mismatch", False
-            )
-            if args.allow_metadata_mismatch:
-                print(
-                    "NOTE restoring the recorded metadata-mismatch override.",
-                    file=sys.stderr,
-                )
     else:
         config_path = cli_path(args.config, "configuration") if args.config else None
         query = target
     cfg = load_config(config_path, args.set)
-    extension, configs = _engine(args, cfg)
+    engine = _engine(args, cfg)
     dataset = (
         pathlib.Path(args.dataset).resolve()
         if args.dataset
@@ -431,7 +399,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
     if not query.is_file() or (dataset is not None and not dataset.is_file()):
         raise ValueError("incomplete reproducer: query or dataset file missing")
     work.mkdir(parents=True, exist_ok=True)
-    configs = snapshot_configs(work, configs)
+    configs = snapshot_configs(work, engine.configs)
     (work / "config.toml").write_text(cfg.to_toml())
     shutil.copy(query, work / "query.sql")
     if dataset is not None:
@@ -441,7 +409,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             args.dataset_seed
         )
         (work / "dataset.sql").write_text(ds.schema_sql() + "\n" + ds.data_sql())
-    environment = provenance(extension)
+    environment = provenance(engine.shell, engine.extension)
     write_json(work / "environment.json", environment)
     original_environment = meta.get("environment") or (
         json.loads((bundle / "environment.json").read_text())
@@ -482,9 +450,10 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
     result = supervise(
         {
             "operation": "replay",
-            "extension": extension,
+            "shell": engine.shell,
+            "extension": engine.extension,
+            "cpu_only": engine.cpu_only,
             "sirius_config": configs[0] if configs else None,
-            "allow_metadata_mismatch": args.allow_metadata_mismatch,
             "query": str(work / "query.sql"),
             "dataset": str(work / "dataset.sql"),
             "config": str(work / "config.toml"),
@@ -504,8 +473,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             "comparison": comparison,
             "variant": meta.get("variant"),
             "execution": {
-                "cpu_only": args.cpu_only,
-                "allow_metadata_mismatch": args.allow_metadata_mismatch,
+                "cpu_only": engine.cpu_only,
                 "sirius_config_required": bool(configs),
             },
         }
@@ -627,7 +595,6 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     args.fail_on_findings = True
     args.duration = None
     args.max_respawns = 0
-    args.allow_metadata_mismatch = False
     if args.queries is None:
         args.queries = 150
     if args.seed is None:
@@ -750,6 +717,9 @@ def build_parser() -> argparse.ArgumentParser:
     stp = sub.add_parser("selftest", help="CPU-only harness check (no GPU needed)")
     _common_config_args(stp)
     _mode_arg(stp)
+    stp.add_argument(
+        "--shell", help="DuckDB shell to drive (any DuckDB CLI works here)"
+    )
     stp.add_argument("--seed", type=int)
     stp.add_argument("--queries", type=int)
     stp.add_argument("--workers", type=int, default=1)

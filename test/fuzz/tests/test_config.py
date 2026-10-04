@@ -1,8 +1,7 @@
+import os
 import pathlib
-import sys
 import tempfile
 import tomllib
-import types
 import unittest
 from unittest.mock import patch
 
@@ -179,19 +178,24 @@ class CliHelpers(unittest.TestCase):
             self.assertIn(str(cwd), str(caught.exception))
             self.assertIn(str(REPO_ROOT), str(caught.exception))
 
-    def test_missing_duckdb_module_is_reported_with_the_fix(self):
-        from siriusfuzz.cli import check_duckdb_module
+    def test_missing_shell_is_reported_with_the_fix(self):
+        from siriusfuzz.session import SessionError, check_shell, find_shell
 
-        checkout = types.SimpleNamespace(__path__=["/repo/duckdb"])
-        with patch.dict(sys.modules, {"duckdb": checkout}):
-            with self.assertRaises(ValueError) as caught:
-                check_duckdb_module()
-        self.assertIn("/repo/duckdb", str(caught.exception))
-        self.assertIn("build-duckdb-python", str(caught.exception))
-        with patch.dict(sys.modules, {"duckdb": None}):
-            with self.assertRaises(ValueError) as caught:
-                check_duckdb_module()
-        self.assertIn("build-duckdb-python", str(caught.exception))
+        with patch.dict(os.environ, {"SIRIUSFUZZ_SHELL": ""}), patch(
+            "shutil.which", return_value=None
+        ):
+            with self.assertRaises(SessionError) as caught:
+                find_shell(None, "no/such/duckdb")
+        self.assertIn("pixi run make", str(caught.exception))
+        self.assertIn("no/such/duckdb", str(caught.exception))
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = pathlib.Path(tmp) / "duckdb"
+            broken.write_text("#!/bin/sh\nexit 3\n")
+            broken.chmod(0o755)
+            with self.assertRaises(SessionError):
+                check_shell(str(broken))
+            with patch.dict(os.environ, {"SIRIUSFUZZ_SHELL": str(broken)}):
+                self.assertEqual(find_shell(None, "no/such/duckdb"), str(broken))
 
 
 if __name__ == "__main__":
