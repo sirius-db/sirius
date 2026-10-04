@@ -105,37 +105,5 @@ def runtime_info(session: Any) -> dict[str, Any]:
     }
 
 
-def seal(directory: pathlib.Path) -> None:
-    """Hash the original portable inputs. Later replay/reduction evidence is separate."""
-    files = {}
-    for name in (
-        "query.sql",
-        "dataset.sql",
-        "config.toml",
-        "meta.json",
-        "environment.json",
-        "runtime.json",
-        "sirius.yaml",
-    ):
-        p = directory / name
-        if p.exists():
-            files[name] = fingerprint(p)
-    write_json(directory / "bundle.json", {"schema_version": 1, "files": files})
-
-
-def verify(directory: pathlib.Path) -> None:
-    manifest = directory / "bundle.json"
-    if not manifest.exists():
-        return  # legacy bundle; caller reports missing provenance
-    for name, expected in json.loads(manifest.read_text())["files"].items():
-        p = directory / name
-        if (
-            pathlib.Path(name).name != name
-            or not p.is_file()
-            or fingerprint(p) != expected
-        ):
-            raise ValueError(f"incomplete or modified reproducer: {name}")
-
-
 def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"

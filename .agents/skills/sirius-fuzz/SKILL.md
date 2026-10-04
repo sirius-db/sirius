@@ -131,10 +131,9 @@ plan-time table, separately from findings; gaps are its expected output and do n
 
 Preserve original finding bundles and their datasets/configuration. A request to run fuzzing
 ends with saved evidence and a summary; it does not imply engine edits, repeated crash/hang
-replay, or automatic issue publication. For an existing triage workspace, `fuzz triage-report`
-can refresh reports from saved evidence without executing queries; it may also generate eligible
-local drafts. Keep automatic observations distinct from human review and never attest to manual
-verification on a person's behalf. Follow repository approval rules before any external publication.
+replay, or issue publication. After a fix, `fuzz recheck <run-dir>` replays every finding of a
+run against the current build and reports which ones cleared. Follow repository approval rules
+before any external publication.
 
 Return the selected host and tested source/binary identity, exact command and limits, completion
 status and exit code, query/verdict totals, GPU evidence or CPU-only limitation, and paths to the
