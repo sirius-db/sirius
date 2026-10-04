@@ -309,41 +309,43 @@ Outputs default to unique directories below `test/fuzz/out/`; use `--out` for an
 run-<timestamp>-seed<seed>-<unique>/
 ├── config.toml, sirius-<n>.yaml        effective configuration snapshots
 ├── environment.json, invocation.json   source revisions, binary hashes, GPU/runtime, CLI arguments
-├── summary.json, summary.txt           verdict counts, completion status, coverage histogram
-├── queries.jsonl                       flushed per-query records (every observation is here)
+├── summary.json, summary.txt           verdict counts, gap tables, findings, coverage
+├── queries.jsonl                       one record per query (every observation is here)
 ├── datasets/w<worker>-s<spawn>-d<n>.sql
 ├── logs/                               native stderr, active operation, runtime per worker
 └── findings/<n>-<verdict>-<hash>/
-    ├── query.sql, dataset.sql          immutable original inputs
-    ├── config.toml, sirius.yaml        configuration for this particular worker
-    ├── meta.json                       outcome, variant, comparison, timing, sample evidence
-    ├── environment.json, runtime.json  binary/source provenance and session settings
-    ├── worker.stderr                   log snapshot at observation
-    ├── reduced.sql, reduction.json     optional reduction evidence
-    ├── REPLAY.md, repro.sql            CLI and standalone shell reproduction instructions
-    ├── repro_catch2.cpp                regression-test starting point (needs developer review)
-    └── additional/<n>/                 up to five more complete bundles with the same signature
+    ├── FINDING.md                      what happened, the query, how to replay
+    ├── query.sql, dataset.sql          the original inputs
+    ├── reduced.sql, reduction.json     when reduction made progress
+    ├── config.toml, sirius.yaml        configuration for this worker
+    ├── meta.json                       the full record, provenance and session settings
+    ├── worker.stderr                   crashes and hangs only
+    └── more/<n>/                       up to five further query/dataset pairs with the same signature
 ```
+
+Start with `FINDING.md`: it shows the verdict and reason, the smallest query that reproduces,
+the differing rows or error, and the replay command for that directory.
 
 **How findings are grouped.** Signatures are grouping heuristics, not confirmed root causes.
 Mismatch and timeout signatures include the original SQL, dataset identity, comparison mode,
 variant value and result evidence, so distinct inputs stay separate even when their operator
-labels match. Repeated errors group by normalized reason. This favours keeping
-evidence over compact counts.
+labels match. Repeated errors group by normalized reason. This favours keeping evidence over
+compact counts.
 
 **Reduction never replaces the original.** The original observation is saved before reduction
 starts. Each error signature is reduced once per worker; later queries with the same signature
-are kept as additional reproducers without spending another reduction budget. A reducer failure is recorded separately with `stage=reduction` and the active
-candidate. Reduced output is additional evidence and must itself be replayed; to test an edited
-query, replay it as a SQL file with the bundle's `dataset.sql`.
+are kept under `more/` without spending another reduction budget. A reducer failure is recorded
+separately with `stage=reduction` and the active candidate. Reduced output is additional
+evidence and must itself be replayed; to test an edited query, replay it as a SQL file with the
+bundle's `dataset.sql`.
 
-**Provenance.** Source revisions describe the checkout at run time; the extension fingerprint
-identifies the actual binary, and the revision alone does not prove how it was built. Findings
-carry small, labelled result samples and comparator differences rather than full result dumps.
-`repro.sql` prints CPU/GPU results plus any recorded variant result; the CLI does the comparison.
+**Provenance.** `meta.json` carries the source revisions and binary hashes of the run and the
+session settings of the worker. Source revisions describe the checkout at run time; the
+extension fingerprint identifies the actual binary, and the revision alone does not prove how it
+was built. Findings carry small result samples and comparator differences, not full result dumps.
 
 **Naming.** Dataset filenames include the worker incarnation, so a respawn cannot overwrite
-earlier data. Every retained additional reproducer carries its own dataset and settings.
+earlier data. Every entry under `more/` carries its own dataset.
 
 The optional sqlsmith reducer loads an already-installed extension and never runs `INSTALL`.
 AST reduction works without sqlsmith.

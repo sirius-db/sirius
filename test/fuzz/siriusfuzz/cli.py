@@ -436,9 +436,9 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
         (work / "dataset.sql").write_text(ds.schema_sql() + "\n" + ds.data_sql())
     environment = provenance(extension)
     write_json(work / "environment.json", environment)
-    original_environment = (
+    original_environment = meta.get("environment") or (
         json.loads((bundle / "environment.json").read_text())
-        if bundle and (bundle / "environment.json").exists()
+        if bundle and (bundle / "environment.json").exists()  # older bundles
         else {}
     )
     if (
@@ -467,9 +467,9 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             "overrides": {k: v for k, v in vars(args).items() if k != "func"},
         },
     )
-    baseline_settings = (
+    baseline_settings = meta.get("runtime", {}).get("session_settings") or (
         json.loads((bundle / "runtime.json").read_text()).get("session_settings", {})
-        if bundle and (bundle / "runtime.json").exists()
+        if bundle and (bundle / "runtime.json").exists()  # older bundles
         else {}
     )
     result = supervise(
