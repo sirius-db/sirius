@@ -18,7 +18,7 @@ import tempfile
 import math
 
 from .artifacts import provenance, write_json
-from .isolation import supervise
+from .probe import execute_probe
 from . import __version__
 from .classify import Verdict
 from .config import (
@@ -294,16 +294,16 @@ def run_doctor(engine: Engine, work: pathlib.Path, timeout: float) -> dict:
     work.mkdir(parents=True, exist_ok=True)
     configs = snapshot_configs(work, engine.configs)
     write_json(work / "environment.json", provenance(engine.shell, engine.extension))
-    result = supervise(
+    result = execute_probe(
         {
             "operation": "doctor",
             "shell": engine.shell,
             "extension": engine.extension,
             "cpu_only": engine.cpu_only,
             "sirius_config": configs[0] if configs else None,
+            "timeout": timeout,
         },
         work,
-        timeout,
     )
     if result["status"] == "ok":
         for check in result["checks"]:
@@ -447,7 +447,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
         if bundle and (bundle / "runtime.json").exists()  # older bundles
         else {}
     )
-    result = supervise(
+    result = execute_probe(
         {
             "operation": "replay",
             "shell": engine.shell,
@@ -460,9 +460,9 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
             "variant": meta.get("variant"),
             "comparison": comparison,
             "session_settings": baseline_settings,
+            "timeout": args.timeout,
         },
         work,
-        args.timeout,
     )
     replay_meta = result.get(
         "record",
@@ -504,12 +504,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
     for line in record.get("diffs", [])[:10]:
         print(f"  {line}")
     print(f"Full outcome: {work / 'outcome.json'}")
-    if result["status"] == "cancelled":
-        return 130
-    if result["status"] == "setup_error":
-        return 2
     if result["status"] != "ok":
-        return 1
+        return 2
     return 0 if replay_verdict(result) == Verdict.OK.value else 1
 
 
@@ -529,7 +525,6 @@ def cmd_recheck(args: argparse.Namespace) -> int:
     print(f"Recheck of {len(bundles)} findings from {run_dir}; evidence in {work}\n")
     print(f"  {'finding':<40} {'recorded':>18}    {'now':<18} reason")
     rows = []
-    cancelled = False
     for bundle in bundles:
         meta_path = bundle / "meta.json"
         before = (
@@ -553,15 +548,11 @@ def cmd_recheck(args: argparse.Namespace) -> int:
         print(
             f"  {bundle.name:<40} {before:>18} -> {after:<18} {reason[:60]}", flush=True
         )
-        if result["status"] == "cancelled":
-            cancelled = True
-            break
     cleared = sum(r["now"] == Verdict.OK.value for r in rows)
     write_json(
         work / "recheck.json",
         {
             "run": str(run_dir),
-            "status": "cancelled" if cancelled else "complete",
             "cleared": cleared,
             "findings": rows,
         },
@@ -569,8 +560,6 @@ def cmd_recheck(args: argparse.Namespace) -> int:
     print(
         f"\n{cleared} of {len(rows)} findings no longer reproduce; details in {work / 'recheck.json'}"
     )
-    if cancelled:
-        return 130
     return 0 if cleared == len(rows) else 1
 
 
@@ -657,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=120,
-        help="hard deadline for the setup probe (seconds)",
+        help="deadline for each step of the check (seconds)",
     )
     doctor.set_defaults(func=cmd_doctor)
 
@@ -679,7 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=180,
-        help="hard deadline for the entire replay subprocess, including setup and cleanup (seconds)",
+        help="deadline for the replayed query (seconds)",
     )
     rp.add_argument(
         "--ordered",
@@ -705,7 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=180,
-        help="hard deadline per finding, including setup (seconds)",
+        help="deadline for each replayed query (seconds)",
     )
     rc.set_defaults(func=cmd_recheck, dataset=None, dataset_seed=None, ordered=False)
 
@@ -732,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
     except (ValueError, OSError, ImportError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
