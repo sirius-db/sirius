@@ -55,8 +55,8 @@ not an implicit part of selecting an existing environment.
 - Select an existing host-appropriate Sirius YAML, verifying memory settings and writable spill
   paths. Do not copy another machine's resource limits. Keep metadata checks enabled; a mismatch
   is a setup problem to investigate, not a reason to automatically bypass the check.
-- Choose absolute paths for the configuration, extension, YAML and a fresh output root. The Pixi
-  `fuzz` task changes directory to `test/fuzz`. Record host, source state, submodules, binary
+- Choose absolute paths for the configuration, extension, YAML and a fresh output root, so the
+  recorded command is unambiguous on a remote host. Record host, source state, submodules, binary
   identity, device selection, configuration and overrides without dumping credentials or the full environment.
 
 Use one available GPU and one worker initially. For long runs, use an available persistent
@@ -76,7 +76,8 @@ pixi run -e duckdb-python fuzz doctor \
 ```
 
 Require the doctor's successful outcome, `gpu_verified=true`, and interception evidence before
-starting GPU comparisons. If doctor fails, inspect its logs and identify the setup blocker.
+starting GPU comparisons. `run` repeats these checks first and stops on failure, so the separate
+`doctor` step is where to look when setup is in doubt, not an extra prerequisite. If doctor fails, inspect its logs and identify the setup blocker.
 Resume only after addressing that cause; do not switch to CPU fallback to make the check pass.
 Sirius intercepts ordinary SQL. The harness uses file-backed tables and checkpointing to reach
 the GPU scan path; an ad hoc in-memory query is not an equivalent readiness check.

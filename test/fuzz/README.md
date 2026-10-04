@@ -3,6 +3,9 @@
 `siriusfuzz` generates SQL, runs it on both DuckDB (CPU) and Sirius (GPU), and saves every
 disagreement as a replayable finding. It is a plain command-line tool; no AI agent is required.
 
+For a detailed explanation of generation, execution, comparison, reduction, and the design
+decisions behind the harness, read [Understanding the Sirius fuzzer](../../docs/fuzzer/README.md).
+
 ```text
             ┌────────────┐      ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
    TOML     │  generate  │ SQL  │   execute   │ rows │   compare   │ diff │    save     │
@@ -46,45 +49,42 @@ pixi run make
 pixi run -e duckdb-python build-duckdb-python
 ```
 
-**2. Check readiness** with `doctor`. It validates the TOML profile and output location, imports
-DuckDB, loads Sirius, builds a tiny file-backed dataset, proves GPU interception with a canary
-query, and checks a GPU query's answer:
+**2. Fuzz.** With no options, `run` first checks that the build, the Python module and the GPU
+are ready (the same checks as `doctor`), then fuzzes the enabled features for 10 minutes with
+one worker and prints the summary:
 
 ```bash
-pixi run -e duckdb-python fuzz doctor
-
-# Or point it at an explicit build, config and output location:
-pixi run -e duckdb-python fuzz doctor \
-  --extension /absolute/path/sirius.duckdb_extension \
-  --sirius-config /absolute/path/sirius.yaml \
-  --out /absolute/path/fuzz-results
+pixi run -e duckdb-python fuzz run               # correctness: GPU answers against CPU answers
+pixi run -e duckdb-python fuzz run --mode gaps   # what Sirius hands back to the CPU at runtime
 ```
 
-`doctor` runs in a disposable subprocess with a 120-second hard deadline (including setup and
-cleanup). It leaves a diagnostic directory with logs, configuration, runtime info and
-`outcome.json`; temporary database files are removed on normal exit. It never installs
-dependencies, rebuilds the engine, switches branches or downloads extensions.
+Results land in `test/fuzz/out/run-<timestamp>-seed<seed>-<unique>/`; the summary names the
+directory and ends with the command to replay a finding. See [Saved evidence](#saved-evidence).
 
-**3. Fuzz:**
+**3. Shape the run** when you need to:
 
 ```bash
-# Short, bounded exploration (one worker by default)
-pixi run -e duckdb-python fuzz run --seed 42 --queries 100 --duration 3m --no-reduce
+# Fixed seed, query budget, no reduction: a quick sample
+pixi run -e duckdb-python fuzz run --seed 42 --queries 100 --no-reduce
 
 # Longer campaign; check shared GPU availability before adding workers
 pixi run -e duckdb-python fuzz run --seed 42 --duration 30m --workers 2
 
-# Steer generation toward specific features (others that are enabled can still appear)
-pixi run -e duckdb-python fuzz run --queries 100 \
-  --set 'features.scalar_functions.enabled=["substring","like"]'
+# Another build, Sirius YAML or output root
+pixi run -e duckdb-python fuzz run --extension /path/to/sirius.duckdb_extension \
+  --sirius-config /path/to/sirius.yaml --out /path/to/fuzz-results
 
-# Find what Sirius does not run on the GPU yet: every generator feature on, each
-# fallback reduced to the smallest query that still falls back
-pixi run -e duckdb-python fuzz run --mode gaps --seed 42 --duration 30m
+# Steer generation toward specific features (others that are enabled can still appear)
+pixi run -e duckdb-python fuzz run --set features.scalar_functions.enabled=substring,like
 ```
 
-Results land in `test/fuzz/out/run-<timestamp>-seed<seed>-<unique>/`; see
-[Saved evidence](#saved-evidence).
+`--no-doctor` skips the readiness check on repeat runs. `fuzz doctor` runs only that check: it
+validates the configuration and output location, imports DuckDB, loads Sirius, builds a tiny
+file-backed dataset, proves GPU interception with a canary query and checks a GPU query's answer,
+all in a disposable subprocess with a 120-second deadline. It leaves a diagnostic directory with
+logs, configuration, runtime info and `outcome.json`; temporary database files are removed on
+normal exit. It never installs dependencies, rebuilds the engine, switches branches or downloads
+extensions.
 
 **No GPU handy?** These need only a CPU:
 
@@ -106,8 +106,8 @@ All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
 
 | Command | What it does | GPU? |
 |---------|--------------|------|
-| `doctor` | Verify build, config, interception and a GPU answer before a run | yes |
-| `run` | Generate, execute and compare queries; save findings. `--mode gaps` hunts unsupported features | yes |
+| `doctor` | Verify build, config, interception and a GPU answer (`run` does this first unless `--no-doctor`) | yes |
+| `run` | Generate, execute and compare queries; save findings. `--mode gaps` hunts runtime fallbacks | yes |
 | `replay <finding-or-sql>` | Re-run one finding directory or your own `.sql` file | yes (`--cpu-only` for CPU) |
 | `replay-file <file.sql>` | Classify every `SELECT` in a file, each in its own supervised process | yes |
 | `triage <run-or-finding>...` | Re-validate findings, shrink them, write `REPORT.md` and issue drafts | yes |
@@ -120,9 +120,10 @@ All commands are invoked as `pixi run -e duckdb-python fuzz <command>`.
 
 Also: `pixi run -e duckdb-python fuzz-test` runs the harness unit tests.
 
-**Path rule:** the Pixi `fuzz` task runs from `test/fuzz`, so use absolute paths for any input or
-output outside the repository. Relative engine paths in the configuration resolve against the
-repository root.
+**Paths:** a relative path on the command line resolves from the directory you run `pixi` in,
+then from the repository root, so repo-relative paths work from anywhere in the checkout. Paths
+inside the configuration file resolve from the repository root. Outputs default to
+`test/fuzz/out/`.
 
 ---
 
@@ -171,7 +172,8 @@ Two implementation details worth knowing:
 
 ### Budgets and workers
 
-- Defaults: **1 worker, 500 queries**.
+- Defaults: **1 worker, 10 minutes**, after a readiness check. The banner states the budget in
+  effect.
 - With both `--queries` and `--duration`, whichever budget is reached first stops the campaign.
   Workers already mid-query can overshoot the query count slightly.
 - `--duration` includes worker startup and execution but excludes initial provenance collection.

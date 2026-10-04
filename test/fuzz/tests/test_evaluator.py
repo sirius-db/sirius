@@ -623,7 +623,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 args = build_parser().parse_args(
                     ["run", "--mode", mode, "--seed", "1", "--queries", "1"]
-                    + ["--fail-on-findings", "--out", tmp]
+                    + ["--fail-on-findings", "--no-doctor", "--out", tmp]
                 )
                 with patch(
                     "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
@@ -635,6 +635,47 @@ class ReportTests(unittest.TestCase):
                     next(pathlib.Path(tmp).glob("run-*/summary.json")).read_text()
                 )
                 self.assertEqual(summary["mode"], mode)
+
+    def test_run_checks_readiness_first_and_defaults_to_a_time_budget(self):
+        seen = {}
+
+        def run_campaign(runner):
+            seen["opts"] = runner.opts
+            return runner.report.finish()
+
+        engine = patch(
+            "siriusfuzz.cli._engine", return_value=("synthetic-extension", [])
+        )
+        provenance = patch("siriusfuzz.cli.provenance", return_value={})
+        campaign = patch.object(
+            Orchestrator, "run", autospec=True, side_effect=run_campaign
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(["run", "--seed", "1", "--out", tmp])
+            with engine, provenance, campaign as run, patch(
+                "siriusfuzz.cli.run_doctor",
+                return_value={"status": "setup_error", "error": "boom"},
+            ) as doctor:
+                self.assertEqual(cmd_run(args), 2)
+                doctor.assert_called_once()
+                run.assert_not_called()
+            with engine, provenance, campaign, patch(
+                "siriusfuzz.cli.run_doctor", return_value={"status": "ok"}
+            ) as doctor:
+                self.assertEqual(cmd_run(args), 0)
+                doctor.assert_called_once()
+            self.assertEqual(seen["opts"].duration, 600.0)
+            self.assertIsNone(seen["opts"].max_queries)
+            args = build_parser().parse_args(
+                ["run", "--seed", "1", "--out", tmp, "--no-doctor", "--queries", "5"]
+            )
+            with engine, provenance, campaign, patch(
+                "siriusfuzz.cli.run_doctor"
+            ) as doctor:
+                self.assertEqual(cmd_run(args), 0)
+                doctor.assert_not_called()
+            self.assertEqual(seen["opts"].max_queries, 5)
+            self.assertIsNone(seen["opts"].duration)
 
     def test_summary_groups_gaps_by_their_reduced_reason(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,10 @@
 import pathlib
+import sys
 import tempfile
 import tomllib
+import types
 import unittest
+from unittest.mock import patch
 
 from . import conftest_path  # noqa: F401
 from siriusfuzz.config import (
@@ -155,6 +158,40 @@ class CliHelpers(unittest.TestCase):
         self.assertEqual(parse_duration("30m"), 1800.0)
         self.assertEqual(parse_duration("2h"), 7200.0)
         self.assertEqual(parse_duration("45"), 45.0)
+
+    def test_cli_paths_resolve_from_cwd_then_repo_root(self):
+        from siriusfuzz.cli import cli_path
+        from siriusfuzz.config import REPO_ROOT
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = pathlib.Path(tmp).resolve()
+            (cwd / "local.toml").write_text("")
+            with patch("pathlib.Path.cwd", return_value=cwd):
+                self.assertEqual(
+                    cli_path("local.toml", "configuration"), cwd / "local.toml"
+                )
+                self.assertEqual(
+                    cli_path("test/fuzz/config/default.toml", "configuration"),
+                    REPO_ROOT / "test/fuzz/config/default.toml",
+                )
+                with self.assertRaises(ValueError) as caught:
+                    cli_path("nope.toml", "configuration")
+            self.assertIn(str(cwd), str(caught.exception))
+            self.assertIn(str(REPO_ROOT), str(caught.exception))
+
+    def test_missing_duckdb_module_is_reported_with_the_fix(self):
+        from siriusfuzz.cli import check_duckdb_module
+
+        checkout = types.SimpleNamespace(__path__=["/repo/duckdb"])
+        with patch.dict(sys.modules, {"duckdb": checkout}):
+            with self.assertRaises(ValueError) as caught:
+                check_duckdb_module()
+        self.assertIn("/repo/duckdb", str(caught.exception))
+        self.assertIn("build-duckdb-python", str(caught.exception))
+        with patch.dict(sys.modules, {"duckdb": None}):
+            with self.assertRaises(ValueError) as caught:
+                check_duckdb_module()
+        self.assertIn("build-duckdb-python", str(caught.exception))
 
 
 if __name__ == "__main__":
