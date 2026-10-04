@@ -276,7 +276,7 @@ pixi run fuzz recheck /path/run-dir             # every finding of a run
 
 Replay restores the saved TOML, YAML, baseline session settings, comparison mode and the exact
 failing setting variant; it never picks a new variant or invents a dataset. Each replay runs in
-a supervised subprocess with a hard deadline (`--timeout`, default 180 s), writes a new attempt
+its own shell with `--timeout` (default 180 s) as the query deadline, writes a new attempt
 directory and leaves the finding unchanged. Custom SQL compares as a multiset unless `--ordered`;
 `--cpu-only` runs without a GPU and proves nothing about it. The ambiguity filter is not rerun
 for SQL-only replays, so a replay is evidence for investigation, not automatic confirmation.

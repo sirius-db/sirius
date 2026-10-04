@@ -1,4 +1,4 @@
-"""Developer-facing contracts: portable evidence, exact replay and process isolation."""
+"""Developer-facing contracts: the shell session, exact replay, recheck and the orchestrator."""
 
 import argparse
 import json
@@ -7,7 +7,6 @@ import pathlib
 import signal
 import tempfile
 import threading
-import time
 import unittest
 from dataclasses import asdict
 from unittest.mock import patch
@@ -24,7 +23,7 @@ from siriusfuzz.cli import (
     validate_limits,
 )
 from siriusfuzz.config import load_config
-from siriusfuzz.isolation import supervise
+from siriusfuzz.probe import execute_probe
 from siriusfuzz.report import QueryRecord, Report
 from siriusfuzz.runner import Evaluator, Mailbox, Orchestrator, OrchestratorOptions
 from siriusfuzz.session import (
@@ -51,28 +50,6 @@ class fake_shell:
 
     def __exit__(self, *exc):
         self.patcher.stop()
-
-
-def crash_child(payload, work):
-    os.kill(os.getpid(), signal.SIGKILL)
-
-
-def hang_child(payload, work):
-    time.sleep(30)
-
-
-def ok_child(payload, work):
-    write_json(pathlib.Path(work) / "result.json", {"status": "ok"})
-
-
-def completed_then_crash_child(payload, work):
-    write_json(pathlib.Path(work) / "result.json", {"status": "ok"})
-    os.kill(os.getpid(), signal.SIGKILL)
-
-
-def completed_then_hang_child(payload, work):
-    write_json(pathlib.Path(work) / "result.json", {"status": "ok"})
-    time.sleep(30)
 
 
 def restarting_worker(args, cfg, out, stop):
@@ -224,22 +201,6 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(cfg.features.joins.max_tables, 2)
         self.assertEqual(cfg.features.subqueries.max_depth, 1)
 
-    def test_interrupt_during_process_start_records_cancellation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("siriusfuzz.isolation.mp.get_context") as context:
-                process = context.return_value.Process.return_value
-                process.start.side_effect = KeyboardInterrupt
-                process.pid = None
-                result = supervise({}, pathlib.Path(tmp), 5)
-                self.assertEqual(result["status"], "cancelled")
-                self.assertEqual(
-                    json.loads((pathlib.Path(tmp) / "outcome.json").read_text())[
-                        "status"
-                    ],
-                    "cancelled",
-                )
-                process.kill.assert_not_called()
-
     def test_startup_crash_does_not_exhaust_query_restart_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = load_config(None)
@@ -335,9 +296,10 @@ class ToolTests(unittest.TestCase):
                 "[1.25, NULL]::DECIMAL(12,2)[2] AS decimal_array, "
                 "[[1.25, NULL], NULL]::DECIMAL(12,2)[][] AS nested_list FROM t"
             )
-            outcome = supervise(
+            outcome = execute_probe(
                 {
                     "operation": "replay",
+                    "timeout": 60,
                     "shell": SHELL,
                     "cpu_only": True,
                     "query": str(root / "query.sql"),
@@ -345,7 +307,6 @@ class ToolTests(unittest.TestCase):
                     "config": str(root / "config.toml"),
                 },
                 root,
-                60,
             )
             self.assertEqual(outcome["status"], "ok", outcome)
             self.assertEqual(outcome["record"]["verdict"], "ok")
@@ -362,9 +323,10 @@ class ToolTests(unittest.TestCase):
                 "-- query comment\nSELECT k FROM t ORDER BY k;"
             )
             (root / "config.toml").write_text(load_config(None).to_toml())
-            outcome = supervise(
+            outcome = execute_probe(
                 {
                     "operation": "replay",
+                    "timeout": 60,
                     "shell": SHELL,
                     "cpu_only": True,
                     "query": str(root / "query.sql"),
@@ -373,51 +335,10 @@ class ToolTests(unittest.TestCase):
                     "comparison": "ordered",
                 },
                 root,
-                60,
             )
             self.assertEqual(outcome["status"], "ok", outcome)
             self.assertEqual(outcome["record"]["verdict"], "ok")
             self.assertEqual(outcome["record"]["evidence"]["cpu"]["row_count"], 2)
-
-    def test_supervision_handles_native_death_and_deadline(self):
-        for target, expected, timeout in (
-            (ok_child, "ok", 10),
-            (crash_child, "crash", 10),
-            (hang_child, "timeout", 0.5),
-        ):
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
-                result = supervise({}, pathlib.Path(tmp), timeout, target)
-                self.assertEqual(result["status"], expected)
-                self.assertTrue((pathlib.Path(tmp) / "outcome.json").exists())
-                self.assertLess(result["elapsed_seconds"], timeout + 6)
-
-    def test_supervision_preserves_completed_result_after_cleanup_failure(self):
-        for target, timeout in (
-            (completed_then_crash_child, 10),
-            (completed_then_hang_child, 1),
-        ):
-            with self.subTest(
-                target=target.__name__
-            ), tempfile.TemporaryDirectory() as tmp:
-                result = supervise({}, pathlib.Path(tmp), timeout, target)
-                self.assertEqual(result["status"], "cleanup_error")
-                self.assertEqual(result["query_result"]["status"], "ok")
-                self.assertEqual(
-                    result["cleanup"]["status"],
-                    "crash" if target == completed_then_crash_child else "timeout",
-                )
-                self.assertEqual(
-                    json.loads((pathlib.Path(tmp) / "outcome.json").read_text())[
-                        "status"
-                    ],
-                    "cleanup_error",
-                )
-
-    def test_supervision_does_not_reuse_stale_result(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            write_json(pathlib.Path(tmp) / "result.json", {"status": "ok"})
-            result = supervise({}, pathlib.Path(tmp), 10, crash_child)
-            self.assertEqual(result["status"], "crash")
 
     def test_replay_restores_bundle_and_does_not_modify_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -440,7 +361,7 @@ class ToolTests(unittest.TestCase):
             )
             before = {p.name: p.read_bytes() for p in bundle.iterdir()}
             with fake_shell(root) as shell, patch(
-                "siriusfuzz.cli.supervise",
+                "siriusfuzz.cli.execute_probe",
                 return_value={"status": "ok", "record": {"verdict": "ok"}},
             ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
                 args = build_parser().parse_args(
@@ -510,7 +431,7 @@ class ToolTests(unittest.TestCase):
                     yaml.write_text("# synthetic config\n")
                     options += ["--sirius-config", str(yaml)]
                 with fake_shell(root) as shell, patch(
-                    "siriusfuzz.cli.supervise",
+                    "siriusfuzz.cli.execute_probe",
                     return_value={"status": "ok", "record": {"verdict": "ok"}},
                 ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
                     args = build_parser().parse_args(options + ["--shell", shell])
@@ -522,7 +443,7 @@ class ToolTests(unittest.TestCase):
                         probe.assert_not_called()
                     else:
                         self.assertEqual(cmd_replay(args), 0)
-                        payload, work, _ = probe.call_args.args
+                        payload, work = probe.call_args.args
                         self.assertEqual(payload["extension"], str(extension))
                         self.assertEqual(bool(payload["sirius_config"]), override)
                         if override:
@@ -580,7 +501,7 @@ class ToolTests(unittest.TestCase):
                     + ["--out", str(root / "out")]
                 )
                 with patch(
-                    "siriusfuzz.cli.supervise",
+                    "siriusfuzz.cli.execute_probe",
                     side_effect=lambda *a, **k: next(outcomes),
                 ) as probe, patch("siriusfuzz.cli.provenance", return_value={}):
                     self.assertEqual(cmd_recheck(args), 1)
@@ -602,7 +523,7 @@ class ToolTests(unittest.TestCase):
                     [("mismatch", "ok"), ("gpu_error", "gpu_error")],
                 )
                 with patch(
-                    "siriusfuzz.cli.supervise",
+                    "siriusfuzz.cli.execute_probe",
                     return_value={
                         "status": "ok",
                         "record": {"verdict": "ok", "reason": ""},
