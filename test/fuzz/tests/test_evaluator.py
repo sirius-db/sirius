@@ -20,7 +20,6 @@ from siriusfuzz.report import (
     KnownIssue,
     QueryRecord,
     Report,
-    catch2_snippet,
     load_known_issues,
     signature,
 )
@@ -354,55 +353,6 @@ class ReportTests(unittest.TestCase):
                 self.assertIsNone(report.add(reduced))
                 self.assertEqual(len(report.finish()["findings"]), len(records))
 
-    def test_catch2_reproducer_applies_and_restores_variant(self):
-        for variant in (
-            None,
-            {"hash_partition_bytes": 123},
-            {"expression_evaluator_strategy": "ast_jit"},
-            {"enable_operator": False},
-        ):
-            for mode in ("ordered", "multiset"):
-                with self.subTest(variant=variant, mode=mode):
-                    rec = QueryRecord(
-                        0,
-                        "d0",
-                        1,
-                        "SELECT k FROM t",
-                        "variant_mismatch" if variant else "mismatch",
-                        variant=variant,
-                        comparison=mode,
-                    )
-                    snippet = catch2_snippet("test", rec, None, rec.sql)
-                    comparator = (
-                        "compare_gpu_vs_cpu_ordered"
-                        if mode == "ordered"
-                        else "compare_gpu_vs_cpu"
-                    )
-                    self.assertIn(f"{comparator}(query)", snippet)
-                    if variant:
-                        setting, value = next(iter(variant.items()))
-                        literal = (
-                            f"'{value}'"
-                            if isinstance(value, str)
-                            else str(value).lower()
-                        )
-                        stages = [
-                            snippet.index(part)
-                            for part in (
-                                "auto baseline =",
-                                f"SET {setting} = {literal}",
-                                "auto variant =",
-                                "ToSQLString()",
-                                "REQUIRE_FALSE(variant->HasError())",
-                            )
-                        ]
-                        self.assertEqual(stages, sorted(stages))
-                        self.assertIn("REQUIRE(baseline_rows == variant_rows)", snippet)
-                        self.assertIn(
-                            f"Result>(), {'false' if mode == 'ordered' else 'true'})",
-                            snippet,
-                        )
-
     def test_reduction_compares_each_candidate_in_its_own_order_mode(self):
         cfg = load_config(None, ["oracle.ambiguity_filter=false"])
         ev = Evaluator(cfg, FakeSession(gpu_reversed), lambda m: None)
@@ -571,23 +521,44 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(list((root / "findings").iterdir()), [])
                     report.finish()
 
-    def test_standalone_repro_runs_reference_then_gpu(self):
+    def test_finding_md_leads_with_the_query_and_the_replay_command(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rec, _ = evaluate(gpu_wrong)
+            rec, _ = evaluate(gpu_wrong, sql="SELECT k FROM t")
             report = Report(pathlib.Path(tmp), load_config(None), [], 0)
+            report.dataset_path(rec.dataset).write_text("CREATE TABLE t(k INT);\n")
             name = report.add(rec)
-            report.finish()
-            script = (pathlib.Path(tmp) / "findings" / name / "repro.sql").read_text()
-            # Interpret the generated setting/query sequence against the scripted session.
-            session = FakeSession(gpu_wrong)
-            gpu, results = False, []
-            for line in script.splitlines():
-                if line.startswith("SET gpu_execution = "):
-                    gpu = line.endswith("true;")
-                elif line == rec.sql + ";":
-                    results.append(session.run(rec.sql, gpu, 60))
-            self.assertEqual([r.status for r in results], ["ok", "ok"], script)
-            self.assertNotEqual(results[0].result.rows, results[1].result.rows)
+            bundle = pathlib.Path(tmp) / "findings" / name
+            text = (bundle / "FINDING.md").read_text()
+            self.assertIn("- verdict: `mismatch`", text)
+            self.assertIn("## Query\n\n```sql\nSELECT k FROM t;\n```", text)
+            self.assertIn(f"fuzz replay {bundle.resolve()}", text)
+            self.assertNotIn("Reduced query", text)
+            # Reduction rewrites the page around the smaller query.
+            rec.reduced_sql = "SELECT k"
+            rec.reduction_steps = 3
+            report.add_reduction(rec)
+            text = (bundle / "FINDING.md").read_text()
+            self.assertIn("## Query (reduced in 3 steps; original in query.sql)", text)
+            self.assertIn("```sql\nSELECT k;\n```", text)
+            self.assertEqual((bundle / "reduced.sql").read_text(), "SELECT k;\n")
+            # Only crashes and hangs carry the worker log; the rest is in meta.json.
+            names = sorted(p.name for p in bundle.iterdir())
+            self.assertEqual(
+                names,
+                [
+                    "FINDING.md",
+                    "config.toml",
+                    "dataset.sql",
+                    "meta.json",
+                    "query.sql",
+                    "reduced.sql",
+                    "reduction.json",
+                ],
+            )
+            meta = json.loads((bundle / "meta.json").read_text())
+            self.assertEqual(meta["bundle_version"], 2)
+            self.assertIn("environment", meta)
+            self.assertIn("runtime", meta)
 
     def test_distinct_runtime_errors_do_not_share_a_signature(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -827,8 +798,7 @@ class ReportTests(unittest.TestCase):
                 "dataset.sql",
                 "config.toml",
                 "meta.json",
-                "detail.txt",
-                "repro_catch2.cpp",
+                "FINDING.md",
             ):
                 self.assertTrue((d / f).exists(), f)
             bundles = sorted((run_dir / "findings").rglob("dataset.sql"))

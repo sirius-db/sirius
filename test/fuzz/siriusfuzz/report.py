@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .classify import SEVERITY, Verdict, normalize_reason
-from .artifacts import write_json, sql_literal
+from .artifacts import write_json
 from .config import FuzzConfig, FUZZ_DIR
 
 
@@ -88,7 +88,7 @@ def load_known_issues(path: pathlib.Path | None) -> list[KnownIssue]:
     return out
 
 
-EXTRA_REPRODUCERS = 5  # additional query-<n>.sql files kept per deduplicated finding
+EXTRA_REPRODUCERS = 5  # further query/dataset pairs kept under more/ per finding
 
 
 def signature(rec: QueryRecord) -> str:
@@ -159,6 +159,8 @@ class Report:
         self.status = "complete"
         self.stop_reason = "budget completed"
         self.worker_context: dict[int, dict[str, Any]] = {}
+        self._environment: dict[str, Any] | None = None
+        self._runtime: dict[str, dict[str, Any]] = {}
         self.record_paths: dict[tuple[str, str], pathlib.Path] = {}
         self.record_signatures: dict[tuple[str, str], str] = {}
         self.datasets = 0
@@ -196,8 +198,7 @@ class Report:
             entry["count"] += 1
             entry["gpu_seconds"] += rec.elapsed_gpu
             if entry["count"] <= EXTRA_REPRODUCERS + 1:
-                name = f"{entry['name']}/additional/{entry['count']:03d}"
-                self._write_finding(name, rec, sig)
+                self._write_more(entry["name"], entry["count"], rec)
             return None
         name = f"{len(self.findings):03d}-{rec.verdict}-{short_hash(sig)}"
         self.findings[sig] = {
@@ -231,92 +232,127 @@ class Report:
         d.mkdir(parents=True, exist_ok=True)
         self.record_paths[(rec.dataset, rec.sql)] = d
         (d / "query.sql").write_text(rec.sql.rstrip() + ";\n")
-        repro_sql = rec.reduced_sql or rec.sql
         if rec.reduced_sql:
             (d / "reduced.sql").write_text(rec.reduced_sql.rstrip() + ";\n")
         ds_src = self.dataset_path(rec.dataset)
         if ds_src.exists():
             shutil.copy(ds_src, d / "dataset.sql")
         (d / "config.toml").write_text(self.cfg.to_toml())
-        meta = asdict(rec)
         context = self.worker_context.get(rec.worker, {})
-        for source, dest in (("environment.json", "environment.json"),):
-            path = self.run_dir / source
-            if path.exists():
-                shutil.copy(path, d / dest)
-        for source, dest in (
-            (context.get("sirius_config"), "sirius.yaml"),
-            (context.get("runtime"), "runtime.json"),
-            (context.get("stderr"), "worker.stderr"),
+        yaml = context.get("sirius_config")
+        if yaml and pathlib.Path(yaml).exists():
+            shutil.copy(yaml, d / "sirius.yaml")
+        stderr = context.get("stderr")
+        if (
+            rec.verdict in (Verdict.CRASH.value, Verdict.TIMEOUT.value)
+            and stderr
+            and pathlib.Path(stderr).exists()
         ):
-            if source and pathlib.Path(source).exists():
-                shutil.copy(source, d / dest)
+            shutil.copy(stderr, d / "worker.stderr")
+        meta = asdict(rec)
         meta.update(
             {
                 "signature": sig,
                 "run_seed": self.seed,
                 "config_hash": self.cfg.config_hash(),
-                "bundle_version": 1,
+                "bundle_version": 2,
                 "execution": {
                     "cpu_only": context.get("cpu_only"),
-                    "sirius_config_required": bool(context.get("sirius_config")),
+                    "sirius_config_required": bool(yaml),
                     "allow_metadata_mismatch": context.get(
                         "allow_metadata_mismatch", False
                     ),
                 },
+                "environment": self._environment_json(),
+                "runtime": self._runtime_json(context.get("runtime")),
             }
         )
-        (d / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
-        detail = [
-            f"verdict: {rec.verdict}",
-            f"reason: {rec.reason}",
-            f"detail: {rec.detail}",
+        write_json(d / "meta.json", meta)
+        self._write_finding_md(d, name, rec)
+
+    def _write_more(self, finding: str, count: int, rec: QueryRecord) -> None:
+        """A further query with the same signature: just its SQL and data."""
+        d = self.run_dir / "findings" / finding / "more" / f"{count:03d}"
+        d.mkdir(parents=True, exist_ok=True)
+        self.record_paths[(rec.dataset, rec.sql)] = d
+        (d / "query.sql").write_text(rec.sql.rstrip() + ";\n")
+        ds_src = self.dataset_path(rec.dataset)
+        if ds_src.exists():
+            shutil.copy(ds_src, d / "dataset.sql")
+
+    def _environment_json(self) -> dict[str, Any]:
+        if self._environment is None:
+            path = self.run_dir / "environment.json"
+            self._environment = json.loads(path.read_text()) if path.exists() else {}
+        return self._environment
+
+    def _runtime_json(self, path: str | None) -> dict[str, Any]:
+        if not path:
+            return {}
+        if path not in self._runtime:
+            p = pathlib.Path(path)
+            self._runtime[path] = json.loads(p.read_text()) if p.exists() else {}
+        return self._runtime[path]
+
+    @staticmethod
+    def _write_finding_md(d: pathlib.Path, name: str, rec: QueryRecord) -> None:
+        """The one file to read: what happened, the query, how to replay."""
+        lines = [
+            f"# {name}",
+            "",
+            f"- verdict: `{rec.verdict}`",
+            f"- reason: {rec.reason}",
         ]
         if rec.variant:
-            detail.append(f"variant: {rec.variant}")
-        detail += rec.diffs
-        detail.append("")
-        detail.append(
-            "Reproduce from a Sirius checkout (use this bundle's current absolute path):"
-        )
-        detail.append(
-            "  pixi run -e duckdb-python fuzz replay /absolute/path/to/bundle"
-        )
-        detail.append("See REPLAY.md and repro.sql for standalone shell instructions.")
-        (d / "detail.txt").write_text("\n".join(detail) + "\n")
-        (d / "repro_catch2.cpp").write_text(
-            catch2_snippet(name, rec, ds_src if ds_src.exists() else None, repro_sql)
-        )
-        # Relative files make the SQL usable after copying the entire bundle. Invoke
-        # from the bundle directory with the matching Sirius-linked DuckDB shell.
-        query = rec.sql.rstrip(";\n") + ";\n"
-        variant_sql = "".join(
-            f"SET {key} = {sql_literal(value) if isinstance(value, str) else value};\n"
-            for key, value in (rec.variant or {}).items()
-        )
-        (d / "repro.sql").write_text(
-            "-- Run in this directory with a matching Sirius-loaded DuckDB shell.\n"
-            "-- Use a fresh database path for each attempt.\n"
-            "SET gpu_execution = false;\nATTACH 'repro.duckdb' AS repro;\nUSE repro;\n"
-            ".read dataset.sql\nCHECKPOINT;\n"
-            "-- Reference result\n"
-            + query
-            + "SET enable_duckdb_fallback = false;\nSET gpu_execution = true;\n"
-            "-- GPU baseline\n"
-            + query
-            + ("-- Recorded variant\n" + variant_sql + query if variant_sql else "")
-        )
-        (d / "REPLAY.md").write_text(
-            "Run from a Sirius checkout (replace the path):\n\n"
-            "```sh\npixi run -e duckdb-python fuzz replay /absolute/path/to/this/bundle\n```\n\n"
-            "Replay restores config.toml, sirius.yaml and the recorded variant. It writes a new output directory; this bundle is not modified.\n"
-            "Use --extension to select the matching binary, or deliberately test another build (the new fingerprint is recorded). "
-            "Check environment.json and runtime.json for the original environment. YAML may reference machine-specific spill paths: "
-            "use --sirius-config for a local copy when necessary; the override is recorded.\n\n"
-            "For a standalone shell reproduction, start the matching DuckDB shell in this directory, set SIRIUS_CONFIG_FILE to sirius.yaml, "
-            "LOAD the matching Sirius extension, then `.read repro.sql`. Use a fresh directory/database for each attempt. "
-            "repro.sql prints CPU, strict GPU and recorded variant results as applicable; it does not compare them.\n"
-        )
+            lines.append(f"- setting variant: `{rec.variant}`")
+        lines.append(f"- comparison: {rec.comparison}; dataset: {rec.dataset}")
+        if rec.reduced_sql:
+            lines += [
+                "",
+                f"## Query (reduced in {rec.reduction_steps} steps; original in query.sql)",
+                "",
+                "```sql",
+                rec.reduced_sql.rstrip().rstrip(";") + ";",
+                "```",
+            ]
+            if rec.reduced_reason and rec.reduced_reason != rec.reason:
+                lines.append(f"\nReduced query's reason: {rec.reduced_reason}")
+        else:
+            lines += [
+                "",
+                "## Query",
+                "",
+                "```sql",
+                rec.sql.rstrip().rstrip(";") + ";",
+                "```",
+            ]
+        if rec.detail or rec.diffs:
+            lines += ["", "## What differed", ""]
+            if rec.detail:
+                lines.append(rec.detail)
+            lines += [f"- {line}" for line in rec.diffs]
+        lines += [
+            "",
+            "## Replay",
+            "",
+            "```sh",
+            f"pixi run -e duckdb-python fuzz replay {d.resolve()}",
+            "```",
+            "",
+            "Replay restores config.toml, sirius.yaml and the recorded setting variant, writes a new",
+            "directory and leaves this one unchanged. `--original` replays query.sql instead of",
+            "reduced.sql; `--extension` tests another build. If this directory was copied, use its",
+            "new path. `fuzz recheck <run-dir>` replays every finding of the run at once.",
+            "",
+            "## Files",
+            "",
+            "query.sql and dataset.sql are the original inputs; reduced.sql and reduction.json exist",
+            "when reduction made progress; meta.json holds the full record, provenance and session",
+            "settings; worker.stderr is kept for crashes and hangs; more/<n>/ holds further",
+            "query/dataset pairs with the same signature.",
+            "",
+        ]
+        (d / "FINDING.md").write_text("\n".join(lines))
 
     def add_reduction(self, rec: QueryRecord) -> None:
         d = self.record_paths.get((rec.dataset, rec.sql))
@@ -334,6 +370,8 @@ class Report:
                 "note": "Original evidence retained in meta.json; reduced SQL requires a fresh replay.",
             },
         )
+        if (d / "FINDING.md").exists():
+            self._write_finding_md(d, d.name, rec)
         # The summary shows the smallest reproducer seen for the signature.
         entry = self.findings.get(
             self.record_signatures.get((rec.dataset, rec.sql), "")
@@ -566,78 +604,6 @@ def _CLAIMED_FEATURES(cfg: FuzzConfig) -> list[str]:
     if f.distinct:
         claimed.append("distinct")
     return claimed
-
-
-def catch2_snippet(
-    name: str, rec: QueryRecord, dataset_path: pathlib.Path | None, query_sql: str
-) -> str:
-    schema_hint = (
-        f"// Data: see dataset.sql next to this file ({dataset_path.name}); paste its CREATE/INSERT\n"
-        "// statements into run_ok() calls, or load it with the shell before running the query.\n"
-        if dataset_path
-        else "// Data: dataset SQL was not captured.\n"
-    )
-    comparator = (
-        "compare_gpu_vs_cpu_ordered"
-        if rec.comparison == "ordered"
-        else "compare_gpu_vs_cpu"
-    )
-    comparison = f"  {comparator}(query);\n"
-    if rec.variant:
-        comparison += (
-            "  auto baseline = con->Query(query);\n"
-            "  REQUIRE(baseline);\n"
-            "  REQUIRE_FALSE(baseline->HasError());\n"
-        )
-        restores = ""
-        for i, (setting, value) in enumerate(rec.variant.items()):
-            current_sql = json.dumps(f"SELECT current_setting({sql_literal(setting)});")
-            literal = (
-                sql_literal(value) if isinstance(value, str) else str(value).lower()
-            )
-            set_sql = json.dumps(f"SET {setting} = {literal};")
-            restore_prefix = json.dumps(f"SET {setting} = ")
-            comparison += (
-                f"  auto original_{i} = con->Query({current_sql});\n"
-                f"  REQUIRE(original_{i});\n"
-                f"  REQUIRE_FALSE(original_{i}->HasError());\n"
-                f"  run_ok({set_sql});\n"
-            )
-            restores = (
-                f'  run_ok({restore_prefix} + original_{i}->GetValue(0, 0).ToSQLString() + ";");\n'
-                + restores
-            )
-        sort = "false" if rec.comparison == "ordered" else "true"
-        comparison += (
-            "  auto before = sirius::test::get_transparent_execution_stats(*con);\n"
-            "  auto variant = con->Query(query);\n"
-            "  auto after = sirius::test::get_transparent_execution_stats(*con);\n"
-            "  // Restore settings before asserting on the variant result.\n"
-            + restores
-            + "  REQUIRE(variant);\n"
-            "  REQUIRE_FALSE(variant->HasError());\n"
-            "  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);\n"
-            "  REQUIRE(baseline->ColumnCount() == variant->ColumnCount());\n"
-            f"  auto baseline_rows = collect_rows(baseline->Cast<duckdb::MaterializedQueryResult>(), {sort});\n"
-            f"  auto variant_rows = collect_rows(variant->Cast<duckdb::MaterializedQueryResult>(), {sort});\n"
-            "  REQUIRE(baseline_rows == variant_rows);\n"
-        )
-    return (
-        "// Generated by siriusfuzz; drop into test/cpp/integration/test_gpu_execution_fuzz.cpp\n"
-        f"{schema_hint}"
-        "TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,\n"
-        f'                 "fuzz repro {name}",\n'
-        '                 "[integration][gpu_execution][fuzz]")\n'
-        "{\n"
-        '  run_ok(R"SQL(\n'
-        "    -- schema + data from dataset.sql\n"
-        '  )SQL");\n'
-        '  run_ok("CHECKPOINT;");\n'
-        f"  // verdict: {rec.verdict}; reason: {rec.reason[:100]}\n"
-        '  const std::string query = R"SQL(\n'
-        f"{query_sql}\n"
-        '  )SQL";\n' + comparison + "}\n"
-    )
 
 
 def default_known_issues_path(cfg: FuzzConfig) -> pathlib.Path | None:

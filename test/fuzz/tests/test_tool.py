@@ -512,7 +512,7 @@ class ToolTests(unittest.TestCase):
                     bundle / "meta.json",
                     {"verdict": verdict, "execution": {"cpu_only": True}},
                 )
-            (run / "findings" / "000-mismatch-aa" / "additional").mkdir()
+            (run / "findings" / "000-mismatch-aa" / "more").mkdir()
             outcomes = iter(
                 [
                     {"status": "ok", "record": {"verdict": "ok", "reason": ""}},
