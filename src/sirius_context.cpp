@@ -349,23 +349,8 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
-  // The DuckDB query-end callback releases no slot or repository state: slot ownership is
-  // scope-bound and the mandatory cleanup runs inside the execution window
-  // (StandaloneQueryScope::finish), before the result is exposed.
-  //
-  // The iceberg delete-data memo is the one thing that must still be dropped here rather than
-  // in run_mandatory_cleanup(). It is populated at PLAN time, and this scan path deliberately
-  // declines unsupported iceberg tables at plan time — those queries never open an execution
-  // window, so a clear living only in the window would never run for them. An entry that
-  // outlives its query can serve a previous snapshot's deletes, i.e. return rows the table has
-  // since removed. This hook fires per statement for GPU and CPU queries alike.
-  //
-  // The internal-query bracket is checked by the QueryEnd(ClientContext&) overload above this
-  // one, which is the only path DuckDB delivers (client_context.cpp calls QueryEnd(ctx, error)).
-  // The memo is filled by internal connections during planning, so a clear that ran for those
-  // would drop the entry the plan just built; iceberg_delete_data_uncached_read_count() is the
-  // assertion that holds this honest.
-  sirius::op::scan::clear_iceberg_delete_data_cache();
+  // Execution windows own retirement. Plan-time Iceberg memoization has its own
+  // connection-local QueryEnd callback, including queries declined before execution.
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)
@@ -581,7 +566,7 @@ std::size_t SiriusContext::release_query_state(sirius::query_id_t query_id, bool
   // Best-effort: telemetry failure must not abort the remaining mandatory
   // steps or poison the runtime.
   try {
-    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
+    sirius::telemetry::batch_telemetry_registry::instance().on_query_end(query_id);
   } catch (std::exception& e) {
     try {
       SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
@@ -1248,13 +1233,6 @@ SiriusContext::get_data_repository_manager(sirius::query_id_t query_id) const
 {
   throw_if_not_initialized();
   return data_repository_registry_.get(query_id);
-}
-
-std::vector<sirius::data::data_repository_manager_registry::manager_ptr>
-SiriusContext::get_data_repository_managers() const
-{
-  throw_if_not_initialized();
-  return data_repository_registry_.get_all();
 }
 
 sirius::data::data_repository_manager_registry& SiriusContext::get_data_repository_registry()
