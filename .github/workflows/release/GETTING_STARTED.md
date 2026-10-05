@@ -18,7 +18,15 @@ curl https://install.duckdb.org | DUCKDB_VERSION={{DUCKDB_VERSION_BARE}} sh
 
 {{DOWNLOAD_LINKS}}
 
-### 3. Allow unsigned extensions
+### 3. Decompress it
+
+Downloads are gzip-compressed to fit under GitHub's release-asset size limit:
+
+```bash
+gunzip <downloaded-file>.duckdb_extension.gz
+```
+
+### 4. Allow unsigned extensions
 
 Sirius isn't published through DuckDB's official signed extension repository yet, so you need to explicitly allow
 unsigned extensions before loading it:
@@ -32,7 +40,7 @@ For client APIs, pass the same config at connect time instead, e.g. Python:
 
 **Warning**: unsigned extensions execute native code with the host process's privileges.
 
-### 4. Load the extension and try it
+### 5. Load the extension and try it
 
 ```sql
 LOAD './{{FIRST_FILE}}';
