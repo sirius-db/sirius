@@ -217,13 +217,11 @@ jobs:
           pixi run cargo test --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys
 
       - name: Build (vcpkg)
-        env:
-          CUDAARCHS: "100"
         if: matrix.build.environment == 'vcpkg'
         run: |
           set -o pipefail
           pixi run -e vcpkg cmake -S . -B build/vcpkg-release -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$CUDAARCHS" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100 \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_BUILD=ON -DCPM_LOCAL_PACKAGES_ONLY=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache -DSIRIUS_BUILD_STATIC=ON -DSIRIUS_BUILD_TESTS=ON 2>&1 | tee /tmp/vcpkg.log
