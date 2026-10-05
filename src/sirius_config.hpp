@@ -132,7 +132,9 @@ struct operator_params {
 
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
-  bool like_swar_fastpath = false;
+  bool like_swar_fastpath                           = false;
+  expression_evaluator_strategy expression_strategy = expression_evaluator_strategy::AST_INTERPRET;
+  bool enable_regex_jit                             = true;
 
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
