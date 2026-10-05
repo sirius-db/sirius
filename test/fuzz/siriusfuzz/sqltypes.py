@@ -15,9 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# Kinds an expression can have. ``int`` covers every signed/unsigned integer
-# width; ``timestamp`` covers every timestamp precision.
-KINDS = ("bool", "int", "float", "decimal", "date", "timestamp", "varchar")
+# ``int`` covers every integer width, ``timestamp`` every timestamp precision.
 NUMERIC_KINDS = ("int", "float", "decimal")
 
 
@@ -26,7 +24,7 @@ class SqlType:
     """A concrete DuckDB type together with its generation kind."""
 
     name: str  # exact DuckDB spelling, e.g. "DECIMAL(12,2)"
-    kind: str  # one of KINDS
+    kind: str  # bool | int | float | decimal | date | timestamp | varchar
     signed: bool = True  # integers only
     bits: int = 64  # integers / floats
     precision: int = 0  # decimals: width

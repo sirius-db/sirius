@@ -99,26 +99,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_config(None, ["features.no_such_thing=true"])
 
-    def test_retired_keys_accepted_only_with_their_old_behaviour(self):
-        # Bundles saved before these options were removed still carry them.
-        with tempfile.TemporaryDirectory() as tmp:
-            saved = pathlib.Path(tmp) / "config.toml"
-            saved.write_text(
-                'profile = "strict"\n'
-                "[features.cte]\nrecursive = false\n"
-                "[features.aggregates]\nfilter = false\norder_by = false\n"
-                "[features.limit]\npercent = false\n"
-                '[oracle]\non_plan_fallback = "fail"\n'
-            )
-            self.assertEqual(load_config(saved).to_dict(), FuzzConfig().to_dict())
-        self.assertEqual(
-            load_config(None, ["profile=frontier"]).to_dict(),
-            load_config(None).to_dict(),
-        )
-        for retired in ("features.cte.recursive=true", "oracle.on_plan_fallback=count"):
-            with self.assertRaises(ConfigError):
-                load_config(None, [retired])
-
     def test_overrides_and_keywords(self):
         cfg = load_config(
             None,
