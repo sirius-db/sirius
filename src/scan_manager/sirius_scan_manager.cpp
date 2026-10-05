@@ -1337,9 +1337,7 @@ sirius_scan_manager::sirius_scan_manager(
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
-    // Query execution is serialized by SiriusContext's lifecycle slot. Reserve one extra
-    // worker for the query's blocking coalescer so its producers retain their working budget.
-    _thread_pool(_config.thread_pool.num_threads + 1,
+    _thread_pool(_config.thread_pool.num_threads,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _ioctx_registry(_config, reservation_manager)
@@ -1472,25 +1470,13 @@ void sirius_scan_manager::prepare_for_query(
     reset(query_id);
   }
 
-  // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
-  // generation counter (prefetching_cache::_ticker, bumped in
-  // prefetching_cache::prepare_for_query, src/io/cache/prefetching_cache.cpp).
-  // chunk_lifecycle::eviction_tier(query_tick) (src/include/io/cache/types.hpp) scores every
-  // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
-  // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
-  // front of the eviction order. Performance only, never correctness: mark_evicting()
-  // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
-  // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
-  // epochs rather than newest-wins), not here.
+  // Refresh synchronized cache accounting; cache entries retain their own IO/read leases.
   if (_io_ctx && _io_ctx->cache()) {
     auto const report = _io_ctx->cache()->prepare_for_query();
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", report);
   }
 
-  // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
-  // reused across queries; advance their caches to this query too, or a routed
-  // cache's epoch freezes at build time and a later query serves the prior
-  // query's cached chunks as current. Same global-epoch caveat as above.
+  // Refresh accounting for lazily created backend caches too.
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [type, io_ctx] : _routed_io_ctxs) {
@@ -1509,10 +1495,11 @@ void sirius_scan_manager::prepare_for_query(
   state->completion = completion;
   state->active_gpu_ids.assign(allocated_gpu_ids.begin(), allocated_gpu_ids.end());
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; the shared pool selects older queries
+  // whole pool. Dispatchers yield between tasks; each shared pool selects older queries
   // first and preserves FIFO order within each query's priority.
-  state->dispatcher = std::make_unique<exec::scoped_dispatcher>(
-    _thread_pool, _thread_pool.num_threads(), sirius::query_priority_bits(query_id));
+  auto const priority = sirius::query_priority_bits(query_id);
+  state->dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads(), priority);
   state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   // ioctxs are process/query-manager resources and remain alive across query
@@ -1571,8 +1558,11 @@ void sirius_scan_manager::prepare_for_query(
 
     if (plan.budget > 0) {
       // Registers its mailbox for the query's lifetime; unregistered in reset().
-      state->readahead = std::make_shared<readahead_scan_manager>(
-        *_query_event_publisher, plan.budget, _physical_counters);
+      state->readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher,
+                                                                  plan.budget,
+                                                                  _shared_readahead_budget,
+                                                                  _config.max_readahead_scans,
+                                                                  _physical_counters);
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }
