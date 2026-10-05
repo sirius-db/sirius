@@ -18,6 +18,7 @@
 #include <catch.hpp>
 
 // sirius
+#include <vss/cluster_lists.hpp>
 #include <vss/vector_clustering.hpp>
 
 // raft
@@ -30,15 +31,18 @@
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 // rmm
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -357,4 +361,40 @@ TEST_CASE("assign_to_centroids round-trips centroids trained by train_centroids"
   CHECK(std::all_of(
     clusters.begin() + 4, clusters.end(), [&](std::int32_t c) { return c == clusters[4]; }));
   CHECK(clusters[0] != clusters[4]);
+}
+
+// The list build square-roots whichever maximum these report into max_row_norm, which bounds the
+// FP16 filter; both must report the squared norm, or rows of norm above 1 get too tight a bound.
+TEST_CASE("half and FP32 row norms report the same largest squared norm", "[vss]")
+{
+  constexpr std::int64_t dim  = 16;
+  constexpr std::int64_t rows = 2;
+  auto const stream           = cudf::get_default_stream();
+  // Integer components round to half exactly, so both norms are exactly 3^2 and 40^2.
+  std::vector<float> host(rows * dim, 0.f);
+  host[0]       = 3.f;
+  host[dim + 1] = 40.f;
+
+  rmm::device_uvector<float> x(host.size(), stream);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    x.data(), host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice, stream.value()));
+  rmm::device_uvector<std::uint16_t> h(host.size(), stream);
+  sirius::vss::narrow_to_float16(x.data(), rows * dim, h.data(), stream);
+  rmm::device_uvector<float> sq(rows, stream);
+  rmm::device_uvector<unsigned int> bits(2, stream);
+  CUDF_CUDA_TRY(cudaMemsetAsync(bits.data(), 0, 2 * sizeof(unsigned int), stream.value()));
+
+  sirius::vss::half_rows_norms(
+    x.data(), h.data(), rows, dim, sq.data(), nullptr, nullptr, bits.data(), stream);
+  sirius::vss::float_row_sq_norms(x.data(), rows, dim, sq.data(), bits.data() + 1, stream);
+
+  std::vector<unsigned int> out(2);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    out.data(), bits.data(), 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  float half_max = 0.f, fp32_max = 0.f;
+  std::memcpy(&half_max, &out[0], sizeof(float));
+  std::memcpy(&fp32_max, &out[1], sizeof(float));
+  CHECK(half_max == 1600.f);
+  CHECK(fp32_max == 1600.f);
 }

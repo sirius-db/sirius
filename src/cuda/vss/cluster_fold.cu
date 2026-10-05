@@ -327,7 +327,7 @@ __global__ void int8_code_limit_kernel(float const* bound,
 }
 
 // |half(x)|^2 per row, with the row's rounding error |x - half(x)|: to row_error[r] and/or into
-// *max_error_bits, and the largest |half(x)| into *max_norm_bits (all non-negative floats' bits).
+// *max_error_bits, and the largest |half(x)|^2 into *max_norm_bits (all non-negative floats' bits).
 __global__ void half_rows_norms_kernel(float const* x,
                                        uint16_t const* h,
                                        int64_t rows,
@@ -356,7 +356,7 @@ __global__ void half_rows_norms_kernel(float const* x,
       float const e = sqrtf(err) * (1.f + 1e-6f);
       if (row_error != nullptr) { row_error[r] = e; }
       if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
-      if (max_norm_bits != nullptr) { atomicMax(max_norm_bits, __float_as_uint(sqrtf(acc))); }
+      if (max_norm_bits != nullptr) { atomicMax(max_norm_bits, __float_as_uint(acc)); }
     }
   }
 }

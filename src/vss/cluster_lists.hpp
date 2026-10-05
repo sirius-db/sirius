@@ -315,7 +315,7 @@ void int8_seed_upper_bound(float* bound,
 
 /// |half(x)|^2 per row of FP32 rows @p x and their half-rounded copy @p h, with each row's
 /// rounding error |x - half(x)| to row_error[i] and/or into *max_error_bits, and the largest
-/// |half(x)| into *max_norm_bits, for whichever are given (non-negative floats' bits).
+/// |half(x)|^2 into *max_norm_bits, for whichever are given (non-negative floats' bits).
 void half_rows_norms(float const* x,
                      std::uint16_t const* h,
                      std::int64_t rows,
