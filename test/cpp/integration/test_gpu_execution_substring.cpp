@@ -43,6 +43,7 @@ void create_substring_tables(SubstringFixture& fx)
   fx.run_ok(
     "INSERT INTO unicode_t VALUES"
     " (1, 'héllo wörld'), (2, ''), (3, NULL), (4, '日本'), (5, 'ascii only'), (6, 'ñ');");
+  fx.run_ok("CHECKPOINT;");
 }
 
 }  // namespace
