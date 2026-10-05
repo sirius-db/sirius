@@ -16,6 +16,7 @@
 
 #include "scan_manager/memory_prefetcher.hpp"
 
+#include "cuda/device_health.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
@@ -108,6 +109,18 @@ void memory_prefetcher::stop()
   _workers.clear();
 }
 
+void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
+{
+  if (!fatal_device_exception(error)) return;
+  _running.store(false, std::memory_order_relaxed);
+
+  _lifecycle.mark_runtime_failed();
+  try {
+    _lifecycle.quiesce_all();
+  } catch (...) {
+  }
+}
+
 void memory_prefetcher::worker_loop()
 {
   while (_running.load(std::memory_order_relaxed)) {
@@ -118,6 +131,7 @@ void memory_prefetcher::worker_loop()
       auto lease = sirius::memory::runtime_stream_pool::acquire(*space);
       converted  = sweep(lease.get(), space);
     } catch (const std::exception& e) {
+      handle_error(std::current_exception());
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }
 
@@ -260,6 +274,7 @@ std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream,
                          mut->get_batch_id());
         return converted;
       } catch (const std::exception& e) {
+        handle_error(std::current_exception());
         // Conversion is more than data movement (compressed batches decode
         // here), so non-OOM failures are possible. Skip the batch: the scan
         // task converts it itself on the authoritative path and surfaces the
