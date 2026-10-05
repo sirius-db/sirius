@@ -153,6 +153,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
+    test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
