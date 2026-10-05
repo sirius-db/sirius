@@ -102,7 +102,8 @@ pinned_column_storage_matrix storage_for(std::size_t n_columns)
 struct epoch_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   cucascade::memory::memory_space* space =
     sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::GPU);
 

@@ -43,13 +43,15 @@ using sirius::creator::task_creator_config;
 //! wired because none of the per-query lifecycle entry points below dispatch tasks.
 struct query_state_fixture {
   query_state_fixture()
-    : memory_manager(initialize_memory_manager(1)), creator(task_creator_config{}, *memory_manager)
+    : memory_manager(initialize_memory_manager(1)),
+      creator(lifecycle, task_creator_config{}, *memory_manager)
   {
   }
 
   duckdb::DuckDB db{nullptr};
   duckdb::Connection con{db};
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
+  sirius::exec::query_lifecycle_registry lifecycle;
   task_creator creator;
 };
 

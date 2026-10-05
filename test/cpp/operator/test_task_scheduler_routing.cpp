@@ -126,8 +126,10 @@ TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgp
   constexpr int tested_device_count = 2;
   auto manager                      = initialize_memory_manager(tested_device_count);
   sirius::exec::thread_pool_config gpu_config{1};
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
   sirius::pipeline::task_scheduler scheduler(
-    gpu_config, *manager, sirius::test::make_test_telemetry_context());
+    lifecycle, gpu_config, *manager, sirius::test::make_test_telemetry_context());
   auto state = std::make_shared<routing_test_global_state>();
 
   scheduler.schedule(std::make_unique<routing_test_task>(0, 0, state));

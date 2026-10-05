@@ -1099,7 +1099,8 @@ TEST_CASE_METHOD(fragment_fixture,
       auto fragment = make_leaf();
       {
         query_window window(*sirius_ctx, *con->context, "frag12_outer");
-        REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("nested execution window"));
+        REQUIRE_THROWS_WITH(fragment->build(),
+                            ContainsSubstring("Nested Sirius execution windows"));
       }
       REQUIRE_THROWS_WITH(fragment->build(), ContainsSubstring("cannot be retried"));
     }
@@ -1167,4 +1168,38 @@ TEST_CASE_METHOD(fragment_fixture,
     con->Rollback();
     throw;
   }
+}
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "runtime retirement retains resources until the query window closes",
+                 "[integration][query_retirement]")
+{
+  using retirement = duckdb::SiriusContext::query_retirement_mode;
+  auto mode        = retirement::completed;
+  SECTION("successful completion") { mode = retirement::completed; }
+  SECTION("cancellation") { mode = retirement::cancelled; }
+
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  query_window window(*runtime, *con->context, "retirement_ownership");
+  auto const query_id         = window.query_id();
+  auto& lifecycle             = runtime->get_query_lifecycle_registry();
+  auto resource               = std::make_shared<int>(42);
+  std::weak_ptr<int> retained = resource;
+  lifecycle.retain_resources(query_id, std::move(resource));
+
+  runtime->retire_query_work(query_id, mode);
+  CHECK_FALSE(lifecycle.accepts_work(query_id));
+  CHECK(lifecycle.activity(query_id).work == 0);
+  CHECK_FALSE(retained.expired());
+  CHECK(runtime->get_data_repository_manager(query_id) != nullptr);
+
+  // Engine destruction and the execution window can both retire the same query.
+  REQUIRE_NOTHROW(runtime->retire_query_work(query_id, retirement::cancelled));
+  CHECK_FALSE(retained.expired());
+  window.finish();
+  CHECK(retained.expired());
+  CHECK(runtime->get_data_repository_manager(query_id) == nullptr);
+  REQUIRE_NOTHROW(runtime->retire_query_work(query_id, retirement::cancelled));
+  CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
 }

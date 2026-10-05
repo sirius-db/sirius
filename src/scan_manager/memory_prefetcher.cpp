@@ -36,8 +36,9 @@ namespace sirius::scan_manager {
 
 memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
                                      std::vector<std::shared_ptr<split_connector>> connectors,
-                                     cucascade::memory::memory_space* gpu_space)
-  : _config(cfg), _connectors(std::move(connectors)), _gpu_space(gpu_space)
+                                     cucascade::memory::memory_space* gpu_space,
+                                     exec::query_lifecycle_registry& lifecycle)
+  : _lifecycle(lifecycle), _config(cfg), _connectors(std::move(connectors)), _gpu_space(gpu_space)
 {
   if (_gpu_space == nullptr || _connectors.empty()) {
     _running.store(false);
