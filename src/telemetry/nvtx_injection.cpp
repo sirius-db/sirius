@@ -37,6 +37,12 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
 
 // Quent's static shim starts with this pointer set. Clear it at load so paths
 // that never call configure_nvtx_injection (e.g. SIRIUS_DISABLE) stay off.
+//
+// `constructor` is a GCC/Clang extension (supported on x86 and ARM) that runs the function when
+// the shared object is loaded, before any NVTX consumer can read the pointer. The priority (101)
+// orders it among constructors: 0-100 are reserved for the implementation, and lower values run
+// first, so 101 is the earliest priority available to user code, ahead of default-priority
+// static initializers.
 __attribute__((constructor(101))) static void disarm_static_nvtx_injection() noexcept
 {
   InitializeInjectionNvtx2_fnptr = nullptr;
