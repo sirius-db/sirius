@@ -63,8 +63,8 @@ std::filesystem::path project_root()
 #endif
 }
 
-/// Local-file scan config: no S3 backend, no prefetch cache, two workers. The pool the manager
-/// builds is num_threads + 1, which is what the two-query gates lean on.
+/// Local-file scan config: no S3 backend, no prefetch cache, two producer workers.
+/// Blocking coalescers use a separate pool so they cannot occupy producer capacity.
 sirius::scan_manager::scan_manager_config make_local_config()
 {
   sirius::scan_manager::scan_manager_config cfg;
