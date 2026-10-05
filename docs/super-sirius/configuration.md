@@ -487,8 +487,9 @@ Those two knobs derive the settings below, which are therefore **not** individua
 Overlaps the host→GPU upload of queued pinned-cache scan splits with compute:
 worker threads walk the pending splits in scan execution order and convert
 resident batches to GPU tier ahead of task creation, gated on GPU memory
-headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default;
-single-GPU configurations only (logs a warning and disables itself otherwise).
+headroom (see `scan_manager/memory_prefetcher.hpp`). Disabled by default. Workers rotate over
+the query's admitted GPUs, use per-device reservations and exclusive stream leases, and release
+those leases before parking. Multi-GPU concurrency still requires actual hardware qualification.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
