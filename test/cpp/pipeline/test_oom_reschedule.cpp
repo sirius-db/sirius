@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "creator/task_creator.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -22,7 +23,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "pipeline/task_request.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
@@ -77,8 +78,15 @@ class oom_test_global_state : public sirius::pipeline::sirius_pipeline_task_glob
 struct oom_test_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   cucascade::memory::memory_space* mem_space = nullptr;
-  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> request_channel;
-  std::unique_ptr<sirius::pipeline::gpu_pipeline_executor> executor;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  std::unique_ptr<sirius::pipeline::task_scheduler> executor;
+  std::unique_ptr<sirius::creator::task_creator> creator;
+
+  ~oom_test_fixture()
+  {
+    // GPU workers borrow the creator, so stop them before member destruction.
+    if (executor) executor->stop();
+  }
   // The query's completion signal now travels on the task's global state rather than on
   // the executor, so it is shared with whatever global state the test builds.
   std::shared_ptr<sirius::pipeline::completion_handler> completion =
@@ -106,18 +114,17 @@ struct oom_test_fixture {
     mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
     if (!mem_space) { return false; }
 
-    auto request_publisher = request_channel.make_publisher();
-
     sirius::exec::thread_pool_config config;
     config.num_threads        = num_threads;
     config.thread_name_prefix = thread_name_prefix;
 
-    executor = std::make_unique<sirius::pipeline::gpu_pipeline_executor>(
-      config,
-      mem_space,
-      std::move(request_publisher),
-      nullptr,
-      sirius::test::make_test_telemetry_context());
+    lifecycle.open_query(sirius::make_query_id(0));
+    executor = std::make_unique<sirius::pipeline::task_scheduler>(
+      lifecycle, config, *manager, sirius::test::make_test_telemetry_context());
+    creator = std::make_unique<sirius::creator::task_creator>(
+      lifecycle, sirius::creator::task_creator_config{}, *manager);
+    creator->set_task_scheduler(*executor);
+    executor->set_task_creator(*creator);
     return true;
   }
 };
@@ -372,10 +379,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 
   f.executor->start();
 
-  // Post-v1.0 push-model (commit 90dc104): gpu_pipeline_executor no longer publishes
-  // task_requests. Schedule tasks directly onto the executor instead of waiting on
-  // f.request_channel.get(). The request_channel is kept wired to preserve the
-  // fixture API but is not used at runtime.
+  // Route initial work and retries through the shared scheduler, as production does.
   std::thread request_handler([&]() {
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
       auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
@@ -399,7 +403,6 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       f.executor->stop();
-      f.request_channel.close();
       request_handler.join();
       FAIL("Timed out waiting for OOM rescheduled tasks to complete. "
            << "Completed: " << global_state->completed_count.load()
@@ -408,7 +411,6 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
   }
 
   f.executor->stop();
-  f.request_channel.close();
   request_handler.join();
 
   //--------------------------------------------------------------------------
@@ -443,7 +445,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 // The XL tasks will be rescheduled up to 10 times each before the executor
 // reports a max-retry error on the completion handler.
 // The 5 small tasks should all complete regardless.
-// After the error, drain_and_wait() should empty the task queue.
+// After the error, per-query retirement should empty the task queue.
 // ---------------------------------------------------------------------------
 TEST_CASE("GPU pipeline executor fails after max OOM retries",
           "[gpu_pipeline_executor][oom][max_retries]")
@@ -494,7 +496,6 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       f.executor->stop();
-      f.request_channel.close();
       request_handler.join();
       FAIL("Timed out waiting for max-retry OOM error. "
            << "Completed: " << global_state->completed_count.load()
@@ -505,8 +506,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   //--------------------------------------------------------------------------
   // Drain remaining tasks and shut down
   //--------------------------------------------------------------------------
-  f.executor->drain_and_wait();
-  f.request_channel.close();
+  f.executor->drain_after_error(sirius::make_query_id(0));
   request_handler.join();
   f.executor->stop();
 
@@ -530,8 +530,8 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   // XL tasks should have OOM'd many times (at least 10 for the one that hit the limit).
   REQUIRE(global_state->oom_count.load(std::memory_order_relaxed) >= 10);
 
-  // After drain_and_wait(), the task queue should be empty.
-  REQUIRE(f.executor->is_task_queue_empty());
+  // After retirement, the task queue should be empty.
+  REQUIRE(f.executor->get_pipeline_task_queue()->empty());
 
   INFO("Max-retry OOM test passed: " << global_state->oom_count.load() << " OOM events, "
                                      << global_state->completed_count.load()

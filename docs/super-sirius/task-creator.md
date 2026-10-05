@@ -31,15 +31,15 @@ Create task (gpu_pipeline_task)
 Dispatch to executor (task_scheduler)
 ```
 
-## Global State Maps
+## Per-query State
 
-Initialized during `prepare_for_query()`, cleared during `reset()`:
+Created for each query at execution-window begin, filled during `prepare_for_query()`, and removed by `reset(query_id)`:
 
 | Map | Key | Value | Purpose |
 |-----|-----|-------|---------|
-| `_gpu_operator_global_state_map` | operator ID | `gpu_pipeline_task_global_state` | Shared per-operator pipeline state |
+| `_query_task_global_states` | query ID | `query_task_global_state` | Completion handler, per-operator pipeline states, and look-ahead queue for one query |
 
-All map access is protected by `_global_state_mutex`.
+The registry is protected by `_global_state_mutex`. Each query's pipeline-state map is filled before its task-creation workers read it.
 
 ## `TaskCreationHint` Enum
 
@@ -219,7 +219,7 @@ The `mark_task_created()` call before data popping prevents a race condition whe
 
 **Files:** `src/creator/config.hpp`, `src/creator/task_creator.cpp`
 
-The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds a `_lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the queue from `_index_of_next_lookahead`, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
+The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds that query's `lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the query's queue, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks(query_id)` and `reset(query_id)` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
 
 ## Device Assignment for GPU Tasks
 
@@ -253,11 +253,13 @@ Both throw `not implemented` in the base class and must be overridden by operato
 
 **File:** `src/creator/task_creator.cpp`
 
-Called during `drain_after_error()` to cleanly shut down:
-1. `_task_creation_queue.interrupt()` then `.drain()` — clears pending requests
-2. `_bounded_pool->wait_all()` — waits for in-flight task-creation lambdas to complete (guarded, since `stop_thread_pool()` may have released the pool)
-3. Clears the look-ahead queue and cursor under `_lookahead_mutex` — avoids dereferencing dangling operators after `QueryEnd`
-4. `reactivate()` — prepares for the next query
+`drain_pending_tasks(query_id)` is called during error cleanup and query reset:
+
+1. Drains that query's requests from `_task_creation_queue` using its query index.
+2. Waits for that query's in-flight task-creation lambdas to finish.
+3. Clears that query's look-ahead queue and cursor under its state mutex.
+
+The shared queue remains open for other queries.
 
 ## Key Files
 

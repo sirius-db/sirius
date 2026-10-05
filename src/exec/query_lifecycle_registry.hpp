@@ -285,7 +285,7 @@ class query_lifecycle_registry {
     control->resources = std::move(resources);
   }
 
-  /// Retire resources only after all asynchronous users, before repositories are cleared.
+  /// Retire resources only after all asynchronous users and cleanup that borrows them.
   /// Run destructors outside both locks: they can invoke callbacks into the runtime.
   void release_resources(query_id_t query_id)
   {

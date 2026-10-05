@@ -1306,11 +1306,13 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
-  : _config(validate_scan_manager_config(config)),
+  : _query_lifecycle(lifecycle),
+    _config(validate_scan_manager_config(config)),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
@@ -1959,20 +1961,6 @@ void sirius_scan_manager::prepare_for_query(
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
   {
     std::lock_guard lk{_query_states_mutex};
-    if (_query_states.size() >= static_cast<std::size_t>(k_max_concurrent_queries)) {
-      // The pool is sized for k_max_concurrent_queries parked sequencers; past that, each
-      // extra query eats into the working budget and at pool size it deadlocks outright.
-      // Loud rather than silent, so the missing config option reports itself the first time
-      // real concurrency is exercised. See k_max_concurrent_queries.
-      SIRIUS_LOG_WARN(
-        "[sirius_scan_manager::prepare_for_query] registering query {} brings the live query "
-        "count to {}, above the {} the scan thread pool is sized for; scan throughput will "
-        "degrade and {} concurrent queries would deadlock. Raise k_max_concurrent_queries.",
-        query_id,
-        _query_states.size() + 1,
-        k_max_concurrent_queries,
-        _thread_pool.num_threads() + k_max_concurrent_queries);
-    }
     _query_states.emplace(query_id, state);
   }
 
@@ -2059,7 +2047,8 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     connectors.push_back(scan.op->get_shared_split_connector());
   }
 
-  state.prefetcher = std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space);
+  state.prefetcher =
+    std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space, _query_lifecycle);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -2216,6 +2205,10 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
 {
+  // The engine retires scans while their operators are alive. Window cleanup and state
+  // destruction repeat this barrier after a prepared statement may have released its plan.
+  // Keep providers alive for batch disposal, but never revisit the borrowed operators.
+  if (std::exchange(drained, true)) { return; }
   if (coordinator) coordinator->request_stop(stop_reason::normal_eos);
   if (completion && completion->injections)
     completion->release_footer_for_testing(completion->injections->hold_footer_index);
@@ -2253,6 +2246,11 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
   std::lock_guard lk{_query_states_mutex};
   auto it = _query_states.find(query_id);
   return it == _query_states.end() ? nullptr : it->second;
+}
+
+void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
+{
+  if (auto state = get_query_state(query_id)) { state->drain(); }
 }
 
 void sirius_scan_manager::reset(sirius::query_id_t query_id)
