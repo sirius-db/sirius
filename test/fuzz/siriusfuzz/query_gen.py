@@ -892,10 +892,9 @@ class QueryGenerator:
         order = [OrderItem(rng.choice(cols), desc=rng.random() < 0.5)]
 
         def row_number() -> Window:
-            # row_number() numbers ORDER BY ties arbitrarily. Ordering by every column
-            # in scope leaves ties only between rows equal in all of them, which the
-            # output cannot tell apart. The aggregates below need no tiebreak: their
-            # default RANGE frame gives peers the same value.
+            # row_number() breaks ORDER BY ties arbitrarily; ordering by every column
+            # in scope leaves ties only between indistinguishable rows. The aggregates
+            # below need no tiebreak: their default RANGE frame gives peers one value.
             order.extend(
                 OrderItem(c, desc=rng.random() < 0.5)
                 for c in cols

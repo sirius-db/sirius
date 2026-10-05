@@ -4,22 +4,14 @@
 # See the LICENSE file at the repo root for the full text.
 """One DuckDB shell process per session, driven over pipes.
 
-The shell is the one built next to the Sirius extension (``build/release/duckdb``),
-so nothing has to be built besides Sirius and no version metadata can disagree.
-Every statement is followed by a marker on each stream, written with the shell's
-own dot commands (``.print``, and ``.output /dev/stderr`` for the stderr one) so
-the markers never pass through SQL or Sirius; a result (JSON on stdout) and its
-error text (stderr) are therefore delimited exactly. Sirius prints a banner on
-stdout when it falls back to the CPU; it is removed from the result and kept
-as log. A query that overruns its timeout gets the shell killed and restarted,
-because the shell exits on SIGINT when stdin is a pipe; a GPU fault takes the
-shell down the same way and is reported as a crash. The next statement starts a
-fresh shell and re-attaches the datasets, which are files on disk.
-
-Generated tables live in an ATTACHed file-backed database (in-memory tables
-never reach the GPU native scan) and are CHECKPOINTed so the scan sees them on
-disk. Queries run with ``enable_duckdb_fallback = false`` so plan-time and
-runtime fallbacks surface as errors instead of silent CPU runs.
+The shell is the one built with the Sirius extension (``build/release/duckdb``).
+Each statement is followed by a marker on stdout and on stderr, written with the
+shell's dot commands so they never pass through SQL; the JSON result and the
+error text are delimited exactly. A timed-out statement gets the shell killed, a
+GPU fault takes it down, and either way the next statement starts a fresh shell
+and re-attaches the datasets, which are files on disk (in-memory tables never
+reach the GPU scan). Queries run with ``enable_duckdb_fallback = false`` so
+fallbacks surface as errors.
 """
 
 from __future__ import annotations
@@ -197,9 +189,8 @@ class Shell:
             threading.Thread(
                 target=self._pump, args=(stream, name, self.events), daemon=True
             ).start()
-        # Startup chatter (an extension banner, driver messages) belongs to no statement.
-        # A SET is never intercepted by Sirius; a SELECT here would run on the GPU with
-        # fallback still enabled.
+        # Drain startup output with a statement Sirius never intercepts; a SELECT
+        # would run on the GPU with fallback still enabled.
         first = self.execute("SET enable_progress_bar = false", timeout=300)
         if first.status != "ok":
             raise SessionError(
@@ -233,8 +224,7 @@ class Shell:
         self.counter += 1
         tag = f"{_SENTINEL}-{self.counter}"
         stderr_tag = f"{tag}-stderr"
-        # Dot commands never reach SQL, so the markers cannot be intercepted by
-        # Sirius or fail with it; a SELECT marker did both when GPU execution was on.
+        # Dot commands never reach SQL, so Sirius cannot intercept the markers.
         text = (
             f"{sql.rstrip().rstrip(';')}\n;\n"
             f".output /dev/stderr\n.print {stderr_tag}\n.output\n"
@@ -256,9 +246,8 @@ class Shell:
             if remaining is not None and remaining <= 0:
                 if killed:
                     break
-                # The shell leaves its input loop on SIGINT when stdin is a pipe, so
-                # interrupting would end it anyway; kill, and let the next statement
-                # start a fresh one.
+                # SIGINT would end a piped shell anyway; kill it and let the next
+                # statement start a fresh one.
                 self.kill()
                 killed = True
                 deadline = time.monotonic() + 5
