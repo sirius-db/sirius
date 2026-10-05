@@ -51,6 +51,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/optimizer/expression_rewriter.hpp>
 #include <duckdb/planner/expression/bound_between_expression.hpp>
 #include <duckdb/planner/expression/bound_case_expression.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -580,6 +581,34 @@ TEST_CASE("ast_from_duckdb - date_trunc admits only GPU-supported constant frequ
   SECTION("NULL frequency")
   {
     fn_expr->children[0] = duckdb::make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - constant_or_null translates with its constant as the first argument",
+          "[ast_from_duckdb]")
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  children.push_back(make_bound_ref(0, LogicalTypeId::INTEGER));
+  children.push_back(make_bound_ref(1, LogicalTypeId::VARCHAR));
+  auto fn_expr =
+    duckdb::ExpressionRewriter::ConstantOrNull(std::move(children), Value::BOOLEAN(true));
+
+  auto out = sirius::ast::from_duckdb(*fn_expr);
+  REQUIRE(out);
+  REQUIRE(out->holds<function_call>());
+  auto const& fc = out->get<function_call>();
+  REQUIRE(fc.function() == sirius::function_id::constant_or_null);
+  REQUIRE(fc.return_type().id() == sirius::type_id::BOOLEAN);
+  REQUIRE(fc.arguments().size() == 3);
+  REQUIRE(fc.arguments()[0]->holds<constant>());
+  REQUIRE(fc.arguments()[1]->holds<reference>());
+  REQUIRE(fc.arguments()[2]->holds<reference>());
+
+  SECTION("non-constant first argument")
+  {
+    fn_expr->Cast<BoundFunctionExpression>().children[0] =
+      make_bound_ref(2, LogicalTypeId::BOOLEAN);
     REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
   }
 }
