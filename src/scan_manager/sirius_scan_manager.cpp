@@ -27,6 +27,7 @@
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
@@ -644,11 +645,15 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   return {};
 }
 
-/// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend. Thin alias for the shared helper — kept so
-/// the cache-key and routing call sites below read as they did, while there is
-/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
-std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
+/// Strip a leading "file://" scheme and canonicalize the case-insensitive S3
+/// scheme. Bucket and key bytes remain byte-identical because they are part of
+/// the object-store identity and may be case-sensitive.
+std::string normalize_path(std::string const& p)
+{
+  auto normalized = sirius::io::strip_file_scheme(p);
+  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
+  return normalized;
+}
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.

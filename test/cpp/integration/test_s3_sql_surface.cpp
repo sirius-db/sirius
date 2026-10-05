@@ -459,6 +459,35 @@ class s3_sql_fixture {
   duckdb::Connection con;
 };
 
+// Starts Sirius with no programmatic object-store fallback. Tests using this
+// fixture must make every S3 credential available through DuckDB secrets.
+class s3_secret_only_sql_fixture {
+ public:
+  explicit s3_secret_only_sql_fixture(s3_test_env const& env)
+    : config_env(env), db(nullptr), con(db)
+  {
+    load_sirius_extension(db);
+    setenv("SIRIUS_DISABLE", "1", 1);
+  }
+
+  sirius_config_env_guard config_env;
+  duckdb::DuckDB db;
+  duckdb::Connection con;
+};
+
+std::string create_sirius_s3_secret_sql(s3_test_env const& env,
+                                        std::string_view name,
+                                        std::optional<std::string> scope = std::nullopt)
+{
+  auto sql = "CREATE SECRET " + std::string{name} + " (TYPE SIRIUS_S3";
+  if (scope.has_value()) { sql += ", SCOPE " + sql_quote(*scope); }
+  sql += ", KEY_ID " + sql_quote(env.access_key) + ", SECRET " + sql_quote(env.secret_key) +
+         ", REGION " + sql_quote(env.region) + ", ENDPOINT " + sql_quote(env.endpoint) +
+         ", USE_SSL " + (env.endpoint.rfind("https://", 0) == 0 ? "true" : "false");
+  if (!env.session_token.empty()) { sql += ", SESSION_TOKEN " + sql_quote(env.session_token); }
+  return sql + ")";
+}
+
 std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connection& con,
                                                                   std::string const& sql)
 {
@@ -1282,6 +1311,45 @@ TEST_CASE("SIRIUS_S3 CREATE SECRET credentials are scoped and refreshed for Siri
                    create_secret("s3_matching", scope, env->access_key, env->secret_key));
   auto rescanned = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
   CHECK(rescanned->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("SIRIUS_S3 secret authenticates every file in an explicit parquet list",
+          "[s3][integration][sql][gpu_execution][secret]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_secret_only_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(
+    fixture.con,
+    create_sirius_s3_secret_sql(*env, "explicit_list", "s3://" + env->bucket + "/glob/multi/"));
+
+  auto const first  = sql_quote(s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const second = sql_quote(s3_uri(env->bucket, "glob/multi/nation_b.parquet"));
+  auto const scan_sql =
+    "SELECT count(*) FROM read_parquet([" + first + ", " + second + "], union_by_name=false)";
+  auto result = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
+}
+
+TEST_CASE("SIRIUS_S3 secret authenticates an uppercase-scheme parquet glob",
+          "[s3][integration][sql][gpu_execution][secret][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_secret_only_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, create_sirius_s3_secret_sql(*env, "uppercase_glob"));
+
+  auto uri = s3_uri(env->bucket, "root_*.parquet");
+  uri.replace(0, 2, "S3");
+  auto const scan_sql = "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")";
+  auto result         = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",

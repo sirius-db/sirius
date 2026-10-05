@@ -35,6 +35,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "helper/type_conversions.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -136,6 +137,19 @@ bool is_nested_logical_type(duckdb::LogicalType const& type)
   auto const id = type.id();
   return id == duckdb::LogicalTypeId::STRUCT || id == duckdb::LogicalTypeId::LIST ||
          id == duckdb::LogicalTypeId::MAP;
+}
+
+void install_parquet_s3_configs(sirius::op::scan::parquet_ingestible_table_info const& table_info,
+                                duckdb::ClientContext& context,
+                                duckdb::SiriusContext* sirius_ctx)
+{
+  if (sirius_ctx == nullptr) { return; }
+  auto const& defaults = sirius_ctx->get_config().get_scan_manager_config().object_store;
+  for (auto const& path : table_info.resolved_file_paths) {
+    if (!sirius::io::s3::is_s3_path(path)) { continue; }
+    auto config = sirius::io::s3::resolve_duckdb_s3_secret(context, path, defaults);
+    sirius_ctx->get_scan_manager().install_s3_config(path, std::move(config));
+  }
 }
 
 //! Insert `factory(std::move(parent.children[i]))` between `parent` and its i-th child. The
@@ -1039,8 +1053,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return make_gpu_scan_leaf(
-    build_parquet_table_info(scan, op_params), scan, op_params, mode, sirius_ctx.get());
+  auto table_info = build_parquet_table_info(scan, op_params);
+  // DuckDB may bind an explicit file list after opening only its first file. Sirius opens every
+  // resolved file later, so install the matching secret snapshot for each path before the bind
+  // data moves into the GPU ingestible.
+  install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
+  return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
