@@ -169,6 +169,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_order.cpp
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
+    test/cpp/operator/test_physical_replicate.cpp
     test/cpp/operator/test_physical_result_collector.cpp
     test/cpp/operator/test_physical_streaming_sink.cpp
     test/cpp/operator/test_physical_streaming_source.cpp
