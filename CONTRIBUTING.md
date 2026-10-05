@@ -36,7 +36,7 @@ test process.
 ### On-demand SQL fuzzing
 
 The [Sirius fuzzer guide](test/fuzz/README.md) covers GPU setup, bounded SQL campaigns,
-portable replay, triage and local issue drafts. Run it directly or use the
+replayable findings and rechecking them after a fix. Run it directly or use the
 [sirius-fuzz agent skill](.agents/skills/sirius-fuzz/SKILL.md) with an available development GPU.
 Harness unit tests use `pixi run fuzz-test` and do not require a GPU.
 
