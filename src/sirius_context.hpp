@@ -500,6 +500,14 @@ class SiriusContext : public ClientContextState {
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
+  /// \brief Restore the cuDF global pinned memory resource and threshold that
+  ///        initialize() installed, before the slab allocator backing them is
+  ///        destroyed. Idempotent and no-op when nothing was installed, so it
+  ///        is safe to call from both terminate() (success path) and the
+  ///        failure/early-return paths. cuDF holds a non-owning reference to
+  ///        small_pinned_allocator_view_, so skipping this leaves it dangling.
+  void restore_cudf_pinned_memory_resource() noexcept;
+
   /// \brief Log host and GPU memory pool stats (allocated, peak, and
   ///        tier-specific capacity fields) at a labeled tag — used for
   ///        verifying that allocations return to baseline after each query.

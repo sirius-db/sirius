@@ -24,6 +24,7 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
@@ -596,6 +597,38 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
+}
+
+TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
+          "[sirius][context][config][isolated_context]")
+{
+  // The [isolated_context] tag makes the Catch2 listener pause (destroy) any
+  // shared env, so no live SiriusContext owns cuDF's pinned resource here and
+  // the baseline below is cuDF's own default.
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "init_failure_pinned_rollback.yaml";
+
+  // Baseline cuDF pinned state before the failed init.
+  auto const prev_threshold = cudf::get_allocate_host_as_pinned_threshold();
+
+  // initialize() installs the cuDF pinned resource, then throws starting the
+  // four uring reactors (256 MiB staging) against the config's 160 MB host
+  // pool -- the exact path the 1->4 reactor default change exposes.
+  REQUIRE_THROWS(sirius::test::open_sirius_db(nullptr, cfg));
+
+  // The rollback must have restored cuDF's threshold. Without the fix it would
+  // still be the sirius-installed MAX_SLAB_SIZE, not the pre-init default.
+  CHECK(cudf::get_allocate_host_as_pinned_threshold() == prev_threshold);
+
+  // And the pinned resource must not dangle at the freed slab allocator: an
+  // allocate/deallocate through whatever cuDF now points at must succeed.
+  auto pinned = cudf::get_pinned_memory_resource();
+  void* p     = pinned.allocate_sync(256);
+  CHECK(p != nullptr);
+  pinned.deallocate_sync(p, 256);
 }
 
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")
