@@ -432,24 +432,26 @@ The GPU executor catches the **base** `task_reschedule_exception` and:
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
 5. Transitions intermediate data from idle to `task_created` state
 6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 50ms for backoff
-8. Reschedules the new task back through the manager loop
+7. Assigns a retry deadline 50 ms in the future
+8. Returns the new task to the shared scheduler and releases the worker slot during backoff
 
 If max retries are exceeded, the error propagates and terminates the query.
 
 ## Error Handling and Draining
 
-**File:** `src/pipeline/task_scheduler.cpp`
+**Files:** `src/sirius_context.cpp`, `src/pipeline/task_scheduler.cpp`
 
-`drain_after_error(query_id)` performs a multi-stage clean shutdown while execution windows remain serialized:
+`SiriusContext::retire_query_work()` coordinates retirement for one query:
 
-1. **Stop task creator thread pool** — prevents new tasks from being created
-2. **Drain the task queue** — clears pending pipeline tasks
-3. **Drain GPU executors** — `drain_and_wait()` per device: interrupts the queue, joins the manager thread, waits for all in-flight tasks
-4. **Drain the failed query's pending creation requests** — `drain_pending_tasks(query_id)` (also clears its look-ahead state)
-5. **Clear the task queue again** — catches tasks enqueued during the drain
+1. Close its publication gate and wait for already-admitted publishers.
+2. Stop its scan and prefetch producers, retaining their providers and buffers.
+3. Drain only its creator, scheduler and executor queues; destroy detached tasks outside queue locks.
+4. Wait for its workers, completion callbacks and spill borrowers to release their work leases.
+5. During execution-window cleanup, release its creator state, plan, repositories and scan providers.
 
-This ensures that when `drain_after_error()` returns, no tasks are referencing operators or data repositories that are about to be destroyed.
+Shared worker pools continue serving other queries. Successful completion uses the same
+publication and work barriers but validates empty execution queues instead of silently discarding
+queued tasks. See [Query lifetime and retirement](query-lifecycle.md) for the ownership contract.
 
 ## Key Files
 
