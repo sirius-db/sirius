@@ -39,6 +39,31 @@ target_include_directories(
   sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
                                  ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
+# A fresh-process helper for NVTX startup tests. A shared test context can cache
+# domain handles and mask first-domain capture bugs.
+add_executable(sirius_nvtx_startup test/telemetry/nvtx_startup.cpp)
+target_link_libraries(sirius_nvtx_startup ${sirius_test_library} duckdb_static
+                      ZLIB::ZLIB)
+if(PROJECT_IS_TOP_LEVEL)
+  target_sources(
+    sirius_nvtx_startup PRIVATE src/sirius_extension_entry.cpp
+                                test/cpp/utils/sirius_extension_loader.cpp)
+  target_include_directories(
+    sirius_nvtx_startup
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+else()
+  link_extension_libraries(sirius_nvtx_startup "")
+endif()
+target_link_options(sirius_nvtx_startup PRIVATE
+                    "LINKER:--allow-multiple-definition")
+set_target_properties(
+  sirius_nvtx_startup
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+add_dependencies(sirius_unittest sirius_nvtx_startup)
+
 # S3 container harness: the testcontainers-native bridge plus libcurl for
 # host-side fixture upload (SigV4 signing comes from Sirius). Gated so
 # offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded

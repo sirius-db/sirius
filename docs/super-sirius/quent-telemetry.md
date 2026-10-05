@@ -38,6 +38,12 @@ loadable Sirius is its own injection DSO. A DuckDB executable with Sirius linked
 same initializer and handles NVTX's private injection token inside the executable, so it does not
 ship a sidecar DSO.
 
+Startup parses and validates the YAML once, applies `enable_quent && enable_nvtx` to injection,
+then creates Quent before discovering hardware and resolving memory capacities. This ordering
+is shared by the DuckDB extension and FFI runtime. Topology discovery itself emits `libcucascade`
+NVTX, so it must run after Quent installs its capture hook. A domain created earlier loses its
+name declaration even if its later ranges are captured.
+
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with
 `enable_quent: true` then writes ndjson files into `output_directory` by default. Set
