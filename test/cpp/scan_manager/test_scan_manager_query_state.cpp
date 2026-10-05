@@ -104,11 +104,15 @@ query_context make_query(sirius::query_id_t query_id, std::string const& file)
   ctx.pipeline->set_pipeline_id(1);
   ctx.pipeline->set_query_id(query_id);
 
-  auto ingestible = scan::make_ingestible(make_table_info(file));
-  ctx.scan_op     = std::make_unique<scan::sirius_gpu_scan_operator>(
+  auto info              = make_table_info(file);
+  auto const contract_id = static_cast<scan::scan_contract_id>(sirius::value_of(query_id)) + 1;
+  info->contract_id      = contract_id;
+  auto ingestible        = scan::make_ingestible(std::move(info));
+  ctx.scan_op            = std::make_unique<scan::sirius_gpu_scan_operator>(
     duckdb::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)},
     0,
-    std::move(ingestible));
+    std::move(ingestible),
+    contract_id);
 
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.scan_op);

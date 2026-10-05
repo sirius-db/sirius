@@ -28,6 +28,7 @@ target_sources(
           scan/parquet_gpu_ingestible.cpp
           scan/parquet_materialize.cpp
           scan/duckdb_native_gpu_ingestible.cpp
+          scan/table_scan/bound_read_view.cpp
           scan/iceberg_metadata_reader.cpp
           scan/puffin_reader.cpp
           scan/positional_delete_filter.cpp

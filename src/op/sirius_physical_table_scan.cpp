@@ -53,10 +53,12 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
-  duckdb::virtual_column_map_t virtual_columns_p)
+  duckdb::virtual_column_map_t virtual_columns_p,
+  duckdb::vector<duckdb::LogicalType> duckdb_types_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
+    duckdb_types(std::move(duckdb_types_p)),
     bind_data(std::move(bind_data_p)),
     returned_types(std::move(returned_types_p)),
     column_ids(std::move(column_ids_p)),

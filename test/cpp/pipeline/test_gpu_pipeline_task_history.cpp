@@ -361,7 +361,7 @@ cached_scan_pipeline_context create_cached_scan_pipeline_context()
   ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
-    duckdb::vector<sirius::logical_type>{}, 0, nullptr);
+    duckdb::vector<sirius::logical_type>{}, 0, nullptr, /*contract_id=*/1);
 
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.scan_op);

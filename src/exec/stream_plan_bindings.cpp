@@ -66,15 +66,22 @@ void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&,
 
 }  // namespace
 
+duckdb::TableFunction get_stream_source_function()
+{
+  duckdb::TableFunction stream_source(kStreamSourceFunctionName,
+                                      {duckdb::LogicalType::BIGINT},
+                                      stream_source_function,
+                                      stream_source_bind);
+
+  return stream_source;
+}
+
 void register_stream_source_function(duckdb::DatabaseInstance& instance)
 {
   auto transaction = duckdb::CatalogTransaction::GetSystemTransaction(instance);
   auto& catalog    = duckdb::Catalog::GetSystemCatalog(instance);
 
-  duckdb::TableFunction stream_source(kStreamSourceFunctionName,
-                                      {duckdb::LogicalType::BIGINT},
-                                      stream_source_function,
-                                      stream_source_bind);
+  auto stream_source = get_stream_source_function();
 
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: extension callback and explicit callers may both register.
