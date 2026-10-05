@@ -2380,6 +2380,77 @@ TEMPLATE_TEST_CASE("select OR conjunction",
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
 }
 
+TEMPLATE_TEST_CASE("evaluate conjunction with scalar children",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
+
+  auto const boolean = logical_type::make(type_id::BOOLEAN);
+  auto bool_const    = [&](bool v) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{v}, boolean});
+  };
+  auto null_const = [&] { return make_null_const(boolean); };
+  auto cmp  = [] { return make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(17)); };
+  auto conj = [](sirius::ast::conjunction::kind kind, auto... children) {
+    std::vector<std::unique_ptr<ast_node>> v;
+    (v.push_back(std::move(children)), ...);
+    return make_conj(kind, std::move(v));
+  };
+  auto constexpr op_or  = sirius::ast::conjunction::kind::op_or;
+  auto constexpr op_and = sirius::ast::conjunction::kind::op_and;
+
+  std::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(conj(op_or, cmp(), null_const()));                     // col0 > 17 OR NULL
+  exprs.push_back(conj(op_or, null_const(), cmp()));                     // NULL OR col0 > 17
+  exprs.push_back(conj(op_and, cmp(), null_const()));                    // col0 > 17 AND NULL
+  exprs.push_back(conj(op_or, cmp(), bool_const(true)));                 // col0 > 17 OR TRUE
+  exprs.push_back(conj(op_and, bool_const(false), cmp()));               // FALSE AND col0 > 17
+  exprs.push_back(conj(op_or, null_const(), bool_const(false), cmp()));  // NULL OR FALSE OR ...
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  REQUIRE(ov.num_columns() == 6);
+  auto const in0 = copy_column_to_host<int32_t>(iv.column(0));
+
+  // Kleene logic: TRUE OR NULL = TRUE, FALSE AND NULL = FALSE, otherwise NULL.
+  std::vector<bool> or_null_valid, and_null_valid;
+  std::vector<uint8_t> gt;
+  for (auto v : in0) {
+    gt.push_back(v > 17 ? 1U : 0U);
+    or_null_valid.push_back(v > 17);
+    and_null_valid.push_back(v <= 17);
+  }
+  auto values_where = [](std::vector<uint8_t> values, std::vector<bool> const& valid) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (!valid[i]) { values[i] = 0; }
+    }
+    return values;
+  };
+  auto check = [&](int col, std::vector<uint8_t> const& expected, std::vector<bool> const& valid) {
+    CAPTURE(col);
+    REQUIRE(ov.column(col).type() == cudf::data_type{cudf::type_id::BOOL8});
+    auto const valids = copy_valids_to_host(ov.column(col));
+    REQUIRE(valids == valid);
+    REQUIRE(values_where(copy_bool_column_to_host(ov.column(col)), valid) ==
+            values_where(expected, valid));
+  };
+
+  auto const all_valid = std::vector<bool>(in0.size(), true);
+  check(0, gt, or_null_valid);
+  check(1, gt, or_null_valid);
+  check(2, gt, and_null_valid);
+  check(3, std::vector<uint8_t>(in0.size(), 1U), all_valid);
+  check(4, std::vector<uint8_t>(in0.size(), 0U), all_valid);
+  check(5, gt, or_null_valid);
+}
+
 // ---------------------------------------------------------------------------
 // Nested compound: CASE inside a comparison inside a conjunction
 // Exercises AST breaker (CASE) nested within AST-capable nodes

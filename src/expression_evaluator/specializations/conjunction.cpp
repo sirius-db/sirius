@@ -24,6 +24,7 @@
 
 // cudf
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 
 namespace sirius {
@@ -98,15 +99,26 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::conjunction const& a
   // Conjunction ops always return BOOLEAN.
   auto const output_type = cudf::data_type{cudf::type_id::BOOL8};
 
-  // Resolve the children incrementally into the output
+  // Resolve the children incrementally into the output. Scalar children survive constant folding
+  // when they can't decide the result, e.g. `x OR NULL`.
   auto output = evaluate(*alt.children[0], evaluation_mode::MATERIALIZE);
-  // DuckDB should prune all scalar conjuncts away
-  D_ASSERT(!output.is_scalar());
   for (std::size_t i = 1; i < alt.children.size(); ++i) {
     auto child = evaluate(*alt.children[i], evaluation_mode::MATERIALIZE);
-    D_ASSERT(!child.is_scalar());
-    auto output_column = cudf::binary_operation(
-      output.get_column_view(), child.get_column_view(), binary_op, output_type, _stream, _mr);
+    if (output.is_scalar() && child.is_scalar()) {
+      output = evaluate_result(
+        cudf::make_column_from_scalar(output.get_scalar(), _input_table.num_rows(), _stream, _mr));
+    }
+    std::unique_ptr<cudf::column> output_column;
+    if (output.is_scalar()) {
+      output_column = cudf::binary_operation(
+        output.get_scalar(), child.get_column_view(), binary_op, output_type, _stream, _mr);
+    } else if (child.is_scalar()) {
+      output_column = cudf::binary_operation(
+        output.get_column_view(), child.get_scalar(), binary_op, output_type, _stream, _mr);
+    } else {
+      output_column = cudf::binary_operation(
+        output.get_column_view(), child.get_column_view(), binary_op, output_type, _stream, _mr);
+    }
     output = evaluate_result(std::move(output_column));
   }
   return output;
