@@ -16,6 +16,7 @@
 
 #include "sirius_engine.hpp"
 
+#include "cuda/device_health.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
@@ -233,7 +234,8 @@ void sirius_engine::execute()
   if (!completion_handler_) {
     throw std::logic_error("execution requires a live window completion handler");
   }
-  auto future = completion_handler_->get_awaitable();
+  auto* registry = &sirius_ctx->get_query_lifecycle_registry();
+  auto future    = completion_handler_->get_awaitable();
 
   // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
   try {
@@ -253,11 +255,20 @@ void sirius_engine::execute()
   try {
     while (future.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
       if (context.IsInterrupted()) { throw duckdb::InterruptException(); }
+      if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+        sirius_ctx->throw_runtime_unavailable();
     }
     future.get();
+    if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE)
+      sirius_ctx->throw_runtime_unavailable();
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
   } catch (const std::exception& e) {
+    registry->record_error(query_id_, std::current_exception());
+    if (fatal_device_exception(std::current_exception())) {
+      registry->mark_runtime_failed();
+      registry->quiesce_all();
+    }
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
@@ -265,6 +276,7 @@ void sirius_engine::execute()
                                   duckdb::SiriusContext::query_retirement_mode::cancelled);
     throw;
   } catch (...) {
+    registry->record_error(query_id_, std::current_exception());
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     sirius_ctx->retire_query_work(query_id_,

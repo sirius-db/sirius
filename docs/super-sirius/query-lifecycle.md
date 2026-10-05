@@ -82,5 +82,6 @@ registration and retained resources. Scheduler tests hold a task after removing 
 production queue and prove retirement waits for its disposal. Queue tests exercise reentrant
 destructors. SQL lifecycle tests cover cleanup and subsequent queries.
 
-SQL execution remains serialized at this layer. Bounded concurrent admission, session settings,
-memory progress and runtime diagnostics are introduced by later layers of the stack.
+Query diagnostics retain bounded metadata after retirement without retaining query resources.
+Fatal shared-device failures close publication and refuse later registration; ordinary query
+errors remain query-local. SQL execution remains serialized until the next admission layer.

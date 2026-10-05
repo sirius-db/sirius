@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
+#include "cuda/device_health.hpp"
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "expression_evaluator/query_policy.hpp"
@@ -220,6 +221,11 @@ void gpu_pipeline_executor::process_task(
     // would have exploited is over.  A reservation that succeeds outright is the
     // common case and raises nothing.
     auto reservation = _memory_space->make_reservation_or_null(bytes_needs);
+    exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
+    if (!reservation || reservation->size() < bytes_needs) {
+      memory_wait_activity =
+        _query_lifecycle.begin_memory_wait(pipe ? pipe->get_query_id() : make_query_id(0));
+    }
     if (!reservation) {
       if (_query_event_publisher) {
         auto const* pipe               = gpu_task->get_pipeline();
@@ -297,6 +303,7 @@ void gpu_pipeline_executor::process_task(
             })
             .get();
       } catch (const std::exception& e) {
+        if (fatal_device_exception(std::current_exception())) { throw; }
         // The downgrade executor cancelled this request (its queue was drained). This task cannot
         // get its reservation, so fail its query
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
@@ -368,6 +375,7 @@ void gpu_pipeline_executor::process_task(
         gpu_task->get_task_id(),
         reservation->size());
     }
+    memory_wait_activity.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -428,7 +436,15 @@ void gpu_pipeline_executor::process_task(
           }
 
           // Sync the stream to ensure all memory is released before the reschedule.
-          exc_stream->synchronize();
+          auto const status = cudaStreamSynchronize(exc_stream.get().get());
+          if (fatal_cuda_status(status)) {
+            _query_lifecycle.mark_runtime_failed();
+            _query_lifecycle.quiesce_all();
+          }
+          check_cuda_health(status);
+          if (status != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA retry synchronization failed: ") +
+                                     cudaGetErrorName(status));
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -533,6 +549,10 @@ void gpu_pipeline_executor::process_task(
           _task_creator->reschedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
+          if (fatal_device_exception(std::current_exception())) {
+            _query_lifecycle.mark_runtime_failed();
+            _query_lifecycle.quiesce_all();
+          }
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (completion) {
             completion->report_error(std::current_exception(),
