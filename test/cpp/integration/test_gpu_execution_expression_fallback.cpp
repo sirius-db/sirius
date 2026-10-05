@@ -100,6 +100,6 @@ TEST_CASE_METHOD(ExpressionFallbackFixture,
   for (auto const* unit : {"day", "hour", "minute", "second", "millisecond", "microsecond"}) {
     CAPTURE(unit);
     compare_gpu_vs_cpu(std::string("SELECT date_trunc('") + unit + "', ts) FROM expr_t;");
+    compare_gpu_vs_cpu(std::string("SELECT date_trunc('") + unit + "', d) FROM expr_t;");
   }
-  compare_gpu_vs_cpu("SELECT date_trunc('day', d) FROM expr_t;");
 }

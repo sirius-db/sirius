@@ -17,6 +17,7 @@
 // sirius
 #include <config.hpp>
 #include <expression/ast/node.hpp>
+#include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
@@ -299,32 +300,29 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     // The first child is the frequency, which should be a constant string
     D_ASSERT(args[0]->holds<sirius::ast::constant>());
     auto const& freq_str = std::get<std::string>(args[0]->get<sirius::ast::constant>().payload);
-    auto input           = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto const unit      = parse_gpu_date_trunc_unit(freq_str);
+    if (!unit) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
+        freq_str);
+    }
+    auto input = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
-    auto freq_string_switch =
-      [](std::string const& freq_str) -> cudf::datetime::rounding_frequency {
-      if (freq_str == "day") {
-        return cudf::datetime::rounding_frequency::DAY;
-      } else if (freq_str == "hour") {
-        return cudf::datetime::rounding_frequency::HOUR;
-      } else if (freq_str == "minute") {
-        return cudf::datetime::rounding_frequency::MINUTE;
-      } else if (freq_str == "second") {
-        return cudf::datetime::rounding_frequency::SECOND;
-      } else if (freq_str == "millisecond") {
-        return cudf::datetime::rounding_frequency::MILLISECOND;
-      } else if (freq_str == "microsecond") {
-        return cudf::datetime::rounding_frequency::MICROSECOND;
-      } else {
-        throw invalid_input_exception(
-          "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
-          freq_str);
+    auto frequency = [](date_trunc_unit unit) -> cudf::datetime::rounding_frequency {
+      switch (unit) {
+        case date_trunc_unit::day: return cudf::datetime::rounding_frequency::DAY;
+        case date_trunc_unit::hour: return cudf::datetime::rounding_frequency::HOUR;
+        case date_trunc_unit::minute: return cudf::datetime::rounding_frequency::MINUTE;
+        case date_trunc_unit::second: return cudf::datetime::rounding_frequency::SECOND;
+        case date_trunc_unit::millisecond: return cudf::datetime::rounding_frequency::MILLISECOND;
+        case date_trunc_unit::microsecond: return cudf::datetime::rounding_frequency::MICROSECOND;
       }
+      throw internal_exception("[expression_evaluator:function] unknown date_trunc unit");
     };
 
-    auto result_column = cudf::datetime::floor_datetimes(
-      input.get_column_view(), freq_string_switch(freq_str), _stream, _mr);
+    auto result_column =
+      cudf::datetime::floor_datetimes(input.get_column_view(), frequency(*unit), _stream, _mr);
     return evaluate_result(std::move(result_column));
   }
 

@@ -31,6 +31,7 @@
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
 #include "expression/ast/unary_op.hpp"
+#include "expression/date_trunc_unit.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
 #include "expression/value.hpp"           // sirius::from_duckdb(Value const&, logical_type const&)
@@ -201,10 +202,7 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
       return nullptr;
     }
     auto const& unit = duckdb::StringValue::Get(frequency);
-    if (unit != "day" && unit != "hour" && unit != "minute" && unit != "second" &&
-        unit != "millisecond" && unit != "microsecond") {
-      return nullptr;
-    }
+    if (!parse_gpu_date_trunc_unit(unit)) { return nullptr; }
   }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
