@@ -54,13 +54,6 @@ def execute_probe(payload: dict[str, Any], work: pathlib.Path) -> dict[str, Any]
     try:
         session.open()
         for name, value in payload.get("session_settings", {}).items():
-            if name == "TimeZone" and not session.setting_supported(name):
-                # The DuckDB CLI does not load ICU automatically, unlike the
-                # Python module that recorded older finding bundles.
-                try:
-                    session.execute("LOAD icu")
-                except SessionError:
-                    pass
             if not session.setting_supported(name):
                 raise SessionError(f"recorded session setting unavailable: {name}")
             session.set(name, value)

@@ -350,32 +350,12 @@ def _strip_trailing_underscores(obj: Any) -> Any:
     return obj
 
 
-# Removed options. Bundles saved before the removal still carry them: accept the
-# values that match today's behaviour so those findings replay, reject the rest.
-# ``None`` accepts any value (the key was a label only).
-_RETIRED_KEYS: dict[str, tuple[Any, ...] | None] = {
-    "features.cte.recursive": (False,),
-    "features.aggregates.filter": (False,),
-    "features.aggregates.order_by": (False,),
-    "features.limit.percent": (False,),
-    "profile": None,
-    "oracle.on_plan_fallback": ("fail",),  # count/skip were the frontier profile
-}
-
-
 def _build(cls: type, data: dict[str, Any], path: str) -> Any:
     fields = {f.name: f for f in dataclasses.fields(cls)}
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         name = _KEYWORD_FIELDS.get(key, key)
         if name not in fields:
-            if f"{path}{key}" in _RETIRED_KEYS:
-                accepted = _RETIRED_KEYS[f"{path}{key}"]
-                if accepted is None or value in accepted:
-                    continue
-                raise ConfigError(
-                    f"{path}{key} was removed; {value!r} is no longer supported"
-                )
             raise ConfigError(f"unknown key {path}{key}")
         ftype = fields[name].type
         target = _resolve_type(ftype)
