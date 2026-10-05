@@ -6,41 +6,24 @@ reads, NULL/decimal/string/date values, empty tables, and multiple partitions/fi
 The suite compares values and SQL types, then checks connection liveness. It does
 not implement or demonstrate a GPU Paimon scan.
 
-## Qualification status
+## Qualified reader artifacts
 
-The historical qualified reader uses DuckDB **v1.5.5**, platform `linux_amd64`,
-duckdb-paimon `5e89198235c8be6a402f2b02ef54f249914eee29`, and native Paimon
-`53f9c86d45aabb0a6f1a379271da07d7a9f27a3d`. Its exact hash is recorded in
-`qualified-artifacts.json`, separately from the authored answers.
+`qualified-artifacts.json` records qualified readers separately from the authored
+answers, keyed by DuckDB version and platform. The `linux_amd64` records cover:
 
-Current Sirius main uses **v1.5.6**. Its reader was qualified locally on
-2026-10-05 with duckdb-paimon `e49d491a103e30399d2d0cdc9c2f7efaf138d200`;
-that source pins the same native Paimon revision as above. The uncompressed
-artifact is 103,197,494 bytes, SHA256
-`2f52be825bcab6cc179bdd4f0c0fd4ff3e63b29eff7cc7f163443a2065f4e973`.
-The registry records separate hashes for the two DuckDB versions.
+- DuckDB **v1.5.5**: duckdb-paimon
+  `5e89198235c8be6a402f2b02ef54f249914eee29`.
+- DuckDB **v1.5.6**: duckdb-paimon
+  `e49d491a103e30399d2d0cdc9c2f7efaf138d200`.
 
-Validation used Sirius `c2f8b73e12ceca4e95cf154c44e0de7052eca1f4`, DuckDB
-`069cc9f9b5be802405797faecc284961b07c70ef`, the locked CUDA 13.4 environment,
-architecture 120, and an RTX 5060 Ti with driver 595.84:
+Both sources pin native Paimon
+`53f9c86d45aabb0a6f1a379271da07d7a9f27a3d`. Each registry entry records its own
+uncompressed artifact size and SHA256. Provisioning requires a verified retained
+URL; an entry without one intentionally refuses a cold download.
 
-| Current-build check | Result |
-| --- | --- |
-| CPU harness, Python 3.12 with warnings as errors | 63 tests passed |
-| Native conformance, both CPU modes and three smoke cases | 53 cases passed; 54 processes; approximately 55 seconds |
-| Relocated corpus, IPv4/IPv6 socket creation denied | 53 cases passed |
-| Freshly regenerated corpus and independent history reads | 53 native cases passed |
-| Sirius transparent execution and DISTINCT fallback regressions | 82 cases passed; 1,854 assertions |
-
-These native tests cover the committed fixtures, not general Paimon support.
-The GPU regressions exercise Sirius; Paimon itself still uses the CPU path.
-The older v1.5.5 reader was also rerun, including regenerated fixtures, and its
-results are separate from the current-build evidence.
-
-**Delivery is still pending:** neither artifact has a verified retained,
-content-addressed public download URL. Cold provisioning therefore intentionally
-fails. Actual GitHub workflow execution and final independent review are also
-pending; local qualification does not establish reproducible CI delivery.
+Qualification covers the committed fixtures, not general Paimon support. Sirius
+GPU regressions exercise the surrounding engine; Paimon reads use the CPU path.
+Dated validation results and delivery status belong in the pull request.
 
 Known limit: [duckdb-paimon #95](https://github.com/polardb/duckdb-paimon/issues/95)
 reports stale same-key updates with a Flink-written composite primary key, subset
@@ -120,15 +103,23 @@ revision. Workflow paths with or without an `@ref` suffix are accepted.
 This workflow does not rebuild or rerun the ordinary test matrix. It waits until
 the selected Test run completes, which can mean waiting for its full 90-minute
 job budget even when the build artifact is already available. Artifacts expire
-after one day; missing/expired builds fail explicitly. Running this workflow in
-the base repository requires a branch/tag there: a maintainer must first make a
-fork PR's head available on a base-repository ref. Dispatching in the fork is a
-separate option only if its workflow and runner access are available.
+after one day; missing/expired builds fail explicitly.
+
+GitHub requires the workflow file to exist on the repository's default branch
+before [`workflow_dispatch`](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatch)
+can trigger it. A newly introduced workflow therefore cannot be dispatched in
+the base repository merely by publishing a PR ref; its first run requires the
+workflow to reach the default branch. Dispatch also requires a branch/tag in the
+repository where it runs. To validate a fork PR revision in the base repository,
+a maintainer must make that revision available on a base-repository ref. A fork
+can dispatch only when its default branch contains the workflow and its required
+runners are available.
 
 Provisioning/case diagnostics are uploaded even on failure. Normal PR/merge-group
 checks run the CPU harness in its own required job, independently of lint and
-thread-sweep checks, with a Paimon-specific summary. Actual workflow execution
-remains unvalidated until a real run completes.
+thread-sweep checks, with a Paimon-specific summary. Workflow validation requires
+a completed real run with retained reports; local checks alone do not establish
+CI delivery.
 
 ## Explicit regeneration
 
@@ -189,5 +180,4 @@ point from that basename. Run native conformance, relocation/offline checks, and
 appropriate Sirius GPU fallback/regressions. Investigate disagreements against authored answers and
 independent reader evidence. Publish the accepted bytes at a retained
 content-addressed URL, verify a cold download, and add the reviewed qualification
-record and evidence. The v1.5.6 local results above use newly tested bytes;
-retained-artifact provisioning and real CI delivery remain pending.
+record and evidence.
