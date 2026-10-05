@@ -153,42 +153,26 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
           "collection");
       }
-      // Pick the host space with the most available memory.
-      /// TODO: prefer the NUMA-closest host space to the source GPU for locality.
-      auto const* mem_space =
-        *std::max_element(host_spaces.begin(), host_spaces.end(), [](auto const* a, auto const* b) {
-          return a->get_available_memory() < b->get_available_memory();
-        });
-
+      // Reserve atomically, trying each host space. A sampled free-byte count is not an
+      // allocation guarantee when another query can reserve concurrently.
+      std::unique_ptr<cucascade::memory::reservation> host_reservation;
+      for (auto const* candidate : host_spaces) {
+        host_reservation =
+          const_cast<cucascade::memory::memory_space*>(candidate)->make_reservation_or_null(
+            data->get_size_in_bytes());
+        if (host_reservation) { break; }
+      }
+      if (!host_reservation) {
+        throw std::runtime_error("Result collection cannot reserve HOST memory");
+      }
       auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
-
-      auto host_reservation =
-        const_cast<cucascade::memory::memory_space*>(mem_space)->make_reservation_or_null(
-          data->get_size_in_bytes());
-
-      // clone_to: creates new batch with data converted to host_data_representation
-      if (host_reservation == nullptr) {
-        SIRIUS_LOG_WARN(
-          "sirius_physical_materialized_collector: host reservation failed for batch {} ({} "
-          "bytes) — proceeding without reservation, converter may OOM",
-          ro.get_batch_id(),
-          data->get_size_in_bytes());
-      }
-      auto result_batch =
-        host_reservation != nullptr
-          ? ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              *host_reservation,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id))
-          : ro.clone_to<cucascade::host_data_representation>(
-              registry,
-              next_batch_id,
-              mem_space,
-              stream,
-              telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
+      auto result_batch  = ro.clone_to<cucascade::host_data_representation>(
+        registry,
+        next_batch_id,
+        *host_reservation,
+        stream,
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), next_batch_id));
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives
       // the branch — data points into it and must not dangle when we reach the assert below.

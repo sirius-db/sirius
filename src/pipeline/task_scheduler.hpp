@@ -222,7 +222,7 @@ class task_scheduler {
   /// Observer of query event transitions. Never null.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
-  /// Non-owning; owned by SiriusContext and outlives this scheduler. Null in unit tests.
+  /// Non-owning; the runtime or test fixture must outlive this scheduler.
   sirius::exec::query_lifecycle_registry& _query_lifecycle;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
