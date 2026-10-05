@@ -369,15 +369,11 @@ class Report:
     def gaps(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         """Gap findings grouped by the reason their smallest reproducer reports.
 
-        ``runtime`` fallbacks come first, ordered by the GPU time they threw away,
-        since those are the checks worth moving to plan time; ``plan`` rejections
-        follow, ordered by count. Reduction narrows an "Unsupported <expression>"
-        rejection to the function Sirius cannot translate, so findings that
-        started from different expressions around the same function share a
-        group. A group shows the smallest reduced query it has, or an original
-        query when nothing in it was reduced. A gap that matched known_issues.toml
-        stays in its table, tagged with the issue, so the list is complete after
-        the issue is filed.
+        ``runtime`` fallbacks first, ordered by the GPU time they threw away
+        (the checks worth moving to plan time), then ``plan`` rejections by
+        count. Reduction narrows an "Unsupported <expression>" rejection to the
+        function Sirius cannot translate, so findings around the same function
+        share a group. Known issues stay in their table, tagged with the issue.
         """
         groups: dict[str, dict[str, dict[str, Any]]] = {"runtime": {}, "plan": {}}
         for f in findings:

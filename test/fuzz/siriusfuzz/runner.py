@@ -431,12 +431,10 @@ class Evaluator:
 def wants_reduction(rec: QueryRecord, mode: str, seen: set[str]) -> bool:
     """Whether the worker should reduce ``rec`` now.
 
-    Each signature is reduced once per worker: errors and plan rejections dedup
-    by normalized reason, so a second query with the same signature would spend
-    the whole budget on a reproducer the report already has (mismatch and
-    timeout signatures include the query and stay unique). A gaps run reduces
-    runtime fallbacks only: a plan rejection is already named by its reason and
-    costs no GPU time, so it is not what that run is looking for.
+    Each signature is reduced once per worker (error and plan-rejection
+    signatures dedup by reason; mismatch and timeout signatures include the
+    query). A gaps run reduces runtime fallbacks only: a plan rejection is
+    already named by its reason and costs no GPU time.
     """
     verdict = Verdict(rec.verdict)
     if not verdict.is_finding():
@@ -822,9 +820,8 @@ class Orchestrator:
                 if w in finished:
                     continue
                 if not p.is_alive():
-                    # Its last result/done can land after the drain above. Nothing more
-                    # can arrive from a dead worker, so read everything before deciding
-                    # how it ended; after a respawn its messages would be discarded.
+                    # A dead worker's last messages can land after the drain above; read
+                    # them before deciding how it ended, since a respawn would discard them.
                     self._drain(finished)
                     if w not in finished:
                         self._worker_died(w, p, finished)

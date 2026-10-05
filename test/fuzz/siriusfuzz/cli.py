@@ -305,7 +305,7 @@ def validate_limits(args: argparse.Namespace) -> None:
 
 
 def run_doctor(engine: Engine, work: pathlib.Path, timeout: float) -> dict:
-    """Readiness checks in a disposable subprocess; prints one line per check."""
+    """Readiness checks; prints one line per check."""
     work.mkdir(parents=True, exist_ok=True)
     configs = snapshot_configs(work, engine.configs)
     write_json(work / "environment.json", provenance(engine.shell, engine.extension))
@@ -364,8 +364,8 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
 
     A finding directory restores its own configuration, Sirius YAML, comparison
     mode and recorded setting variant. ``args`` may be updated with values the
-    bundle recorded (cpu-only, YAML, metadata override), so pass a copy when
-    replaying several bundles.
+    bundle recorded (cpu-only, YAML), so pass a copy when replaying several
+    bundles.
     """
     bundle = target if target.is_dir() else None
     meta = {}
@@ -492,7 +492,7 @@ def replay(args: argparse.Namespace, target: pathlib.Path, work: pathlib.Path) -
 
 
 def replay_verdict(result: dict) -> str:
-    """The verdict a replay produced, or the supervisor status when it did not run."""
+    """The verdict a replay produced, or the probe status when it did not run."""
     return result.get("record", {}).get("verdict", result["status"])
 
 
