@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "expression_evaluator/query_policy.hpp"
 
 // sirius
 #include <config.hpp>
@@ -54,7 +55,8 @@ namespace sirius {
  */
 inline expression_evaluator_strategy strategy_from_config()
 {
-  return duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
+  return active_expression_policy ? active_expression_policy->strategy
+                                  : duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY;
 }
 
 /**
