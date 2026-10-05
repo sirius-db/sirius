@@ -812,9 +812,9 @@ class rewriter {
 
   /// Picks how an exact join over a pinned corpus runs: brute force over the pinned rows, or every
   /// cluster of its lists searched (the same answer, from fewer bytes and on tensor cores), by
-  /// access_path_cost on the estimated probe rows. With no lists, SIRIUS_VSS_BUILD_IN_QUERY=1 lets
-  /// it build them first (kept for later queries, like an index) when building and searching beats
-  /// brute force. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice; SIRIUS_VSS_REWRITE_LISTS=0
+  /// access_path_cost on the estimated probe rows. With no lists it builds them first (kept for
+  /// later queries, like an index) when building and searching beats brute force, unless
+  /// SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice; SIRIUS_VSS_REWRITE_LISTS=0
   /// is brute.
   bool use_exact_lists(vector_join_request& req,
                        duckdb::TableCatalogEntry& table,
@@ -853,7 +853,7 @@ class rewriter {
     };
     if (!choice) {
       auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
-      if (force == "cost" && (build_env == nullptr || std::strcmp(build_env, "1") != 0)) {
+      if (force == "cost" && build_env != nullptr && std::strcmp(build_env, "0") == 0) {
         return false;
       }
       // Lists that would answer exactly and beat brute force: UINT8 if every value is a byte,
@@ -931,11 +931,8 @@ class rewriter {
       lists.table        = table;
       lists.column       = column;
       lists.dim          = req.dim;
-      auto const storage = cosine ? list_storage::float16 : list_storage::automatic;
-      auto built         = run_kmeans_build_lists(ctx, lists, storage, false, cosine);
-      if (!cosine && built.encoding == "float32") {
-        built = run_kmeans_build_lists(ctx, lists, list_storage::float16, false, false);
-      }
+      run_kmeans_build_lists(
+        ctx, lists, cosine ? list_storage::float16 : list_storage::exact, false, cosine);
     } catch (std::exception const& e) {
       SIRIUS_LOG_INFO(
         "[vector_join_rewrite] building lists for '{}' declined: {}", table, e.what());

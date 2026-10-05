@@ -393,7 +393,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         "multiple of 16 and at most 256, not " +
                                         std::to_string(req.dim) + "; use 'float16' or 'float32'");
   }
-  if (storage == list_storage::float16 && !bound_filter_f16_supports(req.dim)) {
+  if ((storage == list_storage::float16 || storage == list_storage::exact) &&
+      !bound_filter_f16_supports(req.dim)) {
     throw duckdb::InvalidInputException(fn +
                                         ": storage => 'float16' needs a vector width that is "
                                         "a multiple of 16, not " +
@@ -433,7 +434,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // Whether every component is a byte, counted while the chunks are resident anyway: that is
   // what decides if the lists may be stored as UINT8 without changing a single value.
   bool const check_uint8 =
-    !unit_rows && (storage == list_storage::automatic || storage == list_storage::uint8);
+    !unit_rows && (storage == list_storage::automatic || storage == list_storage::uint8 ||
+                   storage == list_storage::exact);
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
@@ -505,6 +507,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   auto const encoding = storage == list_storage::float16     ? list_encoding::float16
                         : want_int8                          ? list_encoding::int8
                         : check_uint8 && non_uint8_host == 0 ? list_encoding::uint8
+                        : storage == list_storage::exact     ? list_encoding::float16
                                                              : list_encoding::float32;
   // INT8 codes: each component centered on the middle of its range, one scale sized so the
   // widest component's range fills [-127, 127]. A single scale keeps code dot products

@@ -465,3 +465,32 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   REQUIRE_FALSE(centroids->HasError());
   CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() > 0);
 }
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "lists built inside the query over float vectors answer exactly",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Values that are not bytes: the lists the query builds are FLOAT16 with their FP32 rows, and
+  // every candidate is re-scored in FP32, so the answer is DuckDB's.
+  SqlRewriteTables tables(*this);
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_floats AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_floats_probe AS SELECT i::INTEGER AS id, " + floats("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_floats', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_ACCESS_PATH"); }
+  } unset_access_path;
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id, n.d FROM sr_floats_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_floats c ORDER BY d LIMIT 5) n;");
+  CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive > before.pairs_exhaustive);
+}

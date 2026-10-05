@@ -179,7 +179,9 @@ struct cluster_lists_result {
 };
 
 /// `storage =>` of the build: FLOAT32 always, UINT8 or fail, or the tightest lossless one.
-enum class list_storage : std::uint8_t { automatic, float32, uint8, float16, int8 };
+/// `exact` is what a query builds for itself: UINT8 when every value is a byte, else FLOAT16 with
+/// its FP32 copy, so the lists answer exactly either way.
+enum class list_storage : std::uint8_t { automatic, float32, uint8, float16, int8, exact };
 
 /**
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
