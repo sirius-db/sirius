@@ -172,21 +172,16 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
   }
 }
 
-// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Each byte's bits
-// are folded down into its bit 0, then the four bit-0 positions of each 32-bit lane are gathered.
+// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Per 32-bit lane,
+// bit 7 of each byte is set iff that byte is non-zero (the add cannot carry across bytes because
+// the operand is masked to 7 bits), and one multiply gathers the four bit-7s into bits 28..31.
 __device__ __forceinline__ uint32_t pack16_nonzero(uint4 v)
 {
-  auto const nonzero_bit0 = [](uint32_t x) {
-    uint32_t y = x | (x >> 4);
-    y |= y >> 2;
-    y |= y >> 1;
-    return y & 0x01010101u;
+  auto const nibble = [](uint32_t x) {
+    uint32_t const m = ((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x;
+    return ((m & 0x80808080u) * 0x00204081u) >> 28;
   };
-  auto const gather4 = [](uint32_t x) {
-    return (x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u);
-  };
-  return gather4(nonzero_bit0(v.x)) | (gather4(nonzero_bit0(v.y)) << 4) |
-         (gather4(nonzero_bit0(v.z)) << 8) | (gather4(nonzero_bit0(v.w)) << 12);
+  return nibble(v.x) | (nibble(v.y) << 4) | (nibble(v.z) << 8) | (nibble(v.w) << 12);
 }
 
 // Bit i of the result is set iff p[i] is non-zero, for i in [0, count).
