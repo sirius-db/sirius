@@ -32,9 +32,10 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_query_lifecycle_registry.cpp
-    test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
+    test/cpp/exec/test_query_lifecycle_registry.cpp
+  test/cpp/exec/test_query_admission.cpp
+  test/cpp/exec/test_scoped_dispatcher.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/event/test_query_event_publisher.cpp
@@ -153,7 +154,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
-    test/cpp/scan_manager/test_shared_scan_budget.cpp
+  test/cpp/scan_manager/test_shared_scan_budget.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp

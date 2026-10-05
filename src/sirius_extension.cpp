@@ -1069,7 +1069,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
   // finish() at the end of this body quiesces any transient per-query state
   // the materialization created; the pinned entries themselves persist across
   // windows.
-  duckdb::SiriusContext::StandaloneQueryScope window(*sirius_ctx, context, "pin_table");
+  duckdb::SiriusContext::StandaloneQueryScope window(
+    *sirius_ctx, context, "pin_table", sirius::exec::query_admission::access::maintenance);
   try {
     auto pin_registry_guard = sirius_ctx->lock_pinned_table_registry();
 
