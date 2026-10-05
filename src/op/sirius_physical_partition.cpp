@@ -163,18 +163,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
     _partition_keys            = grouped_aggregate_op.get_output_grouping_indices();
-
-    // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
-    // operator which may be what we want to use when we care about grouping sets for (std::size_t
-    // i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
-    //   auto& grouping = grouped_aggregate_op.groupings[i];
-    //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
-    //     auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
-    //     if (group->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    //       _partition_keys.push_back(group->Cast<duckdb::BoundReferenceExpression>().index);
-    //     }
-    //   }
-    // }
   } else if (op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) {
     // The fused count-join is both the key source and the downstream sizing consumer. Its two
     // inputs partition on their respective join keys so equal keys co-locate.
