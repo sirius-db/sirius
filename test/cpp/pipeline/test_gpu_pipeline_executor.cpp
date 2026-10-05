@@ -184,7 +184,10 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
   config.num_threads        = 2;
   config.thread_name_prefix = "gpu-pipeline-test";
 
-  sirius::pipeline::gpu_pipeline_executor executor(config,
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(sirius::make_query_id(0));
+  sirius::pipeline::gpu_pipeline_executor executor(lifecycle,
+                                                   config,
                                                    mem_space,
                                                    std::move(request_publisher),
                                                    nullptr,

@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task.hpp"
 
@@ -90,6 +91,7 @@ class downgrade_executor {
    * @param pipeline_task_queue Optional pointer to pipeline task queue for tiered fallback
    */
   explicit downgrade_executor(
+    sirius::exec::query_lifecycle_registry& lifecycle,
     exec::downgrade_executor_config config,
     sirius::data::data_repository_manager_registry& data_repo_registry,
     cucascade::memory::memory_space_id space_id,
@@ -216,6 +218,8 @@ class downgrade_executor {
   // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
   // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
 };
 
 }  // namespace parallel

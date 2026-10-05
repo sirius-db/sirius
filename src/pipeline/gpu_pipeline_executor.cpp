@@ -31,6 +31,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -46,13 +47,14 @@ namespace sirius {
 namespace pipeline {
 
 gpu_pipeline_executor::gpu_pipeline_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
   : sirius::parallel::itask_executor(
-      config, std::move(telemetry_context), mem_space->get_device_id()),
+      lifecycle, config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
@@ -130,16 +132,37 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping publisher loop");
       break;
     }
+    // Everything past this point is per-task and must not be able to stop the manager thread:
+    // it serves every in-flight query on this device.
+    process_task(std::move(pipeline_task), std::move(slot), manager_thread_telemetry);
+  }
+}
+
+void gpu_pipeline_executor::process_task(
+  std::unique_ptr<parallel::itask> pipeline_task,
+  exec::bounded_thread_pool::slot slot,
+  telemetry::TaskManagerLoopThreadHandleWrapper& manager_thread_telemetry) noexcept
+{
+  // Resolved as soon as the task is known so every failure path below — including an unexpected
+  // throw — fails THIS task's query rather than the engine.
+  std::shared_ptr<completion_handler> iteration_completion;
+  try {
     auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       // Only gpu_pipeline_tasks are ever scheduled onto a GPU executor, so this is a
       // programming error rather than a query failure. There is no pipeline here and therefore
       // no query whose completion handler could own the error; reporting it to some arbitrary
-      // in-flight query would fail the wrong one. Fail the engine loudly instead.
+      // in-flight query would fail the wrong one. Drop it loudly instead: this used to throw,
+      // which escaped manager_loop (a std::thread entry function) and aborted the process.
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
-      throw sirius::internal_exception(
-        "GPU Pipeline Executor: a non-gpu_pipeline_task reached the GPU executor queue");
+      return;
     }
+    iteration_completion = gpu_task->get_completion_handler();
+    // Attribute the reserved slot now that the task's query is known, so
+    // drain_and_wait(query_id) covers this execution. Not done at reserve() time: the manager
+    // parks in pop() holding the slot before any task exists, and counting that against a query
+    // would make its drain wait for work that may never arrive.
+    if (auto const* pipe = gpu_task->get_pipeline()) { slot.attach(pipe->get_query_id()); }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
@@ -214,7 +237,7 @@ void gpu_pipeline_executor::manager_loop()
           "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
           std::to_string(gpu_task->get_task_id()));
       }
-      break;
+      return;
     } else if (reservation->size() < bytes_needs && _downgrade_executor) {
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
@@ -268,10 +291,17 @@ void gpu_pipeline_executor::manager_loop()
             })
             .get();
       } catch (const std::exception& e) {
+        // The downgrade executor cancelled this request (its queue was drained). This task cannot
+        // get its reservation, so fail its query
         SIRIUS_LOG_INFO("GPU Pipeline Executor: downgrade request cancelled for task {}: {}",
                         gpu_task->get_task_id(),
                         e.what());
-        break;
+        if (iteration_completion) {
+          iteration_completion->report_error(
+            "GPU Pipeline Executor: downgrade request cancelled for task " +
+            std::to_string(gpu_task->get_task_id()) + ": " + e.what());
+        }
+        return;
       }
 
       if (new_reservation) {
@@ -308,7 +338,7 @@ void gpu_pipeline_executor::manager_loop()
             "after downgrade for task " +
             std::to_string(gpu_task->get_task_id()));
         }
-        break;
+        return;
       }
       if (reservation->size() < bytes_needs) {
         SIRIUS_LOG_WARN(
@@ -342,17 +372,18 @@ void gpu_pipeline_executor::manager_loop()
         handler->report_error("GPU Pipeline Executor: Failed to cast local state for task " +
                               std::to_string(gpu_task->get_task_id()));
       }
-      break;
+      return;
     }
     auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
     auto exc_stream       = _stream_pool.acquire_stream(
       cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-    // Resolved once here: every report below belongs to THIS task's query, so a failure or
-    // completion can never land on another in-flight query's promise. The shared_ptr also keeps
-    // the handler alive past the owning sirius_engine, which is destroyed before query cleanup
-    // drains the queues.
-    auto completion = gpu_task->get_completion_handler();
+    // Resolved once at the top of this function: every report below belongs to THIS task's query,
+    // so a failure or completion can never land on another in-flight query's promise. The
+    // shared_ptr also keeps the handler alive past the owning sirius_engine, which is destroyed
+    // before query cleanup drains the queues. Copied (not moved) into the lambda so the catch
+    // blocks below still have it if dispatch itself throws.
+    auto completion = iteration_completion;
     _bounded_pool->dispatch(
       std::move(slot),
       [this,
@@ -361,6 +392,14 @@ void gpu_pipeline_executor::manager_loop()
        consumers  = std::move(output_consumers),
        completion = std::move(completion),
        pipeline]() mutable {
+        // Retry bodies and completion callbacks can throw too. Report before captured tasks
+        // unwind and potentially signal pipeline completion; the pool's catch alone only logs.
+        const int entered_exceptions = std::uncaught_exceptions();
+        absl::Cleanup report_unwind  = [&] {
+          if (completion && std::uncaught_exceptions() > entered_exceptions) {
+            completion->report_error("GPU task retry or completion callback failed");
+          }
+        };
         try {
           if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
@@ -480,11 +519,11 @@ void gpu_pipeline_executor::manager_loop()
             pipeline_task->telemetry_handle().exit();
             pipeline_task->set_telemetry_finalized();
           }
-          this->schedule(std::move(new_task));
+          if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
+          _task_creator->reschedule(std::move(new_task));
           return;
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
-          if (_task_creator) { _task_creator->stop(); }
           if (completion) {
             completion->report_error(std::current_exception(),
                                      transparent::late_failure_cause::gpu_error);
@@ -492,7 +531,6 @@ void gpu_pipeline_executor::manager_loop()
           return;
         } catch (...) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
-          if (_task_creator) { _task_creator->stop(); }
           if (completion) {
             completion->report_error(std::current_exception(),
                                      transparent::late_failure_cause::gpu_error);
@@ -507,6 +545,9 @@ void gpu_pipeline_executor::manager_loop()
           pipeline_task->telemetry_handle().exit();
           pipeline_task->set_telemetry_finalized();
         }
+        // Destruction updates pipeline completion. Keep its lifetime claim through the
+        // epilogue, which still dereferences the pipeline and schedules its consumers.
+        auto completed_work = task->take_work_lease();
         task.reset();
 
         // Check if query is complete BEFORE scheduling downstream tasks.
@@ -550,6 +591,19 @@ void gpu_pipeline_executor::manager_loop()
           completion->mark_completed();
         }
       });
+  } catch (const std::exception& e) {
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception while preparing task for dispatch: {}",
+                     e.what());
+    try {
+      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    } catch (...) {  // reporting must never take down the manager thread
+    }
+  } catch (...) {
+    SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error while preparing task for dispatch");
+    try {
+      if (iteration_completion) { iteration_completion->report_error(std::current_exception()); }
+    } catch (...) {
+    }
   }
 }
 

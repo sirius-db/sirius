@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "exec/query_lifecycle_registry.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/split_connector.hpp"
 
@@ -80,7 +81,8 @@ class memory_prefetcher {
  public:
   memory_prefetcher(memory_prefetcher_config cfg,
                     std::vector<std::shared_ptr<split_connector>> connectors,
-                    cucascade::memory::memory_space* gpu_space);
+                    cucascade::memory::memory_space* gpu_space,
+                    exec::query_lifecycle_registry& lifecycle);
 
   ~memory_prefetcher();
 
@@ -107,6 +109,7 @@ class memory_prefetcher {
   /// Attempt one sweep over all connectors; returns the number of batches converted.
   std::size_t sweep(::cuda::stream_ref stream);
 
+  exec::query_lifecycle_registry& _lifecycle;
   memory_prefetcher_config _config;
   std::vector<std::shared_ptr<split_connector>> _connectors;
   /// Per-connector work claim (parallel to _connectors): only one worker at a
