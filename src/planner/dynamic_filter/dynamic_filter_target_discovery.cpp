@@ -172,6 +172,7 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::TOP_N:
     case SiriusPhysicalOperatorType::WINDOW:
     case SiriusPhysicalOperatorType::UNNEST:
+    case SiriusPhysicalOperatorType::REPLICATE:
     case SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
     case SiriusPhysicalOperatorType::PERFECT_HASH_GROUP_BY:
     case SiriusPhysicalOperatorType::PARTITIONED_AGGREGATE:
