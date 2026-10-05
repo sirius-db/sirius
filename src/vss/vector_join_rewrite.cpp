@@ -192,6 +192,36 @@ void split_conjunction(unique_ptr<Expression> e, std::vector<unique_ptr<Expressi
   out.push_back(std::move(e));
 }
 
+/// True when DuckDB's statistics say the table column behind @p b can hold a NULL vector. A NULL
+/// vector has no distance, so DuckDB orders or filters it in ways the join does not reproduce;
+/// declining leaves the query to a plan that can fall back to the CPU at run time. Only a column
+/// read straight from a table scan is checked; any other source reports false.
+bool vector_may_hold_nulls(duckdb::ClientContext& context, LogicalOperator& subtree, const ColumnBinding& b)
+{
+  if (subtree.type == LogicalOperatorType::LOGICAL_GET) {
+    auto& scan = subtree.Cast<duckdb::LogicalGet>();
+    if (scan.table_index != b.table_index) { return false; }
+    auto table = scan.GetTable();
+    if (!table) { return false; }
+    auto const pos = scan.projection_ids.empty() ? b.column_index
+                     : b.column_index < scan.projection_ids.size()
+                       ? scan.projection_ids[b.column_index]
+                       : scan.GetColumnIds().size();
+    auto const& ids = scan.GetColumnIds();
+    if (pos >= ids.size() || ids[pos].IsRowIdColumn() || ids[pos].IsEmptyColumn()) { return false; }
+    try {
+      auto const stats = table->GetStatistics(context, ids[pos].GetPrimaryIndex());
+      return stats && stats->CanHaveNull();
+    } catch (std::exception&) {
+      return false;
+    }
+  }
+  for (auto& child : subtree.children) {
+    if (vector_may_hold_nulls(context, *child, b)) { return true; }
+  }
+  return false;
+}
+
 bool has_binding(LogicalOperator& op, const ColumnBinding& b)
 {
   auto const bindings = op.GetColumnBindings();
@@ -1130,6 +1160,10 @@ class rewriter {
     auto const probe_vec  = delim_cols[vi];
     auto const corpus_vec = call->a == delim_vec ? call->b : call->a;
     if ((call->kind == distance_kind::cosine_similarity) != descending) { return decline(13); }
+    if (vector_may_hold_nulls(_context, *dj.children[pi], probe_vec) ||
+        vector_may_hold_nulls(_context, *cross.children[1 - dgi], corpus_vec)) {
+      return decline(19);
+    }
     // The aggregate groups by exactly the correlated columns; group g is delim column
     // group_delim[g], which the probe has as delim_cols[group_delim[g]].
     std::vector<std::size_t> group_delim;
@@ -1330,6 +1364,10 @@ class rewriter {
     std::size_t const pi  = est_a <= est_b ? ai : 1 - ai;
     auto const probe_vec  = pi == ai ? call->a : call->b;
     auto const corpus_vec = pi == ai ? call->b : call->a;
+    if (vector_may_hold_nulls(_context, *cross_slot->children[pi], probe_vec) ||
+        vector_may_hold_nulls(_context, *cross_slot->children[1 - pi], corpus_vec)) {
+      return false;
+    }
     auto const k          = static_cast<std::int64_t>(topn.limit + topn.offset);
 
     // Nothing above may read the vectors raw; distance calls on the pair become the score.
@@ -1686,6 +1724,10 @@ class rewriter {
     std::size_t const pi = est0 <= est1 ? 0 : 1;
     auto const probe_vec = has_binding(*join.children[pi], pred.call.a) ? pred.call.a : pred.call.b;
     auto const corpus_vec = probe_vec == pred.call.a ? pred.call.b : pred.call.a;
+    if (vector_may_hold_nulls(_context, *join.children[pi], probe_vec) ||
+        vector_may_hold_nulls(_context, *join.children[1 - pi], corpus_vec)) {
+      return false;
+    }
     if (!validate_above(slot.get(), conjuncts, *idx, pred)) { return false; }
 
     auto probe  = std::move(join.children[pi]);
@@ -1725,6 +1767,10 @@ class rewriter {
       return false;
     });
     if (!idx || !lifted) { return false; }
+    if (vector_may_hold_nulls(_context, *tree, probe_vec) ||
+        vector_may_hold_nulls(_context, *tree, corpus_vec)) {
+      return false;
+    }
     auto const pred = *as_threshold(*conjuncts[*idx]);
 
     // The lifted relation must feed nothing inside the tree but the cross product, or removing it
