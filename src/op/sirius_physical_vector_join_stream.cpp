@@ -2720,8 +2720,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // The fold is mode-independent; only which of its candidates survive is not.
     switch (_request.mode) {
       case vss::vector_join_mode::global_top_k: {
-        shaped = vss::shape_global_top_k(
-          acc_neighbors->view(), acc_distances->view(), n_left, k_join, k_join, stream, mr);
+        // Each left row is searched to depth k_join (k clamped to the corpus), but the batch keeps
+        // the requested k: with k beyond one row's candidates the answer spans several rows.
+        shaped = vss::shape_global_top_k(acc_neighbors->view(),
+                                         acc_distances->view(),
+                                         n_left,
+                                         k_join,
+                                         _request.k,
+                                         stream,
+                                         mr);
         break;
       }
       case vss::vector_join_mode::threshold: {

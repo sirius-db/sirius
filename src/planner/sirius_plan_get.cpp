@@ -1301,7 +1301,12 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       add(*filter);
     }
   }
-  if (right_rows > 0 && req.k > right_rows) { req.k = right_rows; }
+  // k is per left row except in the global mode, where it counts pairs across all left rows and
+  // can exceed the right table (the stream stage clamps each row's search depth on its own).
+  if (right_rows > 0 && req.k > right_rows &&
+      req.mode != sirius::vss::vector_join_mode::global_top_k) {
+    req.k = right_rows;
+  }
 
   // Three-stage pipeline: select (per-pair top-k) → reduce_local (per-left-batch
   // reduction) → materialize (gather output columns + score into the TVF rows).
