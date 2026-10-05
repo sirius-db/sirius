@@ -32,7 +32,10 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/types.hpp>
@@ -59,9 +62,8 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
-  // Sirius's GPU aggregate path does not support DISTINCT aggregates — see the throw in
-  // build_aggregate_layout. DistinctAggregateCollectionInfo / DistinctAggregateData are not
-  // wired into any subsequent code path here, so we skip populating them.
+  // COUNT(DISTINCT) uses COLLECT_SET. DistinctAggregateCollectionInfo and DistinctAggregateData
+  // are not populated.
 }
 
 namespace {
@@ -91,7 +93,7 @@ std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type typ
   return out;
 }
 
-enum class aggregate_kind { SUM, MIN, MAX, COUNT, COUNT_STAR, AVG, FIRST };
+enum class aggregate_kind { SUM, MIN, MAX, COUNT, COUNT_DISTINCT, COUNT_STAR, AVG, FIRST };
 
 struct aggregate_spec {
   aggregate_kind kind;
@@ -107,7 +109,8 @@ struct aggregate_layout {
   std::vector<cudf::aggregation::Kind> merge_kinds;
   std::vector<std::optional<cudf::size_type>>
     merge_nth_index;  // when merge_kinds[i] == NTH_ELEMENT
-  bool has_avg = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
 };
 
 aggregate_layout build_aggregate_layout(
@@ -119,12 +122,15 @@ aggregate_layout build_aggregate_layout(
 
   for (size_t i = 0; i < aggregates.size(); ++i) {
     auto const& agg = sirius::ast::require_aggregate(aggregates[i].get(), "ungrouped aggregate");
-    if (agg.distinct()) {
-      throw not_implemented_exception("Distinct aggregates not supported in GPU path yet");
-    }
     auto const& children = agg.arguments();
     if (children.size() > 1) {
       throw not_implemented_exception("Aggregates with multiple children not supported yet");
+    }
+    if (agg.distinct() && (agg.function() != sirius::aggregate_id::count || children.empty() ||
+                           !children[0]->is_reference())) {
+      throw not_implemented_exception(
+        "Distinct aggregates other than COUNT(DISTINCT col) "
+        "not supported in GPU path yet");
     }
 
     auto agg_return_type = sirius::to_duckdb(agg.return_type());
@@ -149,13 +155,23 @@ aggregate_layout build_aggregate_layout(
         if (children.empty()) {
           throw not_implemented_exception("count() without arguments not supported");
         }
-        spec.kind          = aggregate_kind::COUNT;
         spec.return_type   = duckdb::LogicalType::BIGINT;
         spec.input_idx     = child_ref_index();
         spec.local_sum_idx = local_idx++;
-        layout.local_types.push_back(duckdb::LogicalType::BIGINT);
-        layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
         layout.merge_nth_index.push_back(std::nullopt);
+        if (agg.distinct()) {
+          // Each batch collects its distinct values into a one-row LIST, the merge unions the
+          // lists and the finalize step counts the elements.
+          spec.kind = aggregate_kind::COUNT_DISTINCT;
+          layout.local_types.push_back(
+            duckdb::LogicalType::LIST(sirius::to_duckdb(children[0]->return_type())));
+          layout.merge_kinds.push_back(cudf::aggregation::Kind::MERGE_SETS);
+          layout.has_count_distinct = true;
+        } else {
+          spec.kind = aggregate_kind::COUNT;
+          layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+          layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+        }
         break;
       case sirius::aggregate_id::sum:
       case sirius::aggregate_id::sum_no_overflow:
@@ -271,6 +287,23 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
   return cudf::cast(avg_f64->view(), out_type, stream, memory_resource);
 }
 
+std::unique_ptr<cudf::column> make_count_distinct_column(
+  const cudf::column_view& set_view,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref memory_resource)
+{
+  auto count = cudf::cast(
+    cudf::lists::count_elements(cudf::lists_column_view{set_view}, stream, memory_resource)->view(),
+    cudf::data_type{cudf::type_id::INT64},
+    stream,
+    memory_resource);
+  // COLLECT_SET over an empty or all-NULL input gives a NULL list, whose count is 0.
+  if (!count->has_nulls()) { return count; }
+  auto const zero =
+    make_numeric_scalar_with_value<int64_t>(cudf::data_type{cudf::type_id::INT64}, 0, stream);
+  return cudf::replace_nulls(count->view(), *zero, stream, memory_resource);
+}
+
 }  // namespace
 
 duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_local_output_types()
@@ -331,6 +364,16 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar =
             cudf::reduce(col, *agg_op, cudf::data_type(cudf::type_id::INT64), std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
+          break;
+        }
+        case aggregate_kind::COUNT_DISTINCT: {
+          auto const mr = space->get_default_allocator();
+          auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto agg_op   = cudf::make_collect_set_aggregation<cudf::reduce_aggregation>(
+            cudf::null_policy::EXCLUDE, cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL);
+          auto scalar = cudf::reduce(
+            col, *agg_op, cudf::data_type{cudf::type_id::LIST}, std::nullopt, stream, mr);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream, mr));
           break;
         }
         case aggregate_kind::FIRST: {
@@ -506,7 +549,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());
   }
 
-  if (!layout.has_avg) {
+  if (!layout.has_avg && !layout.has_count_distinct) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
@@ -524,6 +567,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
       auto count_view = merged_view.column(static_cast<cudf::size_type>(spec.local_count_idx));
       output_cols.push_back(make_avg_column(
         sum_view, count_view, spec.return_type, stream, cudf::get_current_device_resource_ref()));
+    } else if (spec.kind == aggregate_kind::COUNT_DISTINCT) {
+      auto set_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      output_cols.push_back(
+        make_count_distinct_column(set_view, stream, space->get_default_allocator()));
     } else {
       auto col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
       output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));

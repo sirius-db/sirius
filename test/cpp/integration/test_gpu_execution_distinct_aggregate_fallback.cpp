@@ -18,13 +18,14 @@
  * @file test_gpu_execution_distinct_aggregate_fallback.cpp
  * @brief Verifies that GPU planning rejects the DISTINCT aggregates the GPU does not support.
  *
- * The GPU aggregates support DISTINCT only in grouped COUNT. Grouped SUM and AVG with DISTINCT
- * and every ungrouped DISTINCT aggregate must fall back to the CPU at plan time and return
- * DuckDB's rows. With the fallback disabled they must fail at plan time.
+ * The GPU aggregates support DISTINCT only in COUNT, and ungrouped COUNT(DISTINCT) only on a
+ * single column, without a FILTER clause. The other DISTINCT aggregates must fall back to the CPU
+ * at plan time and return DuckDB's rows. With the fallback disabled they must fail at plan time.
  */
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
@@ -34,12 +35,12 @@ using DistinctAggregateFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-/// Every value of `v` repeats, so DISTINCT changes SUM, AVG and COUNT.
+/// Every value of `v` and `s` repeats, so DISTINCT changes SUM, AVG and COUNT.
 void create_distinct_table(DistinctAggregateFixture& fx)
 {
   fx.run_ok(
-    "CREATE TABLE da_t AS SELECT (i % 3)::INTEGER g, (i % 5)::INTEGER v, (i * 7)::BIGINT w "
-    "FROM range(60) r(i);");
+    "CREATE TABLE da_t AS SELECT (i % 3)::INTEGER g, (i % 5)::INTEGER v, (i * 7)::BIGINT w, "
+    "'s' || (i % 4) s FROM range(60) r(i);");
   fx.run_ok("CHECKPOINT;");
 }
 
@@ -47,13 +48,18 @@ void create_distinct_table(DistinctAggregateFixture& fx)
 
 TEST_CASE_METHOD(
   DistinctAggregateFixture,
-  "distinct aggregates - grouped SUM and AVG with DISTINCT fall back and match the CPU",
+  "distinct aggregates - unsupported grouped DISTINCT aggregates fall back and match the CPU",
   "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
 {
   create_distinct_table(*this);
   SECTION("SUM(DISTINCT)")
   {
     expect_plan_fallback_matches_cpu("SELECT g, sum(DISTINCT v) s FROM da_t GROUP BY g;");
+  }
+  SECTION("COUNT(DISTINCT) with a FILTER clause")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT g, count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t GROUP BY g;");
   }
   SECTION("SUM(DISTINCT) and AVG(DISTINCT) next to COUNT(DISTINCT)")
   {
@@ -62,19 +68,23 @@ TEST_CASE_METHOD(
   }
 }
 
-TEST_CASE_METHOD(DistinctAggregateFixture,
-                 "distinct aggregates - ungrouped DISTINCT aggregates fall back and match the CPU",
-                 "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
+TEST_CASE_METHOD(
+  DistinctAggregateFixture,
+  "distinct aggregates - unsupported ungrouped DISTINCT aggregates fall back and match the CPU",
+  "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
 {
   create_distinct_table(*this);
   SECTION("SUM and AVG with DISTINCT")
   {
     expect_plan_fallback_matches_cpu("SELECT sum(DISTINCT v) s, avg(DISTINCT v) a FROM da_t;");
   }
-  SECTION("COUNT(DISTINCT) next to plain aggregates")
+  SECTION("multi-column COUNT(DISTINCT)")
   {
-    // The shape of TPC-DS Q16, Q94 and Q95.
-    expect_plan_fallback_matches_cpu("SELECT count(DISTINCT v) c, sum(w) s, count(*) n FROM da_t;");
+    expect_plan_fallback_matches_cpu("SELECT count(DISTINCT (g, v)) c FROM da_t;");
+  }
+  SECTION("COUNT(DISTINCT) with a FILTER clause")
+  {
+    expect_plan_fallback_matches_cpu("SELECT count(DISTINCT v) FILTER (WHERE v < 2) c FROM da_t;");
   }
 }
 
@@ -104,10 +114,10 @@ TEST_CASE_METHOD(DistinctAggregateFixture,
     expect_plan_rejection("SELECT g, sum(DISTINCT v) s FROM da_t GROUP BY g;",
                           "DISTINCT in grouped aggregates other than COUNT");
   }
-  SECTION("ungrouped COUNT(DISTINCT)")
+  SECTION("ungrouped SUM(DISTINCT)")
   {
-    expect_plan_rejection("SELECT count(DISTINCT v) c FROM da_t;",
-                          "DISTINCT in ungrouped aggregates");
+    expect_plan_rejection("SELECT sum(DISTINCT v) s FROM da_t;",
+                          "DISTINCT in ungrouped aggregates other than COUNT");
   }
 }
 
@@ -117,4 +127,39 @@ TEST_CASE_METHOD(DistinctAggregateFixture,
 {
   create_distinct_table(*this);
   compare_gpu_vs_cpu("SELECT g, count(DISTINCT v) c, sum(w) s FROM da_t GROUP BY g;");
+}
+
+TEST_CASE_METHOD(DistinctAggregateFixture,
+                 "distinct aggregates - ungrouped COUNT(DISTINCT) runs on the GPU",
+                 "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
+{
+  create_distinct_table(*this);
+  SECTION("next to plain aggregates")
+  {
+    // The shape of TPC-DS Q16, Q94 and Q95.
+    compare_gpu_vs_cpu("SELECT count(DISTINCT v) c, sum(w) s, count(*) n FROM da_t;");
+  }
+  SECTION("on several columns and types")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT count(DISTINCT v), count(DISTINCT w % 4), count(DISTINCT (v * 1.5)::DOUBLE), "
+      "count(DISTINCT (v::DECIMAL(7, 2))), count(DISTINCT s) FROM da_t;");
+  }
+  SECTION("on an empty input")
+  {
+    compare_gpu_vs_cpu("SELECT count(DISTINCT v) c, count(*) n FROM da_t WHERE w < 0;");
+  }
+}
+
+TEST_CASE_METHOD(DistinctAggregateFixture,
+                 "distinct aggregates - ungrouped COUNT(DISTINCT) merges sets across batches",
+                 "[integration][gpu_execution][aggregate][distinct_aggregate_fallback]")
+{
+  // Values repeat across batches, so the merge must union the sets rather than add the counts.
+  run_ok(
+    "CREATE TABLE da_big AS SELECT (i % 1000)::INTEGER v, CASE WHEN i % 7 = 0 THEN NULL ELSE "
+    "(i % 333)::BIGINT END n FROM range(300000) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 65536};
+  compare_gpu_vs_cpu("SELECT count(DISTINCT v) c, count(DISTINCT n) d, count(*) r FROM da_big;");
 }
