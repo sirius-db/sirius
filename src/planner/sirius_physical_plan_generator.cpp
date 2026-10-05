@@ -1339,9 +1339,16 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-      throw duckdb::NotImplementedException("Set operation (EXCEPT/INTERSECT) not supported");
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: {
+      // The distinct forms need the DISTINCT operator above them; only the ALL forms dispatch.
+      auto& set_operation = op.Cast<duckdb::LogicalSetOperation>();
+      if (!set_operation.setop_all) {
+        throw duckdb::NotImplementedException(
+          "Set operation (EXCEPT/INTERSECT) not supported; only the ALL forms are on the GPU path");
+      }
+      plan = create_plan(set_operation);
       break;
+    }
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalInsert>());

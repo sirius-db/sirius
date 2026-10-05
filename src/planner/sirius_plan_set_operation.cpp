@@ -23,20 +23,26 @@
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_replicate.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
+#include <array>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sirius::planner {
 
-// The generator switch routes only `LOGICAL_UNION` to this builder — `EXCEPT` / `INTERSECT` keep
-// their own throwing case — so the UNION body below the fork checks only `setop_all` and
-// `allow_out_of_order`.
+// The fork sends `EXCEPT` / `INTERSECT` to `plan_except_intersect`, so the UNION body below it
+// checks only `setop_all` and `allow_out_of_order`.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 {
@@ -159,18 +165,143 @@ void require_input_types(sirius::op::sirius_physical_operator const& input,
   }
 }
 
+//! The connection's `operator_params`; defaults when no SiriusContext is registered.
+sirius::operator_params current_operator_params(duckdb::ClientContext& context)
+{
+  auto const sirius_ctx = context.registered_state
+                            ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                            : nullptr;
+  return sirius_ctx ? sirius_ctx->get_config().get_operator_params() : sirius::operator_params{};
+}
+
+std::unique_ptr<sirius::ast::node> column_reference(std::size_t column, sirius::logical_type type)
+{
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::reference{static_cast<std::uint32_t>(column), std::move(type)});
+}
+
+//! Input @p input's tag values for an ALL form. Per group, the tag columns sum to `m - n` for
+//! EXCEPT ALL, and to `m` and `n` for INTERSECT ALL, where `m` and `n` count the group's rows in
+//! inputs 0 and 1.
+std::vector<std::int8_t> bag_tags(duckdb::LogicalOperatorType type, std::size_t input)
+{
+  bool const left = input == 0;
+  switch (type) {
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
+      return {left ? std::int8_t{1} : std::int8_t{-1}};
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      return {left ? std::int8_t{1} : std::int8_t{0}, left ? std::int8_t{0} : std::int8_t{1}};
+    default: throw duckdb::InternalException("Unrecognized filtering set operation type");
+  }
+}
+
+//! A group's copies from its tag sums at columns @p first_sum onward: `max(m - n, 0)` for EXCEPT
+//! ALL, `min(m, n)` for INTERSECT ALL.
+std::unique_ptr<sirius::ast::node> bag_copies(duckdb::LogicalOperatorType type,
+                                              std::size_t first_sum)
+{
+  auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto const sum = [&](std::size_t offset) { return column_reference(first_sum + offset, bigint); };
+  std::unique_ptr<sirius::ast::node> when;
+  std::unique_ptr<sirius::ast::node> otherwise;
+  switch (type) {
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: {
+      auto zero = [&] {
+        return std::make_unique<sirius::ast::node>(
+          sirius::ast::constant{sirius::value{std::int64_t{0}}, bigint});
+      };
+      when = std::make_unique<sirius::ast::node>(
+        sirius::ast::comparison{sirius::comparison_type::gt, sum(0), zero()});
+      otherwise = zero();
+      break;
+    }
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
+      when = std::make_unique<sirius::ast::node>(
+        sirius::ast::comparison{sirius::comparison_type::lt, sum(0), sum(1)});
+      otherwise = sum(1);
+      break;
+    default: throw duckdb::InternalException("Unrecognized filtering set operation type");
+  }
+  std::vector<sirius::ast::case_expr::when_then> cases;
+  cases.push_back({std::move(when), sum(0)});
+  return std::make_unique<sirius::ast::node>(
+    sirius::ast::case_expr{std::move(cases), std::move(otherwise), bigint});
+}
+
+//! Lowers an ALL form over its planned inputs, as Spark does: tag each input's rows, UNION ALL,
+//! sum the tags per group of every column, turn the sums into copies, and repeat each group's
+//! row that many times.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_bag_set_operation(
+  duckdb::LogicalOperatorType type,
+  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> inputs,
+  duckdb::vector<sirius::logical_type> const& types,
+  std::size_t estimated_cardinality,
+  sirius::op::gpu_replicate_impl::limits replicate_limits)
+{
+  auto const width     = types.size();
+  auto const tinyint   = sirius::logical_type::make(sirius::type_id::TINYINT);
+  auto const bigint    = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto const tag_count = bag_tags(type, 0).size();
+
+  auto tagged_types = types;
+  tagged_types.insert(tagged_types.end(), tag_count, tinyint);
+  auto union_op =
+    duckdb::make_uniq<sirius::op::sirius_physical_union>(tagged_types, estimated_cardinality);
+  for (std::size_t input = 0; input < inputs.size(); ++input) {
+    duckdb::vector<std::unique_ptr<sirius::ast::node>> select_list;
+    for (std::size_t i = 0; i < width; ++i) {
+      select_list.push_back(column_reference(i, types[i]));
+    }
+    for (auto const tag : bag_tags(type, input)) {
+      select_list.push_back(
+        std::make_unique<sirius::ast::node>(sirius::ast::constant{sirius::value{tag}, tinyint}));
+    }
+    auto const input_cardinality = inputs[input]->estimated_cardinality;
+    union_op->children.push_back(push_projection(
+      std::move(inputs[input]), tagged_types, std::move(select_list), input_cardinality));
+  }
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+  for (std::size_t i = 0; i < width; ++i) {
+    groups.push_back(column_reference(i, types[i]));
+  }
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> sums;
+  for (std::size_t tag = 0; tag < tag_count; ++tag) {
+    std::vector<std::unique_ptr<sirius::ast::node>> arguments;
+    arguments.push_back(column_reference(width + tag, tinyint));
+    sums.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
+      sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
+  }
+  auto summed_types = types;
+  summed_types.insert(summed_types.end(), tag_count, bigint);
+  auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    summed_types, std::move(sums), std::move(groups), estimated_cardinality);
+  aggregate->children.push_back(std::move(union_op));
+
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> copies_list;
+  for (std::size_t i = 0; i < width; ++i) {
+    copies_list.push_back(column_reference(i, types[i]));
+  }
+  copies_list.push_back(bag_copies(type, width));
+  auto copies_types = types;
+  copies_types.push_back(bigint);
+  auto copies = push_projection(
+    std::move(aggregate), std::move(copies_types), std::move(copies_list), estimated_cardinality);
+
+  auto replicate = duckdb::make_uniq<sirius::op::sirius_physical_replicate>(
+    types, static_cast<cudf::size_type>(width), replicate_limits, estimated_cardinality);
+  replicate->children.push_back(std::move(copies));
+  return replicate;
+}
+
 }  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperation& op)
 {
   auto const set_op = filtering_set_operation_of(op.type);
-  std::string const name{set_op.name};
-
-  // The ALL forms need a ROW_NUMBER window on each input, and there is no window operator.
-  if (op.setop_all) {
-    throw duckdb::NotImplementedException("%s ALL not supported on the GPU path", name);
-  }
+  std::string const name =
+    op.setop_all ? std::string{set_op.name} + " ALL" : std::string{set_op.name};
 
   D_ASSERT(op.children.size() == 2);
   if (op.children.size() != 2) {
@@ -187,10 +318,34 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
         i,
         op.types[i].ToString());
     }
+    // A group keeps one of its -0.0 / +0.0 rows; DuckDB's ALL forms return the input's own rows.
+    auto const type_id = op.types[i].id();
+    if (op.setop_all &&
+        (type_id == duckdb::LogicalTypeId::FLOAT || type_id == duckdb::LogicalTypeId::DOUBLE)) {
+      throw duckdb::NotImplementedException(
+        "%s on column %d (%s): floating-point keys not supported on the GPU path",
+        name,
+        i,
+        op.types[i].ToString());
+    }
   }
 
   auto const output_types = sirius::from_duckdb_vec(op.types);
-  auto conditions         = sirius::wrap_join_conditions(null_safe_column_conditions(op.types));
+  auto const op_params    = current_operator_params(context);
+  if (op.setop_all) {
+    std::array inputs{create_plan(*op.children[0]), create_plan(*op.children[1])};
+    // Each tag projection and the union read their input's declared `types`.
+    require_input_types(*inputs[0], 0, output_types, name);
+    require_input_types(*inputs[1], 1, output_types, name);
+    return plan_bag_set_operation(
+      op.type,
+      std::move(inputs),
+      output_types,
+      op.estimated_cardinality,
+      {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
+  }
+
+  auto conditions = sirius::wrap_join_conditions(null_safe_column_conditions(op.types));
   if (!sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions,
                                                                        set_op.join_type)) {
     throw duckdb::NotImplementedException("%s keys not supported by the GPU hash join", name);
@@ -202,13 +357,6 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   // The join and its wrappers read each input's declared `types`.
   require_input_types(*left, 0, output_types, name);
   require_input_types(*right, 1, output_types, name);
-
-  // Without a SiriusContext the join takes default-constructed `operator_params`.
-  sirius::operator_params op_params;
-  auto const sirius_ctx = context.registered_state
-                            ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                            : nullptr;
-  if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
 
   return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
     op,

@@ -169,8 +169,8 @@ class sirius_physical_plan_generator {
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
   //! `UNION ALL`, or a set operation forked to `plan_except_intersect`; the builder rejects
-  //! distinct UNION. EXCEPT / INTERSECT share the same DuckDB node but keep their own throwing case
-  //! in the dispatch switch, so they never arrive from SQL.
+  //! distinct UNION. The dispatch switch refuses distinct EXCEPT / INTERSECT, so only their ALL
+  //! forms arrive from SQL.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -201,7 +201,8 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  //! Lowers EXCEPT / INTERSECT to a null-safe ANTI / SEMI hash join over their two arms.
+  //! Lowers EXCEPT / INTERSECT to a null-safe ANTI / SEMI hash join over their two arms, and their
+  //! ALL forms to tag, UNION ALL, per-group tag sums, and `sirius_physical_replicate`.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
     duckdb::LogicalSetOperation& op);
 
