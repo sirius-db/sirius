@@ -42,6 +42,7 @@
 #include "expression/ast/unary_op.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type
+#include "expression/substring_slice.hpp"
 
 // duckdb — direct-ctor construction surface
 #include <duckdb/common/exception.hpp>
@@ -64,8 +65,10 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 // standard library
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -493,20 +496,44 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION '+' resolves to function_id::add", "
   REQUIRE(fc.return_type().id() == sirius::type_id::INTEGER);
 }
 
-TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id::substring",
-          "[ast_from_duckdb]")
+namespace {
+
+// DuckDB binds substring(VARCHAR, BIGINT[, BIGINT]) with constant-folded bounds.
+duckdb::unique_ptr<BoundFunctionExpression> make_substring(
+  std::string const& name, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> bounds)
 {
+  duckdb::vector<LogicalType> arg_types{LogicalType::VARCHAR};
+  for (auto const& bound : bounds) {
+    arg_types.push_back(bound->return_type);
+  }
   auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
     LogicalType{LogicalTypeId::VARCHAR},
-    ScalarFunction("substring",
-                   {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::VARCHAR,
-                   nullptr),
+    ScalarFunction(name, std::move(arg_types), LogicalType::VARCHAR, nullptr),
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
     nullptr);
   fn_expr->children.push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
-  fn_expr->children.push_back(make_bound_int_const(1));
-  fn_expr->children.push_back(make_bound_int_const(3));
+  for (auto& bound : bounds) {
+    fn_expr->children.push_back(std::move(bound));
+  }
+  return fn_expr;
+}
+
+duckdb::unique_ptr<BoundFunctionExpression> make_substring(std::string const& name,
+                                                           std::vector<Value> const& bounds)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+  for (auto const& bound : bounds) {
+    children.push_back(duckdb::make_uniq<BoundConstantExpression>(bound));
+  }
+  return make_substring(name, std::move(children));
+}
+
+}  // namespace
+
+TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id::substring",
+          "[ast_from_duckdb]")
+{
+  auto fn_expr = make_substring("substring", {Value::BIGINT(1), Value::BIGINT(3)});
 
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
@@ -517,22 +544,85 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substring' resolves to function_id:
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION 'substr' alias resolves to function_id::substring",
           "[ast_from_duckdb]")
 {
-  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
-    LogicalType{LogicalTypeId::VARCHAR},
-    ScalarFunction("substr",
-                   {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::INTEGER},
-                   LogicalType::VARCHAR,
-                   nullptr),
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
-    nullptr);
-  fn_expr->children.push_back(make_bound_ref(0, LogicalTypeId::VARCHAR));
-  fn_expr->children.push_back(make_bound_int_const(1));
-  fn_expr->children.push_back(make_bound_int_const(3));
+  auto fn_expr = make_substring("substr", {Value::BIGINT(1), Value::BIGINT(3)});
 
   auto out = sirius::ast::from_duckdb(*fn_expr);
   REQUIRE(out);
   REQUIRE(out->holds<function_call>());
   REQUIRE(out->get<function_call>().function() == sirius::function_id::substring);
+}
+
+TEST_CASE("ast_from_duckdb - two-argument substring translates", "[ast_from_duckdb]")
+{
+  for (int64_t offset : {int64_t{-3}, int64_t{0}, int64_t{4}}) {
+    CAPTURE(offset);
+    auto out = sirius::ast::from_duckdb(*make_substring("substring", {Value::BIGINT(offset)}));
+    REQUIRE(out);
+    REQUIRE(out->get<function_call>().arguments().size() == 2);
+  }
+}
+
+TEST_CASE("ast_from_duckdb - substring bounds the GPU cannot match return nullptr",
+          "[ast_from_duckdb]")
+{
+  SECTION("non-constant offset")
+  {
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> bounds;
+    bounds.push_back(make_bound_ref(1, LogicalTypeId::BIGINT));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(*make_substring("substring", std::move(bounds))));
+  }
+  SECTION("NULL length")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(1), Value(LogicalType::BIGINT)})));
+  }
+  SECTION("non-BIGINT bounds")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::INTEGER(1), Value::INTEGER(3)})));
+  }
+  SECTION("bounds where DuckDB's ASCII and Unicode kernels disagree")
+  {
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(3), Value::BIGINT(-2)})));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(-5), Value::BIGINT(3)})));
+  }
+  SECTION("bounds DuckDB rejects as out of range")
+  {
+    REQUIRE_FALSE(
+      sirius::ast::from_duckdb(*make_substring("substring", {Value::BIGINT(int64_t{1} << 33)})));
+    REQUIRE_FALSE(sirius::ast::from_duckdb(
+      *make_substring("substring", {Value::BIGINT(1), Value::BIGINT(int64_t{1} << 33)})));
+  }
+}
+
+TEST_CASE("gpu_substring_slice maps DuckDB bounds to cuDF slices", "[ast_from_duckdb]")
+{
+  using sirius::gpu_substring_slice;
+  auto const slice = [](int64_t offset, int64_t length) {
+    auto const result = gpu_substring_slice(offset, length);
+    REQUIRE(result);
+    return std::pair{result->start, result->stop};
+  };
+  using bounds = std::pair<std::optional<int32_t>, std::optional<int32_t>>;
+
+  REQUIRE(slice(4, sirius::substring_default_length) == bounds{3, INT32_MAX});
+  REQUIRE(slice(2, 3) == bounds{1, 4});
+  REQUIRE(slice(0, 3) == bounds{0, 2});
+  REQUIRE(slice(0, 1) == bounds{0, 0});
+  REQUIRE(slice(0, -1) == bounds{0, 0});
+  REQUIRE(slice(5, 0) == bounds{0, 0});
+  REQUIRE(slice(int64_t{1} << 31, 1) == bounds{INT32_MAX, INT32_MAX});
+  REQUIRE(slice(-3, sirius::substring_default_length) == bounds{-3, std::nullopt});
+  REQUIRE(slice(-3, 3) == bounds{-3, std::nullopt});
+  REQUIRE(slice(-2, -2) == bounds{-4, -2});
+  REQUIRE(slice(-(int64_t{1} << 32), -1) == bounds{INT32_MIN, INT32_MIN});
+
+  REQUIRE_FALSE(gpu_substring_slice(3, -2));
+  REQUIRE_FALSE(gpu_substring_slice(-3, 2));
+  REQUIRE_FALSE(gpu_substring_slice(int64_t{1} << 32, 1));
+  REQUIRE_FALSE(gpu_substring_slice(-1, -(int64_t{1} << 32) - 1));
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_FUNCTION unknown name returns nullptr", "[ast_from_duckdb]")
