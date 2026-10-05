@@ -306,8 +306,7 @@ GPUs or runtimes is not guaranteed; a bundle without a saved YAML needs an expli
 `.claude/skills/`) runs the same commands on an available GPU host and reports the saved evidence.
 
 **Versions.** The shell and the extension must come from the same DuckDB version; the build's
-shell guarantees that. A plain DuckDB CLI that refuses a `LOAD` names the version it wants. The
-`duckdb-python` Pixi environment is no longer needed by the fuzzer.
+shell guarantees that. A plain DuckDB CLI that refuses a `LOAD` names the version it wants.
 
 **Shell protocol.** Every statement is followed by a marker on each stream, written with the
 shell's own dot commands so they never pass through SQL or Sirius; results (JSON on stdout) and
