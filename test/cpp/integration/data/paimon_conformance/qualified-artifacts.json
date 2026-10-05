@@ -6,13 +6,24 @@
       "native_commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
       "platform": "linux_amd64",
       "sha256": "0617d2bf2263b3fd50a2220d77b9dc775222bab854e6faf1d5a7a216b04dfdde",
+      "size_bytes": 103065470,
       "source_commit": "5e89198235c8be6a402f2b02ef54f249914eee29",
       "version": "5e89198"
+    },
+    {
+      "download_url": null,
+      "duckdb_version": "v1.5.6",
+      "native_commit": "53f9c86d45aabb0a6f1a379271da07d7a9f27a3d",
+      "platform": "linux_amd64",
+      "sha256": "2f52be825bcab6cc179bdd4f0c0fd4ff3e63b29eff7cc7f163443a2065f4e973",
+      "size_bytes": 103197494,
+      "source_commit": "e49d491a103e30399d2d0cdc9c2f7efaf138d200",
+      "version": "e49d491"
     }
   ],
   "format_version": 1,
   "pending": {
-    "retained_artifact": "No verified retained content-addressed URL for the historical artifact; cold provisioning intentionally fails.",
-    "v1.5.6/linux_amd64": "NOT RUN: requires native conformance and GPU fallback validation; do not copy the v1.5.5 hash."
+    "delivery": "Actual GitHub workflow execution and independent review of the final revision remain pending.",
+    "retained_artifact": "Both readers have local fixture qualification but no verified retained content-addressed URL; cold provisioning intentionally fails."
   }
 }

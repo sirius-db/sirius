@@ -13,11 +13,34 @@ duckdb-paimon `5e89198235c8be6a402f2b02ef54f249914eee29`, and native Paimon
 `53f9c86d45aabb0a6f1a379271da07d7a9f27a3d`. Its exact hash is recorded in
 `qualified-artifacts.json`, separately from the authored answers.
 
-Current Sirius main uses **v1.5.6**, which is **not yet qualified**. A retained,
-content-addressed download URL is also still missing. Provisioning intentionally
-fails for these pending prerequisites. This PR is not ready to claim reproducible
-current-main native qualification until they are completed. Do not copy the old
-hash into a new version entry or bless whatever the community server serves today.
+Current Sirius main uses **v1.5.6**. Its reader was qualified locally on
+2026-10-05 with duckdb-paimon `e49d491a103e30399d2d0cdc9c2f7efaf138d200`;
+that source pins the same native Paimon revision as above. The uncompressed
+artifact is 103,197,494 bytes, SHA256
+`2f52be825bcab6cc179bdd4f0c0fd4ff3e63b29eff7cc7f163443a2065f4e973`.
+The registry records separate hashes for the two DuckDB versions.
+
+Validation used Sirius `c2f8b73e12ceca4e95cf154c44e0de7052eca1f4`, DuckDB
+`069cc9f9b5be802405797faecc284961b07c70ef`, the locked CUDA 13.4 environment,
+architecture 120, and an RTX 5060 Ti with driver 595.84:
+
+| Current-build check | Result |
+| --- | --- |
+| CPU harness, Python 3.12 with warnings as errors | 63 tests passed |
+| Native conformance, both CPU modes and three smoke cases | 53 cases passed; 54 processes; approximately 55 seconds |
+| Relocated corpus, IPv4/IPv6 socket creation denied | 53 cases passed |
+| Freshly regenerated corpus and independent history reads | 53 native cases passed |
+| Sirius transparent execution and DISTINCT fallback regressions | 82 cases passed; 1,854 assertions |
+
+These native tests cover the committed fixtures, not general Paimon support.
+The GPU regressions exercise Sirius; Paimon itself still uses the CPU path.
+The older v1.5.5 reader was also rerun, including regenerated fixtures, and its
+results are separate from the current-build evidence.
+
+**Delivery is still pending:** neither artifact has a verified retained,
+content-addressed public download URL. Cold provisioning therefore intentionally
+fails. Actual GitHub workflow execution and final independent review are also
+pending; local qualification does not establish reproducible CI delivery.
 
 Known limit: [duckdb-paimon #95](https://github.com/polardb/duckdb-paimon/issues/95)
 reports stale same-key updates with a Flink-written composite primary key, subset
@@ -161,9 +184,10 @@ both expected answers and recorded observations still require independent review
 Retain candidate bytes outside the corpus; record their actual version, platform,
 source/native revisions, uncompressed byte size, and SHA256. Use a separate candidate registry via
 `--registry` for investigation, without treating the candidate as accepted.
-Run native conformance, relocation/offline checks, and appropriate Sirius GPU
-fallback/regressions. Investigate disagreements against authored answers and
+Keep the filename `paimon.duckdb_extension`: DuckDB derives the extension entry
+point from that basename. Run native conformance, relocation/offline checks, and
+appropriate Sirius GPU fallback/regressions. Investigate disagreements against authored answers and
 independent reader evidence. Publish the accepted bytes at a retained
 content-addressed URL, verify a cold download, and add the reviewed qualification
-record and evidence. These steps remain pending for v1.5.6 and must not be inferred
-from the old v1.5.5 results.
+record and evidence. The v1.5.6 local results above use newly tested bytes;
+retained-artifact provisioning and real CI delivery remain pending.
