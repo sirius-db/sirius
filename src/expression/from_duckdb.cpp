@@ -189,6 +189,23 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
 {
   auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
   if (!func_id_opt.has_value()) { return nullptr; }
+  if (*func_id_opt == function_id::date_trunc) {
+    // Match the GPU evaluator's supported frequencies. It requires a constant string;
+    // reject other forms here so neither unsupported units nor dynamic units reach execution.
+    if (expr.children.size() != 2 ||
+        expr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+      return nullptr;
+    }
+    auto const& frequency = expr.children[0]->Cast<duckdb::BoundConstantExpression>().value;
+    if (frequency.IsNull() || frequency.type().id() != duckdb::LogicalTypeId::VARCHAR) {
+      return nullptr;
+    }
+    auto const& unit = duckdb::StringValue::Get(frequency);
+    if (unit != "day" && unit != "hour" && unit != "minute" && unit != "second" &&
+        unit != "millisecond" && unit != "microsecond") {
+      return nullptr;
+    }
+  }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
@@ -219,7 +236,8 @@ std::unique_ptr<node> translate_operator(duckdb::BoundOperatorExpression const& 
     case duckdb::ExpressionType::OPERATOR_IS_NOT_NULL:
       unary_kind = unary_op::kind::op_is_not_null;
       break;
-    case duckdb::ExpressionType::OPERATOR_TRY: unary_kind = unary_op::kind::op_try; break;
+    // TRY needs per-row error suppression, which the GPU evaluator does not implement.
+    case duckdb::ExpressionType::OPERATOR_TRY: return nullptr;
     default: break;
   }
   if (unary_kind != unary_op::kind::invalid) {

@@ -547,6 +547,43 @@ TEST_CASE("ast_from_duckdb - BOUND_FUNCTION unknown name returns nullptr", "[ast
   REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
 }
 
+TEST_CASE("ast_from_duckdb - date_trunc admits only GPU-supported constant frequencies",
+          "[ast_from_duckdb]")
+{
+  auto fn_expr = duckdb::make_uniq<BoundFunctionExpression>(
+    LogicalType::TIMESTAMP,
+    ScalarFunction("date_trunc",
+                   {LogicalType::VARCHAR, LogicalType::TIMESTAMP},
+                   LogicalType::TIMESTAMP,
+                   nullptr),
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
+    nullptr);
+  fn_expr->children.push_back(nullptr);
+  fn_expr->children.push_back(make_bound_ref(0, LogicalTypeId::TIMESTAMP));
+
+  for (auto const* unit : {"day", "hour", "minute", "second", "millisecond", "microsecond"}) {
+    CAPTURE(unit);
+    fn_expr->children[0] = duckdb::make_uniq<BoundConstantExpression>(Value(unit));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) != nullptr);
+  }
+  for (auto const* unit : {"year", "month", "week", "quarter", "decade", "DAY", "days"}) {
+    CAPTURE(unit);
+    fn_expr->children[0] = duckdb::make_uniq<BoundConstantExpression>(Value(unit));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+
+  SECTION("column frequency")
+  {
+    fn_expr->children[0] = make_bound_ref(1, LogicalTypeId::VARCHAR);
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+  SECTION("NULL frequency")
+  {
+    fn_expr->children[0] = duckdb::make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
+    REQUIRE(sirius::ast::from_duckdb(*fn_expr) == nullptr);
+  }
+}
+
 // ============================================================================
 // BOUND_OPERATOR — full demultiplex table coverage (NOT / IS_NULL /
 // IS_NOT_NULL / TRY / COALESCE / COMPARE_IN / COMPARE_NOT_IN), plus one
@@ -591,16 +628,12 @@ TEST_CASE("ast_from_duckdb - BOUND_OPERATOR IS_NOT_NULL translates to unary_op(o
   REQUIRE(out->get<unary_op>().op == unary_op::kind::op_is_not_null);
 }
 
-TEST_CASE("ast_from_duckdb - BOUND_OPERATOR TRY translates to unary_op(op_try)",
-          "[ast_from_duckdb]")
+TEST_CASE("ast_from_duckdb - BOUND_OPERATOR TRY is unsupported", "[ast_from_duckdb]")
 {
   auto try_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_TRY,
                                                              LogicalType{LogicalTypeId::INTEGER});
   try_expr->children.push_back(make_bound_ref(0));
-  auto out = sirius::ast::from_duckdb(*try_expr);
-  REQUIRE(out);
-  REQUIRE(out->holds<unary_op>());
-  REQUIRE(out->get<unary_op>().op == unary_op::kind::op_try);
+  REQUIRE(sirius::ast::from_duckdb(*try_expr) == nullptr);
 }
 
 TEST_CASE("ast_from_duckdb - BOUND_OPERATOR COALESCE translates to coalesce(N children)",

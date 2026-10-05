@@ -60,6 +60,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
+    test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets_fallback.cpp
     test/cpp/integration/test_gpu_execution_join_nulls.cpp
