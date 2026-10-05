@@ -22,6 +22,7 @@
 #include "planner/query_index.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/gatekeeper.hpp"
+#include "scan_manager/shared_scan_budget.hpp"
 
 #include <array>
 #include <atomic>
@@ -159,6 +160,8 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// never issue anything.
   readahead_scan_manager(event::query_event_publisher& publisher,
                          std::size_t budget,
+                         std::shared_ptr<shared_scan_budget> shared_budget = nullptr,
+                         std::optional<std::size_t> budget_override        = std::nullopt,
                          std::shared_ptr<op::scan::physical_check_counters> physical_counters = {})
     : event::query_event_subscriber(publisher,
                                     {event::event_type::task_deployed,
@@ -167,7 +170,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
                                      event::event_type::wait_for_memory_for_task}),
       _budget(budget),
       _gatekeeper(static_cast<int>(budget)),
-      _physical_counters(std::move(physical_counters))
+      _physical_counters(std::move(physical_counters)),
+      _shared_budget(std::move(shared_budget)),
+      _budget_override(budget_override)
   {
   }
   /// Stops and joins both workers -- the prefetch worker and the event subscriber.
@@ -374,19 +379,16 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   /// for stage events -- which happens before @ref start runs.  It hands out no
   /// tickets until armed, so existing this early costs nothing.
   gatekeeper _gatekeeper;
+  query_id_t _query_id{make_query_id(0)};
+  std::shared_ptr<shared_scan_budget> _shared_budget;
+  std::optional<std::size_t> _budget_override;
+  std::mutex _demand_mutex;
+  std::unordered_map<const op::scan::scan_info*, shared_scan_budget::token> _demand_tickets;
+  shared_scan_budget::token acquire_shared_ticket(const op::scan::scan_info& task, bool demand);
   std::atomic<bool> _prefetching_started{false};
   std::atomic<size_t> _cursor{0};
 
-  /// Generation of fully-published `disposed` scan transitions. A preparation
-  /// retry snapshots this before synchronous eviction and waits for it to move
-  /// (or for its bounded timer) when the pool is still short afterwards.
-  std::mutex _disposable_mutex;
-  std::condition_variable _disposable_cv;
-  std::uint64_t _disposable_generation{0};
-
-  /// Tops the in-flight scan set back up from the scheduler. Under memory
-  /// pressure it waits for a disposed scan notification, bounded by 25 ms so a
-  /// missed/coalesced notification cannot strand the worker.
+  /// Fill speculative capacity; abandon a candidate after bounded eviction attempts.
   void worker_loop(const std::stop_token& st);
 
   prefetch_strategy _strategy{prefetch_strategy::eager};
