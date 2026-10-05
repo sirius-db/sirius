@@ -661,7 +661,10 @@ GPU's CPU topology. `num_threads` must be `> 0` for every pool except `scan_mana
 
 ## DuckDB SET Variables
 
-Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
+Registered in `src/sirius_extension.cpp`. Operator, expression and compression options are
+connection-local overrides of YAML defaults; GLOBAL writes are rejected and RESET restores the
+registered default. Each execution uses one immutable operator-options snapshot. Logging updates
+serialize runtime-wide. Hardware decompression requires startup configuration.
 
 ### Logging
 

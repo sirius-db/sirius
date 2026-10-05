@@ -1741,7 +1741,7 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                       : nullptr;
   auto op_params =
     sirius_ctx
-      ? sirius_ctx->get_config().get_operator_params()
+      ? *duckdb::query_operator_options(context)
       : sirius::operator_params::with_batch_size(sirius::config::derived_default_batch_size());
 
   std::unordered_map<op::sirius_physical_operator*, plan_lineage> lineage_aliases;
