@@ -42,6 +42,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -776,11 +777,20 @@ class SiriusContext : public ClientContextState {
 /// null (best-effort) path never throws.
 void install_configured_log_sink(DatabaseInstance* db);
 
+/// Publish whether Quent captures NVTX, from the telemetry section of @p config_path.
+/// Call before constructing a sirius_config: its hardware discovery makes this image's
+/// first NVTX call, and NVTX picks an injector only once per image.
+void publish_nvtx_injection(const std::filesystem::path& config_path);
+
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
   SiriusContextExtensionCallback();
+
+  /// publish_nvtx_injection for the config file the constructor will load, unless Sirius is
+  /// disabled. Call before constructing the callback: its config_ member runs discovery.
+  static void publish_configured_nvtx_injection();
 
   /// Finish runtime initialization after process-wide setup that must precede
   /// the first NVTX/runtime-initialization call.

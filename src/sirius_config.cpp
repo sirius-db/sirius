@@ -368,6 +368,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_batch_events", opt.enable_batch_events);
+  r.optional("enable_nvtx", opt.enable_nvtx);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
     if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
     throw std::runtime_error("must be one of ndjson, msgpack, postcard");
@@ -692,6 +693,19 @@ void sirius_config::apply_defaults()
   _operator_params      = operator_params{};
 
   finalize_derived_config();
+}
+
+telemetry_config sirius_config::read_telemetry_config(
+  const std::filesystem::path& config_path) noexcept
+{
+  try {
+    auto const root = YAML::LoadFile(config_path.string());
+    telemetry_config telemetry;
+    if (auto const node = root["sirius"]["telemetry"]) { from_yaml(node, telemetry); }
+    return telemetry;
+  } catch (...) {
+    return {};
+  }
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
