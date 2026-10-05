@@ -342,10 +342,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
  * operator type, query id, and preferred device. A task that is not a gpu_pipeline_task gets the
  * maximum priority, so it sorts last, with sentinel index keys.
  *
- * The query id comes from the task's pipeline, NOT from unpacking the priority's high bits:
- * `sirius::query_priority_bits` masks the id to 31 bits, so the unpacked value diverges from the
- * real query id once bit 31 is set, and a `drain(query_index{value_of(query_id)})` would then
- * silently miss the task.
+ * The query id comes from the task's pipeline. Keep ownership independent of scheduling
+ * priority so per-query drains remain correct when a task's priority changes.
  */
 [[nodiscard]] exec::index_keys index_keys_for(const sirius::parallel::itask& task);
 

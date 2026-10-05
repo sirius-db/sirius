@@ -181,9 +181,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //!
   //! Queue index keys are derived from this (see the multi_index_priority_queue extractors in
   //! task_scheduler and task_creator), so that per-query drains target the right tasks. Read it
-  //! from here rather than recovering it from the packed scheduling priority: the priority masks
-  //! the id to 31 bits (see sirius::query_priority_bits), so the recovered value diverges from
-  //! the real query id once bit 31 is set.
+  //! from here so ownership stays independent of scheduling priority.
   [[nodiscard]] sirius::query_id_t get_query_id() const noexcept { return query_id_; }
   //! Returns the parent pipelines (pipelines that depend on this pipeline)
   std::vector<sirius_pipeline*> get_parents() const;
