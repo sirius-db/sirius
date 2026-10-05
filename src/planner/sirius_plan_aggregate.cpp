@@ -29,7 +29,6 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -857,44 +856,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     op.distinct_validity);
   group_by->children.push_back(std::move(plan));
   return group_by;
-}
-
-// Plain DISTINCT is a GROUP BY over every output column with no aggregates, which the grouped
-// aggregate already runs on the GPU. DISTINCT ON keeps one arbitrary (or ORDER BY-chosen) row
-// per key and needs FIRST aggregates over the other columns, which is left to the CPU.
-duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
-{
-  D_ASSERT(op.children.size() == 1);
-  auto const& types = op.types;
-  if (op.distinct_type != duckdb::DistinctType::DISTINCT || op.order_by ||
-      op.distinct_targets.size() != types.size()) {
-    throw duckdb::NotImplementedException("DISTINCT ON not supported");
-  }
-  for (duckdb::idx_t i = 0; i < op.distinct_targets.size(); ++i) {
-    auto const& target = op.distinct_targets[i];
-    if (target->GetExpressionType() != duckdb::ExpressionType::BOUND_REF ||
-        target->Cast<duckdb::BoundReferenceExpression>().index != i ||
-        target->return_type != types[i]) {
-      throw duckdb::NotImplementedException("DISTINCT over a reordered or computed target");
-    }
-  }
-
-  // Table indices are irrelevant here: column references were resolved before planning.
-  auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
-    /*group_index=*/0,
-    /*aggregate_index=*/0,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
-  aggregate->groups = std::move(op.distinct_targets);
-  aggregate->types  = types;
-  duckdb::GroupingSet all_groups;
-  for (duckdb::idx_t i = 0; i < types.size(); ++i) {
-    all_groups.insert(i);
-  }
-  aggregate->grouping_sets.push_back(std::move(all_groups));
-  aggregate->estimated_cardinality = op.estimated_cardinality;
-  aggregate->children.push_back(std::move(op.children[0]));
-  return create_plan(*aggregate);
 }
 
 }  // namespace sirius::planner
