@@ -39,6 +39,7 @@ sirius_memory_reservation_manager::sirius_memory_reservation_manager(
     throw std::runtime_error("At least one GPU memory space must be configured");
   }
   for (const auto* space : gpu_spaces) {
+    runtime_stream_pools_.push_back(runtime_stream_pool::install(*space));
     auto const device_mr = space->get_default_allocator();
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{space->get_device_id()}};
     // Capture the old resource by value (not by ref) — see comment in header for why.
@@ -66,6 +67,7 @@ sirius_memory_reservation_manager::~sirius_memory_reservation_manager()
   for (std::size_t i = 0; i < gpu_spaces.size() && i < prev_device_mrs_.size(); ++i) {
     rmm::cuda_set_device_raii set_device{rmm::cuda_device_id{gpu_spaces[i]->get_device_id()}};
     cudaDeviceSynchronize();
+    runtime_stream_pool::remove(*gpu_spaces[i]);
     cudf::set_current_device_resource(std::move(prev_device_mrs_[i]));
   }
 }

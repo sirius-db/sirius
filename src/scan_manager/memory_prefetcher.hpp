@@ -56,10 +56,9 @@ namespace sirius::scan_manager {
  * reconstructs the cudf table from the host layout, and synchronizes its
  * stream before the batch's exclusive lock can be released, so each in-flight
  * conversion needs a thread to drive it. Concurrency across batches therefore
- * scales with num_threads. Each worker's private CUDA stream carries no copy
- * traffic (the converter allocates and copies on a pool stream it acquires
- * internally); it exists only as a stable per-worker key for attaching the
- * admission reservation to the allocation tracker.
+ * scales with num_threads. Each sweep leases a runtime-owned stream on its target
+ * GPU. Converters may allocate/copy on their own internal stream, so reservation
+ * tracking uses the worker thread. Idle workers retain no stream lease.
  *
  * Races with a consumer are arbitrated by the data_batch state machine: the
  * conversion holds the exclusive (mutable) lock via try_to_mutable (skip on
@@ -82,6 +81,10 @@ class memory_prefetcher {
   memory_prefetcher(memory_prefetcher_config cfg,
                     std::vector<std::shared_ptr<split_connector>> connectors,
                     cucascade::memory::memory_space* gpu_space,
+                    exec::query_lifecycle_registry& lifecycle);
+  memory_prefetcher(memory_prefetcher_config cfg,
+                    std::vector<std::shared_ptr<split_connector>> connectors,
+                    std::vector<cucascade::memory::memory_space*> gpu_spaces,
                     exec::query_lifecycle_registry& lifecycle);
 
   ~memory_prefetcher();
@@ -107,7 +110,7 @@ class memory_prefetcher {
   void worker_loop(std::size_t worker_index);
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
-  std::size_t sweep(::cuda::stream_ref stream);
+  std::size_t sweep(::cuda::stream_ref stream, cucascade::memory::memory_space* gpu_space);
 
   exec::query_lifecycle_registry& _lifecycle;
   memory_prefetcher_config _config;
@@ -117,11 +120,7 @@ class memory_prefetcher {
   /// stacks on top of the active scan's own conversion threads (regresses
   /// short scan-bound queries). Quiet connectors allow full parallelism.
   std::unique_ptr<std::atomic<bool>[]> _drain_claims;
-  cucascade::memory::memory_space* _gpu_space;
-
-  /// One stream per worker, borrowed (NOT owned): converted batches are
-  /// dealloc-bound to it and outlive the worker that made them.
-  std::vector<::cuda::stream_ref> _worker_streams;
+  std::vector<cucascade::memory::memory_space*> _gpu_spaces;
 
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};

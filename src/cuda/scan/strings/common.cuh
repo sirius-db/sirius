@@ -256,8 +256,8 @@ inline uint32_t get_target_ctas()
 {
   int device = 0;
   RMM_CUDA_TRY(cudaGetDevice(&device));
-  static int cached_device = -1;
-  static uint32_t cached   = 0;
+  static thread_local int cached_device = -1;
+  static thread_local uint32_t cached   = 0;
   if (cached_device == device) return cached;
   cudaDeviceProp prop;
   RMM_CUDA_TRY(cudaGetDeviceProperties(&prop, device));
