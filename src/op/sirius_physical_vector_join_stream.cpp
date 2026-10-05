@@ -1313,6 +1313,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto staged_probe  = _probe->stage(left_idx, *mem_space, stream);
   auto const queries = vss::list_column_as_dataset_view(staged_probe.view, dim);
   auto const n_left  = static_cast<std::int64_t>(queries.extent(0));
+  // An empty probe batch joins to nothing; the search libraries refuse a zero-row query matrix.
+  if (n_left == 0) {
+    std::vector<std::unique_ptr<cudf::column>> empty_cols;
+    empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+    empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
+    empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32}));
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    batches.push_back(sirius::make_data_batch(std::make_unique<cudf::table>(std::move(empty_cols)),
+                                              *mem_space,
+                                              stream,
+                                              batch_telemetry()));
+    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+  }
 
   // Every mode is served by searching each left row to some depth and then deciding which
   // of those candidates survive. The depth differs: global top-k needs k_global per left
@@ -2692,13 +2705,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     }
   }
 
-  if (!radius_join && (!acc_neighbors || (_centroids == nullptr && exhaustive_rows_seen == 0))) {
+  // An empty right table joins to nothing: the answer is empty, as DuckDB's is.
+  bool const nothing_searched =
+    !radius_join && (!acc_neighbors || (_centroids == nullptr && exhaustive_rows_seen == 0));
+  if (nothing_searched && _right_total_rows > 0) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] right table produced no rows to join against");
   }
 
   vss::shaped_join_result shaped;
-  if (radius_join) {
+  if (nothing_searched) {
+    shaped.left_rows = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
+    shaped.neighbors = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64});
+    shaped.distances = cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32});
+  } else if (radius_join) {
     // Concatenate the per-chunk edge lists. No merge and no truncation test: every edge the
     // kernel emitted is inside eps and nothing later can displace it, so the answer is complete
     // by construction rather than complete-if-k-was-big-enough.
