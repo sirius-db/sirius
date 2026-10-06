@@ -119,7 +119,7 @@ entities:
       spawned:
         attributes:
           label: string
-          gpu_device_id: { scope-ref: GpuDevice }
+          group_id: { scope-ref: ThreadGroup }
       exit: {}
 
   ExecutorThread:

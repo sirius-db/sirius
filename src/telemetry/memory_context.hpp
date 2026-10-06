@@ -48,9 +48,11 @@ struct channel_key_hash {
 
 class memory_context {
  public:
-  explicit memory_context(quent::worker::WorkerId worker_id,
-                          const quent::Context& context,
-                          const cucascade::memory::memory_reservation_manager* manager);
+  explicit memory_context(
+    quent::worker::WorkerId worker_id,
+    const quent::Context& context,
+    const cucascade::memory::memory_reservation_manager* manager,
+    const std::unordered_map<int, quent::gpu_device::GpuDeviceId>& gpu_handles);
   ~memory_context();
 
   std::optional<std::reference_wrapper<const quent::Handle<quent::MemorySpace>>> get_memory_handle(

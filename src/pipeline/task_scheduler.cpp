@@ -60,7 +60,7 @@ task_scheduler::task_scheduler(
     _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry.created({
-    .worker_id     = quent::worker::WorkerId{telemetry_context->worker_id()},
+    .worker_id     = quent::worker::WorkerId{_telemetry_context->worker_id()},
     .gpu_device_id = std::nullopt,
     .label         = "task-scheduler-gpu-queue",
   });
@@ -289,9 +289,8 @@ void task_scheduler::management_eventloop()
   thread_local quent::Handle<quent::TaskManagerLoopThread> scheduler_thread_telemetry_handle =
     _telemetry_context->context().task_manager_loop_thread_observer()->handle();
   scheduler_thread_telemetry_handle.spawned({
-    .label = "task-scheduler-thread",
-    .gpu_device_id =
-      quent::gpu_device::GpuDeviceId(quent::nil_uuid()),  // _telemetry_context->shared_group_id()
+    .label    = "task-scheduler-thread",
+    .group_id = _telemetry_context->shared_group_id(),
   });
 
   // Each pass tops up the two things the matcher needs — known ready devices

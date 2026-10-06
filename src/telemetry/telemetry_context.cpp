@@ -47,23 +47,21 @@ quent::Context make_quent_context(const sirius::telemetry_config& config)
 std::shared_ptr<const telemetry_context> telemetry_context::create(
   quent::Context&& context,
   const sirius::telemetry_config& config,
-  const cucascade::memory::memory_reservation_manager* manager,
-  const std::vector<int>& gpu_device_ids)
+  const cucascade::memory::memory_reservation_manager* manager)
 {
   return std::shared_ptr<telemetry_context>(
-    new telemetry_context(std::move(context), config, manager, gpu_device_ids));
+    new telemetry_context(std::move(context), config, manager));
 }
 
 telemetry_context::telemetry_context(quent::Context&& context,
-                                     const sirius::telemetry_config& config,
-                                     const cucascade::memory::memory_reservation_manager* manager,
-                                     const std::vector<int>& gpu_device_ids)
-  : shared_group_uuid_(quent::now_v7()),
-    engine_name_(config.engine_name),
+                                     const telemetry_config& config,
+                                     const cucascade::memory::memory_reservation_manager* manager)
+  : engine_name_(config.engine_name),
     context_(std::move(context)),
     engine_handle_(context_.engine_observer()->handle()),
     worker_handle_(context_.worker_observer()->handle()),
-    default_query_group_handle_(context_.query_group_observer()->handle())
+    default_query_group_handle_(context_.query_group_observer()->handle()),
+    shared_thread_group_handle_(context_.thread_group_observer()->handle())
 {
   engine_handle_.init({.label = config.engine_name});
   worker_handle_.init({
@@ -71,7 +69,6 @@ telemetry_context::telemetry_context(quent::Context&& context,
     .process_id       = std::format("{}", getpid()),
     .tag              = "worker",
   });
-  memory_context_ = std::make_shared<memory_context>(worker_handle_.id(), context_, manager);
 
   // One session-scoped query group under this engine; every query in this context is reported
   // under it, so a whole run shows up as a single group rather than one group per query.
@@ -86,14 +83,17 @@ telemetry_context::telemetry_context(quent::Context&& context,
   auto gpu_device_observer   = context_.gpu_device_observer();
   auto thread_group_observer = context_.thread_group_observer();
 
-  quent::Handle<quent::ThreadGroup> shared_thread_group = thread_group_observer->handle();
-  shared_thread_group.declaration({
+  shared_thread_group_handle_.declaration({
     .label         = "shared-thread-group",
     .worker_id     = worker_handle_.id(),
     .gpu_device_id = std::nullopt,
   });
 
-  for (const int device_id : gpu_device_ids) {
+  if (manager == nullptr) { return; }
+  std::unordered_map<int, quent::gpu_device::GpuDeviceId> device_id_to_quent_id;
+  for (const auto* gpu_memory_space :
+       manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    int device_id          = gpu_memory_space->get_device_id();
     auto gpu_device_handle = gpu_device_observer->handle();
     gpu_device_handle.declaration({
       .label     = std::format("gpu-{}", device_id),
@@ -115,13 +115,17 @@ telemetry_context::telemetry_context(quent::Context&& context,
       .gpu_device_id = gpu_device_handle.id(),
     });
 
+    device_id_to_quent_id.emplace(device_id, gpu_device_handle.id());
     gpu_group_ids_.emplace(device_id,
-                           telemetry_context::gpu_device_telemtry_handles{
+                           gpu_device_telemtry_handles{
                              .device           = std::move(gpu_device_handle),
                              .manager_threads  = std::move(manager_thread_group),
                              .executor_threads = std::move(executor_thread_group),
                            });
   }
+
+  memory_context_ =
+    std::make_shared<memory_context>(worker_handle_.id(), context_, manager, device_id_to_quent_id);
 
   SIRIUS_LOG_INFO("Telemetry context initialized (engine={}, {} GPU device group(s))",
                   config.engine_name,

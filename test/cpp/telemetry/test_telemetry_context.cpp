@@ -137,8 +137,8 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   std::string worker_id;
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id;
   {
-    auto context = telemetry_context::create(
-      std::move(make_quent_context(config)), config, /*manager=*/nullptr, {0, 1});
+    auto context =
+      telemetry_context::create(std::move(make_quent_context(config)), config, /*manager=*/nullptr);
     const auto& gpu0 = context->gpu_device_telemetry_handles(0);
     worker_id        = uuid_str(context->worker_id().raw());
     gpu0_id          = uuid_str(gpu0.device.id().raw());
@@ -163,7 +163,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
     auto exec_thread = context->context().executor_thread_observer()->handle();
     exec_thread.spawned({.label = "test-gpu0-exec-0", .group_id = gpu0.executor_threads.id()});
     auto manager_thread = context->context().task_manager_loop_thread_observer()->handle();
-    manager_thread.spawned({.label = "gpu-0-exec-manager", .gpu_device_id = gpu0.device.id()});
+    manager_thread.spawned({.label = "gpu-0-exec-manager", .group_id = gpu0.manager_threads.id()});
     auto task_queue = context->context().task_queue_observer()->handle();
     task_queue.created({.worker_id     = context->worker_id(),
                         .gpu_device_id = gpu0.device.id(),

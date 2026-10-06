@@ -101,9 +101,9 @@ void gpu_pipeline_executor::manager_loop()
   quent::Handle<quent::TaskManagerLoopThread> manager_thread_handle =
     _telemetry_context->context().task_manager_loop_thread_observer()->handle();
   manager_thread_handle.spawned({
-    .label = std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
-    .gpu_device_id =
-      _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id()).device.id(),
+    .label    = std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    .group_id = _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id())
+                  .manager_threads.id(),
   });
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});

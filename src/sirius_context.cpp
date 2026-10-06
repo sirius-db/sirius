@@ -846,10 +846,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
   active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
                        active_gpu_ids.end());
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(std::move(quent_context),
-                                                                    config_.get_telemetry_config(),
-                                                                    memory_manager_.get(),
-                                                                    active_gpu_ids);
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(
+    std::move(quent_context), config_.get_telemetry_config(), memory_manager_.get());
 
   {
     auto disk_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK);

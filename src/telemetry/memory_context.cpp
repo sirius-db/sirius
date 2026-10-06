@@ -35,9 +35,11 @@ inline std::string tier_to_string(cucascade::memory::Tier tier)
 
 namespace sirius::telemetry {
 
-memory_context::memory_context(quent::worker::WorkerId worker_id,
-                               const quent::Context& context,
-                               const cucascade::memory::memory_reservation_manager* manager)
+memory_context::memory_context(
+  quent::worker::WorkerId worker_id,
+  const quent::Context& context,
+  const cucascade::memory::memory_reservation_manager* manager,
+  const std::unordered_map<int, quent::gpu_device::GpuDeviceId>& gpu_handles)
 {
   if (manager == nullptr) { return; }
 
@@ -47,7 +49,9 @@ memory_context::memory_context(quent::worker::WorkerId worker_id,
       .label     = mem_space->to_string(),
       .bounds    = {.bytes = mem_space->get_max_memory()},
       .worker_id = worker_id,
-      .gpu_id    = std::nullopt,
+      .gpu_id    = gpu_handles.contains(mem_space->get_device_id())
+                     ? std::optional(gpu_handles.at(mem_space->get_device_id()))
+                     : std::nullopt,
     });
     memory_space_handles_.insert({
       mem_space->get_id(),

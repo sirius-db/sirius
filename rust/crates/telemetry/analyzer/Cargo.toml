@@ -4,17 +4,20 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-instrumentation-model = { path = "../model" }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-model = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-query-engine-model = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+sirius-telemetry-store = { path = "../store" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model" }
+tempfile = "3"

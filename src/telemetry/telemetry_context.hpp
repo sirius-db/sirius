@@ -58,13 +58,11 @@ class telemetry_context {
   /// NVTX injection hook, and Quent drops every event dispatched before that hook
   /// exists, so the caller must create it before anything else emits NVTX.
   ///
-  /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
-  /// child buckets) under the engine, so thread telemetry can nest per device.
+  /// GPU memory spaces declare resource groups and thread buckets under the worker.
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
     quent::Context&& context,
-    const sirius::telemetry_config& config,
-    const cucascade::memory::memory_reservation_manager* manager = nullptr,
-    const std::vector<int>& gpu_device_ids                       = {});
+    const telemetry_config& config,
+    const cucascade::memory::memory_reservation_manager* manager = nullptr);
 
   ~telemetry_context();
 
@@ -91,8 +89,11 @@ class telemetry_context {
   [[nodiscard]] const gpu_device_telemtry_handles& gpu_device_telemetry_handles(
     int device_id) const;
 
-  /// The `shared` group under the engine, for threads with no single GPU.
-  [[nodiscard]] const quent::Uuid& shared_group_id() const { return shared_group_uuid_; }
+  /// Group for threads serving more than one GPU.
+  [[nodiscard]] quent::thread_group::ThreadGroupId shared_group_id() const
+  {
+    return shared_thread_group_handle_.id();
+  }
   [[nodiscard]] const quent::Context& context() const { return context_; }
   [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
   {
@@ -102,8 +103,7 @@ class telemetry_context {
  private:
   telemetry_context(quent::Context&& context,
                     const sirius::telemetry_config& config,
-                    const cucascade::memory::memory_reservation_manager* manager,
-                    const std::vector<int>& gpu_device_ids);
+                    const cucascade::memory::memory_reservation_manager* manager);
 
   const gpu_device_telemtry_handles& fallback_gpu_device_telemtry_handles() const
   {
@@ -120,7 +120,6 @@ class telemetry_context {
 
   std::string engine_name_;
   quent::Context context_;
-  quent::Uuid shared_group_uuid_;
 
   mutable std::mutex labeled_groups_mutex_;
   mutable std::map<std::string, quent::query_group::QueryGroupId> labeled_group_ids_;
@@ -132,6 +131,7 @@ class telemetry_context {
   quent::Handle<quent::Engine> engine_handle_;
   quent::Handle<quent::Worker> worker_handle_;
   quent::Handle<quent::QueryGroup> default_query_group_handle_;
+  quent::Handle<quent::ThreadGroup> shared_thread_group_handle_;
 
   std::shared_ptr<const memory_context> memory_context_;
 };

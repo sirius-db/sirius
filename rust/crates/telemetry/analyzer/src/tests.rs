@@ -1,759 +1,535 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+//! Generated-schema ingestion and UI response tests.
 
-//! Tests for Batch ingestion and the data-flow distribution timeline.
-
-use instrumentation_model::SiriusEvent;
-use instrumentation_model::batch::{
-    BatchConsumed, BatchPackaged, BatchPlacementTransition, BatchProcessing, BatchQueued,
-    BatchRegistered, MemoryTier, MemoryTierFinalizing, MemoryTierInitializing, MemoryTierOperating,
-    MemoryTierTransition,
-};
-use instrumentation_model::task::{
-    Computing, Created, Finalizing, Preparing, Queued, Reserving, TaskTransition,
-};
-use quent_analyzer::{AnalyzerError, resource::collection::ResourceCollection};
-use quent_events::Event;
-use quent_model::{Capacity, FsmEvent, Ref, Usage};
+use quent_analyzer::{Entity, Model};
+use quent_events::{EntityRef, Event};
 use quent_query_engine_analyzer::ui::UiAnalyzer;
-use quent_query_engine_model::{engine, operator, plan, query, query_group, worker};
 use quent_query_engine_ui::{OperatorFilter, QueryFilter};
-use quent_ui::entities::request::{
-    EntityListEntry, EntityListFilter, EntityListRequest, EntityScope, EntitySortKey, Sort,
-    SortDir, TimeWindow,
-};
-use quent_ui::timeline::{
-    categorical::CategoricalTimelineRequest,
-    request::{
-        EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineConfig,
-        TimelineRequest,
-    },
-    response::ResourceTimeline as UiResourceTimeline,
-};
+use quent_ui::timeline::{categorical::CategoricalTimelineRequest, request::TimelineConfig};
+use sirius_telemetry_store::{self as s, SiriusEvent as E};
 use uuid::Uuid;
 
-use crate::{SiriusUiAnalyzer, batch_placement::BatchPlacementExt};
+use crate::{DataBatchExt, SiriusUiAnalyzer};
 
-/// Nanoseconds; also the timestamp of the query's first transition, so the
-/// query epoch. All batch timestamps below are relative to this.
-const EPOCH: u64 = 1_000_000_000_000_000;
+const SECOND: u64 = 1_000_000_000;
+const EPOCH: u64 = 1_000_000_000_000;
+const GPU_SPACE_LABEL: &str = "memory_space(tier=GPU, device_id=0, limit=1000)";
+const HOST_SPACE_LABEL: &str = "memory_space(tier=HOST, device_id=0, limit=1000)";
 
-struct Fixture {
-    engine_id: Uuid,
-    query_id: Uuid,
-    op1_id: Uuid,
-    op2_id: Uuid,
-    gpu_id: Uuid,
-    host_id: Uuid,
-    disk_id: Uuid,
-    batch_a_id: Uuid,
-    task_1_id: Uuid,
-    events: Vec<Event<SiriusEvent>>,
+fn id(n: u128) -> Uuid {
+    Uuid::from_u128(n)
+}
+fn ev(n: u128, t: u64, data: E) -> Event<E> {
+    Event::new(id(n), EPOCH + t * SECOND, data)
 }
 
-fn tier_usage(resource_id: Uuid, bytes: u64) -> Option<Usage<MemoryTier>> {
-    Some(Usage {
-        resource_id: Ref::new(resource_id),
-        capacity: MemoryTierOperating {
-            capacity_bytes: Capacity::new(Some(bytes)),
-        },
-    })
-}
-
-fn batch_event(id: Uuid, ts: u64, seq: u16, state: BatchPlacementTransition) -> Event<SiriusEvent> {
-    Event::new(id, ts, SiriusEvent::BatchPlacement(FsmEvent { seq, state }))
-}
-
-fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Event<SiriusEvent>> {
-    let event = |ts: u64, seq: u16, state: MemoryTierTransition| {
-        Event::new(id, ts, SiriusEvent::MemoryTier(FsmEvent { seq, state }))
-    };
-    vec![
-        event(
-            EPOCH - 800,
-            0,
-            MemoryTierTransition::MemoryTierInitializing(MemoryTierInitializing {
-                instance_name: name.to_string(),
-                parent_group_id: parent,
-                resource_type_name: "memory_tier".to_string(),
-            }),
-        ),
-        event(
-            EPOCH - 700,
-            1,
-            MemoryTierTransition::MemoryTierOperating(MemoryTierOperating {
-                capacity_bytes: Capacity::new(Some(bytes)),
-            }),
-        ),
-        event(
-            EPOCH + 100_000,
-            2,
-            MemoryTierTransition::MemoryTierFinalizing(MemoryTierFinalizing),
-        ),
-        event(EPOCH + 100_001, 3, MemoryTierTransition::Exit),
-    ]
-}
-
-/// A minimal engine with one query (two operators), the three memory tiers,
-/// and optionally batch placements:
-///
-/// Batch A (pipeline op1, batch_id 7, 1000 bytes), timestamps relative to the
-/// query epoch:
-/// - t=0    registered on GPU
-/// - t=100  queued on GPU
-/// - t=300  queued on HOST (tier-change self-transition: spill)
-/// - t=500  packaged (task 1) on HOST
-/// - t=800  processing (task 1) on GPU
-/// - t=1000 consumed ("processed"), exit
-///
-/// Batch B lives on a pipeline that is *not* an operator of the query and must
-/// not appear in the query's data-flow timeline.
-fn fixture(with_batches: bool) -> Fixture {
-    let engine_id = Uuid::from_u128(0x01);
-    let query_group_id = Uuid::from_u128(0x02);
-    let query_id = Uuid::from_u128(0x03);
-    let plan_id = Uuid::from_u128(0x04);
-    let op1_id = Uuid::from_u128(0x05);
-    let op2_id = Uuid::from_u128(0x06);
-    let gpu_id = Uuid::from_u128(0x07);
-    let host_id = Uuid::from_u128(0x08);
-    let disk_id = Uuid::from_u128(0x09);
-    let batch_a_id = Uuid::from_u128(0x0a);
-    let batch_b_id = Uuid::from_u128(0x0b);
-    let task_1_id = Uuid::from_u128(0x0c);
-    let worker_id = Uuid::from_u128(0x0f);
-
+fn fixture() -> Vec<Event<E>> {
     let mut events = vec![
-        Event::new(
-            engine_id,
-            EPOCH - 1000,
-            SiriusEvent::Engine(engine::EngineEvent::Init(engine::Init::default())),
-        ),
-        Event::new(
-            query_group_id,
-            EPOCH - 900,
-            SiriusEvent::QueryGroup(query_group::QueryGroupEvent::Declaration(
-                query_group::Declaration {
-                    instance_name: "qg".to_string(),
-                    engine_id,
-                },
-            )),
-        ),
-    ];
-    events.extend(memory_tier_events(gpu_id, engine_id, "GPU", 1 << 30));
-    events.extend(memory_tier_events(host_id, engine_id, "HOST", 4 << 30));
-    events.extend(memory_tier_events(disk_id, engine_id, "DISK", 16 << 30));
-
-    // The query FSM: its first transition is the query epoch.
-    let query_event = |ts: u64, seq: u16, state: query::QueryTransition| {
-        Event::new(query_id, ts, SiriusEvent::Query(FsmEvent { seq, state }))
-    };
-    events.extend([
-        query_event(
-            EPOCH,
-            0,
-            query::QueryTransition::Init(query::Init {
-                instance_name: "q".to_string(),
-                query_group_id: Ref::new(query_group_id),
-            }),
-        ),
-        query_event(
-            EPOCH + 10,
+        ev(
             1,
-            query::QueryTransition::Planning(query::Planning {}),
-        ),
-        query_event(
-            EPOCH + 20,
-            2,
-            query::QueryTransition::Executing(query::Executing {}),
-        ),
-        query_event(EPOCH + 50_000, 3, query::QueryTransition::Exit),
-    ]);
-
-    events.push(Event::new(
-        worker_id,
-        EPOCH - 950,
-        SiriusEvent::Worker(worker::WorkerEvent::Init(worker::Init {
-            parent_engine_id: Ref::new(engine_id),
-            instance_name: "worker".to_string(),
-        })),
-    ));
-    events.push(Event::new(
-        plan_id,
-        EPOCH + 5,
-        SiriusEvent::Plan(plan::PlanEvent::Declaration(plan::Declaration {
-            parent: plan::PlanParent {
-                query_id: Some(Ref::new(query_id)),
-                plan_id: None,
-            },
-            instance_name: "plan".to_string(),
-            edges: vec![],
-            worker_id: Some(Ref::new(worker_id)),
-        })),
-    ));
-    for (op_id, name) in [(op1_id, "op1"), (op2_id, "op2")] {
-        events.push(Event::new(
-            op_id,
-            EPOCH + 6,
-            SiriusEvent::Operator(operator::OperatorEvent::Declaration(
-                operator::Declaration {
-                    plan_id: Ref::new(plan_id),
-                    parent_operator_ids: vec![],
-                    instance_name: name.to_string(),
-                    type_name: "scan".to_string(),
-                    custom_attributes: Default::default(),
-                },
-            )),
-        ));
-    }
-
-    if with_batches {
-        let port_id = Uuid::from_u128(0x0d);
-        events.extend([
-            batch_event(
-                batch_a_id,
-                EPOCH,
-                0,
-                BatchPlacementTransition::BatchRegistered(BatchRegistered {
-                    instance_name: "batch 7".to_string(),
-                    batch_id: 7,
-                    pipeline_uuid: op1_id,
-                    port_uuid: port_id,
-                    origin: "operator_output".to_string(),
-                    tier: tier_usage(gpu_id, 1000),
-                }),
-            ),
-            batch_event(
-                batch_a_id,
-                EPOCH + 100,
-                1,
-                BatchPlacementTransition::BatchQueued(BatchQueued {
-                    tier: tier_usage(gpu_id, 1000),
-                }),
-            ),
-            // Tier change while queued: spill from GPU to HOST.
-            batch_event(
-                batch_a_id,
-                EPOCH + 300,
-                2,
-                BatchPlacementTransition::BatchQueued(BatchQueued {
-                    tier: tier_usage(host_id, 1000),
-                }),
-            ),
-            batch_event(
-                batch_a_id,
-                EPOCH + 500,
-                3,
-                BatchPlacementTransition::BatchPackaged(BatchPackaged {
-                    instance_name: "batch 7".to_string(),
-                    task_uuid: task_1_id,
-                    tier: tier_usage(host_id, 1000),
-                }),
-            ),
-            batch_event(
-                batch_a_id,
-                EPOCH + 800,
-                4,
-                BatchPlacementTransition::BatchProcessing(BatchProcessing {
-                    instance_name: "batch 7".to_string(),
-                    task_uuid: task_1_id,
-                    tier: tier_usage(gpu_id, 1000),
-                }),
-            ),
-            batch_event(
-                batch_a_id,
-                EPOCH + 1000,
-                5,
-                BatchPlacementTransition::BatchConsumed(BatchConsumed {
-                    instance_name: "batch 7".to_string(),
-                    reason: "processed".to_string(),
-                }),
-            ),
-            batch_event(batch_a_id, EPOCH + 1000, 6, BatchPlacementTransition::Exit),
-        ]);
-
-        // A batch on a pipeline outside the query.
-        let foreign_pipeline = Uuid::from_u128(0x0e);
-        events.extend([
-            batch_event(
-                batch_b_id,
-                EPOCH,
-                0,
-                BatchPlacementTransition::BatchRegistered(BatchRegistered {
-                    instance_name: "batch 8".to_string(),
-                    batch_id: 8,
-                    pipeline_uuid: foreign_pipeline,
-                    port_uuid: port_id,
-                    origin: "operator_output".to_string(),
-                    tier: tier_usage(disk_id, 500),
-                }),
-            ),
-            batch_event(
-                batch_b_id,
-                EPOCH,
-                1,
-                BatchPlacementTransition::BatchQueued(BatchQueued {
-                    tier: tier_usage(disk_id, 500),
-                }),
-            ),
-            batch_event(
-                batch_b_id,
-                EPOCH + 900,
-                2,
-                BatchPlacementTransition::BatchConsumed(BatchConsumed {
-                    instance_name: "batch 8".to_string(),
-                    reason: "query_end".to_string(),
-                }),
-            ),
-            batch_event(batch_b_id, EPOCH + 900, 3, BatchPlacementTransition::Exit),
-        ]);
-    }
-
-    Fixture {
-        engine_id,
-        query_id,
-        op1_id,
-        op2_id,
-        gpu_id,
-        host_id,
-        disk_id,
-        batch_a_id,
-        task_1_id,
-        events,
-    }
-}
-
-/// Append one task on the op1 pipeline; only preparing/computing carry the
-/// `reservation` tier usage (2048 bytes on GPU). Timestamps relative to the
-/// query epoch:
-/// - t=0    created
-/// - t=100  queued (no reservation: contributes nothing to working space)
-/// - t=200  reserving (no reservation usage yet)
-/// - t=400  preparing, reservation 2048 B on GPU
-/// - t=700  computing, reservation 2048 B on GPU
-/// - t=900  finalizing (reservation released)
-/// - t=1000 exit
-fn add_working_space_task(fixture: &mut Fixture) {
-    let task_id = fixture.task_1_id;
-    let task_event = |ts: u64, seq: u16, state: TaskTransition| {
-        Event::new(task_id, ts, SiriusEvent::Task(FsmEvent { seq, state }))
-    };
-    fixture.events.extend([
-        task_event(
-            EPOCH,
             0,
-            TaskTransition::Created(Created {
-                instance_name: "task 1".to_string(),
-                pipeline_uuid: fixture.op1_id,
+            E::Engine(s::EngineEvent::Init {
+                label: Some("Sirius".into()),
             }),
         ),
-        task_event(
-            EPOCH + 100,
-            1,
-            TaskTransition::Queued(Queued { queue: None }),
-        ),
-        task_event(
-            EPOCH + 200,
+        ev(
             2,
-            TaskTransition::Reserving(Reserving {
-                instance_name: "task 1".to_string(),
-                requested_bytes: 2048,
-                input_basis: 1000,
-                peak_estimate: 2048,
-                bytes_to_materialize: 1000,
-                manager_thread: None,
+            0,
+            E::Worker(s::WorkerEvent::Init {
+                parent_engine_id: EntityRef::new(id(1), ()),
+                process_id: "42".into(),
+                tag: "worker".into(),
             }),
         ),
-        task_event(
-            EPOCH + 400,
+        ev(
             3,
-            TaskTransition::Preparing(Preparing {
-                instance_name: "task 1".to_string(),
-                origin_tier: "GPU".to_string(),
-                target_tier: "GPU".to_string(),
-                input_bytes: 1000,
-                executor_thread: None,
-                reservation: tier_usage(fixture.gpu_id, 2048),
+            0,
+            E::QueryGroup(s::QueryGroupEvent::Declaration {
+                label: "group".into(),
+                engine_id: EntityRef::new(id(1), ()),
             }),
         ),
-        task_event(
-            EPOCH + 700,
+        ev(
             4,
-            TaskTransition::Computing(Computing {
-                instance_name: "task 1".to_string(),
-                current_operator_id: 0,
-                input_bytes: 1000,
-                peak_allocated_bytes: 1500,
-                executor_thread: None,
-                reservation: tier_usage(fixture.gpu_id, 2048),
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "select".into(),
+                query_group_id: EntityRef::new(id(3), ()),
             }),
         ),
-        task_event(
-            EPOCH + 900,
+        ev(4, 1, E::Query(s::QueryEvent::Planning { seq: 1 })),
+        ev(4, 2, E::Query(s::QueryEvent::Executing { seq: 2 })),
+        ev(4, 10, E::Query(s::QueryEvent::Exit { seq: 3 })),
+        ev(
             5,
-            TaskTransition::Finalizing(Finalizing {
-                instance_name: "task 1".to_string(),
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(4), ()),
+                label: "plan".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(2), ())),
+            }),
+        ),
+        ev(
+            6,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(5), ()),
+                label: "scan".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+        ev(
+            7,
+            0,
+            E::GpuDevice(s::GpuDeviceEvent::Declaration {
+                label: "gpu-0".into(),
+                worker_id: EntityRef::new(id(2), ()),
+                ordinal: 0,
+            }),
+        ),
+        ev(
+            8,
+            0,
+            E::MemorySpace(s::MemorySpaceEvent::Declaration {
+                label: GPU_SPACE_LABEL.into(),
+                bounds: s::MemorySpaceBounds { bytes: 1000 },
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_id: Some(EntityRef::new(id(7), ())),
+            }),
+        ),
+        ev(
+            9,
+            0,
+            E::TaskQueue(s::TaskQueueEvent::Created {
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_device_id: Some(EntityRef::new(id(7), ())),
+                label: "queue".into(),
+            }),
+        ),
+        ev(
+            10,
+            0,
+            E::TaskManagerLoopThread(s::TaskManagerLoopThreadEvent::Spawned {
+                label: "manager".into(),
+                group_id: EntityRef::new(id(11), ()),
+            }),
+        ),
+        ev(
+            11,
+            0,
+            E::ThreadGroup(s::ThreadGroupEvent::Declaration {
+                label: "threads".into(),
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_device_id: Some(EntityRef::new(id(7), ())),
+            }),
+        ),
+        ev(
+            12,
+            0,
+            E::ExecutorThread(s::ExecutorThreadEvent::Spawned {
+                label: "executor".into(),
+                group_id: EntityRef::new(id(11), ()),
+            }),
+        ),
+        ev(
+            13,
+            2,
+            E::DataBatch(s::DataBatchEvent::Constructed {
+                seq: 0,
+                data_batch_id: 77,
+                producer_pipeline_id: EntityRef::new(id(6), ()),
+            }),
+        ),
+        ev(
+            13,
+            3,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 1,
+                memory: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 400 }),
+            }),
+        ),
+        ev(
+            13,
+            8,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+        ),
+        ev(13, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
+        ev(
+            14,
+            2,
+            E::Task(s::TaskEvent::Created {
+                seq: 0,
+                pipeline_uuid: EntityRef::new(id(6), ()),
+            }),
+        ),
+        ev(
+            14,
+            3,
+            E::Task(s::TaskEvent::Queued {
+                seq: 1,
+                queue: EntityRef::new(id(9), s::TaskQueueUsage { entries: 1 }),
+            }),
+        ),
+        ev(
+            14,
+            4,
+            E::Task(s::TaskEvent::Reserving {
+                seq: 2,
+                requested_bytes: 400,
+                input_basis: 400,
+                peak_estimate: 400,
+                bytes_to_materialize: 0,
+                manager_thread: EntityRef::new(id(10), s::TaskManagerLoopThreadUsage),
+            }),
+        ),
+        ev(
+            14,
+            5,
+            E::Task(s::TaskEvent::Preparing {
+                seq: 3,
+                origin_tier: "GPU".into(),
+                target_tier: "GPU".into(),
+                input_bytes: 400,
+                executor_thread: EntityRef::new(id(12), s::ExecutorThreadUsage),
+                reservation: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 100 }),
+            }),
+        ),
+        ev(
+            14,
+            6,
+            E::Task(s::TaskEvent::Computing {
+                seq: 4,
+                current_operator_id: 0,
+                input_bytes: 400,
+                input_batch_ids: vec![77],
+                peak_allocated_bytes: 100,
+                executor_thread: EntityRef::new(id(12), s::ExecutorThreadUsage),
+                reservation: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 100 }),
+            }),
+        ),
+        ev(
+            14,
+            8,
+            E::Task(s::TaskEvent::Finalizing {
+                seq: 5,
                 success: true,
             }),
         ),
-        task_event(EPOCH + 1000, 6, TaskTransition::Exit),
-    ]);
-}
-
-fn analyzer(fixture: &mut Fixture) -> SiriusUiAnalyzer {
-    let events = std::mem::take(&mut fixture.events);
-    SiriusUiAnalyzer::try_new(fixture.engine_id, events.into_iter())
-        .expect("analyzer builds from fixture events")
-}
-
-/// A request for the full query window [0, 1000) ns in 10 bins of 100 ns.
-fn request(query_id: Uuid, measures: &[&str]) -> CategoricalTimelineRequest<QueryFilter> {
-    CategoricalTimelineRequest {
-        measures: measures.iter().map(|m| m.to_string()).collect(),
-        config: TimelineConfig {
-            num_bins: 10,
-            start: 0.0,
-            end: 1e-6,
-        },
-        app_params: QueryFilter { query_id },
-    }
+        ev(14, 8, E::Task(s::TaskEvent::Exit { seq: 6 })),
+    ];
+    events.sort_by_key(|e| e.timestamp);
+    events
 }
 
 #[test]
-fn ingests_batches_and_memory_tiers() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
-    let model = &analyzer.model;
+fn legacy_shared_manager_uses_group() {
+    let mut events = fixture();
+    events.push(ev(
+        15,
+        0,
+        E::ThreadGroup(s::ThreadGroupEvent::Declaration {
+            label: "shared-thread-group".into(),
+            worker_id: EntityRef::new(id(2), ()),
+            gpu_device_id: None,
+        }),
+    ));
+    events.push(ev(
+        16,
+        0,
+        E::TaskManagerLoopThread(s::TaskManagerLoopThreadEvent::Spawned {
+            label: "task-scheduler-thread".into(),
+            group_id: EntityRef::new(Uuid::nil(), ()),
+        }),
+    ));
 
-    assert_eq!(model.batch_placements.len(), 2);
-    let batch_a = &model.batch_placements[&fixture.batch_a_id];
-    assert_eq!(batch_a.batch_id(), Some(7));
-    assert_eq!(batch_a.pipeline_uuid(), Some(fixture.op1_id));
-    assert_eq!(batch_a.last_task_uuid(), Some(fixture.task_1_id));
-
-    for (id, name) in [
-        (fixture.gpu_id, "GPU"),
-        (fixture.host_id, "HOST"),
-        (fixture.disk_id, "DISK"),
-    ] {
-        let resource = model.resource(id).expect("tier resource exists");
-        assert_eq!(resource.type_name(), "memory_tier");
-        assert_eq!(resource.instance_name(), name);
-    }
-    assert!(
-        model.arbitrary_resources.resource_types["memory_tier"]
-            .used_by
-            .contains("batch_placement")
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let thread = analyzer
+        .model
+        .task_manager_loop_threads
+        .get(&id(16))
+        .unwrap();
+    assert_eq!(
+        quent_analyzer::RefTreeEntity::parent_id(thread),
+        Some(id(15))
     );
 }
 
 #[test]
-fn data_flow_timeline_bins() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
-
-    let binned = analyzer
-        .data_flow_timeline(request(fixture.query_id, &[]))
-        .expect("data flow timeline");
-
-    assert_eq!(binned.decl.entity_type_name, "batch_placement");
-    assert_eq!(binned.decl.dimension_name, "Memory Tier");
-    let keys: Vec<&str> = binned
-        .decl
-        .dimension_keys
-        .iter()
-        .map(|k| k.key.as_str())
-        .collect();
-    assert_eq!(keys, ["GPU", "HOST", "DISK"]);
-    let measures: Vec<&str> = binned
-        .decl
-        .measures
-        .iter()
-        .map(|m| m.name.as_str())
-        .collect();
-    assert_eq!(measures, ["count", "bytes"]);
-
-    // Only op1 has placements in the query; absent series mean all-zero.
-    assert_eq!(binned.operators.len(), 1);
-    assert!(!binned.operators.contains_key(&fixture.op2_id));
-    let series = &binned.operators[&fixture.op1_id];
-
-    // Hand-computed spans over 10 bins of 100 ns; the queued state is split
-    // across GPU and HOST by the tier-change self-transition at t=300.
-    let count = &series.values["count"];
+fn generated_events_feed_query_bundle() {
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter()).unwrap();
     assert_eq!(
-        count["batch_queued"]["GPU"],
-        [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        analyzer
+            .query_bundle(id(4))
+            .unwrap()
+            .entities
+            .operators
+            .len(),
+        1
     );
-    assert_eq!(
-        count["batch_queued"]["HOST"],
-        [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    );
-    assert_eq!(
-        count["batch_packaged"]["HOST"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
-    );
-    assert_eq!(
-        count["batch_processing"]["GPU"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
-    );
-    // batch_registered is omitted; batch_consumed holds no tier residency.
-    assert!(!count.contains_key("batch_registered"));
-    assert!(!count.contains_key("batch_consumed"));
-    // No task holds a reservation, so the synthetic series is absent.
-    assert!(!count.contains_key("task_working_space"));
-
-    let bytes = &series.values["bytes"];
-    assert_eq!(
-        bytes["batch_queued"]["GPU"],
-        [0.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    );
-    assert_eq!(
-        bytes["batch_processing"]["GPU"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
-    );
+    assert_eq!(analyzer.model.data_batches[&id(13)].numeric_id(), Some(77));
+    assert_eq!(analyzer.model.batch_by_number[&77], id(13));
+    assert!(analyzer.model.try_entity_ref(id(13)).is_ok());
 }
 
 #[test]
-fn data_flow_timeline_task_working_space() {
-    let mut fixture = fixture(true);
-    add_working_space_task(&mut fixture);
-    let analyzer = analyzer(&mut fixture);
-
-    let binned = analyzer
-        .data_flow_timeline(request(fixture.query_id, &[]))
-        .expect("data flow timeline");
-
-    // The task lives on op1 like batch A: still a single operator series.
-    assert_eq!(binned.operators.len(), 1);
-    let series = &binned.operators[&fixture.op1_id];
-
-    // Only the reservation-holding spans contribute: preparing [400, 700)
-    // + computing [700, 900).
-    let count = &series.values["count"];
-    assert_eq!(
-        count["task_working_space"]["GPU"],
-        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
-    );
-    // The reservation stays on GPU: no other tier appears in the series.
-    assert_eq!(count["task_working_space"].len(), 1);
-
-    let bytes = &series.values["bytes"];
-    assert_eq!(
-        bytes["task_working_space"]["GPU"],
-        [
-            0.0, 0.0, 0.0, 0.0, 2048.0, 2048.0, 2048.0, 2048.0, 2048.0, 0.0
-        ]
-    );
-
-    // The batch lifecycle series coexist, unchanged from the batch-only run.
-    assert_eq!(
-        count["batch_queued"]["GPU"],
-        [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    );
-    assert_eq!(
-        count["batch_processing"]["GPU"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
-    );
-    assert_eq!(
-        bytes["batch_packaged"]["HOST"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0, 1000.0, 0.0, 0.0]
-    );
-    assert!(!count.contains_key("batch_registered"));
-}
-
-#[test]
-fn data_flow_timeline_unsupported_without_memory_tiers() {
-    // A recording made with batch telemetry disabled has no memory_tier
-    // resources: the feature is unsupported (HTTP 501) and the UI hides it.
-    let mut fixture = fixture(false);
-    fixture
-        .events
-        .retain(|e| !matches!(e.data, SiriusEvent::MemoryTier(_)));
-    let analyzer = analyzer(&mut fixture);
-
-    let error = analyzer
-        .data_flow_timeline(request(fixture.query_id, &[]))
-        .expect_err("data flow is unsupported without batch telemetry");
-    assert!(matches!(error, AnalyzerError::Unsupported));
-}
-
-#[test]
-fn data_flow_timeline_empty_query_is_supported() {
-    // Tier resources present but no placements (e.g. `select 1;`): the view
-    // is supported and empty, not an error.
-    let mut fixture = fixture(false);
-    let analyzer = analyzer(&mut fixture);
-
-    let binned = analyzer
-        .data_flow_timeline(request(fixture.query_id, &[]))
-        .expect("empty data flow is a valid response");
-    assert!(binned.operators.is_empty());
-    assert!(!binned.decl.dimension_keys.is_empty());
-}
-
-#[test]
-fn data_flow_timeline_measures_filter() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
-
-    // Only "bytes": the count measure is neither declared nor computed.
-    let binned = analyzer
-        .data_flow_timeline(request(fixture.query_id, &["bytes"]))
-        .expect("data flow timeline");
-    let measures: Vec<&str> = binned
-        .decl
-        .measures
-        .iter()
-        .map(|m| m.name.as_str())
-        .collect();
-    assert_eq!(measures, ["bytes"]);
-    let series = &binned.operators[&fixture.op1_id];
-    assert!(series.values.contains_key("bytes"));
-    assert!(!series.values.contains_key("count"));
-
-    // Unknown-only measures are an error.
-    let error = analyzer
-        .data_flow_timeline(request(fixture.query_id, &["bogus"]))
-        .expect_err("unknown measures are rejected");
-    assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
-
-    // A typo next to a valid measure is an error too, not silently ignored.
-    let error = analyzer
-        .data_flow_timeline(request(fixture.query_id, &["count", "bogus"]))
-        .expect_err("unknown measures are rejected even alongside valid ones");
-    assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
-}
-
-/// A single-timeline request for one resource over the query window
-/// [0, 1000) ns in 10 bins of 100 ns.
-fn single_timeline_request(
-    query_id: Uuid,
-    resource_id: Uuid,
-    entity_type_name: Option<&str>,
-) -> SingleTimelineRequest<QueryFilter, OperatorFilter> {
-    SingleTimelineRequest {
-        entry: TimelineRequest::Resource(ResourceTimelineRequest {
-            resource_id,
-            long_entities_threshold_s: None,
-            entity_filter: EntityFilter {
-                entity_type_name: entity_type_name.map(|name| name.to_string()),
-            },
-            application: OperatorFilter {
-                operator_ids: vec![],
-            },
+fn data_flow_has_rate_residency_and_working_space() {
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter()).unwrap();
+    let response = analyzer
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec![],
             config: TimelineConfig {
                 num_bins: 10,
                 start: 0.0,
-                end: 1e-6,
+                end: 10.0,
             },
-        }),
-        app_params: QueryFilter { query_id },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let series = &response.operators[&id(6)].values;
+    assert_eq!(
+        series["input_bytes_per_sec"]["computing"][GPU_SPACE_LABEL][6],
+        200.0
+    );
+    assert_eq!(
+        series["input_bytes_per_sec"]["computing"][GPU_SPACE_LABEL][7],
+        200.0
+    );
+    assert_eq!(series["bytes"]["stationary"][GPU_SPACE_LABEL][4], 400.0);
+    assert_eq!(
+        series["bytes"]["task_working_space"][GPU_SPACE_LABEL][6],
+        100.0
+    );
+    assert_eq!(series["count"]["precompute"][GPU_SPACE_LABEL][4], 1.0);
+    assert_eq!(series["count"]["computing"][GPU_SPACE_LABEL][6], 1.0);
+    assert_eq!(series["bytes"]["computing"][GPU_SPACE_LABEL][6], 400.0);
+    assert_eq!(
+        response.decl.default_measure.as_deref(),
+        Some("input_bytes_per_sec")
+    );
+}
+
+#[test]
+fn rate_respects_partial_windows_and_measure_filter() {
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter()).unwrap();
+    let response = analyzer
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec!["input_bytes_per_sec".into()],
+            config: TimelineConfig {
+                num_bins: 1,
+                start: 5.5,
+                end: 6.5,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let series = &response.operators[&id(6)].values;
+    assert_eq!(
+        series["input_bytes_per_sec"]["computing"][GPU_SPACE_LABEL],
+        vec![100.0]
+    );
+    assert_eq!(series.len(), 1);
+    assert_eq!(response.decl.measures.len(), 1);
+
+    assert!(
+        analyzer
+            .data_flow_timeline(CategoricalTimelineRequest {
+                measures: vec!["bogus".into()],
+                config: TimelineConfig {
+                    num_bins: 1,
+                    start: 0.0,
+                    end: 10.0
+                },
+                app_params: QueryFilter { query_id: id(4) },
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn duplicate_ids_in_one_compute_stage_count_once() {
+    let mut events = fixture();
+    for event in &mut events {
+        if let E::Task(s::TaskEvent::Computing {
+            input_batch_ids, ..
+        }) = &mut event.data
+        {
+            input_batch_ids.push(77);
+        }
     }
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let response = analyzer
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec!["count".into()],
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 10.0,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    assert_eq!(
+        response.operators[&id(6)].values["count"]["computing"][GPU_SPACE_LABEL][6],
+        1.0
+    );
+    assert_eq!(response.decl.default_measure.as_deref(), Some("count"));
 }
 
 #[test]
-fn batch_keyed_timeline_over_memory_tier_resource() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
-
-    // Per-state timeline of the GPU tier resource sliced by the batch FSM.
+fn transit_does_not_double_count_batch_bytes() {
+    let mut events = fixture();
+    events.retain(|event| {
+        event.id != id(13)
+            || !matches!(
+                event.data,
+                E::DataBatch(s::DataBatchEvent::Destructed { .. } | s::DataBatchEvent::Exit { .. })
+            )
+    });
+    events.extend([
+        ev(
+            16,
+            0,
+            E::MemorySpace(s::MemorySpaceEvent::Declaration {
+                label: HOST_SPACE_LABEL.into(),
+                bounds: s::MemorySpaceBounds { bytes: 1000 },
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_id: None,
+            }),
+        ),
+        ev(
+            17,
+            0,
+            E::Channel(s::ChannelEvent::Declaration {
+                source_tier: EntityRef::new(id(8), ()),
+                destination_tier: EntityRef::new(id(16), ()),
+                worker_id: EntityRef::new(id(2), ()),
+                gpu_id: Some(EntityRef::new(id(7), ())),
+                label: "copy".into(),
+            }),
+        ),
+        ev(
+            13,
+            5,
+            E::DataBatch(s::DataBatchEvent::InTransit {
+                seq: 2,
+                source_memory: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 400 }),
+                dest_memory: EntityRef::new(id(16), s::MemorySpaceUsage { bytes: 400 }),
+                channel: EntityRef::new(id(17), s::ChannelUsage { bytes: 400 }),
+            }),
+        ),
+        ev(
+            13,
+            7,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 3,
+                memory: EntityRef::new(id(16), s::MemorySpaceUsage { bytes: 400 }),
+            }),
+        ),
+        ev(
+            13,
+            8,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 4 }),
+        ),
+        ev(13, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 5 })),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
     let response = analyzer
-        .single_resource_timeline(single_timeline_request(
-            fixture.query_id,
-            fixture.gpu_id,
-            Some("batch_placement"),
-        ))
-        .expect("batch keyed timeline over a memory_tier resource");
-    let UiResourceTimeline::BinnedByState(by_state) = response.data else {
-        panic!("expected a per-state binned response");
-    };
-
-    let states = &by_state.capacities_states_values["capacity_bytes"];
-    assert_eq!(
-        states["batch_queued"],
-        [0.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    );
-    // The registered entry state occupies GPU for bin 0 but is explicitly
-    // omitted from aggregated lanes.
-    assert!(!states.contains_key("batch_registered"));
-    assert_eq!(
-        states["batch_processing"],
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0]
-    );
-    // batch_packaged held the batch on HOST, not GPU.
-    assert!(!states.contains_key("batch_packaged"));
-
-    // The task path over the same resource keeps working (tasks never use
-    // memory tiers, so it is simply empty).
-    let response = analyzer
-        .single_resource_timeline(single_timeline_request(
-            fixture.query_id,
-            fixture.gpu_id,
-            Some("task"),
-        ))
-        .expect("task keyed timeline over a memory_tier resource");
-    let UiResourceTimeline::BinnedByState(by_state) = response.data else {
-        panic!("expected a per-state binned response");
-    };
-    assert!(by_state.capacities_states_values.is_empty());
-
-    // Unknown entity types are still rejected.
-    let error = analyzer
-        .single_resource_timeline(single_timeline_request(
-            fixture.query_id,
-            fixture.gpu_id,
-            Some("widget"),
-        ))
-        .expect_err("unknown entity types are rejected");
-    assert!(matches!(error, AnalyzerError::InvalidArgument(_)));
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec![],
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 10.0,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    let series = &response.operators[&id(6)].values;
+    assert_eq!(series["count"]["computing"]["IN_TRANSIT"][6], 1.0);
+    assert_eq!(series["count"]["computing"][HOST_SPACE_LABEL][7], 1.0);
+    assert_eq!(series["bytes"]["stationary"][HOST_SPACE_LABEL][7], 400.0);
+    assert!(!series["bytes"]["computing"].contains_key("IN_TRANSIT"));
 }
 
 #[test]
-fn plain_timeline_over_memory_tier_resource_includes_batches() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
-
+fn empty_query_has_supported_empty_data_flow() {
+    let events = fixture()
+        .into_iter()
+        .filter(|event| event.id != id(13) && event.id != id(14));
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events).unwrap();
     let response = analyzer
-        .single_resource_timeline(single_timeline_request(
-            fixture.query_id,
-            fixture.gpu_id,
-            None,
-        ))
-        .expect("plain timeline over a memory_tier resource");
-    let UiResourceTimeline::Binned(binned) = response.data else {
-        panic!("expected a plain binned response");
-    };
-
-    // The GPU residency of batch A: queued [0, 300) + processing [800, 1000).
-    assert_eq!(
-        binned.capacities_values["capacity_bytes"],
-        [
-            1000.0, 1000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1000.0, 1000.0
-        ]
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec![],
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 10.0,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    assert!(response.operators.is_empty());
+    assert!(
+        response
+            .decl
+            .measures
+            .iter()
+            .any(|measure| measure.name == "input_bytes_per_sec")
     );
 }
 
 #[test]
-fn list_entities_scoped_to_memory_tier_resource_is_empty() {
-    let mut fixture = fixture(true);
-    let analyzer = analyzer(&mut fixture);
+fn resource_timelines_and_entity_listing_use_generated_fsms() {
+    use quent_ui::entities::request::{
+        EntityListEntry, EntityListFilter, EntityListRequest, EntitySortKey, Sort, SortDir,
+        TimeWindow,
+    };
+    use quent_ui::timeline::{
+        request::{EntityFilter, ResourceTimelineRequest, SingleTimelineRequest, TimelineRequest},
+        response::ResourceTimeline,
+    };
 
-    // Only tasks are listable v1; a memory_tier scope must not error, it just
-    // matches no tasks.
-    let response = analyzer
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter()).unwrap();
+    let config = TimelineConfig {
+        num_bins: 10,
+        start: 0.0,
+        end: 10.0,
+    };
+    for (entity_type, state) in [("task", "computing"), ("data_batch", "stationary")] {
+        let response = analyzer
+            .single_resource_timeline(SingleTimelineRequest {
+                entry: TimelineRequest::Resource(ResourceTimelineRequest {
+                    resource_id: id(8),
+                    long_entities_threshold_s: None,
+                    entity_filter: EntityFilter {
+                        entity_type_name: Some(entity_type.into()),
+                    },
+                    application: OperatorFilter {
+                        operator_ids: vec![id(6)],
+                    },
+                    config,
+                }),
+                app_params: QueryFilter { query_id: id(4) },
+            })
+            .unwrap();
+        let ResourceTimeline::BinnedByState(data) = response.data else {
+            panic!("state timeline expected")
+        };
+        assert!(data.capacities_states_values["bytes"].contains_key(state));
+    }
+
+    let listed = analyzer
         .list_entities(EntityListRequest {
             entry: EntityListEntry {
                 window: TimeWindow {
                     start: 0.0,
-                    end: 1e-6,
+                    end: 10.0,
                 },
                 filter: EntityListFilter {
-                    scope: Some(EntityScope::Resource {
-                        resource_id: fixture.gpu_id,
-                    }),
-                    entity_type_name: None,
-                    min_usage_s: None,
+                    entity_type_name: Some("data_batch".into()),
+                    ..Default::default()
                 },
                 sort: Sort {
                     key: EntitySortKey::UsageDuration,
@@ -761,14 +537,236 @@ fn list_entities_scoped_to_memory_tier_resource_is_empty() {
                 },
                 page: None,
                 application: OperatorFilter {
-                    operator_ids: vec![],
+                    operator_ids: vec![id(6)],
                 },
             },
-            app_params: QueryFilter {
-                query_id: fixture.query_id,
-            },
+            app_params: QueryFilter { query_id: id(4) },
         })
-        .expect("list entities scoped to a memory_tier resource");
-    assert_eq!(response.total, 0);
-    assert!(response.items.is_empty());
+        .unwrap();
+    assert_eq!(listed.total, 1);
+    assert_eq!(listed.items[0].entity.fsm.id, id(13));
+}
+
+#[test]
+fn duplicate_numeric_batch_id_is_rejected() {
+    let mut events = fixture();
+    events.extend([
+        ev(
+            15,
+            2,
+            E::DataBatch(s::DataBatchEvent::Constructed {
+                seq: 0,
+                data_batch_id: 77,
+                producer_pipeline_id: EntityRef::new(id(6), ()),
+            }),
+        ),
+        ev(
+            15,
+            3,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 1,
+                memory: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 1 }),
+            }),
+        ),
+        ev(
+            15,
+            8,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+        ),
+        ev(15, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
+    ]);
+    assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_err());
+}
+
+#[test]
+fn consumer_view_resolves_foreign_producer_batch() {
+    let mut events = fixture();
+    for event in &mut events {
+        if let E::Task(s::TaskEvent::Computing {
+            input_batch_ids, ..
+        }) = &mut event.data
+        {
+            input_batch_ids.push(78);
+        }
+    }
+    events.extend([
+        ev(
+            20,
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "other".into(),
+                query_group_id: EntityRef::new(id(3), ()),
+            }),
+        ),
+        ev(20, 1, E::Query(s::QueryEvent::Planning { seq: 1 })),
+        ev(20, 2, E::Query(s::QueryEvent::Executing { seq: 2 })),
+        ev(20, 10, E::Query(s::QueryEvent::Exit { seq: 3 })),
+        ev(
+            21,
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(20), ()),
+                label: "other plan".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(2), ())),
+            }),
+        ),
+        ev(
+            22,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(21), ()),
+                label: "producer".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+        ev(
+            23,
+            2,
+            E::DataBatch(s::DataBatchEvent::Constructed {
+                seq: 0,
+                data_batch_id: 78,
+                producer_pipeline_id: EntityRef::new(id(22), ()),
+            }),
+        ),
+        ev(
+            23,
+            3,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 1,
+                memory: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 50 }),
+            }),
+        ),
+        ev(
+            23,
+            8,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+        ),
+        ev(23, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
+    ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    let view = analyzer.model.query_view(id(4)).unwrap();
+    assert!(view.data_batches().any(|batch| batch.id() == id(23)));
+    assert_eq!(
+        analyzer
+            .query_bundle(id(4))
+            .unwrap()
+            .entities
+            .operators
+            .len(),
+        1
+    );
+
+    let response = analyzer
+        .data_flow_timeline(CategoricalTimelineRequest {
+            measures: vec!["count".into()],
+            config: TimelineConfig {
+                num_bins: 10,
+                start: 0.0,
+                end: 10.0,
+            },
+            app_params: QueryFilter { query_id: id(4) },
+        })
+        .unwrap();
+    assert!(!response.operators.contains_key(&id(22)));
+    assert_eq!(
+        response.operators[&id(6)].values["count"]["computing"][GPU_SPACE_LABEL][6],
+        2.0
+    );
+}
+
+#[test]
+fn generated_ndjson_imports_into_analyzer() {
+    use quent_io::{
+        ExporterOptions,
+        filesystem::{self, Format},
+    };
+    use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
+    use quent_store::event::{ModelEventStore, filesystem::Store};
+    use sirius_telemetry_instrumentation as instrumentation;
+
+    let output = tempfile::tempdir().unwrap();
+    let (context_id, engine_id, query_id) = {
+        let context = instrumentation::Context::<instrumentation::Sirius>::try_new(
+            ExporterOptions::FileSystem(filesystem::exporter::Options::new(
+                Format::Ndjson,
+                output.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+        let context_id = context.id();
+        let mut engine = context.observer::<instrumentation::Engine>().handle();
+        engine.init(Some("Sirius".into())).unwrap();
+        let engine_id = engine.id();
+        let mut group = context.observer::<instrumentation::QueryGroup>().handle();
+        group
+            .declaration("group".into(), engine.as_entity_ref())
+            .unwrap();
+        let query = context
+            .observer::<instrumentation::Query>()
+            .handle()
+            .init("select".into(), group.as_entity_ref())
+            .planning()
+            .executing()
+            .exit();
+        let query_id = query.id();
+        let mut worker = context.observer::<instrumentation::Worker>().handle();
+        worker
+            .init(engine.as_entity_ref(), "42".into(), "worker".into())
+            .unwrap();
+        let mut plan = context.observer::<instrumentation::Plan>().handle();
+        plan.declaration(
+            query.as_entity_ref(),
+            "plan".into(),
+            vec![],
+            Some(worker.as_entity_ref()),
+        )
+        .unwrap();
+        engine.exit().unwrap();
+        (context_id, engine_id, query_id)
+    };
+
+    let stored = Store::<s::Sirius>::new(output.path())
+        .events(context_id)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stored.len(), 9);
+
+    let context_dir = output.path().join(context_id.to_string());
+    let inventory = crate::Viewer::context_inventory(&context_dir).unwrap();
+    assert!(inventory.analysis_target_ids.contains(&engine_id));
+    let imported: ViewerEventStream<SiriusUiAnalyzer> =
+        crate::Viewer::import_events(&context_dir).unwrap();
+    let analyzer = SiriusUiAnalyzer::try_new(engine_id, imported).unwrap();
+    assert_eq!(analyzer.query_bundle(query_id).unwrap().query_id, query_id);
+
+    let worker_context_id = {
+        let context = instrumentation::Context::<instrumentation::Sirius>::try_new(
+            ExporterOptions::FileSystem(filesystem::exporter::Options::new(
+                Format::Ndjson,
+                output.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+        let mut worker = context.observer::<instrumentation::Worker>().handle();
+        worker
+            .init(
+                instrumentation::EntityRef::new(engine_id, ()),
+                "43".into(),
+                "remote".into(),
+            )
+            .unwrap();
+        context.id()
+    };
+    let worker_dir = output.path().join(worker_context_id.to_string());
+    let inventory = crate::Viewer::context_inventory(&worker_dir).unwrap();
+    assert!(inventory.analysis_target_ids.contains(&engine_id));
+    let engine_events = crate::Viewer::import_events(&context_dir).unwrap();
+    let worker_events = crate::Viewer::import_events(&worker_dir).unwrap();
+    let combined =
+        SiriusUiAnalyzer::try_new(engine_id, engine_events.chain(worker_events)).unwrap();
+    assert_eq!(combined.model.workers.len(), 2);
 }

@@ -3,8 +3,9 @@ resolver = "3"
 members = [
     "crates/telemetry/bridge",
     "crates/telemetry/model",
-    #    "crates/telemetry/analyzer",
-    #    "crates/telemetry/server",
+    "crates/telemetry/store",
+    "crates/telemetry/analyzer",
+    "crates/telemetry/server",
     "crates/sirius-sys",
     "crates/sirius"
 ]

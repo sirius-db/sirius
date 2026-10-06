@@ -1,17 +1,21 @@
-use instrumentation_model::{Sirius, SiriusEvent};
+use quent_dynamic_attributes::DynamicValue;
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
-use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
+use quent_query_engine_analyzer::ui::UiAnalyzer;
+#[cfg(not(target_arch = "wasm32"))]
+use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
 use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, QueryGroupEntity,
     WorkerEntity,
 };
 use quent_query_engine_ui::{
-    DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
+    DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_ui::{
-    FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
+    FiniteStateMachine, Resource as UiResource, ResourceGroup as UiResourceGroup,
+    ResourceGroupNode, ResourceTree, convert_resource_tree,
+    fsm::FsmTypeDeclaration,
     quantity::{CapacityKind, QuantitySpec},
     timeline::{
         categorical::{
@@ -30,19 +34,21 @@ use quent_ui::{
     },
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use sirius_telemetry_store::Sirius;
+use sirius_telemetry_store::{self as schema, SiriusEvent};
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use tracing::debug;
 
+#[cfg(not(target_arch = "wasm32"))]
+use quent_analyzer::context::ContextInventory;
 use quent_analyzer::{
-    AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{
-        FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection,
-        events::TransitionEvent,
-    },
+    AnalyzerError, AnalyzerResult, Entity, Span,
+    fsm::{FsmUsages, collection::FsmCollection, native::AnalyzedTransition},
+    ref_tree::RefTreeCollection,
     resource::{
-        ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
-        tree::ResourceTreeNode,
+        ResourceTypeDecl, Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode,
     },
     timeline::binned::{
         categorical::{CategoricalKey, CategoricalTimelineBuilder},
@@ -52,50 +58,118 @@ use quent_analyzer::{
         },
     },
 };
-use quent_simulator_ui::EntityRef;
+#[cfg(not(target_arch = "wasm32"))]
+use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
+pub use crate::boilerplate::{DataBatch, DataBatchExt, Task, TaskExt};
 use crate::{
-    batch_placement::{BatchPlacement, BatchPlacementExt},
-    data_batch::{DataBatch, DataBatchExt},
-    model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
-    task::{Task, TaskExt},
+    model::{MEMORY_SPACE_BYTES_CAPACITY_NAME, SiriusModel, SiriusModelBuilder},
     view::SiriusModelQueryView,
 };
 
-pub mod batch_placement;
-pub mod data_batch;
+mod boilerplate;
 pub mod model;
-pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod view;
 
 const TASK_TYPE_NAME: &str = "task";
 const DATA_BATCH_TYPE_NAME: &str = "data_batch";
-const BATCH_PLACEMENT_TYPE_NAME: &str = "batch_placement";
-/// The BatchPlacement FSM's instantaneous entry state, omitted from aggregates.
-const BATCH_REGISTERED_STATE: &str = "batch_registered";
 /// Synthetic series: the memory reservation tasks hold while
 /// preparing/computing (may overlap the input batches' resident bytes).
 const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
-/// Data-flow measure counting batches residing in each (state, tier) cell.
+/// Counts physical batches, task reservations, or associated inputs by state.
 const MEASURE_COUNT: &str = "count";
-/// Data-flow measure summing batch bytes held in each (state, tier) cell.
+/// Bytes in overlapping physical, associated-input, and reservation layers.
 const MEASURE_BYTES: &str = "bytes";
+const MEASURE_RATE: &str = "input_bytes_per_sec";
+const UNKNOWN_DIMENSION: &str = "UNKNOWN";
+const IN_TRANSIT_DIMENSION: &str = "IN_TRANSIT";
 
-/// Push one entity's per-state tier residency into the data-flow aggregation.
-/// `state_for` labels each transition span (`None` skips it); a tier-change
-/// self-transition splits a state's residency across both dimension keys.
-fn push_tier_state_spans<'a, T>(
+#[derive(Clone, Copy)]
+enum BatchMeasures {
+    Neither,
+    Count,
+    Bytes,
+    Both,
+}
+
+impl BatchMeasures {
+    fn count(self) -> bool {
+        matches!(self, Self::Count | Self::Both)
+    }
+    fn bytes(self) -> bool {
+        matches!(self, Self::Bytes | Self::Both)
+    }
+}
+const QUANTITY_BYTES: &str = "bytes";
+const QUANTITY_SECONDS: &str = "seconds";
+const BYTE_OPERATOR_STATISTICS: &[&str] = &[
+    "average_partition_size_bytes",
+    "avg_key_length_bytes",
+    "bloom_filter_size_bytes",
+    "build_side_bytes",
+    "bytes_read",
+    "bytes_written",
+    "hash_table_size_bytes",
+    "input_bytes",
+    "network_bytes_sent",
+    "output_bytes",
+    "peak_memory_bytes",
+    "per_file_bytes_read",
+    "probe_side_bytes",
+    "spill_bytes",
+];
+const SECOND_OPERATOR_STATISTICS: &[&str] = &[
+    "build_time_ns",
+    "cpu_time_ns",
+    "decompress_time_ns",
+    "flush_time_ns",
+    "hash_time_ns",
+    "io_wait_ns",
+    "merge_time_ns",
+    "network_time_ns",
+    "partition_time_ns",
+    "predicate_filter_time_ns",
+    "probe_time_ns",
+    "serialization_time_ns",
+    "wall_time_ns",
+];
+
+fn operator_statistic_quantity(name: &str) -> Option<&'static str> {
+    BYTE_OPERATOR_STATISTICS
+        .contains(&name)
+        .then_some(QUANTITY_BYTES)
+}
+
+fn scale_operator_statistic(name: &str, value: &Option<DynamicValue>) -> Option<DynamicValue> {
+    if !SECOND_OPERATOR_STATISTICS.contains(&name) {
+        return None;
+    }
+    match value {
+        Some(DynamicValue::U64(nanoseconds)) => {
+            let seconds = *nanoseconds as f64 / 1_000_000_000.0;
+            Some(DynamicValue::F64(seconds))
+        }
+        _ => None,
+    }
+}
+
+fn scaled_operator_statistic_name(name: String) -> String {
+    name.strip_suffix("_ns").unwrap_or(&name).to_owned()
+}
+
+/// Push one entity's per-state memory-space usage into the data-flow aggregation.
+/// A self-transition can split residency across two spaces.
+fn push_space_state_spans<'a, T>(
     builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
-    tier_names: &HashMap<Uuid, &'a str>,
+    space_names: &HashMap<Uuid, &'a str>,
     operator_id: Uuid,
-    transitions: &'a [TransitionEvent<T>],
-    state_for: impl Fn(&'a TransitionEvent<T>) -> Option<&'a str>,
-    want_count: bool,
-    want_bytes: bool,
+    transitions: &'a [AnalyzedTransition<T>],
+    state_for: impl Fn(&'a AnalyzedTransition<T>) -> Option<&'a str>,
+    measures: BatchMeasures,
 ) -> AnalyzerResult<()> {
     for pair in transitions.windows(2) {
         let (from, to) = (&pair[0], &pair[1]);
@@ -105,15 +179,15 @@ fn push_tier_state_spans<'a, T>(
         let Some(state) = state_for(from) else {
             continue;
         };
-        let Some(tier_usage) = from
-            .usages
+        let Some(space_usage) = from
+            .usages()
             .iter()
-            .find(|u| tier_names.contains_key(&u.resource_id))
+            .find(|u| space_names.contains_key(&u.resource_id))
         else {
             continue;
         };
-        let dimension = tier_names[&tier_usage.resource_id];
-        if want_count {
+        let dimension = space_names[&space_usage.resource_id];
+        if measures.count() {
             builder.try_push(
                 CategoricalKey {
                     series: operator_id,
@@ -125,11 +199,11 @@ fn push_tier_state_spans<'a, T>(
                 1.0,
             )?;
         }
-        if want_bytes {
-            let bytes: u64 = tier_usage
+        if measures.bytes() {
+            let bytes: u64 = space_usage
                 .capacities
                 .iter()
-                .filter(|c| c.name == crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME)
+                .filter(|c| c.name == MEMORY_SPACE_BYTES_CAPACITY_NAME)
                 .filter_map(|c| c.value)
                 .sum();
             if bytes > 0 {
@@ -149,32 +223,188 @@ fn push_tier_state_spans<'a, T>(
     Ok(())
 }
 
-/// Stable dimension-key order: GPU tiers, HOST, DISK, then unknown by name.
-fn memory_tier_rank(name: &str) -> (u8, &str) {
-    if name == "GPU" || name.starts_with("GPU-") {
-        (0, name)
-    } else if name == "HOST" {
-        (1, name)
-    } else if name == "DISK" {
-        (2, name)
-    } else {
-        (3, name)
+/// Attribute one task phase to its distinct physical input batches.
+/// A producer may be outside the selected query; the numeric index is global
+/// to the imported engine and rejects ambiguous IDs during model build.
+struct BatchAttribution<'a, 'b> {
+    model: &'a SiriusModel,
+    space_names: &'b HashMap<Uuid, &'a str>,
+    pipeline_id: Uuid,
+    state: &'a str,
+    measures: BatchMeasures,
+}
+
+impl<'a> BatchAttribution<'a, '_> {
+    fn push_count(
+        &self,
+        builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
+        span: SpanNanoSec,
+        dimension: &'a str,
+    ) -> AnalyzerResult<()> {
+        if self.measures.count() && span.duration() > 0 {
+            builder.try_push(
+                CategoricalKey {
+                    series: self.pipeline_id,
+                    measure: MEASURE_COUNT,
+                    state: self.state,
+                    dimension,
+                },
+                span,
+                1.0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn push(
+        &self,
+        builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
+        span: SpanNanoSec,
+        ids: &[u64],
+    ) -> AnalyzerResult<()> {
+        let mut seen = HashSet::default();
+        for &number in ids {
+            if !seen.insert(number) {
+                continue;
+            }
+            let batch = self
+                .model
+                .batch_by_number
+                .get(&number)
+                .and_then(|id| self.model.data_batches.get(id));
+            let Some(batch) = batch else {
+                self.push_count(builder, span, UNKNOWN_DIMENSION)?;
+                continue;
+            };
+
+            let mut covered_until = span.start();
+            for pair in batch.transitions().windows(2) {
+                let Ok(batch_span) = SpanNanoSec::try_new(pair[0].timestamp(), pair[1].timestamp())
+                else {
+                    continue;
+                };
+                let Some(overlap) = span.intersection(&batch_span) else {
+                    continue;
+                };
+                if overlap.start() > covered_until {
+                    self.push_count(
+                        builder,
+                        SpanNanoSec::try_new(covered_until, overlap.start())?,
+                        UNKNOWN_DIMENSION,
+                    )?;
+                }
+                covered_until = covered_until.max(overlap.end());
+
+                let (dimension, bytes) = match &pair[0].data {
+                    schema::DataBatchEvent::Stationary { memory, .. } => (
+                        self.space_names
+                            .get(&memory.target)
+                            .copied()
+                            .unwrap_or(UNKNOWN_DIMENSION),
+                        Some(memory.data.bytes),
+                    ),
+                    schema::DataBatchEvent::InTransit { .. } => (IN_TRANSIT_DIMENSION, None),
+                    _ => (UNKNOWN_DIMENSION, None),
+                };
+                self.push_count(builder, overlap, dimension)?;
+                if self.measures.bytes()
+                    && let Some(bytes) = bytes
+                    && bytes > 0
+                {
+                    builder.try_push(
+                        CategoricalKey {
+                            series: self.pipeline_id,
+                            measure: MEASURE_BYTES,
+                            state: self.state,
+                            dimension,
+                        },
+                        overlap,
+                        bytes as f64,
+                    )?;
+                }
+            }
+            if covered_until < span.end() {
+                self.push_count(
+                    builder,
+                    SpanNanoSec::try_new(covered_until, span.end())?,
+                    UNKNOWN_DIMENSION,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Viewer;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl QuentViewer for Viewer {
     type Analyzer = SiriusUiAnalyzer;
 
+    fn context_inventory(dir: &std::path::Path) -> quent_io::ImporterResult<ContextInventory> {
+        let (context_id, root) = context_location(dir)?;
+        let store = Store::<Sirius>::new(root);
+        let engine_ids = store
+            .entity_events::<schema::Engine>(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .map(|event| event.map(|event| event.id))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+        let worker_analysis_target_ids = store
+            .entity_events::<schema::Worker>(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .filter_map(|event| match event {
+                Ok(Event {
+                    data:
+                        schema::WorkerEvent::Init {
+                            parent_engine_id, ..
+                        },
+                    ..
+                }) => Some(Ok(parent_engine_id.target)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+
+        Ok(ContextInventory {
+            analysis_target_ids: engine_ids
+                .into_iter()
+                .chain(worker_analysis_target_ids)
+                .collect(),
+        })
+    }
+
     fn import_events(
         dir: &std::path::Path,
-    ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
-        let events =
-            Sirius::import_events(dir)?.collect::<quent_model::io::ImporterResult<Vec<_>>>()?;
+    ) -> quent_io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+        let (context_id, root) = context_location(dir)?;
+        let events = Store::<Sirius>::new(root)
+            .events(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
         Ok(Box::new(events.into_iter()))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn context_location(dir: &std::path::Path) -> quent_io::ImporterResult<(Uuid, &std::path::Path)> {
+    let invalid_path = || {
+        quent_io::ImporterError::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("context directory must end in a UUID: {}", dir.display()),
+        ))
+    };
+    let context_id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .ok_or_else(invalid_path)?;
+    let root = dir.parent().ok_or_else(invalid_path)?;
+    Ok((context_id, root))
 }
 
 pub struct SiriusUiAnalyzer {
@@ -197,6 +427,21 @@ struct PerStateBuilderSlot<'a> {
     op_filter: OperatorFilter,
     entity_type_name: String,
 }
+
+type PlainBulkBuilder<'a> = (
+    String,
+    ResourceTimelineBuilder<'a>,
+    HashSet<Uuid>,
+    OperatorFilter,
+);
+
+type PerStateBulkBuilder<'a> = (
+    String,
+    ResourceTimelineByKeyBuilder<'a, &'a str>,
+    HashSet<Uuid>,
+    OperatorFilter,
+    String,
+);
 
 /// Adapts the model's task map to the [`FsmCollection`] contract that
 /// [`entities::list_entities`] ranks and pages over.
@@ -222,21 +467,26 @@ impl FsmCollection for DataBatchCollection<'_> {
     }
 }
 
-/// Adapts the model's batch-placement map to the [`FsmCollection`] contract
-/// that [`entities::list_entities`] ranks and pages over.
-struct BatchPlacementCollection<'a>(&'a HashMap<Uuid, BatchPlacement>);
-
-impl FsmCollection for BatchPlacementCollection<'_> {
-    type Fsm = BatchPlacement;
-
-    fn fsms(&self) -> impl Iterator<Item = &BatchPlacement> {
-        self.0.values()
-    }
-}
-
 impl UiAnalyzer for SiriusUiAnalyzer {
     type Event = SiriusEvent;
-    type EntityRef = EntityRef;
+
+    fn extract_engine(
+        engine_id: Uuid,
+        events: impl Iterator<Item = Event<SiriusEvent>>,
+    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
+        for event in events {
+            if let SiriusEvent::Engine(schema::EngineEvent::Init { label }) = event.data {
+                return Ok(quent_query_engine_ui::Engine {
+                    id: engine_id,
+                    start_time_unix_ns: Some(event.timestamp),
+                    duration_s: None,
+                    instance_name: label,
+                    implementation: None,
+                });
+            }
+        }
+        Ok(quent_query_engine_ui::Engine::new(engine_id))
+    }
 
     fn try_new(
         engine_id: Uuid,
@@ -254,50 +504,25 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             builder.try_build()?
         };
 
-        let qe = &model.query_engine;
         tracing::info!(
-            workers = qe.workers.len(),
-            query_groups = qe.query_groups.len(),
-            queries = qe.queries.len(),
-            plans = qe.plans.len(),
-            operators = qe.operators.len(),
-            ports = qe.ports.len(),
-            resources = model.arbitrary_resources.resources.len(),
-            resource_groups = model.arbitrary_resources.resource_groups.len(),
-            resource_types = model.arbitrary_resources.resource_types.len(),
+            workers = model.workers.len(),
+            query_groups = model.query_groups.len(),
+            queries = model.queries.len(),
+            plans = model.plans.len(),
+            operators = model.operators.len(),
+            ports = model.ports.len(),
+            resources = model.resources().count(),
+            resource_groups = model.gpu_devices.len() + model.thread_groups.len(),
+            resource_types = model.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
             data_batches = model.data_batches.len(),
-            batches = model.batch_placements.len(),
         );
 
         Ok(Self { model })
     }
 
-    fn extract_engine(
-        engine_id: Uuid,
-        events: impl Iterator<Item = Event<SiriusEvent>>,
-    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
-        use quent_query_engine_model::engine::EngineEvent;
-        for event in events {
-            if let SiriusEvent::Engine(EngineEvent::Init(init)) = event.data {
-                return Ok(quent_query_engine_ui::Engine {
-                    id: engine_id,
-                    start_time_unix_ns: Some(event.timestamp),
-                    duration_s: None,
-                    instance_name: init.instance_name,
-                    implementation: Some(
-                        quent_query_engine_ui::EngineImplementationAttributes::from(
-                            &init.implementation,
-                        ),
-                    ),
-                });
-            }
-        }
-        Ok(quent_query_engine_ui::Engine::new(engine_id))
-    }
-
-    fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle<EntityRef>> {
+    fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle> {
         debug!("constructing view");
         // TODO(johanpel): A query view could be cached in an analyzer so
         // subsequent calls into the analyzer for that query could benefit from
@@ -320,7 +545,33 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let query = query.to_ui()?;
         let workers = view.workers().map(|w| (w.id(), w.to_ui(epoch))).collect();
         let plans = view.plans().map(|p| (p.id(), p.to_ui())).collect();
-        let operators = view.operators().map(|o| (o.id(), o.to_ui(epoch))).collect();
+        let operators = view
+            .operators()
+            .map(|operator| {
+                let mut ui_operator = operator.to_ui(epoch);
+                if let Some(statistics) = &mut ui_operator.statistics {
+                    statistics.custom_statistics =
+                        std::mem::take(&mut statistics.custom_statistics)
+                            .into_iter()
+                            .map(|(name, mut statistic)| {
+                                let name = if let Some(value) =
+                                    scale_operator_statistic(&name, &statistic.value)
+                                {
+                                    statistic.value = Some(value);
+                                    statistic.quantity = Some(QUANTITY_SECONDS.to_owned());
+                                    scaled_operator_statistic_name(name)
+                                } else {
+                                    statistic.quantity =
+                                        operator_statistic_quantity(&name).map(str::to_owned);
+                                    name
+                                };
+                                (name, statistic)
+                            })
+                            .collect();
+                }
+                (operator.id(), ui_operator)
+            })
+            .collect();
         let ports = view.ports().map(|p| (p.id(), p.to_ui(epoch))).collect();
         let unique_operator_names = view
             .operators()
@@ -329,38 +580,62 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .into_iter()
             .collect();
 
-        debug!("converting Sirius runtime resource entities");
+        debug!("converting Sirius resource entities");
 
         let resources = view
-            .runtime_resources()
-            .map(|resource| (resource.id(), resource.into()))
-            .collect();
+            .sirius_resources()
+            .map(|resource| {
+                let parent_id = view
+                    .ref_tree_entity(resource.id())?
+                    .parent_id()
+                    .ok_or_else(|| {
+                        AnalyzerError::Validation(format!(
+                            "resource {} is the Reference Tree root",
+                            resource.id()
+                        ))
+                    })?;
+                Ok((
+                    resource.id(),
+                    UiResource::from_analyzed(
+                        resource,
+                        view.resource_instance_name(resource.id())
+                            .unwrap_or_default(),
+                        parent_id,
+                    ),
+                ))
+            })
+            .collect::<AnalyzerResult<_>>()?;
 
         let resource_groups = view
-            .runtime_resource_groups()
+            .sirius_resource_groups()
             .map(|group| {
-                let group: &dyn ResourceGroup = group;
-                (group.id(), group.into())
+                (
+                    group.id(),
+                    UiResourceGroup::from_analyzed(
+                        group,
+                        view.resource_group_instance_name(group.id())
+                            .unwrap_or_default(),
+                        group.parent_id(),
+                    ),
+                )
             })
             .collect();
 
         let resource_types = view
-            .runtime_resource_types()
+            .sirius_resource_types()
             .map(|(name, resource_type)| (name.to_string(), resource_type.into()))
             .collect();
 
         let resource_group_types = view
-            .runtime_resource_group_types()
-            .map(|(name, group_type)| (name.to_string(), group_type.into()))
+            .sirius_resource_group_types()
+            .map(|(name, group_type)| (name.to_string(), group_type.clone()))
             .collect();
 
         let task_decl = Task::fsm_type_declaration();
         let data_batch_decl = DataBatch::fsm_type_declaration();
-        let batch_decl = BatchPlacement::fsm_type_declaration();
         let fsm_types = [
             (task_decl.name.clone(), task_decl),
             (data_batch_decl.name.clone(), data_batch_decl),
-            (batch_decl.name.clone(), batch_decl),
         ]
         .into_iter()
         .collect();
@@ -385,8 +660,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         debug!("deriving resource tree");
         let engine = view.engine()?;
-        let resource_tree =
-            convert_resource_tree(view.resource_tree()?, &view)?.unwrap_or_else(|| {
+        let resource_tree = convert_resource_tree(ResourceTreeNode::try_new(&view)?, &view)?
+            .unwrap_or_else(|| {
                 ResourceTree::ResourceGroup(ResourceGroupNode {
                     id: EntityRef::Engine(engine.id()),
                     children: vec![],
@@ -402,13 +677,14 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             quantity_specs: [
                 // SI decimal prefixes (kB/MB/GB) read better on the DAG bars.
                 (
-                    crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME.into(),
+                    MEMORY_SPACE_BYTES_CAPACITY_NAME.into(),
                     QuantitySpec {
                         occupancy_prefix: quent_ui::quantity::PrefixSystem::Si,
                         ..QuantitySpec::bytes()
                     },
                 ),
-                ("capacity_entries".into(), QuantitySpec::unit()),
+                (QUANTITY_SECONDS.into(), QuantitySpec::seconds()),
+                ("entries".into(), QuantitySpec::unit()),
                 ("unit".into(), QuantitySpec::unit()),
             ]
             .into(),
@@ -424,7 +700,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
     fn list_entities(
         &self,
         request: quent_ui::entities::request::EntityListRequest<QueryFilter, OperatorFilter>,
-    ) -> AnalyzerResult<quent_ui::entities::response::EntityListResponse> {
+    ) -> AnalyzerResult<quent_query_engine_ui::EntityListResponse> {
         let query_id = request.app_params.query_id;
         let epoch = self.query_engine_model().query_epoch(query_id)?;
         let entry = request.entry;
@@ -464,21 +740,11 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             Some(DATA_BATCH_TYPE_NAME) => entities::list_entities(
                 &DataBatchCollection(&self.model.data_batches),
                 |data_batch| {
-                    data_batch
-                        .producer_pipeline_uuid()
-                        .is_some_and(|op| query_operators.contains(&op))
+                    data_batch.belongs_to(&query_operators)
                         && data_batch.matches_filter(&operator_filter)
                 },
-                query,
-            ),
-            Some(BATCH_PLACEMENT_TYPE_NAME) => entities::list_entities(
-                &BatchPlacementCollection(&self.model.batch_placements),
-                |batch| {
-                    batch
-                        .pipeline_uuid()
-                        .is_some_and(|op| query_operators.contains(&op))
-                        && batch.matches_filter(&operator_filter)
-                },
+                |batch| batch.operator_in(&query_operators),
+                DataBatchExt::try_to_ui_fsm,
                 query,
             ),
             _ => entities::list_entities(
@@ -487,6 +753,14 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     task.pipeline_uuid()
                         .is_some_and(|op| query_operators.contains(&op))
                         && task.matches_filter(&operator_filter)
+                },
+                TaskExt::pipeline_uuid,
+                |task, epoch| {
+                    let pipeline_name = task
+                        .pipeline_uuid()
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
+                    task.try_to_ui_fsm(epoch, pipeline_name)
                 },
                 query,
             ),
@@ -556,25 +830,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
-                        Some(BATCH_PLACEMENT_TYPE_NAME) => {
-                            self.populate_keyed_builder(
-                                &mut builder,
-                                self.filtered_batches(
-                                    &view,
-                                    req.entity_filter,
-                                    &fsm_filter,
-                                    config.span,
-                                )?
-                                .into_iter()
-                                .filter(|batch| {
-                                    batch
-                                        .usages()
-                                        .any(|usage| usage.resource_id() == req.resource_id)
-                                }),
-                                |id| id == req.resource_id,
-                                Some(BATCH_REGISTERED_STATE),
-                            )?;
-                        }
                         other => {
                             Err(AnalyzerError::InvalidArgument(format!(
                                 "{:?} is not a known entity type in this model",
@@ -615,12 +870,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .flat_map(|db| db.usages())
                         .filter(|usage| usage.resource_id() == req.resource_id),
                     )?;
-                    builder.try_extend(
-                        self.filtered_batches(&view, req.entity_filter, &fsm_filter, config.span)?
-                            .into_iter()
-                            .flat_map(|batch| batch.usages())
-                            .filter(|usage| usage.resource_id() == req.resource_id),
-                    )?;
                     Ok(SingleTimelineResponse {
                         config: config_secs,
                         data: self.timeline_to_ui(builder.build(), epoch)?,
@@ -632,11 +881,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
                 let fsm_filter = req.app_params;
 
-                // Build the resource tree for this group
-                let tree = ResourceTreeNode::try_new(&view, req.resource_group_id)?;
-                // Collect all leaf resource IDs of the requested type in the tree
+                let resource_tree = ResourceTreeNode::try_new(&view)?;
+                let tree = resource_tree
+                    .find(req.resource_group_id)
+                    .ok_or(AnalyzerError::InvalidId(req.resource_group_id))?;
+                // Collect all resource IDs of the requested type in the tree.
                 let resource_ids: HashSet<Uuid> = tree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -689,25 +940,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                                 None,
                             )?;
                         }
-                        Some(BATCH_PLACEMENT_TYPE_NAME) => {
-                            self.populate_keyed_builder(
-                                &mut builder,
-                                self.filtered_batches(
-                                    &view,
-                                    req.entity_filter,
-                                    &fsm_filter,
-                                    config.span,
-                                )?
-                                .into_iter()
-                                .filter(|batch| {
-                                    batch
-                                        .usages()
-                                        .any(|usage| resource_ids.contains(&usage.resource_id()))
-                                }),
-                                |id| resource_ids.contains(&id),
-                                Some(BATCH_REGISTERED_STATE),
-                            )?;
-                        }
                         other => {
                             Err(AnalyzerError::InvalidArgument(format!(
                                 "{:?} is not a known entity type in this model",
@@ -748,12 +980,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .flat_map(|db| db.usages())
                         .filter(|usage| resource_ids.contains(&usage.resource_id())),
                     )?;
-                    builder.try_extend(
-                        self.filtered_batches(&view, req.entity_filter, &fsm_filter, config.span)?
-                            .into_iter()
-                            .flat_map(|batch| batch.usages())
-                            .filter(|usage| resource_ids.contains(&usage.resource_id())),
-                    )?;
                     Ok(SingleTimelineResponse {
                         config: config_secs,
                         data: self.timeline_to_ui(builder.build(), epoch)?,
@@ -776,27 +1002,16 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let view = self.model.query_view(request.app_params.query_id)?;
         // Prepare resource tree, we'll reuse this as it is potentially
         // expensive to build for every entry.
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         // Prepare builders, resource id filters, and operator filters, one for
         // each bulk entry. After populating this, we'll build a reverse index,
         // that maps a resource_id to a list of indices in these vecs, for which
         // that resource's usages are relevant.
-        let mut plain_builders: Vec<(
-            String,
-            ResourceTimelineBuilder,
-            HashSet<Uuid>,
-            OperatorFilter,
-        )> = Vec::new();
+        let mut plain_builders: Vec<PlainBulkBuilder<'_>> = Vec::new();
 
         // Prepare them also for keyed builders (building by state).
-        let mut per_state_builders: Vec<(
-            String,
-            ResourceTimelineByKeyBuilder<&str>,
-            HashSet<Uuid>,
-            OperatorFilter,
-            String, // entity_type_name this slot breaks down by ("task" | "data_batch", etc.)
-        )> = Vec::new();
+        let mut per_state_builders: Vec<PerStateBulkBuilder<'_>> = Vec::new();
 
         for (entry_id, entry) in request.entries {
             let entry_config = entry.config().try_into_binned_span(epoch)?;
@@ -930,37 +1145,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
         }
 
-        for batch in view.batch_placements() {
-            for usage in batch.usages() {
-                let resource_id = usage.resource_id();
-                if let Some(builder_indices) = plain_index.get(&resource_id) {
-                    for &builder_idx in builder_indices {
-                        let builder = &mut plain_builders[builder_idx];
-                        if batch.matches_filter(&builder.3) {
-                            builder.1.try_push(&usage)?;
-                        }
-                    }
-                }
-            }
-
-            for (state_name, usage) in batch.usages_with_state_names() {
-                if state_name == BATCH_REGISTERED_STATE {
-                    continue;
-                }
-                let resource_id = usage.resource_id();
-                if let Some(builder_indices) = per_state_index.get(&resource_id) {
-                    for &builder_idx in builder_indices {
-                        let builder = &mut per_state_builders[builder_idx];
-                        if builder.4 == BATCH_PLACEMENT_TYPE_NAME
-                            && batch.matches_filter(&builder.3)
-                        {
-                            builder.1.try_push(state_name, &usage)?;
-                        }
-                    }
-                }
-            }
-        }
-
         // Collect results for all requests.
         let mut entries = std::collections::HashMap::default();
         for (entry_id, builder, _, _) in plain_builders {
@@ -999,7 +1183,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .query_engine_model()
             .query_epoch(request.app_params.query_id)?;
         let view = self.model.query_view(request.app_params.query_id)?;
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         let n_configs = request.configs.len();
 
@@ -1134,36 +1318,6 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             }
         }
 
-        for batch in view.batch_placements() {
-            for usage in batch.usages() {
-                let resource_id = usage.resource_id();
-                if let Some(builder_indices) = plain_index.get(&resource_id) {
-                    for &builder_idx in builder_indices {
-                        let slot = &mut plain_builders[builder_idx];
-                        if batch.matches_filter(&slot.op_filter) {
-                            slot.builder.try_push(&usage)?;
-                        }
-                    }
-                }
-            }
-            for (state_name, usage) in batch.usages_with_state_names() {
-                if state_name == BATCH_REGISTERED_STATE {
-                    continue;
-                }
-                let resource_id = usage.resource_id();
-                if let Some(builder_indices) = per_state_index.get(&resource_id) {
-                    for &builder_idx in builder_indices {
-                        let slot = &mut per_state_builders[builder_idx];
-                        if slot.entity_type_name == BATCH_PLACEMENT_TYPE_NAME
-                            && batch.matches_filter(&slot.op_filter)
-                        {
-                            slot.builder.try_push(state_name, &usage)?;
-                        }
-                    }
-                }
-            }
-        }
-
         // Reassemble per-entry Vec aligned with `request.configs` order. Slots
         // start as `None` and must all be filled by the end — every (entry,
         // config_idx) had a builder, and every builder produces an `Ok`.
@@ -1228,60 +1382,154 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         if let Some(unknown) = request
             .measures
             .iter()
-            .find(|m| *m != MEASURE_COUNT && *m != MEASURE_BYTES)
+            .find(|m| *m != MEASURE_COUNT && *m != MEASURE_BYTES && *m != MEASURE_RATE)
         {
             return Err(AnalyzerError::InvalidArgument(format!(
-                "unknown measure '{unknown}'; declared measures are '{MEASURE_COUNT}' and '{MEASURE_BYTES}'"
+                "unknown measure '{unknown}'; declared measures are '{MEASURE_COUNT}', '{MEASURE_BYTES}', and '{MEASURE_RATE}'"
             )));
         }
         let want =
             |name: &str| request.measures.is_empty() || request.measures.iter().any(|m| m == name);
         let want_count = want(MEASURE_COUNT);
         let want_bytes = want(MEASURE_BYTES);
+        let batch_measures = match (want_count, want_bytes) {
+            (true, true) => BatchMeasures::Both,
+            (true, false) => BatchMeasures::Count,
+            (false, true) => BatchMeasures::Bytes,
+            (false, false) => BatchMeasures::Neither,
+        };
 
         let view = self.model.query_view(query_id)?;
 
-        // The memory_tier resources exist iff batch telemetry was enabled
-        // when recording; without them the view is unsupported (HTTP 501).
-        let tier_names: HashMap<Uuid, &str> = self
+        // The schema supplies display labels, not stable tier codes.
+        let space_names: HashMap<Uuid, &str> = self
             .model
-            .arbitrary_resources
             .resources()
-            .filter(|r| r.type_name() == MEMORY_TIER_TYPE_NAME)
-            .map(|r| (r.id(), r.instance_name()))
+            .filter(|r| r.type_name() == "memory_space")
+            .filter_map(|resource| {
+                self.model
+                    .resource_instance_name(resource.id())
+                    .map(|name| (resource.id(), name))
+            })
             .collect();
-        if tier_names.is_empty() {
-            return Err(AnalyzerError::Unsupported);
-        }
-
         let mut builder = CategoricalTimelineBuilder::new(config);
-        for batch in view.batch_placements() {
-            let Some(operator_id) = batch.pipeline_uuid() else {
-                continue;
-            };
-            push_tier_state_spans(
-                &mut builder,
-                &tier_names,
-                operator_id,
-                batch.transitions(),
-                |t| Some(t.name()).filter(|state| *state != BATCH_REGISTERED_STATE),
-                want_count,
-                want_bytes,
-            )?;
-        }
         for task in view.tasks() {
             let Some(operator_id) = task.pipeline_uuid() else {
                 continue;
             };
-            push_tier_state_spans(
+            push_space_state_spans(
                 &mut builder,
-                &tier_names,
+                &space_names,
                 operator_id,
                 task.transitions(),
                 |_| Some(TASK_WORKING_SPACE_STATE),
-                want_count,
-                want_bytes,
+                batch_measures,
             )?;
+        }
+
+        for batch in view.data_batches() {
+            let Some(operator_id) = batch.producer_pipeline_uuid() else {
+                continue;
+            };
+            if view.operator(operator_id).is_err() {
+                continue;
+            }
+            push_space_state_spans(
+                &mut builder,
+                &space_names,
+                operator_id,
+                batch.transitions(),
+                |transition| {
+                    matches!(transition.data, schema::DataBatchEvent::Stationary { .. })
+                        .then_some("stationary")
+                },
+                batch_measures,
+            )?;
+        }
+
+        if want_count || want_bytes {
+            for task in view.tasks() {
+                let Some(pipeline_id) = task.pipeline_uuid() else {
+                    continue;
+                };
+                let transitions = task.transitions();
+                if let (Some(created), Some(first_compute)) = (
+                    transitions.first(),
+                    transitions.iter().find(|transition| {
+                        matches!(transition.data, schema::TaskEvent::Computing { .. })
+                    }),
+                ) && let schema::TaskEvent::Computing {
+                    input_batch_ids, ..
+                } = &first_compute.data
+                    && let Ok(span) =
+                        SpanNanoSec::try_new(created.timestamp(), first_compute.timestamp())
+                {
+                    BatchAttribution {
+                        model: &self.model,
+                        space_names: &space_names,
+                        pipeline_id,
+                        state: "precompute",
+                        measures: batch_measures,
+                    }
+                    .push(&mut builder, span, input_batch_ids)?;
+                }
+                for pair in transitions.windows(2) {
+                    let schema::TaskEvent::Computing {
+                        input_batch_ids, ..
+                    } = &pair[0].data
+                    else {
+                        continue;
+                    };
+                    let Ok(span) = SpanNanoSec::try_new(pair[0].timestamp(), pair[1].timestamp())
+                    else {
+                        continue;
+                    };
+                    BatchAttribution {
+                        model: &self.model,
+                        space_names: &space_names,
+                        pipeline_id,
+                        state: "computing",
+                        measures: batch_measures,
+                    }
+                    .push(&mut builder, span, input_batch_ids)?;
+                }
+            }
+        }
+
+        if want(MEASURE_RATE) {
+            for task in view.tasks() {
+                let Some(operator_id) = task.pipeline_uuid() else {
+                    continue;
+                };
+                for pair in task.transitions().windows(2) {
+                    let schema::TaskEvent::Computing { input_bytes, .. } = &pair[0].data else {
+                        continue;
+                    };
+                    let Ok(span) = SpanNanoSec::try_new(pair[0].timestamp(), pair[1].timestamp())
+                    else {
+                        continue;
+                    };
+                    let duration_secs = (pair[1].timestamp() - pair[0].timestamp()) as f64 / 1e9;
+                    if duration_secs <= 0.0 {
+                        continue;
+                    }
+                    let dimension = pair[0]
+                        .usages()
+                        .iter()
+                        .find_map(|usage| space_names.get(&usage.resource_id).copied())
+                        .unwrap_or(UNKNOWN_DIMENSION);
+                    builder.try_push(
+                        CategoricalKey {
+                            series: operator_id,
+                            measure: MEASURE_RATE,
+                            state: "computing",
+                            dimension,
+                        },
+                        span,
+                        *input_bytes as f64 / duration_secs,
+                    )?;
+                }
+            }
         }
 
         // Pivot into per-operator series; all-zero series are omitted.
@@ -1301,10 +1549,14 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 .insert(key.dimension.to_owned(), bins);
         }
 
-        let present_tiers: HashSet<&str> = tier_names.values().copied().collect();
-        let mut ordered_tiers: Vec<&str> = present_tiers.into_iter().collect();
-        ordered_tiers.sort_unstable_by_key(|tier| memory_tier_rank(tier));
-        let dimension_keys: Vec<DimensionKeyDecl> = ordered_tiers
+        let present_spaces: HashSet<&str> = space_names
+            .values()
+            .copied()
+            .chain([UNKNOWN_DIMENSION, IN_TRANSIT_DIMENSION])
+            .collect();
+        let mut ordered_spaces: Vec<&str> = present_spaces.into_iter().collect();
+        ordered_spaces.sort_unstable();
+        let dimension_keys: Vec<DimensionKeyDecl> = ordered_spaces
             .into_iter()
             .map(|tier| DimensionKeyDecl {
                 key: tier.to_owned(),
@@ -1316,7 +1568,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         if want_count {
             measures.push(MeasureDecl {
                 name: MEASURE_COUNT.to_owned(),
-                display_name: "Batches".to_owned(),
+                display_name: "Batches / task reservations".to_owned(),
                 quantity: "unit".to_owned(),
                 kind: CapacityKind::Occupancy,
             });
@@ -1324,20 +1576,37 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         if want_bytes {
             measures.push(MeasureDecl {
                 name: MEASURE_BYTES.to_owned(),
-                display_name: "Batch bytes".to_owned(),
-                quantity: crate::model::MEMORY_TIER_BYTES_CAPACITY_NAME.to_owned(),
+                display_name: "Attributed bytes (overlapping layers)".to_owned(),
+                quantity: MEMORY_SPACE_BYTES_CAPACITY_NAME.to_owned(),
                 kind: CapacityKind::Occupancy,
+            });
+        }
+        if want(MEASURE_RATE) {
+            measures.push(MeasureDecl {
+                name: MEASURE_RATE.to_owned(),
+                display_name: "Input processing rate".to_owned(),
+                quantity: QUANTITY_BYTES.to_owned(),
+                kind: CapacityKind::Rate,
             });
         }
 
         Ok(DataFlowTimelineBinned {
             config: config.try_to_secs_relative(epoch)?,
             decl: CategoricalDecl {
-                entity_type_name: BatchPlacement::fsm_type_declaration().name,
-                dimension_name: "Memory Tier".to_owned(),
+                entity_type_name: Task::fsm_type_declaration().name,
+                dimension_name: "Memory space".to_owned(),
                 dimension_keys,
                 measures,
-                default_measure: Some(MEASURE_BYTES.to_owned()),
+                default_measure: Some(
+                    if want(MEASURE_RATE) {
+                        MEASURE_RATE
+                    } else if want_bytes {
+                        MEASURE_BYTES
+                    } else {
+                        MEASURE_COUNT
+                    }
+                    .to_owned(),
+                ),
             },
             operators,
         })
@@ -1389,29 +1658,6 @@ impl SiriusUiAnalyzer {
             .collect())
     }
 
-    /// Return the query's batch placements, filtered by time window and
-    /// operator id.
-    fn filtered_batches<'a>(
-        &self,
-        view: &'a SiriusModelQueryView<'a>,
-        entity_filter: EntityFilter,
-        filter: &OperatorFilter,
-        time_window: SpanNanoSec,
-    ) -> AnalyzerResult<Vec<&'a BatchPlacement>> {
-        if let Some(entity_type_name) = entity_filter.entity_type_name
-            && entity_type_name != BATCH_PLACEMENT_TYPE_NAME
-        {
-            return Err(AnalyzerError::InvalidArgument(format!(
-                "{entity_type_name} is not a known entity type in this model"
-            )));
-        }
-        Ok(view
-            .batch_placements()
-            .filter(|batch| batch.span().is_ok_and(|s| s.intersects(&time_window)))
-            .filter(|batch| batch.matches_filter(filter))
-            .collect())
-    }
-
     /// Given a TimelineRequest figure out what are:
     /// - The resource_type
     /// - For groups, the set of resources to aggregate for.
@@ -1438,7 +1684,7 @@ impl SiriusUiAnalyzer {
                     .find(rg.resource_group_id)
                     .ok_or(AnalyzerError::InvalidId(rg.resource_group_id))?;
                 let resource_ids: HashSet<Uuid> = subtree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -1480,8 +1726,7 @@ impl SiriusUiAnalyzer {
         Ok(())
     }
 
-    /// Turn a list of entity ids (tasks, data batches, or batch placements)
-    /// into UI-compatible FSM data.
+    /// Turn Task and DataBatch ids into UI FSM data.
     fn task_entities_to_ui_fsm(
         &self,
         entity_ids: &[Uuid],
@@ -1493,16 +1738,14 @@ impl SiriusUiAnalyzer {
                 if let Some(task) = self.model.tasks.get(&id) {
                     let pipeline_name = task
                         .pipeline_uuid()
-                        .and_then(|id| self.model.query_engine.operators.get(&id))
-                        .map(|operator| operator.instance_name());
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
                     Some(task.try_to_ui_fsm(epoch, pipeline_name))
-                } else if let Some(db) = self.model.data_batches.get(&id) {
-                    Some(db.try_to_ui_fsm(epoch))
                 } else {
                     self.model
-                        .batch_placements
+                        .data_batches
                         .get(&id)
-                        .map(|batch| batch.try_to_ui_fsm(epoch))
+                        .map(|db| db.try_to_ui_fsm(epoch))
                 }
             })
             .collect()
