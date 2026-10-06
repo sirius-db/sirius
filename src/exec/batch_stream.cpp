@@ -131,6 +131,15 @@ void batch_stream::wait()
   _cv.wait(lock, [&] { return _terminal || !_repo->all_empty(); });
 }
 
+batch_stream::availability batch_stream::wait_for(std::chrono::milliseconds timeout)
+{
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait_for(lock, timeout, [&] { return _terminal || !_repo->all_empty(); });
+  }
+  return classify();
+}
+
 void batch_stream::set_on_data(std::function<void()> hook)
 {
   std::lock_guard<std::mutex> lock(_mutex);
