@@ -862,8 +862,8 @@ class SiriusContext : public ClientContextState {
                                       std::string_view end_tag) noexcept;
 
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
-  /// window will run cleanup. Reuses the normal retirement/release sequence and stops
-  /// at the first failure, retaining any owners whose borrowers are not proven idle.
+  /// window will run cleanup. Retires work without retrying a partially failed release;
+  /// remaining resources stay owned until shutdown.
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;

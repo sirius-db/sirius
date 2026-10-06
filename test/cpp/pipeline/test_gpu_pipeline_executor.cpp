@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -57,6 +59,7 @@ class test_gpu_pipeline_task_global_state
     errors.push_back(std::move(message));
   }
 
+  std::atomic<int> estimated_count{0};
   std::atomic<int> executed_count{0};
   std::atomic<int> error_count{0};
   std::mutex error_mutex;
@@ -135,6 +138,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
     const cucascade::memory::memory_space* /*target_space*/) const override
   {
+    _global_state->cast<test_gpu_pipeline_task_global_state>().estimated_count.fetch_add(1);
     sirius::pipeline::reservation_size_info info;
     info.reservation_size = kReservationBytes;
     return info;
@@ -143,7 +147,130 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   std::vector<sirius::op::sirius_physical_operator*> get_output_consumers() override { return {}; }
 };
 
+// Hold the production manager before it can pop any staging task. The gate is test-local;
+// no production callback or alternative manager protocol is needed to control the interleaving.
+class paused_gpu_executor : public sirius::pipeline::gpu_pipeline_executor {
+ public:
+  using gpu_pipeline_executor::gpu_pipeline_executor;
+
+  ~paused_gpu_executor() override
+  {
+    resume_manager_for_test();
+    stop();
+  }
+
+  void resume_manager_for_test()
+  {
+    if (!resumed_) {
+      resumed_ = true;
+      resume_.set_value();
+    }
+  }
+
+ protected:
+  void manager_loop() override
+  {
+    ready_to_run_.wait();
+    gpu_pipeline_executor::manager_loop();
+  }
+
+ private:
+  std::promise<void> resume_;
+  std::future<void> ready_to_run_{resume_.get_future()};
+  bool resumed_{false};
+};
+
 }  // namespace
+
+TEST_CASE("GPU cancellation preserves staged work until the manager restores readiness",
+          "[gpu_pipeline_executor][query_lifecycle_gate][concurrency]")
+{
+  using namespace std::chrono_literals;
+  const auto cancelled_query = sirius::make_query_id(7);
+  const auto next_query      = sirius::make_query_id(0);  // Detached test tasks use query 0.
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(cancelled_query);
+  lifecycle.open_query(next_query);
+  auto manager    = initialize_memory_manager(1);
+  auto* mem_space = manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(mem_space);
+
+  // Supply a real query identity and a valid operator for task destruction callbacks.
+  sirius::op::sirius_physical_operator source(
+    sirius::op::SiriusPhysicalOperatorType::FILTER, {}, 0);
+  auto pipe = std::make_shared<sirius::pipeline::sirius_pipeline>(
+    sirius::pipeline::pipeline_build_context{sirius::test::make_test_telemetry_context()});
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipe, source);
+  build_state.set_pipeline_sink(*pipe, &source, 1);
+  pipe->set_query_id(cancelled_query);
+  auto cancelled_state = std::make_shared<test_gpu_pipeline_task_global_state>();
+  cancelled_state->set_pipeline(pipe);
+  auto next_state = std::make_shared<test_gpu_pipeline_task_global_state>();
+  auto make_task  = [](auto state) {
+    return std::make_unique<sirius_pipeline_task>(
+      1,
+      std::make_unique<test_gpu_pipeline_task_local_state>(
+        std::make_unique<sirius::op::pipelineable_operator_data>(
+          std::vector<std::shared_ptr<cucascade::data_batch>>{})),
+      std::move(state));
+  };
+
+  sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> requests;
+  paused_gpu_executor executor(lifecycle,
+                               {1, "cancel-staging"},
+                               mem_space,
+                               requests.make_publisher(),
+                               nullptr,
+                               sirius::test::make_test_telemetry_context());
+  executor.start();
+  REQUIRE(executor.schedule(make_task(cancelled_state)));
+  REQUIRE(lifecycle.activity(cancelled_query).work == 1);
+
+  // Freeze the queue-insertion-before-pop interleaving. In production the scheduler has
+  // consumed readiness for this accepted handoff; cancellation must not remove its task.
+  lifecycle.quiesce_and_wait_for_submissions(cancelled_query);
+  executor.wait_and_drain_query(cancelled_query);
+  CHECK_FALSE(executor.is_task_queue_empty());
+  CHECK(lifecycle.activity(cancelled_query).work == 1);
+  executor.resume_manager_for_test();
+
+  auto take_readiness = [&] {
+    std::unique_ptr<sirius::pipeline::task_request> request;
+    auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!(request = requests.try_get()) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(1ms);
+    }
+    return request;
+  };
+  // The first announcement belongs to the staged handoff. The second proves the real manager
+  // popped and discarded the cancelled task, released its slot, and entered its next iteration.
+  for (int i = 0; i < 2; ++i) {
+    auto request = take_readiness();
+    REQUIRE(request);
+    CHECK(request->kind == sirius::pipeline::task_request_kind::device_ready);
+    CHECK(request->device_id == 0);
+  }
+  CHECK(cancelled_state->estimated_count.load() == 0);
+  CHECK(cancelled_state->executed_count.load() == 0);
+  REQUIRE(lifecycle.activity(cancelled_query).work == 0);
+  lifecycle.wait_for_work(cancelled_query);
+  lifecycle.close(cancelled_query);
+
+  // Use the restored readiness to run a different query without restarting the executor.
+  REQUIRE(executor.schedule(make_task(next_state)));
+  auto request = take_readiness();
+  REQUIRE(request);
+  CHECK(request->kind == sirius::pipeline::task_request_kind::device_ready);
+  // With one worker slot, this announcement follows completion of the task and its epilogue.
+  CHECK(next_state->executed_count.load() == 1);
+  CHECK(next_state->error_count.load() == 0);
+  REQUIRE(lifecycle.activity(next_query).work == 0);
+  lifecycle.quiesce_and_wait_for_submissions(next_query);
+  lifecycle.wait_for_work(next_query);
+  lifecycle.close(next_query);
+  executor.stop();
+}
 
 // Post-v1.0 push-model: tasks are pushed directly to the executor (see commit 90dc104 —
 // management_eventloop now pops tasks from _task_queue and routes by preferred_device_id;

@@ -248,8 +248,9 @@ void metadata_overwrite(sirius::io::cache::cache_mode mode)
   cfg.uring_n_reactors           = 1;
   cfg.rest_n_reactors            = 1;
   cfg.apply_cache_mode();
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
   sirius::scan_manager::sirius_scan_manager manager{
-    cfg, *memory, sirius::test::s3::single_gpu_index(0)};
+    scan_lifecycle, cfg, *memory, sirius::test::s3::single_gpu_index(0)};
   auto first_shape = manager.describe_parquet(objects.uri);
   REQUIRE(first_shape.names.size() == 1);
   CHECK(first_shape.names.front() == "column_a");
