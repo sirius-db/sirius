@@ -61,7 +61,8 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
 /// lets columns with small values, such as TPC-H's DECIMAL(15,2), skip the widening copy and the
 /// 128-bit accumulation. Nulls are skipped, and a column with no valid value cannot overflow.
 /// All cudf::minmax passes are launched first and their results come back in one device-to-host
-/// copy, so a batch costs a single stream synchronization.
+/// copy, so a batch costs a single stream synchronization. Throws sirius::internal_exception if a
+/// candidate is not DECIMAL32 or DECIMAL64.
 std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
                                                       std::vector<int> const& candidates,
                                                       rmm::cuda_stream_view stream,

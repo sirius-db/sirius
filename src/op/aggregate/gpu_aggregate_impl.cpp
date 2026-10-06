@@ -298,6 +298,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     std::vector<int> candidates;
     for (size_t i = 0; i < aggregates.size(); ++i) {
       bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      // Only SUM is gated: MIN, MAX and COUNT cannot overflow, and PRODUCT / SUM_OF_SQUARES are
+      // not reachable (get_local_aggregation rejects them).
       if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
       auto const col_id = aggregate_idx[i];
       if (widened_decimal_sum_type(input_table.column(col_id).type()) &&
@@ -427,8 +429,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       }
     }
 
-    // A decimal SUM that ran at the input width yields the wider type DuckDB expects. The
-    // batch was proven unable to overflow that width, so widening the result is exact.
+    // A decimal SUM that ran at the input width is widened here, on the small per-group result, so
+    // that merge and exchange see the same wider type as before; only the per-row input widening
+    // is skipped. The batch was proven unable to overflow the input width, so this is exact.
     if (aggregate_col_id >= 0 && aggregate_col_id < widened_sum_key_offset) {
       auto const widened_type = widened_decimal_sum_type(requests[i].values.type());
       for (size_t j = 0; widened_type && j < aggregation_result.results.size(); ++j) {

@@ -365,6 +365,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     {
       std::vector<int> candidates;
       for (auto const& spec : layout.aggregates) {
+        // Only SUM (and AVG's SUM) is gated: MIN, MAX and COUNT cannot overflow, and no other
+        // overflow-prone kind (PRODUCT, SUM_OF_SQUARES) is reachable here.
         if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
         auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
         if (widened_decimal_sum_type(col_type) &&
