@@ -30,6 +30,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -188,6 +189,24 @@ void split_conjunction(unique_ptr<Expression> e, std::vector<unique_ptr<Expressi
       split_conjunction(std::move(child), out);
     }
     return;
+  }
+  // DuckDB folds two bounds on one expression into a BETWEEN; on a distance call that hides the
+  // threshold, so it goes back to the two comparisons it stands for.
+  if (e->GetExpressionClass() == ExpressionClass::BOUND_BETWEEN) {
+    auto& between = e->Cast<duckdb::BoundBetweenExpression>();
+    if (as_distance_call(*between.input)) {
+      out.push_back(duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+        between.lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO
+                                : ExpressionType::COMPARE_GREATERTHAN,
+        between.input->Copy(),
+        std::move(between.lower)));
+      out.push_back(duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+        between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO
+                                : ExpressionType::COMPARE_LESSTHAN,
+        std::move(between.input),
+        std::move(between.upper)));
+      return;
+    }
   }
   out.push_back(std::move(e));
 }
@@ -814,8 +833,8 @@ class rewriter {
   /// cluster of its lists searched (the same answer, from fewer bytes and on tensor cores), by
   /// access_path_cost on the estimated probe rows. With no lists it builds them first (kept for
   /// later queries, like an index) when building and searching beats brute force, unless
-  /// SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice; SIRIUS_VSS_REWRITE_LISTS=0
-  /// is brute.
+  /// SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice;
+  /// SIRIUS_VSS_REWRITE_LISTS=0 is brute.
   bool use_exact_lists(vector_join_request& req,
                        duckdb::TableCatalogEntry& table,
                        const std::string& column,
@@ -925,12 +944,12 @@ class rewriter {
         static_cast<std::int64_t>(std::sqrt(static_cast<double>(rows))), 1, 1024);
       run_kmeans_fit(ctx, fit);
       kmeans_assign_request lists;
-      lists.clustering   = name;
-      lists.catalog      = catalog;
-      lists.schema       = schema;
-      lists.table        = table;
-      lists.column       = column;
-      lists.dim          = req.dim;
+      lists.clustering = name;
+      lists.catalog    = catalog;
+      lists.schema     = schema;
+      lists.table      = table;
+      lists.column     = column;
+      lists.dim        = req.dim;
       run_kmeans_build_lists(
         ctx, lists, cosine ? list_storage::float16 : list_storage::exact, false, cosine);
     } catch (std::exception const& e) {

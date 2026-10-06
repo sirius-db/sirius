@@ -157,6 +157,33 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a range on the similarity or the distance runs as the vector join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // DuckDB folds two bounds on one expression into a BETWEEN. The join takes the bound that
+  // makes it a threshold join and the other is applied to the score it returns.
+  SqlRewriteTables tables(*this);
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_probe p, sr_corpus c "
+                             "WHERE array_cosine_similarity(p.vec, c.vec) BETWEEN 0.7 AND 0.9;");
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, c.id, array_distance(p.vec, c.vec) AS d FROM sr_probe p, "
+    "sr_corpus c WHERE array_distance(p.vec, c.vec) BETWEEN 0.5 AND 0.9;");
+  // The upper bound sits above the join, on the score the select list reads.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT id, cid FROM (SELECT p.id, c.id AS cid, array_cosine_similarity(p.vec, c.vec) AS s "
+    "FROM sr_probe p JOIN sr_corpus c ON array_cosine_similarity(p.vec, c.vec) >= 0.7) WHERE s < "
+    "0.9;");
+  // Strict on both sides.
+  require_gpu_matches_duckdb(*con,
+                             "SELECT count(*) FROM sr_probe p, sr_corpus c "
+                             "WHERE array_distance(p.vec, c.vec) > 0.5 AND array_distance(p.vec, "
+                             "c.vec) < 0.9;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "plain-SQL threshold join keeps the corpus-side join and filter",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
