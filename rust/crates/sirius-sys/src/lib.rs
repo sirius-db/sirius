@@ -190,6 +190,10 @@ mod ffi {
             src: Pin<&mut CxxVector<u64>>,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
 
+        /// A handle exporting an output stream from any thread, including while
+        /// the fragment runs. Take it after `build` and before `run`.
+        fn output_drain(self: &Fragment, stream_id: u64) -> Result<UniquePtr<OutputDrain>>;
+
         /// Push the batch received under `token` into an input stream.
         fn push_received(self: Pin<&mut Fragment>, stream_id: u64, token: u64) -> Result<()>;
 
@@ -217,10 +221,26 @@ mod ffi {
 
         /// DuckDB type names of a built fragment's output columns.
         fn output_types(self: &Fragment) -> Result<UniquePtr<CxxVector<CxxString>>>;
+
+        /// Exports one output stream of a fragment while it runs. Callable from
+        /// any thread; the contract is documented on the C++ class.
+        type OutputDrain;
+
+        /// Export the next batch, waiting up to `timeout_ms`: sets `token`,
+        /// `rows` and `src` and returns the layout, or returns null with `ended`
+        /// set at the end of the stream and clear when nothing arrived in time.
+        fn export_next(
+            self: &OutputDrain,
+            timeout_ms: u32,
+            ended: &mut bool,
+            token: &mut u64,
+            rows: &mut u64,
+            src: Pin<&mut CxxVector<u64>>,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
     }
 }
 
 pub use ffi::{
-    Context, DirectExchange, Fragment, make_context, make_context_from_config, make_fragment,
-    stream_view_name,
+    Context, DirectExchange, Fragment, OutputDrain, make_context, make_context_from_config,
+    make_fragment, stream_view_name,
 };

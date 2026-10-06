@@ -95,6 +95,10 @@ class stream_session {
   /// @throws on unknown output id.
   [[nodiscard]] bool drained(stream_id_t id) const;
 
+  /// The stream behind output `id`, shared so a consumer may outlive the sink's operators.
+  /// @throws on unknown output id.
+  [[nodiscard]] std::shared_ptr<batch_stream> output_stream(stream_id_t id) const;
+
   /// Poison an output stream (S2/P1–P4). Wakes consumers blocked in wait(); rethrown from pull().
   /// Poisons all partitions of the sink that owns the given id.
   /// @throws on unknown output id.

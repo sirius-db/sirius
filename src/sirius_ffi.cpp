@@ -37,6 +37,7 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/batch_stream.hpp"                           // sirius::exec::batch_stream
 #include "exec/exchange_direct.hpp"                        // sirius::exec::direct_exchange
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"      // sirius::exec::register_stream_source_function
@@ -433,6 +434,47 @@ void DirectExchange::seal(std::uint64_t token) const { exchange_->seal(token); }
 
 std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
 
+OutputDrain::OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+                         std::shared_ptr<sirius::exec::direct_exchange> exchange)
+  : stream_(std::move(stream)), exchange_(std::move(exchange))
+{
+}
+
+std::unique_ptr<std::vector<std::uint8_t>> OutputDrain::export_next(
+  std::uint32_t timeout_ms,
+  bool& ended,
+  std::uint64_t& token,
+  std::uint64_t& rows,
+  std::vector<std::uint64_t>& src) const
+{
+  using availability  = sirius::exec::batch_stream::availability;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  ended               = false;
+  for (;;) {
+    switch (stream_->classify()) {
+      case availability::END_OF_STREAM: ended = true; return nullptr;
+      case availability::HAS_DATA:
+        // Rethrows the fragment's error; nullptr only if another consumer took the batch.
+        if (auto batch = stream_->try_pull()) {
+          if (auto exported = exchange_->export_batch(std::move(batch))) {
+            token = exported->token;
+            rows  = exported->rows;
+            src   = std::move(exported->src);
+            return std::make_unique<std::vector<std::uint8_t>>(std::move(exported->layout));
+          }
+        }
+        break;  // a batch without rows is not sent
+      case availability::WAITING: {
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+        if (left.count() <= 0) { return nullptr; }
+        static_cast<void>(stream_->wait_for(left));
+        break;
+      }
+    }
+  }
+}
+
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
@@ -641,6 +683,17 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_direct(std::uint64_t
     }
   }
   return nullptr;
+}
+
+std::unique_ptr<OutputDrain> Fragment::output_drain(std::uint64_t stream_id) const
+{
+  impl_->require_built("output_drain()");
+  if (!impl_->ctx.exchange) {
+    throw sirius::invalid_input_exception(
+      "Fragment: output_drain() needs a direct exchange (a single GPU slab memory space)");
+  }
+  return std::make_unique<OutputDrain>(impl_->fragment->output_stream(stream_id),
+                                       impl_->ctx.exchange);
 }
 
 void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)

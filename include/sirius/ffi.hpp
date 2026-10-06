@@ -39,13 +39,15 @@
 #endif
 
 namespace sirius::exec {
+class batch_stream;
 class direct_exchange;
-}
+}  // namespace sirius::exec
 
 namespace sirius::ffi {
 
 class DirectExchange;
 class Fragment;
+class OutputDrain;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -155,6 +157,34 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   std::shared_ptr<sirius::exec::direct_exchange> exchange_;
 };
 
+/// Exports one output stream of a fragment for direct exchange while the fragment is still
+/// running, so its batches ship as the sink produces them instead of after run() returns. Created
+/// by Fragment::output_drain().
+///
+/// Callable from any thread, without the Context's connection: it shares only the stream and the
+/// DirectExchange. One consumer per stream; do not mix with export_direct() or relay_from() on
+/// the same stream. Destroy it before its Context.
+class SIRIUS_FFI_EXPORT OutputDrain {
+ public:
+  OutputDrain(std::shared_ptr<sirius::exec::batch_stream> stream,
+              std::shared_ptr<sirius::exec::direct_exchange> exchange);
+
+  /// Export the next batch with rows, waiting up to `timeout_ms` for the sink to produce one.
+  /// On a batch, sets `token` (release on the DirectExchange once its buffers were written),
+  /// `rows` and `src` ([address, length] per buffer) and returns the layout. Otherwise returns
+  /// null, with `ended` true at the end of the stream and false when nothing arrived in time.
+  /// @throws the fragment's error once its run() failed, or on a batch it cannot send.
+  std::unique_ptr<std::vector<std::uint8_t>> export_next(std::uint32_t timeout_ms,
+                                                         bool& ended,
+                                                         std::uint64_t& token,
+                                                         std::uint64_t& rows,
+                                                         std::vector<std::uint64_t>& src) const;
+
+ private:
+  std::shared_ptr<sirius::exec::batch_stream> stream_;
+  std::shared_ptr<sirius::exec::direct_exchange> exchange_;
+};
+
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
 ///
 /// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
@@ -245,6 +275,13 @@ class SIRIUS_FFI_EXPORT Fragment {
                                                            std::uint64_t& token,
                                                            std::uint64_t& rows,
                                                            std::vector<std::uint64_t>& src);
+
+  /// A handle that exports output stream `stream_id` from any thread, including while run()
+  /// executes. Take it after build() and before run() to ship output as it is produced. A
+  /// fragment destroyed without running fails its drains.
+  /// @throws before build(), on an unknown stream or a result fragment, or without a
+  /// DirectExchange.
+  [[nodiscard]] std::unique_ptr<OutputDrain> output_drain(std::uint64_t stream_id) const;
 
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
   /// unless it throws before reading it: before build() or on an undeclared input.

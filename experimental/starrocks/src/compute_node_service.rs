@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::ComputeNodeConfig;
+/// Remote outputs ship while their fragment runs unless `SIRIUS_CN_STREAM_OUTPUT` is `0`, which
+/// ships them from parked output after the run, as before.
+fn stream_output_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SIRIUS_CN_STREAM_OUTPUT").as_deref() != Ok("0"))
+}
+
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
-use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
+use crate::fragment_executor::{DrainHandoff, FragmentExecutor, FragmentRun, SenderSlot};
 use crate::local_exchange::{
     ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, RemoteBatch, SenderSource,
 };
-use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope};
+use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope, StreamHop};
 use crate::proto::starrocks::{
     ExecuteCommandRequestPb, ExecuteCommandResultPb, PCancelPlanFragmentRequest,
     PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult,
@@ -571,6 +579,7 @@ impl SiriusComputeNodeService {
                     outputs: Vec::new(),
                     broadcast: false,
                     hash_keys: Vec::new(),
+                    drains: None,
                 })?
                 .ok_or_else(|| "result fragment returned no rows".to_string())?;
             let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
@@ -625,25 +634,27 @@ impl SiriusComputeNodeService {
                 remote.push((slot, peer));
             }
         }
-        self.executor.run_fragment(FragmentRun {
+        let run = FragmentRun {
             plan: translated,
             inputs,
             remote_inputs,
             outputs: outputs.clone(),
             broadcast,
             hash_keys,
-        })?;
+            drains: None,
+        };
+        let shipped = if remote.is_empty() || !stream_output_enabled() {
+            self.executor.run_fragment(run)?;
+            self.ship_parked(&remote, &translated.output_names)
+        } else {
+            self.run_streaming(run, &outputs, &remote, &translated.output_names)?
+        };
 
-        // Every hop runs and releases its own claim. If one fails, the local claims are released
-        // too: their receivers can no longer complete, and nothing may stay parked.
+        // If a hop failed, the local claims are released too: their receivers can no longer
+        // complete, and nothing may stay parked.
         let local = outputs
             .into_iter()
             .filter(|slot| remote.iter().all(|(remote_slot, _)| remote_slot != slot));
-        let mut shipped = Ok(());
-        for &(slot, peer) in &remote {
-            let hop = self.ship_remote(slot, peer, &translated.output_names);
-            shipped = shipped.and(hop);
-        }
         if let Err(err) = shipped {
             for slot in local {
                 let _ = self.executor.drop_parked(slot);
@@ -674,6 +685,77 @@ impl SiriusComputeNodeService {
             }
         }
         Ok(ready)
+    }
+
+    /// Runs a sender fragment while its remote outputs ship batch by batch, so its output never
+    /// has to be fully resident before the first byte leaves. Local outputs stay parked. An
+    /// executor that hands out no drains is shipped from parked output after its run instead.
+    ///
+    /// The outer error is the run's; the inner one is the hops'. Either way every remote claim
+    /// is released.
+    fn run_streaming(
+        &self,
+        mut run: FragmentRun<'_>,
+        outputs: &[SenderSlot],
+        remote: &[(SenderSlot, SocketAddr)],
+        names: &[String],
+    ) -> std::result::Result<std::result::Result<(), String>, String> {
+        let nixl = self.nixl.as_ref().ok_or("this CN has no NIXL transport")?;
+        let streams = remote
+            .iter()
+            .map(|(slot, _)| outputs.iter().position(|output| output == slot))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("a remote destination is not one of the fragment's outputs")?;
+        let (respond, handed) = channel();
+        run.drains = Some(DrainHandoff { streams, respond });
+        let (ran, streamed) = std::thread::scope(|scope| {
+            let shipper = scope.spawn(move || {
+                // No drains: the executor does not stream, or the fragment failed before it ran.
+                let drains = handed.recv().ok()?;
+                let hops = remote
+                    .iter()
+                    .zip(drains)
+                    .map(|(&(slot, peer), drain)| StreamHop {
+                        peer,
+                        slot,
+                        names: names.to_vec(),
+                        drain,
+                    })
+                    .collect();
+                Some(nixl.stream(hops))
+            });
+            let ran = self.executor.run_fragment(run);
+            let streamed = shipper
+                .join()
+                .unwrap_or_else(|_| Some(Err("the output shipper panicked".to_string())));
+            (ran, streamed)
+        });
+        let shipped = match (&ran, streamed) {
+            (_, Some(streamed)) => {
+                for &(slot, _) in remote {
+                    let _ = self.executor.drop_parked(slot);
+                }
+                streamed
+            }
+            (Ok(_), None) => return Ok(self.ship_parked(remote, names)),
+            (Err(_), None) => Ok(()),
+        };
+        ran.map(|_| shipped)
+    }
+
+    /// Ships every remote output from its parked batches, one destination at a time. Every hop
+    /// runs and releases its own claim; the first error is returned.
+    fn ship_parked(
+        &self,
+        remote: &[(SenderSlot, SocketAddr)],
+        names: &[String],
+    ) -> std::result::Result<(), String> {
+        let mut shipped = Ok(());
+        for &(slot, peer) in remote {
+            let hop = self.ship_remote(slot, peer, names);
+            shipped = shipped.and(hop);
+        }
+        shipped
     }
 
     /// How a sink to `destinations` fans out: whether it broadcasts, and its hash key columns
@@ -1199,7 +1281,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        fragment_executor::FragmentResult,
+        fragment_executor::{DrainNext, ExportedBatch, FragmentResult, OutputDrain},
         local_exchange::ExchangeCounts,
         nixl_chunk::AllocReply,
         proto::starrocks::{
@@ -1232,6 +1314,8 @@ mod tests {
         released: Mutex<Vec<u64>>,
         sealed: Mutex<Vec<u64>>,
         sent: Mutex<Vec<(SocketAddr, SenderSlot)>>,
+        /// Hops streamed while their fragment ran, with the rows each drain delivered.
+        streamed: Mutex<Vec<(SocketAddr, SenderSlot, u64)>>,
     }
 
     impl NixlEndpoint for FakeNixl {
@@ -1268,6 +1352,24 @@ mod tests {
             _executor: Arc<dyn FragmentExecutor>,
         ) -> Result<(), String> {
             self.sent.lock().unwrap().push((peer, slot));
+            Ok(())
+        }
+
+        fn stream(&self, hops: Vec<StreamHop>) -> Result<(), String> {
+            for mut hop in hops {
+                let mut rows = 0;
+                loop {
+                    match hop.drain.next(Duration::from_millis(1))? {
+                        DrainNext::Batch(batch) => rows += batch.rows,
+                        DrainNext::Waiting => {}
+                        DrainNext::End => break,
+                    }
+                }
+                self.streamed
+                    .lock()
+                    .unwrap()
+                    .push((hop.peer, hop.slot, rows));
+            }
             Ok(())
         }
     }
@@ -1501,6 +1603,112 @@ mod tests {
         let sent = nixl.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!((sent[0].0.port(), sent[0].1.node_id), (18060, 2));
+    }
+
+    /// Hands out drains for the outputs it is asked to stream, each delivering `rows` and then
+    /// either the end or `fail_with`, and records the parked output the service drops.
+    #[derive(Debug, Default)]
+    struct StreamingExecutor {
+        rows: u64,
+        fail_with: Option<String>,
+        dropped: Mutex<Vec<SenderSlot>>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedDrain(Vec<Result<DrainNext, String>>);
+
+    impl OutputDrain for ScriptedDrain {
+        fn next(&mut self, _timeout: Duration) -> Result<DrainNext, String> {
+            self.0.pop().unwrap_or(Ok(DrainNext::End))
+        }
+    }
+
+    impl FragmentExecutor for StreamingExecutor {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if let Some(handoff) = run.drains {
+                let drains = handoff
+                    .streams
+                    .iter()
+                    .map(|_| {
+                        let last = match &self.fail_with {
+                            Some(err) => Err(err.clone()),
+                            None => Ok(DrainNext::End),
+                        };
+                        let batch = ExportedBatch {
+                            token: 1,
+                            rows: self.rows,
+                            layout: Vec::new(),
+                            src: Vec::new(),
+                        };
+                        // Popped from the back: waiting, a batch, then the last outcome.
+                        let script =
+                            vec![last, Ok(DrainNext::Batch(batch)), Ok(DrainNext::Waiting)];
+                        Box::new(ScriptedDrain(script)) as Box<dyn OutputDrain>
+                    })
+                    .collect();
+                handoff.respond.send(drains).unwrap();
+            }
+            match &self.fail_with {
+                Some(err) => Err(err.clone()),
+                None => Ok(None),
+            }
+        }
+
+        fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+            self.dropped.lock().unwrap().push(slot);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remote_outputs_stream_while_the_fragment_runs() {
+        let executor = Arc::new(StreamingExecutor {
+            rows: 42,
+            ..Default::default()
+        });
+        let (service, nixl) = nixl_service(executor.clone());
+        let mut sender = query_fragment(14, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        exec_ok(&service, &sender);
+        assert!(
+            nixl.sent.lock().unwrap().is_empty(),
+            "nothing ships from parked output"
+        );
+        let streamed = nixl.streamed.lock().unwrap();
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(
+            (streamed[0].0.port(), streamed[0].1.node_id, streamed[0].2),
+            (18060, 2, 42)
+        );
+        // The streamed slot's claim is dropped once the hop finished.
+        assert_eq!(*executor.dropped.lock().unwrap(), vec![streamed[0].1]);
+    }
+
+    #[test]
+    fn a_failed_streaming_run_reports_the_run_error() {
+        let executor = Arc::new(StreamingExecutor {
+            rows: 1,
+            fail_with: Some("scan exploded".to_string()),
+            ..Default::default()
+        });
+        let (service, nixl) = nixl_service(executor);
+        let mut sender = query_fragment(14, 11, scan_node(0, 0), stream_sink(2));
+        send_to(&mut sender, 10, 18060);
+        let status = exec(&service, &sender);
+        assert_ne!(status.status_code, 0);
+        assert!(
+            status
+                .error_msgs
+                .iter()
+                .any(|msg| msg.contains("scan exploded")),
+            "{:?}",
+            status.error_msgs
+        );
+        assert!(nixl.sent.lock().unwrap().is_empty());
     }
 
     #[test]

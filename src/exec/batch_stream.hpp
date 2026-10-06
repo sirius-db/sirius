@@ -18,6 +18,7 @@
 
 #include <cucascade/data/data_repository.hpp>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -88,6 +89,10 @@ class batch_stream {
   /// Block until classify() != WAITING (S5: not atomic with try_pull — re-check after wake).
   /// External threads only — never from a GPU worker.
   void wait();
+
+  /// wait() for at most @p timeout. @return classify() after waking or timing out.
+  /// External threads only — never from a GPU worker.
+  [[nodiscard]] availability wait_for(std::chrono::milliseconds timeout);
 
   // -----------------------------------------------------------------------
   // Hooks fire after unlock; may re-enter. Do not capture raw this.

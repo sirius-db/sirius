@@ -197,7 +197,15 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
   }
 }
 
-streaming_fragment::~streaming_fragment() = default;
+streaming_fragment::~streaming_fragment()
+{
+  // A built fragment that never ran leaves its outputs open; a consumer draining them from
+  // another thread would wait forever.
+  if (_phase.load() == phase::built && !is_result()) {
+    poison_outputs(std::make_exception_ptr(sirius::invalid_input_exception(
+      "streaming_fragment: the fragment was destroyed without running")));
+  }
+}
 
 void streaming_fragment::require_built(const char* what) const
 {
@@ -536,6 +544,16 @@ std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(s
       "indistinguishable from a finished one");
   }
   return _session.pull(id);
+}
+
+std::shared_ptr<batch_stream> streaming_fragment::output_stream(stream_id_t id) const
+{
+  require_built("output_stream()");
+  if (_output_repos.find(id) == _output_repos.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no output stream with id " +
+                                          std::to_string(id));
+  }
+  return _session.output_stream(id);
 }
 
 bool streaming_fragment::drained(stream_id_t id) const
