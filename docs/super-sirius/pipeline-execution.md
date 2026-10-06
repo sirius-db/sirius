@@ -270,7 +270,6 @@ sub-executor or scan-priority queue owned here.
 | `terminate_query(handler, exception)` | Reports an error to that query's completion handler |
 | `wait_for_completion(query_id)` | Stops task creation and validates the scheduler and executor queues after completion |
 | `drain_after_error(query_id)` | Drains in-flight work after a query error |
-| `drain_query_tasks(query_id)` | Discards queued work belonging to one query |
 
 ### Management Event Loop
 

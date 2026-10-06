@@ -113,7 +113,8 @@ TEST_CASE("parquet tier pin caches complete footer evidence for every file",
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, config_with_sirius_cache(), *memory, topology};
   sirius::test::scratch_dir directory("pin_parquet_evidence");
   std::vector<std::string> paths;
   for (auto const* name : {"a.parquet", "b.parquet"}) {

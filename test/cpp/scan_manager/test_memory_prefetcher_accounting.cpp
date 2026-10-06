@@ -450,7 +450,9 @@ TEST_CASE("Resident certificate refusal is invisible to an active memory prefetc
   cfg.num_threads       = 1;
   cfg.min_free_fraction = 0.05;
   cfg.poll_interval_ms  = 1;
-  memory_prefetcher prefetcher(cfg, {rejected_connector, control_connector}, e.gpu_space);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  memory_prefetcher prefetcher(
+    cfg, {rejected_connector, control_connector}, e.gpu_space, lifecycle);
   scripted_provider invalid;
   invalid.contract_id            = 81;
   invalid.validation.query_token = 17;
