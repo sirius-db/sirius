@@ -2044,7 +2044,9 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
   std::uint64_t config_id = 0;
   std::shared_ptr<const sirius::io::object_store_config> resolved_config;
-  if (type == sirius::io::io_context_type::restful && !file_path.empty()) {
+  auto const uses_object_store_config =
+    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
+  if (uses_object_store_config && !file_path.empty()) {
     if (auto snapshot = _s3_configs.resolve(file_path)) {
       config_id       = snapshot->id;
       resolved_config = std::move(snapshot->config);
@@ -2064,7 +2066,7 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   // Serialize construction, not ordinary lookups. A waiting builder rechecks
   // the scope so it cannot publish an ioctx with superseded credentials.
   std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (type == sirius::io::io_context_type::restful && !file_path.empty()) {
+  if (uses_object_store_config && !file_path.empty()) {
     auto latest          = _s3_configs.resolve(file_path);
     auto const latest_id = latest ? latest->id : 0;
     if (latest_id != config_id) {
@@ -2102,18 +2104,20 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
                                             sirius::io::object_store_config config)
 {
   auto scope = normalize_path(std::string(path));
-  std::shared_ptr<sirius::io::ioctx> retired;
+  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
   {
     // Existing in-flight users retain shared ownership of the old context.
     std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
     auto superseded_id = _s3_configs.install(scope, std::move(config));
     if (superseded_id) {
       std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
-      auto it = _routed_io_ctxs.find(
-        routed_ioctx_key{sirius::io::io_context_type::restful, *superseded_id});
-      if (it != _routed_io_ctxs.end()) {
-        retired = std::move(it->second);
-        _routed_io_ctxs.erase(it);
+      for (auto const type :
+           {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
+        auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
+        if (it != _routed_io_ctxs.end()) {
+          retired.push_back(std::move(it->second));
+          _routed_io_ctxs.erase(it);
+        }
       }
     }
   }

@@ -10,6 +10,8 @@
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/string_util.hpp>
+#include <duckdb/main/client_context.hpp>
+#include <duckdb/main/database.hpp>
 #include <duckdb/main/secret/secret.hpp>
 #include <duckdb/main/secret/secret_manager.hpp>
 
@@ -87,6 +89,15 @@ std::string canonicalize_s3_scheme(std::string_view path)
   return canonical;
 }
 
+duckdb::CatalogTransaction secret_catalog_transaction(duckdb::ClientContext& context)
+{
+  if (context.transaction.HasActiveTransaction()) {
+    return duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
+  }
+  return duckdb::CatalogTransaction::GetSystemTransaction(
+    duckdb::DatabaseInstance::GetDatabase(context));
+}
+
 }  // namespace
 
 void register_sirius_s3_secret(duckdb::SecretManager& manager)
@@ -135,7 +146,10 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
   // every bind/open, so replacement affects future work. Sirius keeps the
   // resolved config snapshot needed by its REST signer, but does not retain the
   // DuckDB secret object or its catalog name in bind data.
-  auto transaction = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
+  // File-system callbacks can also run outside query execution (for example a
+  // direct FileSystem::OpenFile in an embedding). In that case there is no
+  // ClientContext transaction to borrow, so use DuckDB's committed system view.
+  auto transaction = secret_catalog_transaction(context);
   auto& manager    = duckdb::SecretManager::Get(context);
   // URI schemes are case-insensitive, but DuckDB secret scopes use case-sensitive prefix
   // matching. Canonicalize only the scheme so SCOPE 's3://bucket/' also covers

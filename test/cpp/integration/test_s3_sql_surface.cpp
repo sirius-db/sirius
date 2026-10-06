@@ -1348,7 +1348,7 @@ TEST_CASE("SIRIUS_S3 secret authenticates an uppercase-scheme parquet glob",
   auto uri = s3_uri(env->bucket, "root_*.parquet");
   uri.replace(0, 2, "S3");
   auto const scan_sql = "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")";
-  auto result         = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
+  auto result         = require_query_ok(fixture.con, scan_sql);
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
 }

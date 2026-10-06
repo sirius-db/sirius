@@ -1051,7 +1051,7 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
-  /// rest_ioctx alongside the local uring/kvikio `_io_ctx`). Contexts are keyed
+  /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so
   /// credentials/endpoints can differ by path. `_routed_io_ctxs_build_mtx` serializes construction
   /// (reactor threads + cache allocation happen outside the map mutex), while
