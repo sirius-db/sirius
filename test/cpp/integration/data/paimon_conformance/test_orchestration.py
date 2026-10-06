@@ -196,6 +196,17 @@ for result in results: print(json.dumps(result))
         self.assertEqual(report["executed_cases"], 0)
         self.assertEqual(report["not_run_cases"], 5)
 
+    def test_historical_registry_cannot_enable_unsigned_loading(self):
+        record = self.spec["extension"] | {"kind": "source_build"}
+        self.registry.write_text(
+            canonical_json({"format_version": 1, "artifacts": [record]})
+        )
+        report, error = self.run_suite(selected=("append_b",))
+        self.assertIsNone(error)
+        self.assertEqual(report["state"], "passed")
+        for line in self.trace.read_text().splitlines():
+            self.assertNotIn("-unsigned", json.loads(line)["argv"])
+
     def test_complete_suite_one_process_per_case(self):
         report, error = self.run_suite()
         self.assertIsNone(error)

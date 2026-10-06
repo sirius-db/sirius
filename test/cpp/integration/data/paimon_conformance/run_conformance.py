@@ -273,11 +273,7 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
         return execute(
             [
                 cli,
-                *(
-                    ["-unsigned"]
-                    if spec["extension"].get("kind") == "source_build"
-                    else []
-                ),
+                *(["-unsigned"] if args.registry is None else []),
                 "-init",
                 "/dev/null",
                 "-json",
