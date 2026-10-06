@@ -97,9 +97,9 @@ class SourceBuildTests(unittest.TestCase):
 
     def test_source_id_accepts_real_git_abbreviations_only(self):
         commit = self.recipe["sources"]["duckdb"]["commit"]
-        for count in (8, 10, 40):
+        for count in (7, 8, 10, 40):
             self.assertTrue(builder.matches_source_id(commit[:count], commit))
-        for wrong in (None, "", commit[:7], "deadbeef", commit + "0", "../" + commit):
+        for wrong in (None, "", commit[:6], "deadbeef", commit + "0", "../" + commit):
             self.assertFalse(builder.matches_source_id(wrong, commit))
 
     def test_source_fetch_checks_hash_and_retries_only_transport_errors(self):

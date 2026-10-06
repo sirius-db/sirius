@@ -121,7 +121,7 @@ def matches_source_id(source_id, commit):
     # DuckDB uses the checkout's abbreviated Git hash, whose length can vary.
     return (
         isinstance(source_id, str)
-        and re.fullmatch(r"[0-9a-f]{8,40}", source_id) is not None
+        and re.fullmatch(r"[0-9a-f]{7,40}", source_id) is not None
         and commit.startswith(source_id)
     )
 
