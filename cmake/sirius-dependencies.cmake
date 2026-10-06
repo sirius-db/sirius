@@ -12,6 +12,7 @@ find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+include(${CMAKE_CURRENT_LIST_DIR}/sirius-nixl.cmake)
 
 # The static vcpkg build only exports cuvs::cuvs_static; conda's shared build
 # already provides cuvs::cuvs. Provide the canonical name when it is missing so

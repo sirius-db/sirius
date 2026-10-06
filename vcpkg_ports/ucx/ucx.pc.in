@@ -1,0 +1,10 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/@UCX_PC_INCLUDE@
+
+Name: ucx
+Description: Static UCX with TCP, shared-memory and CUDA transports
+Version: @VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -L${libdir}/ucx -Wl,--start-group -Wl,--whole-archive -luct_cma -luct_cuda -lucm_cuda -Wl,--no-whole-archive -lucp -luct -lucs -lucm -Wl,--end-group -Wl,--undefined=ucp_global_init -Wl,--undefined=uct_init -Wl,--undefined=ucs_init
+Libs.private: -lcuda -lcudart_static -lnvidia-ml -ldl -lrt -lm -pthread

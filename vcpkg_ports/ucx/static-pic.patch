@@ -1,0 +1,14 @@
+UCX 1.20.1: retain static transport registration in PIC archives.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -91,7 +91,8 @@
+ #
+ # Define SHARED_LIB preprocessor macro when building a shared library
+ #
+-lt_prog_compiler_pic="$lt_prog_compiler_pic -DUCX_SHARED_LIB"
++AS_IF([test "x$enable_shared" != "xno"],
++      [lt_prog_compiler_pic="$lt_prog_compiler_pic -DUCX_SHARED_LIB"])
+ 
+ 
+ #

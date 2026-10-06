@@ -29,6 +29,14 @@
       "name": "curl"
     }
   ],
+  "features": {
+    "nixl": {
+      "dependencies": [
+        "nixl"
+      ],
+      "description": "GPU exchanges using static NIXL and UCX"
+    }
+  },
   "overrides": [
     {
       "name": "dlpack",

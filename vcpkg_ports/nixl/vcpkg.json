@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "dependencies": [
+    "abseil",
+    "asio",
+    "tomlplusplus",
+    "ucx",
+    {
+      "host": true,
+      "name": "vcpkg-tool-meson"
+    }
+  ],
+  "description": "NVIDIA Inference Xfer Library with the built-in UCX transport",
+  "homepage": "https://github.com/ai-dynamo/nixl",
+  "license": "Apache-2.0",
+  "name": "nixl",
+  "supports": "linux & (x64 | arm64) & static",
+  "version": "1.5.0"
+}
