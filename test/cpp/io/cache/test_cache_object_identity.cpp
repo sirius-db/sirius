@@ -95,7 +95,6 @@ std::vector<std::uint8_t> read_all(sirius_datasource& ds)
 struct parquet_objects {
   explicit parquet_objects(bool varied = false)
   {
-    REQUIRE(sirius::test::ensure_s3_container_env());
     std::string pattern = (std::filesystem::temp_directory_path() / "sirius-c2-XXXXXX").string();
     auto* dir           = ::mkdtemp(pattern.data());
     REQUIRE(dir != nullptr);
@@ -419,6 +418,11 @@ struct held_request {
 
 TEST_CASE("cache identity isolates equal-size overwrites", "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -436,18 +440,33 @@ TEST_CASE("cache identity isolates equal-size overwrites", "[s3][integration][ca
 TEST_CASE("cache identity replaces metadata with the byte cache enabled",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   metadata_overwrite(sirius::io::cache::cache_mode::sirius);
 }
 
 TEST_CASE("cache identity replaces metadata with the byte cache disabled",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   metadata_overwrite(sirius::io::cache::cache_mode::none);
 }
 
 TEST_CASE("cache identity reclaims a retired generation on final handle release",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -468,6 +487,11 @@ TEST_CASE("cache identity reclaims a retired generation on final handle release"
 TEST_CASE("cache identity retains a disposed datasource generation until destruction",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -487,6 +511,11 @@ TEST_CASE("cache identity retains a disposed datasource generation until destruc
 TEST_CASE("cache identity bounds retired generations across five overwrites",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -511,6 +540,11 @@ TEST_CASE("cache identity bounds retired generations across five overwrites",
 TEST_CASE("cache identity pins retired bytes until a gated device copy completes",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -600,6 +634,11 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
 TEST_CASE("cache identity releases read pins when a read of a retired generation fails",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -630,6 +669,11 @@ TEST_CASE("cache identity releases read pins when a read of a retired generation
 TEST_CASE("cache identity releases a retired footer stash with its last datasource",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -738,18 +782,33 @@ struct prefetch_observer {
 TEST_CASE("cache identity rejects mid-open replacement on allocated fills",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   require_mid_open_failure(true);
 }
 
 TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   require_mid_open_failure(false);
 }
 
 TEST_CASE("cache identity fails a mixed hit and replaced miss without publication",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects(true);
   objects.publish(objects.first);
   identity_fixture fixture;
@@ -789,6 +848,11 @@ TEST_CASE("cache identity fails a mixed hit and replaced miss without publicatio
 TEST_CASE("cache identity publishes prefetch failure before notifying the consumer",
           "[s3][integration][cache_identity]")
 {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
+                                            "MinIO test environment is not available")) {
+    return;
+  }
+
   parquet_objects objects;
   objects.publish(objects.first);
   identity_fixture fixture;
