@@ -21,8 +21,10 @@
 
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/uring/config.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +98,27 @@ std::string single_gpu_scan_manager_yaml(std::string const& body)
          "  executor:\n"
          "    scan_manager:\n" +
          body;
+}
+
+std::string uring_yaml(std::string const& body)
+{
+  return scan_manager_yaml("      uring:\n" + body);
+}
+
+std::string scheduling_yaml(std::string const& body)
+{
+  return uring_yaml("        scheduling:\n" + body);
+}
+
+/// Loading @p text must fail, and the error must end with @p message (the loader
+/// prefixes it with the file it was reading).
+void require_load_error(std::string const& name,
+                        std::string const& text,
+                        std::string const& message)
+{
+  scoped_yaml yaml(name, text);
+  sirius::sirius_config cfg;
+  REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path()), Catch::Matchers::EndsWith(": " + message));
 }
 
 }  // namespace
@@ -651,4 +674,150 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
                                      "      backend: kvikio\n");
 
   CHECK(cfg.backend == io_backend::native);
+}
+
+TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
+{
+  using namespace std::chrono_literals;
+  cucascade::io::detail::scheduling_config const cucascade_defaults{};
+
+  auto const check_defaults = [&](scan_manager_config const& cfg) {
+    CHECK(cfg.uring_n_reactors == 4);
+    CHECK(cfg.rest_n_reactors == 2);
+    CHECK(cfg.uring.n_max_concurrent_scans == 0);
+    CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
+    CHECK(cfg.uring.slices_per_pass == 8);
+
+    auto const& sched = cfg.uring.scheduling;
+    CHECK(sched.background_slot_fraction == Approx(0.75));
+    CHECK(sched.max_active_groups == cucascade_defaults.max_active_groups);
+    CHECK(sched.max_latency_groups == cucascade_defaults.max_latency_groups);
+    CHECK(sched.max_background_groups == cucascade_defaults.max_background_groups);
+    CHECK(sched.reserved_background_slots == cucascade_defaults.reserved_background_slots);
+    CHECK(sched.reserved_latency_slots == cucascade_defaults.reserved_latency_slots);
+    CHECK(sched.write_slot_fraction == Approx(cucascade_defaults.write_slot_fraction));
+    CHECK(sched.write_ring_fraction == Approx(cucascade_defaults.write_ring_fraction));
+    CHECK(sched.write_max_wait == cucascade_defaults.write_max_wait);
+    CHECK(sched.write_max_wait == 20ms);
+  };
+
+  SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
+
+  SECTION("empty uring and scheduling blocks")
+  {
+    check_defaults(
+      load_scan_manager("sirius_uring_empty_blocks.yaml", uring_yaml("        scheduling: {}\n")));
+  }
+}
+
+TEST_CASE("sirius_config reads uring.slices_per_pass", "[scan_manager][config][uring]")
+{
+  for (std::size_t const value : {std::size_t{0}, std::size_t{8}, std::size_t{64}}) {
+    CAPTURE(value);
+    auto const cfg =
+      load_scan_manager("sirius_uring_slices_per_pass_" + std::to_string(value) + ".yaml",
+                        uring_yaml("        slices_per_pass: " + std::to_string(value) + "\n"));
+    CHECK(cfg.uring.slices_per_pass == value);
+    CHECK(cfg.to_io_config().uring.slices_per_pass == value);
+  }
+}
+
+TEST_CASE("sirius_config rejects an out-of-range uring.slices_per_pass",
+          "[scan_manager][config][uring]")
+{
+  require_load_error("sirius_uring_slices_per_pass_65.yaml",
+                     uring_yaml("        slices_per_pass: 65\n"),
+                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
+                     "free staging slot), got 65");
+  require_load_error("sirius_uring_slices_per_pass_negative.yaml",
+                     uring_yaml("        slices_per_pass: -1\n"),
+                     "'uring.slices_per_pass': must be between 0 and 64 (0 = no cap: fill every "
+                     "free staging slot), got -1");
+}
+
+TEST_CASE("sirius_config reads the uring.scheduling keys", "[scan_manager][config][uring]")
+{
+  using namespace std::chrono_literals;
+  cucascade::io::detail::scheduling_config const cucascade_defaults{};
+
+  SECTION("every key")
+  {
+    auto const cfg    = load_scan_manager("sirius_uring_scheduling_all.yaml",
+                                       scheduling_yaml("          max_active_groups: 6\n"
+                                                          "          max_latency_groups: 3\n"
+                                                          "          max_background_groups: 1\n"
+                                                          "          reserved_background_slots: 4\n"
+                                                          "          reserved_latency_slots: 1\n"
+                                                          "          background_slot_fraction: 0.5\n"
+                                                          "          write_slot_fraction: 0.25\n"
+                                                          "          write_ring_fraction: 0.375\n"
+                                                          "          write_max_wait_ms: 35\n"));
+    auto const& sched = cfg.uring.scheduling;
+    CHECK(sched.max_active_groups == 6);
+    CHECK(sched.max_latency_groups == 3);
+    CHECK(sched.max_background_groups == 1);
+    CHECK(sched.reserved_background_slots == 4);
+    CHECK(sched.reserved_latency_slots == 1);
+    CHECK(sched.background_slot_fraction == Approx(0.5));
+    CHECK(sched.write_slot_fraction == Approx(0.25));
+    CHECK(sched.write_ring_fraction == Approx(0.375));
+    CHECK(sched.write_max_wait == 35ms);
+
+    // The whole block reaches cuCascade's io_config.
+    auto const io = cfg.to_io_config();
+    CHECK(io.uring.scheduling.max_active_groups == 6);
+    CHECK(io.uring.scheduling.background_slot_fraction == Approx(0.5));
+    CHECK(io.uring.scheduling.write_max_wait == 35ms);
+  }
+
+  SECTION("write_max_wait_ms accepts a unit suffix")
+  {
+    auto const cfg = load_scan_manager("sirius_uring_scheduling_wait_suffix.yaml",
+                                       scheduling_yaml("          write_max_wait_ms: 1.5s\n"));
+    CHECK(cfg.uring.scheduling.write_max_wait == 1500ms);
+  }
+
+  SECTION("an omitted key keeps cuCascade's default")
+  {
+    auto const cfg    = load_scan_manager("sirius_uring_scheduling_one_key.yaml",
+                                       scheduling_yaml("          max_active_groups: 8\n"));
+    auto const& sched = cfg.uring.scheduling;
+    CHECK(sched.max_active_groups == 8);
+    CHECK(sched.max_latency_groups == cucascade_defaults.max_latency_groups);
+    CHECK(sched.max_background_groups == cucascade_defaults.max_background_groups);
+    CHECK(sched.reserved_background_slots == cucascade_defaults.reserved_background_slots);
+    CHECK(sched.reserved_latency_slots == cucascade_defaults.reserved_latency_slots);
+    CHECK(sched.background_slot_fraction == Approx(cucascade_defaults.background_slot_fraction));
+    CHECK(sched.write_slot_fraction == Approx(cucascade_defaults.write_slot_fraction));
+    CHECK(sched.write_ring_fraction == Approx(cucascade_defaults.write_ring_fraction));
+    CHECK(sched.write_max_wait == cucascade_defaults.write_max_wait);
+    CHECK(cfg.uring.slices_per_pass == 8);
+  }
+}
+
+TEST_CASE("sirius_config rejects invalid uring.scheduling values", "[scan_manager][config][uring]")
+{
+  struct invalid_case {
+    char const* key;
+    char const* value;
+  };
+  // The uring reactor's own rules: group limits >= 1, fractions within [0, 1] (NaN too).
+  for (auto const& [key, value] : {invalid_case{"background_slot_fraction", "1.5"},
+                                   invalid_case{"write_slot_fraction", "-0.25"},
+                                   invalid_case{"write_ring_fraction", ".nan"},
+                                   invalid_case{"max_active_groups", "0"},
+                                   invalid_case{"max_latency_groups", "0"},
+                                   invalid_case{"max_background_groups", "0"}}) {
+    CAPTURE(key, value);
+    require_load_error(std::string{"sirius_uring_scheduling_invalid_"} + key + ".yaml",
+                       scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
+                       std::string{"'uring.scheduling."} + key + "': value out of range");
+  }
+}
+
+TEST_CASE("sirius_config rejects an unknown uring.scheduling key", "[scan_manager][config][uring]")
+{
+  require_load_error("sirius_uring_scheduling_unknown.yaml",
+                     scheduling_yaml("          foo: 1\n"),
+                     "unknown config key: 'foo' in uring.scheduling");
 }

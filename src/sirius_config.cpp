@@ -22,6 +22,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/io/uring/config.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <yaml-cpp/yaml.h>
@@ -225,6 +226,25 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.reject_unknown();
 }
 
+// The uring reactor re-checks the scheduling and slices_per_pass rules when it is
+// constructed, but cuCascade's factory turns that std::invalid_argument into a bare
+// nullptr. Checking them here names the offending key at startup instead.
+static void from_yaml(const YAML::Node& node, cucascade::io::detail::scheduling_config& opt)
+{
+  yaml::reader r(node, "uring.scheduling");
+  r.optional("max_active_groups", opt.max_active_groups, yaml::greater_than<std::size_t>{0});
+  r.optional("max_latency_groups", opt.max_latency_groups, yaml::greater_than<std::size_t>{0});
+  r.optional(
+    "max_background_groups", opt.max_background_groups, yaml::greater_than<std::size_t>{0});
+  r.optional("reserved_background_slots", opt.reserved_background_slots);
+  r.optional("reserved_latency_slots", opt.reserved_latency_slots);
+  r.optional("background_slot_fraction", opt.background_slot_fraction, yaml::fraction<double>{});
+  r.optional("write_slot_fraction", opt.write_slot_fraction, yaml::fraction<double>{});
+  r.optional("write_ring_fraction", opt.write_ring_fraction, yaml::fraction<double>{});
+  r.optional("write_max_wait_ms", opt.write_max_wait);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
@@ -238,6 +258,21 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  {
+    // Signed, so a negative value is reported as itself rather than wrapped.
+    std::optional<long long> slices;
+    r.optional("slices_per_pass", slices);
+    if (slices.has_value()) {
+      auto const max_slices = static_cast<long long>(cucascade::io::uring::max_slices_per_pass);
+      if (*slices < 0 || *slices > max_slices) {
+        throw std::runtime_error(
+          "'uring.slices_per_pass': must be between 0 and " + std::to_string(max_slices) +
+          " (0 = no cap: fill every free staging slot), got " + std::to_string(*slices));
+      }
+      opt.slices_per_pass = static_cast<std::size_t>(*slices);
+    }
+  }
+  if (auto n = r.optional_node("scheduling")) { from_yaml(*n, opt.scheduling); }
   r.reject_unknown();
 }
 
