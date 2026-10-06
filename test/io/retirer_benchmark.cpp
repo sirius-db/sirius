@@ -61,6 +61,7 @@
 // DIFFERENCE between the arms is meaningful.
 
 #include "exec/cuda_event_completion_poll.hpp"
+#include "exec/invocable.hpp"
 
 #include <cuda_runtime.h>
 

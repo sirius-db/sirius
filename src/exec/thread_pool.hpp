@@ -20,6 +20,9 @@
 
 namespace sirius::exec {
 
+/// cuCascade's pool; its 4th constructor parameter (per-thread init) is a
+/// std::function<void()>, so a move-only invocable does not bind there. Sirius
+/// passes move-only per-thread init only to its own bounded_thread_pool.
 using cucascade::exec::static_thread_pool;
 
 }  // namespace sirius::exec

@@ -172,3 +172,30 @@ TEST_CASE("semi_future timed and untimed waiters on one core both wake", "[exec]
   CHECK(untimed_woke.load(std::memory_order_acquire));
   CHECK(timed_value == 77);
 }
+
+TEST_CASE("semi_future resolution without a parked waiter still delivers", "[exec][semi_future]")
+{
+  SECTION("no waiter: value is available after set_value")
+  {
+    promise<int> p;
+    auto sf = p.get_semi_future();
+
+    p.set_value(7);
+
+    CHECK(std::move(sf).get() == 7);
+  }
+
+  SECTION("callback waiter: install_callback runs on resolution")
+  {
+    promise<int> p;
+    auto sf = p.get_semi_future();
+    std::atomic<int> observed{0};
+
+    std::move(sf).install_callback([&observed](try_t<int>&& t) {
+      observed.store(std::move(t).get(), std::memory_order_release);
+    });
+    p.set_value(8);
+
+    CHECK(observed.load(std::memory_order_acquire) == 8);
+  }
+}
