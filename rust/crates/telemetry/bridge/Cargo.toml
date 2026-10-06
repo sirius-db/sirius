@@ -10,10 +10,14 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1"
 instrumentation-model = { path = "../model" }
-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1", features = ["static-injection"] }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df", features = ["io-ndjson", "io-msgpack", "io-postcard"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df", default-features = false, features = ["ndjson", "msgpack", "postcard"] }
+nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df", features = ["static-injection"] }
 
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }

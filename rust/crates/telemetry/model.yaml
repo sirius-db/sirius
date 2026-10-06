@@ -1,0 +1,317 @@
+quent: alpha
+model: sirius
+doc: Sirius engine event model
+
+records:
+  Edge:
+    doc: A directed edge between two operator ports.
+    fields:
+      source: { ref: Port }
+      target: { ref: Port }
+
+entities:
+  Engine:
+    doc: A Sirius engine instance and the root of the resource tree
+    events:
+      init:
+        attributes:
+          label: { option: string }
+      exit: {}
+
+  QueryGroup:
+    doc: Group of queries submitted to an engine.
+    events:
+      declaration:
+        attributes:
+          label: string
+          engine_id: { scope-ref: Engine}
+
+  Worker:
+    doc: A worker executing queries for an engine.
+    events:
+      init:
+        attributes:
+          parent_engine_id: { scope-ref: Engine }
+          process_id: string
+          tag: string
+      exit: {}
+
+  Plan:
+    doc: A directed acyclic graph of query operators.
+    events:
+      declaration:
+        attributes:
+          # parent: TODO(dhruv9vats): do we want nested plans?
+          query_id: { scope-ref: Query }
+          label: string
+          edges: { list: Edge }
+          worker_id: { option: { ref: Worker } }
+
+  Operator:
+    doc: A source, sink, or transformation within a query plan DAG
+    events:
+      declaration:
+        attributes:
+          plan_id : { scope-ref: Plan }
+          # TODO(dhruv9vats): operators in nested plans.
+          # parent_operator_ids: { list: { ref: Operator } }
+          label: string
+          type_name: string
+          custom_attributes: dynamic
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+  Port:
+    doc: Entity accepting inputs or producing outputs for an Operator
+    events:
+      declaration:
+        attributes:
+          operator_id: { scope-ref: Operator }
+          label: string
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+  # One per GPU at engine startup: gpu-0, gpu-1, ...
+  GpuDevice:
+    doc: A GPU resource group
+    events:
+      declaration:
+        attributes:
+          # Human-readable group label shown in the viewer, e.g. "gpu-0".
+          label: string
+          worker_id: { scope-ref: Worker }
+          # CUDA device ordinal of this GPU.
+          ordinal: u32
+
+  TaskQueue:
+    doc: A queue that manages tasks.
+    resource:
+      entries:
+        kind: occupancy
+    events:
+      created:
+        attributes:
+          worker_id: { scope-ref: Worker }
+          gpu_device_id: { option: { ref: GpuDevice } }
+          label: string
+      exit: {}
+
+  ThreadGroup:
+    doc: A bucket of threads
+    events:
+      declaration:
+        attributes:
+          label: string
+          worker_id: { scope-ref: Worker }
+          # The GPU device this thread-group acts on behalf of,
+          # for cases like executor threads, so obtain a hierarchical tree
+          # empty for case like scheduler thread-group that used by multiple
+          # GPUs and sits underneath the engine.
+          gpu_device_id: { option: { ref: GpuDevice } }
+      exit: {}
+
+  TaskManagerLoopThread:
+    doc: A thread coordinating task execution.
+    resource: true
+    events:
+      spawned:
+        attributes:
+          label: string
+          gpu_device_id: { scope-ref: GpuDevice }
+      exit: {}
+
+  ExecutorThread:
+    doc: A thread executing tasks.
+    resource: true
+    events:
+      spawned:
+        attributes:
+          label: string
+          group_id: { scope-ref: ThreadGroup }
+      exit: {}
+
+#  GpuMemory:
+#    doc: Device memory owned by a GPU.
+#    resource:
+#      bytes:
+#        kind: occupancy
+#        known-bounds: true
+#    events:
+#      declaration:
+#        attributes:
+#          gpu_id: { scope-ref: GpuDevice }
+#
+#  HostMemory:
+#    doc: Host memory owned by a worker.
+#    resource:
+#      bytes:
+#        kind: occupancy
+#        known-bounds: true
+#    events:
+#      declaration:
+#        attributes:
+#          worker_id: { scope-ref: Worker }
+#
+#  Storage:
+#    doc: Persistent storage used by a worker.
+#    resource:
+#      bytes:
+#        kind: occupancy
+#        known-bounds: true
+#    events:
+#      declaration:
+#        attributes:
+#          worker_id: { scope-ref: Worker }
+  MemorySpace:
+    doc: A logical memory space data can reside in, like device memory, host memory or storage.
+    resource:
+      bytes:
+        kind: occupancy
+        known-bounds: true
+    events:
+      declaration:
+        attributes:
+          label: string
+          bounds: { sets-resource-bounds: true }
+          worker_id: { scope-ref: Worker }
+          gpu_id: { option: { ref: GpuDevice } }
+      exit: {}
+
+  Channel:
+    doc: A logical channel over which data is transferred between two memory tiers.
+    resource:
+      bytes: { kind: rate }
+    events:
+      declaration:
+        attributes:
+          source_tier: { ref: MemorySpace }
+          destination_tier: { ref: MemorySpace }
+          worker_id: { scope-ref: Worker }
+          gpu_id: { option: { ref: GpuDevice } }
+          label: string
+      exit: {}
+
+#  StorageChannel:
+#    doc: A worker-local channel transferring bytes between storage and host memory.
+#    resource:
+#      bytes: { kind: rate }
+#    events:
+#      declaration:
+#        attributes:
+#          worker_id: { scope-ref: Worker }
+#
+#  PcieChannel:
+#    doc: A GPU-local channel transferring bytes between host and device memory.
+#    resource:
+#      bytes: { kind: rate }
+#    events:
+#      declaration:
+#        attributes:
+#          worker_id: { scope-ref: GpuDevice }
+#
+#  GpuDirectChannel:
+#    doc: A GPU-local channel transferring bytes between host and storage.
+#    resource:
+#      bytes: { kind: rate }
+#    events:
+#      declaration:
+#        attributes:
+#          worker_id: { scope-ref: GpuDevice }
+
+
+fsms:
+  Query:
+    doc: A query progressing through planning and execution.
+    states:
+      init:
+        initial: true
+        attributes:
+          instance_name: string
+          query_group_id: { scope-ref: QueryGroup }
+        to: [planning]
+      planning:
+        to: [executing]
+      executing:
+        to: [exit]
+      exit: {}
+
+  Task:
+    doc: Scheduling and execution of one pipeline task.
+    states:
+      created:
+        initial: true
+        attributes:
+          pipeline_uuid: { scope-ref: Operator }
+        to: [ queued, finalizing ]
+      queued:
+        attributes:
+          queue: { uses: TaskQueue }
+        to: [ routing, reserving, finalizing ]
+      routing:
+        attributes:
+          preferred_device_id: i64
+          manager_thread: { uses: TaskManagerLoopThread }
+        to: [ queued, reserving, finalizing ]
+      reserving:
+        attributes:
+          requested_bytes: u64
+          input_basis: u64
+          peak_estimate: u64
+          bytes_to_materialize: u64
+          manager_thread: { uses: TaskManagerLoopThread }
+        to: [ downgrading, preparing, finalizing ]
+      downgrading:
+        attributes:
+          shortfall_bytes: u64
+          partial_bytes: u64
+          manager_thread: { uses: TaskManagerLoopThread }
+        to: [ preparing, finalizing ]
+      preparing:
+        attributes:
+          origin_tier: string
+          target_tier: string
+          input_bytes: u64
+          executor_thread: { uses: ExecutorThread }
+          # Processing-space reservation on the selected tier.
+          reservation: { uses: MemorySpace }
+        to: [ computing, finalizing ]
+      computing:
+        attributes:
+          current_operator_id: u32
+          input_bytes: u64
+          input_batch_ids: { list: u64 }
+          # Stream allocator peak when this operator started.
+          peak_allocated_bytes: u64
+          executor_thread: { uses: ExecutorThread }
+          reservation: { uses: MemorySpace }
+        to: [ computing, finalizing ]
+      finalizing:
+        attributes:
+          success: bool
+        to: [ exit ]
+      exit: {}
+
+  DataBatch:
+    doc: Physical batch residency and transfer
+    states:
+      constructed:
+        initial: true
+        attributes:
+          data_batch_id: u64
+          producer_pipeline_id: { scope-ref: Operator }
+        to: [ stationary ]
+      stationary:
+        attributes:
+          memory: { uses: MemorySpace }
+        to: [ stationary, in_transit, destructed ]
+      in_transit:
+        attributes:
+          source_memory: { uses: MemorySpace }
+          dest_memory: { uses: MemorySpace }
+          channel: { uses: Channel }
+        to: [ stationary ]
+      destructed:
+        to: [ exit ]
+      exit: { }

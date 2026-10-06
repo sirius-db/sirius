@@ -39,6 +39,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
@@ -115,16 +116,19 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
     sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_handle_(quent::query::create(
-      telemetry_context_->context(),
-      quent::query::Init{
-        .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-        .query_group_id = telemetry_context_->query_group_id_for(sirius_iface.session_label),
-      }))
+    query_handle_(telemetry_context_->context()
+                    .query_observer()
+                    ->handle()
+                    .init({
+                      .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+                      .query_group_id = quent::query_group::QueryGroupId(
+                        telemetry_context_->query_group_id_for(sirius_iface.session_label)),
+                    })
+                    .into_dynamic())
 {
 }
 
-sirius_engine::~sirius_engine() { query_handle_->exit(); }
+sirius_engine::~sirius_engine() { query_handle_.exit(); }
 
 void sirius_engine::reset()
 {
@@ -164,7 +168,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
-  query_handle_->planning();
+  query_handle_.planning();
   reset();
   sirius_owned_plan = std::move(plan);
   initialize_internal(*sirius_owned_plan);
@@ -173,7 +177,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 void sirius_engine::execute()
 {
   nvtx_scoped_range nvtx_range{"sirius::query"};
-  query_handle_->executing();
+  query_handle_.executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
@@ -183,7 +187,7 @@ void sirius_engine::execute()
   // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
   // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
   // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
-  auto const telemetry_uuid = query_handle_->uuid();
+  auto const telemetry_uuid = query_handle_.id().raw();
   SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
                   query_id_,
                   telemetry_uuid.high_bits,
@@ -200,7 +204,7 @@ void sirius_engine::execute()
                                     completion_handler_,
                                     telemetry::query_telemetry_info{
                                       .telemetry_query_id = telemetry_uuid,
-                                      .worker_id          = telemetry_context_->worker_id(),
+                                      .worker_id          = telemetry_context_->worker_id().raw(),
                                       .query_id           = query_id_,
                                     });
   sirius_ctx->get_task_scheduler().start_query(*query_);

@@ -12,16 +12,16 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 instrumentation-model = { path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
-nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
+nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-collector = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 uuid = "1"
 
 [build-dependencies]
-quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "75821b00cfc9f74a65e536e96a5c28575c1566df" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

@@ -16,8 +16,6 @@
 
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
-#include "telemetry/batch_telemetry.hpp"
-
 namespace sirius {
 namespace op {
 
@@ -29,11 +27,7 @@ void sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
   std::size_t partition_idx)
 {
   auto* p = get_port(port_id);
-  if (p && p->repo) {
-    telemetry::batch_telemetry_registry::instance().on_published(
-      batch, p->repo, telemetry::batch_origin::partition_output);
-    p->repo->add_data_batch(batch, partition_idx);
-  }
+  if (p && p->repo) { p->repo->add_data_batch(std::move(batch), partition_idx); }
 }
 
 partition_strategy sirius_physical_partition_consumer_operator::get_partition_strategy(

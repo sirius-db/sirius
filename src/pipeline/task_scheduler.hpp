@@ -25,6 +25,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
 
@@ -223,8 +224,8 @@ class task_scheduler {
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
   sirius::creator::task_creator* _task_creator{nullptr};
+  quent::Handle<quent::TaskQueue> _task_queue_telemetry;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
-  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };
 
 }  // namespace pipeline

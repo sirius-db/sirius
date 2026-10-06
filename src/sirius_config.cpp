@@ -318,7 +318,6 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
 {
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
-  r.optional("enable_batch_events", opt.enable_batch_events);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
     if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
     throw std::runtime_error("must be one of ndjson, msgpack, postcard");

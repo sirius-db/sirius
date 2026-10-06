@@ -26,6 +26,7 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
@@ -71,10 +72,13 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
           thread_prefix     = _config.thread_name_prefix,
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
-    telemetry::thread_local_executor_thread_telemtry_init(
-      *telemetry_context,
-      std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
-      telemetry_context->executor_thread_group_id(device_id));
+
+    telemetry::executor_thread_telemetry_handle =
+      telemetry_context->context().executor_thread_observer()->handle();
+    telemetry::executor_thread_telemetry_handle->spawned({
+      .label    = std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+      .group_id = telemetry_context->gpu_device_telemetry_handles(device_id).executor_threads.id(),
+    });
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
@@ -94,10 +98,13 @@ absl::AnyInvocable<void() noexcept> gpu_pipeline_executor::get_per_thread_init()
 
 void gpu_pipeline_executor::manager_loop()
 {
-  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
-    *_telemetry_context,
-    std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
-    _telemetry_context->manager_thread_group_id(_memory_space->get_device_id())};
+  quent::Handle<quent::TaskManagerLoopThread> manager_thread_handle =
+    _telemetry_context->context().task_manager_loop_thread_observer()->handle();
+  manager_thread_handle.spawned({
+    .label = std::format("gpu-{}-exec-manager", _memory_space->get_device_id()),
+    .gpu_device_id =
+      _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id()).device.id(),
+  });
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -129,7 +136,7 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
     }
-    auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
+    gpu_pipeline_task* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       // Only gpu_pipeline_tasks are ever scheduled onto a GPU executor, so this is a
       // programming error rather than a query failure. There is no pipeline here and therefore
@@ -143,13 +150,12 @@ void gpu_pipeline_executor::manager_loop()
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
     auto bytes_needs      = reservation_info.reservation_size;
-    gpu_task->telemetry_handle().reserving({
-      .instance_name              = "",
-      .requested_bytes            = reservation_info.reservation_size,
-      .input_basis                = reservation_info.input_basis,
-      .peak_estimate              = reservation_info.peak_memory_estimate,
-      .bytes_to_materialize       = reservation_info.bytes_to_materialize_input,
-      .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+    gpu_task->telemetry_fsm().reserving({
+      .requested_bytes      = reservation_info.reservation_size,
+      .input_basis          = reservation_info.input_basis,
+      .peak_estimate        = reservation_info.peak_memory_estimate,
+      .bytes_to_materialize = reservation_info.bytes_to_materialize_input,
+      .manager_thread       = {manager_thread_handle.id()},
     });
     // Clamp the reservation request to what this memory space can actually
     // grant (its reservation limit). The history-based estimate can balloon far
@@ -198,11 +204,10 @@ void gpu_pipeline_executor::manager_loop()
       size_t shortfall    = bytes_needs - reservation->size();
       size_t partial_size = reservation->size();
 
-      gpu_task->telemetry_handle().downgrading({
-        .instance_name              = "",
-        .shortfall_bytes            = shortfall,
-        .partial_bytes              = partial_size,
-        .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+      gpu_task->telemetry_fsm().downgrading({
+        .shortfall_bytes = shortfall,
+        .partial_bytes   = partial_size,
+        .manager_thread  = {manager_thread_handle.id()},
       });
 
       SIRIUS_LOG_DEBUG(
@@ -414,11 +419,10 @@ void gpu_pipeline_executor::manager_loop()
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
           if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-            pipeline_task->telemetry_handle().finalizing({
-              .instance_name = "",
-              .success       = false,
+            pipeline_task->telemetry_fsm().finalizing({
+              .success = false,
             });
-            pipeline_task->telemetry_handle().exit();
+            pipeline_task->telemetry_fsm().exit();
             pipeline_task->set_telemetry_finalized();
           }
           this->schedule(std::move(new_task));
@@ -435,11 +439,8 @@ void gpu_pipeline_executor::manager_loop()
           return;
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-          pipeline_task->telemetry_handle().finalizing({
-            .instance_name = "",
-            .success       = true,
-          });
-          pipeline_task->telemetry_handle().exit();
+          pipeline_task->telemetry_fsm().finalizing({.success = true});
+          pipeline_task->telemetry_fsm().exit();
           pipeline_task->set_telemetry_finalized();
         }
         task.reset();

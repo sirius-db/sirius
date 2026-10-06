@@ -22,6 +22,7 @@
 #include "exec/multi_index_priority_queue.hpp"
 #include "parallel/task.hpp"
 #include "query_id.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <atomic>
 #include <memory>
@@ -31,7 +32,6 @@
 namespace sirius {
 namespace telemetry {
 class telemetry_context;
-struct TaskQueueHandleWrapper;
 }  // namespace telemetry
 
 namespace parallel {
@@ -186,7 +186,7 @@ class itask_executor {
   exec::multi_index_priority_queue<itask> _task_queue;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
-  std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
+  quent::Handle<quent::TaskQueue> _task_queue_telemetry;
 };
 
 }  // namespace parallel

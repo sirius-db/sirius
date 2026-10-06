@@ -28,7 +28,8 @@ inline std::shared_ptr<const telemetry::telemetry_context> make_test_telemetry_c
   telemetry_config config;
   config.enable_quent = false;
   config.engine_name  = "test-engine";
-  return telemetry::telemetry_context::create(telemetry::make_quent_context(config), config);
+  return telemetry::telemetry_context::create(std::move(telemetry::make_quent_context(config)),
+                                              config);
 }
 
 }  // namespace sirius::test

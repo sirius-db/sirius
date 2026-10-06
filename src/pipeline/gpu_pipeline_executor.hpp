@@ -83,7 +83,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~gpu_pipeline_executor();
+  ~gpu_pipeline_executor() override;
 
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
