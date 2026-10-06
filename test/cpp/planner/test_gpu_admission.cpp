@@ -19,11 +19,13 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 using sirius::logical_type;
 using sirius::type_id;
 using sirius::planner::accumulate_scan_bytes;
+using sirius::planner::admission_row_count;
 using sirius::planner::apply_gpu_cap;
 using sirius::planner::estimate_bytes_per_row;
 using sirius::planner::gpu_count_for_bytes;
@@ -146,6 +148,49 @@ TEST_CASE("estimate_bytes_per_row mixes fixed and variable widths", "[admission_
 TEST_CASE("estimate_bytes_per_row returns zero for an empty projection", "[admission_estimator]")
 {
   REQUIRE(estimate_bytes_per_row({}, k_avg_var) == 0);
+}
+
+TEST_CASE("estimate_bytes_per_row takes a known width for a variable-width column",
+          "[admission_estimator]")
+{
+  // VARCHAR with a source-reported width of 5 (a one-character string plus its offset word)
+  // instead of the 32-byte fallback; BIGINT keeps its carrier width.
+  const std::vector<logical_type> types{logical_type::make(type_id::VARCHAR),
+                                        logical_type::make(type_id::BIGINT)};
+  const std::vector<std::optional<uint64_t>> known{uint64_t{5}, std::nullopt};
+  REQUIRE(estimate_bytes_per_row(types, k_avg_var, known) == 5 + 8);
+}
+
+TEST_CASE("estimate_bytes_per_row ignores a known width on a fixed-width column",
+          "[admission_estimator]")
+{
+  // A Parquet footer's encoded size for an INT64 column can be far below 8 bytes per value
+  // (dictionary, RLE); the cuDF carrier is 8 regardless.
+  const std::vector<logical_type> types{logical_type::make(type_id::BIGINT)};
+  const std::vector<std::optional<uint64_t>> known{uint64_t{1}};
+  REQUIRE(estimate_bytes_per_row(types, k_avg_var, known) == 8);
+}
+
+TEST_CASE("estimate_bytes_per_row falls back where no width is known", "[admission_estimator]")
+{
+  const std::vector<logical_type> types{logical_type::make(type_id::VARCHAR),
+                                        logical_type::make(type_id::VARCHAR),
+                                        logical_type::make(type_id::VARCHAR)};
+  // Shorter vector: the third column is covered by the fallback; unset entries too.
+  const std::vector<std::optional<uint64_t>> known{uint64_t{10}, std::nullopt};
+  REQUIRE(estimate_bytes_per_row(types, k_avg_var, known) == 10 + k_avg_var + k_avg_var);
+  REQUIRE(estimate_bytes_per_row(types, k_avg_var, {}) == estimate_bytes_per_row(types, k_avg_var));
+}
+
+TEST_CASE("admission_row_count never goes below the planner estimate", "[admission_estimator]")
+{
+  // The unfiltered count raises an under-estimated filtered scan ...
+  REQUIRE(admission_row_count(120'000'000, uint64_t{600'000'000}) == 600'000'000);
+  // ... but never lowers one the planner already sized larger (appended rows, unions).
+  REQUIRE(admission_row_count(700'000'000, uint64_t{600'000'000}) == 700'000'000);
+  // Without a table count the planner estimate stands.
+  REQUIRE(admission_row_count(120'000'000, std::nullopt) == 120'000'000);
+  REQUIRE(admission_row_count(0, uint64_t{600'000'000}) == 600'000'000);
 }
 
 TEST_CASE("gpu_count_for_bytes rounds up to cover the total", "[admission_estimator]")

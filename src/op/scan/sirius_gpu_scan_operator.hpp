@@ -18,6 +18,7 @@
 
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/scan_admission_hint.hpp>
 #include <op/scan/table_scan/scan_contract.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
@@ -171,6 +172,15 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
+  /// Plan-time admission facts (unfiltered row count, known column widths); see
+  /// scan_admission_hint. Set once by the plan generator, read by GPU admission before any
+  /// pipeline exists. Absent fields fall back to the planner estimate.
+  void set_admission_hint(scan_admission_hint hint) { _admission_hint = std::move(hint); }
+  [[nodiscard]] scan_admission_hint const& admission_hint() const noexcept
+  {
+    return _admission_hint;
+  }
+
   [[nodiscard]] bound_table_scan const& scan_contract() const;
   [[nodiscard]] scan_contract_id contract_id() const noexcept { return _contract_id; }
   [[nodiscard]] std::shared_ptr<transparent::read_view_registry> const& read_views() const noexcept
@@ -207,6 +217,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   uint64_t _query_token = 0;
   std::optional<key_held_witness> _expected_key;
   std::shared_ptr<gpu_ingestible> _ingestible;
+  scan_admission_hint _admission_hint;
   std::shared_ptr<transparent::read_view_registry> _read_views;
   scan_contract_id _contract_id = 0;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
