@@ -22,6 +22,12 @@
 
 #include <cucascade/io/config.hpp>
 
+// cuCascade declares kvikio_config (scan_manager_config::kvikio, which to_io_config()
+// copies) only when built with cuDF, and so kvikIO; Sirius always is.
+#ifndef CUCASCADE_HAS_KVIKIO
+#error "Sirius requires cuCascade built with kvikIO (CUCASCADE_HAS_KVIKIO)"
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <optional>
@@ -298,12 +304,6 @@ struct scan_manager_config {
     cache.apply_mode();
     uring.use_odirect = cache.use_odirect();
   }
-
-  // to_io_config() copies the kvikio sub-config, which cuCascade declares only when
-  // built with cuDF (and so kvikIO); Sirius always is.
-#ifndef CUCASCADE_HAS_KVIKIO
-#error "Sirius requires cuCascade built with kvikIO (CUCASCADE_HAS_KVIKIO)"
-#endif
 
   /// The cuCascade io configuration for the @c io_context_registry: the backend
   /// sub-configs and runner counts copied verbatim, @ref backend mapped onto

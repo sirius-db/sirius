@@ -1103,8 +1103,8 @@ class sirius_scan_manager {
 
   /// Per-query runner health check for the backends with runner pools (uring,
   /// restful): restart a pool whose runners all died, and report (once per ioctx)
-  /// a pool running short.  Spawns threads on restart, so never call it under
-  /// `_routed_io_ctxs_mtx`.
+  /// a pool running short.  Serialized by `_io_runner_check_mtx`, a leaf lock;
+  /// spawns threads on restart, so never call it under `_routed_io_ctxs_mtx`.
   void check_io_runners(cucascade::io::ioctx& io_ctx);
 
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
@@ -1153,8 +1153,14 @@ class sirius_scan_manager {
   /// only fail the same way; installing a new S3 secret yields a new key.
   /// Guarded by `_routed_io_ctxs_build_mtx`.
   std::unordered_set<routed_ioctx_key, routed_ioctx_key_hash> _unavailable_io_ctxs;
+  /// Serializes @ref check_io_runners end to end (restart included) and guards
+  /// `_io_runner_shortfall_reported`.  A leaf lock: no other scan-manager lock is
+  /// taken while it is held.  Lock order: `_routed_io_ctxs_build_mtx` /
+  /// `_routed_io_ctxs_mtx` are never taken under it -- callers snapshot the routed
+  /// ioctxs under `_routed_io_ctxs_mtx`, release it, then check.
+  std::mutex _io_runner_check_mtx;
   /// ioctxs whose runner shortfall has been reported; see @ref check_io_runners.
-  std::mutex _io_runner_health_mtx;
+  /// Guarded by `_io_runner_check_mtx`.
   std::unordered_set<cucascade::io::ioctx const*> _io_runner_shortfall_reported;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its

@@ -28,7 +28,7 @@
 #include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
 
-// rmm
+// cccl
 #include <cuda/stream>
 
 // standard library

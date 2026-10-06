@@ -1365,12 +1365,20 @@ sirius_scan_manager::sirius_scan_manager(
   // path is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
-  if (_config.backend == scan_manager::io_backend::native) {
-    _io_ctx = make_ioctx_or_explain(cucascade::io::io_context_type::uring);
-    if (!_io_ctx) {
-      throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context: " +
-                               explain_ioctx_failure(cucascade::io::io_context_type::uring).cause);
+  //
+  // The default ioctx is mandatory, so its failure is thrown rather than logged:
+  // the cause is explained once, in the exception.
+  auto const make_default_ioctx = [this](cucascade::io::io_context_type type) {
+    auto io_ctx = _ioctx_registry.make_ioctx(type);
+    if (!io_ctx) {
+      throw std::runtime_error(std::string{"[sirius_scan_manager] failed to create "} +
+                               to_string(type) +
+                               " io_context: " + explain_ioctx_failure(type).cause);
     }
+    return io_ctx;
+  };
+  if (_config.backend == scan_manager::io_backend::native) {
+    _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] native backend (uring_ioctx n_runner_threads={})",
                      _config.uring_n_reactors);
   } else {
@@ -1381,11 +1389,7 @@ sirius_scan_manager::sirius_scan_manager(
         std::to_string(_topology_index->gpu_ids().size()) +
         " GPUs.  Set backend=native for multi-GPU runs.");
     }
-    _io_ctx = make_ioctx_or_explain(cucascade::io::io_context_type::kvikio);
-    if (!_io_ctx) {
-      throw std::runtime_error("[sirius_scan_manager] failed to create kvikio io_context: " +
-                               explain_ioctx_failure(cucascade::io::io_context_type::kvikio).cause);
-    }
+    _io_ctx = make_default_ioctx(cucascade::io::io_context_type::kvikio);
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] backend=kvikio — using kvikio_context fallback");
   }
 
@@ -1512,7 +1516,9 @@ void sirius_scan_manager::prepare_for_query(
 
   // A runner pool dies only of fatal engine errors, after which every read on that
   // backend fails fast; check the backends already built before this query reads.
-  // Outside _routed_io_ctxs_mtx: a restart spawns threads and allocates staging.
+  // Outside _routed_io_ctxs_mtx: a restart spawns threads and allocates staging,
+  // and check_io_runners takes the leaf _io_runner_check_mtx, so the snapshot is
+  // taken first and the map lock released before any check.
   for (auto const& io_ctx : built_io_ctxs) {
     check_io_runners(*io_ctx);
   }
@@ -1576,9 +1582,14 @@ void sirius_scan_manager::prepare_for_query(
     std::vector<backend_readahead_policy> backend_policies;
     backend_policies.reserve(query_io_ctxs.size());
     for (auto const& io_ctx : query_io_ctxs) {
-      // Nowhere to read ahead into on this backend (it cannot cache, or its
-      // cache was not built), so it has no say in the readahead's terms.
-      if (!io_ctx->can_use_fs_cache() || io_ctx->cache() == nullptr) { continue; }
+      // Nowhere to read ahead into on this backend, so it has no say in the
+      // readahead's terms: it cannot cache at all, or a requested pinned cache
+      // failed to build and has nothing to read ahead into.  `os` mode builds no
+      // pinned cache by design and reads ahead into the page cache instead.
+      if (!io_ctx->can_use_fs_cache() ||
+          (_config.cache.use_fs_cache() && io_ctx->cache() == nullptr)) {
+        continue;
+      }
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
     }
@@ -2204,7 +2215,7 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
       note(store.access_key.empty(), "access_key");
       note(store.secret_key.empty(), "secret_key");
       if (!empty.empty()) {
-        return {.cause = "object store not configured (empty object_store." + empty +
+        return {.cause = "object store not configured (empty object_store fields: " + empty +
                          "); REST backend disabled",
                 .by_configuration = true};
       }
@@ -2265,6 +2276,11 @@ bool sirius_scan_manager::init_cache_for(cucascade::io::ioctx& io_ctx)
 
 void sirius_scan_manager::check_io_runners(cucascade::io::ioctx& io_ctx)
 {
+  // Held across the whole check, restart included, so a concurrent query's check
+  // cannot observe a pool mid-start() (a spurious "died; restarting" or a false
+  // shortfall) and the reported set cannot go stale between a restart's erase and
+  // another check's insert.  A leaf lock: see _io_runner_check_mtx.
+  std::lock_guard check_lk{_io_runner_check_mtx};
   auto const type = io_ctx.type();
   // kvikIO and s3rdma have no runner pool to supervise.
   if (type != cucascade::io::io_context_type::uring &&
@@ -2290,12 +2306,10 @@ void sirius_scan_manager::check_io_runners(cucascade::io::ioctx& io_ctx)
       return;
     }
     // A fresh pool: a shortfall in it is news again.
-    std::lock_guard lk{_io_runner_health_mtx};
     _io_runner_shortfall_reported.erase(&io_ctx);
     return;
   }
   if (active < expected) {
-    std::lock_guard lk{_io_runner_health_mtx};
     if (_io_runner_shortfall_reported.insert(&io_ctx).second) {
       SIRIUS_LOG_ERROR(
         "[sirius_scan_manager] {} backend is running {} of {} io runners; the rest died and are "

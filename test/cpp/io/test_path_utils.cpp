@@ -25,6 +25,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 
 //===----------------------------------------------------------------------===//
 // strip_file_scheme: Sirius's duckdb::Path-based variant. It strips every legal `file:` URI form
@@ -112,11 +114,35 @@ TEST_CASE("strip_file_scheme does not throw on input a URI parser rejects", "[pa
 
 namespace {
 
-/// A regular file at <tmp>/sirius-path-utils-<pid>/dir/data.bin.
-std::filesystem::path make_open_datasource_file()
+/// Removes a scratch directory tree when it goes out of scope, pass or fail.
+class remove_all_guard {
+ public:
+  explicit remove_all_guard(std::filesystem::path root) : _root(std::move(root)) {}
+  ~remove_all_guard()
+  {
+    std::error_code ignored;
+    std::filesystem::remove_all(_root, ignored);
+  }
+  remove_all_guard(remove_all_guard const&)            = delete;
+  remove_all_guard& operator=(remove_all_guard const&) = delete;
+
+  [[nodiscard]] std::filesystem::path const& path() const noexcept { return _root; }
+
+ private:
+  std::filesystem::path _root;
+};
+
+/// <tmp>/sirius-path-utils-<pid>: the scratch root of the open_datasource tests.
+std::filesystem::path open_datasource_root()
 {
-  auto const dir = std::filesystem::temp_directory_path() /
-                   ("sirius-path-utils-" + std::to_string(::getpid())) / "dir";
+  return std::filesystem::temp_directory_path() /
+         ("sirius-path-utils-" + std::to_string(::getpid()));
+}
+
+/// A regular file at <root>/dir/data.bin.
+std::filesystem::path make_open_datasource_file(std::filesystem::path const& root)
+{
+  auto const dir = root / "dir";
   std::filesystem::create_directories(dir);
   auto const file = dir / "data.bin";
   std::ofstream{file, std::ios::binary} << "open_datasource normalization\n";
@@ -128,7 +154,8 @@ std::filesystem::path make_open_datasource_file()
 
 TEST_CASE("open_datasource keys a dotted file URI like the bare path", "[path_utils]")
 {
-  auto const file  = make_open_datasource_file();
+  remove_all_guard const scratch{open_datasource_root()};
+  auto const file  = make_open_datasource_file(scratch.path());
   auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
   auto const dotted =
     "file://" + (file.parent_path() / ".." / "dir" / "." / file.filename()).string();
@@ -143,7 +170,8 @@ TEST_CASE("open_datasource keys a dotted file URI like the bare path", "[path_ut
 
 TEST_CASE("open_datasource normalizes the path it forwards with an open hint", "[path_utils]")
 {
-  auto const file  = make_open_datasource_file();
+  remove_all_guard const scratch{open_datasource_root()};
+  auto const file  = make_open_datasource_file(scratch.path());
   auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
   // The host-omitted `file:/abs` spelling, with an empty segment.
   auto const uri = "file:" + file.parent_path().string() + "//" + file.filename().string();

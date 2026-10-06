@@ -168,7 +168,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  std::shared_ptr<cucascade::io::ioctx> metadata_ioctx,
+  std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery);
 
