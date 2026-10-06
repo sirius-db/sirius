@@ -80,6 +80,13 @@ void reject_true_bool_option(duckdb::KeyValueSecret const& secret, char const* n
   if (get_bool(secret, name, value) && value) { reject_present_option(secret, name); }
 }
 
+std::string canonicalize_s3_scheme(std::string_view path)
+{
+  auto canonical = std::string{path};
+  canonical.replace(0, std::string_view{"s3://"}.size(), "s3://");
+  return canonical;
+}
+
 }  // namespace
 
 void register_sirius_s3_secret(duckdb::SecretManager& manager)
@@ -128,9 +135,12 @@ object_store_config resolve_duckdb_s3_secret(duckdb::ClientContext& context,
   // every bind/open, so replacement affects future work. Sirius keeps the
   // resolved config snapshot needed by its REST signer, but does not retain the
   // DuckDB secret object or its catalog name in bind data.
-  auto transaction       = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
-  auto& manager          = duckdb::SecretManager::Get(context);
-  auto const secret_path = std::string(path);
+  auto transaction = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
+  auto& manager    = duckdb::SecretManager::Get(context);
+  // URI schemes are case-insensitive, but DuckDB secret scopes use case-sensitive prefix
+  // matching. Canonicalize only the scheme so SCOPE 's3://bucket/' also covers
+  // 'S3://bucket/object' without changing case-sensitive bucket or object-key bytes.
+  auto const secret_path = canonicalize_s3_scheme(path);
   auto match             = manager.LookupSecret(transaction, secret_path, "sirius_s3");
   if (!match.HasMatch()) { match = manager.LookupSecret(transaction, secret_path, "s3"); }
   if (!match.HasMatch()) { return defaults; }

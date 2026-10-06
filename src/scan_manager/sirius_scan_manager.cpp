@@ -2006,7 +2006,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto* rest = rest_ioctx_for_list(s3_prefix_uri);
+  auto rest = rest_ioctx_for_list(s3_prefix_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2021,7 +2021,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto* rest = rest_ioctx_for_list(s3_uri);
+  auto rest = rest_ioctx_for_list(s3_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2091,10 +2091,11 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   return it->second;
 }
 
-sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list(std::string_view path)
+std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
+  std::string_view path)
 {
-  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful, path);
-  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(
+    ioctx_for_type(sirius::io::io_context_type::restful, path));
 }
 
 void sirius_scan_manager::install_s3_config(std::string_view path,

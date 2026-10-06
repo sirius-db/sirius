@@ -1342,7 +1342,8 @@ TEST_CASE("SIRIUS_S3 secret authenticates an uppercase-scheme parquet glob",
 
   s3_secret_only_sql_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
-  require_query_ok(fixture.con, create_sirius_s3_secret_sql(*env, "uppercase_glob"));
+  require_query_ok(
+    fixture.con, create_sirius_s3_secret_sql(*env, "uppercase_glob", "s3://" + env->bucket + "/"));
 
   auto uri = s3_uri(env->bucket, "root_*.parquet");
   uri.replace(0, 2, "S3");
@@ -1350,6 +1351,38 @@ TEST_CASE("SIRIUS_S3 secret authenticates an uppercase-scheme parquet glob",
   auto result         = require_query_ok(fixture.con, gpu_execution_sql(scan_sql));
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 50);
+}
+
+TEST_CASE("S3 LIST keeps its REST context alive while credentials rotate",
+          "[s3][integration][filesystem][secret][rotation]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto sirius_ctx =
+    fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& manager      = sirius_ctx->get_scan_manager();
+  auto const scope   = "s3://" + env->bucket;
+  auto const prefix  = scope + "/glob/multi/";
+  auto rotated       = fixture.config_env.object_store();
+  rotated.tls_verify = !rotated.tls_verify;
+
+  std::size_t pages = 0;
+  manager.list_objects_paged(prefix,
+                             /*page_size=*/1,
+                             [&](sirius::io::rest::s3::list_objects_v2_page const&) {
+                               ++pages;
+                               if (pages == 1) {
+                                 // Replacing the final scope retires the registry's owner of the
+                                 // old context. The LIST call must retain its own shared owner
+                                 // until all pages have been consumed.
+                                 manager.install_s3_config(scope, rotated);
+                               }
+                               return true;
+                             });
+  CHECK(pages >= 2);
 }
 
 TEST_CASE("transparent S3 read_parquet expands globbed parquet files",

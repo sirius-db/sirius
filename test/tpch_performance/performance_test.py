@@ -373,13 +373,6 @@ class S3Input:
     """
 
     def __init__(self, source, session=None):
-        try:
-            from botocore.exceptions import ClientError
-        except ImportError as exc:
-            raise RuntimeError(
-                "S3 input requires boto3 in the Python environment"
-            ) from exc
-
         uri = urlsplit(source)
         if uri.scheme.lower() != "s3" or not uri.netloc or uri.query or uri.fragment:
             raise ValueError("S3 --input must be s3://bucket/directory")
@@ -407,8 +400,8 @@ class S3Input:
         s3 = self.session.client("s3", region_name=bootstrap_region)
         try:
             response = s3.head_bucket(Bucket=self.bucket)
-        except ClientError as exc:
-            response = exc.response
+        except Exception as exc:
+            response = getattr(exc, "response", {})
             headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
             if not headers.get("x-amz-bucket-region"):
                 raise RuntimeError(

@@ -13,9 +13,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from botocore.exceptions import ClientError
-
 import performance_test as benchmark
+
+
+class FakeClientError(Exception):
+    def __init__(self, response):
+        super().__init__("fake S3 client error")
+        self.response = response
 
 
 class FakeS3Client:
@@ -30,7 +34,7 @@ class FakeS3Client:
             "ResponseMetadata": {"HTTPHeaders": {"x-amz-bucket-region": self.region}}
         }
         if self.head_error:
-            raise ClientError({**response, "Error": {"Code": "403"}}, "HeadBucket")
+            raise FakeClientError({**response, "Error": {"Code": "403"}})
         return response
 
     def get_paginator(self, operation):

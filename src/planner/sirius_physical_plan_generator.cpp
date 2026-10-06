@@ -1070,8 +1070,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return make_gpu_scan_leaf(
-    build_iceberg_table_info(scan, op_params, context), scan, op_params, mode, sirius_ctx.get());
+  auto table_info = build_iceberg_table_info(scan, op_params, context);
+  // Iceberg resolves manifests into parquet data files. Some files may not be opened during
+  // binding, so install each path's credential snapshot before the ingestible opens them later.
+  install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
+  return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
 }
 
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,

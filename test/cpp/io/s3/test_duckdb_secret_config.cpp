@@ -98,6 +98,11 @@ TEST_CASE("Sirius S3 secrets resolve without httpfs and rotate by path", "[s3][s
   CHECK(matching.session_token == "first-token");
   CHECK_FALSE(matching.tls_verify);
 
+  auto const uppercase_scheme = sirius::io::s3::resolve_duckdb_s3_secret(
+    *con.context, "S3://bucket/data/CaseSensitive.parquet", defaults);
+  CHECK(uppercase_scheme.access_key == "first-key");
+  CHECK(uppercase_scheme.secret_key == "first-secret");
+
   auto const outside_scope = sirius::io::s3::resolve_duckdb_s3_secret(
     *con.context, "s3://bucket/data_elsewhere/table.parquet", defaults);
   CHECK(outside_scope.endpoint == "https://yaml-endpoint");

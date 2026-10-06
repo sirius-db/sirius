@@ -1039,8 +1039,9 @@ class sirius_scan_manager {
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
-  /// backend cannot be built.  The returned ioctx stays owned by this manager.
-  sirius::io::rest::rest_ioctx* rest_ioctx_for_list(std::string_view path);
+  /// backend cannot be built. The caller shares ownership for the full LIST so
+  /// credential rotation cannot retire the context while a request is in flight.
+  std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
