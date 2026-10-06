@@ -29,22 +29,45 @@ on:
     # Dry-run trigger: any PR touching this file exercises every read-only step (Distribution
     # run lookup, artifact download/verify/rename, DuckDB version cross-check, manifest and
     # notes generation) against real data on main, without creating/editing/publishing anything.
-    # The mutating steps below are gated to workflow_dispatch only. This lets us catch script
-    # bugs in review instead of discovering them after merging and dispatching for real.
+    # The mutating steps below are gated to workflow_dispatch (and workflow_run, see below) only.
+    # This lets us catch script bugs in review instead of discovering them after merging and
+    # dispatching for real.
     paths:
       - ".github/workflows/release.yml"
+  workflow_run:
+    # Automatic latest: fires on every completion of Distribution on main, regardless of outcome
+    # or which event triggered it. `branches: [main]` filters at the trigger level (GitHub never
+    # even starts the run for a Distribution completion on another branch); the job-level `if:`
+    # below filters the rest - down to only the case that should actually publish, a successful,
+    # push-triggered run.
+    workflows: [Distribution]
+    types: [completed]
+    branches: [main]
 
 jobs:
-  manual-release:
-    name: manual-release (${{ inputs.mode || 'pr-dry-run' }})
-    if: github.repository == 'sirius-db/sirius'
+  release:
+    name: release (${{ inputs.mode || (github.event_name == 'workflow_run' && 'auto-latest') || 'pr-dry-run' }})
+    # workflow_run fires for every Distribution completion on main, success or not, and for
+    # every triggering event (push, pull_request, merge_group) - branch is already filtered by
+    # the trigger's `branches: [main]` above. Only a successful, push-triggered run should
+    # actually publish; every other workflow_run completion is a no-op skip here, not a failure,
+    # since Distribution failing isn't this workflow's problem to report on.
+    if: >-
+      github.repository == 'sirius-db/sirius' &&
+      (github.event_name != 'workflow_run' ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push'))
     runs-on: ubuntu-24.04
     concurrency:
       # workflow_dispatch runs serialize by mode (real publishers to the same tag must queue
-      # behind each other). pull_request dry-runs use the PR number instead of a shared
-      # "pr-dry-run" bucket, so unrelated PRs touching this file don't queue behind each other,
-      # only re-pushes to the *same* PR do.
-      group: release-${{ inputs.mode || format('pr-{0}', github.event.pull_request.number) }}
+      # behind each other). workflow_run (automatic latest) joins the same "release-latest"
+      # bucket as a manual `mode: latest` dispatch, so an automatic publish and a manual
+      # `mode: latest` dispatch (e.g. someone re-running this workflow by hand after the
+      # automatic workflow_run publish failed or was skipped) can never race each other.
+      # pull_request dry-runs use the PR number instead of a shared "pr-dry-run" bucket, so
+      # unrelated PRs touching this file don't queue behind each other, only re-pushes to the
+      # *same* PR do.
+      group: release-${{ inputs.mode || (github.event_name == 'workflow_run' && 'latest') || format('pr-{0}', github.event.pull_request.number) }}
       queue: max
       # Do not add cancel-in-progress here, even by copying a pattern from another workflow:
       # queue: max is what bounds concurrent runs for this group. Mixing in cancel-in-progress
@@ -106,6 +129,11 @@ jobs:
             # string-equality checks against API-returned SHAs (e.g. the tag-move assertions)
             # compare correctly regardless of how the input was cased.
             sha="$(echo "$SHA_INPUT" | tr 'A-F' 'a-f')"
+          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+            # The exact commit Distribution just finished building, from the triggering event
+            # itself, not a live lookup. No race: this is tied to one specific completed run,
+            # unlike git rev-parse origin/main below, which chases whatever main currently is.
+            sha="$WORKFLOW_RUN_HEAD_SHA"
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             # Dry-run: target the most recent main commit that already has a completed,
             # successful, push-triggered Distribution run, not literal main HEAD. Distribution's
@@ -130,6 +158,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           SHA_INPUT: ${{ inputs.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
       - name: Resolve release tag
         id: tag
@@ -142,12 +171,45 @@ jobs:
         env:
           MODE: ${{ inputs.mode }}
 
-      - name: Find Distribution run for target commit
-        id: run
+      - name: Check latest is not stale
+        id: staleness
+        if: steps.tag.outputs.tag == 'latest'
         run: |
           set -euo pipefail
-          run_id=$(gh api "repos/${REPO}/actions/workflows/distribution.yml/runs?head_sha=${TARGET_SHA}&status=success" \
-            --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main")] | .[0].id // empty')
+          current_sha=$(git rev-parse -q --verify refs/tags/latest 2>/dev/null || true)
+          if [ -z "$current_sha" ]; then
+            # No latest tag published yet - nothing to compare against, proceed.
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          elif git merge-base --is-ancestor "$current_sha" "$TARGET_SHA"; then
+            # Target is the same commit as, or a descendant of, what's currently published.
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            # Target is older than, or has diverged from, what's currently live. Only reachable
+            # via workflow_run - e.g. a manually re-run old Distribution build, or a race with a
+            # newer publish that already landed. Manual `mode: latest` dispatches can't hit this
+            # branch: they always resolve to live origin/main HEAD (see the "Resolve target SHA"
+            # step above), which can never be older than the already-published latest tag.
+            # Skip, don't error: expected no-op, not a failure.
+            echo "::warning::Target ${TARGET_SHA} is not newer than the currently-published latest (${current_sha}). Skipping publish."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+
+      - name: Find Distribution run for target commit
+        id: run
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            # Already known from the triggering event itself - the job-level `if:` already
+            # confirmed this run was a successful, push-triggered build on main, no need to
+            # search for it again.
+            run_id="$WORKFLOW_RUN_ID"
+          else
+            run_id=$(gh api "repos/${REPO}/actions/workflows/distribution.yml/runs?head_sha=${TARGET_SHA}&status=success" \
+              --jq '[.workflow_runs[] | select(.event == "push" and .head_branch == "main")] | .[0].id // empty')
+          fi
           if [ -z "$run_id" ]; then
             echo "::error::No successful push-triggered Distribution run found for ${TARGET_SHA}. Re-run the existing Distribution run for that commit (or push a new commit), then try again. This workflow never triggers a new Distribution build itself." >&2
             exit 1
@@ -157,8 +219,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
 
       - name: Download extension artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           gh run download "$RUN_ID" \
             --repo "$REPO" \
@@ -171,6 +236,7 @@ jobs:
 
       - name: Verify and rename artifacts
         id: artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           mkdir -p renamed
@@ -214,11 +280,24 @@ jobs:
           echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
 
       - name: Compress artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # GitHub Releases rejects any single asset >= 2 GiB; cuda12 builds land right at that
         # line. All 4 variants are compressed for consistency, not just the ones that need it.
-        run: gzip -9 renamed/*.duckdb_extension
+        # Looped per-file (not a single `gzip -9 renamed/*.duckdb_extension` wildcard) so progress
+        # is visible: compressing all 4 takes close to 5 minutes, and the wildcard form runs
+        # silently the whole time, which made a legitimately-still-running step look hung during
+        # this workflow's own testing.
+        run: |
+          set -euo pipefail
+          for f in renamed/*.duckdb_extension; do
+            before=$(stat -c%s "$f")
+            gzip -9 "$f"
+            after=$(stat -c%s "$f.gz")
+            echo "$(basename "$f"): ${before} -> ${after} bytes"
+          done
 
       - name: Cross-check DuckDB version against distribution.yml
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           # Capture to a variable first, then grep/sed against the in-memory string, not a live
@@ -238,20 +317,32 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
+      - name: Copy LICENSE into the release assets
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
+        # The repo's own Apache 2.0 LICENSE, bundled with every release. Third-party dependency
+        # attribution (a generated NOTICE) is tracked separately: #1979. Read via `git show` at
+        # TARGET_SHA, not a plain `cp`, so this matches the commit actually being released even
+        # when the checked-out ref differs from it (e.g. mode=stable promoting an older commit).
+        run: git show "${TARGET_SHA}:LICENSE" > renamed/LICENSE
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+
       - name: Build manifest
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           cd renamed
           {
             echo "# source_sha=${TARGET_SHA}"
             echo "# run_id=${RUN_ID}"
-            sha256sum *.duckdb_extension.gz
+            sha256sum *.duckdb_extension.gz LICENSE
           } > MANIFEST.sha256
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           RUN_ID: ${{ steps.run.outputs.run_id }}
 
       - name: Build release notes
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # Content lives in .github/workflows/release/*.md, not inline here: GETTING_STARTED.md
         # is the shared walkthrough (requirements, install, download, unsigned-extensions,
         # load-and-try) used by both modes, with {{PLACEHOLDER}} tokens filled in below;
@@ -305,15 +396,50 @@ jobs:
                   capture_output=True,
               ).returncode == 0
               rev_range = f"stable..{target_sha}" if has_stable else target_sha
-              # -n 50 limits git log's own output; no pipe to a truncating consumer (head/etc.)
-              # that could SIGPIPE it under a shell's pipefail, not a concern here either way
-              # since this runs as one subprocess call, not a shell pipeline.
+              # When a stable tag exists, show every commit since it, no cap - that's the whole
+              # point of a "what's changed since stable" changelog. Only the no-stable fallback
+              # (the entire repo history up to target_sha) gets capped at 50, so it doesn't
+              # overwhelm the release notes. -n limits git log's own output; no pipe to a
+              # truncating consumer (head/etc.) that could SIGPIPE it under a shell's pipefail,
+              # not a concern here either way since this runs as one subprocess call, not a shell
+              # pipeline.
+              log_args = ["git", "log", rev_range, "--oneline"]
+              if not has_stable:
+                  log_args[2:2] = ["-n", "50"]
               log = subprocess.run(
-                  ["git", "log", "-n", "50", rev_range, "--oneline"],
+                  log_args,
                   capture_output=True, text=True, check=True,
               ).stdout
-              changes = "\n".join(f"- {line}" for line in log.splitlines())
-              notes += "\n\n## Changes\n\n" + changes + "\n"
+              lines = [f"- {line}" for line in log.splitlines()]
+              heading = "## Changes since `stable`" if has_stable else "## Changes (last 50 commits)"
+
+              # GitHub hard-caps a release body at 125,000 characters (HTTP 422 if exceeded) - with
+              # no cap here, a stable tag that's gone stale for a long stretch could blow past that
+              # and fail the publish on the very last step, after staging/verification already
+              # succeeded. Keep a 15,000-char safety margin below the real limit for the rest of
+              # the notes (GETTING_STARTED.md + LATEST.md, already in `notes` above) plus encoding
+              # slop, and truncate the commit list to fit instead of letting the API call fail.
+              # The no-stable fallback is already capped at 50 short lines, well under any
+              # reasonable budget, so this is a no-op there in practice.
+              BODY_LIMIT = 125_000
+              SAFETY_MARGIN = 15_000
+              budget = BODY_LIMIT - SAFETY_MARGIN - len(notes) - len(heading)
+              changes = "\n".join(lines)
+              if len(changes) > budget and has_stable:
+                  kept = []
+                  used = 0
+                  compare_url = f"https://github.com/{repo}/compare/stable...{target_sha}"
+                  reserved = len(compare_url) + 40  # room for the "... and N more" line itself
+                  for line in lines:
+                      if used + len(line) + 1 > budget - reserved:
+                          break
+                      kept.append(line)
+                      used += len(line) + 1
+                  omitted = len(lines) - len(kept)
+                  kept.append(f"- ... and {omitted} more commit(s), see the full history: {compare_url}")
+                  changes = "\n".join(kept)
+
+              notes += f"\n\n{heading}\n\n" + changes + "\n"
 
           with open("NOTES.md", "w") as f:
               f.write(notes)
@@ -326,7 +452,7 @@ jobs:
           DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
       - name: Stage assets on a scratch release for verification
-        if: github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         # Staged under "$TAG-pending", never the live "$TAG": the live release/tag/assets stay
         # published and downloadable for the entire slow part (upload, download, checksum
         # verify). Only the swap step below touches the live release, and that step is fast
@@ -343,16 +469,16 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Upload assets to the scratch release
-        if: github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         run: |
           gh release upload "$PENDING_TAG" \
-            renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 --clobber
+            renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE --clobber
         env:
           GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Verify staged assets
-        if: github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           tmp=$(mktemp -d)
@@ -366,7 +492,7 @@ jobs:
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Publish the live release
-        if: github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         # Assets are already verified above, so everything here is the fast swap: move/create
         # the live tag, replace its assets in place (--clobber replaces one file at a time, never
         # a bulk unpublish), and update metadata. The live release is never flipped to draft, so
@@ -380,14 +506,14 @@ jobs:
             # Tag exists - force-move it. gh release edit --target does NOT retarget an
             # existing tag, so this has to go through the git refs API directly.
             gh api -X PATCH "repos/${REPO}/git/refs/tags/$TAG" -f sha="$TARGET_SHA" -F force=true
-            gh release upload "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 --clobber
+            gh release upload "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE --clobber
             gh release edit "$TAG" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           else
             # First-ever publish of this tag - no live release exists yet to protect, so create
             # and publish it directly with assets attached, no staging swap needed. --target is
             # required: without it, gh release create would auto-create the tag at whatever main
             # HEAD is right now, not the target SHA.
-            gh release create "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 \
+            gh release create "$TAG" renamed/*.duckdb_extension.gz renamed/MANIFEST.sha256 renamed/LICENSE \
               --target "$TARGET_SHA" --title "${TAG} (${short_sha})" --notes-file NOTES.md --prerelease=true
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
@@ -402,23 +528,23 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Clean up the scratch release
-        if: always() && github.event_name == 'workflow_dispatch'
+        if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         run: gh release delete "$PENDING_TAG" --yes --cleanup-tag 2>/dev/null || true
         env:
           GH_TOKEN: ${{ secrets.SIRIUS_RELEASE_TOKEN }}
           PENDING_TAG: ${{ steps.tag.outputs.tag }}-pending
 
       - name: Post-publish assertion
-        if: github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') && steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           out=$(gh release view "$TAG" --json isDraft,isPrerelease,assets)
           is_draft=$(echo "$out" | jq -r .isDraft)
           is_pre=$(echo "$out" | jq -r .isPrerelease)
           asset_count=$(echo "$out" | jq '.assets | length')
-          # 5 = 4 .duckdb_extension files + MANIFEST.sha256
-          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -ne 5 ]; then
-            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets=5)" >&2
+          # 6 = 4 .duckdb_extension files + MANIFEST.sha256 + LICENSE
+          if [ "$is_draft" != "false" ] || [ "$is_pre" != "true" ] || [ "$asset_count" -ne 6 ]; then
+            echo "::error::Post-publish state looks wrong: draft=$is_draft prerelease=$is_pre assets=$asset_count (expected draft=false prerelease=true assets=6)" >&2
             exit 1
           fi
           resolved=$(gh api "repos/${REPO}/git/refs/tags/$TAG" --jq .object.sha)
