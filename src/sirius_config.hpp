@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -169,6 +170,13 @@ struct operator_params {
 
   /// Enable dynamic filters for eligible hash joins.
   bool enable_dynamic_filter = true;
+
+  /// Enable Bloom accumulation for non-broadcast hash builds with more than one partition.
+  bool enable_dynamic_filter_multi_partition = true;
+
+  /// Aggregate aligned Bloom-array budget per GPU for accumulation; must be greater than zero.
+  uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
+    sirius::op::default_max_dynamic_filter_bloom_bytes_per_gpu;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;

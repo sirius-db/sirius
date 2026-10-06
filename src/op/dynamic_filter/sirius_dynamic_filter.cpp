@@ -468,11 +468,18 @@ struct sirius_dynamic_filter_set::state {
   struct producer_state {
     bool terminal     = false;
     completion result = completion::SKIPPED;
+    /// Pushes the producer may still make, per planned target column.
+    std::vector<std::pair<std::size_t, std::size_t>> room;
+  };
+
+  /// The filters on one target column, with capacity for every push its producers may still make.
+  struct column_filters {
+    std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters;
+    std::size_t reserved = 0;  ///< Pushes registered for the column; never below `filters.size()`
   };
 
   mutable std::mutex mutex;
-  std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
-    filters;
+  std::unordered_map<std::size_t, column_filters> filters;
   std::unordered_set<std::size_t> ignored_columns;
   std::set<std::size_t> planned_columns;
   std::vector<producer_state> producers;
@@ -512,17 +519,23 @@ sirius_dynamic_filter_set::producer::~producer()
   finish();
 }
 
+//===----------sirius_dynamic_filter_set::producer----------===//
 bool sirius_dynamic_filter_set::producer::push_filter(
-  std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const
+  std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const noexcept
 {
   if (!_channel || !filter) { return false; }
   std::scoped_lock lock(_channel->mutex);
-  if (_channel->producers[_index].terminal ||
-      !_channel->accepting.load(std::memory_order_relaxed) ||
+  auto& self = _channel->producers[_index];
+  if (self.terminal || !_channel->accepting.load(std::memory_order_relaxed) ||
       _channel->ignored_columns.contains(col_idx)) {
     return false;
   }
-  _channel->filters[col_idx].push_back(std::move(filter));
+  auto const room =
+    std::ranges::find(self.room, col_idx, &std::pair<std::size_t, std::size_t>::first);
+  if (room == self.room.end() || room->second == 0) { return false; }
+  --room->second;
+  // Registration reserved this push, so appending does not allocate.
+  _channel->filters.find(col_idx)->second.filters.push_back(std::move(filter));
   _channel->filter_count.fetch_add(1, std::memory_order_release);
   return true;
 }
@@ -537,14 +550,15 @@ void sirius_dynamic_filter_set::producer::finish(completion result) const noexce
   slot.terminal = true;
   ++_channel->completed_producers;
 }
+//===--------------------------------------------------===//
 
 dynamic_filter_snapshot sirius_dynamic_filter_set::snapshot() const
 {
   std::scoped_lock lock(_state->mutex);
   dynamic_filter_snapshot result;
   result._entries.reserve(_state->filter_count.load(std::memory_order_relaxed));
-  for (auto const& [column, filters] : _state->filters) {
-    for (auto const& filter : filters) {
+  for (auto const& [column, column_state] : _state->filters) {
+    for (auto const& filter : column_state.filters) {
       result._entries.push_back({column, filter});
     }
   }
@@ -560,11 +574,26 @@ void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& c
 }
 
 sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer(
-  std::vector<std::size_t> planned_target_columns)
+  std::vector<std::size_t> planned_target_columns, std::size_t filters_per_column)
 {
   std::scoped_lock lock(_state->mutex);
   if (_state->registration_frozen) {
     throw std::logic_error("Dynamic-filter producers must register before execution");
+  }
+  state::producer_state registered;
+  for (auto const column : planned_target_columns) {
+    auto room =
+      std::ranges::find(registered.room, column, &std::pair<std::size_t, std::size_t>::first);
+    if (room == registered.room.end()) { room = registered.room.insert(room, {column, 0}); }
+    room->second += filters_per_column;
+  }
+  // Reserve every push before the producer exists, so a failed allocation registers nothing.
+  for (auto const& [column, pushes] : registered.room) {
+    auto& column_state = _state->filters[column];
+    column_state.filters.reserve(column_state.reserved + pushes);
+  }
+  for (auto const& [column, pushes] : registered.room) {
+    _state->filters[column].reserved += pushes;
   }
   if (planned_target_columns.empty()) {
     _state->unscoped.store(true, std::memory_order_release);
@@ -572,7 +601,7 @@ sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer
     _state->planned_columns.insert(planned_target_columns.begin(), planned_target_columns.end());
   }
   auto const index = _state->producers.size();
-  _state->producers.emplace_back();
+  _state->producers.push_back(std::move(registered));
   _state->producer_count.fetch_add(1, std::memory_order_release);
   return producer{_state, index};
 }

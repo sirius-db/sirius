@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
@@ -527,7 +528,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     } catch (const thrust::system_error& cuda_err) {
       auto err = static_cast<cudaError_t>(cuda_err.code().value());
-      if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidValue) {
+      if (is_retryable_launch_error(err)) {
         SIRIUS_LOG_WARN(
           "Pipeline {}: CUDA launch error [{}] {} at operator {} (id={}, index {}/{}), "
           "rescheduling task {}",

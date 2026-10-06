@@ -33,7 +33,7 @@ target_include_directories(
 )
 
 target_link_libraries(sirius_unittest ${sirius_test_library} duckdb_static
-                      ZLIB::ZLIB Catch2::Catch2)
+                      ZLIB::ZLIB Catch2::Catch2 ${CMAKE_DL_LIBS})
 
 target_include_directories(
   sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
@@ -53,6 +53,19 @@ endif()
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
+
+# Isolated opt-in host allocation fault tests; the runner supplies exact
+# call-site ranges.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_library(sirius_host_allocation_fault SHARED EXCLUDE_FROM_ALL
+              test/cpp/utils/dynamic_filter_host_allocation_fault.cpp)
+  target_link_libraries(sirius_host_allocation_fault PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(
+    sirius_host_allocation_fault
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_SCAN_FOR_MODULES OFF)
+endif()
 
 set_target_properties(
   sirius_unittest

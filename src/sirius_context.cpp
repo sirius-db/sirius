@@ -772,6 +772,11 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // in cucascade's converter is a correct alternate path.
   {
     if (active_gpu_ids.size() >= 2) {
+      // cucascade's first peer-DMA query probes every visible GPU pair and caches the results. Run
+      // it here, before any pair is enabled below and even when no pair supports peer access, so
+      // later queries (dynamic-filter accumulation admission runs under a task-creation lock) only
+      // read the cache.
+      (void)cucascade::memory::probe_peer_dma_works(active_gpu_ids[0], active_gpu_ids[1]);
       peer_access_enabled_pairs_.reserve(active_gpu_ids.size() * (active_gpu_ids.size() - 1));
       for (int source_device : active_gpu_ids) {
         rmm::cuda_set_device_raii guard_i{rmm::cuda_device_id{source_device}};
