@@ -135,6 +135,12 @@ bool stream_session::drained(stream_id_t id) const
   return out.sink->drained(out.partition);
 }
 
+std::shared_ptr<batch_stream> stream_session::output_stream(stream_id_t id) const
+{
+  const auto& out = resolve_sink(id);
+  return out.sink->output_stream(out.partition);
+}
+
 void stream_session::fail_output(stream_id_t id, std::exception_ptr error)
 {
   // fail_output poisons all partitions of the sink (one pipeline = one sender).
