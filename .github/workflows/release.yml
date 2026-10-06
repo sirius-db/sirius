@@ -410,8 +410,35 @@ jobs:
                   log_args,
                   capture_output=True, text=True, check=True,
               ).stdout
-              changes = "\n".join(f"- {line}" for line in log.splitlines())
+              lines = [f"- {line}" for line in log.splitlines()]
               heading = "## Changes since `stable`" if has_stable else "## Changes (last 50 commits)"
+
+              # GitHub hard-caps a release body at 125,000 characters (HTTP 422 if exceeded) - with
+              # no cap here, a stable tag that's gone stale for a long stretch could blow past that
+              # and fail the publish on the very last step, after staging/verification already
+              # succeeded. Keep a 15,000-char safety margin below the real limit for the rest of
+              # the notes (GETTING_STARTED.md + LATEST.md, already in `notes` above) plus encoding
+              # slop, and truncate the commit list to fit instead of letting the API call fail.
+              # The no-stable fallback is already capped at 50 short lines, well under any
+              # reasonable budget, so this is a no-op there in practice.
+              BODY_LIMIT = 125_000
+              SAFETY_MARGIN = 15_000
+              budget = BODY_LIMIT - SAFETY_MARGIN - len(notes) - len(heading)
+              changes = "\n".join(lines)
+              if len(changes) > budget and has_stable:
+                  kept = []
+                  used = 0
+                  compare_url = f"https://github.com/{repo}/compare/stable...{target_sha}"
+                  reserved = len(compare_url) + 40  # room for the "... and N more" line itself
+                  for line in lines:
+                      if used + len(line) + 1 > budget - reserved:
+                          break
+                      kept.append(line)
+                      used += len(line) + 1
+                  omitted = len(lines) - len(kept)
+                  kept.append(f"- ... and {omitted} more commit(s), see the full history: {compare_url}")
+                  changes = "\n".join(kept)
+
               notes += f"\n\n{heading}\n\n" + changes + "\n"
 
           with open("NOTES.md", "w") as f:
