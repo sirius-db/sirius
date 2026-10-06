@@ -131,6 +131,25 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * applied. Editing or deleting the file after loading has no effect on this
    * builder. Loading does not discover hardware or resolve hardware-dependent values.
    *
+   * The [YAML configuration reference](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md)
+   * lists supported fields, defaults, byte units, and constraints. Settings belong
+   * under the top-level `sirius` key; omitted settings use built-in defaults.
+   * For example, `sirius.yaml` can contain:
+   * @code{.yaml}
+   * sirius:
+   *   topology:
+   *     num_gpus: 1
+   *   memory:
+   *     gpu:
+   *       usage_limit_bytes: 8Gi
+   *   executor:
+   *     pipeline:
+   *       num_threads: 4
+   * @endcode
+   *
+   * This method reads only the supplied path; the automatic config-file search
+   * described in the reference does not apply here.
+   *
    * @param path Configuration file to read; relative paths use the working directory.
    * @return A builder on success, otherwise an Error with code
    *         ErrorCode::configuration_io, ErrorCode::malformed_yaml,
