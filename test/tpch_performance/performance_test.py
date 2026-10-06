@@ -453,22 +453,6 @@ def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
             "Sirius defaults"
         )
 
-    # Fail now rather than after the first query was measured against a warm cache.
-    if not can_drop_os_cache():
-        detail = (
-            "passwordless sudo for /usr/bin/tee /proc/sys/vm/drop_caches is not "
-            "available, so the OS page cache cannot be dropped"
-        )
-        if profile["drop_os_cache_between"]:
-            problems.append(
-                f"--profile {profile_name} requires a cold page cache: {detail}"
-            )
-        else:
-            warnings.append(
-                f"{detail}; {label} wanted one drop at startup, so the first "
-                "query may read warm"
-            )
-
     if profile["reset_cache_between"] and engine == "cpu":
         warnings.append(
             f"--profile {profile_name} resets Sirius's cache between runs, which "
@@ -535,35 +519,14 @@ def derive_profile_config(overrides, config_path, benchmark_dir):
     return effective_path
 
 
-def can_drop_os_cache():
-    """Whether drop_os_cache() would work, without dropping anything.
-
-    Must name the exact command drop_os_cache runs: the sudoers rule is scoped
-    to `/usr/bin/tee /proc/sys/vm/drop_caches`, so probing anything else reports
-    "no sudo" on a correctly configured machine.
-    """
-    proc = subprocess.run(
-        ["sudo", "-n", "-l", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        capture_output=True,
-        text=True,
-    )
-    return proc.returncode == 0
-
-
 def drop_os_cache(source, data_source="parquet"):
-    """Drop OS filesystem cache. Requires passwordless sudo per CLAUDE.md."""
-    proc = subprocess.run(
-        ["sudo", "-n", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        input="3\n",
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Failed to drop OS cache. Set up passwordless sudo as described "
-            f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
-        )
+    """Evict the benchmark data files from the OS page cache.
 
+    Uses posix_fadvise(DONTNEED) per data file instead of writing to
+    /proc/sys/vm/drop_caches, so no sudo is needed. Unlike drop_caches this
+    only covers the benchmark's own files (not dentries/inodes or unrelated
+    cached files), and filesystems that ignore the hint will stay warm.
+    """
     if data_source == "duckdb":
         files = [source]
     elif is_s3_source(source):
@@ -1914,12 +1877,6 @@ def main():
     # profile asked for is kept.
     if args.mode is not None:
         mode_props = MODE_PROFILES[args.mode]
-        if not can_drop_os_cache():
-            raise SystemExit(
-                f"--mode {args.mode} drops the OS page cache: passwordless sudo "
-                "for /usr/bin/tee /proc/sys/vm/drop_caches is not available "
-                "(see test/tpch_performance/CLAUDE.md)"
-            )
         profile = {
             **profile,
             "ordering": mode_props["ordering"],
@@ -1997,12 +1954,8 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    # Best-effort: a profile that REQUIRES a cold cache already failed the
-    # sanity check above when sudo is unavailable, so reaching here without it
-    # means the run only wanted the one drop at startup and can proceed warm.
-    if can_drop_os_cache():
-        log("Dropping OS page cache")
-        drop_os_cache(source, args.data_source)
+    log("Dropping OS page cache")
+    drop_os_cache(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = RuntimeCsv(csv.writer(f), len(queries))
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
