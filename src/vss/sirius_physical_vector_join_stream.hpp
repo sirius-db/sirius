@@ -104,6 +104,16 @@ class vector_chunk_source {
                                     ::cucascade::memory::memory_space& space,
                                     rmm::cuda_stream_view stream) = 0;
 
+  /// As stage(), for the chunk a task holds for its whole run (its probe batch). The copy is
+  /// allocated on @p stream, the task's own, so it draws on the reservation the task was admitted
+  /// with -- the memory estimate already counts this chunk -- rather than committing a second.
+  virtual staged_vector_chunk stage_for_task(std::size_t i,
+                                             ::cucascade::memory::memory_space& space,
+                                             rmm::cuda_stream_view stream)
+  {
+    return stage(i, space, stream);
+  }
+
   /// True when staging performs a host-to-device copy, i.e. the data is not resident.
   [[nodiscard]] virtual bool is_streaming() const = 0;
 

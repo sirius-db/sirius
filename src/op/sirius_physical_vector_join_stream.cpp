@@ -176,6 +176,21 @@ class host_pinned_chunk_source : public vector_chunk_source {
                             cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream) override
   {
+    return copy_in(i, space, stream, /*own_reservation=*/true);
+  }
+  staged_vector_chunk stage_for_task(std::size_t i,
+                                     cucascade::memory::memory_space& space,
+                                     rmm::cuda_stream_view stream) override
+  {
+    return copy_in(i, space, stream, /*own_reservation=*/false);
+  }
+
+ private:
+  staged_vector_chunk copy_in(std::size_t i,
+                              cucascade::memory::memory_space& space,
+                              rmm::cuda_stream_view stream,
+                              bool own_reservation)
+  {
     auto const& chunk = _pin.host_chunks.at(i);
     if (!chunk) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] host chunk " +
@@ -187,13 +202,16 @@ class host_pinned_chunk_source : public vector_chunk_source {
     auto data_rep    = uncompressed_host_chunk(*chunk).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
 
-    // Draw the staged copy from the task's budget rather than silently exceeding it. A null
-    // reservation is retried once a downgrade has freed memory, unless the chunk could never fit.
-    std::shared_ptr<cucascade::memory::reservation> reservation{
-      space.make_reservation_or_null(bytes)};
-    if (!reservation) {
-      vss::throw_staging_shortfall(
-        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
+    // A chunk staged for the corpus fold gets a reservation of its own: it is copied on the
+    // staging stream, which no task reservation covers. A null one is retried once a downgrade
+    // has freed memory, unless the chunk could never fit.
+    std::shared_ptr<cucascade::memory::reservation> reservation;
+    if (own_reservation) {
+      reservation = space.make_reservation_or_null(bytes);
+      if (!reservation) {
+        vss::throw_staging_shortfall(
+          space, bytes, "[sirius_physical_vector_join_stream] host chunk " + std::to_string(i));
+      }
     }
 
     auto const batch_id = sirius::get_next_batch_id();
@@ -204,15 +222,19 @@ class host_pinned_chunk_source : public vector_chunk_source {
 
     {
       auto mut = batch->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(
-        sirius::converter_registry::get(), *reservation, stream);
+      if (reservation) {
+        mut.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), *reservation, stream);
+      } else {
+        mut.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), &space, stream);
+      }
       mut.rebind_stream(stream);  // the converter binds the copy to its own stream
     }
     auto const table = sirius::get_cudf_table_view(*batch);
     return staged_vector_chunk{table.column(0), std::move(batch), std::move(reservation)};
   }
 
- private:
   const scan_manager::pinned_entry& _pin;
   telemetry::batch_telemetry_info _telemetry_info;
   std::size_t _column_index{0};
@@ -283,6 +305,21 @@ class materialized_chunk_source : public vector_chunk_source {
                             cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream) override
   {
+    return resident(i, space, stream, /*own_reservation=*/true);
+  }
+  staged_vector_chunk stage_for_task(std::size_t i,
+                                     cucascade::memory::memory_space& space,
+                                     rmm::cuda_stream_view stream) override
+  {
+    return resident(i, space, stream, /*own_reservation=*/false);
+  }
+
+ private:
+  staged_vector_chunk resident(std::size_t i,
+                               cucascade::memory::memory_space& space,
+                               rmm::cuda_stream_view stream,
+                               bool own_reservation)
+  {
     auto batch = fetch(_batch_ids.at(i));
     auto ro    = batch->to_read_only();
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
@@ -294,8 +331,8 @@ class materialized_chunk_source : public vector_chunk_source {
     }
 
     // Spilled: copy just the vector column back, the rest of the batch is dead weight on the
-    // wire. Mirrors the HOST-tier pin path, including drawing from the task's own budget so a
-    // chunk that does not fit surfaces as a sizing error instead of silently overcommitting.
+    // wire. As on the HOST-tier pin path, a chunk staged for the corpus fold reserves its own
+    // copy (spilling first if it must), while the task's probe chunk draws on the task's budget.
     // The slice references the batch's host allocation, so the borrow is held across the copy.
     // A batch the engine took all the way to disk first comes back to host through the engine.
     if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
@@ -305,10 +342,13 @@ class materialized_chunk_source : public vector_chunk_source {
     auto data_rep    = host_repr(ro).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
 
-    std::shared_ptr<cucascade::memory::reservation> reservation{reserve_or_spill(space, bytes)};
-    if (!reservation) {
-      vss::throw_staging_shortfall(
-        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
+    std::shared_ptr<cucascade::memory::reservation> reservation;
+    if (own_reservation) {
+      reservation = reserve_or_spill(space, bytes);
+      if (!reservation) {
+        vss::throw_staging_shortfall(
+          space, bytes, "[sirius_physical_vector_join_stream] batch " + std::to_string(i));
+      }
     }
 
     auto const batch_id = sirius::get_next_batch_id();
@@ -318,8 +358,13 @@ class materialized_chunk_source : public vector_chunk_source {
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
     {
       auto mut = staged->to_mutable();
-      mut.convert_to<cucascade::gpu_table_representation>(
-        sirius::converter_registry::get(), *reservation, stream);
+      if (reservation) {
+        mut.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), *reservation, stream);
+      } else {
+        mut.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), &space, stream);
+      }
       mut.rebind_stream(stream);  // the converter binds the copy to its own stream
     }
     auto const table = sirius::get_cudf_table_view(*staged);
@@ -1310,7 +1355,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // Held for the whole task: every corpus chunk is searched against this probe chunk. A copy
   // staged back from the host is freed on the compute stream (the chunk sources rebind it), so
   // dropping it as execute returns, before the task's stream sync, is ordered behind the searches.
-  auto staged_probe  = _probe->stage(left_idx, *mem_space, stream);
+  auto staged_probe  = _probe->stage_for_task(left_idx, *mem_space, stream);
   auto const queries = vss::list_column_as_dataset_view(staged_probe.view, dim);
   auto const n_left  = static_cast<std::int64_t>(queries.extent(0));
   // An empty probe batch joins to nothing; the search libraries refuse a zero-row query matrix.
