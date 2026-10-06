@@ -139,19 +139,6 @@ std::string match_header(std::string_view line, std::string_view name)
   return std::string(val);
 }
 
-/// Header callback: capture Content-Range and Retry-After.
-size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
-{
-  auto* hc           = static_cast<header_capture*>(userdata);
-  size_t const bytes = size * nitems;
-  std::string_view line(buffer, bytes);
-  if (auto v = match_header(line, "content-range"); !v.empty()) {
-    hc->content_range = std::move(v);
-  }
-  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
-  return bytes;
-}
-
 /// True iff @p line is an HTTP status line ("HTTP/..."), i.e. the start of a
 /// (possibly interim) response's header block within one transfer.
 bool is_http_status_line(std::string_view line) noexcept
@@ -160,10 +147,26 @@ bool is_http_status_line(std::string_view line) noexcept
          ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
 }
 
+/// Header callback: capture Content-Range, Retry-After and ETag of the response
+/// block currently being received; a new status line starts a new block.
+size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+  auto* hc           = static_cast<header_capture*>(userdata);
+  size_t const bytes = size * nitems;
+  std::string_view line(buffer, bytes);
+  if (is_http_status_line(line)) { hc->reset(); }
+  if (auto v = match_header(line, "content-range"); !v.empty()) {
+    hc->content_range = std::move(v);
+  }
+  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
+  return bytes;
+}
+
 /// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
-/// object's ETag.  Separate from @c header_capture so the async data-GET path
-/// parses nothing it does not consume.  The ETag resets on every status line,
-/// so interim responses (proxy CONNECT) within one transfer leave no residue.
+/// object's ETag.  Kept apart from @c header_capture, whose Content-Range the
+/// HEAD never receives.  The ETag resets on every status line, so interim
+/// responses (proxy CONNECT) within one transfer leave no residue.
 struct head_capture {
   std::string retry_after;
   std::string etag;

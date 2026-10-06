@@ -56,8 +56,15 @@ struct string_hash {
  * skip the parse — without depending on whether the prefetching cache
  * has been initialised.
  *
- * The store is intentionally minimal: register / lookup, no eviction.
- * Entries live for the ioctx's lifetime.
+ * The key is the object's *generation* (path plus validator for an object
+ * store), so metadata parsed from one version of an object is never handed to
+ * a reader of another.  The store keeps at most one generation per path: a
+ * registration replaces whatever that path held, whichever generation it was
+ * (validators are opaque, not ordered), and a reader that then misses simply
+ * re-parses.  Metadata already handed out stays valid for its holders.
+ *
+ * Register / lookup only, no eviction beyond that replacement; entries live
+ * for the ioctx's lifetime.
  */
 class metadata_store {
  public:
@@ -67,29 +74,34 @@ class metadata_store {
   metadata_store(metadata_store&&)                 = delete;
   metadata_store& operator=(metadata_store&&)      = delete;
 
-  /// Record (or overwrite) the metadata for @p obj's cache key.  A null
-  /// @p metadata is silently ignored — symmetric with the older
-  /// @c prefetching_cache::register_metadata contract so callers that
+  /// Record the metadata for @p obj's cache key, dropping any other generation
+  /// of the same path.  A null @p metadata is silently ignored — symmetric with
+  /// the older @c prefetching_cache::register_metadata contract so callers that
   /// pass through pre-parsed metadata don't have to null-check.
   void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
+
+  /// True when some generation of @p object_path is registered.  A hint for
+  /// choosing how to open the object (a known footer needs no probe), never a
+  /// source of metadata: only an exact-key lookup is.
+  [[nodiscard]] bool has_path(std::string_view object_path) const noexcept;
 
   /// Look up the metadata for @p obj's cache key.  Returns nullptr on
   /// miss.
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
 
-  /// As above but keyed directly by @c raw_file_cache_id() — for callers that
-  /// know the path but have not built an io_object yet.  Returns nullptr on miss.
-  /// Looked up heterogeneously, so passing a @c string_view or a string literal
-  /// allocates nothing.
+  /// As above but keyed directly by @c raw_file_cache_id().  Returns nullptr on
+  /// miss.  Looked up heterogeneously, so passing a @c string_view or a string
+  /// literal allocates nothing.
   [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(std::string_view cache_key) const;
 
  private:
+  template <typename V>
+  using string_map = std::unordered_map<std::string, V, detail::string_hash, std::equal_to<>>;
+
   mutable std::shared_mutex _mtx;
-  std::unordered_map<std::string,
-                     std::shared_ptr<io_object_metadata>,
-                     detail::string_hash,
-                     std::equal_to<>>
-    _by_key;
+  string_map<std::shared_ptr<io_object_metadata>> _by_key;
+  /// The one registered generation key per object path.
+  string_map<std::string> _key_by_path;
 };
 
 }  // namespace sirius::io::cache

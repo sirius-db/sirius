@@ -55,15 +55,19 @@ struct buf_sink {
 
 /// Response headers the reactor inspects on completion.  @c content_range
 /// validates that a 206 honored the requested byte range; @c retry_after drives
-/// the retry delay when the server asks the client to back off.
+/// the retry delay when the server asks the client to back off; @c etag is the
+/// final response's validator.  Every field belongs to the last status block
+/// seen on the transfer: an interim response (1xx, proxy CONNECT) clears them.
 struct header_capture {
   std::string content_range;
   std::string retry_after;
+  std::string etag;
 
   void reset() noexcept
   {
     content_range.clear();
     retry_after.clear();
+    etag.clear();
   }
 };
 

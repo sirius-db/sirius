@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/list_parser.hpp"
@@ -482,10 +483,14 @@ class range_http_server {
     timeout.tv_sec = 3;
     (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    std::string request(4096, '\0');
-    ssize_t n = ::recv(fd, request.data(), request.size(), 0);
-    if (n <= 0) { return; }
-    request.resize(static_cast<std::size_t>(n));
+    std::string request;
+    std::array<char, 4096> buffer{};
+    while (request.find("\r\n\r\n") == std::string::npos) {
+      auto const received = ::recv(fd, buffer.data(), buffer.size(), 0);
+      if (received <= 0) { return; }
+      request.append(buffer.data(), static_cast<std::size_t>(received));
+      if (request.size() > (64U << 10)) { return; }
+    }
 
     bool const is_head = request.rfind("HEAD ", 0) == 0;
     bool const is_get  = request.rfind("GET ", 0) == 0;
@@ -805,6 +810,64 @@ std::shared_ptr<rest_ioctx> make_direct_rest_ioctx(std::string endpoint)
   return make_direct_rest_ioctx(std::move(endpoint), direct_rest_test_config());
 }
 
+struct cache_identity_rest_fixture {
+  explicit cache_identity_rest_fixture(std::string endpoint)
+  {
+    sirius::converter_registry::reset_for_testing();
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(2ULL << 30)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_numa_region_capacity(256ULL << 20)
+      .use_gpu_id_as_host_id()
+      .set_reservation_fraction_per_numa_region(1.0);
+    memory = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+    sirius::converter_registry::initialize();
+    auto* host = sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::HOST);
+    REQUIRE(host != nullptr);
+    auto cfg             = direct_rest_test_config();
+    cfg.max_connections  = 1;
+    auto reactor_context = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg,
+      std::make_shared<fixed_url_authorizer>(std::move(endpoint)),
+      host->get_memory_resource_of<cucascade::memory::Tier::HOST>());
+    context = std::make_shared<rest_ioctx>(1, std::move(reactor_context));
+    context->start();
+    sirius::io::cache::config cache_config;
+    cache_config.mode                            = sirius::io::cache::cache_mode::sirius;
+    cache_config.eviction                        = sirius::io::cache::eviction_policy::lru;
+    cache_config.min_prefetching_budget_fraction = 0.5;
+    cache_config.eviction_threshold_fraction     = 1.0;
+    cache_config.apply_mode();
+    context->initialize_cache(*memory, cache_config, single_gpu_index(0));
+    REQUIRE(context->cache() != nullptr);
+    REQUIRE(context->cache()->chunk_size() == (1U << 20));
+  }
+
+  ~cache_identity_rest_fixture()
+  {
+    if (context) {
+      context->shutdown_cache();
+      context->shutdown();
+    }
+  }
+
+  std::vector<std::uint8_t> fill(sirius::io::sirius_datasource& datasource, std::size_t size)
+  {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(0, static_cast<std::int64_t>(size));
+    datasource.fadvise(ranges, 0);
+    REQUIRE(datasource.prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    std::vector<std::uint8_t> bytes(size);
+    REQUIRE(datasource.host_read(0, bytes.size(), bytes.data()) == bytes.size());
+    REQUIRE(context->cache()->claimed_bytes() > 0);
+    return bytes;
+  }
+
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory;
+  std::shared_ptr<rest_ioctx> context;
+};
+
 using capture_sink       = sirius::test::recording_log_sink;
 using scoped_log_capture = sirius::test::scoped_recording_log_sink;
 
@@ -870,6 +933,103 @@ list_watchdog_result run_list_watchdog(range_http_server const& server,
 }
 
 }  // namespace
+
+namespace {
+
+void require_unqualified_cache_opens(std::string const& tag)
+{
+  auto const payload = deterministic_payload(64U << 10);
+  range_fault_policy fault;
+  fault.successful_head_etag = tag;
+  fault.successful_get_etag  = tag;
+  range_http_server server(payload, fault);
+  cache_identity_rest_fixture fixture(server.endpoint());
+  std::string const path = "s3://cache-identity/unqualified.bin";
+  scoped_log_capture logs("warn");
+  auto first = fixture.context->open_datasource(path);
+  CHECK_FALSE(sirius::io::rest::rest_io_object::is_strong_tag(tag));
+  auto const first_key = first->get_io_object().raw_file_cache_id();
+  CHECK(first->get_io_object().raw_file_cache_id() == first_key);
+  CHECK(fixture.fill(*first, payload.size()) == payload);
+  REQUIRE(server.get_count() == 1);
+  std::vector<std::uint8_t> bytes(payload.size());
+  REQUIRE(first->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes == payload);
+  REQUIRE(server.get_count() == 1);
+  auto second = fixture.context->open_datasource(path);
+  CHECK(second->get_io_object().raw_file_cache_id() != first_key);
+  CHECK(fixture.fill(*second, payload.size()) == payload);
+  CHECK(server.get_count() == 2);
+  CHECK(server.head_count() == 2);
+  auto records        = logs.records();
+  auto const warnings = std::count_if(records.begin(), records.end(), [&](auto const& record) {
+    return record.level == sirius::log::level::warn &&
+           record.message.find(path) != std::string::npos;
+  });
+  CHECK(warnings == 1);
+}
+
+}  // namespace
+
+TEST_CASE("cache identity isolates opens without validators", "[rest][cache_identity]")
+{
+  require_unqualified_cache_opens("");
+}
+
+TEST_CASE("cache identity isolates opens with weak validators", "[rest][cache_identity]")
+{
+  require_unqualified_cache_opens("W/\"x\"");
+}
+
+TEST_CASE("cache identity isolates opens with wildcard validators", "[rest][cache_identity]")
+{
+  require_unqualified_cache_opens("*");
+}
+
+TEST_CASE("cache identity isolates opens with unquoted validators", "[rest][cache_identity]")
+{
+  require_unqualified_cache_opens("open#1");
+}
+
+TEST_CASE("cache identity accepts only single strong entity tags", "[rest][cache_identity]")
+{
+  using sirius::io::rest::rest_io_object;
+  for (auto const* tag : {"\"abc\"", "\"\"", "\"multipart-5\"", "\"a,b\""}) {
+    INFO(tag);
+    CHECK(rest_io_object::is_strong_tag(tag));
+  }
+  for (auto const* tag :
+       {"", "*", "W/\"x\"", "w/\"x\"", "open#1", "\"a\",\"b\"", "\"bad\tvalue\"", "\"unclosed"}) {
+    INFO(tag);
+    CHECK_FALSE(rest_io_object::is_strong_tag(tag));
+  }
+  std::string const path = "s3://cache-identity/key";
+  CHECK(rest_io_object::generation_key(path, "\"abc\"") == path + '\x1f' + "\"abc\"");
+}
+
+TEST_CASE("cache identity reuses a strong generation across opens", "[rest][cache_identity]")
+{
+  auto const payload = deterministic_payload(64U << 10);
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"generation-one\"";
+  fault.successful_get_etag  = fault.successful_head_etag;
+  range_http_server server(payload, fault);
+  cache_identity_rest_fixture fixture(server.endpoint());
+  auto first = fixture.context->open_datasource("s3://cache-identity/same-tag.bin");
+  REQUIRE(first->get_io_object().validation_tag() == fault.successful_head_etag);
+  CHECK(fixture.fill(*first, payload.size()) == payload);
+  REQUIRE(server.get_count() == 1);
+  std::vector<std::uint8_t> bytes(payload.size());
+  REQUIRE(first->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes == payload);
+  CHECK(server.get_count() == 1);
+  auto second = fixture.context->open_datasource("s3://cache-identity/same-tag.bin");
+  CHECK(second->get_io_object().raw_file_cache_id() == first->get_io_object().raw_file_cache_id());
+  REQUIRE(second->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes == payload);
+  CHECK(server.get_count() == 1);
+  CHECK(server.head_count() == 2);
+}
 
 TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuation tokens",
           "[s3][integration][rest][list]")
@@ -1539,7 +1699,10 @@ TEST_CASE("describe_parquet over S3 uses footer probe and preserves schema",
           "[s3][integration][rest][footerbind]")
 {
   auto const parquet = read_binary_file(committed_parquet_fixture("nation.parquet"));
-  range_http_server server(parquet);
+  range_fault_policy fault;
+  fault.successful_head_etag = "\"nation-generation\"";
+  fault.successful_get_etag  = fault.successful_head_etag;
+  range_http_server server(parquet, fault);
   scan_manager_fixture fixture;
   sirius_scan_manager manager{
     make_fake_rest_config(server.endpoint()), *fixture.memory, fixture.topology};

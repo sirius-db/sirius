@@ -802,10 +802,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  // Probe only when the footer will actually be read: once the metadata store
-  // holds this file's parsed footer, a suffix GET would download bytes nothing
-  // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
+  // Probe only when the footer will probably be read: once the metadata store
+  // holds a parsed footer for this path, a suffix GET would most likely download
+  // bytes nothing consumes, and the open only needs the size; the exact
+  // generation lookup below decides reuse. Mirrors describe_parquet.
+  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
   std::shared_ptr<io::sirius_datasource> sirius_ds;
   {
     sirius_ds = io_ctx->open_datasource(
