@@ -125,12 +125,12 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 ## Step 6: Scan Execution
 
-**Files:** `src/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
+**Files:** `src/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/path_utils.cpp` (I/O itself: cuCascade's `cucascade::io`)
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 
 1. **Scan manager (per-query setup + I/O).** During `prepare_for_query()`, `sirius_scan_manager` walks the query's scan operators in order. For each scan it selects a provider: `split_provider` on a cache miss, `cached_databatch_provider` on a cache hit. Providers push splits into the connector the operator created at plan time. The operator retains the ingestible the plan generator created. A driver thread then runs the providers sequentially, populating each connector with splits.
-2. **I/O layer.** The split providers read bytes through the scan manager's `io_context`: io_uring for local disk, with REST and kvikio backends resolved by per-backend path checkers via the datasource factory. The prefetching cache fronts the uring and REST backends.
+2. **I/O layer.** The split providers read bytes through cuCascade's io layer (`cucascade::io`), via the context the scan manager resolves for each path: io_uring for local disk, REST for `s3://`, or kvikIO under `backend: kvikio`, chosen by the per-backend path checkers of cuCascade's `io_context_registry`. Under `cache.mode: cucs` a pinned `fs_cache` fronts the uring and REST backends. See [Scan — IO Layer](scan.md#io-layer-cucascade-io).
 3. **GPU scan source (materialization).** The unified `sirius_gpu_scan_operator` pulls splits from its `split_connector` (`get_next_task_input_data`) and, in `execute()`, delegates each split to the installed `gpu_ingestible`'s `materialize_table` (and conditional `post_filter_and_project`). This runs as a `gpu_pipeline_task` on a GPU executor worker thread and publishes GPU-ready batches to the data repository, scheduling downstream consumers via `task_creator->schedule()`.
 
 ## Step 7: GPU Pipeline Execution
@@ -217,7 +217,7 @@ sequenceDiagram
     Engine->>PE: start_query(pipelines)
     PE->>CH: create completion_handler
     PE->>SM: prepare_for_query (split providers + connectors)
-    SM->>SM: drive splits through io_context + prefetch cache
+    SM->>SM: drive splits through cuCascade ioctx + fs_cache
     PE->>GPE: schedule initial GPU scan tasks
     GPE->>SM: pull splits via split_connector
     GPE->>GPE: materialize via gpu_ingestible, publish to repos

@@ -29,6 +29,6 @@ It respects `CUDA_VISIBLE_DEVICES` and shards over the GPUs it lists. Each proce
 
 To run specific tests, call the test binary directly with a Catch2 tag or test name:
 ```bash
-pixi run build/release/test/cpp/sirius_unittest "[uri_parser]"
-pixi run build/release/test/cpp/sirius_unittest "uri_parser parses bare absolute paths as file URIs"
+pixi run build/release/test/cpp/sirius_unittest "[path_utils]"
+pixi run build/release/test/cpp/sirius_unittest "strip_file_scheme folds dot, dot-dot and empty segments"
 ```

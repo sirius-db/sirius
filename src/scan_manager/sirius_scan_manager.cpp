@@ -1382,15 +1382,13 @@ sirius_scan_manager::sirius_scan_manager(
     SIRIUS_LOG_DEBUG("[sirius_scan_manager] backend=kvikio — using kvikio_context fallback");
   }
 
-  // Build the prefetching cache on the ioctx.  Budget=0 keeps the
-  // cache unarmed (no background threads); we pass that whenever the
-  // user has disabled prefetching so the construction is always
-  // unconditional and there's no "is the cache present" branch to
-  // worry about in callers.
+  // Build the fs_cache when cache.mode is cucs and the backend can use one;
+  // otherwise the context runs without a cache and callers check cache().
   init_cache_for(*_io_ctx);
 
-  // Reactors are built parked; start() launches their worker threads and
-  // allocates per-reactor staging.  No-op for the kvikio fallback (no reactors).
+  // The context is built without runners; start() spawns the runner threads,
+  // each of which builds its own engine (for uring a ring plus pinned staging),
+  // and rethrows the first engine failure.  No-op for the kvikio fallback.
   _io_ctx->start();
 }
 
@@ -2321,7 +2319,10 @@ void sirius_scan_manager::log_io_stats(cucascade::io::ioctx& io_ctx)
   std::lock_guard lk{_io_stats_mtx};
   auto after   = io_stats_snapshot::take(io_ctx);
   auto& before = _io_stats_snapshots[&io_ctx];  // first boundary: counts from zero
-  if (io_ctx.active_runners() > 0) {
+  // The line is built eagerly as a macro argument, so check the level first; the
+  // sample above and the peak reset / new baseline below happen regardless.
+  if (io_ctx.active_runners() > 0 &&
+      sirius::log::get_sink()->should_log(sirius::log::level::debug)) {
     SIRIUS_LOG_DEBUG("{}", format_io_stats_delta(io_ctx.type(), before, after));
   }
   // `after` becomes the next baseline rather than a fresh sample, so no counter

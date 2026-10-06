@@ -54,7 +54,7 @@ namespace sirius::bench {
 
 using clock_type = std::chrono::steady_clock;
 
-/// Host pinned pool geometry for the REST reactors' bounce staging.
+/// Host pinned pool geometry for the REST runners' device-read staging.
 inline constexpr std::size_t host_pool_size_v       = 128;
 inline constexpr std::size_t host_initial_pools_v   = 64;
 inline constexpr std::size_t host_region_capacity_v = 32UL << 30;
@@ -74,8 +74,8 @@ struct bench_options {
   std::size_t per_file_gib{1};       ///< GB of data to read per file (random segments)
   std::size_t repeat{3};
 
-  /// Logical request size in MiB. The REST reactor may split a logical request
-  /// further according to its current connection availability and backlog.
+  /// Logical request size in MiB. A REST runner may split a logical request
+  /// further according to its free connections and the queued backlog.
   std::size_t chunk_size_mib{1};
 
   /// Exact GET size in bytes, overriding @c chunk_size_mib when non-zero.  For
@@ -83,10 +83,10 @@ struct bench_options {
   /// autotune one derives it from bandwidth x latency.
   std::size_t chunk_size_bytes{0};
 
-  /// Max concurrent in-flight easy handles per reactor (rest.max_connections).
+  /// Max concurrent in-flight easy handles per REST runner (rest.max_connections).
   std::size_t max_nconnection{128};
 
-  /// Number of REST reactor instances.
+  /// Number of REST runner threads (rest_n_reactors).
   std::size_t n_reactors{1};
 
   /// Share of each GPU's memory the pool may use.  Only matters for benchmarks
@@ -207,9 +207,10 @@ class engine {
  public:
   explicit engine(bench_options const& opts)
   {
-    // Defaults to chunk_bytes so the fixed-size host pool, the REST reactor's
-    // chunk_size and the benchmark's pinned_staging are carved at the same
-    // granularity; host_chunk_mib decouples them when that is not wanted.
+    // Defaults to chunk_bytes so the fixed-size host pool (whose blocks the REST
+    // runners stage device reads into) and the benchmark's pinned_staging are
+    // carved at the same granularity; host_chunk_mib decouples them when that is
+    // not wanted.
     const std::size_t block_size = opts.host_block_bytes();
     cucascade::memory::reservation_manager_configurator builder;
     builder

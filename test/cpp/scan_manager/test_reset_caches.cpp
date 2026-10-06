@@ -210,12 +210,11 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
 {
   // claim_some_cache() only attaches buffers (fadvise + prepare_prefetch); unlike
   // the "replaces a populated cache" test above, nothing here evicts them before
-  // reset_caches() runs. This is the exact shape that used to leak: the old Sirius
-  // prefetching_cache (now cuCascade's fs_cache) destructor tore down _file_cache and
-  // _pool without ever returning a still-resident chunk's buffer to the underlying
-  // fixed_size_host_memory_resource, so the block was gone from its free list
-  // for the rest of the process's life even though the cache object reporting
-  // it was destroyed.
+  // reset_caches() runs. Invariant: destroying the cache (fs_cache) must return
+  // every chunk buffer still resident in it to the underlying
+  // fixed_size_host_memory_resource; a buffer it drops instead is gone from the
+  // free list for the rest of the process's life, even though the cache that
+  // held it no longer exists.
   temp_data_file file(8ull << 20);  // 8 MiB
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_reset();
