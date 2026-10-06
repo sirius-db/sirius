@@ -154,9 +154,10 @@ class streaming_fragment {
   ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
 
-  /// Total rows parked on output stream `id`, without draining it.
-  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a parked
-  ///         batch that is not GPU-resident.
+  /// Total rows parked on output stream `id`, without draining it. Each batch's rows are
+  /// recorded when it is parked, so the count holds after batches spill to host.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or when a batch
+  ///         reached the stream already off the GPU.
   [[nodiscard]] std::uint64_t output_row_count(stream_id_t id) const;
 
   /// The declared spec of input `id`.

@@ -114,6 +114,9 @@ mod ffi {
         /// Free what `token` holds. Unknown and consumed tokens are ignored.
         fn release(self: &DirectExchange, token: u64) -> Result<()>;
 
+        /// Hold a fully received batch so it may spill to host while it waits for its receiver.
+        fn seal(self: &DirectExchange, token: u64) -> Result<()>;
+
         /// Tokens neither released nor consumed.
         fn outstanding(self: &DirectExchange) -> Result<usize>;
 

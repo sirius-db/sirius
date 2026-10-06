@@ -144,6 +144,10 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   /// that will not be pushed. Unknown and consumed tokens are ignored.
   void release(std::uint64_t token) const;
 
+  /// Hold a fully received batch so that it may spill to host while it waits for its receiver.
+  /// A sealed token is still pushed with Fragment::push_received and freed with release().
+  void seal(std::uint64_t token) const;
+
   /// Tokens neither released nor consumed.
   [[nodiscard]] std::size_t outstanding() const;
 

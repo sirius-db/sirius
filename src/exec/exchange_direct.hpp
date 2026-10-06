@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,14 @@
 
 namespace cucascade {
 class data_batch;
+class data_repository;
+namespace memory {
+class reservation;
+}
+}  // namespace cucascade
+
+namespace sirius::exec {
+class exchange_staging;
 }
 
 namespace sirius::exec {
@@ -117,6 +126,15 @@ class direct_exchange {
 
   direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region);
 
+  /// Frees at least `bytes` of GPU memory if it can, e.g. by spilling to host; blocks until done.
+  using make_room_fn = std::function<void(std::size_t bytes)>;
+
+  /// Lets received batches spill: sealed batches are visible to @p staging, and allocate() and
+  /// export_batch() call @p make_room once before giving up on GPU memory, again if it throws
+  /// (the downgrade executor cancels queued requests whenever a query window closes). Without
+  /// this, a full pool fails the transfer at once.
+  void enable_spill(exchange_staging& staging, make_room_fn make_room);
+
   /// Holds @p batch, or a copy of it if it is sliced or not in the slab, until released.
   /// Its buffers are ready to read when this returns.
   /// @return nullopt for a batch with no rows.
@@ -124,16 +142,25 @@ class direct_exchange {
   ///         that is neither fixed-width nor STRING.
   [[nodiscard]] std::optional<exported> export_batch(std::shared_ptr<cucascade::data_batch> batch);
 
-  /// Allocates the buffers of the encoded @p layout without waiting for memory.
+  /// Allocates the buffers of the encoded @p layout. When they cannot be reserved and spilling is
+  /// enabled, it makes room once and retries; it never waits on other transfers.
   /// @return the token and the [address, length] of each non-empty buffer.
   /// @throws sirius::invalid_input_exception on a malformed layout.
-  /// @throws rmm::out_of_memory when the buffers cannot be reserved now.
+  /// @throws rmm::out_of_memory when the buffers cannot be reserved.
   [[nodiscard]] std::pair<std::uint64_t, std::vector<std::uint64_t>> allocate(
     std::span<std::uint8_t const> layout);
 
   /// Consumes the token of a received batch, wrapping its buffers without a copy.
-  /// @throws sirius::invalid_input_exception on a token that holds no received batch.
+  /// @throws sirius::invalid_input_exception on a token that holds no unsealed received batch.
   [[nodiscard]] std::unique_ptr<cudf::table> take(std::uint64_t token);
+
+  /// Wraps a fully received batch as a data batch the downgrade executor may spill while it
+  /// waits for its receiver. A sealed, consumed or unknown token is left as it is.
+  void seal(std::uint64_t token);
+
+  /// Consumes the token of a received batch, sealed (possibly spilled to host) or not.
+  /// @throws sirius::invalid_input_exception on a token that holds no received batch.
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> take_batch(std::uint64_t token);
 
   /// Frees what @p token holds; an unknown or consumed token is ignored.
   void release(std::uint64_t token);
@@ -153,6 +180,10 @@ class direct_exchange {
   };
 
   void require_open() const;
+  /// Wraps @p entry's buffers as a table; @p entry is consumed.
+  [[nodiscard]] static std::unique_ptr<cudf::table> to_table(received&& entry);
+  /// Moves a spilled @p batch back to the GPU before it is sent.
+  void bring_to_gpu(cucascade::data_batch& batch);
 
   cucascade::memory::memory_space& _gpu;
   memory::slab_region _region;
@@ -161,6 +192,14 @@ class direct_exchange {
   bool _closed{false};
   /// A sent batch's keepalive, or a received batch's buffers.
   std::map<std::uint64_t, std::variant<std::shared_ptr<void const>, received>> _entries;
+  make_room_fn _make_room;
+
+  /// A reservation of @p bytes, making room first if there is too little.
+  std::unique_ptr<cucascade::memory::reservation> reserve(std::size_t bytes);
+  /// Sealed received batches, by batch id; tracked by the exchange staging once spill is on.
+  std::shared_ptr<cucascade::data_repository> _sealed;
+  /// Token -> batch id in _sealed.
+  std::map<std::uint64_t, std::uint64_t> _sealed_ids;
 };
 
 }  // namespace sirius::exec

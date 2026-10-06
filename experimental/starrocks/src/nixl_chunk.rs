@@ -203,6 +203,10 @@ pub trait NixlEndpoint: Send + Sync + std::fmt::Debug {
     /// Receive and export buffers this CN's direct exchange still holds.
     fn outstanding(&self) -> usize;
 
+    /// Lets a fully received batch spill to host while it waits for its receiver. The token is
+    /// still pushed and released as before.
+    fn seal(&self, token: u64) -> Result<(), String>;
+
     /// Writes every batch parked under `slot` into `peer`'s pool, announcing each, then EOS.
     fn send(
         &self,

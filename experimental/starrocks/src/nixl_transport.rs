@@ -123,6 +123,12 @@ impl NixlEndpoint for NixlTransport {
         release(&self.exchange, token);
     }
 
+    fn seal(&self, token: u64) -> Result<(), String> {
+        self.exchange
+            .seal(token)
+            .map_err(|err| format!("failed to seal received batch {token}: {err}"))
+    }
+
     fn outstanding(&self) -> usize {
         self.exchange.outstanding().unwrap_or_else(|err| {
             warn!(error = %err, "failed to count direct-exchange buffers");

@@ -437,6 +437,11 @@ impl SiriusComputeNodeService {
                 Ok((Vec::new(), None))
             }
             NixlEnvelope::Packed { token, rows, names } => {
+                // Sealed before the rendezvous sees it, so a receiver this frame completes always
+                // finds it sealed. The batch can then spill to host while it waits.
+                if token != 0 {
+                    nixl.seal(token).inspect_err(|_| nixl.release(token))?;
+                }
                 // A refused frame is never pushed, so its buffers are freed here. A duplicate is
                 // accepted as a no-op: it carries the token its first copy already delivered.
                 let ready = self
@@ -1225,6 +1230,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeNixl {
         released: Mutex<Vec<u64>>,
+        sealed: Mutex<Vec<u64>>,
         sent: Mutex<Vec<(SocketAddr, SenderSlot)>>,
     }
 
@@ -1247,6 +1253,11 @@ mod tests {
 
         fn outstanding(&self) -> usize {
             0
+        }
+
+        fn seal(&self, token: u64) -> Result<(), String> {
+            self.sealed.lock().unwrap().push(token);
+            Ok(())
         }
 
         fn send(
