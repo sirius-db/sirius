@@ -134,7 +134,8 @@ target_compile_definitions(
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
 
 # -----------------------------------------------------------------------------
-# test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
+# test/io/parquet_benchmark — standalone benchmark binary for
+# cucascade::io::datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
 

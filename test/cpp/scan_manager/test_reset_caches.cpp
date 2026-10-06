@@ -20,13 +20,14 @@
 // cache in the first place.
 
 #include "catch.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/io_context.hpp"
-#include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -77,13 +78,13 @@ struct temp_data_file {
   }
 };
 
-scan_manager_config config_with_cache(sirius::io::cache::cache_mode mode)
+scan_manager_config config_with_cache(cucascade::io::cache::cache_mode mode)
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 3;
   cfg.uring_n_reactors        = 1;
   cfg.cache.mode              = mode;
-  cfg.cache.eviction          = sirius::io::cache::eviction_policy::lru;
+  cfg.cache.eviction          = cucascade::io::cache::eviction_policy::lru;
   cfg.apply_cache_mode();
   return cfg;
 }
@@ -102,11 +103,11 @@ std::size_t claim_some_cache(sirius_scan_manager& manager, temp_data_file const&
   ds->fadvise(ranges, 0);
   // Nothing attaches staging buffers on its own; fadvise only registers the
   // request and the chunks it names.
-  REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  REQUIRE(ds->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
   return cache->claimed_bytes();
 }
 
-/// Pull `global[... evictions=N ...]` out of prefetching_cache::summary().  The
+/// Pull `global[... evictions=N ...]` out of fs_cache::summary().  The
 /// counters live on the cache object, so a non-zero count going back to zero is
 /// the observable proof that the object was replaced rather than emptied --
 /// pointer identity is not, since the allocator readily hands back the address
@@ -121,7 +122,7 @@ std::uint64_t evictions_from(std::string const& summary)
 
 /// Poll rather than sleep once: the evictor is a background thread, so a sweep
 /// that is merely slow must not read as one that never happened.
-std::uint64_t evictions_within(sirius::io::cache::prefetching_cache& cache,
+std::uint64_t evictions_within(cucascade::io::cache::fs_cache& cache,
                                std::chrono::milliseconds budget)
 {
   auto const deadline = std::chrono::steady_clock::now() + budget;
@@ -144,7 +145,7 @@ TEST_CASE("reset_caches replaces a populated cache with an empty one",
   auto topology = single_gpu_index_for_reset();
 
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   auto* before = manager.io_ctx()->cache();
   REQUIRE(before != nullptr);
   bool const was_armed = before->is_armed();
@@ -177,7 +178,7 @@ TEST_CASE("a rebuilt cache is usable again", "[scan_manager][cache][reset_cache]
   auto topology = single_gpu_index_for_reset();
 
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(claim_some_cache(manager, file) > 0);
   manager.reset_caches();
 
@@ -193,7 +194,7 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
   auto topology = single_gpu_index_for_reset();
 
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   manager.reset_caches();
@@ -225,7 +226,7 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
   REQUIRE(host_mr != nullptr);
 
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+    config_with_cache(cucascade::io::cache::cache_mode::cucs), *memory, topology};
   REQUIRE(manager.io_ctx()->cache() != nullptr);
 
   // Baseline AFTER construction: the scan manager's own io/uring buffers are
@@ -253,7 +254,7 @@ TEST_CASE("reset_caches is a no-op where the configuration does not cache",
   auto topology = single_gpu_index_for_reset();
 
   sirius_scan_manager manager{
-    config_with_cache(sirius::io::cache::cache_mode::none), *memory, topology};
+    config_with_cache(cucascade::io::cache::cache_mode::none), *memory, topology};
   // Caching off, so no cache was ever built...
   REQUIRE(manager.io_ctx()->cache() == nullptr);
 

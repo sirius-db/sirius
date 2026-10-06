@@ -252,7 +252,7 @@ TEST_CASE("deferred walk: split claims see the walk's row-group count",
   auto count_claims = [](duckdb_native_gpu_ingestible& ing) {
     std::size_t n = 0;
     while (auto task = ing.next_split_provider(
-             [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return nullptr; })) {
+             [](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return nullptr; })) {
       ++n;
     }
     return n;

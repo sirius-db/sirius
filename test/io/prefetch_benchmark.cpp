@@ -27,9 +27,6 @@
 
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/cache/config.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uring/uring_ioctx.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -38,6 +35,9 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/cache/config.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
@@ -77,7 +77,7 @@ std::vector<std::string> const COLUMNS = {
 
 struct file_info {
   std::string path;
-  std::unique_ptr<sirius::io::sirius_datasource> ds;
+  std::unique_ptr<cucascade::io::datasource> ds;
   std::vector<cudf::io::text::byte_range_info> ranges;
   std::size_t range_bytes{0};
 };
@@ -104,12 +104,11 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 
 // ---- parse_parquet ---------------------------------------------------------
 
-// Parse a single parquet file using the sirius_datasource already backed by
+// Parse a single parquet file using the cucascade::io::datasource already backed by
 // the uring io_ctx.  source_info takes a raw (non-owning) datasource* so no
 // shim or ownership transfer is needed.  Stream is synchronised before
 // returning so the caller may safely discard the table immediately.
-std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           ::cuda::stream_ref stream)
+std::unique_ptr<cudf::table> parse_parquet(cucascade::io::datasource& ds, ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
@@ -154,13 +153,13 @@ void run_baseline(std::vector<file_info>& files,
 void run_prefetch(std::vector<file_info>& files,
                   sirius::exec::scoped_dispatcher& disp,
                   stream_pool_t& streams,
-                  sirius::io::uring::uring_ioctx& io_ctx,
+                  cucascade::io::uring::uring_ioctx& io_ctx,
                   sirius::memory::sirius_memory_reservation_manager& mgr,
                   std::size_t total_bytes)
 {
-  sirius::io::cache::config cache_cfg;
-  cache_cfg.mode                            = sirius::io::cache::cache_mode::sirius;
-  cache_cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
+  cucascade::io::cache::config cache_cfg;
+  cache_cfg.mode                            = cucascade::io::cache::cache_mode::cucs;
+  cache_cfg.eviction                        = cucascade::io::cache::eviction_policy::lru;
   cache_cfg.min_prefetching_budget_fraction = 0.9;
   cache_cfg.eviction_threshold_fraction     = 0.9;
   cache_cfg.apply_mode();
@@ -200,7 +199,7 @@ void run_prefetch(std::vector<file_info>& files,
           done.count_down();
         });
       });
-    if (refusal == sirius::io::prefetch_refusal::issued) {
+    if (refusal == cucascade::io::prefetch_refusal::issued) {
       io_issued.fetch_add(1, std::memory_order_relaxed);
     } else {
       SIRIUS_LOG_WARN("prefetch_async: file {} was refused ({})", k, static_cast<int>(refusal));
@@ -280,9 +279,9 @@ int main(int argc, char** argv)
   auto* bounce_mr  = host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 
   // ---- io context ----------------------------------------------------------
-  auto ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-    sirius::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
-  auto io_ctx = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(ctx));
+  auto ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+    cucascade::io::uring::uring_reactor::reactor_config_type{}, bounce_mr);
+  auto io_ctx = std::make_shared<cucascade::io::uring::uring_ioctx>(1, std::move(ctx));
   io_ctx->start();
 
   // ---- thread pool + dispatcher --------------------------------------------
@@ -313,7 +312,7 @@ int main(int argc, char** argv)
   for (auto const& path : paths) {
     file_info fi;
     fi.path = path;
-    fi.ds   = io_ctx->open_datasource(path);
+    fi.ds   = cucascade::io::open_datasource(io_ctx, path);
 
     auto footer = cudf::io::parquet::fetch_footer_to_host(*fi.ds);
     hybrid_scan_reader reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),

@@ -6,15 +6,14 @@
  */
 
 #include "catch.hpp"
-#include "io/rest/rest_ioctx.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/sirius_datasource.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
 #include <arpa/inet.h>
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/open_file_info.hpp>
@@ -333,8 +332,8 @@ void set_gpu_execution(duckdb::Connection& con, bool enabled)
   REQUIRE_FALSE(result->HasError());
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> require_rest_datasource(
-  sirius_httpfs_fixture& fixture, std::string const& uri)
+std::shared_ptr<cucascade::io::datasource> require_rest_datasource(sirius_httpfs_fixture& fixture,
+                                                                   std::string const& uri)
 {
   auto sirius_ctx =
     fixture.con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");

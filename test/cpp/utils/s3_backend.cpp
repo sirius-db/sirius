@@ -16,7 +16,7 @@
 
 #include "utils/s3_backend.hpp"
 
-#include "io/rest/s3/sigv4.hpp"
+#include <cucascade/io/rest/s3/sigv4.hpp>
 
 #include <arpa/inet.h>
 #include <curl/curl.h>
@@ -420,7 +420,7 @@ long s3_put(s3_endpoint const& ep,
             std::optional<fs::path> const& ca_bundle,
             long timeout_seconds = 0)
 {
-  sirius::io::rest::s3::sigv4_signer_config creds;
+  cucascade::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
   creds.secret_key = kSecretKey;
   creds.region     = kRegion;
@@ -428,7 +428,7 @@ long s3_put(s3_endpoint const& ep,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; SeaweedFS accepts it.
-  auto signed_req = sirius::io::rest::s3::sign_request("PUT",
+  auto signed_req = cucascade::io::rest::s3::sign_request("PUT",
                                                        ep.authority,
                                                        canonical_uri,
                                                        /*query=*/"",
@@ -481,8 +481,8 @@ long s3_put(s3_endpoint const& ep,
 
 std::string uri_path_for(std::string const& bucket, std::string const& key)
 {
-  std::string p = "/" + sirius::io::rest::s3::uri_encode(bucket, false);
-  if (!key.empty()) p += "/" + sirius::io::rest::s3::uri_encode(key, false);
+  std::string p = "/" + cucascade::io::rest::s3::uri_encode(bucket, false);
+  if (!key.empty()) p += "/" + cucascade::io::rest::s3::uri_encode(key, false);
   return p;
 }
 

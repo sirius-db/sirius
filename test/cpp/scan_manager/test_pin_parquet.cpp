@@ -24,14 +24,15 @@
 // still pinned and chunks it reclaims are not.
 
 #include "catch.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/io_context.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/io_context.hpp>
 
 #include <cstddef>
 #include <filesystem>
@@ -61,8 +62,8 @@ scan_manager_config config_with_sirius_cache()
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 3;
   cfg.uring_n_reactors        = 1;
-  cfg.cache.mode              = sirius::io::cache::cache_mode::sirius;
-  cfg.cache.eviction          = sirius::io::cache::eviction_policy::lru;
+  cfg.cache.mode              = cucascade::io::cache::cache_mode::cucs;
+  cfg.cache.eviction          = cucascade::io::cache::eviction_policy::lru;
   cfg.apply_cache_mode();
   return cfg;
 }
@@ -78,7 +79,7 @@ std::string missing_parquet() { return "/nonexistent/sirius_pin_rollback.parquet
 
 /// Bytes still held after asking the evictor to reclaim everything it can.
 /// Anything left over is held by a live pin, which is the property under test.
-std::size_t bytes_after_full_eviction(sirius::io::cache::prefetching_cache& cache)
+std::size_t bytes_after_full_eviction(cucascade::io::cache::fs_cache& cache)
 {
   cache.evict_sync(cache.claimed_bytes());
   return cache.claimed_bytes();

@@ -26,6 +26,8 @@
 #include "transparent/read_view_registry.hpp"
 
 #include <catch.hpp>
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/kvikio/kvikio_context.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -36,8 +38,6 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
-#include <io/kvikio/kvikio_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
@@ -163,8 +163,8 @@ std::unique_ptr<parquet_ingestible_table_info> parquet_info(scan_contract_id con
 struct parquet_certificate_fixture {
   static constexpr scan_contract_id contract_id = 53;
   temporary_directory files;
-  std::shared_ptr<sirius::io::kvikio_context> ioctx =
-    std::make_shared<sirius::io::kvikio_context>();
+  std::shared_ptr<cucascade::io::kvikio_context> ioctx =
+    std::make_shared<cucascade::io::kvikio_context>();
   std::shared_ptr<gpu_ingestible> ingestible;
 
   parquet_certificate_fixture()
@@ -184,7 +184,7 @@ struct parquet_certificate_fixture {
   std::unique_ptr<parquet_file_scan_info> next_file()
   {
     auto provider = ingestible->next_split_provider(
-      [this](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [this](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
     auto info  = provider();
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
@@ -469,17 +469,17 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   info->resolved_file_paths    = paths;
   info->approximate_batch_size = 64 * 1024 * 1024;
   auto ingestible              = make_ingestible(std::move(info));
-  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                   = std::make_shared<cucascade::io::kvikio_context>();
   if (warm_cache) {
     auto warm_info                 = make_info();
     warm_info->resolved_file_paths = paths;
     auto warmer                    = make_ingestible(std::move(warm_info));
     for (auto const& path : paths) {
       auto provider = warmer->next_split_provider(
-        [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+        [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
       REQUIRE(provider);
       REQUIRE(provider());
-      REQUIRE(ioctx->open_datasource(path)->metadata());
+      REQUIRE(cucascade::io::open_datasource(ioctx, path)->metadata());
     }
   }
   auto coalescer = ingestible->create_batch_coalescer();
@@ -491,7 +491,7 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   };
   for (auto const& path : paths) {
     auto provider = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
     auto file = provider();
     REQUIRE(file);
@@ -690,8 +690,10 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   // Finalize can publish evidence after constructing the ingestible, before metadata dispatch.
   registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
-  auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
-  auto resolve = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
+  auto ioctx   = std::make_shared<cucascade::io::kvikio_context>();
+  auto resolve = [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> {
+    return ioctx;
+  };
   auto first_provider  = ingestible->next_split_provider(resolve);
   auto second_provider = ingestible->next_split_provider(resolve);
   REQUIRE(first_provider);
@@ -772,10 +774,10 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
                                (files.path / "a.parquet").string()};
   info->read_views          = registry;
   auto ingestible           = make_ingestible(std::move(info));
-  auto ioctx                = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                = std::make_shared<cucascade::io::kvikio_context>();
   for (auto const index : {1, 0}) {
     auto provider = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
     REQUIRE(provider);
     auto file = provider();
     REQUIRE(file);
@@ -803,9 +805,9 @@ TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
   auto info       = native_info(fixture, 62);
   auto* database  = &info->storage->GetAttached();
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
   auto split = provider();
   REQUIRE(split);
@@ -849,13 +851,13 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   auto info                    = native_info(fixture, contract_id);
   info->approximate_batch_size = 1;
   auto ingestible              = make_ingestible(std::move(info));
-  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx                   = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer               = ingestible->create_batch_coalescer();
   std::size_t input_slices     = 0;
   std::size_t input_ranges     = 0;
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto range = provider();
     ++input_ranges;
     REQUIRE(range);
@@ -937,9 +939,9 @@ TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
                       "native split requires one certificate and dependency per row group");
 
   // Rejection must leave the coalescer ready for a valid provider.
-  auto ioctx    = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx    = std::make_shared<cucascade::io::kvikio_context>();
   auto provider = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   REQUIRE(provider);
   REQUIRE(coalescer->push(provider()).empty());
   auto splits = coalescer->flush();
@@ -959,11 +961,11 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   exec_ok(*fixture.connection, "CHECKPOINT");
 
   auto ingestible = make_ingestible(native_info(fixture, contract_id, /*all_pruned=*/true));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto coalescer  = ingestible->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
-           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+           [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; })) {
     auto emitted = coalescer->push(provider());
     for (auto& split : emitted) {
       splits.push_back(std::move(split));
@@ -1027,9 +1029,9 @@ TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
 {
   auto info       = parquet_info(81);
   auto ingestible = make_ingestible(std::move(info));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto coalescer = ingestible->create_batch_coalescer();
   auto splits    = coalescer->push(provider());
   auto tail      = coalescer->flush();
@@ -1195,9 +1197,9 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
           "CREATE TABLE items AS SELECT i::INTEGER id FROM range(300000) t(i)");
   exec_ok(*fixture.connection, "CHECKPOINT");
   auto ingestible = make_ingestible(native_info(fixture, 81));
-  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto ioctx      = std::make_shared<cucascade::io::kvikio_context>();
   auto provider   = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    [ioctx](std::string_view) -> std::shared_ptr<cucascade::io::ioctx> { return ioctx; });
   auto split = provider();
   auto required =
     check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
