@@ -361,8 +361,7 @@ class bulk_context final : public cucascade::io::ioctx {
 
   cucascade::exec::semi_future<std::size_t> mixed_readv_async_io(
     cucascade::io::io_object const&,
-    std::vector<cucascade::io::prepared_io_slice>&& slices,
-    cucascade::io::io_options) noexcept override
+    std::vector<cucascade::io::prepared_io_slice>&& slices) noexcept override
   {
     std::size_t bytes = 0;
     for (auto const& slice : slices) {

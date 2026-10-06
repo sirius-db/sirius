@@ -30,7 +30,6 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
-#include "scan_manager/io_stats_log.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
 #include "scan_manager/mvcc_mask_cache.hpp"
@@ -38,6 +37,7 @@
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 #include "scan_manager/split_provider.hpp"
+#include "scan_manager/uring_gauges_sampler.hpp"
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
@@ -116,6 +116,9 @@ struct batch_telemetry_info;
 }  // namespace sirius::telemetry
 
 namespace sirius::scan_manager {
+
+/// The backend's name, for log lines and exception text.
+[[nodiscard]] char const* to_string(cucascade::io::io_context_type type) noexcept;
 
 /// Lightweight descriptor of a pinned table's cache identity + column layout,
 /// stored on @ref pinned_entry in place of the read-side ingestible_table_info.
@@ -1102,19 +1105,6 @@ class sirius_scan_manager {
   /// was called for (built or not).
   bool init_cache_for(cucascade::io::ioctx& io_ctx);
 
-  /// Per-query runner health check for the backends with runner pools (uring,
-  /// restful): restart a pool whose runners all died, and report (once per ioctx)
-  /// a pool running short.  Serialized by `_io_runner_check_mtx`, a leaf lock;
-  /// spawns threads on restart, so never call it under `_routed_io_ctxs_mtx`.
-  void check_io_runners(cucascade::io::ioctx& io_ctx);
-
-  /// Per-query DEBUG `[io_stats]` line (@ref format_io_stats_delta) for @p io_ctx:
-  /// what it did since the previous query boundary (since it was built, at its
-  /// first).  Concurrent queries share the window.  Skipped while no runner is
-  /// active (kvikIO has none); peaks are reset either way.  Takes the leaf
-  /// `_io_stats_mtx`.
-  void log_io_stats(cucascade::io::ioctx& io_ctx);
-
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
@@ -1130,6 +1120,9 @@ class sirius_scan_manager {
   std::shared_ptr<op::scan::physical_check_counters> _physical_counters;
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<cucascade::io::ioctx> _io_ctx;
+  /// `[uring_gauges]` DEBUG sampler of `_io_ctx` when it is a uring ioctx (null
+  /// otherwise).  Stopped in @ref stop, before any ioctx is released.
+  std::unique_ptr<uring_gauges_sampler> _uring_gauges_sampler;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
   /// by the immutable resolved-config snapshot, not merely by backend type, so
@@ -1161,20 +1154,6 @@ class sirius_scan_manager {
   /// only fail the same way; installing a new S3 secret yields a new key.
   /// Guarded by `_routed_io_ctxs_build_mtx`.
   std::unordered_set<routed_ioctx_key, routed_ioctx_key_hash> _unavailable_io_ctxs;
-  /// Serializes @ref check_io_runners end to end (restart included) and guards
-  /// `_io_runner_shortfall_reported`.  A leaf lock: no other scan-manager lock is
-  /// taken while it is held.  Lock order: `_routed_io_ctxs_build_mtx` /
-  /// `_routed_io_ctxs_mtx` are never taken under it -- callers snapshot the routed
-  /// ioctxs under `_routed_io_ctxs_mtx`, release it, then check.
-  std::mutex _io_runner_check_mtx;
-  /// ioctxs whose runner shortfall has been reported; see @ref check_io_runners.
-  /// Guarded by `_io_runner_check_mtx`.
-  std::unordered_set<cucascade::io::ioctx const*> _io_runner_shortfall_reported;
-  /// Guards `_io_stats_snapshots`.  A leaf lock.
-  std::mutex _io_stats_mtx;
-  /// Per started ioctx, its stats at the previous query boundary; see @ref log_io_stats.
-  /// Keyed by address: ioctxs live as long as this manager.
-  std::unordered_map<cucascade::io::ioctx const*, io_stats_snapshot> _io_stats_snapshots;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
   /// whole duration, and an unpin from another connection drops only the map slot, leaving

@@ -45,7 +45,6 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
-#include "scan_manager/io_stats_log.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -71,6 +70,7 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -99,6 +99,17 @@
 #include <utility>
 
 namespace sirius::scan_manager {
+
+char const* to_string(cucascade::io::io_context_type type) noexcept
+{
+  switch (type) {
+    case cucascade::io::io_context_type::uring: return "uring";
+    case cucascade::io::io_context_type::restful: return "restful";
+    case cucascade::io::io_context_type::kvikio: return "kvikio";
+    case cucascade::io::io_context_type::s3rdma: return "s3rdma";
+  }
+  return "unknown";
+}
 
 namespace {
 
@@ -1368,8 +1379,12 @@ sirius_scan_manager::sirius_scan_manager(
   };
   if (_config.backend == scan_manager::io_backend::native) {
     _io_ctx = make_default_ioctx(cucascade::io::io_context_type::uring);
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] native backend (uring_ioctx n_runner_threads={})",
-                     _config.uring_n_reactors);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_scan_manager] default io context: uring n_reactors={} slices_per_pass={} "
+      "prefetch_reactors={}",
+      _config.uring_n_reactors,
+      _config.uring.slices_per_pass,
+      _config.uring.prefetch_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
@@ -1386,10 +1401,16 @@ sirius_scan_manager::sirius_scan_manager(
   // otherwise the context runs without a cache and callers check cache().
   init_cache_for(*_io_ctx);
 
-  // The context is built without runners; start() spawns the runner threads,
-  // each of which builds its own engine (for uring a ring plus pinned staging),
-  // and rethrows the first engine failure.  No-op for the kvikio fallback.
+  // start() spawns one worker thread per reactor (for uring each with its own
+  // ring and pinned staging).  No-op for the kvikio fallback.
   _io_ctx->start();
+
+  // The `[uring_gauges]` DEBUG sampler polls the uring reactors' gauges; it only
+  // does work while the log sink accepts DEBUG.
+  if (auto uring = std::dynamic_pointer_cast<cucascade::io::uring::uring_ioctx>(_io_ctx)) {
+    _uring_gauges_sampler = std::make_unique<uring_gauges_sampler>(std::move(uring));
+    _uring_gauges_sampler->start();
+  }
 }
 
 sirius_scan_manager::~sirius_scan_manager()
@@ -1490,27 +1511,11 @@ void sirius_scan_manager::prepare_for_query(
   // reused across queries; advance their caches to this query too, or a routed
   // cache's epoch freezes at build time and a later query serves the prior
   // query's cached chunks as current. Same global-epoch caveat as above.
-  std::vector<std::shared_ptr<cucascade::io::ioctx>> built_io_ctxs;
-  if (_io_ctx) { built_io_ctxs.push_back(_io_ctx); }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
     for (auto& [key, io_ctx] : _routed_io_ctxs) {
-      if (!io_ctx) { continue; }
-      if (io_ctx->cache()) { io_ctx->cache()->prepare_for_query(); }
-      built_io_ctxs.push_back(io_ctx);
+      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(); }
     }
-  }
-
-  // A runner pool dies only of fatal engine errors, after which every read on that
-  // backend fails fast; check the backends already built before this query reads.
-  // Outside _routed_io_ctxs_mtx: a restart spawns threads and allocates staging,
-  // and check_io_runners takes the leaf _io_runner_check_mtx, so the snapshot is
-  // taken first and the map lock released before any check.  A backend's io stats
-  // cover the IO since the previous query boundary, so they are logged before a
-  // restart replaces the runners they count.
-  for (auto const& io_ctx : built_io_ctxs) {
-    log_io_stats(*io_ctx);
-    check_io_runners(*io_ctx);
   }
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
@@ -2220,7 +2225,7 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
       }
       return {.cause =
                 "invalid uring configuration (check uring.n_max_concurrent_scans, "
-                "uring.slices_per_pass, uring.scheduling.*)",
+                "uring.slices_per_pass, uring.prefetch_reactors)",
               .by_configuration = false};
     case cucascade::io::io_context_type::kvikio:
       return {.cause = "kvikIO backend could not be constructed (check kvikio.* settings)",
@@ -2263,72 +2268,6 @@ bool sirius_scan_manager::init_cache_for(cucascade::io::ioctx& io_ctx)
   io_ctx.initialize_cache(_reservation_manager, _config.cache, _topology_index);
   warn_if_cache_not_built(io_ctx);
   return true;
-}
-
-void sirius_scan_manager::check_io_runners(cucascade::io::ioctx& io_ctx)
-{
-  // Held across the whole check, restart included, so a concurrent query's check
-  // cannot observe a pool mid-start() (a spurious "died; restarting" or a false
-  // shortfall) and the reported set cannot go stale between a restart's erase and
-  // another check's insert.  A leaf lock: see _io_runner_check_mtx.
-  std::lock_guard check_lk{_io_runner_check_mtx};
-  auto const type = io_ctx.type();
-  // kvikIO and s3rdma have no runner pool to supervise.
-  if (type != cucascade::io::io_context_type::uring &&
-      type != cucascade::io::io_context_type::restful) {
-    return;
-  }
-  auto const expected = type == cucascade::io::io_context_type::uring ? _config.uring_n_reactors
-                                                                      : _config.rest_n_reactors;
-  // No pool was spawned: requests would wait for an external run*() by design.
-  if (expected == 0) { return; }
-  auto const active = io_ctx.active_runners();
-  if (active == 0) {
-    // Every runner died of a fatal engine error, so every read on this backend now
-    // fails fast.  start() joins the dead pool and spawns a fresh one.
-    SIRIUS_LOG_ERROR("[sirius_scan_manager] {} io runners died (0 of {} active); restarting",
-                     to_string(type),
-                     expected);
-    try {
-      io_ctx.start();
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_ERROR(
-        "[sirius_scan_manager] restarting the {} io runners failed: {}", to_string(type), e.what());
-      return;
-    }
-    // A fresh pool: a shortfall in it is news again.
-    _io_runner_shortfall_reported.erase(&io_ctx);
-    return;
-  }
-  if (active < expected) {
-    if (_io_runner_shortfall_reported.insert(&io_ctx).second) {
-      SIRIUS_LOG_ERROR(
-        "[sirius_scan_manager] {} backend is running {} of {} io runners; the rest died and are "
-        "not restarted while any runner is alive",
-        to_string(type),
-        active,
-        expected);
-    }
-  }
-}
-
-void sirius_scan_manager::log_io_stats(cucascade::io::ioctx& io_ctx)
-{
-  // Serialized so two queries' boundaries cannot interleave one's diff with the
-  // other's peak reset.
-  std::lock_guard lk{_io_stats_mtx};
-  auto after   = io_stats_snapshot::take(io_ctx);
-  auto& before = _io_stats_snapshots[&io_ctx];  // first boundary: counts from zero
-  // The line is built eagerly as a macro argument, so check the level first; the
-  // sample above and the peak reset / new baseline below happen regardless.
-  if (io_ctx.active_runners() > 0 &&
-      sirius::log::get_sink()->should_log(sirius::log::level::debug)) {
-    SIRIUS_LOG_DEBUG("{}", format_io_stats_delta(io_ctx.type(), before, after));
-  }
-  // `after` becomes the next baseline rather than a fresh sample, so no counter
-  // increment between the two calls is lost; only the peaks restart here.
-  io_ctx.reset_stats_peaks();
-  before = std::move(after);
 }
 
 std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
@@ -2585,6 +2524,8 @@ void sirius_scan_manager::stop()
   // a dequeue that will never be satisfied would otherwise never return.
   reset_all();
   _thread_pool.stop();
+  // Before any ioctx is released: the sampler polls the uring ioctx's reactors.
+  if (_uring_gauges_sampler) { _uring_gauges_sampler->stop(); }
 }
 
 namespace {

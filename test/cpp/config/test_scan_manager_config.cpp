@@ -25,7 +25,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -104,11 +103,6 @@ std::string single_gpu_scan_manager_yaml(std::string const& body)
 std::string uring_yaml(std::string const& body)
 {
   return scan_manager_yaml("      uring:\n" + body);
-}
-
-std::string scheduling_yaml(std::string const& body)
-{
-  return uring_yaml("        scheduling:\n" + body);
 }
 
 /// Loading @p text must fail, and the error must end with @p message (the loader
@@ -679,35 +673,21 @@ TEST_CASE("sirius_config forces the native backend for multi-GPU",
 
 TEST_CASE("sirius_config keeps the Sirius scan_manager defaults", "[scan_manager][config][uring]")
 {
-  using namespace std::chrono_literals;
-  cucascade::io::detail::scheduling_config const cucascade_defaults{};
-
   auto const check_defaults = [&](scan_manager_config const& cfg) {
     CHECK(cfg.uring_n_reactors == 4);
     CHECK(cfg.rest_n_reactors == 2);
     CHECK(cfg.uring.n_max_concurrent_scans == 0);
     CHECK_FALSE(cfg.uring.n_max_concurrent_scans_explicit);
     CHECK(cfg.uring.slices_per_pass == 8);
-
-    auto const& sched = cfg.uring.scheduling;
-    CHECK(sched.background_slot_fraction == Approx(0.75));
-    CHECK(sched.max_active_groups == cucascade_defaults.max_active_groups);
-    CHECK(sched.max_latency_groups == cucascade_defaults.max_latency_groups);
-    CHECK(sched.max_background_groups == cucascade_defaults.max_background_groups);
-    CHECK(sched.reserved_background_slots == cucascade_defaults.reserved_background_slots);
-    CHECK(sched.reserved_latency_slots == cucascade_defaults.reserved_latency_slots);
-    CHECK(sched.write_slot_fraction == Approx(cucascade_defaults.write_slot_fraction));
-    CHECK(sched.write_ring_fraction == Approx(cucascade_defaults.write_ring_fraction));
-    CHECK(sched.write_max_wait == cucascade_defaults.write_max_wait);
-    CHECK(sched.write_max_wait == 20ms);
+    CHECK(cfg.uring.prefetch_reactors == 0);
+    CHECK_FALSE(cfg.uring.prefetch_reactors_explicit);
   };
 
   SECTION("default-constructed") { check_defaults(scan_manager_config{}); }
 
-  SECTION("empty uring and scheduling blocks")
+  SECTION("empty uring block")
   {
-    check_defaults(
-      load_scan_manager("sirius_uring_empty_blocks.yaml", uring_yaml("        scheduling: {}\n")));
+    check_defaults(load_scan_manager("sirius_uring_empty_block.yaml", uring_yaml("        {}\n")));
   }
 }
 
@@ -736,139 +716,93 @@ TEST_CASE("sirius_config rejects an out-of-range uring.slices_per_pass",
                      "free staging slot), got -1");
 }
 
-TEST_CASE("sirius_config reads the uring.scheduling keys", "[scan_manager][config][uring]")
+TEST_CASE("uring prefetch_reactors derives from the readahead and validates against the pool",
+          "[scan_manager][config][uring][prefetch_reactors]")
 {
-  using namespace std::chrono_literals;
-  cucascade::io::detail::scheduling_config const cucascade_defaults{};
-
-  SECTION("every key")
-  {
-    auto const cfg    = load_scan_manager("sirius_uring_scheduling_all.yaml",
-                                       scheduling_yaml("          max_active_groups: 6\n"
-                                                          "          max_latency_groups: 3\n"
-                                                          "          max_background_groups: 1\n"
-                                                          "          reserved_background_slots: 4\n"
-                                                          "          reserved_latency_slots: 1\n"
-                                                          "          background_slot_fraction: 0.5\n"
-                                                          "          write_slot_fraction: 0.25\n"
-                                                          "          write_ring_fraction: 0.375\n"
-                                                          "          write_max_wait_ms: 35\n"));
-    auto const& sched = cfg.uring.scheduling;
-    CHECK(sched.max_active_groups == 6);
-    CHECK(sched.max_latency_groups == 3);
-    CHECK(sched.max_background_groups == 1);
-    CHECK(sched.reserved_background_slots == 4);
-    CHECK(sched.reserved_latency_slots == 1);
-    CHECK(sched.background_slot_fraction == Approx(0.5));
-    CHECK(sched.write_slot_fraction == Approx(0.25));
-    CHECK(sched.write_ring_fraction == Approx(0.375));
-    CHECK(sched.write_max_wait == 35ms);
-
-    // The whole block reaches cuCascade's io_config.
-    auto const io        = cfg.to_io_config();
-    auto const& io_sched = io.uring.scheduling;
-    CHECK(io_sched.max_active_groups == 6);
-    CHECK(io_sched.max_latency_groups == 3);
-    CHECK(io_sched.max_background_groups == 1);
-    CHECK(io_sched.reserved_background_slots == 4);
-    CHECK(io_sched.reserved_latency_slots == 1);
-    CHECK(io_sched.background_slot_fraction == Approx(0.5));
-    CHECK(io_sched.write_slot_fraction == Approx(0.25));
-    CHECK(io_sched.write_ring_fraction == Approx(0.375));
-    CHECK(io_sched.write_max_wait == 35ms);
-  }
-
-  SECTION("the inclusive bounds are accepted")
-  {
-    auto const cfg    = load_scan_manager("sirius_uring_scheduling_bounds.yaml",
-                                       scheduling_yaml("          max_active_groups: 65536\n"
-                                                          "          reserved_latency_slots: 0\n"
-                                                          "          write_max_wait_ms: 1h\n"));
-    auto const& sched = cfg.uring.scheduling;
-    CHECK(sched.max_active_groups == 65536);
-    CHECK(sched.reserved_latency_slots == 0);
-    CHECK(sched.write_max_wait == 3600000ms);
-  }
-
-  SECTION("write_max_wait_ms accepts a unit suffix")
-  {
-    auto const cfg = load_scan_manager("sirius_uring_scheduling_wait_suffix.yaml",
-                                       scheduling_yaml("          write_max_wait_ms: 1.5s\n"));
-    CHECK(cfg.uring.scheduling.write_max_wait == 1500ms);
-  }
-
-  SECTION("an omitted key keeps cuCascade's default")
-  {
-    auto const cfg    = load_scan_manager("sirius_uring_scheduling_one_key.yaml",
-                                       scheduling_yaml("          max_active_groups: 8\n"));
-    auto const& sched = cfg.uring.scheduling;
-    CHECK(sched.max_active_groups == 8);
-    CHECK(sched.max_latency_groups == cucascade_defaults.max_latency_groups);
-    CHECK(sched.max_background_groups == cucascade_defaults.max_background_groups);
-    CHECK(sched.reserved_background_slots == cucascade_defaults.reserved_background_slots);
-    CHECK(sched.reserved_latency_slots == cucascade_defaults.reserved_latency_slots);
-    CHECK(sched.background_slot_fraction == Approx(cucascade_defaults.background_slot_fraction));
-    CHECK(sched.write_slot_fraction == Approx(cucascade_defaults.write_slot_fraction));
-    CHECK(sched.write_ring_fraction == Approx(cucascade_defaults.write_ring_fraction));
-    CHECK(sched.write_max_wait == cucascade_defaults.write_max_wait);
-    CHECK(cfg.uring.slices_per_pass == 8);
-  }
-}
-
-TEST_CASE("sirius_config rejects invalid uring.scheduling values", "[scan_manager][config][uring]")
-{
-  struct invalid_case {
-    char const* key;
-    char const* value;
-  };
-  struct bounded_case {
-    char const* key;
-    char const* value;
-    char const* message;
-  };
-
-  SECTION("fractions")
-  {
-    // The uring reactor's own rule: fractions within [0, 1] (NaN too).
-    for (auto const& [key, value] : {invalid_case{"background_slot_fraction", "1.5"},
-                                     invalid_case{"write_slot_fraction", "-0.25"},
-                                     invalid_case{"write_ring_fraction", ".nan"}}) {
-      CAPTURE(key, value);
-      require_load_error(std::string{"sirius_uring_scheduling_invalid_"} + key + ".yaml",
-                         scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
-                         std::string{"'uring.scheduling."} + key + "': value out of range");
+  // `body` goes under scan_manager; `readahead` adds a cache and a uring budget.
+  auto yaml = [](std::string const& body, bool readahead) {
+    std::string text = body;
+    if (readahead) {
+      text +=
+        "      cache:\n"
+        "        mode: cucs\n";
     }
-  }
+    return scan_manager_yaml(text);
+  };
+  auto uring        = [](std::string const& fields) { return "      uring:\n" + fields; };
+  auto const budget = std::string{"        n_max_concurrent_scans: 8\n"};
 
-  SECTION("counts and write_max_wait_ms")
+  CHECK(cucascade::io::uring::config{}.prefetch_reactors == 0);
+
+  SECTION("derived: 1 only when the uring readahead runs")
   {
-    // Read signed, so -1 is reported as itself rather than wrapped to SIZE_MAX.
-    for (auto const& [key, value, message] :
-         {bounded_case{"max_active_groups", "0", "must be between 1 and 65536, got 0"},
-          bounded_case{"max_latency_groups", "0", "must be between 1 and 65536, got 0"},
-          bounded_case{"max_background_groups", "0", "must be between 1 and 65536, got 0"},
-          bounded_case{"max_active_groups", "-1", "must be between 1 and 65536, got -1"},
-          bounded_case{"max_active_groups",
-                       "4611686018427387904",
-                       "must be between 1 and 65536, got 4611686018427387904"},
-          bounded_case{"reserved_background_slots", "-1", "must be between 0 and 65536, got -1"},
-          bounded_case{"reserved_background_slots",
-                       "4611686018427387904",
-                       "must be between 0 and 65536, got 4611686018427387904"},
-          bounded_case{"write_max_wait_ms", "-5", "must be between 0 and 3600000 ms, got -5"},
-          bounded_case{
-            "write_max_wait_ms", "48h", "must be between 0 and 3600000 ms, got 172800000"}}) {
-      CAPTURE(key, value);
-      require_load_error(std::string{"sirius_uring_scheduling_bounded_"} + key + ".yaml",
-                         scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
-                         std::string{"'uring.scheduling."} + key + "': " + message);
-    }
-  }
-}
+    auto const off =
+      load_scan_manager("sirius_pr_off.yaml", yaml("      uring_n_reactors: 4\n", false));
+    CHECK_FALSE(off.uring.prefetch_reactors_explicit);
+    CHECK(off.uring.prefetch_reactors == 0);
 
-TEST_CASE("sirius_config rejects an unknown uring.scheduling key", "[scan_manager][config][uring]")
-{
-  require_load_error("sirius_uring_scheduling_unknown.yaml",
-                     scheduling_yaml("          foo: 1\n"),
-                     "unknown config key: 'foo' in uring.scheduling");
+    // A cache but no uring budget: the local readahead stays off.
+    auto const cache_only =
+      load_scan_manager("sirius_pr_cache_only.yaml", yaml("      uring_n_reactors: 4\n", true));
+    CHECK(cache_only.uring.prefetch_reactors == 0);
+
+    auto const on = load_scan_manager("sirius_pr_on.yaml", yaml(uring(budget), true));
+    CHECK_FALSE(on.uring.prefetch_reactors_explicit);
+    CHECK(on.uring.prefetch_reactors == 1);
+    CHECK(on.to_io_config().uring.prefetch_reactors == 1);
+
+    // max_readahead_scans: 0 turns the readahead, and so the isolation, off.
+    auto const vetoed = load_scan_manager(
+      "sirius_pr_vetoed.yaml", yaml("      max_readahead_scans: 0\n" + uring(budget), true));
+    CHECK(vetoed.uring.prefetch_reactors == 0);
+
+    // A single reactor has none to spare.
+    auto const single = load_scan_manager(
+      "sirius_pr_single.yaml", yaml("      uring_n_reactors: 1\n" + uring(budget), true));
+    CHECK(single.uring.prefetch_reactors == 0);
+  }
+
+  SECTION("explicit values win over the derivation")
+  {
+    auto const zero = load_scan_manager(
+      "sirius_pr_zero.yaml", yaml(uring(budget + "        prefetch_reactors: 0\n"), true));
+    CHECK(zero.uring.prefetch_reactors_explicit);
+    CHECK(zero.uring.prefetch_reactors == 0);
+
+    auto const two =
+      load_scan_manager("sirius_pr_two.yaml", yaml(uring("        prefetch_reactors: 2\n"), false));
+    CHECK(two.uring.prefetch_reactors_explicit);
+    CHECK(two.uring.prefetch_reactors == 2);
+
+    auto const three = load_scan_manager(
+      "sirius_pr_three.yaml",
+      yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 3\n"), false));
+    CHECK(three.uring.prefetch_reactors == 3);
+    CHECK(three.to_io_config().uring.prefetch_reactors == 3);
+
+    // With one reactor an explicit value is ignored (with a warning), not rejected.
+    auto const single = load_scan_manager(
+      "sirius_pr_single_explicit.yaml",
+      yaml("      uring_n_reactors: 1\n" + uring("        prefetch_reactors: 1\n"), false));
+    CHECK(single.uring.prefetch_reactors == 0);
+  }
+
+  SECTION("rejects a negative value and one that leaves no demand reactor")
+  {
+    require_load_error("sirius_pr_negative.yaml",
+                       yaml(uring("        prefetch_reactors: -1\n"), false),
+                       "'uring.prefetch_reactors': must be 0 or more, got -1");
+    auto rejects = [](std::string const& name, std::string const& text, std::string const& what) {
+      scoped_yaml file(name, text);
+      sirius::sirius_config cfg;
+      CHECK_THROWS_WITH(cfg.load_from_file(file.path()), Catch::Matchers::ContainsSubstring(what));
+    };
+    rejects("sirius_pr_all.yaml",
+            yaml("      uring_n_reactors: 4\n" + uring("        prefetch_reactors: 4\n"), false),
+            "'uring.prefetch_reactors': must be below uring_n_reactors (4) so at least one "
+            "reactor serves demand reads, got 4");
+    rejects("sirius_pr_word.yaml",
+            yaml(uring("        prefetch_reactors: one\n"), false),
+            "uring.prefetch_reactors");
+  }
 }

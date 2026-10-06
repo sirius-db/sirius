@@ -77,7 +77,6 @@ using cucascade::io::io_context_registry;
 using cucascade::io::io_context_type;
 using sirius::scan_manager::scan_manager_config;
 using sirius::scan_manager::sirius_scan_manager;
-using sirius::test::s3::require_rest_ioctx;
 using sirius::test::s3::single_gpu_index;
 
 std::filesystem::path make_regular_file()
@@ -473,12 +472,6 @@ class range_s3_server {
   std::thread _thread;
 };
 
-void read_one_host_range(cucascade::io::datasource& ds)
-{
-  std::array<std::uint8_t, 128> dst{};
-  REQUIRE(ds.host_read(0, dst.size(), dst.data()) == dst.size());
-}
-
 }  // namespace
 
 TEST_CASE("io_context_registry routes full paths before the kvikio catch-all", "[s3][routing]")
@@ -681,19 +674,19 @@ TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[
   REQUIRE_NOTHROW(manager.prepare_for_query(q, true, {}));
 }
 
-TEST_CASE("warmup opens every runner's connection pool, and only once per bucket", "[s3][routing]")
+TEST_CASE("warmup opens every reactor's connection pool, and only once per bucket", "[s3][routing]")
 {
   range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{7}));
   scan_manager_fixture fixture;
   auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
-  // One connection per runner over two runners: small enough for the serial
-  // test server to serve the burst, but still per-runner rather than global
-  // (each runner's engine owns its own, thread-confined connection pool).
+  // One connection per reactor over two reactors: small enough for the serial
+  // test server to serve the burst, but still per-reactor rather than global
+  // (each reactor owns its own, thread-confined connection pool).
   cfg.rest.max_connections = 1;
   cfg.rest_n_reactors      = 2;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
-  // Routes s3:// to the REST ioctx and starts its runners; the size HEAD it
+  // Routes s3:// to the REST ioctx and starts its reactors; the size HEAD it
   // costs is the baseline the warm-up requests are counted on top of.
   auto datasource = manager.create_datasource("s3://warm-bucket/data.parquet");
   REQUIRE(datasource != nullptr);
@@ -709,7 +702,7 @@ TEST_CASE("warmup opens every runner's connection pool, and only once per bucket
   };
 
   int const baseline          = server.request_count();
-  constexpr int expected_warm = 2;  // rest_n_reactors (runner threads) * max_connections
+  constexpr int expected_warm = 2;  // rest_n_reactors * max_connections
 
   // A bucket URL, with no object in it: warm-up traffic never names a data file.
   io_ctx->warmup("s3://warm-bucket");
@@ -741,33 +734,6 @@ TEST_CASE("warmup is a no-op for backends with nothing to connect", "[s3][routin
   manager.io_ctx()->warmup("s3://warm-bucket");
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   CHECK(server.request_count() == 0);
-}
-
-TEST_CASE("rest ioctx runs one runner per rest_n_reactors once started", "[s3][rest]")
-{
-  range_s3_server server(std::vector<std::uint8_t>(4096, std::uint8_t{11}));
-  scan_manager_fixture fixture;
-  auto cfg = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
-  cfg.rest_n_reactors = 4;
-  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
-
-  // Routing s3:// builds and start()s the REST ioctx; start() returns only once
-  // every runner thread registered and built its engine, so the count is exact.
-  auto datasource = manager.create_datasource("s3://routing-bucket/pool.parquet");
-  auto* rest_ctx  = require_rest_ioctx(datasource);
-  CHECK(rest_ctx->n_runner_threads() == cfg.rest_n_reactors);
-  CHECK(rest_ctx->active_runners() == cfg.rest_n_reactors);
-  CHECK(rest_ctx->stats().active_runners == cfg.rest_n_reactors);
-
-  // Queue depth is a backlog gauge, not a lifetime counter: it returns to zero
-  // once a runner has taken the work, so a served read leaves no residue.
-  read_one_host_range(*datasource);
-  auto const stats = rest_ctx->stats();
-  CHECK(stats.active_runners == cfg.rest_n_reactors);
-  for (auto const& per_class : stats.per_class) {
-    CHECK(per_class.queued_requests == 0);
-    CHECK(per_class.queued_bytes == 0);
-  }
 }
 
 TEST_CASE("parquet_gpu_ingestible resolver routes each parquet file independently", "[s3][routing]")

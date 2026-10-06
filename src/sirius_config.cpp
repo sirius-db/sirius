@@ -28,7 +28,6 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <exception>
 #include <limits>
@@ -227,61 +226,9 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.reject_unknown();
 }
 
-// Upper bound of the uring.scheduling group limits and reserved-slot counts. The
-// reactor sizes its per-runner group bookkeeping from the group limits, so a wrapped
-// or huge value would fail there (std::length_error / std::bad_alloc) instead of here.
-static constexpr long long max_scheduling_count = 65536;
-
-// Read an optional uring.scheduling count as a signed integer, so a negative value is
-// reported as itself rather than wrapped to a huge std::size_t, and require lo..hi.
-static void read_scheduling_count(
-  yaml::reader& r, std::string const& key, std::size_t& out, long long lo, long long hi)
-{
-  std::optional<long long> value;
-  r.optional(key, value);
-  if (!value.has_value()) { return; }
-  if (*value < lo || *value > hi) {
-    throw std::runtime_error("'uring.scheduling." + key + "': must be between " +
-                             std::to_string(lo) + " and " + std::to_string(hi) + ", got " +
-                             std::to_string(*value));
-  }
-  out = static_cast<std::size_t>(*value);
-}
-
-// The uring reactor re-checks the scheduling and slices_per_pass rules when it is
-// constructed, but cuCascade's factory then returns nullptr and the cause appears only
-// in cuCascade's (compiled-out) log, so Sirius validates them here and names the key.
-static void from_yaml(const YAML::Node& node, cucascade::io::detail::scheduling_config& opt)
-{
-  yaml::reader r(node, "uring.scheduling");
-  read_scheduling_count(r, "max_active_groups", opt.max_active_groups, 1, max_scheduling_count);
-  read_scheduling_count(r, "max_latency_groups", opt.max_latency_groups, 1, max_scheduling_count);
-  read_scheduling_count(
-    r, "max_background_groups", opt.max_background_groups, 1, max_scheduling_count);
-  read_scheduling_count(
-    r, "reserved_background_slots", opt.reserved_background_slots, 0, max_scheduling_count);
-  read_scheduling_count(
-    r, "reserved_latency_slots", opt.reserved_latency_slots, 0, max_scheduling_count);
-  r.optional("background_slot_fraction", opt.background_slot_fraction, yaml::fraction<double>{});
-  r.optional("write_slot_fraction", opt.write_slot_fraction, yaml::fraction<double>{});
-  r.optional("write_ring_fraction", opt.write_ring_fraction, yaml::fraction<double>{});
-  {
-    // Bounded so the policy's comparison against a nanosecond age cannot overflow.
-    std::optional<std::chrono::milliseconds> wait;
-    r.optional("write_max_wait_ms", wait);
-    if (wait.has_value()) {
-      constexpr std::chrono::milliseconds max_wait = std::chrono::hours{1};
-      if (*wait < std::chrono::milliseconds::zero() || *wait > max_wait) {
-        throw std::runtime_error("'uring.scheduling.write_max_wait_ms': must be between 0 and " +
-                                 std::to_string(max_wait.count()) + " ms, got " +
-                                 std::to_string(wait->count()));
-      }
-      opt.write_max_wait = *wait;
-    }
-  }
-  r.reject_unknown();
-}
-
+// The uring reactor re-checks the slices_per_pass rule when it is constructed, but
+// cuCascade's factory then returns nullptr and the cause appears only in cuCascade's
+// (compiled-out) log, so Sirius validates it here and names the key.
 static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
@@ -309,7 +256,20 @@ static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
       opt.slices_per_pass = static_cast<std::size_t>(*slices);
     }
   }
-  if (auto n = r.optional_node("scheduling")) { from_yaml(*n, opt.scheduling); }
+  {
+    // Signed for the same reason; the upper bound (below the reactor count) is
+    // checked in finalize_derived_config, where uring_n_reactors is known.
+    std::optional<long long> prefetch_reactors;
+    r.optional("prefetch_reactors", prefetch_reactors);
+    if (prefetch_reactors.has_value()) {
+      if (*prefetch_reactors < 0) {
+        throw std::runtime_error("'uring.prefetch_reactors': must be 0 or more, got " +
+                                 std::to_string(*prefetch_reactors));
+      }
+      opt.prefetch_reactors          = static_cast<std::size_t>(*prefetch_reactors);
+      opt.prefetch_reactors_explicit = true;
+    }
+  }
   r.reject_unknown();
 }
 
@@ -1032,6 +992,39 @@ void sirius_config::finalize_derived_config()
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
   enforce_native_backend_for_multi_gpu();
+  derive_uring_prefetch_reactors();
+}
+
+void sirius_config::derive_uring_prefetch_reactors()
+{
+  auto& sm    = _scan_manager_config;
+  auto& uring = sm.uring;
+  // Prefetch isolation only pays when there is prefetch traffic: without the
+  // readahead the reserved reactors would sit idle and demand would lose their
+  // bandwidth.  With it on, one reactor (~5 GB/s) is enough to keep the
+  // readahead ahead of the executor while demand reads never queue behind it;
+  // measured on TPC-H SF1000 local parquet with 4 reactors, 1 beats both 0 and 2.
+  if (!uring.prefetch_reactors_explicit) {
+    auto const readahead_runs = sm.resolve_readahead(uring.n_max_concurrent_scans,
+                                                     scan_manager::prefetch_strategy::opportunistic)
+                                  .budget > 0;
+    uring.prefetch_reactors = readahead_runs && sm.uring_n_reactors > 1 ? 1 : 0;
+  }
+  if (uring.prefetch_reactors == 0) { return; }
+  if (sm.uring_n_reactors == 1) {
+    SIRIUS_LOG_WARN(
+      "sirius_config: uring.prefetch_reactors={} ignored: with a single uring reactor there is "
+      "none left for demand reads",
+      uring.prefetch_reactors);
+    uring.prefetch_reactors = 0;
+    return;
+  }
+  if (uring.prefetch_reactors >= sm.uring_n_reactors) {
+    throw std::runtime_error("'uring.prefetch_reactors': must be below uring_n_reactors (" +
+                             std::to_string(sm.uring_n_reactors) +
+                             ") so at least one reactor serves demand reads, got " +
+                             std::to_string(uring.prefetch_reactors));
+  }
 }
 
 void sirius_config::derive_rest_scan_budget()

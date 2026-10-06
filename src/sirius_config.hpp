@@ -378,9 +378,10 @@ struct sirius_config {
   friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
-  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called by parsed_sirius_config::resolve after
-  /// memory capacities and operator defaults are resolved.
+  /// scan budgets, the @c pipeline_width stamp, the multi-GPU backend
+  /// override and the uring prefetch reactors, in that order. Called by
+  /// parsed_sirius_config::resolve after memory capacities and operator
+  /// defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -395,6 +396,13 @@ struct sirius_config {
   /// thread to stay ahead of demand. Called from
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
+
+  /// Default @c _scan_manager_config.uring.prefetch_reactors to 1 when the
+  /// uring readahead will run (0 otherwise), then validate it against
+  /// @c uring_n_reactors: ignored with a warning for a single reactor, rejected
+  /// when it would leave no demand reactor. Called from
+  /// @ref finalize_derived_config; an explicit config value is never re-derived.
+  void derive_uring_prefetch_reactors();
 
   cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;

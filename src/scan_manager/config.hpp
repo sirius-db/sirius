@@ -39,18 +39,19 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring runner-thread count (cuCascade's @c io_config::uring_n_reactors);
+/// Default uring reactor count (cuCascade's @c io_config::uring_n_reactors; one
+/// worker thread each);
 /// counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 4;
 
-/// Sirius's default uring backend config: cuCascade's struct defaults, except that
-/// readahead is off (@c n_max_concurrent_scans = 0).
+/// Sirius's default uring backend config: cuCascade's struct defaults with
+/// readahead off (@c n_max_concurrent_scans = 0).  cuCascade's own default is now
+/// 0 as well; the explicit assignment keeps Sirius's choice independent of it.
 ///
 /// Local NVMe has no round trip to hide, so a readahead competes with the
 /// executor's own reads for the same device and just reorders the queue rather
 /// than adding throughput.  Measured on SF1000 local-parquet, turning it off is a
-/// large net win, so the local backend defaults to 0 (off); cuCascade's struct
-/// default is the pipeline width.  Set a positive value (or
+/// large net win, so the local backend defaults to 0 (off).  Set a positive value (or
 /// @c max_readahead_scans) to opt the local path back in.
 /// @c n_max_concurrent_scans_explicit stays false: this is a default, not a
 /// value the config named.
@@ -239,11 +240,11 @@ struct scan_manager_config {
   /// IO backend that serves managed reads.
   io_backend backend{io_backend::native};
 
-  /// Number of uring runner threads for the local-disk IO path (each allocates
-  /// its pinned staging at @c ioctx::start()).
+  /// Number of uring reactors for the local-disk IO path (each one worker thread
+  /// and one ring; each allocates its pinned staging at @c ioctx::start()).
   std::size_t uring_n_reactors{default_uring_n_reactors};
 
-  /// Number of REST runner threads for the S3/object-store IO path (each its own
+  /// Number of REST reactors for the S3/object-store IO path (each its own
   /// libcurl event loop + connection pool).
   std::size_t rest_n_reactors{2};
 
@@ -306,7 +307,7 @@ struct scan_manager_config {
   }
 
   /// The cuCascade io configuration for the @c io_context_registry: the backend
-  /// sub-configs and runner counts copied verbatim, @ref backend mapped onto
+  /// sub-configs and reactor counts copied verbatim, @ref backend mapped onto
   /// cuCascade's enum, and the cache-derived knobs refreshed.
   [[nodiscard]] cucascade::io::io_config to_io_config() const
   {
