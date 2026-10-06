@@ -97,16 +97,30 @@ std::vector<std::optional<uint64_t>> parquet_leaf_column_widths(const duckdb::Fu
   // indices do not account for.
   if (num_leaves == 0 || num_leaves != multi->names.size()) { return {}; }
 
-  std::vector<uint64_t> bytes(num_leaves, 0);
-  std::vector<uint64_t> values(num_leaves, 0);
-  std::vector<bool> dictionary(num_leaves, false);
+  // Two sources per leaf, best first. (1) Parquet size statistics (format 2.10+): the unencoded
+  // byte count of a BYTE_ARRAY column, exact whatever the encoding. (2) The chunk's uncompressed
+  // size, usable only when no dictionary is involved (a dictionary chunk's size says nothing about
+  // the decoded width). Either way cuDF adds a 4-byte offset per string.
+  constexpr uint64_t k_string_offset_bytes = 4;
+  std::vector<uint64_t> unencoded(num_leaves, 0), unencoded_values(num_leaves, 0);
+  std::vector<uint64_t> bytes(num_leaves, 0), values(num_leaves, 0);
+  std::vector<bool> dictionary(num_leaves, false), byte_array(num_leaves, false);
   for (auto const& row_group : metadata->row_groups) {
     if (row_group.columns.size() != num_leaves) { return {}; }
     for (std::size_t c = 0; c < num_leaves; ++c) {
       auto const& meta = row_group.columns[c].meta_data;
-      if (meta.num_values > 0 && meta.total_uncompressed_size > 0) {
+      if (meta.num_values <= 0) { continue; }
+      auto const n = static_cast<uint64_t>(meta.num_values);
+      if (meta.type == duckdb_parquet::Type::BYTE_ARRAY) { byte_array[c] = true; }
+      if (meta.__isset.size_statistics &&
+          meta.size_statistics.__isset.unencoded_byte_array_data_bytes &&
+          meta.size_statistics.unencoded_byte_array_data_bytes > 0) {
+        unencoded[c] += static_cast<uint64_t>(meta.size_statistics.unencoded_byte_array_data_bytes);
+        unencoded_values[c] += n;
+      }
+      if (meta.total_uncompressed_size > 0) {
         bytes[c] += static_cast<uint64_t>(meta.total_uncompressed_size);
-        values[c] += static_cast<uint64_t>(meta.num_values);
+        values[c] += n;
       }
       if (meta.__isset.dictionary_page_offset) { dictionary[c] = true; }
       for (auto const encoding : meta.encodings) {
@@ -120,7 +134,14 @@ std::vector<std::optional<uint64_t>> parquet_leaf_column_widths(const duckdb::Fu
 
   std::vector<std::optional<uint64_t>> widths(num_leaves);
   for (std::size_t c = 0; c < num_leaves; ++c) {
+    if (byte_array[c] && unencoded_values[c] > 0) {
+      widths[c] =
+        (unencoded[c] + unencoded_values[c] - 1) / unencoded_values[c] + k_string_offset_bytes;
+      continue;
+    }
     if (dictionary[c] || values[c] == 0) { continue; }
+    // PLAIN / DELTA_LENGTH byte arrays already carry a 4-byte length per value, so the encoded
+    // average is within a few bytes of chars + offset; take it as is.
     widths[c] = std::max<uint64_t>(1, (bytes[c] + values[c] - 1) / values[c]);
   }
   return widths;
