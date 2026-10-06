@@ -43,6 +43,7 @@
 #include <mutex>
 #include <tuple>
 #include <typeinfo>
+#include <unordered_set>
 
 namespace sirius::planner {
 namespace {
@@ -153,9 +154,47 @@ std::array<connector, 6> const entries{make_seq_scan_connector(),
                                        make_iceberg_scan_connector(),
                                        make_sirius_stream_source_connector()};
 
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-void* host_factory(duckdb::DatabaseInstance& db, char const* symbol);
-#endif
+// The system catalog's dynamic type identifies its DuckDB module independently of
+// mutable function registrations, including Python's RTLD_LOCAL import.
+link_map const* host_module(duckdb::DatabaseInstance& db)
+{
+  auto& catalog = duckdb::Catalog::GetSystemCatalog(db);
+  Dl_info owner{};
+  void* module{};
+  if (!::dladdr1(&typeid(catalog), &owner, &module, RTLD_DL_LINKMAP)) return nullptr;
+  return static_cast<link_map const*>(module);
+}
+
+template <class Factory>
+Factory host_factory(duckdb::DatabaseInstance& db, Factory local_factory, char const* symbol)
+{
+  auto const* module = host_module(db);
+  if (!module) return nullptr;
+  Dl_info implementation{};
+  void* implementation_map{};
+  // Embedded DuckDB may hide its symbols. Its directly linked factory is trusted
+  // only when it belongs to the same module as the host's system catalog.
+  if (::dladdr1(reinterpret_cast<void*>(local_factory),
+                &implementation,
+                &implementation_map,
+                RTLD_DL_LINKMAP) &&
+      implementation_map == module)
+    return local_factory;
+
+  // Use the loader's existing record, without probing a file or changing symbol scope.
+  // The main executable has an empty name and must be opened through its main handle.
+  auto const* name = module->l_name && module->l_name[0] ? module->l_name : nullptr;
+  auto* handle     = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+  if (!handle) return nullptr;
+  auto close = [](void* value) { ::dlclose(value); };
+  std::unique_ptr<void, decltype(close)> guard(handle, close);
+  auto* factory = ::dlsym(handle, symbol);
+  // A handle can also resolve symbols from dependencies. Only this host may grant trust.
+  if (!factory || !::dladdr1(factory, &implementation, &implementation_map, RTLD_DL_LINKMAP) ||
+      implementation_map != module)
+    return nullptr;
+  return reinterpret_cast<Factory>(factory);
+}
 
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
@@ -187,12 +226,10 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
     config.options.maximum_threads = 1;
     duckdb::DuckDB reference(nullptr, &config);
     reference.LoadStaticExtension<duckdb::ParquetExtension>();
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-    // Iceberg derives part of its scan callbacks from Parquet. The reference must
-    // use the host factory, not the loadable Sirius module's hidden DuckDB copy.
-    using parquet_factory = duckdb::TableFunctionSet (*)();
-    auto get_parquet      = reinterpret_cast<parquet_factory>(
-      host_factory(db, "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    // Iceberg derives scan callbacks from Parquet; use the caller's DuckDB factory.
+    auto get_parquet = host_factory(db,
+                                    &duckdb::ParquetScanFunction::GetFunctionSet,
+                                    "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     if (!get_parquet) return {};
     duckdb::ExtensionLoader parquet_loader(*reference.instance, "parquet");
     auto functions = get_parquet();
@@ -202,7 +239,6 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
       info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       parquet_loader.RegisterFunction(std::move(info));
     }
-#endif
     duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
     init(loader);
     auto entry = loader.TryGetTableFunction("iceberg_scan");
@@ -211,63 +247,22 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
   return {};
 }
 
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-void* host_factory(duckdb::DatabaseInstance& db, char const* symbol)
-{
-  // The system catalog object is created by the host, independently of mutable function
-  // registrations. Its dynamic type locates that DuckDB module even for Python's RTLD_LOCAL
-  // import. Do not locate the host through a candidate callback or promote it to RTLD_GLOBAL.
-  auto& catalog = duckdb::Catalog::GetSystemCatalog(db);
-  Dl_info owner{};
-  void* owner_map{};
-  if (!::dladdr1(&typeid(catalog), &owner, &owner_map, RTLD_DL_LINKMAP) || !owner_map)
-    return nullptr;
-  auto const* module = static_cast<link_map const*>(owner_map);
-  // Use the loader's own name so NOLOAD finds its existing record without probing a file.
-  // The main executable has an empty name: use its main handle, never reopen its disk path.
-  auto const* name = module->l_name && module->l_name[0] ? module->l_name : nullptr;
-  auto* handle     = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
-  if (!handle) return nullptr;
-  auto close = [](void* value) { ::dlclose(value); };
-  std::unique_ptr<void, decltype(close)> guard(handle, close);
-  auto* factory = ::dlsym(handle, symbol);
-  Dl_info implementation{};
-  // A handle can also resolve symbols from dependencies. Only this host may grant trust.
-  if (!factory || !::dladdr(factory, &implementation) ||
-      implementation.dli_fbase != owner.dli_fbase) {
-    return nullptr;
-  }
-  return factory;
-}
-#endif
-
 duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& name,
                                                           duckdb::ClientContext& context)
 {
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-  // The loadable extension links a hidden DuckDB copy. Its factory addresses are not the
-  // host's. Resolve the host's exported factories (pinned DuckDB C++ ABI), never an entry in
-  // the caller's mutable catalog. Missing host symbols leave the source unverified.
+  auto& db = duckdb::DatabaseInstance::GetDatabase(context);
   if (name == "seq_scan") {
-    using factory = duckdb::TableFunction (*)();
-    auto get =
-      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
-                                             "_ZN6duckdb17TableScanFunction11GetFunctionEv"));
+    auto get = host_factory(
+      db, &duckdb::TableScanFunction::GetFunction, "_ZN6duckdb17TableScanFunction11GetFunctionEv");
     return get ? duckdb::vector<duckdb::TableFunction>{get()}
                : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "parquet_scan" || name == "read_parquet") {
-    using factory = duckdb::TableFunctionSet (*)();
-    auto get =
-      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
-                                             "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    auto get = host_factory(db,
+                            &duckdb::ParquetScanFunction::GetFunctionSet,
+                            "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
   }
-#else
-  if (name == "seq_scan") return {duckdb::TableScanFunction::GetFunction()};
-  if (name == "parquet_scan" || name == "read_parquet")
-    return duckdb::ParquetScanFunction::GetFunctionSet().functions;
-#endif
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
   // Iceberg is initialized at extension load, never during a planning lookup.
@@ -367,21 +362,22 @@ struct accepted_callbacks {
   /// Caches trusted definitions, including an unavailable resolution result.
   detail::connector_reference_cache reference;
   /// Prevents repeated warnings when a connector has no trusted definition.
-  bool missing_reference_reported = false;
+  std::unordered_set<void const*> missing_reference_reported;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
 
 void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
 {
   if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("iceberg")) return;
+  auto const* host = &typeid(duckdb::Catalog::GetSystemCatalog(db));
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].function_name != "iceberg_scan") continue;
     auto& cache = accepted[i];
     std::lock_guard lock(cache.mutex);
-    if (cache.reference.has_verified_functions()) return;
+    if (cache.reference.has_verified_functions(host)) return;
     try {
       // Publish the complete independent reference only after registration succeeds.
-      cache.reference.publish(iceberg_reference_functions(db));
+      cache.reference.publish(host, iceberg_reference_functions(db));
     } catch (std::exception const& error) {
       // Optional GPU admission must not break LOAD or fall back to trusting the caller's
       // catalog. An empty cache makes lookup decline without retrying initialization there.
@@ -420,7 +416,9 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
     if (entry.function_name != function.name || !entry.bind_data_matches(bind)) continue;
-    auto& cache = accepted[i];
+    // RTTI identifies the host without a loader symbol-table walk on every lookup.
+    auto const* host = &typeid(duckdb::Catalog::GetSystemCatalog(context));
+    auto& cache      = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
       duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -428,25 +426,22 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
     if (!catalog_entry) return nullptr;
     // A mutable catalog can confirm registration, but must never grant trust.
     auto const& references = cache.reference.get_or_resolve(
-      [&] { return reference_functions(entry.function_name, context); });
+      host, [&] { return reference_functions(entry.function_name, context); });
     if (references.empty()) {
-      if (!cache.missing_reference_reported) {
+      if (cache.missing_reference_reported.insert(host).second) {
         auto const* requirement =
           "The source extension must provide a verifiable function definition.";
-#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
         if (entry.function_name == "seq_scan" || entry.function_name == "parquet_scan" ||
             entry.function_name == "read_parquet") {
           requirement =
-            "Loadable Sirius requires the matching host DuckDB build to export "
+            "An external DuckDB host must export "
             "TableScanFunction::GetFunction and ParquetScanFunction::GetFunctionSet.";
         }
-#endif
         SIRIUS_LOG_WARN(
           "GPU scan source '{}' has no trusted reference definition; GPU lowering "
           "is disabled for this source. {}",
           entry.function_name,
           requirement);
-        cache.missing_reference_reported = true;
       }
       return nullptr;
     }

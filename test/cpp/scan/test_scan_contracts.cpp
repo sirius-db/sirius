@@ -699,6 +699,7 @@ TEST_CASE("Scan reference resolution remembers unavailable definitions",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
+  int host;
   unsigned calls = 0;
   auto resolve   = [&] {
     ++calls;
@@ -708,7 +709,7 @@ TEST_CASE("Scan reference resolution remembers unavailable definitions",
     return duckdb::vector<duckdb::TableFunction>{duckdb::TableScanFunction::GetFunction()};
   };
   for (unsigned lookup = 0; lookup < 3; ++lookup) {
-    CHECK(cache.get_or_resolve(resolve).empty());
+    CHECK(cache.get_or_resolve(&host, resolve).empty());
   }
   CHECK(calls == 1);
 }
@@ -717,22 +718,23 @@ TEST_CASE("Extension bootstrap can publish after unavailable scan references",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
+  int host;
   unsigned calls   = 0;
   auto unavailable = [&] {
     ++calls;
     return duckdb::vector<duckdb::TableFunction>{};
   };
-  REQUIRE(cache.get_or_resolve(unavailable).empty());
-  cache.publish({});
-  REQUIRE(cache.get_or_resolve(unavailable).empty());
+  REQUIRE(cache.get_or_resolve(&host, unavailable).empty());
+  cache.publish(&host, {});
+  REQUIRE(cache.get_or_resolve(&host, unavailable).empty());
   CHECK(calls == 1);
 
   auto trusted = duckdb::TableScanFunction::GetFunction();
-  cache.publish({trusted});
-  auto const& references = cache.get_or_resolve(unavailable);
+  cache.publish(&host, {trusted});
+  auto const& references = cache.get_or_resolve(&host, unavailable);
   REQUIRE(references.size() == 1);
   CHECK(references.front().function == trusted.function);
-  CHECK(cache.has_verified_functions());
+  CHECK(cache.has_verified_functions(&host));
   CHECK(calls == 1);
 }
 
@@ -740,11 +742,13 @@ TEST_CASE("Scan reference resolution publishes only complete results",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  CHECK_THROWS_AS(cache.get_or_resolve([]() -> duckdb::vector<duckdb::TableFunction> {
-    throw std::runtime_error("factory unavailable");
-  }),
+  int host;
+  CHECK_THROWS_AS(cache.get_or_resolve(&host,
+                                       []() -> duckdb::vector<duckdb::TableFunction> {
+                                         throw std::runtime_error("factory unavailable");
+                                       }),
                   std::runtime_error);
-  CHECK_FALSE(cache.has_verified_functions());
+  CHECK_FALSE(cache.has_verified_functions(&host));
 
   unsigned calls = 0;
   auto trusted   = duckdb::TableScanFunction::GetFunction();
@@ -753,10 +757,42 @@ TEST_CASE("Scan reference resolution publishes only complete results",
     return duckdb::vector<duckdb::TableFunction>{trusted};
   };
   for (unsigned lookup = 0; lookup < 3; ++lookup) {
-    auto const& references = cache.get_or_resolve(resolve);
+    auto const& references = cache.get_or_resolve(&host, resolve);
     REQUIRE(references.size() == 1);
     CHECK(references.front().function == trusted.function);
   }
+  CHECK(calls == 1);
+}
+
+TEST_CASE("Scan references are isolated between DuckDB hosts", "[scan][contracts][reference_cache]")
+{
+  sirius::planner::detail::connector_reference_cache cache;
+  int embedded, external;
+  auto const embedded_first = GENERATE(true, false);
+  auto* first               = embedded_first ? &embedded : &external;
+  auto* second              = embedded_first ? &external : &embedded;
+  auto trusted              = duckdb::TableScanFunction::GetFunction();
+  unsigned calls            = 0;
+  auto unavailable          = [&] {
+    ++calls;
+    return duckdb::vector<duckdb::TableFunction>{};
+  };
+  REQUIRE(cache.get_or_resolve(first, unavailable).empty());
+  auto const& references =
+    cache.get_or_resolve(second, [&] { return duckdb::vector<duckdb::TableFunction>{trusted}; });
+  REQUIRE(references.size() == 1);
+  CHECK(references.front().function == trusted.function);
+  CHECK(cache.get_or_resolve(first, unavailable).empty());
+  CHECK_FALSE(cache.has_verified_functions(first));
+  CHECK(cache.has_verified_functions(second));
+  CHECK(calls == 1);
+
+  // An extension bootstrap publishes only to the host that loaded it.
+  cache.publish(first, {trusted});
+  cache.publish(second, {});
+  CHECK(cache.has_verified_functions(first));
+  CHECK_FALSE(cache.has_verified_functions(second));
+  CHECK(cache.get_or_resolve(second, unavailable).empty());
   CHECK(calls == 1);
 }
 
