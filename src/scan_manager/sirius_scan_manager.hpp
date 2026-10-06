@@ -81,10 +81,11 @@ class fixed_size_host_memory_resource;
 
 namespace cucascade::memory {
 class memory_reservation_manager;
+class topology_index;
 }  // namespace cucascade::memory
 
 namespace sirius::memory {
-class topology_index;
+using cucascade::memory::topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::io {

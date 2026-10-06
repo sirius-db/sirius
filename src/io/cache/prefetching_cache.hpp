@@ -57,13 +57,14 @@ namespace sirius::cuda {
 class device_copy_batch;
 }  // namespace sirius::cuda
 
-namespace sirius::memory {
-class topology_index;
-}  // namespace sirius::memory
-
 namespace cucascade::memory {
 class memory_reservation_manager;
+class topology_index;
 }  // namespace cucascade::memory
+
+namespace sirius::memory {
+using cucascade::memory::topology_index;
+}  // namespace sirius::memory
 
 namespace sirius::io::cache {
 

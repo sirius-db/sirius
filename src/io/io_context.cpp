@@ -21,6 +21,7 @@
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <cassert>
 #include <cmath>

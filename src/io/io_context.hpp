@@ -56,13 +56,14 @@ class sirius_datasource;
 
 }  // namespace sirius::io
 
-namespace sirius::memory {
-class topology_index;
-}  // namespace sirius::memory
-
 namespace cucascade::memory {
 class memory_reservation_manager;
+class topology_index;
 }  // namespace cucascade::memory
+
+namespace sirius::memory {
+using cucascade::memory::topology_index;
+}  // namespace sirius::memory
 
 namespace sirius::io {
 
