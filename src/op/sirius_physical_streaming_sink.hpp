@@ -125,6 +125,11 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// @throws sirius::invalid_input_exception when `index` is out of range.
   [[nodiscard]] exec::batch_stream::availability availability(std::size_t index = 0) const;
 
+  /// The stream behind output `index`, for a consumer that drains it from its own thread while
+  /// the fragment runs.
+  /// @throws sirius::invalid_input_exception when `index` is out of range.
+  [[nodiscard]] std::shared_ptr<exec::batch_stream> output_stream(std::size_t index) const;
+
   /// Poison every output stream (S2 / P1–P4). First failure wins. Sink has no on_data — wait()
   /// wakes via the stream CV.
   void fail_output(std::exception_ptr error);
