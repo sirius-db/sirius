@@ -19,7 +19,7 @@
 #include "log/logging.hpp"
 #include "log/spdlog_owning_sink.hpp"
 #include "util/segfault_backtrace.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
@@ -189,29 +189,24 @@ int main(int argc, char* argv[])
     sirius::test::g_integration_env_2gpu = &(*integration_env_2gpu_holder);
   }
 
-  // Bring up the S3 test backend (MinIO via testcontainers) once, when the [s3]
-  // suite is run with SIRIUS_TEST_S3_AUTO=1; a no-op otherwise. Doing it here
-  // (rather than per-test) keeps it out of the default `make test` path and lets
-  // a strict bring-up failure abort with a clear message instead of silently
-  // skipping every [s3] test green. Compiled only when the testcontainers
-  // harness is built (SIRIUS_BUILD_S3_TESTS).
-#ifdef SIRIUS_HAVE_TESTCONTAINERS
+  // Bring up the S3 test backend (a spawned SeaweedFS process) once, when the
+  // [s3] suite is run with SIRIUS_TEST_S3_AUTO=1; a no-op otherwise. Doing it
+  // here (rather than per-test) keeps it out of the default `make test` path and
+  // lets a strict bring-up failure abort with a clear message instead of
+  // silently skipping every [s3] test green.
   try {
-    sirius::test::ensure_s3_container_env();
+    sirius::test::ensure_s3_test_env();
   } catch (std::exception const& e) {
     std::cerr << "[s3] fatal: " << e.what() << std::endl;
-    sirius::test::shutdown_s3_container_env();
+    sirius::test::shutdown_s3_test_env();
     return EXIT_FAILURE;
   }
-#endif
 
   Catch::Session session;
   session.applyCommandLine(argc, argv);
   int result = session.run();
 
-#ifdef SIRIUS_HAVE_TESTCONTAINERS
-  sirius::test::shutdown_s3_container_env();
-#endif
+  sirius::test::shutdown_s3_test_env();
 
   sirius::test::g_integration_env_2gpu = nullptr;
   sirius::test::g_integration_env      = nullptr;

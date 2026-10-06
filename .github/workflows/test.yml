@@ -227,6 +227,13 @@ jobs:
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
 
+      - name: S3 integration tests
+        run: make s3-test
+
+      - name: S3 large integration tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: make s3-test-large
+
       - name: TPC-H performance snapshot
         id: tpch
         env:

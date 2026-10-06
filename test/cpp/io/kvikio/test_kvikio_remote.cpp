@@ -24,7 +24,7 @@
 #include <io/object_store_config.hpp>
 #include <io/sirius_datasource.hpp>
 #include <unistd.h>  // getpid
-#include <utils/s3_container.hpp>
+#include <utils/s3_backend.hpp>
 #include <utils/s3_test_env.hpp>
 
 #include <atomic>
@@ -70,13 +70,12 @@ class scoped_temp_file {
   std::filesystem::path _path;
 };
 
-#ifdef SIRIUS_HAVE_TESTCONTAINERS
 using sirius::test::s3::env_or;
 using sirius::test::s3::require_env;
 
-/// Credentials for the managed MinIO instance brought up by
-/// ensure_s3_container_env(); TLS verification is off for its self-signed cert.
-io::object_store_config minio_store()
+/// Credentials for the managed SeaweedFS instance brought up by
+/// ensure_s3_test_env(); TLS verification is off for its self-signed cert.
+io::object_store_config s3_store()
 {
   io::object_store_config os;
   os.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
@@ -86,7 +85,6 @@ io::object_store_config minio_store()
   os.tls_verify = false;
   return os;
 }
-#endif
 
 io::object_store_config configured_store()
 {
@@ -149,14 +147,13 @@ TEST_CASE("kvikio_context clamps local reads past the end of the object", "[kvik
   REQUIRE(ds->host_read(contents.size() + 100, buffer.size(), buffer.data()) == 0);
 }
 
-#ifdef SIRIUS_HAVE_TESTCONTAINERS
 TEST_CASE("kvikio_context orders remote device reads behind the destination stream",
           "[s3][integration][kvikio]")
 {
   using namespace std::chrono_literals;
 
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -171,12 +168,12 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
     payload[i] = static_cast<uint8_t>((i * 31 + 7) & 0xff);
   }
   std::string const key = "kvikio-stream-gate.bin";
-  if (!sirius::test::put_s3_container_object(key, payload)) {
+  if (!sirius::test::put_s3_test_object(key, payload)) {
     WARN("Skipping kvikio remote stream-ordering test: S3 environment is externally managed");
     return;
   }
 
-  auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, minio_store());
+  auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, s3_store());
   auto ds  = ctx->open_datasource("s3://" + require_env("SIRIUS_TEST_S3_BUCKET") + "/" + key);
   REQUIRE(ds != nullptr);
   REQUIRE(ds->size() == payload.size());
@@ -234,4 +231,3 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
   REQUIRE(got == payload);
 }
-#endif

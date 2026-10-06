@@ -38,14 +38,6 @@ option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
-# The [s3] integration tests launch MinIO via a patched build of upstream
-# testcontainers-native, fetched + patched at configure time and built as a Go
-# c-archive — so it needs a Go toolchain and network at configure/build time. ON
-# by default (the pixi env provides Go); turn OFF for offline / Go-less /
-# release / package builds, which then skip the S3 container harness entirely.
-option(SIRIUS_BUILD_S3_TESTS
-       "Build the testcontainers-backed S3 integration test harness" ON)
-
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
 endif()
