@@ -40,6 +40,8 @@ if(SIRIUS_BUILD_STATIC)
             parquet_extension
             cucascade_static
             cucascade_cudf_static
+            cucascade_io_static
+            cucascade_io_thirdparty
             cucascade_topology_discovery_static
     EXPORT sirius-static-targets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library)
