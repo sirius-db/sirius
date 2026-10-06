@@ -124,6 +124,17 @@ mod ffi {
         fn done(self: &RingExchange, ticket: u64) -> Result<bool>;
         fn stats_line(self: &RingExchange) -> Result<UniquePtr<CxxString>>;
 
+        /// Add the non-null rows, minimum and maximum of a signed integer
+        /// column of the sealed batch under `token`, leaving it in place.
+        fn key_stats(
+            self: &ExchangeInbox,
+            token: u64,
+            column: u32,
+            rows: &mut u64,
+            min: &mut i64,
+            max: &mut i64,
+        ) -> Result<()>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches) or none (a result fragment, which produces Arrow). The
@@ -192,6 +203,37 @@ mod ffi {
             rows: &mut u64,
             stream_bytes: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Add the non-null rows, minimum and maximum of a signed integer
+        /// column over every batch parked on an output stream, without
+        /// draining it.
+        fn output_key_stats(
+            self: &Fragment,
+            stream_id: u64,
+            column: u32,
+            rows: &mut u64,
+            min: &mut i64,
+            max: &mut i64,
+        ) -> Result<()>;
+
+        /// Push a copy of one column of every batch parked on `source`'s
+        /// output stream into an input stream, leaving the source as it was.
+        fn copy_output_column(
+            self: Pin<&mut Fragment>,
+            source: Pin<&mut Fragment>,
+            source_stream_id: u64,
+            input_stream_id: u64,
+            column: u32,
+        ) -> Result<usize>;
+
+        /// Push a copy of one column of the sealed batch under `token` into an
+        /// input stream, leaving the token for its receiver.
+        fn copy_received_column(
+            self: Pin<&mut Fragment>,
+            input_stream_id: u64,
+            token: u64,
+            column: u32,
+        ) -> Result<()>;
 
         fn push_received(self: Pin<&mut Fragment>, stream_id: u64, token: u64) -> Result<()>;
 
