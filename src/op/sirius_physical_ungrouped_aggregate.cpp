@@ -25,6 +25,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
@@ -48,8 +49,10 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 
 namespace sirius {
 namespace op {
@@ -355,6 +358,28 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
 
+    // DECIMAL32/DECIMAL64 SUM and AVG inputs are summed over DECIMAL128 only if this batch could
+    // overflow the input width (see decimal_sums_needing_widening); otherwise they are reduced at
+    // the input width and the one-row result is widened.
+    std::unordered_set<int> widened_decimal_inputs;
+    {
+      std::vector<int> candidates;
+      for (auto const& spec : layout.aggregates) {
+        // Only SUM (and AVG's SUM) is gated: MIN, MAX and COUNT cannot overflow, and no other
+        // overflow-prone kind (PRODUCT, SUM_OF_SQUARES) is reachable here.
+        if (spec.kind != aggregate_kind::SUM && spec.kind != aggregate_kind::AVG) { continue; }
+        auto const col_type = view.column(static_cast<cudf::size_type>(spec.input_idx)).type();
+        if (widened_decimal_sum_type(col_type) &&
+            std::find(candidates.begin(), candidates.end(), spec.input_idx) == candidates.end()) {
+          candidates.push_back(static_cast<int>(spec.input_idx));
+        }
+      }
+      if (!candidates.empty()) {
+        widened_decimal_inputs =
+          decimal_sums_needing_widening(view, candidates, stream, space->get_default_allocator());
+      }
+    }
+
     for (auto const& spec : layout.aggregates) {
       switch (spec.kind) {
         case aggregate_kind::COUNT_STAR: {
@@ -414,19 +439,23 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           }
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we apply the return type in the merge step (SUM/COUNT).
-          // For SUM and AVG we widen decimals before the aggregation to avoid overflow.
+          // For SUM and AVG, decimals that could overflow the input width in this batch are
+          // widened before the aggregation. Otherwise the reduction runs at the input width and
+          // the one-row partial is widened to DECIMAL128 afterwards.
           bool is_decimal = sirius::IsCudfTypeDecimal(col.type());
 
           std::unique_ptr<cudf::column> casted_col;
+          std::optional<cudf::data_type> widen_partial_to;
           if (spec.kind == aggregate_kind::SUM || spec.kind == aggregate_kind::AVG) {
             if (col.type().id() == cudf::type_id::DECIMAL32 ||
                 col.type().id() == cudf::type_id::DECIMAL64) {
-              casted_col =
-                cudf::cast(col,
-                           cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()),
-                           stream,
-                           space->get_default_allocator());
-              col = casted_col->view();
+              auto const wide = cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale());
+              if (widened_decimal_inputs.contains(static_cast<int>(spec.input_idx))) {
+                casted_col = cudf::cast(col, wide, stream, space->get_default_allocator());
+                col        = casted_col->view();
+              } else {
+                widen_partial_to = wide;
+              }
             }
           }
           if (is_decimal) {
@@ -443,8 +472,13 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
             }
             out_type = col.type();
           }
-          auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
-          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
+          auto scalar  = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
+          auto partial = cudf::make_column_from_scalar(*scalar, 1, stream);
+          if (widen_partial_to) {
+            partial = cudf::cast(
+              partial->view(), *widen_partial_to, stream, space->get_default_allocator());
+          }
+          cols.push_back(std::move(partial));
           if (spec.kind == aggregate_kind::AVG) {
             // AVG denominator is the count of non-null values (SUM skips NULLs).
             // No NULLs -> row count suffices, so avoid the extra COUNT reduction.
