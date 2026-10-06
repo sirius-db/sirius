@@ -5428,3 +5428,164 @@ fn execute_same_type_aggregate_sort_and_project_outputs() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A broadcast join filter `filter_id` on `build_key`, targeting scan `target` through `probe`.
+fn runtime_filter(
+    filter_id: i32,
+    build_key: TExpr,
+    target: i32,
+    probe: TExpr,
+    mode: starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode,
+) -> starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+    starrocks_thrift::runtime_filter::TRuntimeFilterDescription {
+        filter_id: Some(filter_id),
+        build_expr: Some(build_key),
+        plan_node_id_to_target_expr: Some(BTreeMap::from([(target, probe)])),
+        build_join_mode: Some(mode),
+        build_plan_node_id: Some(2),
+        ..Default::default()
+    }
+}
+
+/// A scan of tuple 0 (`a`) probing broadcast filter 7 on `a`.
+fn probing_scan_params() -> TExecPlanFragmentParams {
+    let mut scan = scan_node(0, 0);
+    scan.probe_runtime_filters = Some(vec![runtime_filter(
+        7,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        0,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode::BROADCAST,
+    )]);
+    params(Some(TPlan::new(vec![scan])), Some(join_desc()), None)
+}
+
+fn key_stream(ty: &str) -> starrocks_plan_translator::runtime_filter::FilterInput {
+    starrocks_plan_translator::runtime_filter::FilterInput {
+        filter_id: 7,
+        node_id: 1_000_007,
+        stream_view: "sirius_stream_1000007".to_string(),
+        column: starrocks_plan_translator::StreamInputColumn {
+            name: "rf_key".to_string(),
+            ty: ty.to_string(),
+        },
+    }
+}
+
+#[test]
+fn a_scan_reports_the_runtime_filters_it_probes() {
+    let probed = starrocks_plan_translator::runtime_filter::probed_filters(&probing_scan_params());
+    assert_eq!(
+        probed,
+        vec![starrocks_plan_translator::runtime_filter::ProbedFilter {
+            filter_id: 7,
+            scan_node_id: 0
+        }]
+    );
+    let plain = params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(join_desc()),
+        None,
+    );
+    assert!(starrocks_plan_translator::runtime_filter::probed_filters(&plain).is_empty());
+}
+
+#[test]
+fn a_bound_runtime_filter_semi_joins_the_scan_with_its_key_stream() {
+    let params = probing_scan_params();
+    let unfiltered = PlanTranslator::new().translate_fragment(&params).unwrap();
+    let filtered = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[key_stream("BIGINT")])
+        .unwrap();
+    // Same output; the key stream is declared for the engine.
+    assert_eq!(filtered.output_names, unfiltered.output_names);
+    assert_eq!(filtered.stream_inputs.len(), 1);
+    assert_eq!(filtered.stream_inputs[0].node_id, 1_000_007);
+    assert_eq!(filtered.stream_inputs[0].columns[0].ty, "BIGINT");
+    let rel::RelType::Join(join) = root(&filtered.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the scan under a semi join");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+    let rel::RelType::Read(keys) = join.right.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the key stream read on the right");
+    };
+    assert!(matches!(
+        keys.read_type.as_ref().unwrap(),
+        read_rel::ReadType::NamedTable(table) if table.names == ["sirius_stream_1000007"]
+    ));
+    let Some(expression::RexType::ScalarFunction(equal)) =
+        join.expression.as_ref().unwrap().rex_type.as_ref()
+    else {
+        panic!("expected an equality condition");
+    };
+    // `a` of the scan against the key, past the scan's one column.
+    assert_eq!(argument_field_indices(equal), vec![0, 1]);
+
+    // A filter bound to no scan of the fragment changes nothing.
+    let mut other = key_stream("BIGINT");
+    other.filter_id = 8;
+    let untouched = PlanTranslator::new()
+        .translate_fragment_with_inputs(&params, &[], &[other])
+        .unwrap();
+    assert!(untouched.stream_inputs.is_empty());
+}
+
+#[test]
+fn a_key_stream_of_another_type_is_refused() {
+    let err = PlanTranslator::new()
+        .translate_fragment_with_inputs(&probing_scan_params(), &[], &[key_stream("INTEGER")])
+        .unwrap_err();
+    assert!(err.to_string().contains("probes a BIGINT key"), "{err}");
+}
+
+#[test]
+fn a_broadcast_join_reports_the_filters_it_builds_from_its_exchange() {
+    // Probe exchange 0 (tuple 0: `a`) joined to build exchange 1 (tuple 1: `b`).
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    let filter = |id, mode| {
+        runtime_filter(
+            id,
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            0,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            mode,
+        )
+    };
+    use starrocks_thrift::runtime_filter::TRuntimeFilterBuildJoinMode as Mode;
+    join.hash_join_node.as_mut().unwrap().build_runtime_filters = Some(vec![
+        filter(7, Mode::BROADCAST),
+        // A partitioned build side holds only a slice of the keys on each instance.
+        filter(8, Mode::PARTITIONED),
+    ]);
+    let plan = TPlan::new(vec![
+        join,
+        exchange_node(10, vec![0]),
+        exchange_node(11, vec![1]),
+    ]);
+    let built = starrocks_plan_translator::runtime_filter::built_filters(&params(
+        Some(plan),
+        Some(join_desc()),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        built,
+        vec![starrocks_plan_translator::runtime_filter::BuiltFilter {
+            filter_id: 7,
+            join_node_id: 2,
+            exchange_node_id: 11,
+            column: 0,
+            column_type: "BIGINT".to_string(),
+        }]
+    );
+}
