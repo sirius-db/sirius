@@ -236,6 +236,13 @@ bool cache_handle::wait_until_prepared() noexcept
   return _req.producer->wait_until_prepared();
 }
 
+std::exception_ptr cache_handle::failure() const noexcept
+{
+  if (!_req.failure) { return nullptr; }
+  std::lock_guard lk(_req.failure->mtx);
+  return _req.failure->failure;
+}
+
 std::shared_ptr<const std::vector<cached_chunk*>> cache_handle::chunks() const noexcept
 {
   return _req.chunks;
@@ -597,16 +604,17 @@ cache_handle prefetching_cache::initiate_prefetching_request(const io_object& ob
     }
   }
 
-  auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
-  std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
-
   prefetch_request req;
   req.obj        = obj.shared_from_this();
   req.producer   = std::make_shared<producer_stage>();
   req.consumer   = std::make_shared<consumer_stage>();
-  req.chunks     = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
+  req.failure    = std::make_shared<prefetch_failure_slot>();
   req.generation = generation;
   req.timestamp  = _ticker.load(std::memory_order_relaxed);
+
+  auto chunks_to_fetch = file.update_and_get_chunks(chunk_offsets, desired);
+  std::erase(chunks_to_fetch, nullptr);  // offsets past EOF have no slot
+  req.chunks = std::make_shared<const std::vector<cached_chunk*>>(std::move(chunks_to_fetch));
   // Resolve the preferred NUMA node for staging buffers from the target GPU's
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
@@ -1361,7 +1369,11 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
       [req, done_owner, owner = handle._generation](exec::try_t<size_t>&& res) mutable noexcept {
         owner.reset();
         auto const ok = res.has_value();
-        std::ignore   = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
+        if (!ok && req.failure) {
+          std::lock_guard lk(req.failure->mtx);
+          req.failure->failure = std::move(res).exception();
+        }
+        std::ignore = ok ? req.producer->mark_ready() : req.producer->mark_load_failed();
         (*done_owner)(ok);
       }};
     for (auto& slice : prepared) {

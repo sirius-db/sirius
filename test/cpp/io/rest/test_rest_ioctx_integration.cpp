@@ -16,9 +16,11 @@
 
 #include "catch.hpp"
 #include "io/cache/prefetching_cache.hpp"
+#include "io/io_errors.hpp"
 #include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/list_parser.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -235,10 +237,13 @@ struct range_fault_policy {
   bool omit_content_range{false};
   bool unknown_content_range_total{false};
   bool ignore_range_with_200{false};
+  bool full_object_with_200{false};
+  std::string interim_get_etag;
   bool fail_suffix_with_416{false};
   std::string failed_get_etag;
   std::string successful_get_etag;
   std::string successful_head_etag;
+  bool truncate_error_body{false};
 };
 
 struct listed_object {
@@ -282,6 +287,19 @@ class fixed_url_authorizer final : public sirius::io::rest::request_authorizer {
 
 class range_http_server {
  public:
+  struct get_record {
+    std::vector<std::string> if_match;
+    std::vector<std::string> ranges;
+    bool header_authorized;
+    bool presigned;
+  };
+
+  std::vector<get_record> get_requests() const
+  {
+    std::lock_guard lock(_get_records_mutex);
+    return _get_records;
+  }
+
   explicit range_http_server(std::vector<std::uint8_t> object,
                              range_fault_policy fault          = {},
                              std::vector<listed_object> listed = {},
@@ -350,6 +368,32 @@ class range_http_server {
   }
 
  private:
+  static std::vector<std::string> header_values(std::string_view request, std::string_view name)
+  {
+    std::vector<std::string> values;
+    auto position = request.find("\r\n");
+    while (position != std::string_view::npos) {
+      position += 2;
+      auto const end = request.find("\r\n", position);
+      if (end == std::string_view::npos || end == position) { break; }
+      auto const line  = request.substr(position, end - position);
+      auto const colon = line.find(':');
+      if (colon == name.size() &&
+          std::equal(name.begin(), name.end(), line.begin(), [](unsigned char a, unsigned char b) {
+            return std::tolower(a) == std::tolower(b);
+          })) {
+        auto value       = line.substr(colon + 1);
+        auto const begin = value.find_first_not_of(" \t");
+        auto const last  = value.find_last_not_of(" \t");
+        values.emplace_back(begin == std::string_view::npos
+                              ? std::string_view{}
+                              : value.substr(begin, last - begin + 1));
+      }
+      position = end;
+    }
+    return values;
+  }
+
   static void append_etag_header(std::string& response, std::string const& etag)
   {
     if (!etag.empty()) { response += "\r\nETag: " + etag; }
@@ -523,16 +567,31 @@ class range_http_server {
     active_get_guard active{*this};
     if (_fault.response_delay.count() > 0) { std::this_thread::sleep_for(_fault.response_delay); }
 
+    {
+      std::lock_guard lock(_get_records_mutex);
+      _get_records.push_back({header_values(request, "if-match"),
+                              header_values(request, "range"),
+                              !header_values(request, "authorization").empty(),
+                              target.find("X-Amz-Signature=") != std::string::npos});
+    }
     auto const get_idx = _get_count.fetch_add(1, std::memory_order_relaxed);
     if (_fault.fail_all_gets || get_idx < _fault.fail_first_gets) {
-      std::string response = "HTTP/1.1 " + std::to_string(_fault.fail_status) +
-                             " Service Unavailable\r\nContent-Length: 0";
+      std::string response =
+        "HTTP/1.1 " + std::to_string(_fault.fail_status) +
+        " Service Unavailable\r\nContent-Length: " + (_fault.truncate_error_body ? "64" : "0");
       append_etag_header(response, _fault.failed_get_etag);
       response += "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
+      if (_fault.truncate_error_body) { send_all(fd, "short"); }
       return;
     }
 
+    if (!_fault.interim_get_etag.empty()) {
+      std::string interim = "HTTP/1.1 103 Early Hints";
+      append_etag_header(interim, _fault.interim_get_etag);
+      interim += "\r\n\r\n";
+      send_all(fd, interim);
+    }
     if (auto range = parse_range(request)) {
       auto const [start, end] = *range;
       if (_fault.fail_suffix_with_416 && is_suffix_range(request)) {
@@ -541,7 +600,8 @@ class range_http_server {
                  "close\r\n\r\n");
         return;
       }
-      if (_fault.ignore_range_with_200 && is_suffix_range(request)) {
+      if ((_fault.ignore_range_with_200 && is_suffix_range(request)) ||
+          _fault.full_object_with_200) {
         std::string response =
           "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size());
         append_etag_header(response, _fault.successful_get_etag);
@@ -771,6 +831,8 @@ class range_http_server {
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
+  mutable std::mutex _get_records_mutex;
+  std::vector<get_record> _get_records;
   std::atomic<std::size_t> _list_count{0};
   std::atomic<std::size_t> _body_bytes_sent{0};
   std::atomic<std::size_t> _max_requested_range{0};
@@ -961,6 +1023,12 @@ void require_unqualified_cache_opens(std::string const& tag)
   CHECK(fixture.fill(*second, payload.size()) == payload);
   CHECK(server.get_count() == 2);
   CHECK(server.head_count() == 2);
+  auto requests = server.get_requests();
+  REQUIRE(requests.size() == 2);
+  for (auto const& request : requests) {
+    CHECK(request.if_match.empty());
+    REQUIRE(request.ranges.size() == 1);
+  }
   auto records        = logs.records();
   auto const warnings = std::count_if(records.begin(), records.end(), [&](auto const& record) {
     return record.level == sirius::log::level::warn &&
@@ -1029,6 +1097,166 @@ TEST_CASE("cache identity reuses a strong generation across opens", "[rest][cach
   CHECK(bytes == payload);
   CHECK(server.get_count() == 1);
   CHECK(server.head_count() == 2);
+}
+
+namespace {
+
+template <typename Error, typename Action>
+void require_conditional_error(Action&& action,
+                               std::string const& path,
+                               std::string const& expected,
+                               std::string const& observed)
+{
+  bool caught = false;
+  try {
+    std::forward<Action>(action)();
+  } catch (Error const& error) {
+    caught = true;
+    CHECK(error.object_path() == path);
+    CHECK(error.expected_tag() == expected);
+    CHECK(error.observed_tag() == observed);
+  }
+  REQUIRE(caught);
+}
+
+std::shared_ptr<rest_ioctx> make_signed_rest_ioctx(std::string const& endpoint, bool header_mode)
+{
+  using namespace sirius::io::rest;
+  s3::static_credentials credentials{
+    "rest-integration-access-key", "rest-integration-secret-key", {}, std::nullopt};
+  std::shared_ptr<request_authorizer> authorizer;
+  if (header_mode) {
+    authorizer = std::make_shared<s3::sigv4_header_authorizer>(credentials, "us-east-1", endpoint);
+  } else {
+    authorizer =
+      std::make_shared<s3::sigv4_presigned_authorizer>(credentials, "us-east-1", endpoint);
+  }
+  auto config               = direct_rest_test_config();
+  config.max_connections    = 1;
+  config.max_retry_attempts = 3;
+  auto reactor_context =
+    std::make_shared<rest_reactor::reactor_context>(config, authorizer, nullptr);
+  auto context = std::make_shared<rest_ioctx>(1, std::move(reactor_context));
+  context->start();
+  return context;
+}
+
+void verify_conditional_get(range_fault_policy fault,
+                            bool expect_error,
+                            std::string const& observed = {})
+{
+  std::string const expected = "\"opened-generation\"";
+  std::string const path     = "s3://conditional-bucket/object.bin";
+  fault.successful_head_etag = expected;
+  auto const payload         = deterministic_payload(64U << 10);
+  auto const offset          = fault.full_object_with_200 ? std::size_t{0} : std::size_t{17};
+  auto const length          = fault.full_object_with_200 ? payload.size() : std::size_t{4096};
+  auto const attempts        = fault.fail_all_gets ? std::size_t{1} : fault.fail_first_gets + 1;
+  for (bool header_mode : {false, true}) {
+    DYNAMIC_SECTION("signing=" << (header_mode ? "header" : "presigned"))
+    {
+      range_http_server server(payload, fault);
+      auto context = make_signed_rest_ioctx(server.endpoint(), header_mode);
+      auto source  = context->open_datasource(path);
+      REQUIRE(source->get_io_object().validation_tag() == expected);
+      REQUIRE(server.head_count() == 1);
+      REQUIRE(server.get_count() == 0);
+      std::vector<std::uint8_t> bytes(length);
+      if (expect_error) {
+        require_conditional_error<sirius::io::object_changed_error>(
+          [&] { source->host_read(offset, length, bytes.data()); }, path, expected, observed);
+      } else {
+        REQUIRE(source->host_read(offset, length, bytes.data()) == length);
+        require_bytes_equal(bytes, std::span<std::uint8_t const>(payload).subspan(offset, length));
+      }
+      REQUIRE(server.get_count() == attempts);
+      auto requests = server.get_requests();
+      REQUIRE(requests.size() == attempts);
+      auto const expected_range =
+        "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
+      for (auto const& request : requests) {
+        CHECK(request.if_match == std::vector<std::string>{expected});
+        CHECK(request.ranges == std::vector<std::string>{expected_range});
+        CHECK(request.header_authorized == header_mode);
+        CHECK(request.presigned == !header_mode);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("cache identity sends If-Match and does not retry 412", "[rest][cache_identity]")
+{
+  range_fault_policy fault;
+  fault.fail_all_gets   = true;
+  fault.fail_status     = 412;
+  fault.failed_get_etag = "\"untrusted-412-tag\"";
+  verify_conditional_get(fault, true);
+}
+
+TEST_CASE("cache identity does not retry a 412 with a truncated error body",
+          "[rest][cache_identity]")
+{
+  range_fault_policy fault;
+  fault.fail_all_gets       = true;
+  fault.fail_status         = 412;
+  fault.failed_get_etag     = "\"untrusted-412-tag\"";
+  fault.truncate_error_body = true;
+  verify_conditional_get(fault, true);
+}
+
+TEST_CASE("cache identity rejects a different ETag on full-object 200", "[rest][cache_identity]")
+{
+  range_fault_policy fault;
+  fault.full_object_with_200 = true;
+  fault.successful_get_etag  = "\"replacement\"";
+  verify_conditional_get(fault, true, fault.successful_get_etag);
+}
+
+TEST_CASE("cache identity rejects a missing ETag on 206", "[rest][cache_identity]")
+{
+  verify_conditional_get({}, true);
+}
+
+TEST_CASE("cache identity rejects weak and different ETags on 206", "[rest][cache_identity]")
+{
+  for (std::string const observed : {"W/\"opened-generation\"", "\"replacement\""}) {
+    DYNAMIC_SECTION("observed=" << observed)
+    {
+      range_fault_policy fault;
+      fault.successful_get_etag = observed;
+      verify_conditional_get(fault, true, observed);
+    }
+  }
+}
+
+TEST_CASE("cache identity retries 503 with the original If-Match", "[rest][cache_identity]")
+{
+  range_fault_policy fault;
+  fault.fail_first_gets     = 1;
+  fault.fail_status         = 503;
+  fault.failed_get_etag     = "\"transient-response\"";
+  fault.successful_get_etag = "\"opened-generation\"";
+  verify_conditional_get(fault, false);
+}
+
+TEST_CASE("cache identity discards validators from earlier responses", "[rest][cache_identity]")
+{
+  SECTION("interim response does not supply the final validator")
+  {
+    range_fault_policy fault;
+    fault.interim_get_etag = "\"opened-generation\"";
+    verify_conditional_get(fault, true);
+  }
+  SECTION("retry response does not inherit the failed attempt validator")
+  {
+    range_fault_policy fault;
+    fault.fail_first_gets = 1;
+    fault.fail_status     = 503;
+    fault.failed_get_etag = "\"opened-generation\"";
+    verify_conditional_get(fault, true);
+  }
 }
 
 TEST_CASE("rest_ioctx lists S3 objects with sizes and follows encoded continuation tokens",

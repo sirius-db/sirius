@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <latch>
 #include <memory>
 #include <mutex>
@@ -111,6 +112,14 @@ struct cache_generation {
   std::atomic<bool> retired{false};
 };
 
+/// The last failure of an issued prefetch attempt, kept by the request so its
+/// consumer can ask after the terminal notification.  Stored before the
+/// producer leaves @c loading; a later successful attempt does not clear it.
+struct prefetch_failure_slot {
+  std::mutex mtx;
+  std::exception_ptr failure;
+};
+
 /// One prefetch request: the two stage machines plus the chunk set they cover.
 /// Held by value — the cache's queues and the owning @ref cache_handle
 /// each carry a copy, so the stages outlive whichever side finishes first.
@@ -125,6 +134,7 @@ struct prefetch_request {
   std::shared_ptr<consumer_stage> consumer;
   std::shared_ptr<const std::vector<cached_chunk*>> chunks;
   std::weak_ptr<cache_generation> generation;
+  std::shared_ptr<prefetch_failure_slot> failure;
   std::uint32_t timestamp{0};
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
@@ -254,6 +264,11 @@ class cache_handle {
   /// overtook it or the cache shut down.  No-op and returns false on an empty
   /// handle.
   [[nodiscard]] bool wait_until_prepared() noexcept;
+
+  /// The exception a failed prefetch ended with; null when none has failed.
+  /// Available once @ref wait_until_ready returns or the prefetch's completion
+  /// callback runs.
+  [[nodiscard]] std::exception_ptr failure() const noexcept;
 
   /// The chunks of the underlying request.  Null when the handle is empty.
   [[nodiscard]] std::shared_ptr<const std::vector<cached_chunk*>> chunks() const noexcept;

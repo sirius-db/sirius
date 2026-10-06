@@ -1,5 +1,6 @@
 #include "catch.hpp"
 #include "io/cache/prefetching_cache.hpp"
+#include "io/io_errors.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/sirius_datasource.hpp"
@@ -92,7 +93,7 @@ std::vector<std::uint8_t> read_all(sirius_datasource& ds)
 }
 
 struct parquet_objects {
-  parquet_objects()
+  explicit parquet_objects(bool varied = false)
   {
     REQUIRE(sirius::test::ensure_s3_container_env());
     std::string pattern = (std::filesystem::temp_directory_path() / "sirius-c2-XXXXXX").string();
@@ -101,8 +102,9 @@ struct parquet_objects {
     directory = dir;
     key       = "cache-identity/" + directory.filename().string() + "/object.parquet";
     uri       = "s3://" + require_env("SIRIUS_TEST_S3_BUCKET") + "/" + key;
-    first     = generate(1, "column_a");
-    second    = generate(2, "column_b");
+    first     = generate(1, "column_a", varied);
+    second    = generate(2, "column_b", varied);
+    if (varied) { REQUIRE(first.size() > 8192); }
     REQUIRE(first.size() == second.size());
     REQUIRE(first != second);
     REQUIRE(first.size() < chunk_bytes);
@@ -115,13 +117,16 @@ struct parquet_objects {
     std::filesystem::remove_all(directory, error);
   }
 
-  std::vector<std::uint8_t> generate(int value, std::string const& name)
+  std::vector<std::uint8_t> generate(int value, std::string const& name, bool varied = false)
   {
     auto const path = directory / ("generation-" + std::to_string(value) + ".parquet");
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
-    auto result = con.Query("COPY (SELECT " + std::to_string(value) + "::INTEGER AS " + name +
-                            " FROM range(4096)) TO " + sql_quote(path.string()) +
+    auto const expression =
+      varied ? "hash(range + " + std::to_string(value) + ")" : std::to_string(value) + "::INTEGER";
+    auto const rows = varied ? 16384 : 4096;
+    auto result     = con.Query("COPY (SELECT " + expression + " AS " + name + " FROM range(" +
+                            std::to_string(rows) + ")) TO " + sql_quote(path.string()) +
                             " (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)");
     REQUIRE(result != nullptr);
     INFO((result->HasError() ? result->GetError() : ""));
@@ -662,4 +667,164 @@ TEST_CASE("cache identity releases a retired footer stash with its last datasour
   CHECK(stash_alive.expired());
   require_generations(cache, objects.uri, 1, 0);
   CHECK(cache.claimed_bytes() == chunk_bytes);
+}
+
+namespace {
+
+template <typename Action>
+std::exception_ptr capture_read_failure(Action&& action)
+{
+  try {
+    std::forward<Action>(action)();
+  } catch (...) {
+    return std::current_exception();
+  }
+  FAIL("reading a replaced object must fail");
+  return {};
+}
+
+template <typename Error>
+void require_changed_failure(std::exception_ptr failure,
+                             std::string const& path,
+                             std::string const& expected,
+                             std::string const& observed = {})
+{
+  REQUIRE(static_cast<bool>(failure));
+  try {
+    std::rethrow_exception(failure);
+  } catch (Error const& error) {
+    CHECK(error.object_path() == path);
+    CHECK(error.expected_tag() == expected);
+    CHECK(error.observed_tag() == observed);
+  }
+}
+
+void require_mid_open_failure(bool allocated)
+{
+  parquet_objects objects;
+  objects.publish(objects.first);
+  identity_fixture fixture;
+  auto source         = fixture.context->open_datasource(objects.uri);
+  auto const expected = std::string(source->get_io_object().validation_tag());
+  REQUIRE(rest_io_object::is_strong_tag(expected));
+  if (allocated) { advise(*source, source->size()); }
+  auto const footprint = fixture.context->cache()->claimed_bytes();
+  REQUIRE(footprint == (allocated ? chunk_bytes : 0));
+  objects.publish(objects.second);
+  auto current = fixture.context->open_datasource(objects.uri);
+  REQUIRE(current->get_io_object().validation_tag() != expected);
+  auto const before = fixture.authorizer->gets.load();
+  std::vector<std::uint8_t> bytes(source->size());
+  for (std::size_t attempt = 1; attempt <= 2; ++attempt) {
+    auto failure = capture_read_failure([&] { source->host_read(0, bytes.size(), bytes.data()); });
+    require_changed_failure<sirius::io::object_changed_error>(failure, objects.uri, expected);
+    CHECK(fixture.authorizer->gets.load() == before + attempt);
+    CHECK(fixture.context->cache()->claimed_bytes() == footprint);
+  }
+}
+
+struct prefetch_outcome {
+  bool ok;
+  std::exception_ptr failure;
+};
+
+struct prefetch_observer {
+  std::atomic<std::size_t> calls{0};
+  std::promise<prefetch_outcome> completed;
+};
+
+}  // namespace
+
+TEST_CASE("cache identity rejects mid-open replacement on allocated fills",
+          "[s3][integration][cache_identity]")
+{
+  require_mid_open_failure(true);
+}
+
+TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
+          "[s3][integration][cache_identity]")
+{
+  require_mid_open_failure(false);
+}
+
+TEST_CASE("cache identity fails a mixed hit and replaced miss without publication",
+          "[s3][integration][cache_identity]")
+{
+  parquet_objects objects(true);
+  objects.publish(objects.first);
+  identity_fixture fixture;
+  auto source         = fixture.context->open_datasource(objects.uri);
+  auto const expected = std::string(source->get_io_object().validation_tag());
+  REQUIRE(rest_io_object::is_strong_tag(expected));
+  constexpr std::size_t prefix = 4096;
+  advise(*source, prefix);
+  std::vector<std::uint8_t> resident(prefix);
+  REQUIRE(source->host_read(0, prefix, resident.data()) == prefix);
+  CHECK(std::equal(resident.begin(), resident.end(), objects.first.begin()));
+  REQUIRE(fixture.authorizer->gets.load() == 1);
+  REQUIRE(source->host_read(0, prefix, resident.data()) == prefix);
+  REQUIRE(fixture.authorizer->gets.load() == 1);
+  auto const footprint = fixture.context->cache()->claimed_bytes();
+  REQUIRE(footprint == chunk_bytes);
+
+  objects.publish(objects.second);
+  auto current = fixture.context->open_datasource(objects.uri);
+  REQUIRE(current->get_io_object().validation_tag() != expected);
+  std::vector<std::uint8_t> missing(prefix);
+  std::array<sirius::io::slice, 2> ranges{sirius::io::slice{0, prefix, resident.data()},
+                                          sirius::io::slice{prefix, prefix, missing.data()}};
+  auto const before = fixture.authorizer->gets.load();
+  for (std::size_t attempt = 1; attempt <= 2; ++attempt) {
+    auto failure = capture_read_failure([&] { source->host_read_ranges_async(ranges).get(); });
+    require_changed_failure<sirius::io::object_changed_error>(failure, objects.uri, expected);
+    CHECK(fixture.authorizer->gets.load() == before + attempt);
+    CHECK(fixture.context->cache()->claimed_bytes() == footprint);
+  }
+  auto const after = fixture.authorizer->gets.load();
+  REQUIRE(source->host_read(0, prefix, resident.data()) == prefix);
+  CHECK(std::equal(resident.begin(), resident.end(), objects.first.begin()));
+  CHECK(fixture.authorizer->gets.load() == after);
+}
+
+TEST_CASE("cache identity publishes prefetch failure before notifying the consumer",
+          "[s3][integration][cache_identity]")
+{
+  parquet_objects objects;
+  objects.publish(objects.first);
+  identity_fixture fixture;
+  std::shared_ptr<sirius_datasource> source = fixture.context->open_datasource(objects.uri);
+  auto const expected                       = std::string(source->get_io_object().validation_tag());
+  REQUIRE(rest_io_object::is_strong_tag(expected));
+  advise(*source, source->size());
+  REQUIRE_FALSE(static_cast<bool>(source->prefetch_failure()));
+  auto const footprint = fixture.context->cache()->claimed_bytes();
+  REQUIRE(footprint == chunk_bytes);
+  objects.publish(objects.second);
+  auto current = fixture.context->open_datasource(objects.uri);
+  REQUIRE(current->get_io_object().validation_tag() != expected);
+
+  auto observer     = std::make_shared<prefetch_observer>();
+  auto completed    = observer->completed.get_future();
+  auto const before = fixture.authorizer->gets.load();
+  REQUIRE(source->prefetch_async([observer, source](bool ok) noexcept {
+    std::exception_ptr failure = source->prefetch_failure();
+    if (observer->calls.fetch_add(1) == 0) {
+      observer->completed.set_value(prefetch_outcome{ok, std::move(failure)});
+    }
+  }) == sirius::io::prefetch_refusal::issued);
+  REQUIRE(completed.wait_for(5s) == std::future_status::ready);
+  auto outcome = completed.get();
+  CHECK_FALSE(outcome.ok);
+  require_changed_failure<sirius::io::object_changed_error>(outcome.failure, objects.uri, expected);
+  CHECK(source->prefetch_failure() == outcome.failure);
+  CHECK(observer->calls.load() == 1);
+  CHECK(fixture.authorizer->gets.load() == before + 1);
+  CHECK(fixture.context->cache()->claimed_bytes() == footprint);
+
+  std::vector<std::uint8_t> bytes(source->size());
+  auto failure = capture_read_failure([&] { source->host_read(0, bytes.size(), bytes.data()); });
+  require_changed_failure<sirius::io::object_changed_error>(failure, objects.uri, expected);
+  CHECK(fixture.authorizer->gets.load() == before + 2);
+  CHECK(fixture.context->cache()->claimed_bytes() == footprint);
+  CHECK(observer->calls.load() == 1);
 }
