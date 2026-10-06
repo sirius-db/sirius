@@ -1,0 +1,88 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    l_returnflag[#67]
+    l_linestatus[#68]
+    sum_qty[#69]
+    sum_base_price[#70]
+    sum_disc_price[#71]
+    sum_charge[#72]
+    avg_qty[#73]
+    avg_price[#74]
+    avg_disc[#75]
+    count_order[#76]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  5:VSORT(298)
+  |  order by: l_returnflag[#67] ASC, l_linestatus[#68] ASC
+  |  algorithm: full sort
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  4:VEXCHANGE
+     offset: 0
+     distribute expr lists: l_returnflag[#57], l_linestatus[#58]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_returnflag[#47], l_linestatus[#48]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:VAGGREGATE (merge finalize)(292)
+  |  output: sum(partial_sum(l_quantity)[#49])[#59], sum(partial_sum(l_extendedprice)[#51])[#60], sum(partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))))[#53])[#61], sum(partial_sum(((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))) * (1.00 + cast(l_tax as DECIMALV3(16, 2)))))[#54])[#62], avg(partial_avg(l_quantity)[#56])[#63], avg(partial_avg(l_extendedprice)[#55])[#64], avg(partial_avg(l_discount)[#50])[#65], count(partial_count(*)[#52])[#66]
+  |  group by: l_returnflag[#47], l_linestatus[#48]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: l_returnflag[#47], l_linestatus[#48]
+  |  
+  2:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: l_returnflag[#47], l_linestatus[#48]
+
+  1:VAGGREGATE (update serialize)(286)
+  |  STREAMING
+  |  output: partial_sum(l_quantity[#42])[#49], partial_avg(l_discount[#44])[#50], partial_sum(l_extendedprice[#43])[#51], partial_count(*)[#52], partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#45])[#53], partial_sum(((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))) * (1.00 + cast(l_tax as DECIMALV3(16, 2))))[#46])[#54], partial_avg(l_extendedprice[#43])[#55], partial_avg(l_quantity[#42])[#56]
+  |  group by: l_returnflag[#40], l_linestatus[#41]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(250)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#10] <= '1998-09-02')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: l_returnflag[#31], l_linestatus[#32], l_quantity[#33], l_extendedprice[#34], l_discount[#35], (l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#39], ((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#39] * (1.00 + CAST(l_tax[#36] AS decimalv3(16,2))))
+     final project output tuple id: 4
+     intermediate projections: l_returnflag[#23], l_linestatus[#24], l_quantity[#25], l_extendedprice[#26], l_discount[#27], l_tax[#28], cast(l_discount as DECIMALV3(16, 2))[#29], (1.00 - cast(l_discount as DECIMALV3(16, 2)))[#30], (l_extendedprice[#26] * (1.00 - cast(l_discount as DECIMALV3(16, 2)))[#30])
+     intermediate tuple id: 3
+     intermediate projections: l_returnflag[#16], l_linestatus[#17], l_quantity[#18], l_extendedprice[#19], l_discount[#20], l_tax[#21], cast(l_discount as DECIMALV3(16, 2))[#22], (1.00 - cast(l_discount as DECIMALV3(16, 2))[#22])
+     intermediate tuple id: 2
+     intermediate projections: _tvf_local.l_returnflag[#8], _tvf_local.l_linestatus[#9], _tvf_local.l_quantity[#4], _tvf_local.l_extendedprice[#5], _tvf_local.l_discount[#6], _tvf_local.l_tax[#7], CAST(_tvf_local.l_discount[#6] AS decimalv3(16,2))
+     intermediate tuple id: 1
+
+
+
+========== STATISTICS ==========

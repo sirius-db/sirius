@@ -26,6 +26,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace sirius {
@@ -235,6 +236,9 @@ struct telemetry_config {
   /// Emit per-batch placement telemetry (Batch FSM + MemoryTier usages).
   /// Roughly doubles telemetry volume; no-op when enable_quent is false.
   bool enable_batch_events{true};
+  /// Capture NVTX ranges (Sirius and libcudf) into Quent; no-op when
+  /// enable_quent is false.
+  bool enable_nvtx{false};
   std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
@@ -276,11 +280,21 @@ struct compression_config {
 };
 
 struct sirius_config {
+  /// Construction prepares defaults without emitting NVTX. Runtime startup must install
+  /// Quent before resolving the hardware-dependent memory and operator settings.
   sirius_config();
   ~sirius_config() = default;
 
+  /// Parse and resolve immediately, for standalone configuration consumers.
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
+
+  /// Validate YAML without topology discovery. Runtime entry points use this before
+  /// creating the configured Quent context, then call resolve_hardware().
+  void parse_from_file(const std::filesystem::path& config_path);
+  /// Discover topology and resolve memory capacities/operator defaults once. Copies of
+  /// a parsed config resolve independently; copies of a resolved config do no more work.
+  void resolve_hardware();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -341,11 +355,13 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  struct hardware_config;
+
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called from the end of both @ref load_from_file
-  /// and @ref apply_defaults so a missing config file derives the same values
-  /// an empty one does; each step is idempotent.
+  /// override, in that order. Called after parsing and hardware resolution so a
+  /// missing config file derives the same values an empty one does; each step is
+  /// idempotent.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -353,13 +369,6 @@ struct sirius_config {
   /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
   void enforce_sirius_backend_for_multi_gpu();
-
-  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
-  /// CONFIGURED pipeline pool size. The struct default can only use the
-  /// compile-time thread count, so resizing the pipeline in config would
-  /// otherwise leave the readahead budget behind. Called from
-  /// @ref finalize_derived_config; an explicit config value is left alone.
-  void derive_uring_scan_budget();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
@@ -369,6 +378,7 @@ struct sirius_config {
   void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  std::shared_ptr<const hardware_config> _hardware_config;
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
