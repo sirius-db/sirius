@@ -212,18 +212,18 @@ void require_reference_to(sirius::ast::node const& node, std::uint32_t column)
 }
 
 //! The operators an ALL form lowers to, top down.
-struct bag_plan {
+struct replicate_plan {
   sirius::op::sirius_physical_replicate& replicate;
-  sirius::op::sirius_physical_projection& copies;
+  sirius::op::sirius_physical_projection& count_projection;
   sirius::op::sirius_physical_grouped_aggregate& aggregate;
   sirius::op::sirius_physical_union& union_op;
 };
 
 //! Requires @p plan to be `REPLICATE -> PROJECTION -> HASH_GROUP_BY -> UNION` over @p types with
 //! @p tag_count tag columns, where input @p i is tagged `tags[i]`.
-bag_plan require_bag_plan(sirius_physical_operator& plan,
-                          duckdb::vector<sirius::logical_type> const& types,
-                          std::vector<std::vector<std::int8_t>> const& tags)
+replicate_plan require_replicate_plan(sirius_physical_operator& plan,
+                                      duckdb::vector<sirius::logical_type> const& types,
+                                      std::vector<std::vector<std::int8_t>> const& tags)
 {
   auto const width     = types.size();
   auto const tag_count = tags.front().size();
@@ -238,19 +238,20 @@ bag_plan require_bag_plan(sirius_physical_operator& plan,
   REQUIRE(replicate.children.size() == 1);
 
   REQUIRE(replicate.children[0]->type == SiriusPhysicalOperatorType::PROJECTION);
-  auto& copies      = replicate.children[0]->Cast<sirius::op::sirius_physical_projection>();
-  auto copies_types = types;
-  copies_types.push_back(bigint);
-  CHECK(copies.types == copies_types);
-  REQUIRE(copies.select_list.size() == width + 1);
+  auto& count_projection = replicate.children[0]->Cast<sirius::op::sirius_physical_projection>();
+  auto count_types       = types;
+  count_types.push_back(bigint);
+  CHECK(count_projection.types == count_types);
+  REQUIRE(count_projection.select_list.size() == width + 1);
   for (std::size_t i = 0; i < width; ++i) {
-    REQUIRE(copies.select_list[i]->holds<sirius::ast::reference>());
-    CHECK(copies.select_list[i]->get<sirius::ast::reference>().column_index == i);
+    REQUIRE(count_projection.select_list[i]->holds<sirius::ast::reference>());
+    CHECK(count_projection.select_list[i]->get<sirius::ast::reference>().column_index == i);
   }
-  REQUIRE(copies.children.size() == 1);
+  REQUIRE(count_projection.children.size() == 1);
 
-  REQUIRE(copies.children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
-  auto& aggregate   = copies.children[0]->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  REQUIRE(count_projection.children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  auto& aggregate =
+    count_projection.children[0]->Cast<sirius::op::sirius_physical_grouped_aggregate>();
   auto summed_types = types;
   summed_types.insert(summed_types.end(), tag_count, bigint);
   CHECK(aggregate.types == summed_types);
@@ -281,7 +282,7 @@ bag_plan require_bag_plan(sirius_physical_operator& plan,
       require_constant(expression, tags[input][tag]);
     }
   }
-  return {replicate, copies, aggregate, union_op};
+  return {replicate, count_projection, aggregate, union_op};
 }
 
 bool subtree_contains(sirius_physical_operator const& root, SiriusPhysicalOperatorType type)
@@ -396,10 +397,10 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 {
   auto const types = sirius_types({duckdb::LogicalType::INTEGER, duckdb::LogicalType::VARCHAR});
   auto const plan  = lower("SELECT k, v FROM ia INTERSECT ALL SELECT k, v FROM ib");
-  auto const bag   = require_bag_plan(*plan, types, {{1, 0}, {0, 1}});
+  auto const chain = require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
 
   // copies = CASE WHEN m < n THEN m ELSE n END over the sums at columns 2 and 3.
-  auto const& copies = *bag.copies.select_list[2];
+  auto const& copies = *chain.count_projection.select_list[2];
   REQUIRE(copies.holds<sirius::ast::case_expr>());
   auto const& case_expr = copies.get<sirius::ast::case_expr>();
   REQUIRE(case_expr.cases.size() == 1);
@@ -576,10 +577,10 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 {
   auto const types = sirius_types({duckdb::LogicalType::INTEGER});
   auto const plan  = lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib");
-  auto const bag   = require_bag_plan(*plan, types, {{1}, {-1}});
+  auto const chain = require_replicate_plan(*plan, types, {{1}, {-1}});
 
   // copies = CASE WHEN s > 0 THEN s ELSE 0 END over the sum at column 1.
-  auto const& copies = *bag.copies.select_list[1];
+  auto const& copies = *chain.count_projection.select_list[1];
   REQUIRE(copies.holds<sirius::ast::case_expr>());
   auto const& case_expr = copies.get<sirius::ast::case_expr>();
   REQUIRE(case_expr.cases.size() == 1);
