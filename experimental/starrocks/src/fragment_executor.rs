@@ -112,6 +112,11 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn drop_parked(&self, _slot: SenderSlot) -> Result<(), String> {
         Ok(())
     }
+
+    /// Sender fragments still parked, freed or not. The default parks nothing.
+    fn parked_fragments(&self) -> usize {
+        0
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
