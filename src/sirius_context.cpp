@@ -1247,6 +1247,27 @@ void SiriusContext::record_transparent_decline(sirius::transparent::decline_reas
   }
 }
 
+SiriusContext::vector_join_prune_stats SiriusContext::get_vector_join_prune_stats() const noexcept
+{
+  return vector_join_prune_stats{
+    .pairs_scored     = vector_join_pairs_scored_.load(std::memory_order_relaxed),
+    .pairs_exhaustive = vector_join_pairs_exhaustive_.load(std::memory_order_relaxed),
+    .chunks_staged    = vector_join_chunks_staged_.load(std::memory_order_relaxed),
+    .chunks_available = vector_join_chunks_available_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_vector_join_prune(uint64_t pairs_scored,
+                                             uint64_t pairs_exhaustive,
+                                             uint64_t chunks_staged,
+                                             uint64_t chunks_available) noexcept
+{
+  vector_join_pairs_scored_.fetch_add(pairs_scored, std::memory_order_relaxed);
+  vector_join_pairs_exhaustive_.fetch_add(pairs_exhaustive, std::memory_order_relaxed);
+  vector_join_chunks_staged_.fetch_add(chunks_staged, std::memory_order_relaxed);
+  vector_join_chunks_available_.fetch_add(chunks_available, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_rebind_success() noexcept
 {
   transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1369,6 +1390,85 @@ void print_cpu_fallback_banner()
   std::fflush(stdout);
 }
 
+namespace {
+
+bool subtree_has_vector_join(const LogicalOperator& op)
+{
+  if (op.type == LogicalOperatorType::LOGICAL_GET) {
+    auto const& name = op.Cast<LogicalGet>().function.name;
+    if (name == "sirius_knn_join" || name == "sirius_knn_join_rel") { return true; }
+  }
+  for (auto const& child : op.children) {
+    if (subtree_has_vector_join(*child)) { return true; }
+  }
+  return false;
+}
+
+bool is_sink_root(const LogicalOperator& op)
+{
+  return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+         op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE ||
+         op.type == LogicalOperatorType::LOGICAL_INSERT;
+}
+
+}  // namespace
+
+// CREATE TABLE AS / COPY TO / INSERT SELECT over a plan the CPU cannot run: DuckDB's sink stays
+// and its single child becomes a GPU operator producing the same columns. The GPU plan is
+// validated here from a copy when the plan is copyable; otherwise the template is consumed at
+// execute time (see PhysicalSiriusExecution). The child has no CPU fallback -- the statement
+// had none before either.
+RebindQueryInfo SiriusContext::splice_gpu_child_under_sink(ClientContext& context,
+                                                           PreparedStatementData& prepared,
+                                                           unique_ptr<LogicalOperator> logical_plan,
+                                                           bool plan_reads_s3)
+{
+  if (!logical_plan || !is_sink_root(*logical_plan) || logical_plan->children.size() != 1 ||
+      !subtree_has_vector_join(*logical_plan->children[0])) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  if (!prepared.physical_plan || prepared.physical_plan->Root().children.size() != 1) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  auto child = std::move(logical_plan->children[0]);
+  child->ResolveOperatorTypes();
+  auto child_types = child->types;
+  vector<string> child_names;
+  for (idx_t i = 0; i < child_types.size(); ++i) {
+    child_names.push_back("col" + std::to_string(i));
+  }
+  try {
+    unique_ptr<LogicalOperator> validation_plan;
+    try {
+      validation_plan = sirius::transparent::copy_logical_plan(*child, context);
+    } catch (NotImplementedException&) {
+      validation_plan.reset();
+    }
+    if (validation_plan) {
+      sirius::planner::sirius_physical_plan_generator planner(context);
+      planner.create_plan(std::move(validation_plan));
+    }
+  } catch (std::exception& e) {
+    record_transparent_fallback();
+    SIRIUS_LOG_INFO("Transparent execution fallback (sink child unsupported): {}", e.what());
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
+  auto& root      = prepared.physical_plan->Root();
+  auto const card = root.children[0].get().estimated_cardinality;
+  auto& sirius_op = prepared.physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
+    std::move(child),
+    std::string{},
+    child_types,
+    std::move(child_names),
+    nullptr,
+    plan_reads_s3,
+    card);
+  root.children[0] = sirius_op;
+  record_transparent_rebind_success();
+  SIRIUS_LOG_INFO("Transparent execution: GPU operator spliced under a CPU sink");
+  return RebindQueryInfo::DO_NOT_REBIND;
+}
+
 RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                  PreparedStatementData& prepared,
                                                  PreparedStatementMode mode)
@@ -1411,8 +1511,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (!is_initialized_) { return RebindQueryInfo::DO_NOT_REBIND; }
 
-  // Only intercept SELECT statements.
-  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
+  // SELECT statements are intercepted whole. A sink statement (CREATE TABLE AS / COPY TO /
+  // INSERT SELECT) keeps DuckDB's own sink and gets a GPU operator spliced in as its child,
+  // but only when that child could not run on the CPU anyway: the vector join has no CPU
+  // implementation, so without this the whole statement lands on a stub that throws.
+  bool const sink_statement = prepared.statement_type == StatementType::CREATE_STATEMENT ||
+                              prepared.statement_type == StatementType::COPY_STATEMENT ||
+                              prepared.statement_type == StatementType::INSERT_STATEMENT;
+  if (prepared.statement_type != StatementType::SELECT_STATEMENT && !sink_statement) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
   // Try to capture the SQL string while the active query context is alive —
@@ -1479,6 +1585,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // (create_plan below consumes it). S3 is GPU-only: if GPU translation fails we
   // must NOT fall back to CPU for s3:// (see throw_if_s3_no_cpu_fallback).
   bool const plan_reads_s3 = logical_plan_reads_s3(*logical_plan);
+  if (sink_statement) {
+    return splice_gpu_child_under_sink(context, prepared, std::move(logical_plan), plan_reads_s3);
+  }
 
   try {
     // Plan-generation window: create_plan below reads the scan manager's pin

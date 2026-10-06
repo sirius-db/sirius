@@ -31,7 +31,7 @@ namespace sirius {
  * test_function_id.cpp). The order is grouped by category for human
  * readability; integer values are part of the public ABI — new entries go
  * at the end of their category, never in the middle. Cardinality is
- * exactly 29 (D-01).
+ * exactly 37 (D-01; abs/sqrt/floor/ceil/round/exp/ln/pow appended before error).
  */
 enum class function_id : uint16_t {
   // Arithmetic — 6 entries (also the contents of supported_ast_functions)
@@ -69,6 +69,16 @@ enum class function_id : uint16_t {
   // Struct / control — 3 entries
   row,
   struct_pack,
+
+  // Math — 8 entries
+  abs,
+  sqrt,
+  floor,
+  ceil,
+  round,
+  exp,
+  ln,
+  pow,
   error,
 };
 

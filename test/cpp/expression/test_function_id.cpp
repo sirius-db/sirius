@@ -41,8 +41,8 @@ using sirius::to_duckdb_function_name;
 static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
-static_assert(static_cast<uint16_t>(function_id::error) + 1 == 29,
-              "sirius::function_id has exactly 29 entries (D-01 — locked ABI).");
+static_assert(static_cast<uint16_t>(function_id::error) + 1 == 37,
+              "sirius::function_id has exactly 37 entries (D-01 — locked ABI).");
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -367,4 +367,24 @@ TEST_CASE("ast_function_id - unknown function name returns std::nullopt", "[ast_
 TEST_CASE("ast_function_id - empty function name returns std::nullopt", "[ast_function_id]")
 {
   REQUIRE_FALSE(from_duckdb_function_name("").has_value());
+}
+
+TEST_CASE("ast_function_id - math functions round-trip through name mappers", "[ast_function_id]")
+{
+  for (auto const [id, name] : {std::pair{function_id::abs, "abs"},
+                                std::pair{function_id::sqrt, "sqrt"},
+                                std::pair{function_id::floor, "floor"},
+                                std::pair{function_id::ceil, "ceil"},
+                                std::pair{function_id::round, "round"},
+                                std::pair{function_id::exp, "exp"},
+                                std::pair{function_id::ln, "ln"},
+                                std::pair{function_id::pow, "pow"}}) {
+    REQUIRE(to_duckdb_function_name(id) == name);
+    auto const back = from_duckdb_function_name(name);
+    REQUIRE(back.has_value());
+    REQUIRE(*back == id);
+  }
+  // aliases resolve to the canonical id
+  REQUIRE(*from_duckdb_function_name("ceiling") == function_id::ceil);
+  REQUIRE(*from_duckdb_function_name("power") == function_id::pow);
 }

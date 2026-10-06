@@ -299,6 +299,23 @@ class SiriusContext : public ClientContextState {
     uint64_t classification_failures = 0;
   };
 
+  /// What the approximate vector join actually did, accumulated over the session.
+  ///
+  /// Pruning is the whole point of the clustered path and it is invisible in a result set: an
+  /// approximate join that skipped nothing returns a correct answer, just slowly, so no
+  /// assertion over rows can tell the two apart. These are what a test can assert on.
+  struct vector_join_prune_stats {
+    /// Probe-row x corpus-row distances the search issued.
+    uint64_t pairs_scored = 0;
+    /// What an exhaustive join over the same probe batches would have issued. The ratio of
+    /// the two is the fraction of the corpus scanned.
+    uint64_t pairs_exhaustive = 0;
+    /// Corpus chunks made device-resident, and how many the corpus holds. A chunk no probe
+    /// run wants is never staged, so this is the transfer the pruning saved.
+    uint64_t chunks_staged    = 0;
+    uint64_t chunks_available = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -332,6 +349,13 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Called after physical plan generation, before execution.
   /// Replaces the DuckDB physical plan with a Sirius GPU plan when possible.
+  /// \brief Sink statement whose SELECT child needs the GPU: keep DuckDB's sink, replace the
+  /// child with a GPU operator. Returns DO_NOT_REBIND either way.
+  RebindQueryInfo splice_gpu_child_under_sink(ClientContext& context,
+                                              PreparedStatementData& prepared,
+                                              unique_ptr<LogicalOperator> logical_plan,
+                                              bool plan_reads_s3);
+
   RebindQueryInfo OnFinalizePrepare(ClientContext& context,
                                     PreparedStatementData& prepared_statement,
                                     PreparedStatementMode mode) final;
@@ -627,6 +651,14 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Snapshot what the approximate vector join has pruned this session.
+  [[nodiscard]] vector_join_prune_stats get_vector_join_prune_stats() const noexcept;
+
+  /// \brief Add one clustered vector-join batch's work to the session totals.
+  void record_vector_join_prune(uint64_t pairs_scored,
+                                uint64_t pairs_exhaustive,
+                                uint64_t chunks_staged,
+                                uint64_t chunks_available) noexcept;
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
@@ -761,6 +793,10 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> vector_join_pairs_scored_{0};
+  std::atomic<uint64_t> vector_join_pairs_exhaustive_{0};
+  std::atomic<uint64_t> vector_join_chunks_staged_{0};
+  std::atomic<uint64_t> vector_join_chunks_available_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};

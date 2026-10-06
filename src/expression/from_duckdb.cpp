@@ -280,8 +280,9 @@ std::unique_ptr<node> from_duckdb(duckdb::Expression const& expr)
     case duckdb::ExpressionClass::BOUND_REF:
       return translate_reference(expr.Cast<duckdb::BoundReferenceExpression>());
     default:
-      throw duckdb::InternalException("[sirius::ast::from_duckdb] Unknown ExpressionClass: %d",
-                                      expr.GetExpressionClass());
+      throw duckdb::InternalException("[sirius::ast::from_duckdb] Unknown ExpressionClass: " +
+                                      std::to_string(static_cast<int>(expr.GetExpressionClass())) +
+                                      " (" + expr.ToString() + ")");
   }
 }
 

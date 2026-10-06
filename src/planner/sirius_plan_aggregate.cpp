@@ -19,13 +19,17 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -77,6 +81,57 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
+// The GPU aggregate has no notion of a FILTER clause (sirius::ast::aggregate carries none), so a
+// filtered aggregate has to become an unfiltered one before it reaches the operator. For the
+// aggregates that skip NULL inputs the two are the same thing: agg(x) FILTER (WHERE c) is
+// agg(CASE WHEN c THEN x END), and count(*) FILTER (WHERE c) is count(CASE WHEN c THEN 1 END).
+// Anything outside that set is declined so the whole statement runs on the CPU, where the
+// clause is honoured; hoisting the predicate into a projection and dropping it -- what happened
+// before -- returned the unfiltered answer with no error.
+void rewrite_filtered_aggregate(duckdb::ClientContext& context,
+                                duckdb::unique_ptr<duckdb::Expression>& aggr)
+{
+  auto& bound = aggr->Cast<duckdb::BoundAggregateExpression>();
+  if (!bound.filter) { return; }
+  auto const& name         = bound.function.name;
+  bool const null_skipping = name == "count" || name == "sum" || name == "sum_no_overflow" ||
+                             name == "min" || name == "max" || name == "avg";
+  if (name == "count_star") {
+    // count(*) counts rows; count(expr) counts non-NULL values of expr.
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
+    auto one   = duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(1));
+    auto cased = duckdb::make_uniq<duckdb::BoundCaseExpression>(duckdb::LogicalType::INTEGER);
+    duckdb::BoundCaseCheck check;
+    check.when_expr = std::move(bound.filter);
+    check.then_expr = std::move(one);
+    cased->case_checks.push_back(std::move(check));
+    cased->else_expr = duckdb::make_uniq<duckdb::BoundConstantExpression>(
+      duckdb::Value(duckdb::LogicalType::INTEGER));
+    children.push_back(std::move(cased));
+    auto count = duckdb::CountFun::GetFunctions().GetFunctionByArguments(
+      context, {duckdb::LogicalType::INTEGER});
+    duckdb::FunctionBinder binder(context);
+    auto rewritten =
+      binder.BindAggregateFunction(count, std::move(children), nullptr, bound.aggr_type);
+    rewritten->alias = bound.alias;
+    aggr             = std::move(rewritten);
+    return;
+  }
+  if (!null_skipping || bound.children.size() != 1) {
+    throw duckdb::NotImplementedException("Sirius: aggregate '" + name +
+                                          "' with a FILTER clause is not supported on the GPU");
+  }
+  auto& child = bound.children[0];
+  auto cased  = duckdb::make_uniq<duckdb::BoundCaseExpression>(child->return_type);
+  duckdb::BoundCaseCheck check;
+  check.when_expr = std::move(bound.filter);
+  check.then_expr = std::move(child);
+  cased->case_checks.push_back(std::move(check));
+  cased->else_expr =
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(cased->return_type));
+  child = std::move(cased);
+}
+
 // File-local helper (formerly sirius_physical_plan_generator::extract_aggregate_expressions).
 // Pulls aggregate child / filter sub-expressions out of the aggregate list and groups into a
 // projection fed upstream of the aggregate. Operates on raw DuckDB expressions so the hoist
@@ -99,6 +154,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
       duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
     }
   }
+  for (auto& aggr : aggregates) {
+    rewrite_filtered_aggregate(context, aggr);
+  }
   for (auto& group : groups) {
     auto ref =
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->return_type, expressions.size());
@@ -116,12 +174,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
       child_expr = std::move(ref);
     }
     if (bound_aggr.filter) {
-      auto& filter = bound_aggr.filter;
-      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->return_type,
-                                                                     expressions.size());
-      types.push_back(filter->return_type);
-      expressions.push_back(std::move(filter));
-      bound_aggr.filter = std::move(ref);
+      throw duckdb::InternalException(
+        "Sirius: aggregate FILTER survived rewrite_filtered_aggregate");
     }
   }
   if (expressions.empty()) { return child; }
@@ -803,6 +857,44 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     op.distinct_validity);
   group_by->children.push_back(std::move(plan));
   return group_by;
+}
+
+// Plain DISTINCT is a GROUP BY over every output column with no aggregates, which the grouped
+// aggregate already runs on the GPU. DISTINCT ON keeps one arbitrary (or ORDER BY-chosen) row
+// per key and needs FIRST aggregates over the other columns, which is left to the CPU.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
+{
+  D_ASSERT(op.children.size() == 1);
+  auto const& types = op.types;
+  if (op.distinct_type != duckdb::DistinctType::DISTINCT || op.order_by ||
+      op.distinct_targets.size() != types.size()) {
+    throw duckdb::NotImplementedException("DISTINCT ON not supported");
+  }
+  for (duckdb::idx_t i = 0; i < op.distinct_targets.size(); ++i) {
+    auto const& target = op.distinct_targets[i];
+    if (target->GetExpressionType() != duckdb::ExpressionType::BOUND_REF ||
+        target->Cast<duckdb::BoundReferenceExpression>().index != i ||
+        target->return_type != types[i]) {
+      throw duckdb::NotImplementedException("DISTINCT over a reordered or computed target");
+    }
+  }
+
+  // Table indices are irrelevant here: column references were resolved before planning.
+  auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
+    /*group_index=*/0,
+    /*aggregate_index=*/0,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+  aggregate->groups = std::move(op.distinct_targets);
+  aggregate->types  = types;
+  duckdb::GroupingSet all_groups;
+  for (duckdb::idx_t i = 0; i < types.size(); ++i) {
+    all_groups.insert(i);
+  }
+  aggregate->grouping_sets.push_back(std::move(all_groups));
+  aggregate->estimated_cardinality = op.estimated_cardinality;
+  aggregate->children.push_back(std::move(op.children[0]));
+  return create_plan(*aggregate);
 }
 
 }  // namespace sirius::planner

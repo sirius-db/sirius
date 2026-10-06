@@ -1,13 +1,17 @@
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
-add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
+add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>
+                               $<TARGET_OBJECTS:sirius_whole_program_objects>)
 
 add_library(sirius_shared SHARED src/sirius_library_anchor.cpp
-                                 $<TARGET_OBJECTS:sirius_objects>)
+                                 $<TARGET_OBJECTS:sirius_objects>
+                                 $<TARGET_OBJECTS:sirius_whole_program_objects>)
 build_static_extension(sirius src/sirius_extension_entry.cpp
-                       $<TARGET_OBJECTS:sirius_objects>)
+                       $<TARGET_OBJECTS:sirius_objects>
+                       $<TARGET_OBJECTS:sirius_whole_program_objects>)
 build_loadable_extension(sirius CPP src/sirius_extension_entry.cpp
-                         $<TARGET_OBJECTS:sirius_objects>)
+                         $<TARGET_OBJECTS:sirius_objects>
+                         $<TARGET_OBJECTS:sirius_whole_program_objects>)
 
 # The standalone FFI constructs an embedded DuckDB, which needs the no-op static
 # extension loader retained regardless of archive ordering.

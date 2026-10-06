@@ -74,6 +74,13 @@ void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
 
 /// Move a GPU result table to a host_data_representation the table function can
 /// stream out. Synchronizes @c c.stream before returning.
+/// Move a GPU table to the host through the GPU->host converter, synchronizing @p stream.
+std::unique_ptr<cucascade::host_data_representation> vss_table_to_host(
+  cucascade::memory::memory_space& space,
+  const cucascade::memory::memory_space& host_space,
+  ::cuda::stream_ref stream,
+  std::unique_ptr<cudf::table> table);
+
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   const vector_search_context& c, std::unique_ptr<cudf::table> table);
 

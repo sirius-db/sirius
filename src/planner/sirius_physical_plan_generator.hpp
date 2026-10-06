@@ -22,6 +22,10 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+namespace sirius::vss {
+struct vector_join_side;
+}  // namespace sirius::vss
+
 #include <memory>
 #include <string>
 #include <string_view>
@@ -42,6 +46,7 @@ class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalAnyJoin;
+class LogicalDistinct;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
 class LogicalDelimGet;
@@ -120,6 +125,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDistinct& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -157,6 +163,11 @@ class sirius_physical_plan_generator {
   //! Records the built operator back into the catalog so the fragment can register it with its
   //! stream_session once the plan tree owns it.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
+    duckdb::LogicalGet& op);
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_view_side(
+    const sirius::vss::vector_join_side& side, const std::string& extra_column);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan_knn_join(
     duckdb::LogicalGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);

@@ -66,6 +66,19 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   std::string GetName() const override { return "SIRIUS_GPU_EXECUTION"; }
 
+  /// A sink that preserves insertion order (CREATE TABLE AS, INSERT) asks its source for a batch
+  /// index per chunk. Chunks are handed out in order from one result, so the index is a counter.
+  bool SupportsPartitioning(const duckdb::OperatorPartitionInfo& partition_info) const override
+  {
+    return partition_info.partition_columns.empty();
+  }
+  duckdb::OperatorPartitionData GetPartitionData(
+    duckdb::ExecutionContext& context,
+    duckdb::DataChunk& chunk,
+    duckdb::GlobalSourceState& gstate,
+    duckdb::LocalSourceState& lstate,
+    const duckdb::OperatorPartitionInfo& partition_info) const override;
+
  private:
   /// A reusable copy of the optimized logical plan.
   /// DuckDB can execute the same prepared physical operator multiple times, so
