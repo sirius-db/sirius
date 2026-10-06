@@ -352,11 +352,13 @@ std::unique_ptr<cudf::table> apply_deferred_keys(cudf::table_view const& input,
                                                  dynamic_filter_gate* gate,
                                                  std::size_t observed_generation,
                                                  int device_id,
-                                                 bool validate_indices)
+                                                 bool validate_for_testing)
 {
   deferred_selection_state state;
+  // The testing entry point enables invariant checks after each deferred-selection transition.
+  // Production disables these GPU-to-host copies and stream synchronizations.
   auto validate = [&] {
-    if (validate_indices) { validate_selection_state(state, input.num_rows(), stream); }
+    if (validate_for_testing) { validate_selection_state(state, input.num_rows(), stream); }
   };
   auto applied  = false;
   state.row_ids = make_identity_row_ids(input.num_rows(), stream, mr);
@@ -563,7 +565,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
                                    gate,
                                    observed_filter_count,
                                    device_id,
-                                   /*validate_indices=*/strategy_override.has_value());
+                                   /*validate_for_testing=*/strategy_override.has_value());
       break;
     case detail::compaction_strategy::GATHER_ONCE:
       result = apply_gather_once(input, std::move(ast_mask), entries, stream, mr, device_id);

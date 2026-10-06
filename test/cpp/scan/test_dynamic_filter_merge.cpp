@@ -27,14 +27,14 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 // clang-format on
+#include "utils/test_validation_utility.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -57,7 +57,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstring>
 #include <future>
 #include <initializer_list>
 #include <latch>
@@ -925,127 +924,6 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_in_list_prefix(
     keys->view(), stream, cudf::get_current_device_resource_ref());
 }
 
-std::vector<char> copy_device_bytes(void const* source,
-                                    std::size_t bytes,
-                                    ::cuda::stream_ref stream)
-{
-  std::vector<char> host(bytes);
-  if (bytes != 0) {
-    auto const status =
-      cudaMemcpyAsync(host.data(), source, bytes, cudaMemcpyDeviceToHost, stream.get());
-    if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
-    stream.sync();
-  }
-  return host;
-}
-
-/// Row-wise validity of @p column; every row of a column without a null mask is valid.
-std::vector<char> column_row_validity(cudf::column_view const& column, ::cuda::stream_ref stream)
-{
-  std::vector<char> validity(static_cast<std::size_t>(column.size()), 1);
-  if (!column.nullable() || validity.empty()) { return validity; }
-  auto const mask  = cudf::copy_bitmask(column, stream, cudf::get_current_device_resource_ref());
-  auto const words = copy_device_bytes(mask.data(), mask.size(), stream);
-  for (std::size_t row = 0; row < validity.size(); ++row) {
-    cudf::bitmask_type word = 0;
-    std::memcpy(
-      &word, words.data() + (row / (sizeof(cudf::bitmask_type) * 8)) * sizeof(word), sizeof(word));
-    validity[row] = static_cast<char>((word >> (row % (sizeof(cudf::bitmask_type) * 8))) & 1U);
-  }
-  return validity;
-}
-
-bool column_types_equal(cudf::column_view const& lhs, cudf::column_view const& rhs)
-{
-  if (lhs.type() != rhs.type() || lhs.num_children() != rhs.num_children()) { return false; }
-  for (cudf::size_type child = 0; child < lhs.num_children(); ++child) {
-    if (!column_types_equal(lhs.child(child), rhs.child(child))) { return false; }
-  }
-  return true;
-}
-
-/**
- * @brief Compares two columns under cuDF value semantics: type, row count, row validity and the
- * values of the valid rows.
- *
- * Physical representation is deliberately ignored, because it is not part of what cuDF guarantees
- * and it legitimately differs between the cascade and deferred-keys strategies. The padding words
- * of a null mask allocation are never written, the payload bytes behind a null slot are
- * unspecified, a column holding no nulls may or may not carry a mask at all, and a list child may
- * retain elements no surviving row references. Only fixed-width, LIST and STRUCT columns are
- * supported; any other type compares unequal so an unsupported payload cannot pass silently.
- */
-bool columns_logically_equal(cudf::column_view const& lhs,
-                             cudf::column_view const& rhs,
-                             ::cuda::stream_ref stream)
-{
-  if (!column_types_equal(lhs, rhs) || lhs.size() != rhs.size()) { return false; }
-  auto const validity = column_row_validity(lhs, stream);
-  if (validity != column_row_validity(rhs, stream)) { return false; }
-  if (validity.empty()) { return true; }
-
-  if (lhs.type().id() == cudf::type_id::LIST) {
-    auto const lhs_lists   = cudf::lists_column_view{lhs};
-    auto const rhs_lists   = cudf::lists_column_view{rhs};
-    auto const lhs_offsets = to_host_int32(lhs_lists.offsets(), stream);
-    auto const rhs_offsets = to_host_int32(rhs_lists.offsets(), stream);
-    for (std::size_t row = 0; row < validity.size(); ++row) {
-      if (validity[row] == 0) { continue; }
-      std::vector<cudf::size_type> const lhs_range{lhs_offsets[row], lhs_offsets[row + 1]};
-      std::vector<cudf::size_type> const rhs_range{rhs_offsets[row], rhs_offsets[row + 1]};
-      if (lhs_range[1] - lhs_range[0] != rhs_range[1] - rhs_range[0]) { return false; }
-      if (!columns_logically_equal(cudf::slice(lhs_lists.child(), lhs_range, stream).front(),
-                                   cudf::slice(rhs_lists.child(), rhs_range, stream).front(),
-                                   stream)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  if (lhs.type().id() == cudf::type_id::STRUCT) {
-    auto const lhs_structs = cudf::structs_column_view{lhs};
-    auto const rhs_structs = cudf::structs_column_view{rhs};
-    for (cudf::size_type child = 0; child < lhs.num_children(); ++child) {
-      if (!columns_logically_equal(lhs_structs.get_sliced_child(child, stream),
-                                   rhs_structs.get_sliced_child(child, stream),
-                                   stream)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  if (!cudf::is_fixed_width(lhs.type())) { return false; }
-  auto const width = cudf::size_of(lhs.type());
-  auto const lhs_bytes =
-    copy_device_bytes(lhs.head<char>() + static_cast<std::size_t>(lhs.offset()) * width,
-                      validity.size() * width,
-                      stream);
-  auto const rhs_bytes =
-    copy_device_bytes(rhs.head<char>() + static_cast<std::size_t>(rhs.offset()) * width,
-                      validity.size() * width,
-                      stream);
-  for (std::size_t row = 0; row < validity.size(); ++row) {
-    if (validity[row] == 0) { continue; }
-    if (std::memcmp(lhs_bytes.data() + row * width, rhs_bytes.data() + row * width, width) != 0) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool tables_schema_and_elements_equal(cudf::table_view const& lhs,
-                                      cudf::table_view const& rhs,
-                                      ::cuda::stream_ref stream)
-{
-  if (lhs.num_columns() != rhs.num_columns() || lhs.num_rows() != rhs.num_rows()) { return false; }
-  for (cudf::size_type index = 0; index < lhs.num_columns(); ++index) {
-    if (!columns_logically_equal(lhs.column(index), rhs.column(index), stream)) { return false; }
-  }
-  return true;
-}
-
 bool forced_strategies_equal(cudf::table_view const& input,
                              sirius::op::dynamic_filter_snapshot const& snapshot,
                              ::cuda::stream_ref stream,
@@ -1063,7 +941,8 @@ bool forced_strategies_equal(cudf::table_view const& input,
        {compaction_strategy::DEFERRED_KEYS, compaction_strategy::GATHER_ONCE}) {
     auto const other = apply(strategy);
     if (static_cast<bool>(cascade) != static_cast<bool>(other)) { return false; }
-    if (cascade && !tables_schema_and_elements_equal(cascade->view(), other->view(), stream)) {
+    if (cascade &&
+        !sirius::test::expect_tables_equivalent_impl(cascade->view(), other->view(), stream)) {
       return false;
     }
   }

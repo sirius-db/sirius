@@ -57,8 +57,8 @@ enum class compaction_strategy { CASCADE, DEFERRED_KEYS, GATHER_ONCE };
  */
 struct compaction_policy_input {
   std::size_t rows;
-  std::optional<std::size_t> input_bytes;
-  bool has_ast_mask;  ///< Whether an AST mask precedes the membership steps.
+  std::optional<std::size_t> input_bytes;  ///< Reported bytes; may be estimated for views.
+  bool has_ast_mask;                       ///< Whether an AST mask precedes the membership steps.
   std::span<std::optional<double> const> membership;
 };
 
@@ -71,7 +71,8 @@ struct compaction_policy_input {
 /**
  * @brief Applies one explicitly selected compaction strategy with test-only invariant checks
  *
- * This seam bypasses strategy policy so tests can compare complete outputs from the same snapshot.
+ * This wrapper shares the production implementation but bypasses strategy policy so tests can
+ * compare complete outputs from the same snapshot.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_for_testing(
   cudf::table_view const& input,
@@ -103,8 +104,13 @@ struct compaction_policy_input {
  *
  * Input uses scan output layout. A gate may suppress low-value masks; a negative device ID selects
  * the current device. Submitted work completes before the snapshot can be released, including on
- * exceptional exits; no consumer waits for channel publication. Exact input bytes enable deferred
- * compaction policy decisions; callers without byte accounting retain the conservative cascade.
+ * exceptional exits; no consumer waits for channel publication.
+ *
+ * Policy selects the strategy here; the testing entry point forces a strategy and enables invariant
+ * checks for deferred keys.
+ *
+ * @param input_bytes Reported input size from the batch representation, possibly estimated for
+ * views. Used to infer average row width; absent or invalid values select cascade.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
@@ -119,6 +125,8 @@ struct compaction_policy_input {
  * @brief Applies filters through the scan-level gate
  *
  * A maskless attempt does not train the gate, preserving useful replicas on other GPUs.
+ *
+ * @param input_bytes Reported input size, with the same semantics as apply_dynamic_filters_to_view.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
