@@ -22,6 +22,7 @@
 #include <cucascade/io/cache/config.hpp>
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/uring/config.hpp>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -43,7 +44,7 @@ namespace {
 class scoped_yaml {
  public:
   explicit scoped_yaml(std::string const& name, std::string const& text)
-    : path_(std::filesystem::temp_directory_path() / name)
+    : path_(std::filesystem::temp_directory_path() / (std::to_string(::getpid()) + "_" + name))
   {
     std::ofstream out(path_);
     out << text;
@@ -764,10 +765,29 @@ TEST_CASE("sirius_config reads the uring.scheduling keys", "[scan_manager][confi
     CHECK(sched.write_max_wait == 35ms);
 
     // The whole block reaches cuCascade's io_config.
-    auto const io = cfg.to_io_config();
-    CHECK(io.uring.scheduling.max_active_groups == 6);
-    CHECK(io.uring.scheduling.background_slot_fraction == Approx(0.5));
-    CHECK(io.uring.scheduling.write_max_wait == 35ms);
+    auto const io        = cfg.to_io_config();
+    auto const& io_sched = io.uring.scheduling;
+    CHECK(io_sched.max_active_groups == 6);
+    CHECK(io_sched.max_latency_groups == 3);
+    CHECK(io_sched.max_background_groups == 1);
+    CHECK(io_sched.reserved_background_slots == 4);
+    CHECK(io_sched.reserved_latency_slots == 1);
+    CHECK(io_sched.background_slot_fraction == Approx(0.5));
+    CHECK(io_sched.write_slot_fraction == Approx(0.25));
+    CHECK(io_sched.write_ring_fraction == Approx(0.375));
+    CHECK(io_sched.write_max_wait == 35ms);
+  }
+
+  SECTION("the inclusive bounds are accepted")
+  {
+    auto const cfg    = load_scan_manager("sirius_uring_scheduling_bounds.yaml",
+                                       scheduling_yaml("          max_active_groups: 65536\n"
+                                                          "          reserved_latency_slots: 0\n"
+                                                          "          write_max_wait_ms: 1h\n"));
+    auto const& sched = cfg.uring.scheduling;
+    CHECK(sched.max_active_groups == 65536);
+    CHECK(sched.reserved_latency_slots == 0);
+    CHECK(sched.write_max_wait == 3600000ms);
   }
 
   SECTION("write_max_wait_ms accepts a unit suffix")
@@ -801,17 +821,48 @@ TEST_CASE("sirius_config rejects invalid uring.scheduling values", "[scan_manage
     char const* key;
     char const* value;
   };
-  // The uring reactor's own rules: group limits >= 1, fractions within [0, 1] (NaN too).
-  for (auto const& [key, value] : {invalid_case{"background_slot_fraction", "1.5"},
-                                   invalid_case{"write_slot_fraction", "-0.25"},
-                                   invalid_case{"write_ring_fraction", ".nan"},
-                                   invalid_case{"max_active_groups", "0"},
-                                   invalid_case{"max_latency_groups", "0"},
-                                   invalid_case{"max_background_groups", "0"}}) {
-    CAPTURE(key, value);
-    require_load_error(std::string{"sirius_uring_scheduling_invalid_"} + key + ".yaml",
-                       scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
-                       std::string{"'uring.scheduling."} + key + "': value out of range");
+  struct bounded_case {
+    char const* key;
+    char const* value;
+    char const* message;
+  };
+
+  SECTION("fractions")
+  {
+    // The uring reactor's own rule: fractions within [0, 1] (NaN too).
+    for (auto const& [key, value] : {invalid_case{"background_slot_fraction", "1.5"},
+                                     invalid_case{"write_slot_fraction", "-0.25"},
+                                     invalid_case{"write_ring_fraction", ".nan"}}) {
+      CAPTURE(key, value);
+      require_load_error(std::string{"sirius_uring_scheduling_invalid_"} + key + ".yaml",
+                         scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
+                         std::string{"'uring.scheduling."} + key + "': value out of range");
+    }
+  }
+
+  SECTION("counts and write_max_wait_ms")
+  {
+    // Read signed, so -1 is reported as itself rather than wrapped to SIZE_MAX.
+    for (auto const& [key, value, message] :
+         {bounded_case{"max_active_groups", "0", "must be between 1 and 65536, got 0"},
+          bounded_case{"max_latency_groups", "0", "must be between 1 and 65536, got 0"},
+          bounded_case{"max_background_groups", "0", "must be between 1 and 65536, got 0"},
+          bounded_case{"max_active_groups", "-1", "must be between 1 and 65536, got -1"},
+          bounded_case{"max_active_groups",
+                       "4611686018427387904",
+                       "must be between 1 and 65536, got 4611686018427387904"},
+          bounded_case{"reserved_background_slots", "-1", "must be between 0 and 65536, got -1"},
+          bounded_case{"reserved_background_slots",
+                       "4611686018427387904",
+                       "must be between 0 and 65536, got 4611686018427387904"},
+          bounded_case{"write_max_wait_ms", "-5", "must be between 0 and 3600000 ms, got -5"},
+          bounded_case{
+            "write_max_wait_ms", "48h", "must be between 0 and 3600000 ms, got 172800000"}}) {
+      CAPTURE(key, value);
+      require_load_error(std::string{"sirius_uring_scheduling_bounded_"} + key + ".yaml",
+                         scheduling_yaml(std::string{"          "} + key + ": " + value + "\n"),
+                         std::string{"'uring.scheduling."} + key + "': " + message);
+    }
   }
 }
 

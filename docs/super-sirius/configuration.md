@@ -377,25 +377,28 @@ sirius:
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default; cuCascade's own is 4) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
 | `slices_per_pass` | int (**0..64**) | 8 | Fairness cap: how many slices of one grouped request a runner turns into physical operations per loop pass before it moves on to the next group it holds. It does not bound a request's queue depth (free staging slots are filled either way); it makes the groups a runner holds share freed slots instead of being served first come, first served. `0` = no cap. |
-| `scheduling.max_active_groups` | int (**> 0**) | 4 | Non-latency grouped requests (read / write / background) one runner expands at once. A group whose operations are all in flight no longer counts. |
-| `scheduling.max_latency_groups` | int (**> 0**) | 2 | Latency-class groups a runner may expand on top of `max_active_groups`, so a small read never waits behind bulk groups. |
-| `scheduling.max_background_groups` | int (**> 0**) | 2 | Background (prefetch) groups one runner expands at once. Counted inside `max_active_groups`, so read / write groups always keep the remaining expansion slots; a value above `max_active_groups` behaves as `max_active_groups`. |
+| `scheduling.max_active_groups` | int (**1..65536**) | 4 | Non-latency grouped requests (read / write / background) one runner expands at once. A read or background group whose operations are all in flight no longer counts; a write group counts for as long as the runner holds it. |
+| `scheduling.max_latency_groups` | int (**1..65536**) | 2 | Latency-class groups a runner may expand on top of `max_active_groups`, so a small read never waits behind bulk groups. |
+| `scheduling.max_background_groups` | int (**1..65536**) | 2 | Background (prefetch) groups one runner expands at once. Counted inside `max_active_groups`, so read / write groups always keep the remaining expansion slots; a value above `max_active_groups` behaves as `max_active_groups`. |
 | `scheduling.background_slot_fraction` | double [0,1] | 0.75 | Share of a runner's staging slots and in-flight operations that background operations may hold at any time (at least one operation); the rest stays free for demand reads. |
-| `scheduling.reserved_background_slots` | int | 8 | Slots (and operations) kept free of read / write operations while the runner holds background work it has not dispatched and background is below its share (clamped to a quarter of the slots and to the background share): demand slows a prefetch down but never stalls it. |
-| `scheduling.reserved_latency_slots` | int | 2 | Slots and operations kept free for latency-class operations while latency work is queued or active (clamped to half of each). |
+| `scheduling.reserved_background_slots` | int (**0..65536**) | 8 | Slots (and operations) kept free of read / write operations while the runner holds background work it has not dispatched and background is below its share (clamped to a quarter of the slots and to the background share): demand slows a prefetch down but never stalls it. |
+| `scheduling.reserved_latency_slots` | int (**0..65536**) | 2 | Slots and operations kept free for latency-class operations while latency work is queued or active (clamped to half of each). |
 | `scheduling.write_slot_fraction` | double [0,1] | 0.5 | Share of the staging slots write-class operations may hold (at least one operation). |
 | `scheduling.write_ring_fraction` | double [0,1] | 0.5 | Share of the in-flight operations write-class operations may hold (at least one operation). |
-| `scheduling.write_max_wait_ms` | duration (ms) | 20 | Starvation guard: a write that has waited this long is pulled ahead of latency, read and background work. A bare number is milliseconds; a suffixed string (`1.5s`, `500us`) is also accepted. |
+| `scheduling.write_max_wait_ms` | duration (ms, **0..1 h**) | 20 | Starvation guard: a write that has waited this long is pulled ahead of latency, read and background work. A bare number is milliseconds; a suffixed string (`1.5s`, `500us`) is also accepted. |
 
-Prefetch reads are background class, so `max_background_groups`, `background_slot_fraction`
-and `reserved_background_slots` are the prefetch-isolation knobs. Per runner, at most
-`max_background_groups` prefetch groups expand at once, prefetches hold at most
-`background_slot_fraction` of the runner's (up to 64) staging slots, and
+Prefetch reads are background class under `cache.mode: cucs` (the prefetching cache,
+`fs_cache`, is the only producer of background reads), so `max_background_groups`,
+`background_slot_fraction` and `reserved_background_slots` are the prefetch-isolation knobs.
+Per runner, at most `max_background_groups` prefetch groups expand at once, prefetches hold at
+most `background_slot_fraction` of the runner's (up to 64) staging slots, and
 `reserved_background_slots` is the floor that keeps a prefetch moving under demand pressure.
 
-The scheduling block applies to every runner. Sirius rejects a group limit of 0, a fraction
+The scheduling block applies to every runner. Sirius rejects a group limit outside 1..65536, a
+reserved-slot count outside 0..65536, a `write_max_wait_ms` outside 0 ms..1 h, a fraction
 outside [0, 1] (or NaN) and a `slices_per_pass` outside 0..64 when it loads the config, naming
-the key; cuCascade's uring reactor checks the same rules again when it is built.
+the key; cuCascade's uring reactor checks its own rules (group limits >= 1, the fractions,
+`slices_per_pass`) again when it is built.
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
