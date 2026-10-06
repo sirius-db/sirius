@@ -19,7 +19,7 @@ int main(int argc, char** argv)
   int const iters         = argc > 2 ? std::atoi(argv[2]) : 20;
   std::size_t const off   = argc > 3 ? std::atoll(argv[3]) : 0;
 
-  std::uint8_t* d_flags = nullptr;
+  std::uint8_t* d_flags  = nullptr;
   std::uint32_t* d_words = nullptr;
   std::int64_t const words =
     sirius::codegen::selection_mask::ChunksFor(rows) * 32;  // full padded strip
@@ -48,12 +48,16 @@ int main(int argc, char** argv)
   cudaEventElapsedTime(&ms, a, b);
   double const per = ms / iters;
   std::printf("rows=%lld off=%zu: %.4f ms/iter, %.1f GB/s read\n",
-              static_cast<long long>(rows), off, per, rows / (per * 1e6));
+              static_cast<long long>(rows),
+              off,
+              per,
+              rows / (per * 1e6));
 
   std::vector<std::uint32_t> hw(words);
   cudaMemcpy(hw.data(), d_words, words * 4, cudaMemcpyDeviceToHost);
   std::uint64_t sum = 0;
-  for (auto w : hw) sum += __builtin_popcount(w);
+  for (auto w : hw)
+    sum += __builtin_popcount(w);
   std::printf("popcount=%llu\n", static_cast<unsigned long long>(sum));
   return 0;
 }
