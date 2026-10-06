@@ -465,6 +465,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       bool any_null_scalar = false;
       std::vector<evaluate_result> column_results;
       std::vector<cudf::column_view> column_views;
+      column_results.reserve(args.size() - 1);
+      column_views.reserve(args.size() - 1);
       for (std::size_t i = 1; i < args.size(); ++i) {
         auto result = evaluate(*args[i], evaluation_mode::MATERIALIZE);
         if (result.is_scalar()) {
