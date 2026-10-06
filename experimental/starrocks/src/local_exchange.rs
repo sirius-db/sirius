@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
 use tracing::info;
 
-use crate::fragment_executor::SenderSlot;
+use crate::fragment_executor::{KeySource, SenderSlot};
 use crate::result_store::FragmentInstanceId;
 
 /// Receiver identity used by both the stream sink and the exchange node.
@@ -283,6 +283,35 @@ impl LocalExchange {
         Self::take_ready(&mut state, key.fragment_instance_id)
     }
 
+    /// Where exchange `key`'s batches sit, once every expected sender completed it, left in place
+    /// for its receiver. `None` while a sender is still producing, and once the receiver took
+    /// them (or was never registered here).
+    pub(crate) fn complete_sources(&self, key: ExchangeKey) -> Option<Vec<KeySource>> {
+        let state = self.lock();
+        let expected = *state
+            .receivers
+            .get(&key.fragment_instance_id)?
+            .expected_senders
+            .get(&key.node_id)?;
+        let senders = state.sources.get(&key)?;
+        if senders.len() != expected || !senders.values().all(SenderSource::is_complete) {
+            return None;
+        }
+        let mut ordered = senders.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(sender_id, _)| **sender_id);
+        Some(
+            ordered
+                .into_iter()
+                .map(|(_, source)| match source {
+                    SenderSource::LocalParked { slot, .. } => KeySource::Parked(*slot),
+                    SenderSource::Remote { batches, .. } => {
+                        KeySource::Received(batches.iter().map(|batch| batch.token).collect())
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// Hands the receiver over, exactly once, when every expected sender of every exchange input
     /// is complete. Removing it under the lock is what makes the handoff happen once.
     fn take_ready(
@@ -521,6 +550,53 @@ mod tests {
             })
             .collect();
         assert_eq!(slots, vec![local_slot(key, 0), local_slot(key, 1)]);
+    }
+
+    /// A runtime filter reads a build exchange's sources in place once they are complete, while
+    /// the receiver still waits on another exchange; they are gone once it takes them.
+    #[test]
+    fn complete_sources_are_read_in_place_until_the_receiver_takes_them() {
+        let exchange = LocalExchange::default();
+        let build = key(3, 7);
+        let probe = key(3, 8);
+        assert_eq!(exchange.complete_sources(build), None, "no receiver yet");
+        exchange
+            .register_receiver(build.fragment_instance_id, vec![(7, 2), (8, 1)], params())
+            .unwrap();
+        exchange.push_sender(build, 0, local(build, 0)).unwrap();
+        exchange
+            .push_remote_frame(build, 1, 0, false, names(), Some(remote(41)))
+            .unwrap();
+        assert_eq!(
+            exchange.complete_sources(build),
+            None,
+            "sender 1 is still open"
+        );
+        exchange
+            .push_remote_frame(build, 1, 1, true, names(), Some(remote(42)))
+            .unwrap();
+        let expected = vec![
+            KeySource::Parked(local_slot(build, 0)),
+            KeySource::Received(vec![41, 42]),
+        ];
+        assert_eq!(exchange.complete_sources(build), Some(expected.clone()));
+        assert_eq!(
+            exchange.complete_sources(build),
+            Some(expected),
+            "reading takes nothing"
+        );
+        assert_eq!(exchange.complete_sources(probe), None);
+        assert!(
+            exchange
+                .push_sender(probe, 0, local(probe, 0))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            exchange.complete_sources(build),
+            None,
+            "the receiver took them"
+        );
     }
 
     /// Senders that finish before their receiver is dispatched make it ready on registration.
