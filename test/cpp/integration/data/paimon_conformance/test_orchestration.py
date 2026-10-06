@@ -53,12 +53,16 @@ class OrchestrationTests(unittest.TestCase):
             + """
 sql = sys.argv[sys.argv.index('-c') + 1]
 mode = 'disabled' if os.environ.get('SIRIUS_DISABLE') == '1' else ('transparent' if 'SET gpu_execution=true;' in sql else 'cpu')
-with open(trace, 'a') as f: f.write(json.dumps({'sql':sql,'mode':mode})+'\\n')
+with open(trace, 'a') as f: f.write(json.dumps({'sql':sql,'mode':mode,'argv':sys.argv[1:]})+'\\n')
 fault = os.environ.get('PAIMON_TEST_FAULT', '')
 if sql == 'SELECT version() AS version; PRAGMA platform;':
     print(json.dumps([{'version':os.environ.get('PAIMON_TEST_VERSION', spec['extension']['duckdb_version'])}]))
     print(json.dumps([{'platform':spec['extension']['platform']}]))
     sys.exit(0)
+
+if os.environ.get('PAIMON_TEST_REQUIRE_UNSIGNED') == '1' and '-unsigned' not in sys.argv:
+    print('Unsigned local extension requires -unsigned', file=sys.stderr)
+    sys.exit(1)
 
 if 'SET enable_duckdb_fallback=false;' in sql:
     print("GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius", file=sys.stderr, flush=True)
@@ -125,7 +129,10 @@ for result in results: print(json.dumps(result))
             args.extend(["--case", case])
         error = None
         with patch.dict(
-            os.environ, PAIMON_TEST_FAULT=fault, PAIMON_TEST_TARGET=target
+            os.environ,
+            PAIMON_TEST_FAULT=fault,
+            PAIMON_TEST_TARGET=target,
+            PAIMON_TEST_REQUIRE_UNSIGNED="1" if source else "0",
         ), contextlib.redirect_stdout(io.StringIO()):
             try:
                 main(args)
@@ -176,6 +183,11 @@ for result in results: print(json.dumps(result))
         self.assertEqual(report["state"], "passed")
         self.assertEqual(report["executed_cases"], 5)
         self.assertEqual(report["extension"]["kind"], "source_build")
+        calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertNotIn("-unsigned", calls[0]["argv"])
+        self.assertEqual(len(calls), 6)
+        for call in calls[1:]:
+            self.assertIn("-unsigned", call["argv"])
         shutil.rmtree(self.root / "reports")
         self.extension.write_bytes(b"corrupted after build")
         report, error = self.run_suite(selected=("append_b",), source=True)
@@ -198,6 +210,8 @@ for result in results: print(json.dumps(result))
             (53, 53, 0, 0),
         )
         self.assertEqual(len(self.trace.read_text().splitlines()), 54)
+        for line in self.trace.read_text().splitlines():
+            self.assertNotIn("-unsigned", json.loads(line)["argv"])
         attached = [
             json.loads(line)["sql"]
             for line in self.trace.read_text().splitlines()
