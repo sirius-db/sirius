@@ -8,7 +8,7 @@
 #include "op/scan/parquet_metadata.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -137,7 +137,7 @@ struct parquet_objects {
 
   void publish(std::span<std::uint8_t const> bytes)
   {
-    REQUIRE(sirius::test::put_s3_container_object(key, bytes));
+    REQUIRE(sirius::test::put_s3_test_object(key, bytes));
   }
 
   std::filesystem::path directory;
@@ -418,8 +418,8 @@ struct held_request {
 
 TEST_CASE("cache identity isolates equal-size overwrites", "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -440,8 +440,8 @@ TEST_CASE("cache identity isolates equal-size overwrites", "[s3][integration][ca
 TEST_CASE("cache identity replaces metadata with the byte cache enabled",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -451,8 +451,8 @@ TEST_CASE("cache identity replaces metadata with the byte cache enabled",
 TEST_CASE("cache identity replaces metadata with the byte cache disabled",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -462,8 +462,8 @@ TEST_CASE("cache identity replaces metadata with the byte cache disabled",
 TEST_CASE("cache identity reclaims a retired generation on final handle release",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -487,8 +487,8 @@ TEST_CASE("cache identity reclaims a retired generation on final handle release"
 TEST_CASE("cache identity retains a disposed datasource generation until destruction",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -511,8 +511,8 @@ TEST_CASE("cache identity retains a disposed datasource generation until destruc
 TEST_CASE("cache identity bounds retired generations across five overwrites",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -540,8 +540,8 @@ TEST_CASE("cache identity bounds retired generations across five overwrites",
 TEST_CASE("cache identity pins retired bytes until a gated device copy completes",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -634,8 +634,8 @@ TEST_CASE("cache identity retains a retired generation until a held fill release
 TEST_CASE("cache identity releases read pins when a read of a retired generation fails",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -669,8 +669,8 @@ TEST_CASE("cache identity releases read pins when a read of a retired generation
 TEST_CASE("cache identity releases a retired footer stash with its last datasource",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -782,8 +782,8 @@ struct prefetch_observer {
 TEST_CASE("cache identity rejects mid-open replacement on allocated fills",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -793,8 +793,8 @@ TEST_CASE("cache identity rejects mid-open replacement on allocated fills",
 TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -804,8 +804,8 @@ TEST_CASE("cache identity rejects mid-open replacement on bypass reads",
 TEST_CASE("cache identity fails a mixed hit and replaced miss without publication",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
@@ -848,8 +848,8 @@ TEST_CASE("cache identity fails a mixed hit and replaced miss without publicatio
 TEST_CASE("cache identity publishes prefetch failure before notifying the consumer",
           "[s3][integration][cache_identity]")
 {
-  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_container_env(),
-                                            "MinIO test environment is not available")) {
+  if (sirius::test::s3::skip_or_fail_unless(sirius::test::ensure_s3_test_env(),
+                                            "SeaweedFS test environment is not available")) {
     return;
   }
 
