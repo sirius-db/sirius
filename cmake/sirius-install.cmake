@@ -3,12 +3,24 @@
 # topology_discovery into its own static target, and PR #150 split the
 # cudf-coupled code into cucascade_cudf_static — list both here so the export
 # set covers the full dependency chain.
-install(
-  TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge simpatico
-  EXPORT "${DUCKDB_EXPORT_SET}"
-  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  install(FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
+          DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
+endif()
+
+if(NOT PROJECT_IS_TOP_LEVEL)
+  install(
+    TARGETS sirius_extension
+            sirius_core
+            cucascade_static
+            cucascade_cudf_static
+            cucascade_topology_discovery_static
+            telemetry_bridge
+            simpatico
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
 
 install(
   DIRECTORY include/sirius

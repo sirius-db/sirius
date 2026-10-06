@@ -16,21 +16,45 @@
 
 #pragma once
 
+#include "io/types.hpp"
+
 #include <cstddef>
 
 namespace sirius::io::uring {
 
 struct config {
-  std::size_t bounce_size{1UL << 20};
-  /// When false, every prep path except the BYO-device-buffer read
-  /// (prep_device_rx_request) reads through the buffered (page-cache) file
-  /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
+  /// How many scan tasks the readahead manager may keep in flight against this
+  /// backend at once.  Zero disables readahead for it entirely.
+  ///
+  /// Local NVMe has no round trip to hide, so a readahead competes with the
+  /// executor's own reads for the same device and just reorders the queue
+  /// rather than adding throughput.  Measured on SF1000 local-parquet, turning
+  /// it off is a large net win, so the local backend defaults to 0 (off).  Set
+  /// a positive value (or `max_readahead_scans`) to opt the local path back in.
+  std::size_t n_max_concurrent_scans{0};
+
+  /// Whether the config named @c n_max_concurrent_scans explicitly. Preserved
+  /// for parity with the REST backend (whose budget is still derived from the
+  /// pipeline width) so an explicit value is always distinguishable from the
+  /// struct default -- including an explicit 0, which opts the local path out
+  /// as deliberately as the default does.
+  bool n_max_concurrent_scans_explicit{false};
+
+  /// When false, worker-planned operations use the buffered page-cache handle.
+  /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};
 
-  // max number of contiguous segments to fuse into one readv SQE.  The
-  // prep_host_rxv_request and prep_host_to_device_rx_request paths fuse
-  // contiguous segments into one readv SQE, capped at this value.  The
-  std::size_t max_n_chunks{1};
+  /// O_DIRECT transfers whole pages, so a read is widened to a page boundary
+  /// either way -- naming it lets the caller align once, up front, instead of
+  /// every layer rediscovering it.  Reported even when @ref use_odirect is
+  /// false: a buffered read of a page-aligned span costs no more than an
+  /// unaligned one, and keeping the value constant keeps the two modes
+  /// comparable.
+  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return io::IO_BLOCK_SIZE; }
+
+  /// A local read is a syscall against NVMe, so bridging is only worth it when
+  /// the bridged bytes are cheaper than the extra request -- one page.
+  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return io::IO_BLOCK_SIZE; }
 };
 
 }  // namespace sirius::io::uring

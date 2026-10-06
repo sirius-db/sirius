@@ -25,26 +25,26 @@ namespace sirius::test {
 /**
  * @brief Lazily bring up the MinIO test backend for the [s3] integration tests.
  *
- * Replaces the old out-of-band `make s3-up` flow (docker-compose + fixtures.sh +
- * env.sh). On the first call it:
- *   1. starts two MinIO containers (HTTP + self-signed-TLS) via the vendored
- *      testcontainers-native bridge, on dynamically-mapped host ports,
+ * On the first call it:
+ *   1. starts two MinIO containers (HTTP + self-signed-TLS) via the testcontainers-native
+ *      bridge fetched and patched at configure time, on dynamically-mapped host ports,
  *   2. generates the local fixtures (`generate_fixtures.py`) and uploads them to
  *      both endpoints from the host using Sirius's own SigV4 signer + libcurl
  *      (no `mc` container, no docker network), and
  *   3. publishes the `SIRIUS_TEST_S3_*` env vars the [s3] tests already consume.
- * Containers are torn down at process exit (see @ref shutdown_s3_container_env);
- * testcontainers' Ryuk sidecar guarantees cleanup even on a crash.
+ * Containers are torn down at process exit (see @ref shutdown_s3_container_env).
+ * The library's default Ryuk reaper is best effort; a killed process may leave
+ * containers running.
  *
- * The call is idempotent and cheap after the first success — safe to invoke
- * before every [s3] test from the Catch2 listener.
+ * The call is idempotent and cheap after the first success; main calls it once
+ * before the tests run.
  *
  * Bring-up is **opt-in** via the @c SIRIUS_TEST_S3_AUTO env var so the default
  * `make test` suite never needs Docker. Behavior:
  *   - If @c SIRIUS_TEST_S3_ENDPOINT is already set (manual run / real AWS), it is
  *     used as-is and no container is started → returns true.
- *   - Else if @c SIRIUS_TEST_S3_AUTO is not truthy, returns false (tests skip,
- *     exactly as before).
+ *   - Else if @c SIRIUS_TEST_S3_AUTO is not truthy, returns false. Callers use
+ *     skip_or_fail_unless() to report a skip or fail under STRICT.
  *   - Else containers are brought up. On success returns true; on failure it
  *     returns false (skip) unless @c SIRIUS_TEST_S3_STRICT is truthy, in which
  *     case it throws std::runtime_error so the job goes red.

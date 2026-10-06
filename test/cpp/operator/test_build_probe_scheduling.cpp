@@ -48,6 +48,7 @@ using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
 using sirius::op::compute_hash_join_partition_strategy;
 using sirius::op::HASH_JOIN_MODE;
+using sirius::op::partition_placement;
 using sirius::op::partition_strategy;
 using sirius::op::select_build_probe_action;
 
@@ -81,6 +82,16 @@ constexpr uint64_t kBigPartitionBytes = 512ull * 1024 * 1024;  // 512 MB
 // Default broadcast size cap (256 MB); some tests override it to exercise the ratio-based path.
 constexpr uint64_t kMaxBroadcastBytes = 256ull * 1024 * 1024;
 
+// GPU ids {0, ..., num_gpus - 1}; zero GPUs yields the empty list of an engine-free operator.
+std::vector<int> gpu_ids(int num_gpus)
+{
+  std::vector<int> ids;
+  for (int i = 0; i < num_gpus; ++i) {
+    ids.push_back(i);
+  }
+  return ids;
+}
+
 partition_strategy strategy(uint64_t total_bytes,
                             bool is_build_side,
                             bool build_foldable,
@@ -92,16 +103,20 @@ partition_strategy strategy(uint64_t total_bytes,
                             uint64_t max_broadcast_join_size      = kMaxBroadcastBytes,
                             double estimated_probe_to_build_ratio = 0.0)
 {
-  return compute_hash_join_partition_strategy(total_bytes,
-                                              is_build_side,
-                                              build_foldable,
-                                              num_gpus,
-                                              hash_partition_bytes,
-                                              max_build_hash_table_bytes,
-                                              max_broadcast_join_size,
-                                              join_type,
-                                              join_mode,
-                                              estimated_probe_to_build_ratio);
+  auto result = compute_hash_join_partition_strategy(total_bytes,
+                                                     is_build_side,
+                                                     build_foldable,
+                                                     gpu_ids(num_gpus),
+                                                     /*single_partition_rotation=*/0,
+                                                     hash_partition_bytes,
+                                                     max_build_hash_table_bytes,
+                                                     max_broadcast_join_size,
+                                                     join_type,
+                                                     join_mode,
+                                                     estimated_probe_to_build_ratio);
+  // Every strategy places exactly the partitions it asks for.
+  REQUIRE(result.placement.num_partitions() == static_cast<std::size_t>(result.num_partitions));
+  return result;
 }
 
 }  // namespace
@@ -421,11 +436,66 @@ TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldabl
   REQUIRE_FALSE(unfoldable.build_probe);
 }
 
-TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition violation",
+TEST_CASE("compute_hash_join_partition_strategy - no GPU list plans one GPU, unpinned",
           "[hash_join][build_probe][unit]")
 {
-  REQUIRE_THROWS_AS(strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER),
-                    std::invalid_argument);
+  auto const none = strategy(k100MB, true, true, /*num_gpus=*/0, duckdb::JoinType::INNER);
+  auto const one  = strategy(k100MB, true, true, /*num_gpus=*/1, duckdb::JoinType::INNER);
+  REQUIRE(none.num_partitions == one.num_partitions);
+  REQUIRE(none.build_probe == one.build_probe);
+  REQUIRE(none.broadcast == one.broadcast);
+  REQUIRE_FALSE(none.placement.any_pinned());
+  REQUIRE(one.placement == partition_placement::round_robin(1, {0}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - broadcast places one partition per GPU",
+          "[hash_join][build_probe][unit]")
+{
+  // 1 MB is below the 4-GPU small-table threshold (64 MB), so the build is replicated.
+  auto const s = strategy(1024ull * 1024, true, true, /*num_gpus=*/4, duckdb::JoinType::INNER);
+  REQUIRE(s.broadcast);
+  REQUIRE(s.placement == partition_placement::one_per_device({0, 1, 2, 3}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multi-partition BUILD_PROBE is round-robin",
+          "[hash_join][build_probe][unit]")
+{
+  // 4 GB over 4 GPUs: too big to broadcast, one 1 GB hash table per GPU.
+  auto const s = strategy(4096ull * 1024 * 1024,
+                          true,
+                          true,
+                          /*num_gpus=*/4,
+                          duckdb::JoinType::INNER,
+                          HASH_JOIN_MODE::STANDARD,
+                          /*hash_partition_bytes=*/k100MB,
+                          /*max_build_hash_table_bytes=*/2048ull * 1024 * 1024);
+  REQUIRE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.num_partitions == 4);
+  REQUIRE(s.placement == partition_placement::round_robin(4, {0, 1, 2, 3}));
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - a lone BUILD_PROBE partition rotates by seed",
+          "[hash_join][build_probe][unit]")
+{
+  // Today's count policy only yields a single BUILD_PROBE partition on one GPU (on more, a small
+  // build broadcasts and a larger one is floored to one partition per GPU), so the rotation picks
+  // among a single id. The rotation is what lets a future fewer-GPUs policy spread lone joins.
+  auto const s = compute_hash_join_partition_strategy(k100MB,
+                                                      /*is_build_side=*/true,
+                                                      /*build_foldable=*/true,
+                                                      /*active_gpu_ids=*/{3},
+                                                      /*single_partition_rotation=*/5,
+                                                      kBigPartitionBytes,
+                                                      kMaxBuildBytes,
+                                                      kMaxBroadcastBytes,
+                                                      duckdb::JoinType::INNER,
+                                                      HASH_JOIN_MODE::STANDARD,
+                                                      /*estimated_probe_to_build_ratio=*/0.0);
+  REQUIRE(s.num_partitions == 1);
+  REQUIRE(s.build_probe);
+  REQUIRE_FALSE(s.broadcast);
+  REQUIRE(s.placement.device_for(0) == 3);
 }
 
 //===----------------------------------------------------------------------===//
@@ -435,7 +505,7 @@ TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition
 TEST_CASE("select_build_probe_action - no partitions means the operator is complete",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({});
+  auto const d = select_build_probe_action({}, /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::none);
 }
 
@@ -443,7 +513,8 @@ TEST_CASE("select_build_probe_action - schedules a build for a ready NOT_BUILT p
           "[hash_join][build_probe][unit]")
 {
   // NOT_BUILT with both its build batch and a probe batch -> build (and first probe) it.
-  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true)});
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true)},
+                                           /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 0);
 }
@@ -451,34 +522,68 @@ TEST_CASE("select_build_probe_action - schedules a build for a ready NOT_BUILT p
 TEST_CASE("select_build_probe_action - waits on build vs probe input when nothing is schedulable",
           "[hash_join][build_probe][unit]")
 {
-  // Missing build batch -> wait for the build producer so the build can start.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)}).action ==
-    build_probe_action::wait_for_build);
+  // Missing build batch -> wait for the build producer so the build can start, regardless of
+  // whether the probe side is finished (the build hasn't even arrived).
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_build);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_build);
 
-  // Build batch present but no probe batch yet -> wait for probe input.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)}).action ==
-    build_probe_action::wait_for_probe);
+  // Build batch present but no probe batch yet, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
 
-  // A build in flight (SCHEDULING/SCHEDULED) with no other work -> wait for probe input.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false)}).action ==
-    build_probe_action::wait_for_probe);
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)}).action ==
-    build_probe_action::wait_for_probe);
+  // A build in flight (SCHEDULING/SCHEDULED) with no other work -> wait for probe input, even
+  // once probe_finished: a task is still running against this slot.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_probe);
 
-  // Built but drained of probe data -> wait for probe input (this is also how the op idles until
-  // the probe pipeline signals completion).
-  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)}).action ==
-          build_probe_action::wait_for_probe);
+  // Built but drained of probe data, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+}
+
+TEST_CASE(
+  "select_build_probe_action - probe_finished retires orphaned/drained slots into completion",
+  "[hash_join][build_probe][unit]")
+{
+  // A NOT_BUILT partition holding a build batch but no probe data (broadcast orphan) has nothing
+  // left to do once the probe side is finished -- it does not need to be torn down first for the
+  // operator to report completion.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // A BUILT-and-drained partition likewise has nothing left to do once probe_finished: this is
+  // the exact state that used to make the operator report wait_for_probe forever.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // Mixed: one already-DESTROYED slot alongside a BUILT-and-drained one -- still complete once
+  // probe_finished.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+                                     slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
 }
 
 TEST_CASE("select_build_probe_action - probes a built partition that has probe data",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, true)});
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, true)},
+                                           /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 0);
 }
@@ -488,10 +593,12 @@ TEST_CASE("select_build_probe_action - prefers starting a build over probing a b
 {
   // Partition 0 is BUILT with probe data; partition 1 is NOT_BUILT and ready. Building 1 first
   // gets its GPU busy sooner, so build wins.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 1);
 }
@@ -501,10 +608,12 @@ TEST_CASE("select_build_probe_action - interleaves: probes a built partition whi
 {
   // Partition 0 is still building (SCHEDULED); partition 1 is BUILT with probe data. With no
   // NOT_BUILT partition ready to build, we probe partition 1 on its GPU while 0 finishes.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 1);
 }
@@ -514,10 +623,12 @@ TEST_CASE("select_build_probe_action - a SCHEDULING partition is not re-schedule
 {
   // Partition 0 was just claimed for build (SCHEDULING) by a prior hint; it must not be picked
   // again. Partition 1 is BUILT with probe data, so that is the next action.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, true),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, true),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 1);
 }
@@ -525,10 +636,12 @@ TEST_CASE("select_build_probe_action - a SCHEDULING partition is not re-schedule
 TEST_CASE("select_build_probe_action - all partitions destroyed reports completion",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-    slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::none);
 }
 
@@ -537,12 +650,14 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
 {
   // Partition 0 built+drained, 1 built+drained, 2 NOT_BUILT+ready, 3 NOT_BUILT+ready. The first
   // schedulable build (partition 2) is chosen.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 2);
 }

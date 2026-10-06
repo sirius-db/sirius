@@ -110,19 +110,19 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
 }  // namespace
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
-                             sirius_interface& sirius_iface,
-                             sirius::query_id_t query_id)
+                             sirius::query_id_t query_id,
+                             const std::optional<std::string>& query_label,
+                             const std::optional<std::string>& session_label)
   : context(context),
-    sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_handle_(telemetry_context_->context()
                     .query_observer()
                     ->handle()
                     .init({
-                      .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+                      .instance_name  = query_label.value_or("unnamed_query"),
                       .query_group_id = quent::query_group::QueryGroupId(
-                        telemetry_context_->query_group_id_for(sirius_iface.session_label)),
+                        telemetry_context_->query_group_id_for(session_label)),
                     })
                     .into_dynamic())
 {
@@ -145,8 +145,26 @@ void sirius_engine::reset()
 
 void sirius_engine::cancel_tasks()
 {
+  cancel_dynamic_filter_publications();
   sirius_pipelines.clear();
   sirius_root_pipelines.clear();
+}
+
+void sirius_engine::cancel_dynamic_filter_publications() noexcept
+{
+  if (!query_) { return; }
+  auto cancel = [](op::sirius_physical_operator* candidate) noexcept {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(candidate)) {
+      join->cancel_dynamic_filter_publication();
+    }
+  };
+  for (auto const& pipeline : query_->get_pipelines()) {
+    cancel(pipeline->get_source().get());
+    cancel(pipeline->get_sink().get());
+    for (auto const& op_ref : pipeline->operators) {
+      cancel(&op_ref.get());
+    }
+  }
 }
 
 bool sirius_engine::has_result_collector()
@@ -213,6 +231,7 @@ void sirius_engine::execute()
     sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    cancel_dynamic_filter_publications();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
@@ -221,6 +240,7 @@ void sirius_engine::execute()
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
+    cancel_dynamic_filter_publications();
     sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }

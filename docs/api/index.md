@@ -17,6 +17,6 @@ repository's default branch; they do not promise ABI stability.
 
 ## More documentation
 
-- [Build and development guide](https://github.com/sirius-db/sirius/blob/dev/docs/DEVELOPMENT.md)
-- [Engine architecture](https://github.com/sirius-db/sirius/tree/dev/docs/super-sirius)
+- [Build and development guide](https://github.com/sirius-db/sirius/blob/main/docs/DEVELOPMENT.md)
+- [Engine architecture](https://github.com/sirius-db/sirius/tree/main/docs/super-sirius)
 - [Sirius on GitHub](https://github.com/sirius-db/sirius)

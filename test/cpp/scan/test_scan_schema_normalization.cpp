@@ -87,6 +87,7 @@ struct test_env {
 
 test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }
@@ -209,7 +210,8 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
   return sirius::op::scan::sirius_gpu_scan_operator{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
     /*estimated_cardinality=*/0,
-    std::move(ingestible)};
+    std::move(ingestible),
+    /*contract_id=*/1};
 }
 
 constexpr std::size_t kRows = 8;
@@ -237,8 +239,10 @@ TEST_CASE("scan construction rejects an incomplete native carrier schema",
   types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   types.push_back(sirius::logical_type::make_decimal(4, 2));
 
-  REQUIRE_THROWS_WITH(sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr),
-                      Catch::Contains("output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
+  REQUIRE_THROWS_WITH(
+    sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr, /*contract_id=*/1),
+    Catch::Matchers::ContainsSubstring(
+      "output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
 }
 
 TEST_CASE("scan execute rejects a materialized column count its output types do not describe",
@@ -260,7 +264,7 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("output schema width mismatch"));
+                      Catch::Matchers::ContainsSubstring("output schema width mismatch"));
 }
 
 TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its output type",
@@ -283,7 +287,7 @@ TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("native schema carrier mismatch"));
+                      Catch::Matchers::ContainsSubstring("native schema carrier mismatch"));
 }
 
 TEST_CASE("scan execute restores a narrowed resident carrier to its native output type",
@@ -334,8 +338,10 @@ TEST_CASE("scan execute transactionally restores a fresh cached conversion",
   duckdb::vector<duckdb::LogicalType> logical_types;
   logical_types.push_back(duckdb::LogicalType::BIGINT);
   logical_types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_scan_operator scan{
-    sirius::from_duckdb_vec(logical_types), /*estimated_cardinality=*/0, ingestible};
+  sirius::op::scan::sirius_gpu_scan_operator scan{sirius::from_duckdb_vec(logical_types),
+                                                  /*estimated_cardinality=*/0,
+                                                  ingestible,
+                                                  /*contract_id=*/1};
 
   sirius::op::scan::scan_operator_input input(batch);
   input.needs_carrier_conversion = true;

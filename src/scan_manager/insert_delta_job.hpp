@@ -16,12 +16,11 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
 #include "op/scan/duckdb_insert_delta.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
 #include "sirius_config.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <cstddef>
 #include <memory>
@@ -109,7 +108,7 @@ struct insert_delta_work {
  */
 struct insert_delta_workset {
   std::vector<std::unique_ptr<insert_delta_work>> works;
-  std::vector<absl::AnyInvocable<void()>> fill_tasks;
+  std::vector<sirius::exec::invocable<void()>> fill_tasks;
 };
 
 /**
@@ -182,6 +181,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager);
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id);
 
 }  // namespace sirius::scan_manager

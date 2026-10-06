@@ -16,12 +16,17 @@
 
 #pragma once
 
+#include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -41,11 +46,36 @@ struct partition_sizing_input {
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is
 /// applied to the partition operator(s); `broadcast`/`build_probe` are reported back so the
-/// partition can configure its own wiring (e.g. enabling build-side concat_all).
+/// partition can configure its own wiring (e.g. enabling build-side concat_all). `placement` says
+/// which GPU each partition runs on; the partition hands it to every operator that emits this
+/// exchange's partitioned data.
 struct partition_strategy {
+  /// @throws std::invalid_argument if `num_partitions < 1` or the placement covers a different
+  ///         number of partitions.
+  partition_strategy(int num_partitions_p,
+                     bool broadcast_p,
+                     bool build_probe_p,
+                     partition_placement placement_p)
+    : num_partitions(num_partitions_p),
+      broadcast(broadcast_p),
+      build_probe(build_probe_p),
+      placement(std::move(placement_p))
+  {
+    if (num_partitions < 1) {
+      throw std::invalid_argument("partition_strategy: num_partitions (" +
+                                  std::to_string(num_partitions) + ") must be at least 1");
+    }
+    if (placement.num_partitions() != static_cast<std::size_t>(num_partitions)) {
+      throw std::invalid_argument(
+        "partition_strategy: placement covers " + std::to_string(placement.num_partitions()) +
+        " partitions but num_partitions is " + std::to_string(num_partitions));
+    }
+  }
+
   int num_partitions;
   bool broadcast;
   bool build_probe;
+  partition_placement placement;
 };
 
 /// Multi-GPU partition floor derived purely from the GPU count: below the small-table threshold a
@@ -114,18 +144,46 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
   /// sizing consumer.
   virtual partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
-  /// @brief Inform the consumer how many GPUs the query runs on. Set at plan/convert time; drives
-  /// the multi-GPU partition floor and (for joins) BUILD_PROBE / broadcast admission. Defaults
-  /// to 1.
-  void set_num_gpus(int num_gpus) { _num_gpus = num_gpus; }
+  /// @brief Inform the consumer which GPUs the query was admitted to (sorted, deduped). Set at
+  /// convert time; a placement chosen in get_partition_strategy must stay within this set. Its
+  /// size drives the multi-GPU partition floor and (for joins) BUILD_PROBE / broadcast admission.
+  /// Empty only for operators built without an engine (unit tests).
+  void set_active_gpu_ids(std::vector<int> active_gpu_ids)
+  {
+    _active_gpu_ids = std::move(active_gpu_ids);
+  }
+
+  [[nodiscard]] std::vector<int> const& active_gpu_ids() const noexcept { return _active_gpu_ids; }
+
+  /// Number of GPUs the query runs on; 1 when no GPU list was set.
+  [[nodiscard]] int num_gpus() const noexcept
+  {
+    return std::max(1, static_cast<int>(_active_gpu_ids.size()));
+  }
+
+  /// @brief Install the placement of the partitioned data this operator receives. Called by the
+  /// upstream PARTITION once the partition count is decided. Setting an equal placement again is a
+  /// no-op (a consumer fed by two sibling partitions is reached once per sibling).
+  /// @throws sirius::internal_exception if a different placement was already installed.
+  void set_placement(std::shared_ptr<const partition_placement> placement);
+
+  /// The installed placement. PARTITION must install it before partitioned data is emitted;
+  /// standalone operator tests must install it explicitly with set_placement().
+  /// @throws sirius::internal_exception if no placement has been installed.
+  [[nodiscard]] std::shared_ptr<const partition_placement> placement() const;
 
  protected:
   //! Target size (bytes) per hash partition — the natural-count divisor. Set from operator_params
   //! at construction (a config option, not a runtime setter).
   uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
-  //! Number of GPUs the query runs on (set at plan time via set_num_gpus).
-  int _num_gpus = 1;
+ private:
+  //! GPUs the query was admitted to (set at convert time via set_active_gpu_ids).
+  std::vector<int> _active_gpu_ids;
+
+  //! Placement of the partitioned data this operator receives (see set_placement). Written once by
+  //! the upstream PARTITION and read by task-creation threads without the operator lock.
+  std::atomic<std::shared_ptr<const partition_placement>> _placement;
 };
 
 }  // namespace op

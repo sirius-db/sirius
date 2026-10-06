@@ -25,6 +25,7 @@
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -182,10 +183,7 @@ struct join_expression_key_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(_db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     // big_left is larger so the optimizer keeps small_right as the build side.
@@ -196,8 +194,6 @@ struct join_expression_key_fixture {
     con->Query("CREATE TABLE small_right (rid INTEGER, other INTEGER)");
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
   }
-
-  ~join_expression_key_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;
@@ -266,4 +262,59 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   // Fast path: plain-reference keys need no projection below the join.
   CHECK_FALSE(has_projection_child(*hj));
   require_all_equality_sides_are_references(*hj);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - mixed SEMI and ANTI keep casts in hash keys",
+                 "[join_expression_key][isolated_context]")
+{
+  const bool anti             = GENERATE(false, true);
+  const bool right_family     = GENERATE(false, true);
+  const std::string residual  = GENERATE("<>", "IS NOT DISTINCT FROM");
+  const std::string lhs       = right_family ? "small_right" : "big_left";
+  const std::string rhs       = right_family ? "big_left" : "small_right";
+  const std::string lhs_key   = right_family ? "rid" : "id";
+  const std::string rhs_key   = right_family ? "id" : "rid";
+  const std::string lhs_value = right_family ? "other" : "val";
+  const std::string rhs_value = right_family ? "val" : "other";
+  const auto query = "SELECT l.* FROM " + lhs + " l " + (anti ? "ANTI" : "SEMI") + " JOIN " + rhs +
+                     " r ON CAST(l." + lhs_key + " AS SMALLINT) = CAST(r." + rhs_key +
+                     " AS SMALLINT) AND l." + lhs_value + " " + residual + " r." + rhs_value;
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  const auto expected_type = right_family ? (anti ? JoinType::RIGHT_ANTI : JoinType::RIGHT_SEMI)
+                                          : (anti ? JoinType::ANTI : JoinType::SEMI);
+  REQUIRE(hj->join_type == expected_type);
+  CHECK_FALSE(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 2);
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison == sirius::comparison_type::equal) {
+      CHECK_FALSE(is_bound_ref(*condition.left));
+      CHECK_FALSE(is_bound_ref(*condition.right));
+    }
+  }
+  CHECK(hj->types.size() == 2);
+  const auto& output = right_family ? hj->rhs_output_columns : hj->lhs_output_columns;
+  CHECK(output.col_idxs.size() == 2);
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - hash-only casts stay unmaterialized",
+                 "[join_expression_key][isolated_context]")
+{
+  const std::string join_type = GENERATE("JOIN", "SEMI JOIN", "ANTI JOIN");
+  const auto query            = "SELECT l.* FROM big_left l " + join_type +
+                     " small_right r ON CAST(l.id AS SMALLINT) = CAST(r.rid AS SMALLINT)";
+  INFO(query);
+  auto plan = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  CHECK_FALSE(has_projection_child(*hj));
+  REQUIRE(hj->conditions.size() == 1);
+  CHECK_FALSE(is_bound_ref(*hj->conditions[0].left));
+  CHECK_FALSE(is_bound_ref(*hj->conditions[0].right));
 }

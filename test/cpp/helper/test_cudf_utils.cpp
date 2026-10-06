@@ -265,7 +265,8 @@ TEST_CASE("make_empty_table - the cudf-type overload refuses nested carriers", "
   std::vector<cudf::data_type> const carriers{cudf::data_type{cudf::type_id::INT32},
                                               cudf::data_type{cudf::type_id::LIST}};
   REQUIRE_THROWS_AS(sirius::make_empty_table(carriers), duckdb::InvalidInputException);
-  REQUIRE_THROWS_WITH(sirius::make_empty_table(carriers), Catch::Contains("logical-type overload"));
+  REQUIRE_THROWS_WITH(sirius::make_empty_table(carriers),
+                      Catch::Matchers::ContainsSubstring("logical-type overload"));
 }
 
 TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")

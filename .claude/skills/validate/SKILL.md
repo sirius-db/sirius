@@ -199,4 +199,4 @@ sirius::debug_sample(*batch, 20, stream);
 
 ## Scope
 
-Only analyze code in `namespace sirius` plus exceptions listed in shared build-and-query.md. Ignore legacy `namespace duckdb` code.
+Analyze active code in both `namespace sirius` and `namespace duckdb`; see shared build-and-query.md.

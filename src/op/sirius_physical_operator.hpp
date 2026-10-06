@@ -22,6 +22,7 @@
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
@@ -336,17 +337,29 @@ class pipelineable_operator_data : public operator_data {
 class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
+
+  /// Partition `partition_idx` of an exchange placed by `placement`. When the placement pins the
+  /// partition to a GPU, that GPU becomes this data's preferred device, so the task creator puts
+  /// every task of the partition on it (cuco hash tables must stay on one device).
+  /// @throws std::invalid_argument if `partition_idx >= placement.num_partitions()`.
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
-                            std::size_t partition_idx)
+                            std::size_t partition_idx,
+                            partition_placement const& placement)
     : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
+    if (partition_idx >= placement.num_partitions()) {
+      throw std::invalid_argument("partitioned_operator_data: partition " +
+                                  std::to_string(partition_idx) + " is outside a placement of " +
+                                  std::to_string(placement.num_partitions()) + " partitions");
+    }
+    if (auto const device = placement.device_for(partition_idx)) {
+      set_preferred_device_id(*device);
+    }
   }
 
-  /// Partitioned data with no index. The scheduler pins a task to
-  /// `_active_gpu_ids[partition_idx % size]` only when an index is present; without one it falls
-  /// through to its byte-affinity heuristic and places the task on the GPU already holding the
-  /// data. Used when a consumer produced a single partition, where no cross-task device agreement
-  /// is required.
+  /// Partitioned data with no index and no preferred device: the task creator places the task on
+  /// the GPU already holding the data. Used when a consumer produced a single partition, where no
+  /// cross-task device agreement is required.
   explicit partitioned_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : pipelineable_operator_data(std::move(data_batches))

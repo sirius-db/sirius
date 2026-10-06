@@ -37,6 +37,7 @@
 #include <cucascade/data/data_repository_manager.hpp>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,7 +53,6 @@ class sirius_physical_table_scan;
 namespace sirius {
 
 struct operator_params;
-class sirius_interface;
 
 class sirius_engine {
   friend class pipeline::sirius_pipeline_build_state;
@@ -60,16 +60,17 @@ class sirius_engine {
   friend class pipeline::sirius_meta_pipeline;
 
  public:
-  explicit sirius_engine(duckdb::ClientContext& context,
-                         sirius_interface& sirius_iface,
-                         sirius::query_id_t query_id);
+  /// @p query_label and @p session_label name the query and its session in telemetry.
+  sirius_engine(duckdb::ClientContext& context,
+                sirius::query_id_t query_id,
+                const std::optional<std::string>& query_label   = std::nullopt,
+                const std::optional<std::string>& session_label = std::nullopt);
   ~sirius_engine();
 
   /// \brief The query_id this engine belongs to.
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
-  sirius_interface& sirius_iface;
   duckdb::unique_ptr<op::sirius_physical_operator> sirius_owned_plan;
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 
@@ -109,6 +110,7 @@ class sirius_engine {
   bool query_finished;
 
  private:
+  void cancel_dynamic_filter_publications() noexcept;
   sirius::query_id_t query_id_;
   /// The planner query for this execution: the pipeline set plus the operator->pipeline and
   /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this
@@ -116,9 +118,9 @@ class sirius_engine {
   /// nothing to gain.
   duckdb::shared_ptr<planner::query> query_;
   /// This query's completion signal, created in execute() and shared with every task through
-  /// its pipeline's global state. shared_ptr because this engine is destroyed (in
-  /// sirius_interface::cleanup_internal) before the query's cleanup drains the task queues, so a
-  /// task still unwinding must be able to report without touching freed memory.
+  /// its pipeline's global state. shared_ptr because the transparent path destroys this engine
+  /// (in sirius_interface::cleanup_internal) before the query's cleanup drains the task queues,
+  /// so a task still unwinding must be able to report without touching freed memory.
   std::shared_ptr<pipeline::completion_handler> completion_handler_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   quent::DynamicFsmHandle<quent::Query> query_handle_;

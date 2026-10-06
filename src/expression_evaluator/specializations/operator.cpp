@@ -30,6 +30,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/search.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/wrappers/timestamps.hpp>
@@ -218,19 +219,21 @@ std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list
                                 cudaMemcpyHostToDevice,
                                 stream.get()));
 
-  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                    num_offsets,
-                                                    std::move(offsets_buffer).release(),
-                                                    rmm::device_buffer{},
-                                                    0);
+  auto offsets_col =
+    std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
+                                   num_offsets,
+                                   std::move(offsets_buffer).release(),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
   std::vector<std::unique_ptr<cudf::column>> children;
   children.push_back(std::move(offsets_col));
-  auto in_strings_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
-                                                       num_strings,
-                                                       std::move(chars_buffer).release(),
-                                                       rmm::device_buffer{},
-                                                       0,
-                                                       std::move(children));
+  auto in_strings_col =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
+                                   num_strings,
+                                   std::move(chars_buffer).release(),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0,
+                                   std::move(children));
 
   return cudf::contains(in_strings_col->view(), input_view, stream, mr);
 }

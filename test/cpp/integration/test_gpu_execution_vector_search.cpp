@@ -28,6 +28,8 @@
 #include <catch.hpp>
 #include <cuvs/distance/distance.hpp>
 #include <duckdb.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -54,6 +56,26 @@ std::vector<std::vector<std::string>> ok_col(duckdb::Connection& con, const std:
   REQUIRE_FALSE(r->HasError());
   auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
   return sirius::test::GpuExecutionFixture::collect_rows(mat, /*sort=*/true);
+}
+
+// Catalog/storage identity of catalog.main.`table`, read inside a transaction.
+sirius::duckdb_table_identity table_identity(duckdb::Connection& con,
+                                             const std::string& catalog,
+                                             const std::string& table)
+{
+  sirius::duckdb_table_identity identity;
+  con.BeginTransaction();
+  try {
+    auto& entry = duckdb::Catalog::GetEntry(
+                    *con.context, duckdb::CatalogType::TABLE_ENTRY, catalog, "main", table)
+                    .Cast<duckdb::DuckTableEntry>();
+    identity = {entry.oid, entry.GetStorage().GetRowGroupCollection()};
+    con.Rollback();
+  } catch (...) {
+    con.Rollback();
+    throw;
+  }
+  return identity;
 }
 
 // Assert a query fails, and (when given) that its error mentions `needle`.
@@ -227,6 +249,66 @@ TEST_CASE_METHOD(VectorSearchFixture,
   REQUIRE(after[0][0] == "0");
 
   run_ok("SELECT * FROM unpin_table('vs_rb');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - re-pin requires rebuilding the ANN index after DML",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_repin_dml AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec "
+    "FROM range(1000, 2000) t(i);");
+  run_ok("CHECKPOINT;");
+  std::string const pin_sql =
+    "SELECT * FROM pin_table(name => 'vs_repin_dml', tier => 'gpu', format => 'duckdb');";
+  std::string const build_sql =
+    "SELECT * FROM sirius_create_ann_index('vs_repin_dml', 'vec', metric => 'l2', n_lists => 8);";
+  std::string const args =
+    "'vs_repin_dml', 'vec', [0.0, 0.0, 0.0]::FLOAT[3], k => 1, output_columns => ['id']";
+  std::string const ann = "SELECT id FROM sirius_knn_search(" + args + ", n_probes => 8);";
+  std::string const enn = "SELECT id FROM sirius_knn_search(" + args + ", use_index => false);";
+  run_ok(pin_sql);
+  run_ok(build_sql);
+  REQUIRE(ok_col(*con, ann) == std::vector<std::vector<std::string>>{{"1000"}});
+  run_ok("PREPARE vs_repin_search AS " + ann);
+  auto const original = table_identity(*con, attach_alias, "vs_repin_dml");
+
+  run_ok("SELECT * FROM unpin_table('vs_repin_dml');");
+  std::string nearest;
+  SECTION("INSERT adds a new nearest vector")
+  {
+    run_ok("INSERT INTO vs_repin_dml VALUES (0, [0, 0, 0]::FLOAT[3]);");
+    nearest = "0";
+  }
+  SECTION("UPDATE changes vectors without changing the row count")
+  {
+    run_ok("UPDATE vs_repin_dml SET vec = [0, 0, 0]::FLOAT[3] WHERE id = 1999;");
+    nearest = "1999";
+  }
+  run_ok("CHECKPOINT;");
+  run_ok(pin_sql);
+  // Even the composite catalog/storage identity is unchanged by this sequence.
+  REQUIRE(original.matches(table_identity(*con, attach_alias, "vs_repin_dml")));
+  // Confirm the stale index is still cached, so refusal is due to its pin snapshot.
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  REQUIRE(sirius_ctx->get_cuvs_index_cache().find_by_column(
+            attach_alias,
+            "main",
+            "vs_repin_dml",
+            original,
+            "vec",
+            cuvs::distance::DistanceType::L2SqrtExpanded) != nullptr);
+  expect_error(*con, ann, "previous pin snapshot");
+  expect_error(*con, "EXECUTE vs_repin_search;", "previous pin snapshot");
+  REQUIRE(ok_col(*con, enn) == std::vector<std::vector<std::string>>{{nearest}});
+
+  run_ok(build_sql);
+  REQUIRE(ok_col(*con, ann) == std::vector<std::vector<std::string>>{{nearest}});
+  REQUIRE(ok_col(*con, "EXECUTE vs_repin_search;") ==
+          std::vector<std::vector<std::string>>{{nearest}});
+  run_ok("DEALLOCATE vs_repin_search;");
+  run_ok("SELECT * FROM unpin_table('vs_repin_dml');");
 }
 
 TEST_CASE_METHOD(VectorSearchFixture,
@@ -581,9 +663,10 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx);
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  auto const oid    = table_identity(*con, catalog, "vs_badrebuild");
   {
-    auto entry =
-      index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+    auto entry = index_cache.find_by_column(
+      catalog, "main", "vs_badrebuild", oid, "vec", Metric::L2SqrtExpanded);
     REQUIRE(entry != nullptr);
     REQUIRE(entry->meta.n_lists == 64);
   }
@@ -601,8 +684,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   // The failure contract: the rebuild was rejected before any erase, so the
   // original index is unchanged, not removed.
-  auto entry =
-    index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+  auto entry = index_cache.find_by_column(
+    catalog, "main", "vs_badrebuild", oid, "vec", Metric::L2SqrtExpanded);
   REQUIRE(entry != nullptr);
   REQUIRE(entry->meta.n_lists == 64);
 
@@ -632,6 +715,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx);
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  auto const oid    = table_identity(*con, catalog, "vs_lookup");
 
   // The cache key is the routing identity.
   auto const key =
@@ -646,7 +730,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     auto by_key = index_cache.find(key);
     auto by_identity =
-      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+      index_cache.find_by_column(catalog, "main", "vs_lookup", oid, "vec", Metric::L2SqrtExpanded);
     REQUIRE(by_key != nullptr);
     REQUIRE(by_identity != nullptr);
     REQUIRE(by_key == by_identity);               // same entry, reached two ways
@@ -659,7 +743,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     auto by_key = index_cache.find(key);
     auto by_identity =
-      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+      index_cache.find_by_column(catalog, "main", "vs_lookup", oid, "vec", Metric::L2SqrtExpanded);
     REQUIRE(by_key != nullptr);
     REQUIRE(by_identity != nullptr);
     REQUIRE(by_key == by_identity);
@@ -690,10 +774,11 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx);
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  auto const oid    = table_identity(*con, catalog, "vs_drop");
 
   run_ok("SELECT * FROM sirius_create_ann_index('vs_drop', 'vec', metric => 'l2', n_lists => 16);");
-  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) !=
-          nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop", oid, "vec", Metric::L2SqrtExpanded) != nullptr);
 
   // Drop reports it removed one, and routing can no longer find it.
   {
@@ -703,8 +788,8 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE_FALSE(r->HasError());
     REQUIRE(r->GetValue(0, 0).GetValue<bool>());
   }
-  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) ==
-          nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop", oid, "vec", Metric::L2SqrtExpanded) == nullptr);
 
   // Dropping again is a no-op: nothing matched, so Dropped is false.
   {
@@ -739,6 +824,7 @@ TEST_CASE_METHOD(VectorSearchFixture,
   auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx);
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  auto const oid    = table_identity(*con, catalog, "vs_drop_all");
 
   run_ok(
     "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'l2', n_lists => 16);");
@@ -746,9 +832,9 @@ TEST_CASE_METHOD(VectorSearchFixture,
     "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'cosine', "
     "n_lists => 16);");
   REQUIRE(index_cache.find_by_column(
-            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) != nullptr);
+            catalog, "main", "vs_drop_all", oid, "vec", Metric::L2SqrtExpanded) != nullptr);
   REQUIRE(index_cache.find_by_column(
-            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) != nullptr);
+            catalog, "main", "vs_drop_all", oid, "vec", Metric::CosineExpanded) != nullptr);
 
   // One metric-less drop clears both indexes on the column.
   {
@@ -759,9 +845,9 @@ TEST_CASE_METHOD(VectorSearchFixture,
     REQUIRE(r->GetValue(0, 0).GetValue<bool>());
   }
   REQUIRE(index_cache.find_by_column(
-            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) == nullptr);
+            catalog, "main", "vs_drop_all", oid, "vec", Metric::L2SqrtExpanded) == nullptr);
   REQUIRE(index_cache.find_by_column(
-            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) == nullptr);
+            catalog, "main", "vs_drop_all", oid, "vec", Metric::CosineExpanded) == nullptr);
 
   run_ok("SELECT * FROM unpin_table('vs_drop_all');");
 }
@@ -925,8 +1011,9 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
-    auto const& mgr   = sirius_ctx->get_scan_manager();
-    const auto* entry = mgr.find_pinned_entry_for_duckdb_table(attach_alias, "main", "vs_mc");
+    auto const& mgr = sirius_ctx->get_scan_manager();
+    auto entry      = mgr.find_pinned_entry_for_duckdb_table(
+      attach_alias, "main", "vs_mc", table_identity(*con, attach_alias, "vs_mc"));
     REQUIRE(entry != nullptr);
     auto it = entry->data_batches_by_column.find("vec");
     REQUIRE(it != entry->data_batches_by_column.end());
@@ -1165,4 +1252,144 @@ TEST_CASE_METHOD(VectorSearchFixture,
   REQUIRE(r->GetErrorType() == duckdb::ExceptionType::INVALID_INPUT);
 
   run_ok("SELECT * FROM unpin_table('vs_stale');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - prepared search rejects a replaced table",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  auto const use_index = GENERATE(false, true);
+  INFO("use_index = " << use_index);
+  run_ok(
+    "CREATE TABLE vs_prepared_identity AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec "
+    "FROM range(2000) t(i);");
+  run_ok("CHECKPOINT;");
+  auto pin_and_index = [&] {
+    run_ok(
+      "SELECT * FROM pin_table(name => 'vs_prepared_identity', tier => 'gpu', "
+      "format => 'duckdb');");
+    if (use_index) {
+      run_ok(
+        "SELECT * FROM sirius_create_ann_index('vs_prepared_identity', 'vec', "
+        "metric => 'l2', n_lists => 16);");
+    }
+  };
+  pin_and_index();
+  std::string const search =
+    "SELECT id FROM sirius_knn_search('vs_prepared_identity', 'vec', "
+    "[0.0, 0.0, 0.0]::FLOAT[3], k => 1, output_columns => ['id'], n_probes => 16, "
+    "use_index => " +
+    std::string(use_index ? "true" : "false") + ");";
+  run_ok("PREPARE vs_identity_search AS " + search);
+  REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+          std::vector<std::vector<std::string>>{{"0"}});
+  REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+          std::vector<std::vector<std::string>>{{"0"}});
+
+  // Keep the old storage alive, as an older transaction can. An expired weak
+  // reference must not accidentally hide the stale bind-data/cache-key bug.
+  auto const original = table_identity(*con, attach_alias, "vs_prepared_identity");
+  auto old_storage    = original.row_groups.lock();
+  REQUIRE(old_storage);
+  bool dropped_only = false;
+  SECTION("PREPARE then DROP and CREATE then EXECUTE")
+  {
+    run_ok("DROP TABLE vs_prepared_identity;");
+    run_ok(
+      "CREATE TABLE vs_prepared_identity AS SELECT i AS id, "
+      "[2000 - i, 0, 0]::FLOAT[3] AS vec FROM range(2000) t(i);");
+  }
+  SECTION("PREPARE then same-type ALTER then EXECUTE")
+  {
+    run_ok(
+      "ALTER TABLE vs_prepared_identity ALTER COLUMN vec TYPE FLOAT[3] "
+      "USING [2000 - id, 0, 0]::FLOAT[3];");
+  }
+  SECTION("PREPARE then DROP then EXECUTE")
+  {
+    run_ok("DROP TABLE vs_prepared_identity;");
+    dropped_only = true;
+  }
+
+  // The old pin (and ANN index, when enabled) is deliberately still present
+  // and still matches the prepared identity. Execution must consult the catalog.
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  REQUIRE(sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+            attach_alias, "main", "vs_prepared_identity", original) != nullptr);
+  expect_error(*con,
+               "EXECUTE vs_identity_search;",
+               dropped_only ? "does not exist" : "changed since the query was bound");
+
+  run_ok("SELECT * FROM unpin_table('vs_prepared_identity');");
+  if (!dropped_only) {
+    run_ok("CHECKPOINT;");
+    pin_and_index();
+    // Re-pinning cannot update a prepared query's bound schema/identity.
+    expect_error(*con, "EXECUTE vs_identity_search;", "changed since the query was bound");
+    run_ok("PREPARE vs_identity_search AS " + search);
+    REQUIRE(ok_col(*con, "EXECUTE vs_identity_search;") ==
+            std::vector<std::vector<std::string>>{{"1999"}});
+    run_ok("SELECT * FROM unpin_table('vs_prepared_identity');");
+  }
+  run_ok("DEALLOCATE vs_identity_search;");
+}
+
+// Re-pinning a recreated table without rebuilding its ANN index leaves the index
+// holding the dropped table's vectors and row positions. The search must refuse.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - ANN refuses an index built before a recreate or ALTER",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+  const std::string knn = "SELECT id FROM sirius_knn_search('vs_idx_recreate', 'vec', " + origin +
+                          ", k => 5, output_columns => ['id'], n_probes => 16);";
+  // Exact top-5 over whatever the table currently holds, computed on the CPU.
+  auto exact_ids = [&] {
+    con->Query("SET gpu_execution = false;");
+    auto ids = ok_col(
+      *con, "SELECT id FROM vs_idx_recreate ORDER BY array_distance(vec, " + origin + ") LIMIT 5;");
+    con->Query("SET gpu_execution = true;");
+    return ids;
+  };
+
+  run_ok(
+    "CREATE TABLE vs_idx_recreate AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec "
+    "FROM range(2000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_idx_recreate', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_idx_recreate', 'vec', metric => 'l2', "
+    "n_lists => 16);");
+  // Baseline: the index serves the incarnation it was built on.
+  REQUIRE(ok_col(*con, knn) == exact_ids());
+
+  // Same row count and shape, different vectors: nothing but the table identity
+  // separates the two. The index is deliberately left as it was.
+  run_ok("SELECT * FROM unpin_table('vs_idx_recreate');");
+  SECTION("DROP and CREATE changes the catalog identity")
+  {
+    run_ok("DROP TABLE vs_idx_recreate;");
+    run_ok(
+      "CREATE TABLE vs_idx_recreate AS SELECT i AS id, [2000 - i, 0, 0]::FLOAT[3] AS vec "
+      "FROM range(2000) t(i);");
+  }
+  SECTION("same-type ALTER changes the storage identity")
+  {
+    run_ok(
+      "ALTER TABLE vs_idx_recreate ALTER COLUMN vec TYPE FLOAT[3] "
+      "USING [2000 - id, 0, 0]::FLOAT[3];");
+  }
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_idx_recreate', tier => 'gpu', format => 'duckdb');");
+
+  expect_error(*con, knn, "previous incarnation");
+
+  // Rebuilding the index restores the search, now over the new incarnation's vectors.
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_idx_recreate', 'vec', metric => 'l2', "
+    "n_lists => 16);");
+  REQUIRE(ok_col(*con, knn) == exact_ids());
+
+  run_ok("SELECT * FROM unpin_table('vs_idx_recreate');");
 }

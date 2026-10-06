@@ -18,6 +18,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
@@ -67,11 +68,12 @@ group_key_labels make_group_key_labels(cudf::table_view const& keys,
   cudf::distinct_hash_join label_lookup(
     sorted_unique_keys->view(), cudf::null_equality::EQUAL, 0.5, stream);
   auto label_indices = label_lookup.left_join(keys, stream, mr);
-  auto labels        = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
-                                               keys.num_rows(),
-                                               label_indices->release(),
-                                               rmm::device_buffer{},
-                                               0);
+  auto labels =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                   keys.num_rows(),
+                                   label_indices->release(),
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                   0);
 
   auto min_label        = cudf::reduce(labels->view(),
                                 *cudf::make_min_aggregation<cudf::reduce_aggregation>(),

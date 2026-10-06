@@ -73,6 +73,12 @@ file(
 file(INSTALL ${RAPIDS_LOGGER_CMAKE_FILES}
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/rapids_logger")
 
+# Resolve installed dependencies without build-tree paths or CPM downloads.
+configure_file(
+  "${CMAKE_CURRENT_LIST_DIR}/rapids_logger-dependencies.cmake"
+  "${CURRENT_PACKAGES_DIR}/share/rapids_logger/rapids_logger-dependencies.cmake"
+  COPYONLY)
+
 # create_logger_macros.cmake calls configure_file() on logger_macros.hpp.in,
 # resolved relative to its own install dir. kvikio/cudf 26.06 invoke this macro
 # generator (26.04 did not), so the template must sit alongside it.

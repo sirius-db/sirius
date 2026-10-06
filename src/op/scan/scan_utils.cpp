@@ -87,14 +87,15 @@ std::vector<table_filter_conjunct> decompose_table_filters(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices)
+  const std::unordered_set<std::size_t>& skip_primary_indices,
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types,
+  bool include_is_not_null)
 {
   std::vector<table_filter_conjunct> conjuncts;
 
   for (auto& [column_index, filter] : filters.filters) {
-    // Skip optional and IS_NOT_NULL filters
     if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+        (!include_is_not_null && filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL)) {
       continue;
     }
 
@@ -109,7 +110,18 @@ std::vector<table_filter_conjunct> decompose_table_filters(
       throw std::runtime_error(
         std::format("TABLE_SCAN filter: column_index ({}) not in projected batch", column_index));
     }
-    auto const col_type           = returned_types.at(column.primary_index);
+    sirius::logical_type col_type;
+    auto const source_id = column_ids.at(column_index).GetPrimaryIndex();
+    if (duckdb::IsVirtualColumn(source_id) || virtual_types.contains(source_id)) {
+      auto const type = virtual_types.find(source_id);
+      if (type == virtual_types.end()) {
+        throw std::runtime_error(
+          std::format("TABLE_SCAN filter: virtual column id ({}) has no bound type", source_id));
+      }
+      col_type = type->second;
+    } else {
+      col_type = returned_types.at(column.primary_index);
+    }
     auto const batch_column_index = static_cast<duckdb::idx_t>(column.batch_position);
 
     SIRIUS_LOG_DEBUG(
@@ -135,10 +147,17 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices)
+  const std::unordered_set<std::size_t>& skip_primary_indices,
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types,
+  bool include_is_not_null)
 {
-  auto conjuncts = decompose_table_filters(
-    filters, column_ids, returned_types, batch_position_by_column_id, skip_primary_indices);
+  auto conjuncts = decompose_table_filters(filters,
+                                           column_ids,
+                                           returned_types,
+                                           batch_position_by_column_id,
+                                           skip_primary_indices,
+                                           virtual_types,
+                                           include_is_not_null);
 
   if (conjuncts.empty()) { return nullptr; }
   if (conjuncts.size() == 1) { return std::move(conjuncts[0].expr); }

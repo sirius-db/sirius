@@ -29,6 +29,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -130,11 +131,12 @@ struct fake_string_pin {
         chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get());
       cudaStreamSynchronize(stream.get());
 
-      batches.push_back(cudf::make_strings_column(static_cast<cudf::size_type>(rows),
-                                                  std::move(offsets_col),
-                                                  std::move(chars_buf),
-                                                  0,
-                                                  rmm::device_buffer{0, stream, mr}));
+      batches.push_back(cudf::make_strings_column(
+        static_cast<cudf::size_type>(rows),
+        std::move(offsets_col),
+        std::move(chars_buf),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr)));
     }
 
     view.dtype = cudf::data_type{cudf::type_id::STRING};

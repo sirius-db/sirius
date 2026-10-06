@@ -43,6 +43,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
+#include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
@@ -2133,8 +2134,7 @@ class QueryLifecycleSlotFixture {
       fs::temp_directory_path() / ("sirius_slot_leak_" + std::to_string(next_id.fetch_add(1)));
     fs::remove_all(work_dir);
     fs::create_directories(work_dir);
-    config_path =
-      fs::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" / "integration.yaml";
+    config_path = sirius::test::integration_config_path();
     REQUIRE(fs::exists(config_path));
   }
 
