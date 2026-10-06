@@ -312,7 +312,7 @@ jobs:
       - name: Copy LICENSE into the release assets
         # The repo's own Apache 2.0 LICENSE, bundled with every release. Third-party dependency
         # attribution (a generated NOTICE) is tracked separately: #1979.
-        run: cp LICENSE renamed/LICENSE
+        run: git show "${TARGET_SHA}:LICENSE" > renamed/LICENSE
 
       - name: Build manifest
         run: |
