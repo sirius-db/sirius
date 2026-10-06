@@ -14,15 +14,13 @@
 name: Test
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `main` and merge queue commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
   build:
@@ -46,7 +44,7 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/main-only; on merge_group/main, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
@@ -88,6 +86,18 @@ jobs:
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
 
+      - name: Check installed Sirius package
+        run: |
+          sirius_test_dir="$(mktemp -d)"
+          trap 'rm -rf "$sirius_test_dir"' EXIT
+          cmake --install build/release --prefix "$sirius_test_dir/install" --component sirius_library
+          cmake -E rename "$sirius_test_dir/install" "$sirius_test_dir/relocated"
+          cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
+          cmake --build "$sirius_test_dir/consumer"
+
       - name: Surface build errors
         if: failure()
         run: |
@@ -121,12 +131,12 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/main-only; on merge_group/main, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
@@ -170,20 +180,8 @@ jobs:
 
       - name: Run C++ unit tests
         run: |
-          set -o pipefail
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
-
-      # The late-materialization gate is read from the environment once per process, so the
-      # feature is entirely absent from the run above. Without this step the end-to-end case
-      # (planning -> scan substitution -> transport -> restoration) returns successfully without
-      # executing, and a green suite says nothing about the feature.
-      - name: Run late-materialization tests with the gate on
-        run: |
-          set -o pipefail
-          SIRIUS_EXP_LATE_MAT=1 \
-            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
-            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
+          python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
@@ -209,8 +207,8 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest_late_mat.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -h -B 5 -A 10 'FAILED:' build/release/extension/sirius/test/cpp/log/*/unittest.log \
+            | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs

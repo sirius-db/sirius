@@ -17,7 +17,9 @@
 // sirius
 #include <config.hpp>
 #include <expression/ast/node.hpp>
+#include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
+#include <expression/substring_slice.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -32,8 +34,10 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/combine.hpp>
@@ -43,14 +47,22 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
+
+// rmm
+#include <rmm/device_buffer.hpp>
 
 // standard library
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <regex>
 #include <string>
+#include <tuple>
 #include <variant>
+#include <vector>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -168,29 +180,27 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
   //----------Substring Function----------//
   if (resolved_id == function_id::substring) {
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    // DuckDB binds substring as (VARCHAR, BIGINT[, BIGINT]); planning admits only constant bounds
+    // that gpu_substring_slice accepts.
+    D_ASSERT(args.size() == 2 || args.size() == 3);
+    auto const bigint_arg = [&](std::size_t i) {
+      D_ASSERT(args[i]->holds<sirius::ast::constant>());
+      return std::get<int64_t>(args[i]->get<sirius::ast::constant>().payload);
+    };
+    auto const offset = bigint_arg(1);
+    auto const length = args.size() == 3 ? bigint_arg(2) : substring_default_length;
+    auto const slice  = gpu_substring_slice(offset, length);
+    if (!slice) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unsupported substring bounds (offset {}, length {})",
+        offset,
+        length);
+    }
 
-    // DuckDB binds substring as (VARCHAR, BIGINT, BIGINT), so the start/len
-    // children are BIGINT constants — the payload variant holds int64_t.
-    D_ASSERT(args[1]->holds<sirius::ast::constant>());
-    D_ASSERT(args[2]->holds<sirius::ast::constant>());
-    auto const start_raw = std::get<int64_t>(args[1]->get<sirius::ast::constant>().payload);
-    auto const len_raw   = std::get<int64_t>(args[2]->get<sirius::ast::constant>().payload);
-
-    // Re-base to 0-indexed and convert <start, len> to <start, stop>. Narrow
-    // to cudf::size_type (int32_t) here because cudf::strings::slice_strings
-    // only accepts int32 bounds — the narrowing is a cudf API constraint,
-    // not a SUBSTRING semantic limit.
-    auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
-    auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
-
+    auto input               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto const input_strings = cudf::strings_column_view(input.get_column_view());
-    auto result_column       = cudf::strings::slice_strings(input_strings,
-                                                      std::optional<cudf::size_type>{start_val},
-                                                      std::optional<cudf::size_type>{stop_val},
-                                                      std::optional<cudf::size_type>{1},
-                                                      _stream,
-                                                      _mr);
+    auto result_column       = cudf::strings::slice_strings(
+      input_strings, slice->start, slice->stop, std::optional<cudf::size_type>{1}, _stream, _mr);
     return evaluate_result(std::move(result_column));
   }
 
@@ -298,32 +308,29 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     // The first child is the frequency, which should be a constant string
     D_ASSERT(args[0]->holds<sirius::ast::constant>());
     auto const& freq_str = std::get<std::string>(args[0]->get<sirius::ast::constant>().payload);
-    auto input           = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+    auto const unit      = parse_gpu_date_trunc_unit(freq_str);
+    if (!unit) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
+        freq_str);
+    }
+    auto input = evaluate(*args[1], evaluation_mode::MATERIALIZE);
     D_ASSERT(!input.is_scalar());
 
-    auto freq_string_switch =
-      [](std::string const& freq_str) -> cudf::datetime::rounding_frequency {
-      if (freq_str == "day") {
-        return cudf::datetime::rounding_frequency::DAY;
-      } else if (freq_str == "hour") {
-        return cudf::datetime::rounding_frequency::HOUR;
-      } else if (freq_str == "minute") {
-        return cudf::datetime::rounding_frequency::MINUTE;
-      } else if (freq_str == "second") {
-        return cudf::datetime::rounding_frequency::SECOND;
-      } else if (freq_str == "millisecond") {
-        return cudf::datetime::rounding_frequency::MILLISECOND;
-      } else if (freq_str == "microsecond") {
-        return cudf::datetime::rounding_frequency::MICROSECOND;
-      } else {
-        throw invalid_input_exception(
-          "[expression_evaluator:function] unrecognized/unsupported date_trunc frequency: {}",
-          freq_str);
+    auto frequency = [](date_trunc_unit unit) -> cudf::datetime::rounding_frequency {
+      switch (unit) {
+        case date_trunc_unit::day: return cudf::datetime::rounding_frequency::DAY;
+        case date_trunc_unit::hour: return cudf::datetime::rounding_frequency::HOUR;
+        case date_trunc_unit::minute: return cudf::datetime::rounding_frequency::MINUTE;
+        case date_trunc_unit::second: return cudf::datetime::rounding_frequency::SECOND;
+        case date_trunc_unit::millisecond: return cudf::datetime::rounding_frequency::MILLISECOND;
+        case date_trunc_unit::microsecond: return cudf::datetime::rounding_frequency::MICROSECOND;
       }
+      throw internal_exception("[expression_evaluator:function] unknown date_trunc unit");
     };
 
-    auto result_column = cudf::datetime::floor_datetimes(
-      input.get_column_view(), freq_string_switch(freq_str), _stream, _mr);
+    auto result_column =
+      cudf::datetime::floor_datetimes(input.get_column_view(), frequency(*unit), _stream, _mr);
     return evaluate_result(std::move(result_column));
   }
 
@@ -438,8 +445,57 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       }
     }
     auto const num_rows = child_cols[0]->size();
-    return cudf::make_structs_column(
-      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
+    return cudf::make_structs_column(num_rows,
+                                     std::move(child_cols),
+                                     0,
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
+                                     _stream,
+                                     _mr);
+  }
+
+  //----------constant_or_null----------//
+  // constant_or_null(c, a1, ..., an) is c in every row where all of a1..an are non-NULL and
+  // NULL in the other rows.
+  if (resolved_id == function_id::constant_or_null) {
+    D_ASSERT(args.size() >= 2);
+    auto const num_rows = _input_table.num_rows();
+    auto null_mask      = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, _stream, _mr);
+    cudf::size_type null_count = 0;
+    {
+      bool any_null_scalar = false;
+      std::vector<evaluate_result> column_results;
+      std::vector<cudf::column_view> column_views;
+      column_results.reserve(args.size() - 1);
+      column_views.reserve(args.size() - 1);
+      for (std::size_t i = 1; i < args.size(); ++i) {
+        auto result = evaluate(*args[i], evaluation_mode::MATERIALIZE);
+        if (result.is_scalar()) {
+          any_null_scalar |= !result.get_scalar().is_valid(_stream);
+        } else {
+          column_views.push_back(result.get_column_view());
+          column_results.push_back(std::move(result));
+        }
+      }
+      if (any_null_scalar) {
+        null_mask  = cudf::create_null_mask(num_rows, cudf::mask_state::ALL_NULL, _stream, _mr);
+        null_count = num_rows;
+      } else if (!column_views.empty()) {
+        std::tie(null_mask, null_count) =
+          cudf::bitmask_and(cudf::table_view(column_views), _stream, _mr);
+      }
+    }
+
+    auto const value = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    D_ASSERT(value.is_scalar());
+    auto result_column = cudf::make_column_from_scalar(value.get_scalar(), num_rows, _stream, _mr);
+    if (null_count > 0) {
+      result_column->set_null_mask(std::move(null_mask), null_count);
+      if (!cudf::is_fixed_width(result_column->type())) {
+        // Rows that become NULL still hold the constant's payload, which cuDF expects to be empty.
+        result_column = cudf::purge_nonempty_nulls(result_column->view(), _stream, _mr);
+      }
+    }
+    return evaluate_result(std::move(result_column));
   }
 
   // `error()` is a runtime-error-raising function. We deliberately do not

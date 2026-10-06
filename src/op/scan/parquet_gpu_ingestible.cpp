@@ -29,11 +29,13 @@
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <transparent/read_view_registry.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -51,6 +53,9 @@
 #include <cudf/utilities/span.hpp>
 
 #include <cuda/std/utility>
+
+// rmm
+#include <rmm/device_buffer.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -74,8 +79,9 @@
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <future>
+#include <iterator>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -235,6 +241,12 @@ std::string strip_file_uri(std::string const& p)
   return p;
 }
 
+std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options);
+std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+  std::span<row_group_slice const> slices,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges);
+
 //===----------------------------------------------------------------------===//
 // parquet_batch_coalescer
 //===----------------------------------------------------------------------===//
@@ -253,11 +265,13 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          scan_contract_id contract_id)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
-      _needs_assembly(needs_output_assembly(*_plan))
+      _needs_assembly(needs_output_assembly(*_plan)),
+      _contract_id(contract_id)
   {
   }
 
@@ -266,6 +280,14 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::vector<std::unique_ptr<scan_info>> emitted;
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     if (file == nullptr) { return emitted; }
+
+    // Reject invalid ownership or coverage before recording a fallback or flushing pending work.
+    if (file->contract_id() != _contract_id) {
+      throw std::invalid_argument("parquet file contract does not match coalescer contract");
+    }
+    if (file->certificates().size() != 1 || file->dependencies().size() != 1) {
+      throw std::invalid_argument("parquet file requires one certificate and dependency");
+    }
 
     // Remember the first fully-pruned file. If the WHOLE source coalesces to
     // nothing, flush() emits one empty split built from it — zero splits mean
@@ -280,7 +302,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
-        file->file_index};
+        file->file_index,
+        std::vector<split_materializer_certificate>(file->certificates().begin(),
+                                                    file->certificates().end()),
+        std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
@@ -315,6 +340,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_comp,
                            std::move(slice_ds),
                            file->file_index);
+      auto certificate     = file->certificates().front();
+      certificate.split_id = _next_split_id++;
+      _certificates.push_back(std::move(certificate));
+      _dependencies.push_back(file->dependencies().front());
       _produced_any      = true;
       _acc_working_bytes = memory::saturating_add(_acc_working_bytes, cur_working);
       _acc_run_count     = memory::saturating_add(_acc_run_count, run_count);
@@ -377,7 +406,12 @@ class parquet_batch_coalescer : public batch_coalescer {
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
-      _produced_any       = true;
+      _certificates       = _empty_split_fallback->certificates;
+      _dependencies       = _empty_split_fallback->dependencies;
+      for (auto& certificate : _certificates) {
+        certificate.split_id = _next_split_id++;
+      }
+      _produced_any = true;
       out.push_back(emit_current());
     }
     return out;
@@ -386,14 +420,21 @@ class parquet_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto split                     = std::make_unique<parquet_split_info>();
-    split->rg_slices               = std::move(_slices);
-    split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
+    auto reader_options   = _run_reader_options ? _run_reader_options : _reader_options;
+    auto per_slice_ranges = slice_column_chunk_ranges(_slices, *reader_options);
+    auto hints            = parquet_fadvise_entries(_slices, per_slice_ranges);
+    auto split            = std::make_unique<parquet_split_info>(std::move(hints));
+    split->rg_slices      = std::move(_slices);
+    split->reader_options = std::move(reader_options);
+    split->set_column_chunk_byte_ranges(std::move(per_slice_ranges));
     split->plan                    = _plan;
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
+    split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _slices.clear();
+    _certificates.clear();
+    _dependencies.clear();
     _acc_working_bytes = 0;
     _acc_run_count     = 0;
     _acc_rows          = 0;
@@ -404,8 +445,12 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
+  const scan_contract_id _contract_id;
 
   std::vector<row_group_slice> _slices;
+  std::vector<split_materializer_certificate> _certificates;
+  std::vector<split_dependencies> _dependencies;
+  uint64_t _next_split_id        = 1;
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
@@ -426,24 +471,42 @@ class parquet_batch_coalescer : public batch_coalescer {
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
     std::size_t file_index;
+    std::vector<split_materializer_certificate> certificates;
+    std::vector<split_dependencies> dependencies;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
 };
 
-/// Column-chunk byte ranges a read fetches for @p row_group_indices, honoring
-/// @p options' column projection — the ranges materialize_table reads, used to
-/// drive prefetch. Empty when there are no row groups.
-std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
-  cudf::io::parquet::FileMetaData const& metadata,
-  cudf::io::parquet_reader_options const& options,
-  std::vector<cudf::size_type> const& row_group_indices)
+/// @ref column_chunk_ranges for every slice of a batch, in slice order.
+///
+/// Kept parallel to the slices (rather than dropping the empties the way the
+/// fadvise hints do) because materialization indexes it by slice: the hybrid
+/// scan hands cuDF one chunk-data span per range, in exactly the order the
+/// reader enumerated them.
+std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
 {
-  if (row_group_indices.empty()) { return {}; }
-  hybrid_scan_reader reader(metadata, options);
-  return reader.all_column_chunks_byte_ranges(
-    cudf::host_span<cudf::size_type const>(row_group_indices.data(), row_group_indices.size()),
-    options);
+  std::vector<std::vector<cudf::io::text::byte_range_info>> per_slice(slices.size());
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (!slices[i].file_metadata) { continue; }
+    per_slice[i] =
+      column_chunk_ranges(*slices[i].file_metadata, reader_options, slices[i].row_group_indices);
+  }
+  return per_slice;
+}
+
+std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
+  std::span<row_group_slice const> slices,
+  std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges)
+{
+  std::vector<scan_info::fadvise_entry> entries;
+  entries.reserve(slices.size());
+  for (std::size_t i = 0; i < slices.size(); ++i) {
+    if (!slices[i].datasource || per_slice_ranges[i].empty()) { continue; }
+    entries.push_back({slices[i].datasource, per_slice_ranges[i]});
+  }
+  return entries;
 }
 
 }  // namespace
@@ -479,42 +542,13 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
   // while constructing the offsets and character buffer. Match cuDF's pair type without
   // including its CUDA-only strings_column_factories.cuh in this host translation unit.
   auto const pairs =
-    memory::saturating_mul(rows, sizeof(cuda::std::pair<char const*, cudf::size_type>));
+    memory::saturating_mul(rows, sizeof(::cuda::std::pair<char const*, cudf::size_type>));
   return {output, memory::saturating_add(output, pairs)};
 }
 
 //===----------------------------------------------------------------------===//
-// scan_info fadvise_entries — prefetch byte ranges
+// parquet_ingestible_table_info::has_requested_user_virtual_columns
 //===----------------------------------------------------------------------===//
-std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
-{
-  if (!file_metadata || !reader_options) { return {}; }
-  std::vector<fadvise_entry> entries;
-  append_fadvise_entry(entries, datasource, [this] {
-    std::vector<cudf::size_type> rg_indices;
-    rg_indices.reserve(row_groups.size());
-    for (auto const& rg : row_groups) {
-      rg_indices.push_back(rg.index);
-    }
-    return column_chunk_ranges(*file_metadata, *reader_options, rg_indices);
-  });
-  return entries;
-}
-
-std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() const
-{
-  if (!reader_options) { return {}; }
-  std::vector<fadvise_entry> entries;
-  entries.reserve(rg_slices.size());
-  for (auto const& slice : rg_slices) {
-    if (!slice.file_metadata) { continue; }
-    append_fadvise_entry(entries, slice.datasource, [&slice, this] {
-      return column_chunk_ranges(*slice.file_metadata, *reader_options, slice.row_group_indices);
-    });
-  }
-  return entries;
-}
-
 bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
 {
   for (auto const& column : column_ids) {
@@ -724,7 +758,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->contract_id);
 }
 
 //===----------------------------------------------------------------------===//
@@ -768,8 +802,15 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  std::shared_ptr<io::sirius_datasource> sirius_ds =
-    io_ctx->open_datasource(file_path, io::open_hint::parquet_footer_probe);
+  // Probe only when the footer will actually be read: once the metadata store
+  // holds this file's parsed footer, a suffix GET would download bytes nothing
+  // consumes, and the open only needs the size. Mirrors describe_parquet.
+  bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
+  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  {
+    sirius_ds = io_ctx->open_datasource(
+      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+  }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
@@ -781,16 +822,23 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::size_t footer_len = 0;
   if (sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();
+        footer_len    = pm->footer_byte_len();
       }
     }
   }
   if (!file_metadata) {
-    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
-    auto const footer_len = footer->size();
+    // The normal path: this metadata task owns its file's footer fetch + parse.
+    // One task per file, all dispatched before any consumer runs, so the parses
+    // overlap each other rather than a pipeline's data traffic.  A prior bind
+    // (or a pin) may have already stored the metadata, in which case the branch
+    // above serves it and this costs nothing.
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    footer_len  = footer->size();
     // The carrier projection is only known to match this file after the footer
     // is parsed, so the parse itself runs without a column selection.
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
@@ -1170,6 +1218,39 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   out->partition_values = std::move(partition_values);
+  auto input_identity   = file_path + "|footer=" + std::to_string(footer_len);
+  if (_info->read_views && _info->contract_id != 0) {
+    auto const& entry = _info->read_views->entry(_info->contract_id);
+    if (auto const& evidence = entry.physical_evidence) {
+      std::call_once(_evidence_index_once, [this] {
+        _evidence_index_by_file = make_read_view_evidence_index(_file_paths);
+      });
+      auto const evidence_index =
+        _evidence_index_by_file.empty() ? file_index : _evidence_index_by_file[file_index];
+      if (evidence_index >= evidence->size.size() ||
+          evidence_index >= evidence->last_modified.size() ||
+          evidence_index >= evidence->size_present.size() ||
+          evidence_index >= evidence->last_modified_present.size() ||
+          evidence_index >= evidence->etag.size()) {
+        throw std::logic_error(
+          "physical read-view evidence does not match the bound file inventory");
+      }
+      if (evidence->size_present[evidence_index]) {
+        input_identity += "|size=" + std::to_string(evidence->size[evidence_index]);
+      }
+      if (evidence->last_modified_present[evidence_index]) {
+        input_identity +=
+          "|last_modified=" + std::to_string(evidence->last_modified[evidence_index]);
+      }
+      if (!evidence->etag[evidence_index].empty()) {
+        input_identity += "|etag=" + evidence->etag[evidence_index];
+      }
+    }
+  }
+  out->set_contract_payload(
+    _info->contract_id,
+    {{_info->contract_id, 0, std::move(input_identity), "parquet", "footer"}},
+    {{file_metadata, out->datasource, std::nullopt}});
 
   return out;
 }
@@ -1337,22 +1418,43 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       table = cudf::concatenate(views, stream, mr_ref);
     }
   } else {
-    std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-    std::vector<cudf::io::parquet::FileMetaData> metadatas;
-    std::vector<std::vector<cudf::size_type>> rg_per_src;
+    // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
+    // for one file, hybrid_scan_multifile for several) when every slice's backend
+    // prefers it, otherwise read_parquet.  Both routes apply `opts`' row filter
+    // identically, so `reader_applied_full_filter` below stays route-independent.
+    // The all-pruned split is left to read_parquet: it has no row groups to
+    // enumerate, and set_num_rows(0) already builds the schema-correct empty
+    // table without touching a data page.
+    std::vector<parquet_source> sources;
     sources.reserve(split.rg_slices.size());
-    metadatas.reserve(split.rg_slices.size());
-    rg_per_src.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {
-      sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
-                                         : cudf::io::datasource::create(slice.file_path));
-      metadatas.push_back(*slice.file_metadata);
-      rg_per_src.push_back(slice.row_group_indices);
+      sources.push_back(
+        parquet_source{slice.datasource, slice.file_metadata, slice.row_group_indices});
     }
-    if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
-    auto [decoded, metadata] =
-      cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
-    table = std::move(decoded);
+    bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
+    if (bulk) {
+      table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
+    } else {
+      std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
+      std::vector<cudf::io::parquet::FileMetaData> metadatas;
+      std::vector<std::vector<cudf::size_type>> rg_per_src;
+      cudf_sources.reserve(split.rg_slices.size());
+      metadatas.reserve(split.rg_slices.size());
+      rg_per_src.reserve(split.rg_slices.size());
+      for (auto const& slice : split.rg_slices) {
+        cudf_sources.push_back(slice.datasource
+                                 ? cudf::io::datasource::create(slice.datasource.get())
+                                 : cudf::io::datasource::create(slice.file_path));
+        metadatas.push_back(*slice.file_metadata);
+        rg_per_src.push_back(slice.row_group_indices);
+      }
+      // The general route reads as it decodes, so it needs the row-group selection
+      // on the options; the hybrid readers take it as a call argument instead.
+      if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
+      table = std::move(
+        cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
+          .tbl);
+    }
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();
       table             = append_virtual_columns(std::move(table),

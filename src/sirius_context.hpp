@@ -19,9 +19,11 @@
 #include "creator/task_creator.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "event/query_event_publisher.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -29,6 +31,7 @@
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
 #include "transparent/connection_provenance.hpp"
+#include "util/env_guard.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -40,6 +43,8 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,6 +74,9 @@ class sirius_engine;
 
 namespace duckdb {
 
+class Connection;
+class MaterializedQueryResult;
+
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
 ///
@@ -96,7 +104,11 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// A new query on this connection invalidates any leftover capture.
-  void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+  void QueryBegin(ClientContext& context) final
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void QueryEnd() final { pinned_update_guard_.reset(); }
 
@@ -120,8 +132,11 @@ class SiriusConnectionState : public ClientContextState {
   {
     ++planning_generation_;
     captured_plan_.reset();
+    captured_original_views_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
+
+  [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
 
   /// \brief Current classification; provider_internal remains latched.
   [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
@@ -170,6 +185,23 @@ class SiriusConnectionState : public ClientContextState {
     captured_generation_ = planning_generation_;
   }
 
+  void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
+  {
+    captured_original_views_ =
+      sirius::op::scan::logical_bound_read_view_capture{planning_generation_, std::move(views)};
+  }
+
+  std::optional<sirius::op::scan::logical_bound_read_view_capture>
+  take_captured_original_views_if_current()
+  {
+    if (!captured_original_views_ ||
+        captured_original_views_->planning_generation != planning_generation_) {
+      captured_original_views_.reset();
+      return std::nullopt;
+    }
+    return std::exchange(captured_original_views_, std::nullopt);
+  }
+
   /// \brief Consume the capture iff it belongs to the CURRENT planning attempt;
   /// a stale capture (generation mismatch) is dropped and nullptr is returned,
   /// which sends OnFinalizePrepare down its existing replan-from-SQL path.
@@ -184,7 +216,11 @@ class SiriusConnectionState : public ClientContextState {
 
   /// \brief Drop the capture without touching the generation (used by
   /// OnFinalizePrepare's not-taking-over early-outs).
-  void clear_captured_plan() noexcept { captured_plan_.reset(); }
+  void clear_captured_plan() noexcept
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
   [[nodiscard]] std::optional<std::string> take_pending_query_label()
@@ -242,6 +278,7 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t classified_generation_ = ~uint64_t{0};  ///< sentinel: no attempt classified yet
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -292,31 +329,14 @@ class SiriusContext : public ClientContextState {
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
-    uint64_t provider_internal_skips = 0;
-    uint64_t hidden_catalog_skips    = 0;
-    uint64_t classification_failures = 0;
-  };
-
-  /// Monotonic counters describing compressed-materialization activity.
-  ///
-  /// These counters intentionally describe columns rather than queries: a
-  /// single scan or pinned chunk can narrow or restore several columns.
-  struct compressed_materialization_stats {
-    uint64_t scan_columns_narrowed = 0;
-    uint64_t scan_columns_restored = 0;
-    uint64_t pin_columns_narrowed  = 0;
-    /// Plan-time count of TABLE_SCAN nodes that received a narrow physical
-    /// sidecar (post-residency-gate, pre-propagation/pruning — a later pass may
-    /// still clear or prune it).
-    uint64_t scan_sidecars_installed = 0;
-    /// Runtime count of input-batch columns that crossed an engaged hash
-    /// PARTITION with a carrier narrower than their native mapping. Derived
-    /// from actual batch types, so a regression anywhere in the narrow-carrier
-    /// chain drops it to zero.
-    uint64_t partition_narrow_columns = 0;
-    /// Plan-time count of narrow scan sidecar targets flipped back to native; the keep/retract rule
-    /// is `apply_tier_narrowing_policy`'s.
-    uint64_t scan_narrow_targets_retracted = 0;
+    uint64_t provider_internal_skips          = 0;
+    uint64_t hidden_catalog_skips             = 0;
+    uint64_t classification_failures          = 0;
+    uint64_t read_view_mismatches             = 0;
+    uint64_t certificate_mismatches           = 0;
+    uint64_t execution_rebuilds               = 0;
+    uint64_t checkpoint_revalidation_failures = 0;
+    uint64_t lease_held_at_replay             = 0;
   };
 
   SiriusContext();
@@ -394,6 +414,36 @@ class SiriusContext : public ClientContextState {
    private:
     shared_ptr<SiriusConnectionState> state_;
   };
+
+  /// Framework-owned Sirius-internal DuckDB connection. Its transaction is explicitly
+  /// read-only, and InternalQueryGuard remains active for the connection's entire lifetime.
+  struct internal_connection {
+    internal_connection(internal_connection&&) noexcept;
+    internal_connection& operator=(internal_connection&&) noexcept;
+    ~internal_connection() noexcept;
+    internal_connection(const internal_connection&)            = delete;
+    internal_connection& operator=(const internal_connection&) = delete;
+
+    unique_ptr<MaterializedQueryResult> Query(const string& sql);
+
+   private:
+    struct implementation;
+    explicit internal_connection(unique_ptr<implementation> impl) noexcept;
+    unique_ptr<implementation> impl_;
+    friend class SiriusContext;
+  };
+
+  [[nodiscard]] static internal_connection open_internal_connection(ClientContext& outer);
+
+  // Installed and cleared with no replay in flight; only invoked by the internal test option.
+  // Set before a test starts its workers; reset only after they have joined.
+  std::function<void(ClientContext&, std::string_view, uint64_t)>
+    native_checkpoint_hook_for_testing;
+  void observe_native_checkpoint_for_testing(ClientContext& context,
+                                             std::string_view phase,
+                                             uint64_t iteration = 0);
+  std::function<void()> cpu_replay_hook_for_testing;
+  void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -478,6 +528,17 @@ class SiriusContext : public ClientContextState {
    */
   class StandaloneQueryScope {
    public:
+    enum class lease_release_state : uint8_t {
+      not_entered,
+      released,
+      begin_failed,
+      cleanup_failed
+    };
+    struct lease_release_result {
+      lease_release_state state = lease_release_state::not_entered;
+      std::size_t keys_released = 0;
+    };
+
     StandaloneQueryScope(SiriusContext& ctx, ClientContext& context, std::string_view window_label);
     ~StandaloneQueryScope() noexcept;
     StandaloneQueryScope(const StandaloneQueryScope&)            = delete;
@@ -496,6 +557,7 @@ class SiriusContext : public ClientContextState {
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
     /// query's manager rather than a shared one.
     [[nodiscard]] sirius::query_id_t query_id() const noexcept { return window_id_; }
+    [[nodiscard]] lease_release_result lease_release() const noexcept { return lease_release_; }
 
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
@@ -514,10 +576,20 @@ class SiriusContext : public ClientContextState {
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
+    lease_release_result lease_release_;
+    bool inject_cleanup_failure_ = false;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
+
+  /// \brief Restore the cuDF global pinned memory resource and threshold that
+  ///        initialize() installed, before the slab allocator backing them is
+  ///        destroyed. Idempotent and no-op when nothing was installed, so it
+  ///        is safe to call from both terminate() (success path) and the
+  ///        failure/early-return paths. cuDF holds a non-owning reference to
+  ///        small_pinned_allocator_view_, so skipping this leaves it dangling.
+  void restore_cudf_pinned_memory_resource() noexcept;
 
   /// \brief Log host and GPU memory pool stats (allocated, peak, and
   ///        tier-specific capacity fields) at a labeled tag — used for
@@ -647,30 +719,25 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record a fresh split rejected because it belongs to another scan contract.
+  void record_transparent_certificate_mismatch() noexcept;
+
+  /// \brief Record a CPU/candidate bound read-view comparison failure.
+  void record_transparent_read_view_mismatch() noexcept;
+
+  /// \brief Record rebuilding a Sirius plan inside an execution window.
+  void record_transparent_execution_rebuild() noexcept;
+  void record_checkpoint_revalidation_failure() noexcept;
+  void record_lease_held_at_replay() noexcept;
+
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
-  /// \brief Snapshot counters for compressed-materialization observability.
-  [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
-    const noexcept;
-
-  /// \brief Record columns narrowed while materializing a scan batch.
-  void record_compressed_materialization_scan_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns restored to their native type at a scan boundary.
-  void record_compressed_materialization_scan_columns_restored(uint64_t count = 1) noexcept;
-
-  /// \brief Record columns narrowed while materializing a pinned chunk.
-  void record_compressed_materialization_pin_columns_narrowed(uint64_t count = 1) noexcept;
-
-  /// \brief Record a TABLE_SCAN node that received a narrow physical sidecar at plan time.
-  void record_compressed_materialization_scan_sidecar_installed() noexcept;
-
-  /// \brief Record narrow-carrier columns crossing an engaged hash PARTITION.
-  void record_compressed_materialization_partition_narrow_columns(uint64_t count = 1) noexcept;
-
-  /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
-  void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
+  /// Shared event source for planning, pinning, and execution observations.
+  [[nodiscard]] sirius::event::query_event_publisher& get_event_publisher() const noexcept
+  {
+    return *event_publisher_;
+  }
 
  private:
   void throw_if_not_initialized() const;
@@ -681,9 +748,11 @@ class SiriusContext : public ClientContextState {
   /// window (it releases and throws instead of running any shared mutation).
   void acquire_query_lifecycle_slot(ClientContext* context);
   void release_query_lifecycle_slot() noexcept;
-  /// The begin-of-window shared mutations (repository-manager registration,
-  /// task_creator reset) — runs INSIDE the held slot, per the frozen
-  /// "after acquire + health check, before final create_plan" placement.
+  /// The begin-of-window shared mutations (repository-manager registration and
+  /// the query's task_creator state) — runs INSIDE the held slot, right after
+  /// acquire and the health check. Plans are normally generated before this
+  /// under a SlotGuard (a streaming fragment in build(), the transparent path at
+  /// finalize), so planning must not depend on state set here.
   /// GPU admission happens later, in sirius_engine::initialize_internal().
   void begin_execution_window(ClientContext& context,
                               sirius::query_id_t query_id,
@@ -695,7 +764,9 @@ class SiriusContext : public ClientContextState {
   /// telemetry and logging inside are best-effort and never abort the
   /// remaining steps. @p query_id selects which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
-  void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
+  [[nodiscard]] std::size_t run_mandatory_cleanup(sirius::query_id_t query_id,
+                                                  std::string_view end_tag,
+                                                  bool inject_failure = false);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
@@ -731,6 +802,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<std::uint32_t> next_window_id_{0};
   bool is_initialized_ = false;
   sirius::sirius_config config_;
+  // Holds LIBCUDF_HW_DECOMPRESSION=ON while the context is initialized, when
+  // operator_params.use_hw_decompression is set and every GPU's CUDA driver
+  // supports hardware decompression. Emplaced in initialize(), reset in
+  // terminate(); RAII restores the variable's prior state on destruction.
+  std::optional<sirius::util::env_guard> hw_decompression_env_guard_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
   // after memory_manager_ so it is destroyed before it: each entry holds a
@@ -740,7 +816,7 @@ class SiriusContext : public ClientContextState {
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
   // the small-pinned allocator, downgrade executors, task_creator, and
-  // scan_manager so every NUMA-aware routing decision reads one consistent
+  // scan_publisher so every NUMA-aware routing decision reads one consistent
   // index instead of rebuilding ad-hoc device<->NUMA maps. Owns a copy of the
   // topology and holds no device resources, so teardown order is unconstrained.
   std::shared_ptr<const sirius::memory::topology_index> topology_index_;
@@ -775,6 +851,9 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  /// Observes where a query is in its execution.  Declared before the creator
+  /// and scheduler that report into it so it outlives them on teardown.
+  std::shared_ptr<sirius::event::query_event_publisher> query_event_publisher_;
   // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
   // before reset; reverse member destruction also preserves that order if initialize() throws.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
@@ -782,6 +861,8 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
+  std::shared_ptr<sirius::event::query_event_publisher> event_publisher_{
+    std::make_shared<sirius::event::query_event_publisher>()};
   sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
@@ -790,12 +871,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
-  std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
-  std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
-  std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
+  std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
+  std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
+  std::atomic<uint64_t> lease_held_at_replay_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
@@ -877,7 +957,7 @@ bool compressed_materialization_enabled(ClientContext& context);
 ///
 /// Written to stdout in red (ANSI) when stdout is a TTY, plain text otherwise so
 /// piped/redirected output is not corrupted. Shared by the transparent runtime
-/// fallback and the legacy gpu_execution() CALL path so the message stays in sync.
+/// fallback and the explicit gpu_execution() CALL path so the message stays in sync.
 void print_cpu_fallback_banner();
 
 }  // namespace duckdb

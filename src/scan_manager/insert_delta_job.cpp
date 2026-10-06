@@ -125,7 +125,7 @@ insert_delta_workset prepare_insert_delta_tasks(
         range_works.push_back(std::move(work));
       }
     }
-    std::vector<absl::AnyInvocable<void()>> range_tasks;
+    std::vector<sirius::exec::invocable<void()>> range_tasks;
     range_tasks.reserve(range_works.size());
     for (auto& work : range_works) {
       range_tasks.push_back([work_ptr = work.get()] {
@@ -324,7 +324,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager)
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id)
 {
   std::vector<std::size_t> union_idx;
   union_idx.reserve(op_projected_cols.size());
@@ -372,9 +373,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   std::vector<insert_delta_split> out;
   out.reserve(request.bundles.size());
   for (auto const& bundle : request.bundles) {
-    auto info           = std::make_unique<op::scan::duckdb_native_scan_info>();
-    info->block_manager = block_manager;
-    if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
+    std::vector<op::scan::duckdb_row_group_metadata> row_groups;
+    row_groups.reserve(bundle.rg_indices.size());
 
     bool any_file_read = false;
     for (std::size_t bi = 0; bi < bundle.rg_indices.size(); ++bi) {
@@ -413,13 +413,32 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
         }
         md.columns.push_back(std::move(cm));
       }
-      info->row_groups.push_back(std::move(md));
+      row_groups.push_back(std::move(md));
     }
-    info->host_backed_only = !any_file_read;
     // The prefetch handle inside a datasource is per-scan mutable state, so
     // every file-backed split owns a fresh duplicate (matching the native-scan
     // coalescer); splits that read no file carry none.
-    if (any_file_read && datasource) { info->datasource = datasource->duplicate(); }
+    auto split_datasource = any_file_read && datasource ? datasource->duplicate()
+                                                        : std::shared_ptr<io::sirius_datasource>{};
+    auto info             = std::make_unique<op::scan::duckdb_native_scan_info>(
+      std::move(row_groups), std::move(split_datasource), block_manager);
+    info->host_backed_only = !any_file_read;
+    if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
+
+    std::vector<op::scan::split_materializer_certificate> certificates;
+    std::vector<op::scan::split_dependencies> dependencies;
+    certificates.reserve(info->row_groups.size());
+    dependencies.reserve(info->row_groups.size());
+    for (auto const& row_group : info->row_groups) {
+      certificates.push_back(
+        {contract_id,
+         static_cast<uint64_t>(row_group.row_group_index),
+         request.entry_name + "|row_group=" + std::to_string(row_group.row_group_index),
+         "duckdb_native.insert_delta",
+         info->host_backed_only ? "host" : "file"});
+      dependencies.push_back({nullptr, info->datasource, std::nullopt});
+    }
+    info->set_contract_payload(contract_id, std::move(certificates), std::move(dependencies));
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }

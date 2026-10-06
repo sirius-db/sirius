@@ -16,6 +16,7 @@
   ],
   "license": "Apache-2.0",
   "name": "rmm",
+  "port-version": 1,
   "supports": "linux",
   "version-string": "26.08.00"
 }

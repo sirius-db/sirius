@@ -25,20 +25,24 @@ endif()
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
 # Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
-# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
-# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
-# The pixi build has no such target and links the conda shared libnvrtc.so.
+# the nvrtc::nvrtc_static target, which simpatico links instead of CUDA::nvrtc
+# (see src/compression/simpatico_codegen/CMakeLists.txt). The pixi build uses
+# CUDA::nvrtc for the toolkit's shared library.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
   find_package(nvjitlink CONFIG REQUIRED)
   # FindCUDAToolkit also adds nvJitLink through cuSPARSE's link interface.
-  get_target_property(_cusparse_links CUDA::cusparse INTERFACE_LINK_LIBRARIES)
-  if(_cusparse_links)
-    list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink$"
-                                           "nvjitlink::nvjitlink_static")
-    set_target_properties(CUDA::cusparse PROPERTIES INTERFACE_LINK_LIBRARIES
-                                                    "${_cusparse_links}")
-  endif()
+  foreach(target CUDA::cusparse CUDA::cusparse_static)
+    if(TARGET ${target})
+      get_target_property(_cusparse_links ${target} INTERFACE_LINK_LIBRARIES)
+      if(_cusparse_links)
+        list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink(_static)?$"
+                                               "nvjitlink::nvjitlink_static")
+        set_target_properties(${target} PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                   "${_cusparse_links}")
+      endif()
+    endif()
+  endforeach()
 endif()
 
 # --- cuCollections (cuco) --- #
@@ -55,9 +59,9 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     cuco
-    URL https://github.com/NVIDIA/cuCollections/archive/0883368d39296f3bef3a058033141bcc642c5c54.tar.gz
+    URL https://github.com/NVIDIA/cuCollections/archive/4b26118c99866221f99f35f4e3bc74afdbe063bc.tar.gz
     URL_HASH
-      SHA256=4ec8320a0372839b991f0b431c7f8bf0e770006cb3c8631c6e373c434471fd45
+      SHA256=cfff0dfe8552ca2a8e3c53d04c26ab4d95364d14c159aaf8a37b3971b78b609d
     SOURCE_SUBDIR do-not-build)
   FetchContent_MakeAvailable(cuco)
   # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
@@ -101,34 +105,20 @@ else()
   set(SIRIUS_CURL_TARGET PkgConfig::CURL)
 endif()
 
-# cuCascade - GPU Memory Reservation Library (submodule)
-set(BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_BENCHMARKS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_SHARED_LIBS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_STATIC_LIBS
-    ON
-    CACHE BOOL "" FORCE)
-# Sirius consumes cucascade's cudf-coupled representations and converters (PR
-# #150 split these into the optional cucascade_cudf target), so build it.
-set(CUCASCADE_BUILD_CUDF
-    ON
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_WARNINGS_AS_ERRORS
-    OFF
-    CACHE BOOL "" FORCE)
-set(CUCASCADE_BUILD_IO
-    OFF
-    CACHE BOOL "" FORCE)
+# Scope dependency options without changing the caller's cache.
+block()
+set(CUCASCADE_BUILD_TESTS OFF)
+set(CUCASCADE_BUILD_BENCHMARKS OFF)
+set(CUCASCADE_BUILD_SHARED_LIBS OFF)
+set(CUCASCADE_BUILD_STATIC_LIBS ON)
+set(CUCASCADE_BUILD_CUDF ON)
+set(CUCASCADE_WARNINGS_AS_ERRORS OFF)
+set(CUCASCADE_BUILD_IO OFF)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+endblock()
+foreach(target cucascade_objects cucascade_cudf_objects)
+  target_compile_definitions(${target} PRIVATE CCCL_DISABLE_WARPSPEED_SCAN)
+endforeach()
 
 # Name of the NVTX domain every Sirius range is published into. Derived from the
 # project name so it has a single authoritative source; simpatico turns it into
@@ -141,38 +131,7 @@ set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 add_subdirectory(src/compression/simpatico_codegen
                  "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
 
-if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
-  function(sirius_prefer_static_cudart target_name)
-    foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
-      get_target_property(_libs "${target_name}" "${_prop}")
-      if(NOT _libs OR _libs STREQUAL "_libs-NOTFOUND")
-        continue()
-      endif()
-
-      set(_patched_libs "${_libs}")
-      list(TRANSFORM _patched_libs REPLACE "^CUDA::cudart$"
-                                           "CUDA::cudart_static")
-      list(TRANSFORM _patched_libs REPLACE "^\\$<LINK_ONLY:CUDA::cudart>$"
-                                           "$<LINK_ONLY:CUDA::cudart_static>")
-
-      if(NOT _patched_libs STREQUAL _libs)
-        set_target_properties("${target_name}" PROPERTIES "${_prop}"
-                                                          "${_patched_libs}")
-      endif()
-    endforeach()
-
-    set_target_properties("${target_name}" PROPERTIES CUDA_RUNTIME_LIBRARY
-                                                      Static)
-  endfunction()
-
-  foreach(_target
-          cucascade_objects cucascade_static cucascade_shared
-          cucascade_cudf_objects cucascade_cudf_static cucascade_cudf_shared)
-    if(TARGET "${_target}")
-      sirius_prefer_static_cudart("${_target}")
-    endif()
-  endforeach()
-
+if(VCPKG_BUILD)
   # cucascade's topology discovery gained rmm includes (NUMA capacity
   # detection), so it needs the same vcpkg-over-toolkit include priority as
   # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
@@ -195,6 +154,22 @@ add_subdirectory(rust/crates/telemetry/bridge)
 # start MinIO containers from the test binary. Builds a Go c-archive, so a Go
 # toolchain (provided by pixi) and network access on the first configure/build
 # are required — hence gated behind SIRIUS_BUILD_S3_TESTS.
-if(SIRIUS_BUILD_S3_TESTS)
+if(SIRIUS_BUILD_S3_TESTS AND (SIRIUS_BUILD_TESTS OR NOT PROJECT_IS_TOP_LEVEL))
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
+endif()
+
+find_package(kvikio REQUIRED CONFIG)
+
+# The legacy DuckDB parent enables only C/CXX.
+if(NOT PROJECT_IS_TOP_LEVEL)
+  if(TARGET BS::thread_pool)
+    get_target_property(_bs_thread_pool_features BS::thread_pool
+                        INTERFACE_COMPILE_FEATURES)
+    if(_bs_thread_pool_features)
+      list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+      set_target_properties(
+        BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                   "${_bs_thread_pool_features}")
+    endif()
+  endif()
 endif()

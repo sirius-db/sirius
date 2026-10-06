@@ -58,6 +58,16 @@ std::string operator_chain(const sirius_pipeline& pipeline)
     sirius::pipeline::sirius_plan_printer::build_operator_chain(pipeline), kIdToken, "");
 }
 
+std::string normalize_contract_runtime_ids(std::string dump)
+{
+  // Contract handles are process-wide monotonic and finalize generations advance per planning
+  // attempt. Both are required in the diagnostic dump, but neither is schedule structure.
+  static const std::regex kHandle{"(handle=)\\d+"};
+  static const std::regex kFinalizeGeneration{"(finalize_generation=)\\d+"};
+  dump = std::regex_replace(dump, kHandle, "$1<volatile>");
+  return std::regex_replace(dump, kFinalizeGeneration, "$1<volatile>");
+}
+
 //! Every pipeline must appear after all of its `dependencies` (producers).
 void require_strictly_topological(const std::vector<std::shared_ptr<sirius_pipeline>>& scheduled)
 {
@@ -131,7 +141,7 @@ void require_canonical_schedule(duckdb::Connection& con, const std::string& quer
   // Convert-twice raw-schedule determinism (see the battery doc above).
   auto first_raw  = sirius::test::convert_query_to_raw_schedule(con, query);
   auto second_raw = sirius::test::convert_query_to_raw_schedule(con, query);
-  REQUIRE(first_raw == second_raw);
+  REQUIRE(normalize_contract_runtime_ids(first_raw) == normalize_contract_runtime_ids(second_raw));
 }
 
 //! The 8 TPC-H tables as views over the committed parquet fixtures.

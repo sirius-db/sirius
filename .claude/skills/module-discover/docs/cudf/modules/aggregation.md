@@ -72,7 +72,6 @@ std::unique_ptr<scalar> reduce(column_view const& col,
 
 **Our usage**:
 - `src/op/sirius_physical_ungrouped_aggregate.cpp:30` — Ungrouped aggregations (e.g., `SELECT SUM(x) FROM t`)
-- `src/expression_executor/specializations/gpu_execute_case.cpp:24` — Reduction in CASE expression evaluation
 
 ### `cudf::distinct_count`
 

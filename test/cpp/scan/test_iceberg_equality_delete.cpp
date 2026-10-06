@@ -85,7 +85,9 @@ std::unique_ptr<cudf::column> int32_column(std::vector<int32_t> const& values,
       ++null_count;
     }
     if (null_count > 0) {
-      rmm::device_buffer mask{host_mask.data(), bytes, stream};
+      auto mask = cudf::create_null_mask(col->size(), cudf::mask_state::UNINITIALIZED, stream);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        mask.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get()));
       stream.sync();
       col->set_null_mask(std::move(mask), null_count);
     }

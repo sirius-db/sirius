@@ -351,7 +351,7 @@ static void materialize_expression_join_keys(
                               bool is_left) {
     const std::size_t old_width = child->types.size();
 
-    // Gather the complex, translatable sides on this child across all equality conditions.
+    // Gather the complex, translatable sides on this child across all conditions.
     std::vector<std::size_t> cond_indices;
     duckdb::vector<std::unique_ptr<sirius::ast::node>> key_exprs;
     duckdb::vector<sirius::logical_type> key_types;

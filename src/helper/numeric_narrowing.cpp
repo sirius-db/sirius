@@ -35,11 +35,12 @@
 namespace sirius {
 namespace {
 
+// The range rule is the shared host/device one (helper/numeric_carrier_rule.hpp), so the
+// carrier a column is narrowed to on the host is exactly the carrier a probe kernel converts into.
 template <typename T>
 bool fits(__int128_t minimum, __int128_t maximum)
 {
-  return minimum >= static_cast<__int128_t>(std::numeric_limits<T>::lowest()) &&
-         maximum <= static_cast<__int128_t>(std::numeric_limits<T>::max());
+  return range_fits<T>(minimum, maximum);
 }
 
 // True when `source` and `target` are supported numeric carriers in the same family: integral
@@ -50,14 +51,10 @@ bool same_numeric_carrier_family(cudf::data_type source, cudf::data_type target)
   auto const source_rep = narrowing_rep_type(source);
   auto const target_rep = narrowing_rep_type(target);
 
-  auto const same_family = [&] {
-    if (cudf::is_integral_not_bool(source_rep) && cudf::is_integral_not_bool(target_rep)) {
-      return (cudf::is_signed(source_rep) && cudf::is_signed(target_rep)) ||
-             (cudf::is_unsigned(source_rep) && cudf::is_unsigned(target_rep));
-    }
-    return cudf::is_fixed_point(source_rep) && cudf::is_fixed_point(target_rep) &&
-           source_rep.scale() == target_rep.scale();
-  }();
+  auto const source_domain = narrow_domain_of(source_rep);
+  auto const same_family =
+    source_domain != narrow_domain::NONE && source_domain == narrow_domain_of(target_rep) &&
+    (source_domain != narrow_domain::DECIMAL || source_rep.scale() == target_rep.scale());
   if (!same_family) { return false; }
 
   // A representation only stands in for its type where that type is the one being narrowed or
@@ -147,15 +144,16 @@ std::optional<numeric_range> range_from_scalars(cudf::scalar const& minimum,
 
 bool is_supported_numeric_carrier(cudf::data_type type)
 {
-  auto const rep = narrowing_rep_type(type);
-  return cudf::is_integral_not_bool(rep) || cudf::is_fixed_point(rep);
+  return narrow_domain_of(narrowing_rep_type(type)) != narrow_domain::NONE;
 }
 
 }  // namespace
 
 cudf::data_type narrowing_rep_type(cudf::data_type type) noexcept
 {
-  return type.id() == cudf::type_id::TIMESTAMP_DAYS ? cudf::data_type{cudf::type_id::INT32} : type;
+  // Only the temporal type with a narrowing domain (DATE) is represented by its integer storage
+  // here; see integer_storage_type for why sub-day timestamps deliberately keep their own type.
+  return narrow_domain_of(type) == narrow_domain::DATE ? integer_storage_type(type) : type;
 }
 
 cudf::column_view narrowing_rep_view(cudf::column_view const& column)
@@ -213,6 +211,25 @@ narrow_domain narrow_domain_of(const logical_type& type) noexcept
     // epoch: int16 days reach from 1880 to 2059. Other temporal types get no domain because their
     // sub-day units provide no useful span in a 16-bit carrier.
     case type_id::DATE: return narrow_domain::DATE;
+    default: return narrow_domain::NONE;
+  }
+}
+
+narrow_domain narrow_domain_of(cudf::data_type type) noexcept
+{
+  switch (type.id()) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64: return narrow_domain::SIGNED_INTEGER;
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64: return narrow_domain::UNSIGNED_INTEGER;
+    case cudf::type_id::DECIMAL32:
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128: return narrow_domain::DECIMAL;
+    case cudf::type_id::TIMESTAMP_DAYS: return narrow_domain::DATE;
     default: return narrow_domain::NONE;
   }
 }
@@ -341,6 +358,22 @@ std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const
   if (column.type() != native) { return std::nullopt; }
 
   return compute_exact_numeric_range(column, stream, mr);
+}
+
+bool column_values_fit(cudf::column_view const& column,
+                       cudf::data_type target,
+                       ::cuda::stream_ref stream,
+                       rmm::device_async_resource_ref mr)
+{
+  if (!is_supported_numeric_carrier(column.type()) || !is_supported_numeric_carrier(target)) {
+    return false;
+  }
+  // No non-null value: nothing can be out of range.
+  if (column.size() == 0 || column.null_count() == column.size()) { return true; }
+  // nullopt here means the bounds could not be established (a fixed-point scale outside the SQL
+  // range), and an unverified column does not fit.
+  auto const range = compute_exact_numeric_range(column, stream, mr);
+  return range.has_value() && numeric_range_fits(target, *range);
 }
 
 std::optional<numeric_range> compute_exact_numeric_range(cudf::column_view const& column,

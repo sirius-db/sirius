@@ -1,3 +1,5 @@
 #pragma once
 
-#include "../../duckdb/third_party/catch/catch.hpp"
+#include <catch2/catch_all.hpp>
+
+using Catch::Approx;

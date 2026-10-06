@@ -172,22 +172,61 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
   }
 }
 
-// BOOL8 flags -> packed mask words. One warp per word: lane l tests row
-// w*32+l, ballot packs the word, lane 0 stores it. Grid-stride over the FULL
-// padded strip; rows beyond num_rows ballot to 0 (tail-zero invariant).
+// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Each byte's bits
+// are folded down into its bit 0, then the four bit-0 positions of each 32-bit lane are gathered.
+__device__ __forceinline__ uint32_t pack16_nonzero(uint4 v)
+{
+  auto const nonzero_bit0 = [](uint32_t x) {
+    uint32_t y = x | (x >> 4);
+    y |= y >> 2;
+    y |= y >> 1;
+    return y & 0x01010101u;
+  };
+  auto const gather4 = [](uint32_t x) {
+    return (x & 1u) | ((x >> 7) & 2u) | ((x >> 14) & 4u) | ((x >> 21) & 8u);
+  };
+  return gather4(nonzero_bit0(v.x)) | (gather4(nonzero_bit0(v.y)) << 4) |
+         (gather4(nonzero_bit0(v.z)) << 8) | (gather4(nonzero_bit0(v.w)) << 12);
+}
+
+// Bit i of the result is set iff p[i] is non-zero, for i in [0, count).
+__device__ __forceinline__ uint32_t pack_bytes_nonzero(uint8_t const* p, int count)
+{
+  uint32_t bits = 0;
+  for (int i = 0; i < count; ++i)
+    bits |= (p[i] != 0) ? (1u << i) : 0u;
+  return bits;
+}
+
+// BOOL8 flags -> packed mask words.
+// One thread per word: a full word's 32 flags arrive as two 16-byte loads packed in registers. The
+// 16-byte path needs a 16-byte aligned base and a misaligned vector load is a sticky
+// cudaErrorMisalignedAddress that kills the context, so the base alignment is tested once and an
+// unaligned base takes the byte-wise path instead.
 __global__ void mask_from_bool8_kernel(uint8_t const* __restrict__ flags,
                                        int64_t num_rows,
                                        int64_t num_words,
                                        uint32_t* __restrict__ words)
 {
-  int const lane               = threadIdx.x & 31;
-  int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
-  int64_t w                    = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
-  for (; w < num_words; w += warps_per_grid) {
-    int64_t const r  = w * 32 + lane;
-    bool const p     = (r < num_rows) && (flags[r] != 0);
-    uint32_t const b = __ballot_sync(kFullWarp, p);
-    if (lane == 0) words[w] = b;
+  int64_t const stride     = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t const full_words = num_rows >> 5;
+  bool const aligned       = (reinterpret_cast<std::uintptr_t>(flags) & 15u) == 0;
+  for (int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; w < num_words;
+       w += stride) {
+    uint32_t bits = 0;
+    if (w < full_words) {
+      uint8_t const* p = flags + (w << 5);
+      if (aligned) {
+        auto const* v = reinterpret_cast<uint4 const*>(p);
+        bits          = pack16_nonzero(v[0]) | (pack16_nonzero(v[1]) << 16);
+      } else {
+        bits = pack_bytes_nonzero(p, 32);
+      }
+    } else {
+      int64_t const live = num_rows - (w << 5);
+      if (live > 0) bits = pack_bytes_nonzero(flags + (w << 5), static_cast<int>(live));
+    }
+    words[w] = bits;
   }
 }
 
@@ -279,9 +318,8 @@ void mask_from_bool8(uint8_t const* flags,
 {
   if (flags == nullptr || mask_words == nullptr || num_rows <= 0)
     throw std::runtime_error("selection_wave: mask_from_bool8 on unbound buffers");
-  int64_t const num_words   = selection_mask::WordsFor(num_rows);
-  int const warps_per_block = kBlock / 32;
-  mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.get()>>>(
+  int64_t const num_words = selection_mask::WordsFor(num_rows);
+  mask_from_bool8_kernel<<<grid_for(num_words, kBlock), kBlock, 0, stream.get()>>>(
     flags, num_rows, num_words, mask_words);
   throw_on_cuda(cudaPeekAtLastError(), "mask_from_bool8 launch");
 }

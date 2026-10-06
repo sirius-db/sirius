@@ -1,0 +1,278 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    s_name[#113]
+    numwait[#114]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  21:VMERGING-EXCHANGE
+     offset: 0
+     limit: 100
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: s_name[#109]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    UNPARTITIONED
+IS_MERGE: true
+
+  20:VTOP-N(5239)
+  |  order by: numwait[#114] DESC, s_name[#113] ASC
+  |  algorithm: heap sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  limit: 100
+  |  distribute expr lists: s_name[#111]
+  |  
+  19:VAGGREGATE (merge finalize)(5235)
+  |  output: count(partial_count(*)[#110])[#112]
+  |  group by: s_name[#109]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: s_name[#109]
+  |  
+  18:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: HASH_PARTITIONED: l_orderkey[#83]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    HASH_PARTITIONED: s_name[#109]
+
+  17:VAGGREGATE (update serialize)(5227)
+  |  STREAMING
+  |  output: partial_count(*)[#110]
+  |  group by: s_name[#108]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  16:VHASH JOIN(5219)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (s_nationkey[#104] = n_nationkey[#4])
+  |  cardinality=1
+  |  vec output tuple id: 21
+  |  output tuple id: 21
+  |  vIntermediate tuple ids: 20 
+  |  hash output slot ids: 103 
+  |  final projections: s_name[#105]
+  |  final project output tuple id: 21
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  15:VHASH JOIN(5198)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_orderkey[#98] = o_orderkey[#14])
+  |  cardinality=1
+  |  vec output tuple id: 19
+  |  output tuple id: 19
+  |  vIntermediate tuple ids: 18 
+  |  hash output slot ids: 96 97 
+  |  final projections: s_name[#99], s_nationkey[#100]
+  |  final project output tuple id: 19
+  |  distribute expr lists: l_orderkey[#98]
+  |  distribute expr lists: o_orderkey[#14]
+  |  
+  |----3:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  14:VHASH JOIN(5177)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (l_suppkey[#90] = s_suppkey[#22])
+  |  cardinality=1
+  |  vec output tuple id: 17
+  |  output tuple id: 17
+  |  vIntermediate tuple ids: 16 
+  |  hash output slot ids: 23 24 89 
+  |  final projections: s_name[#94], s_nationkey[#95], l_orderkey[#91]
+  |  final project output tuple id: 17
+  |  distribute expr lists: l_orderkey[#89]
+  |  distribute expr lists: 
+  |  
+  |----5:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  13:VHASH JOIN(5164)
+  |  join op: RIGHT ANTI JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_orderkey[#83] = l_orderkey[#65])
+  |  other join predicates: (l_suppkey[#86] != l_suppkey[#88])
+  |  cardinality=0
+  |  vec output tuple id: 15
+  |  output tuple id: 15
+  |  vIntermediate tuple ids: 14 
+  |  hash output slot ids: 65 66 84 
+  |  final projections: l_orderkey[#87], l_suppkey[#88]
+  |  final project output tuple id: 15
+  |  distribute expr lists: l_orderkey[#83]
+  |  distribute expr lists: l_orderkey[#65]
+  |  
+  |----10:VHASH JOIN(5160)
+  |    |  join op: RIGHT SEMI JOIN(PARTITIONED)[]
+  |    |  equal join conjunct: (l_orderkey[#59] = l_orderkey[#41])
+  |    |  other join predicates: (l_suppkey[#62] != l_suppkey[#64])
+  |    |  cardinality=0
+  |    |  vec output tuple id: 11
+  |    |  output tuple id: 11
+  |    |  vIntermediate tuple ids: 10 
+  |    |  hash output slot ids: 41 42 60 
+  |    |  final projections: l_orderkey[#63], l_suppkey[#64]
+  |    |  final project output tuple id: 11
+  |    |  distribute expr lists: l_orderkey[#59]
+  |    |  distribute expr lists: l_orderkey[#41]
+  |    |  
+  |    |----7:VEXCHANGE
+  |    |       offset: 0
+  |    |       distribute expr lists: 
+  |    |    
+  |    9:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  12:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    HASH_PARTITIONED: l_orderkey[#83]
+
+  11:VTVF_SCAN_NODE(5122)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_receiptdate[#79] > _tvf_local.l_commitdate[#78])
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_orderkey[#67], _tvf_local.l_suppkey[#69]
+     final project output tuple id: 13
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    HASH_PARTITIONED: l_orderkey[#59]
+
+  8:VTVF_SCAN_NODE(5135)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_orderkey[#43], _tvf_local.l_suppkey[#45]
+     final project output tuple id: 9
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 07
+    HASH_PARTITIONED: l_orderkey[#41]
+
+  6:VTVF_SCAN_NODE(5144)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_receiptdate[#37] > _tvf_local.l_commitdate[#36])
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_orderkey[#25], _tvf_local.l_suppkey[#27]
+     final project output tuple id: 7
+
+PLAN FRAGMENT 6
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    UNPARTITIONED
+
+  4:VTVF_SCAN_NODE(5165)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#15], _tvf_local.s_name[#16], _tvf_local.s_nationkey[#18]
+     final project output tuple id: 5
+
+PLAN FRAGMENT 7
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: o_orderkey[#14]
+
+  2:VTVF_SCAN_NODE(5182)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.o_orderstatus[#7] = 'F')
+     inputSplitNum=1, totalFileSize=41097446, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.o_orderkey[#5]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 8
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    UNPARTITIONED
+
+  0:VTVF_SCAN_NODE(5203)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.n_name[#1] = 'SAUDI ARABIA')
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#0]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========
