@@ -143,6 +143,20 @@ TEST_CASE_METHOD(SetOpAllFixture,
 }
 
 TEST_CASE_METHOD(SetOpAllFixture,
+                 "gpu_execution EXCEPT ALL and INTERSECT ALL over an aggregate's narrowed type",
+                 "[integration][gpu_execution][setop_all]")
+{
+  // DuckDB types sum(INTEGER) as HUGEINT and Sirius plans it as BIGINT. Grouped by k, sa's sums
+  // hold 4 twice and NULL once.
+  compare_both("SELECT sum(k) FROM sa GROUP BY k", "SELECT sum(k) FROM sb GROUP BY k");
+  compare_both("SELECT v, sum(k) FROM sa GROUP BY v", "SELECT v, sum(k) FROM sb GROUP BY v");
+  // A parent reads the narrowed column.
+  compare_gpu_vs_cpu(
+    "SELECT s * 2 FROM (SELECT sum(k) AS s FROM sa GROUP BY k "
+    "EXCEPT ALL SELECT sum(k) FROM sb GROUP BY k) t");
+}
+
+TEST_CASE_METHOD(SetOpAllFixture,
                  "gpu_execution EXCEPT ALL and INTERSECT ALL over many batches and partitions",
                  "[integration][gpu_execution][setop_all]")
 {

@@ -468,12 +468,33 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
     REQUIRE_THROWS_WITH(lower("SELECT l FROM ilist INTERSECT ALL SELECT l FROM ilist"),
                         ContainsSubstring("nested column operation on column 'column 0'"));
   }
-  SECTION("an input planned narrower than the output type")
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - an ALL form carries an aggregate's narrowed type",
+                 "[planner][set_operation][isolated_context]")
+{
+  // DuckDB types sum(INTEGER) as HUGEINT; the Sirius aggregate plans it as BIGINT.
+  auto const types = sirius_types({duckdb::LogicalType::BIGINT});
+  SECTION("EXCEPT ALL")
   {
-    REQUIRE_THROWS_WITH(
-      lower("SELECT sum(k) FROM ia EXCEPT ALL SELECT sum(k) FROM ib"),
-      ContainsSubstring("EXCEPT ALL input 0 plans column 0 as BIGINT, not HUGEINT"));
+    auto const plan = lower("SELECT sum(k) FROM ia EXCEPT ALL SELECT sum(k) FROM ib");
+    require_replicate_plan(*plan, types, {{1}, {-1}});
   }
+  SECTION("INTERSECT ALL")
+  {
+    auto const plan = lower("SELECT sum(k) FROM ia INTERSECT ALL SELECT sum(k) FROM ib");
+    require_replicate_plan(*plan, types, {{1, 0}, {0, 1}});
+  }
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - an ALL form whose inputs plan one column differently is refused",
+                 "[planner][set_operation][isolated_context]")
+{
+  REQUIRE_THROWS_WITH(
+    lower("SELECT sum(k) FROM ia INTERSECT ALL SELECT k::HUGEINT FROM ib"),
+    ContainsSubstring("INTERSECT ALL inputs plan column 0 as BIGINT and HUGEINT"));
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,

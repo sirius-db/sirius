@@ -166,6 +166,50 @@ void require_input_types(sirius::op::sirius_physical_operator const& input,
   }
 }
 
+//! The types an ALL plan carries: per column, the type both planned inputs share, which must be
+//! the declared type or, for an aggregate result, `planned_aggregate_type` of it.
+duckdb::vector<sirius::logical_type> reconcile_input_types(
+  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> const& inputs,
+  duckdb::vector<duckdb::LogicalType> const& declared_types,
+  std::string const& name)
+{
+  for (duckdb::idx_t input = 0; input < inputs.size(); ++input) {
+    if (inputs[input]->types.size() != declared_types.size()) {
+      throw duckdb::NotImplementedException("%s input %d is planned with %d columns, not %d",
+                                            name,
+                                            input,
+                                            static_cast<duckdb::idx_t>(inputs[input]->types.size()),
+                                            static_cast<duckdb::idx_t>(declared_types.size()));
+    }
+  }
+  duckdb::vector<sirius::logical_type> types;
+  for (duckdb::idx_t i = 0; i < declared_types.size(); ++i) {
+    auto const declared = sirius::from_duckdb(declared_types[i]);
+    auto const narrowed = sirius::from_duckdb(
+      sirius_physical_plan_generator::planned_aggregate_type(declared_types[i]));
+    for (duckdb::idx_t input = 0; input < inputs.size(); ++input) {
+      auto const& planned = inputs[input]->types[i];
+      if (planned != declared && planned != narrowed) {
+        throw duckdb::NotImplementedException("%s input %d plans column %d as %s, not %s",
+                                              name,
+                                              input,
+                                              i,
+                                              planned.to_string(),
+                                              declared.to_string());
+      }
+    }
+    if (inputs[0]->types[i] != inputs[1]->types[i]) {
+      throw duckdb::NotImplementedException("%s inputs plan column %d as %s and %s",
+                                            name,
+                                            i,
+                                            inputs[0]->types[i].to_string(),
+                                            inputs[1]->types[i].to_string());
+    }
+    types.push_back(inputs[0]->types[i]);
+  }
+  return types;
+}
+
 //! The connection's `operator_params`; defaults when no SiriusContext is registered.
 sirius::operator_params current_operator_params(duckdb::ClientContext& context)
 {
@@ -374,20 +418,20 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     }
   }
 
-  auto const output_types = sirius::from_duckdb_vec(op.types);
-  auto const op_params    = current_operator_params(context);
+  auto const op_params = current_operator_params(context);
   if (op.setop_all) {
     std::array inputs{create_plan(*op.children[0]), create_plan(*op.children[1])};
-    // Each tag projection and the union read their input's declared `types`.
-    require_input_types(*inputs[0], 0, output_types, name);
-    require_input_types(*inputs[1], 1, output_types, name);
+    // Each tag projection and the union read their input's planned `types`.
+    auto const types = reconcile_input_types(inputs, op.types, name);
     return plan_set_operation_all(
       op.type,
       std::move(inputs),
-      output_types,
+      types,
       op.estimated_cardinality,
       {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
   }
+
+  auto const output_types = sirius::from_duckdb_vec(op.types);
 
   auto conditions = sirius::wrap_join_conditions(null_safe_column_conditions(op.types));
   if (!sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions,
