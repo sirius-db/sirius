@@ -1,3 +1,8 @@
+# The public configuration tests use std::expected; other tests use C++20.
+set_source_files_properties(
+  test/cpp/config/test_context_config.cpp
+  PROPERTIES COMPILE_OPTIONS "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
+
 find_package(Catch2 3 REQUIRED CONFIG)
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -59,7 +64,7 @@ target_link_options(sirius_nvtx_startup PRIVATE
 set_target_properties(
   sirius_nvtx_startup
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 add_dependencies(sirius_unittest sirius_nvtx_startup)
@@ -82,7 +87,7 @@ target_link_options(sirius_unittest PRIVATE
 set_target_properties(
   sirius_unittest
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 
@@ -135,7 +140,7 @@ target_link_options(parquet_benchmark PRIVATE
 set_target_properties(
   parquet_benchmark
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -178,7 +183,7 @@ target_link_options(prefetch_benchmark PRIVATE
 set_target_properties(
   prefetch_benchmark
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -225,7 +230,7 @@ target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
 set_target_properties(
   prefetch_hybrid_scan_benchmark
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -268,7 +273,7 @@ target_link_options(columnar_parquet_poc PRIVATE
 set_target_properties(
   columnar_parquet_poc
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -311,7 +316,7 @@ target_link_options(retirer_benchmark PRIVATE
 set_target_properties(
   retirer_benchmark
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -355,7 +360,7 @@ target_link_options(s3_throughput_test PRIVATE
 set_target_properties(
   s3_throughput_test
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -402,7 +407,7 @@ target_link_options(s3_autotune_throughput_bench PRIVATE
 set_target_properties(
   s3_autotune_throughput_bench
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
 
@@ -447,6 +452,6 @@ target_link_options(range_prefetch_benchmark PRIVATE
 set_target_properties(
   range_prefetch_benchmark
   PROPERTIES CXX_SCAN_FOR_MODULES OFF
-             CXX_STANDARD 23
+             CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

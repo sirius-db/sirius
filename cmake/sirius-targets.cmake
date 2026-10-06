@@ -1,3 +1,14 @@
+if(NOT "cxx_std_23" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
+  message(FATAL_ERROR "The Sirius public API requires a C++23 compiler")
+endif()
+
+# Only the public configuration implementation needs std::expected. Keep engine
+# sources at C++20 for dependency headers that do not compile as C++23 with
+# Clang.
+set_source_files_properties(
+  src/context_config.cpp PROPERTIES COMPILE_OPTIONS
+                                    "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
+
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
@@ -112,7 +123,7 @@ foreach(_target sirius_objects sirius_core sirius_extension
   set_target_properties(
     ${_target}
     PROPERTIES CXX_SCAN_FOR_MODULES OFF
-               CXX_STANDARD 23
+               CXX_STANDARD 20
                CXX_STANDARD_REQUIRED ON
                CUDA_STANDARD 20
                CUDA_STANDARD_REQUIRED ON
@@ -234,7 +245,7 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-target_compile_features(sirius_shared PUBLIC cxx_std_23)
+target_compile_features(sirius_shared INTERFACE cxx_std_23)
 # Installed static consumers use the public headers too. Keep this requirement
 # out of DuckDB's in-tree build graph.
 foreach(_target sirius_core sirius_extension)
@@ -292,7 +303,6 @@ if(SIRIUS_BUILD_STATIC)
       parquet_extension
       "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
   )
-  target_compile_features(sirius_core PUBLIC cxx_std_23)
   target_link_options(
     sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
     "LINKER:--allow-multiple-definition")
