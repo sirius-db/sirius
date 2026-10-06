@@ -495,8 +495,10 @@ TEST_CASE("puffin reader rejects a descriptor whose 'fields' is not a list of in
   REQUIRE(read(synthetic_ref(populated, blob)) == std::vector<int64_t>{5});
 }
 
-TEST_CASE("Charged Puffin results use retained backing and free temporary buffers before W returns",
-          "[r2b][iceberg][charged_reader]")
+TEST_CASE(
+  "Charged Puffin results retain backing until release and free temporary memory before returning "
+  "its permit",
+  "[scan_preparation][iceberg][charged_reader]")
 {
   using namespace sirius::scan_manager;
   test::test_reservation_provider provider;
@@ -525,7 +527,7 @@ TEST_CASE("Charged Puffin results use retained backing and free temporary buffer
 }
 
 TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets and runs",
-          "[r2b][iceberg][charged_reader]")
+          "[scan_preparation][iceberg][charged_reader]")
 {
   auto shape = GENERATE(0, 1, 2, 3);
   roaring::Roaring bitmap;
@@ -559,7 +561,7 @@ TEST_CASE("Charged Roaring expansion agrees with CRoaring for arrays, bitsets an
 }
 
 TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files",
-          "[r2b][iceberg][charged_reader][failure]")
+          "[scan_preparation][iceberg][charged_reader][failure]")
 {
   auto corrupt = GENERATE(false, true);
   auto ref     = fixture_ref();
@@ -582,5 +584,87 @@ TEST_CASE("Charged Puffin failures distinguish corrupt input from missing files"
       CHECK(std::string(error.what()).find("referenced-data-file") != std::string::npos);
     } else
       CHECK(std::string(error.what()).find("Cannot open file") != std::string::npos);
+  }
+}
+
+TEST_CASE("Charged Puffin matches legacy Roaring validation and diagnostics",
+          "[scan_preparation][iceberg][charged_reader]")
+{
+  auto scenario = GENERATE(std::string("bitset_under"),
+                           std::string("bitset_over"),
+                           std::string("array_order"),
+                           std::string("key_order"),
+                           std::string("run_empty"),
+                           std::string("run_overflow"),
+                           std::string("run_overlap"),
+                           std::string("run_adjacent"),
+                           std::string("bitmap_budget"),
+                           std::string("late_corruption"),
+                           std::string("run_header"));
+  CAPTURE(scenario);
+  int64_t declared = 1;
+  std::vector<uint8_t> blob;
+  if (scenario.starts_with("bitset")) {
+    declared = 4098;
+    blob     = build_dv_blob_bitset(declared, scenario == "bitset_under" ? 65536 : 1);
+  } else {
+    std::vector<uint8_t> bitmap;
+    if (scenario.starts_with("run")) {
+      push_u32_le(bitmap, 12347);
+      bitmap.push_back(1);
+      push_u16_le(bitmap, 0);
+      push_u16_le(bitmap, 0);
+      push_u16_le(bitmap, scenario == "run_empty" ? 0 : scenario == "run_header" ? 1 : 2);
+      if (scenario != "run_empty") {
+        push_u16_le(bitmap, scenario == "run_overflow" ? 65535 : 1);
+        push_u16_le(bitmap, 1);
+        if (scenario != "run_header") {
+          push_u16_le(bitmap, scenario == "run_adjacent" ? 3 : 2);
+          push_u16_le(bitmap, 0);
+        } else {
+          declared = 2;
+        }
+      }
+    } else {
+      push_u32_le(bitmap, 12346);
+      push_u32_le(bitmap, 2);
+      push_u16_le(bitmap, 0);
+      push_u16_le(bitmap, 1);
+      push_u16_le(bitmap, scenario == "key_order" ? 0 : 1);
+      push_u16_le(bitmap, 1);
+      push_u32_le(bitmap, 24);
+      push_u32_le(bitmap, 28);
+      push_u16_le(bitmap, 5);
+      push_u16_le(bitmap, scenario == "array_order" ? 4 : 6);
+      push_u16_le(bitmap, 5);
+      push_u16_le(bitmap, scenario == "late_corruption" ? 4 : 6);
+      declared = scenario == "bitmap_budget" || scenario == "late_corruption" ? 3 : 4;
+    }
+    std::vector<uint8_t> checksummed = {0xD1, 0xD3, 0x39, 0x64};
+    for (int i = 0; i < 8; ++i)
+      checksummed.push_back(i == 0 ? 1 : 0);
+    push_u32_le(checksummed, 0);
+    checksummed.insert(checksummed.end(), bitmap.begin(), bitmap.end());
+    push_u32_be(blob, static_cast<uint32_t>(checksummed.size()));
+    blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+    push_u32_be(blob, crc32_of(checksummed));
+  }
+  auto path  = write_puffin(blob, "diagnostic_" + scenario, declared);
+  auto ref   = synthetic_ref(path, blob, declared);
+  auto error = [&](bool charged) {
+    try {
+      (void)read_for_test(ref, charged);
+    } catch (std::runtime_error const& e) {
+      return std::string(e.what());
+    }
+    return std::string{};
+  };
+  if (scenario == "run_header") {
+    CHECK(read_for_test(ref, false) == std::vector<int64_t>{1, 2});
+    CHECK(read_for_test(ref, true) == read_for_test(ref, false));
+  } else {
+    auto legacy = error(false);
+    REQUIRE_FALSE(legacy.empty());
+    CHECK(error(true) == legacy);
   }
 }

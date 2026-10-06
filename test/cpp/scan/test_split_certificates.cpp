@@ -544,7 +544,7 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
 }
 
 TEST_CASE("File bounded cursors preserve batching and partial emission never fabricates EOS",
-          "[r2b][coalescer][parquet_certificate]")
+          "[scan_preparation][coalescer][parquet_certificate]")
 {
   auto const iceberg = GENERATE(false, true);
   CAPTURE(iceberg);
@@ -1357,7 +1357,7 @@ TEST_CASE("Native consumption rejects shuffled groups and missing iteration evid
 }
 
 TEST_CASE("Production scan preparation runs and publishes on the execute owner",
-          "[integration][scan][certificate][r2b_production_owner]")
+          "[integration][scan][certificate][scan_preparation][query_thread]")
 {
   sirius::test::GpuExecutionFixture fixture;
   auto& con = *fixture.con;
@@ -1424,7 +1424,7 @@ std::unique_ptr<iceberg_ingestible_table_info> iceberg_info(
 }  // namespace
 
 TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
-          "[r2b][iceberg][delete_set][parquet_certificate]")
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
 {
   auto const alias  = std::string{GENERATE("exact", "file_uri", "suffix")};
   auto const legacy = GENERATE(false, true);
@@ -1501,7 +1501,7 @@ TEST_CASE("Iceberg legacy results become complete per-file split dependencies",
 }
 
 TEST_CASE("Iceberg per-file input distinguishes complete empty results from missing results",
-          "[r2b][iceberg][delete_set][parquet_certificate]")
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
 {
   sirius::test::scoped_sirius_disable disable;
   auto const path = parquet_info(53)->resolved_file_paths.front();
@@ -1556,7 +1556,7 @@ TEST_CASE("Iceberg per-file input distinguishes complete empty results from miss
 }
 
 TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-delete errors",
-          "[r2b][iceberg][delete_set][parquet_certificate]")
+          "[scan_preparation][iceberg][delete_set][parquet_certificate]")
 {
   auto const legacy = GENERATE(false, true);
   CAPTURE(legacy);
@@ -1634,7 +1634,7 @@ TEST_CASE("Iceberg per-file adaptation preserves path ambiguity and unsupported-
 }
 
 TEST_CASE("Iceberg materialization refuses missing or replaced delete dependencies before decode",
-          "[r2b][iceberg][consumer_guard][integration]")
+          "[scan_preparation][iceberg][consumer_guard][integration]")
 {
   auto const defect =
     std::string{GENERATE("valid", "missing", "wrong_file", "replacement", "pushdown")};

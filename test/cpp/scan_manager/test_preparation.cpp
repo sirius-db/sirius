@@ -26,7 +26,8 @@
 using sirius::pipeline::completion_handler;
 using namespace std::chrono_literals;
 
-TEST_CASE("GPU success waits for preparation closure and physical quiescence", "[r2b][preparation]")
+TEST_CASE("GPU success waits for preparation closure and physical quiescence",
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();
@@ -40,7 +41,8 @@ TEST_CASE("GPU success waits for preparation closure and physical quiescence", "
   CHECK_NOTHROW(future.get());
 }
 
-TEST_CASE("Preparation failure wakes the query without a coordinator event", "[r2b][preparation]")
+TEST_CASE("Preparation failure wakes the query without a coordinator event",
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();
@@ -52,7 +54,8 @@ TEST_CASE("Preparation failure wakes the query without a coordinator event", "[r
   CHECK(handler.has_error());
 }
 
-TEST_CASE("Queries without preparation still complete immediately", "[r2b][preparation]")
+TEST_CASE("Queries without preparation still complete immediately",
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();
@@ -61,7 +64,7 @@ TEST_CASE("Queries without preparation still complete immediately", "[r2b][prepa
   CHECK_NOTHROW(future.get());
 }
 
-TEST_CASE("Preparation quiescence alone is not input closure", "[r2b][preparation]")
+TEST_CASE("Preparation quiescence alone is not input closure", "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();
@@ -73,14 +76,16 @@ TEST_CASE("Preparation quiescence alone is not input closure", "[r2b][preparatio
   REQUIRE(future.wait_for(0ms) == std::future_status::ready);
   CHECK_NOTHROW(future.get());
 }
-TEST_CASE("Preparation cannot register after GPU work or terminal success", "[r2b][preparation]")
+TEST_CASE("Preparation cannot register after GPU work or terminal success",
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   handler.mark_completed();
   CHECK_THROWS_AS(handler.begin_preparation(), std::logic_error);
 }
 
-TEST_CASE("Preparation can finish before GPU without declaring query success", "[r2b][preparation]")
+TEST_CASE("Preparation can finish before GPU without declaring query success",
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();
@@ -96,7 +101,7 @@ TEST_CASE("Preparation can finish before GPU without declaring query success", "
 }
 
 TEST_CASE("GPU completion racing preparation failure cannot bypass an open gate",
-          "[r2b][preparation]")
+          "[scan_preparation][completion]")
 {
   for (int iteration = 0; iteration < 50; ++iteration) {
     completion_handler handler;
@@ -122,7 +127,7 @@ TEST_CASE("GPU completion racing preparation failure cannot bypass an open gate"
 }
 
 TEST_CASE("Cancellation wakes an armed query before preparation input closure",
-          "[r2b][preparation]")
+          "[scan_preparation][completion]")
 {
   completion_handler handler;
   auto future = handler.get_awaitable();

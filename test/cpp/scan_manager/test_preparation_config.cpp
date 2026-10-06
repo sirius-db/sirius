@@ -22,7 +22,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 TEST_CASE("Preparation options have finite defaults and preserve explicit internal overrides",
-          "[r2b][preparation_config]")
+          "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
   config.thread_pool.num_threads = 3;
@@ -60,7 +60,7 @@ TEST_CASE("Preparation options have finite defaults and preserve explicit intern
   CHECK(snapshot.max_inflight_jobs == 2);  // independent attempt value
 }
 TEST_CASE("Invalid preparation options fail before constructing a scan manager",
-          "[r2b][preparation_config]")
+          "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
   SECTION("zero jobs") { config.preparation.max_inflight_jobs = 0; }
@@ -82,7 +82,7 @@ TEST_CASE("Invalid preparation options fail before constructing a scan manager",
 }
 
 TEST_CASE("Manager construction validates preparation before creating worker or IO state",
-          "[r2b][preparation_config]")
+          "[scan_preparation][preparation_config]")
 {
   cucascade::memory::host_memory_space_config host_config;
   host_config.numa_id              = 0;

@@ -1278,8 +1278,8 @@ void start_guarded_write_transaction(duckdb::ClientContext& outer,
 
 }  // namespace
 
-TEST_CASE("R2b internal write start rejects the owning window checkpoint key",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Internal write start rejects the owning window checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_write'");
@@ -1310,8 +1310,8 @@ TEST_CASE("R2b internal write start rejects the owning window checkpoint key",
   REQUIRE_NOTHROW(duckdb::SiriusContext::open_internal_connection(outer));
 }
 
-TEST_CASE("R2b internal read-only helper works while its window holds a checkpoint key",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Internal read-only helper works while its window holds a checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   auto& outer = *fixture.con->context;
@@ -1334,8 +1334,8 @@ TEST_CASE("R2b internal read-only helper works while its window holds a checkpoi
   CHECK(fixture.context->get_scan_manager().checkpoint_key_count() == 0);
 }
 
-TEST_CASE("R2b internal guard allows a database without this window checkpoint key",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Internal guard allows a database without this window checkpoint key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   auto& outer = *fixture.con->context;
@@ -1354,8 +1354,8 @@ TEST_CASE("R2b internal guard allows a database without this window checkpoint k
   query_ok(internal, "ROLLBACK");
 }
 
-TEST_CASE("R2b internal guard does not borrow another connection window key",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Internal guard does not borrow another connection window key",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   duckdb::Connection other(*fixture.con->context->db);
@@ -1372,8 +1372,8 @@ TEST_CASE("R2b internal guard does not borrow another connection window key",
   window.finish();
 }
 
-TEST_CASE("R2b internal guard consults only the owning query key record",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Internal guard consults only the owning query key record",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   auto& outer = *fixture.con->context;
@@ -1396,8 +1396,8 @@ TEST_CASE("R2b internal guard consults only the owning query key record",
   CHECK(manager.checkpoint_key_count(other_query) == 1);
 }
 
-TEST_CASE("R2b unfinished window clears its internal transaction guard association",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Unfinished window clears its internal transaction guard association",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   auto& outer = *fixture.con->context;
@@ -1414,8 +1414,8 @@ TEST_CASE("R2b unfinished window clears its internal transaction guard associati
   REQUIRE_NOTHROW(duckdb::SiriusContext::open_internal_connection(outer));
 }
 
-TEST_CASE("R2b component write probe without a key never exposes a writable helper",
-          "[r2b_internal_guard][scan][checkpoint][integration]")
+TEST_CASE("Component write probe without a key never exposes a writable helper",
+          "[scan_preparation][internal_transaction_guard][scan][checkpoint][integration]")
 {
   InternalStartFixture fixture;
   query_ok(*fixture.con, "SET sirius_test_internal_start_mode = 'read_write'");

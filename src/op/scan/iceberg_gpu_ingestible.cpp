@@ -173,8 +173,7 @@ std::shared_ptr<iceberg_delete_set const> read_prepared_delete_set(
   return set;
 }
 
-void attach_prepared_delete_set(parquet_file_scan_info& file,
-                                std::shared_ptr<iceberg_delete_set const> set)
+void attach_delete_set(parquet_file_scan_info& file, std::shared_ptr<iceberg_delete_set const> set)
 {
   auto deps =
     std::vector<split_dependencies>(file.dependencies().begin(), file.dependencies().end());
@@ -222,26 +221,14 @@ gpu_ingestible::metadata_scan_task_t iceberg_gpu_ingestible::next_split_provider
         auto& descriptor  = prepared->files[index];
         auto set          = read_prepared_delete_set(*prepared, descriptor, held->permit, counters);
         descriptor.result = set;
-        attach_prepared_delete_set(file, std::move(set));
+        attach_delete_set(file, std::move(set));
         return metadata;
       };
   }
   return [work = std::move(work), sets = _delete_sets]() {
-    auto metadata  = work();
-    auto& file     = dynamic_cast<parquet_file_scan_info&>(*metadata);
-    auto const set = sets->at(file.file_path);
-    auto dependencies =
-      std::vector<split_dependencies>(file.dependencies().begin(), file.dependencies().end());
-    if (dependencies.size() != 1) {
-      throw sirius::internal_exception(
-        "[iceberg_gpu_ingestible] parquet file requires one delete-set dependency");
-    }
-    dependencies.front().delete_set = set;
-    file.set_contract_payload(file.contract_id(),
-                              std::vector<split_materializer_certificate>(
-                                file.certificates().begin(), file.certificates().end()),
-                              std::move(dependencies));
-    file.disable_filter_pushdown |= !set->positions.empty();
+    auto metadata = work();
+    auto& file    = dynamic_cast<parquet_file_scan_info&>(*metadata);
+    attach_delete_set(file, sets->at(file.file_path));
     return metadata;
   };
 }

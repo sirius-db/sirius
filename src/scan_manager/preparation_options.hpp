@@ -22,7 +22,7 @@
 #include <stdexcept>
 
 namespace sirius::scan_manager {
-// Intentionally unset until T-C measures and fixes the production value before activation.
+// Intentionally unset until performance measurements establish a production wait limit.
 inline constexpr std::optional<std::chrono::milliseconds> k_underfilled_batch_residence =
   std::nullopt;
 struct preparation_options {

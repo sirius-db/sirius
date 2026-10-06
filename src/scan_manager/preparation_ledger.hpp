@@ -19,7 +19,6 @@
 
 #include <cucascade/memory/common.hpp>
 
-#include <functional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -211,10 +210,4 @@ struct scan_dv_count {
 };
 bool statement_dv_route_allowed(std::span<scan_dv_count const>);
 bool statement_dv_route_allowed(std::span<scan_dv_count const>, uint64_t limit);
-// Parser-specific proofs are supplied only by a qualified profile; absent proofs stay legacy.
-using envelope_bound = std::function<std::optional<uint64_t>(uint64_t, uint64_t)>;
-std::optional<uint64_t> footer_envelope(uint64_t file_size, envelope_bound const& proof = {});
-std::optional<uint64_t> roaring_envelope(uint64_t encoded_size,
-                                         uint64_t record_count,
-                                         envelope_bound const& proof = {});
 }  // namespace sirius::scan_manager

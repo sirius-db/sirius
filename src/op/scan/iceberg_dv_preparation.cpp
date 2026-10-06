@@ -112,7 +112,8 @@ iceberg_dv_preparation::iceberg_dv_preparation(
   auto bytes = arena_bytes(paths);
   owner.register_unit({id, 0}, bytes);
   auto permit = owner.acquire_permit({id, 0});
-  if (bytes && !permit) throw std::logic_error("descriptor arena requires the admitted W permit");
+  if (bytes && !permit)
+    throw std::logic_error("descriptor arena requires an admitted temporary-memory permit");
   storage_ = std::make_shared<storage>();
   if (bytes) storage_->arena = owner.allocator(permit).allocate_retained(bytes);
   auto* records      = reinterpret_cast<file*>(storage_->arena.data());

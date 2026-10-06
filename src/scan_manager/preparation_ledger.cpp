@@ -136,7 +136,7 @@ struct permit_state {
 namespace {
 struct allocation_owner {
   std::shared_ptr<ledger_state> ledger;
-  std::shared_ptr<permit_state> permit;  // Only temporary buffers keep the W permit alive.
+  std::shared_ptr<permit_state> permit;  // Only temporary buffers keep the memory permit alive.
   unit_key key;
   uint64_t charge;
   bool retained;
@@ -281,7 +281,7 @@ void w_permit::release() noexcept
 charging_allocator preparation_ledger::allocator(w_permit const& permit)
 {
   if (!permit.state_ || permit.state_->ledger != state_)
-    throw std::invalid_argument("foreign or empty W permit");
+    throw std::invalid_argument("foreign or empty temporary-memory permit");
   return charging_allocator(permit.state_);
 }
 charged_block charging_allocator::allocate(uint64_t bytes) { return allocate_impl(bytes, false); }
@@ -292,7 +292,7 @@ charged_block charging_allocator::allocate_retained(uint64_t bytes)
 charged_block charging_allocator::allocate_impl(uint64_t bytes, bool retained)
 {
   auto permit = state_.lock();
-  if (!permit) throw std::logic_error("released W permit");
+  if (!permit) throw std::logic_error("released temporary-memory permit");
   auto ledger     = permit->ledger;
   uint64_t charge = 0;
   {
@@ -422,15 +422,5 @@ bool statement_dv_route_allowed(std::span<scan_dv_count const> scans, uint64_t l
     total += scan.live_positions;
   }
   return true;
-}
-std::optional<uint64_t> footer_envelope(uint64_t file_size, envelope_bound const& proof)
-{
-  return proof ? proof(file_size, 0) : std::nullopt;
-}
-std::optional<uint64_t> roaring_envelope(uint64_t encoded_size,
-                                         uint64_t record_count,
-                                         envelope_bound const& proof)
-{
-  return proof ? proof(encoded_size, record_count) : std::nullopt;
 }
 }  // namespace sirius::scan_manager

@@ -28,10 +28,6 @@
 #include <memory>
 #include <optional>
 
-namespace sirius::scan_manager {
-class preparation_admission;
-}
-
 namespace sirius::op::scan {
 class iceberg_ingestible_table_info;
 }
@@ -92,8 +88,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
   ~sirius_physical_table_scan() override;
 
-  // All scans reference one statement admission owner.
-  std::shared_ptr<scan_manager::preparation_admission> preparation_admission;
   std::unique_ptr<scan::iceberg_ingestible_table_info> prepared_iceberg_info;
 
   //! The table function

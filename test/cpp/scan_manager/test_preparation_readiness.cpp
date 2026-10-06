@@ -229,7 +229,7 @@ struct fixture {
 };
 }  // namespace
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto a   = std::make_shared<accumulator>();
@@ -261,7 +261,7 @@ TEST_CASE("Ready partial batches publish while every preparation worker is block
                        << ", deadline late us=" << stats.max_deadline_lateness.count());
 }
 TEST_CASE("First retained data arms an absolute deadline and pruned results never reset it",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   accumulator a;
   auto origin = accumulator::clock::time_point{} + 100ms;
@@ -288,7 +288,8 @@ TEST_CASE("First retained data arms an absolute deadline and pruned results neve
   CHECK_FALSE(a.partial_emit());
   CHECK_FALSE(a.first_retained_time());
 }
-TEST_CASE("Continuous small completion events cannot starve the deadline", "[r2b][coordinator]")
+TEST_CASE("Continuous small completion events cannot starve the deadline",
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -310,7 +311,7 @@ TEST_CASE("Continuous small completion events cannot starve the deadline", "[r2b
   CHECK(f.coordinator.snapshot().partial_emissions > 0);
 }
 TEST_CASE("A partial emission is not EOS and subsequent input forms another batch",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -338,7 +339,7 @@ TEST_CASE("A partial emission is not EOS and subsequent input forms another batc
   CHECK(out->published == std::vector<int>{0, 1});
 }
 TEST_CASE("Publication is refused after cancellation wins during input construction",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out          = std::make_shared<sink>();
@@ -365,7 +366,7 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -402,7 +403,7 @@ TEST_CASE("Unresolved typed input forbids scan input construction until the whol
 }
 TEST_CASE(
   "A full output window bounds jobs, results and file fan-out without blocking worker settlement",
-  "[r2b][coordinator]")
+  "[scan_preparation][coordinator]")
 {
   fixture f(2, 1);
   auto out = std::make_shared<sink>();
@@ -428,7 +429,7 @@ TEST_CASE(
   CHECK(out->count() == 1);
 }
 TEST_CASE("Claim and partial submission failures release reserved completion slots",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out       = std::make_shared<sink>();
@@ -474,7 +475,8 @@ TEST_CASE("Claim and partial submission failures release reserved completion slo
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 
-TEST_CASE("Non-cancellable reads keep their owner alive until drain finishes", "[r2b][coordinator]")
+TEST_CASE("Non-cancellable reads keep their owner alive until drain finishes",
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -502,7 +504,7 @@ TEST_CASE("Non-cancellable reads keep their owner alive until drain finishes", "
   CHECK(f.coordinator.snapshot().runs == 1);
 }
 TEST_CASE("GPU completion without a ready event still stops preparation and settles success",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out  = std::make_shared<sink>();
@@ -530,7 +532,7 @@ TEST_CASE("GPU completion without a ready event still stops preparation and sett
   CHECK(out->count() == 0);
 }
 TEST_CASE("A deterministic clock drives the coordinator at the original absolute deadline",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out      = std::make_shared<sink>();
@@ -574,7 +576,8 @@ TEST_CASE("A deterministic clock drives the coordinator at the original absolute
   std::this_thread::sleep_for(5ms);
   CHECK(out->count() == 1);
 }
-TEST_CASE("Cancel racing with a deadline never publishes after stop returns", "[r2b][coordinator]")
+TEST_CASE("Cancel racing with a deadline never publishes after stop returns",
+          "[scan_preparation][coordinator]")
 {
   for (int iteration = 0; iteration < 12; ++iteration) {
     fixture f;
@@ -607,7 +610,7 @@ TEST_CASE("Cancel racing with a deadline never publishes after stop returns", "[
 }
 
 TEST_CASE("A unit failed before execution start remains the original terminal failure",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   required_input_set required;
@@ -628,7 +631,8 @@ TEST_CASE("A unit failed before execution start remains the original terminal fa
   CHECK(f.coordinator.unit_state_snapshot({12, 1})->state == unit_state::failed);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
-TEST_CASE("GPU completion cannot hide an accepted preparation failure", "[r2b][coordinator]")
+TEST_CASE("GPU completion cannot hide an accepted preparation failure",
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out     = std::make_shared<sink>();
@@ -658,7 +662,7 @@ TEST_CASE("GPU completion cannot hide an accepted preparation failure", "[r2b][c
 }
 
 TEST_CASE("Later scans cannot consume the last output credit needed by the first scan",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f(2, 2);
   auto first = std::make_shared<sink>(), later = std::make_shared<sink>();
@@ -693,7 +697,7 @@ TEST_CASE("Later scans cannot consume the last output credit needed by the first
 
 TEST_CASE(
   "Query driver is armed before consumers and runs on its owner without waiting for success",
-  "[r2b][coordinator]")
+  "[scan_preparation][coordinator]")
 {
   sirius::exec::static_thread_pool pool(1);
   sirius::exec::scoped_dispatcher dispatcher(pool);
@@ -716,7 +720,7 @@ TEST_CASE(
   c.drain();
 }
 TEST_CASE("Cancellation or startup failure before run drains without starting jobs",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   sirius::exec::static_thread_pool pool(1);
   sirius::exec::scoped_dispatcher dispatcher(pool);
@@ -747,7 +751,7 @@ TEST_CASE("Cancellation or startup failure before run drains without starting jo
 }
 
 TEST_CASE("Expired partial batch parks at a full output window and resumes on consumption",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   struct retaining_coalescer : accumulator {
     retaining_coalescer() : accumulator(1) {}
@@ -794,7 +798,7 @@ TEST_CASE("Expired partial batch parks at a full output window and resumes on co
   CHECK_FALSE(out->closed);
 }
 TEST_CASE("Construction and publication failures drain once and preserve the first error",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out       = std::make_shared<sink>();
@@ -862,7 +866,7 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
 }
 
 TEST_CASE("An accepted failure callback drains before GPU completion can publish success",
-          "[r2b][coordinator][callback_drain]")
+          "[scan_preparation][coordinator][callback_drain]")
 {
   fixture f;
   auto out      = std::make_shared<sink>();
@@ -922,7 +926,7 @@ TEST_CASE("An accepted failure callback drains before GPU completion can publish
 }
 
 TEST_CASE("Exhausted enumeration cannot close before accepted out-of-order results drain",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out   = std::make_shared<sink>();
@@ -952,7 +956,7 @@ TEST_CASE("Exhausted enumeration cannot close before accepted out-of-order resul
   CHECK(out->published == std::vector<int>{1, 0});
 }
 TEST_CASE("A single result and output slot preserves progress across multiple scans",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f(1, 1);
   auto first = std::make_shared<sink>(), last = std::make_shared<sink>();
@@ -983,7 +987,7 @@ TEST_CASE("A single result and output slot preserves progress across multiple sc
 }
 
 TEST_CASE("Physical external users delay quiescence after success or cancellation",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -1019,7 +1023,7 @@ TEST_CASE("Physical external users delay quiescence after success or cancellatio
 }
 
 TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner",
-          "[r2b][coordinator]")
+          "[scan_preparation][coordinator]")
 {
   fixture f;
   auto out = std::make_shared<sink>();
@@ -1057,8 +1061,9 @@ TEST_CASE("Cancelling a pending unit synchronizes with and wakes the query owner
 }
 
 TEST_CASE(
-  "W exhaustion delays claims without closing the source, and cancellation drains charged results",
-  "[r2b][coordinator][ledger]")
+  "Temporary-memory exhaustion delays claims without closing the source; cancellation drains "
+  "charged results",
+  "[scan_preparation][coordinator][ledger]")
 {
   auto cancel = GENERATE(false, true);
   fixture f;

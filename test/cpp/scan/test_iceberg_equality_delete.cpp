@@ -315,7 +315,7 @@ TEST_CASE("iceberg delete pipeline - refuses a batch that is all appended keys",
 }
 
 TEST_CASE("Iceberg per-file positional filters preserve multi-file row positions",
-          "[r2b][iceberg][positional_filter]")
+          "[scan_preparation][iceberg][positional_filter]")
 {
   auto const legacy = GENERATE(false, true);
   CAPTURE(legacy);

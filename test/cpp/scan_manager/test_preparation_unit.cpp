@@ -35,7 +35,8 @@ required_input_set needs(required_input input)
   return set;
 }
 }  // namespace
-TEST_CASE("A pending delete set must not be interpreted as no deletes", "[r2b][preparation_unit]")
+TEST_CASE("A pending delete set must not be interpreted as no deletes",
+          "[scan_preparation][preparation_unit]")
 {
   preparation_unit unit({3, 4}, needs(required_input::delete_set));
   CHECK(unit.record().state == unit_state::pending);
@@ -52,7 +53,7 @@ TEST_CASE("A pending delete set must not be interpreted as no deletes", "[r2b][p
   CHECK(unit.record().deps == ready.deps);
 }
 TEST_CASE("Required inputs are derived from actual scan checks and arrive in any order",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   sirius::op::scan::later_check_set checks;
   checks.set(static_cast<size_t>(sirius::op::scan::later_check::segments_per_range));
@@ -72,7 +73,7 @@ TEST_CASE("Required inputs are derived from actual scan checks and arrive in any
   CHECK_FALSE(unit.complete_input(checkpoint_input{8}));
   CHECK(unit.record().deps->checkpoint_iteration == 7);
 }
-TEST_CASE("Preparation terminal races commit exactly once", "[r2b][preparation_unit]")
+TEST_CASE("Preparation terminal races commit exactly once", "[scan_preparation][preparation_unit]")
 {
   for (int iteration = 0; iteration < 50; ++iteration) {
     preparation_unit unit({1, 1}, needs(required_input::delete_set));
@@ -95,7 +96,7 @@ TEST_CASE("Preparation terminal races commit exactly once", "[r2b][preparation_u
   }
 }
 TEST_CASE("Failure carriers preserve the original exception and reject invalid verdict reasons",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   preparation_failure failure{sirius::transparent::late_failure_cause::resource,
                               {},
@@ -113,7 +114,7 @@ TEST_CASE("Failure carriers preserve the original exception and reject invalid v
   CHECK_NOTHROW(failure.validate());
 }
 TEST_CASE("Typed preparation errors retain their cause and wake before GPU completion",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   sirius::pipeline::completion_handler completion;
   auto future = completion.get_awaitable();
@@ -130,7 +131,7 @@ TEST_CASE("Typed preparation errors retain their cause and wake before GPU compl
   CHECK(completion.has_error());
 }
 TEST_CASE("Cancellation and failure wake independently of preparation closure",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   for (int iteration = 0; iteration < 50; ++iteration) {
     sirius::pipeline::completion_handler completion;
@@ -162,7 +163,7 @@ TEST_CASE("Cancellation and failure wake independently of preparation closure",
 }
 
 TEST_CASE("Typed physical failure keeps the terminal winner's verdict reason",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   sirius::pipeline::completion_handler completion;
   auto future = completion.get_awaitable();
@@ -179,7 +180,7 @@ TEST_CASE("Typed physical failure keeps the terminal winner's verdict reason",
   CHECK(completion.failure().cause == sirius::transparent::late_failure_cause::physical_input);
 }
 TEST_CASE("Footer completion retains its independent metadata and approval owners",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   unit_record snapshot;
   auto footer = std::make_shared<cudf::io::parquet::FileMetaData>();
@@ -200,7 +201,7 @@ TEST_CASE("Footer completion retains its independent metadata and approval owner
 }
 
 TEST_CASE("Late preparation payloads are released and cannot replace a terminal result",
-          "[r2b][preparation_unit]")
+          "[scan_preparation][preparation_unit]")
 {
   preparation_unit unit({4, 5}, needs(required_input::delete_set));
   REQUIRE(unit.cancel());
@@ -213,7 +214,7 @@ TEST_CASE("Late preparation payloads are released and cannot replace a terminal 
 }
 
 TEST_CASE("Delete result validation rejects invalid positions and releases its real backing",
-          "[r2b][ledger][delete_set]")
+          "[scan_preparation][ledger][delete_set]")
 {
   sirius::scan_manager::test::test_reservation_provider provider;
   preparation_ledger ledger(provider);

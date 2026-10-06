@@ -3354,8 +3354,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2b qualifying DV work starts on workers after lowering and before decode",
-                 "[integration][r2b][iceberg][deferred]")
+                 "Qualifying DV work starts on workers after lowering and before decode",
+                 "[integration][scan_preparation][iceberg][deferred]")
 {
   auto table    = inventory_fixture("dv_bounded");
   auto counters = sirius::test::get_registered_sirius_context(*con)->physical_counters();
@@ -3403,8 +3403,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2b unsuccessful HOST admission selects legacy without rejecting the scan",
-                 "[integration][r2b][iceberg][admission]")
+                 "Unsuccessful HOST admission selects legacy without rejecting the scan",
+                 "[integration][scan_preparation][iceberg][admission]")
 {
   auto fault            = GENERATE(0, 1, 2);
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
@@ -3436,10 +3436,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(provider->outstanding() == 0);
 }
 
-TEST_CASE_METHOD(
-  GPUExecutionIcebergFixture,
-  "R2b execution allocation failure keeps its resource cause and existing replay policy",
-  "[integration][r2b][iceberg][resource]")
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Execution allocation failure keeps its resource cause and existing replay policy",
+                 "[integration][scan_preparation][iceberg][resource]")
 {
   auto fallback = GENERATE(false, true);
   sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
@@ -3483,8 +3482,8 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2b first files decode while the third DV is still being prepared",
-                 "[integration][r2b][iceberg][overlap]")
+                 "First files decode while the third DV is still being prepared",
+                 "[integration][scan_preparation][iceberg][overlap]")
 {
   sirius::test::scoped_setting no_fallback(*con, "enable_duckdb_fallback", false);
   sirius::test::scoped_setting one_byte_scan_batch(*con, "scan_task_batch_size", 1);
@@ -3526,10 +3525,9 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   CHECK(overlapped);
 }
 
-TEST_CASE_METHOD(
-  GPUExecutionIcebergFixture,
-  "R2b a statement admits all DV scans once or keeps all legacy and releases idle plans",
-  "[integration][r2b][iceberg][statement_admission]")
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "A statement admits all DV scans once or keeps all legacy and releases idle plans",
+                 "[integration][scan_preparation][iceberg][statement_admission]")
 {
   auto limit            = GENERATE(7u, 8u);
   auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
@@ -3609,8 +3607,8 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
-                 "R2b DV failure drains queued GPU users before releasing binding inputs",
-                 "[integration][r2b][iceberg][drain]")
+                 "DV failure drains queued GPU users before releasing binding inputs",
+                 "[integration][scan_preparation][iceberg][drain]")
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
   sirius::test::scoped_setting small_batch(*con, "scan_task_batch_size", 1);
@@ -3646,4 +3644,82 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   REQUIRE(result);
   REQUIRE_FALSE(result->HasError());
   CHECK(result->RowCount() == 9);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "GPU prepared statements own and renew deferred reservations",
+                 "[integration][scan_preparation][iceberg][prepared_statement]")
+{
+  REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback=false")->HasError());
+  auto provider         = std::make_shared<sirius::scan_manager::test::test_reservation_provider>();
+  provider->grant_bytes = 1024 * 1024;
+  auto counters         = sirius::test::get_registered_sirius_context(*con)->physical_counters();
+  std::atomic<unsigned> dv_reads{0};
+  struct reset_hooks {
+    decltype(counters) value;
+    ~reset_hooks()
+    {
+      value->preparation_provider_for_testing.reset();
+      value->iceberg_dv_phase_for_testing = {};
+    }
+  } reset{counters};
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
+    if (start) ++dv_reads;
+  };
+  auto table    = inventory_fixture("dv_bounded");
+  auto sql      = "SELECT fruit, count FROM " + pinned_scan(table);
+  auto before   = sirius::test::get_transparent_execution_stats(*con);
+  auto prepared = con->Prepare(sql);
+  REQUIRE(prepared);
+  INFO((prepared->HasError() ? prepared->GetError() : ""));
+  REQUIRE_FALSE(prepared->HasError());
+  // Iceberg bind data is not copyable; bind through the real pending execution
+  // entry so finalize can re-plan the SQL inside the statement's query context.
+  duckdb::vector<duckdb::Value> parameters;
+  auto pending = prepared->PendingQuery(parameters, false);
+  REQUIRE(pending);
+  INFO((pending->HasError() ? pending->GetError() : ""));
+  REQUIRE_FALSE(pending->HasError());
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 0, 0);
+  REQUIRE(provider->seen->requests == 1);
+  REQUIRE(provider->outstanding() == 1);
+  CHECK(dv_reads == 0);
+
+  SECTION("abandon a pending GPU plan before the next statement")
+  {
+    pending.reset();
+    prepared.reset();
+    // DuckDB keeps an abandoned pending executor until the next statement or context cleanup.
+    REQUIRE_FALSE(con->Query("SET gpu_execution=true")->HasError());
+  }
+  SECTION("rebind and execute repeatedly on GPU")
+  {
+    for (int i = 0; i < 2; ++i) {
+      auto result = i == 0 ? pending->Execute() : prepared->Execute(parameters, false);
+      REQUIRE(result);
+      INFO((result->HasError() ? result->GetError() : ""));
+      REQUIRE_FALSE(result->HasError());
+      require_route(before, sirius::test::get_transparent_execution_stats(*con), gpu_route::gpu);
+      CHECK(collect_rows(result->Cast<duckdb::MaterializedQueryResult>()) ==
+            std::vector<std::vector<std::string>>{
+              {"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+      CHECK(provider->seen->requests == i + 1);
+      CHECK(dv_reads == i + 1);
+      CHECK(provider->outstanding() == 0);
+      CHECK(provider->seen->allocated_bytes == 0);
+      before = sirius::test::get_transparent_execution_stats(*con);
+    }
+    prepared.reset();
+  }
+  SECTION("release the final prepared handle after its connection wrapper")
+  {
+    con.reset();
+    pending.reset();
+    prepared.reset();
+  }
+  CHECK(provider->outstanding() == 0);
+  CHECK(provider->seen->allocated_bytes == 0);
 }

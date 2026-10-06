@@ -36,7 +36,7 @@ auto const host = memory_space_id(cucascade::memory::Tier::HOST, 0);
 std::array<scan_envelope, 1> sample() { return {scan_envelope{{{8, 8, 16, 20}}, 0, 0, true}}; }
 }  // namespace
 TEST_CASE("Admission uses the one actual grant and releases all unsuccessful grants",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   SECTION("valid grant")
@@ -69,7 +69,7 @@ TEST_CASE("Admission uses the one actual grant and releases all unsuccessful gra
   CHECK(provider.outstanding() == 0);
 }
 TEST_CASE("Admission sums retained results across scans and accounts for allocation granularity",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -92,7 +92,8 @@ TEST_CASE("Admission sums retained results across scans and accounts for allocat
   }
   CHECK(provider.outstanding() == 0);
 }
-TEST_CASE("Unqualified bounds and overflow route to legacy before any request", "[r2b][ledger]")
+TEST_CASE("Unqualified bounds and overflow route to legacy before any request",
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -101,10 +102,8 @@ TEST_CASE("Unqualified bounds and overflow route to legacy before any request", 
   SECTION("overflow") { s[0].units[0].blob = std::numeric_limits<uint64_t>::max(); }
   CHECK_FALSE(ledger.admit(s, host).deferred);
   CHECK(provider.seen->requests == 0);
-  CHECK_FALSE(footer_envelope(1024).has_value());
-  CHECK_FALSE(roaring_envelope(512, 20).has_value());
 }
-TEST_CASE("No DV work does not create a W permit or divide by zero", "[r2b][ledger]")
+TEST_CASE("Scans without DV work need no temporary-memory permits", "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -116,7 +115,8 @@ TEST_CASE("No DV work does not create a W permit or divide by zero", "[r2b][ledg
   CHECK(provider.seen->requests == 0);
   CHECK_FALSE(ledger.acquire_permit({1, 1}));
 }
-TEST_CASE("Whole W remains held until real temporary buffers are freed", "[r2b][ledger]")
+TEST_CASE("The full temporary-memory permit stays held until its buffers are freed",
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -144,7 +144,7 @@ TEST_CASE("Whole W remains held until real temporary buffers are freed", "[r2b][
   CHECK(provider.seen->requests == 1);
 }
 TEST_CASE("Allocation bounds fail before touching backing and retain distinct failure causes",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -169,7 +169,7 @@ TEST_CASE("Allocation bounds fail before touching backing and retain distinct fa
   CHECK(ledger.allocation_failures() == 1);
   CHECK(ledger.charged_bytes({1, 1}) == 0);
 }
-TEST_CASE("Results keep backing after plan and attempt owners finish", "[r2b][ledger]")
+TEST_CASE("Results keep backing after plan and attempt owners finish", "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   auto ledger = std::make_unique<preparation_ledger>(provider);
@@ -197,7 +197,7 @@ TEST_CASE("Results keep backing after plan and attempt owners finish", "[r2b][le
   CHECK(provider.seen->allocated_bytes == 0);
 }
 TEST_CASE("An unexecuted plan releases its grant and cannot be reused after finish",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   {
@@ -213,7 +213,7 @@ TEST_CASE("An unexecuted plan releases its grant and cannot be reused after fini
   CHECK(provider.outstanding() == 0);
 }
 TEST_CASE("Statement DV threshold only chooses preparation route including legacy scans",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   std::array counts{scan_dv_count{1, 150 * 1024 * 1024}, scan_dv_count{2, 150 * 1024 * 1024}};
   CHECK_FALSE(statement_dv_route_allowed(counts));
@@ -226,7 +226,8 @@ TEST_CASE("Statement DV threshold only chooses preparation route including legac
   CHECK_FALSE(statement_dv_route_allowed(counts));
 }
 
-TEST_CASE("Multiple W permits are independent and close rejects further admission", "[r2b][ledger]")
+TEST_CASE("Temporary-memory permits are independent and closure rejects further admission",
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   provider.grant_bytes = 84;
@@ -256,7 +257,7 @@ TEST_CASE("Multiple W permits are independent and close rejects further admissio
   CHECK(provider.seen->requests == 1);
 }
 TEST_CASE("HOST adapter allocates real reserved blocks and returns them after the last consumer",
-          "[r2b][ledger][host]")
+          "[scan_preparation][ledger][host]")
 {
   cucascade::memory::host_memory_space_config config;
   config.numa_id              = 0;
@@ -293,7 +294,7 @@ TEST_CASE("HOST adapter allocates real reserved blocks and returns them after th
 }
 
 TEST_CASE("Closing during allocation keeps the grant alive until the allocation and result exit",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   struct paused_backing : reservation_backing {
     std::shared_ptr<reservation_backing> base;
@@ -355,7 +356,7 @@ TEST_CASE("Closing during allocation keeps the grant alive until the allocation 
 }
 
 TEST_CASE("Dropping an owner closes allocation even if a worker still owns its ticket",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   auto ledger = std::make_unique<preparation_ledger>(provider);
@@ -371,7 +372,7 @@ TEST_CASE("Dropping an owner closes allocation even if a worker still owns its t
 }
 
 TEST_CASE("Large blob and small final positions still require the whole temporary peak",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   provider.grant_bytes = 76;
@@ -391,7 +392,7 @@ TEST_CASE("Large blob and small final positions still require the whole temporar
   blob.release();
   CHECK(ledger.acquire_permit({1, 2}));
 }
-TEST_CASE("A fresh lowering owner is required for every execution", "[r2b][ledger]")
+TEST_CASE("A fresh lowering owner is required for every execution", "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   for (int execution = 0; execution < 2; ++execution) {
@@ -407,7 +408,7 @@ TEST_CASE("A fresh lowering owner is required for every execution", "[r2b][ledge
 }
 
 TEST_CASE("Retained reallocation accounts for the simultaneous old and new buffers",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -425,7 +426,7 @@ TEST_CASE("Retained reallocation accounts for the simultaneous old and new buffe
 }
 
 TEST_CASE("Retained positions without a preparation work bound stay on the original path",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   preparation_ledger ledger(provider);
@@ -436,7 +437,7 @@ TEST_CASE("Retained positions without a preparation work bound stay on the origi
 }
 
 TEST_CASE("Destroying an unexecuted admission releases its reservation without explicit finish",
-          "[r2b][ledger]")
+          "[scan_preparation][ledger]")
 {
   test_reservation_provider provider;
   {
@@ -449,7 +450,8 @@ TEST_CASE("Destroying an unexecuted admission releases its reservation without e
   CHECK(provider.outstanding() == 0);
 }
 
-TEST_CASE("HOST reservation failure does not retry or leave a partial grant", "[r2b][ledger][host]")
+TEST_CASE("HOST reservation failure does not retry or leave a partial grant",
+          "[scan_preparation][ledger][host]")
 {
   cucascade::memory::host_memory_space_config config;
   config.numa_id              = 0;
@@ -478,7 +480,8 @@ TEST_CASE("HOST reservation failure does not retry or leave a partial grant", "[
   CHECK(manager.get_active_reservation_count() == 0);
 }
 
-TEST_CASE("Failure to construct the lowering grant selects the original path once", "[r2b][ledger]")
+TEST_CASE("Failure to construct the lowering grant selects the original path once",
+          "[scan_preparation][ledger]")
 {
   struct failing_provider : reservation_provider {
     int requests = 0;
@@ -499,7 +502,7 @@ TEST_CASE("Failure to construct the lowering grant selects the original path onc
 }
 
 TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-only quota at zero",
-          "[r2b][iceberg][ledger]")
+          "[scan_preparation][iceberg][ledger]")
 {
   using namespace sirius::op::scan;
   iceberg_delete_discovery discovery;
@@ -544,7 +547,7 @@ TEST_CASE("DV profile qualifies only complete bounded inputs and keeps append-on
 }
 
 TEST_CASE("Charged DV descriptor names outlive the plan only while a result actually uses them",
-          "[r2b][iceberg][ledger]")
+          "[scan_preparation][iceberg][ledger]")
 {
   using namespace sirius::op::scan;
   test_reservation_provider provider;

@@ -169,8 +169,9 @@ size_t decode_roaring_charged(
     throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
                              std::to_string(len) +
                              " bytes; the deletion vector is truncated or corrupt");
-  auto fail = [] {
-    throw std::runtime_error("roaring: inconsistent bitmap in the deletion vector");
+  auto fail = [](char const* reason) {
+    throw std::runtime_error(std::string("roaring: inconsistent bitmap in the deletion vector: ") +
+                             reason);
   };
   auto u16 = [](uint8_t const* p) {
     uint16_t v;
@@ -180,72 +181,84 @@ size_t decode_roaring_charged(
   auto const* end = data + consumed;
   auto const* p   = data;
   auto take       = [&](size_t bytes) {
-    if (bytes > static_cast<size_t>(end - p)) fail();
+    if (bytes > static_cast<size_t>(end - p)) fail("unknown reason");
     auto result = p;
     p += bytes;
     return result;
   };
-  auto cookie = read_u32_le(take(4));
-  bool runs   = (cookie & 0xffff) == 12347;
-  uint32_t containers;
-  if (runs)
-    containers = (cookie >> 16) + 1;
-  else {
-    if (cookie != 12346) fail();
-    containers = read_u32_le(take(4));
-  }
-  if (containers > 65536) fail();
+  auto cookie          = read_u32_le(take(4));
+  bool runs            = (cookie & 0xffff) == 12347;
+  uint32_t containers  = runs ? (cookie >> 16) + 1 : read_u32_le(take(4));
   auto const* run_bits = runs ? take((containers + 7) / 8) : nullptr;
   auto const* headers  = take(static_cast<size_t>(containers) * 4);
   if (!runs || containers >= 4) take(static_cast<size_t>(containers) * 4);
-  uint32_t previous_key = 0;
-  for (uint32_t i = 0; i < containers; ++i) {
-    auto key         = u16(headers + i * 4);
-    auto cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
-    if (i && key <= previous_key) fail();
-    previous_key = key;
-    auto start   = count;
-    auto append  = [&](uint32_t low) {
-      if (count == output.size())
-        throw std::runtime_error(
-          "roaring: decoded positions exceed the " + std::to_string(output.size() - start) +
-          " this deletion vector declares; the blob is corrupt or was crafted to expand");
-      output[count++] = high | (int64_t(key) << 16) | low;
-    };
-    if (run_bits && (run_bits[i / 8] & (1u << (i % 8)))) {
-      auto n                = u16(take(2));
-      uint32_t previous_end = 0;
-      for (uint32_t j = 0; j < n; ++j) {
-        auto const* run = take(4);
-        uint32_t first = u16(run), last = first + u16(run + 2);
-        if (last > 65535 || (j && first <= previous_end)) fail();
-        previous_end = last;
-        for (uint32_t v = first; v <= last; ++v)
-          append(v);
-      }
-    } else if (cardinality <= 4096) {
-      auto const* values = take(cardinality * 2);
-      uint32_t previous  = 0;
-      for (uint32_t j = 0; j < cardinality; ++j) {
-        auto value = u16(values + j * 2);
-        if (j && value <= previous) fail();
-        previous = value;
-        append(value);
-      }
-    } else {
-      auto const* words = take(8192);
-      for (uint32_t j = 0; j < 1024; ++j) {
-        uint64_t word;
-        std::memcpy(&word, words + j * 8, 8);
-        while (word) {
-          append(j * 64 + std::countr_zero(word));
-          word &= word - 1;
+  auto const* payload = p;
+
+  // Match CRoaring's validation order before checking the output budget: keys, all
+  // containers, then bitmap cardinality. Keep validation allocation-free.
+  for (uint32_t i = 1; i < containers; ++i)
+    if (u16(headers + i * 4) <= u16(headers + (i - 1) * 4)) fail("keys not strictly increasing");
+
+  auto walk = [&](bool materialize) {
+    p            = payload;
+    size_t total = 0;
+    for (uint32_t i = 0; i < containers; ++i) {
+      auto key         = u16(headers + i * 4);
+      auto cardinality = uint32_t(u16(headers + i * 4 + 2)) + 1;
+      auto append      = [&](uint32_t low) { output[count++] = high | (int64_t(key) << 16) | low; };
+      if (run_bits && (run_bits[i / 8] & (1u << (i % 8)))) {
+        auto n = u16(take(2));
+        if (!n) fail("zero run count");
+        uint32_t previous_end = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+          auto const* run = take(4);
+          uint32_t first = u16(run), end = first + u16(run + 2) + 1;
+          if (end > 65536) fail("run start + length too large");
+          if (first < previous_end) fail("run start less than last end");
+          if (first == previous_end && previous_end)
+            fail("run start equal to last end, should have combined");
+          previous_end = end;
+          total += end - first;
+          if (materialize)
+            for (uint32_t v = first; v < end; ++v)
+              append(v);
         }
+        // CRoaring derives run cardinality from the runs, not the stored header.
+      } else if (cardinality <= 4096) {
+        auto const* values = take(cardinality * 2);
+        for (uint32_t j = 0; j < cardinality; ++j) {
+          auto value = u16(values + j * 2);
+          if (j && value <= u16(values + (j - 1) * 2))
+            fail("array elements not strictly increasing");
+          if (materialize) append(value);
+        }
+        total += cardinality;
+      } else {
+        auto const* words = take(8192);
+        uint32_t actual   = 0;
+        for (uint32_t j = 0; j < 1024; ++j) {
+          uint64_t word;
+          std::memcpy(&word, words + j * 8, 8);
+          actual += std::popcount(word);
+          if (materialize)
+            while (word) {
+              append(j * 64 + std::countr_zero(word));
+              word &= word - 1;
+            }
+        }
+        if (actual != cardinality) fail("cardinality is incorrect");
+        total += actual;
       }
     }
-    if (count - start != cardinality) fail();
-  }
-  if (p != end) fail();
+    return total;
+  };
+  auto const cardinality = walk(false);
+  auto const remaining   = output.size() - count;
+  if (cardinality > remaining)
+    throw std::runtime_error(
+      "roaring: decoded positions exceed the " + std::to_string(remaining) +
+      " this deletion vector declares; the blob is corrupt or was crafted to expand");
+  walk(true);
   return consumed;
 }
 
