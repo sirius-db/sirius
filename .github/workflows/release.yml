@@ -35,24 +35,27 @@ on:
     paths:
       - ".github/workflows/release.yml"
   workflow_run:
-    # Automatic latest: fires on every completion of Distribution, regardless of outcome or
-    # which ref/event triggered it. The job-level `if:` below filters this down to only the case
-    # that should actually publish - a successful, push-triggered Distribution run on main.
+    # Automatic latest: fires on every completion of Distribution on main, regardless of outcome
+    # or which event triggered it. `branches: [main]` filters at the trigger level (GitHub never
+    # even starts the run for a Distribution completion on another branch); the job-level `if:`
+    # below filters the rest - down to only the case that should actually publish, a successful,
+    # push-triggered run.
     workflows: [Distribution]
     types: [completed]
+    branches: [main]
 
 jobs:
   release:
     name: release (${{ inputs.mode || (github.event_name == 'workflow_run' && 'auto-latest') || 'pr-dry-run' }})
-    # workflow_run fires for every Distribution completion, success or not, and for every
-    # triggering event (push, pull_request, merge_group). Only a successful, push-triggered run
-    # on main should actually publish; every other workflow_run completion is a no-op skip here,
-    # not a failure, since Distribution failing isn't this workflow's problem to report on.
+    # workflow_run fires for every Distribution completion on main, success or not, and for
+    # every triggering event (push, pull_request, merge_group) - branch is already filtered by
+    # the trigger's `branches: [main]` above. Only a successful, push-triggered run should
+    # actually publish; every other workflow_run completion is a no-op skip here, not a failure,
+    # since Distribution failing isn't this workflow's problem to report on.
     if: >-
       github.repository == 'sirius-db/sirius' &&
       (github.event_name != 'workflow_run' ||
         (github.event.workflow_run.conclusion == 'success' &&
-         github.event.workflow_run.head_branch == 'main' &&
          github.event.workflow_run.event == 'push'))
     runs-on: ubuntu-24.04
     concurrency:
@@ -195,6 +198,7 @@ jobs:
 
       - name: Find Distribution run for target commit
         id: run
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_run" ]; then
@@ -219,6 +223,7 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
 
       - name: Download extension artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           gh run download "$RUN_ID" \
             --repo "$REPO" \
@@ -231,6 +236,7 @@ jobs:
 
       - name: Verify and rename artifacts
         id: artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           mkdir -p renamed
@@ -274,6 +280,7 @@ jobs:
           echo "duckdb_version=$duckdb_version" >> "$GITHUB_OUTPUT"
 
       - name: Compress artifacts
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # GitHub Releases rejects any single asset >= 2 GiB; cuda12 builds land right at that
         # line. All 4 variants are compressed for consistency, not just the ones that need it.
         # Looped per-file (not a single `gzip -9 renamed/*.duckdb_extension` wildcard) so progress
@@ -290,6 +297,7 @@ jobs:
           done
 
       - name: Cross-check DuckDB version against distribution.yml
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           # Capture to a variable first, then grep/sed against the in-memory string, not a live
@@ -310,11 +318,17 @@ jobs:
           DUCKDB_VERSION: ${{ steps.artifacts.outputs.duckdb_version }}
 
       - name: Copy LICENSE into the release assets
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # The repo's own Apache 2.0 LICENSE, bundled with every release. Third-party dependency
-        # attribution (a generated NOTICE) is tracked separately: #1979.
+        # attribution (a generated NOTICE) is tracked separately: #1979. Read via `git show` at
+        # TARGET_SHA, not a plain `cp`, so this matches the commit actually being released even
+        # when the checked-out ref differs from it (e.g. mode=stable promoting an older commit).
         run: git show "${TARGET_SHA}:LICENSE" > renamed/LICENSE
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
 
       - name: Build manifest
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         run: |
           set -euo pipefail
           cd renamed
@@ -328,6 +342,7 @@ jobs:
           RUN_ID: ${{ steps.run.outputs.run_id }}
 
       - name: Build release notes
+        if: github.event_name == 'pull_request' || steps.staleness.outputs.stale != 'true'
         # Content lives in .github/workflows/release/*.md, not inline here: GETTING_STARTED.md
         # is the shared walkthrough (requirements, install, download, unsigned-extensions,
         # load-and-try) used by both modes, with {{PLACEHOLDER}} tokens filled in below;
@@ -381,11 +396,18 @@ jobs:
                   capture_output=True,
               ).returncode == 0
               rev_range = f"stable..{target_sha}" if has_stable else target_sha
-              # -n 50 limits git log's own output; no pipe to a truncating consumer (head/etc.)
-              # that could SIGPIPE it under a shell's pipefail, not a concern here either way
-              # since this runs as one subprocess call, not a shell pipeline.
+              # When a stable tag exists, show every commit since it, no cap - that's the whole
+              # point of a "what's changed since stable" changelog. Only the no-stable fallback
+              # (the entire repo history up to target_sha) gets capped at 50, so it doesn't
+              # overwhelm the release notes. -n limits git log's own output; no pipe to a
+              # truncating consumer (head/etc.) that could SIGPIPE it under a shell's pipefail,
+              # not a concern here either way since this runs as one subprocess call, not a shell
+              # pipeline.
+              log_args = ["git", "log", rev_range, "--oneline"]
+              if not has_stable:
+                  log_args[2:2] = ["-n", "50"]
               log = subprocess.run(
-                  ["git", "log", "-n", "50", rev_range, "--oneline"],
+                  log_args,
                   capture_output=True, text=True, check=True,
               ).stdout
               changes = "\n".join(f"- {line}" for line in log.splitlines())
