@@ -80,6 +80,7 @@
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/distributed_plan.hpp"
+#include "planner/gpu_admission.hpp"
 #include "planner/mark_join_conversion.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -968,13 +969,15 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
  *
  * @p mode selects membership-only or AST-plus-membership post-decode filtering. @p sirius_ctx,
  * when not null, observes compressed materialization and receives the dynamic-filter counters.
+ * @p context is used to read the scan's GPU admission hint off its table function.
  */
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
   std::shared_ptr<sirius::op::scan::gpu_ingestible> ingestible,
   const sirius::op::sirius_physical_table_scan& scan,
   const sirius::operator_params& op_params,
   sirius::op::scan::dynamic_filter_apply_mode mode,
-  duckdb::SiriusContext* sirius_ctx)
+  duckdb::SiriusContext* sirius_ctx,
+  duckdb::ClientContext& context)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) dynamic_filters.reset();
@@ -988,7 +991,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
                      : std::vector<sirius::op::scan::binding>{},
           sirius_ctx ? &sirius_ctx->get_dynamic_filter_stats() : nullptr)
       : nullptr;
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
+  auto gpu_scan =
     duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(scan.types,
                                                                   scan.estimated_cardinality,
                                                                   std::move(ingestible),
@@ -996,6 +999,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> assemble_gpu_scan_leaf(
                                                                   sirius_ctx,
                                                                   scan.read_views,
                                                                   consumer);
+  // GPU admission runs on the converted plan, after the table function and bind data are gone;
+  // take the unfiltered row count and any known column widths from them now.
+  gpu_scan->set_admission_hint(sirius::planner::derive_scan_admission_hint(context, scan));
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf = std::move(gpu_scan);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
@@ -1017,7 +1024,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   const sirius::op::sirius_physical_table_scan& scan,
   const sirius::operator_params& op_params,
   sirius::op::scan::dynamic_filter_apply_mode mode,
-  duckdb::SiriusContext* sirius_ctx)
+  duckdb::SiriusContext* sirius_ctx,
+  duckdb::ClientContext& context)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
@@ -1055,7 +1063,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       return empty;
     }
   }
-  return assemble_gpu_scan_leaf(std::move(ingestible), scan, op_params, mode, sirius_ctx);
+  return assemble_gpu_scan_leaf(std::move(ingestible), scan, op_params, mode, sirius_ctx, context);
 }
 
 // A leaf reference uses reader input identity, never the post-projection output index.
@@ -2054,7 +2062,7 @@ duckdb::unique_ptr<op::sirius_physical_operator> lower_prepared_scan(
 {
   if (!ingestible) throw std::logic_error("prepared scan has no materializer");
   auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  return assemble_gpu_scan_leaf(std::move(ingestible), scan, params, mode, runtime.get());
+  return assemble_gpu_scan_leaf(std::move(ingestible), scan, params, mode, runtime.get(), context);
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
@@ -2070,7 +2078,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
                                  scan,
                                  op_params,
                                  mode,
-                                 sirius_ctx.get());
+                                 sirius_ctx.get(),
+                                 context);
   if (sirius_ctx) { sirius_ctx->observe_native_checkpoint_for_testing(context, "native_leaf"); }
   return leaf;
 }
@@ -2094,7 +2103,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
     attach_byte_ranges(*table_info, *byte_ranges);
   }
-  return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
+  return make_gpu_scan_leaf(
+    std::move(table_info), scan, op_params, mode, sirius_ctx.get(), context);
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
@@ -2110,7 +2120,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
   // Iceberg resolves manifests into parquet data files. Some files may not be opened during
   // binding, so install each path's credential snapshot before the ingestible opens them later.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
-  return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
+  return make_gpu_scan_leaf(
+    std::move(table_info), scan, op_params, mode, sirius_ctx.get(), context);
 }
 
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
