@@ -17,6 +17,9 @@ scripts = ["scripts/pixi_activate.sh"]
 
 [activation.env]
 SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
+# BASEDIRS + preprocessor cache mode can serve another checkout's object and depfile
+# (mozilla/sccache#2863, fix in #2868); remove once a release with the fix is pinned.
+SCCACHE_DIRECT = "false"
 
 [dependencies]
 bc = "*"
