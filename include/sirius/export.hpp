@@ -16,24 +16,6 @@
 
 #pragma once
 
-namespace duckdb {
-class ExtensionLoader;
-}
-
-namespace sirius {
-
-/// Register Sirius on a DuckDB instance built with the matching DuckDB revision.
-/// Call from an extension load callback with the loader supplied by DuckDB.
-///
-/// @code{.cpp}
-/// #include <sirius/duckdb.hpp>
-///
-/// void LoadSirius(duckdb::ExtensionLoader& loader)
-/// {
-///   sirius::register_duckdb_extension(loader);
-/// }
-/// @endcode
-__attribute__((visibility("default"))) void register_duckdb_extension(
-  duckdb::ExtensionLoader& loader);
-
-}  // namespace sirius
+#ifndef SIRIUS_EXPORT
+#define SIRIUS_EXPORT __attribute__((visibility("default")))
+#endif

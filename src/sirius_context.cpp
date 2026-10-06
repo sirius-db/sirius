@@ -800,7 +800,7 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
   prev_pinned_mr_.reset();
 }
 
-void SiriusContext::initialize(const sirius::sirius_config& config)
+void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
@@ -818,21 +818,21 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     }
   } pinned_rollback{this};
 
-  config_            = config;
-  auto quent_context = sirius::telemetry::make_quent_context(config_.get_telemetry_config());
-  config_.resolve_hardware();
-
-  // Validate the cached topology before any downstream construction so a stub
-  // topology fails loudly rather than producing zero-GPU executors silently.
-  // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
-  // raw CUDA/NUMA device-enumeration APIs directly elsewhere. Configured execution GPU ids come
-  // from the memory manager built below.
-  auto const& topo = config_.get_hw_topology();
-  if (topo.num_gpus == 0) {
-    throw std::runtime_error(
-      "SiriusContext::initialize: cucascade::topology_discovery reported 0 GPUs — "
-      "refusing to initialize on stub topology.");
+  auto quent_context = sirius::telemetry::make_quent_context(config.get_telemetry_config());
+  cucascade::memory::topology_discovery discovery;
+  if (!discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                          /*with_runtime_attributes=*/true)) {
+    throw std::runtime_error("SiriusContext::initialize: failed to discover hardware topology");
   }
+  if (discovery.get_topology().num_gpus == 0) {
+    throw std::runtime_error("SiriusContext::initialize: no GPUs discovered");
+  }
+  config_ = config.resolve(discovery.get_topology());
+  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
+
+  // Discovery is shared by all subsystems; execution GPU ids come from the
+  // configured memory manager built below.
+  auto const& topo = config_.get_hw_topology();
   SIRIUS_LOG_INFO("SiriusContext: topology summary — {} GPU(s), {} NUMA node(s), host='{}'",
                   topo.num_gpus,
                   topo.num_numa_nodes,
@@ -975,7 +975,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   }
 
   // cucascade topology exposes hw-decompression availability as a runtime attribute populated
-  // only when discovery is asked to touch the CUDA driver. sirius_config seeds topology with
+  // only when discovery is asked to touch the CUDA driver. Context initialization requests
   // with_runtime_attributes=true, so an unpopulated optional here is a real "not supported".
   auto enable_hw_decompression =
     config_.get_operator_params().use_hw_decompression && topo.num_gpus > 0 &&
@@ -1946,12 +1946,8 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
-  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
-  // DuckDB's registered option defaults must include the resolved memory capacities
-  // and operator sizes, not just the parsed YAML overrides.
-  config_  = context->get_config();
   context_ = std::move(context);
 }
 
@@ -2008,7 +2004,7 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
-    config_.parse_from_file(*config_path);
+    config_ = sirius::parsed_sirius_config::from_file(*config_path);
     SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
@@ -2019,7 +2015,7 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    // The default-constructed config is resolved by initialize() after Quent exists.
+    config_ = sirius::parsed_sirius_config{};
   }
 }
 

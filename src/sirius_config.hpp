@@ -27,7 +27,14 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <variant>
+
+namespace YAML {
+class Node;
+}
 
 namespace sirius {
 
@@ -279,22 +286,26 @@ struct compression_config {
   std::string input_plan_dir{};
 };
 
+class configuration_input_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+using gpu_usage_limit = std::variant<double, std::uint64_t>;
+
+class parsed_sirius_config;
+
 struct sirius_config {
-  /// Construction prepares defaults without emitting NVTX. Runtime startup must install
-  /// Quent before resolving the hardware-dependent memory and operator settings.
-  sirius_config();
+  sirius_config()  = default;
   ~sirius_config() = default;
 
-  /// Parse and resolve immediately, for standalone configuration consumers.
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
 
-  /// Validate YAML without topology discovery. Runtime entry points use this before
-  /// creating the configured Quent context, then call resolve_hardware().
-  void parse_from_file(const std::filesystem::path& config_path);
-  /// Discover topology and resolve memory capacities/operator defaults once. Copies of
-  /// a parsed config resolve independently; copies of a resolved config do no more work.
-  void resolve_hardware();
+  // Explicit hardware-resolving helpers for internal configuration consumers.
+  // Runtime startup takes parsed_sirius_config instead.
+  void load_from_node(const YAML::Node& root,
+                      std::optional<gpu_usage_limit> gpu_limit = std::nullopt);
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -355,13 +366,12 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
-  struct hardware_config;
+  friend class parsed_sirius_config;
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called after parsing and hardware resolution so a
-  /// missing config file derives the same values an empty one does; each step is
-  /// idempotent.
+  /// override, in that order. Called by parsed_sirius_config::resolve after
+  /// memory capacities and operator defaults are resolved.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -377,8 +387,7 @@ struct sirius_config {
   /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
-  cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
-  std::shared_ptr<const hardware_config> _hardware_config;
+  cucascade::memory::system_topology_info _hw_topology{};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
@@ -386,9 +395,34 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
-  operator_params _operator_params;
+  // Parsing uses constant placeholders; resolution supplies hardware-derived defaults.
+  operator_params _operator_params{.scan_task_batch_size       = config::DEFAULT_BATCH_SIZE,
+                                   .hash_partition_bytes       = config::DEFAULT_BATCH_SIZE,
+                                   .concat_batch_bytes         = config::DEFAULT_BATCH_SIZE,
+                                   .sort_sample_bytes          = config::DEFAULT_BATCH_SIZE,
+                                   .max_build_hash_table_bytes = 2 * config::DEFAULT_BATCH_SIZE};
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+};
+
+/// Validated configuration intent. Construction and parsing never discover hardware.
+/// Resolution produces a separate value and leaves the specification unchanged.
+class parsed_sirius_config {
+ public:
+  parsed_sirius_config();
+  static parsed_sirius_config from_file(const std::filesystem::path& path);
+  static parsed_sirius_config from_node(const YAML::Node& root);
+  [[nodiscard]] parsed_sirius_config with_gpu_usage_limit(gpu_usage_limit limit) const;
+  [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
+  [[nodiscard]] const operator_params& get_operator_params() const noexcept;
+  [[nodiscard]] const compression_config& get_compression_config() const noexcept;
+  [[nodiscard]] sirius_config resolve(
+    const cucascade::memory::system_topology_info& topology) const;
+
+ private:
+  struct Impl;
+  explicit parsed_sirius_config(std::shared_ptr<const Impl> impl);
+  std::shared_ptr<const Impl> impl_;
 };
 
 }  // namespace sirius

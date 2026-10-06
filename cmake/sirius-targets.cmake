@@ -112,7 +112,7 @@ foreach(_target sirius_objects sirius_core sirius_extension
   set_target_properties(
     ${_target}
     PROPERTIES CXX_SCAN_FOR_MODULES OFF
-               CXX_STANDARD 20
+               CXX_STANDARD 23
                CXX_STANDARD_REQUIRED ON
                CUDA_STANDARD 20
                CUDA_STANDARD_REQUIRED ON
@@ -234,7 +234,15 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-target_compile_features(sirius_shared PUBLIC cxx_std_20)
+target_compile_features(sirius_shared PUBLIC cxx_std_23)
+# Installed static consumers use the public headers too. Keep this requirement
+# out of DuckDB's in-tree build graph.
+foreach(_target sirius_core sirius_extension)
+  if(TARGET ${_target})
+    target_compile_features(${_target}
+                            INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
+  endif()
+endforeach()
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
@@ -284,7 +292,7 @@ if(SIRIUS_BUILD_STATIC)
       parquet_extension
       "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
   )
-  target_compile_features(sirius_core PUBLIC cxx_std_20)
+  target_compile_features(sirius_core PUBLIC cxx_std_23)
   target_link_options(
     sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
     "LINKER:--allow-multiple-definition")

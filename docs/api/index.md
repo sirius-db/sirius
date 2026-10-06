@@ -1,16 +1,13 @@
 # Sirius C++ API
 
-Sirius is a GPU-native analytics engine. This reference covers the public C++
-headers under `include/sirius/`, used to embed Sirius and bind it from other
-languages. Internal engine headers and third-party dependencies are outside its
-scope.
+Sirius is a GPU-native analytics engine. This reference documents its public C++
+API.
 
 ## Getting started
 
-- @ref sirius::ffi::Context "Context" owns an initialized engine and executes Substrait plans.
-- @ref sirius::ffi::Fragment "Fragment" executes one fragment of a distributed query.
-- @ref sirius::ffi "Factory functions" create contexts and fragments.
-- @ref ffi.hpp "Public header" lists the complete embedding interface.
+- @ref sirius::ContextConfigBuilder "Configuration builder" assembles settings from defaults, YAML, and C++ overrides.
+- @ref sirius::ContextConfig "Context configuration" holds an immutable, validated configuration.
+- @ref sirius::Error "Errors" describe failures returned by the API.
 
 The API is under active development. These pages describe the headers on the
 repository's default branch; they do not promise ABI stability.
