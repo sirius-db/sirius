@@ -33,7 +33,8 @@ namespace op {
 /// partition count in `get_partition_strategy`; PARTITION distributes it to every operator that
 /// emits that exchange's partitioned data, and each emitter stamps the partition's device onto its
 /// `partitioned_operator_data`, which the task creator honors like any other producer preference.
-/// Every task of a partition therefore lands on one GPU, which cuco hash tables require.
+/// Every task of a pinned partition therefore lands on one GPU, as shared GPU hash tables require.
+/// Unpinned partitions let each task follow input locality instead.
 ///
 /// The devices must be a subset of the query's admitted GPUs. That set is fixed for the life of a
 /// query: running an exchange on fewer GPUs is expressed as a placement over a subset
@@ -44,7 +45,8 @@ class partition_placement {
   /// Marks a partition with no device preference (the task creator places it by data locality).
   static constexpr int unpinned_device = -1;
 
-  /// `num_partitions` partitions, none pinned. Used where no GPU list is known (engine-free tests).
+  /// `num_partitions` partitions, none pinned. Use when no state requires a fixed GPU, or when
+  /// no GPU list is known (engine-free tests).
   static partition_placement unpinned(std::size_t num_partitions)
   {
     if (num_partitions == 0) {
