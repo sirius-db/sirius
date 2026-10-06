@@ -75,7 +75,9 @@ TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][
   // default, which is the pipeline width.
   CHECK(scan_manager_config{}.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(scan_manager_config{}.uring.n_max_concurrent_scans_explicit);
-  CHECK(scan_manager_config{}.rest.n_max_concurrent_scans == 2 * PIPELINE_THREADS);
+  // cuCascade's rest::config struct default; sirius_config rescales it to the configured
+  // pipeline width at load time unless the config sets it explicitly.
+  CHECK(scan_manager_config{}.rest.n_max_concurrent_scans == 8);
   // kvikIO has no prefetching cache to read ahead into, so it publishes no
   // depth at all and there is no knob that could give it one.
   cucascade::io::kvikio_context kvikio;

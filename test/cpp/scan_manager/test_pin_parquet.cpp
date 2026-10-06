@@ -57,7 +57,7 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_index_for_pin()
   return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
 }
 
-scan_manager_config config_with_sirius_cache()
+scan_manager_config config_with_cucs_cache()
 {
   scan_manager_config cfg;
   cfg.thread_pool.num_threads = 3;
@@ -92,7 +92,7 @@ TEST_CASE("a pin that throws part way through pins nothing", "[scan_manager][cac
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -138,7 +138,7 @@ TEST_CASE("a failed re-pin leaves the previous pin intact", "[scan_manager][cach
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
@@ -163,7 +163,7 @@ TEST_CASE("reset_caches drops parquet pins rather than leave them stale",
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index_for_pin();
 
-  sirius_scan_manager manager{config_with_sirius_cache(), *memory, topology};
+  sirius_scan_manager manager{config_with_cucs_cache(), *memory, topology};
   auto* cache = manager.io_ctx()->cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());

@@ -27,20 +27,8 @@
 #include <string_view>
 
 //===----------------------------------------------------------------------===//
-// strip_file_scheme
-//
-// Sirius's own duckdb::Path-based variant (src/io/path_utils.hpp), applied where Sirius
-// normalizes and keys paths before they reach the io layer: normalize_path in the scan
-// manager, the iceberg/puffin readers and plan_get. Iceberg manifests written by the Apache
-// implementations record fully-qualified URIs (file:///abs/path.parquet) — Java and Spark
-// writers always do — while the local backends only open bare paths. An un-stripped URI reaches
-// create_io_object and throws "unsupported path", which happens during execution and so takes the
-// RUNTIME fallback rather than declining at plan time.
-//
-// This is the in-tree coverage for that rule. The corresponding end-to-end case needs a
-// table whose manifests carry an absolute file:// URI, which cannot be expressed with the
-// repo-relative paths a committed fixture requires; generate it with
-// data/iceberg_conformance/gen_corpus.py using an absolute output path.
+// strip_file_scheme: Sirius's duckdb::Path-based variant. It strips every legal `file:` URI form
+// and folds `.`, `..` and empty segments; src/io/path_utils.hpp has the rationale.
 //===----------------------------------------------------------------------===//
 
 using sirius::io::strip_file_scheme;
@@ -57,6 +45,15 @@ TEST_CASE("strip_file_scheme handles every legal file URI form", "[path_utils]")
   CHECK(strip_file_scheme("file://localhost/abs/path.parquet") == "/abs/path.parquet");
 }
 
+TEST_CASE("strip_file_scheme folds dot, dot-dot and empty segments", "[path_utils]")
+{
+  // The duckdb::Path normalization cuCascade's scheme-only strip lacks: callers key caches and
+  // match iceberg delete files on the result, so one file must have one spelling.
+  CHECK(strip_file_scheme("file:///abs/./a//b/../c.parquet") == "/abs/a/c.parquet");
+  // A leading `..` cannot climb above the root.
+  CHECK(strip_file_scheme("file:///../x.parquet") == "/x.parquet");
+}
+
 TEST_CASE("strip_file_scheme percent-decodes a file URI", "[path_utils]")
 {
   // Only what was stripped is a URI. A bare path or object-store key keeps a literal `%`, which
@@ -69,9 +66,8 @@ TEST_CASE("strip_file_scheme percent-decodes a file URI", "[path_utils]")
 
 TEST_CASE("strip_file_scheme is case-insensitive", "[path_utils]")
 {
-  // The ad-hoc stripper this replaced in the iceberg delete-key matcher was case-SENSITIVE.
-  // A manifest written FILE:// would have failed to match its data file, and a failed match
-  // finds no deletes for that file — returning deleted rows while looking healthy.
+  // Manifests spell the scheme FILE:// and File:// too, and iceberg delete files are matched on the
+  // stripped path: a missed match silently returns deleted rows.
   CHECK(strip_file_scheme("FILE:///abs/path.parquet") == "/abs/path.parquet");
   CHECK(strip_file_scheme("File:///abs/path.parquet") == "/abs/path.parquet");
   CHECK(strip_file_scheme("fILe:///abs/path.parquet") == "/abs/path.parquet");

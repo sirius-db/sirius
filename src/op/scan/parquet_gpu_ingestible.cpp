@@ -944,12 +944,14 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // holds a parsed footer for this path, a suffix GET would most likely download
   // bytes nothing consumes, and the open only needs the size; the exact
   // generation lookup below decides reuse. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
+  // The store is keyed by the normalized path, so look up what the open uses.
+  auto const normalized    = sirius::io::strip_file_scheme(file_path);
+  bool const footer_cached = io_ctx->metadata_store().get_metadata(normalized) != nullptr;
   std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
     sirius_ds =
       sirius::io::open_datasource(io_ctx,
-                                  file_path,
+                                  normalized,
                                   footer_cached ? cucascade::io::open_hint::generic
                                                 : cucascade::io::open_hint::parquet_footer_probe);
   }

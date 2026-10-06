@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// s3_throughput_test — raw S3 read throughput via the Sirius REST reactor.
+// s3_throughput_test — raw S3 read throughput via cuCascade's REST backend (rest_ioctx).
 //
 // For each selected file the benchmark picks random non-overlapping aligned
 // slices of --chunk-size to satisfy the --per-file read budget. One batched
@@ -186,7 +186,7 @@ std::size_t count_segments(std::vector<file_work> const& work)
 
 /// Issue each file's logical slices in one host_readv_async_io call, attach an
 /// inline callback to each file future that counts down a latch, then wait.
-/// Reads are submitted from the main thread; callbacks fire on reactor threads.
+/// Reads are submitted from the main thread; callbacks fire on REST runner threads.
 iteration_result run_once(engine& eng, std::vector<file_work>& work)
 {
   std::atomic<std::size_t> bytes_read{0};

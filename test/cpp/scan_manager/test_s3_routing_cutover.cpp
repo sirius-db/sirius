@@ -30,6 +30,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -320,6 +321,13 @@ class range_s3_server {
   /// Every request the server has served, of any method.
   [[nodiscard]] int request_count() const { return _request_count.load(std::memory_order_relaxed); }
 
+  [[nodiscard]] std::size_t head_count() const { return _head_count.load(); }
+  [[nodiscard]] std::size_t get_count() const { return _get_count.load(); }
+  /// GETs that named a suffix range (`Range: bytes=-N`), the footer probe's shape.
+  [[nodiscard]] std::size_t suffix_get_count() const { return _suffix_get_count.load(); }
+  /// The largest exclusive range end any GET asked for, before the server clipped it.
+  [[nodiscard]] std::size_t max_requested_end() const { return _max_requested_end.load(); }
+
  private:
   static std::string errno_message() { return std::strerror(errno); }
 
@@ -355,6 +363,7 @@ class range_s3_server {
     bool const is_get  = request.rfind("GET ", 0) == 0;
     std::string response;
     if (is_head) {
+      _head_count.fetch_add(1, std::memory_order_relaxed);
       response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(_object.size()) +
                  "\r\nConnection: close\r\n\r\n";
       send_all(fd, response);
@@ -367,9 +376,12 @@ class range_s3_server {
         return;
       }
       if (auto range = parse_range(request)) {
-        auto const [start, end] = *range;
-        auto const len          = end - start + 1;
-        response = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
+        auto const [start, end, requested_end, suffix] = *range;
+        if (suffix) { _suffix_get_count.fetch_add(1, std::memory_order_relaxed); }
+        // Single writer: requests are served one at a time on the accept thread.
+        if (requested_end > _max_requested_end.load()) { _max_requested_end.store(requested_end); }
+        auto const len = end - start + 1;
+        response       = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len) +
                    "\r\nContent-Range: bytes " + std::to_string(start) + "-" + std::to_string(end) +
                    "/" + std::to_string(_object.size()) + "\r\nConnection: close\r\n\r\n";
         send_all(fd, response);
@@ -403,8 +415,14 @@ class range_s3_server {
     }
   }
 
-  [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> parse_range(
-    std::string const& request) const
+  struct byte_range {
+    std::size_t start;          ///< First byte served.
+    std::size_t end;            ///< Last byte served (inclusive), clipped to the object.
+    std::size_t requested_end;  ///< Exclusive end as requested, before clipping.
+    bool suffix;                ///< `bytes=-N`.
+  };
+
+  [[nodiscard]] std::optional<byte_range> parse_range(std::string const& request) const
   {
     std::string lower = request;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
@@ -432,10 +450,11 @@ class range_s3_server {
           end = static_cast<std::size_t>(std::stoull(spec.substr(dash + 1)));
         }
       }
+      auto const requested_end = end + 1;
       if (start >= _object.size()) { return std::nullopt; }
       end = std::min(end, _object.size() - 1);
       if (end < start) { return std::nullopt; }
-      return std::make_pair(start, end);
+      return byte_range{start, end, requested_end, dash == 0};
     } catch (...) {
       return std::nullopt;
     }
@@ -447,7 +466,10 @@ class range_s3_server {
   range_fault_policy _fault;
   std::atomic<bool> _stop{false};
   std::atomic<int> _request_count{0};
+  std::atomic<std::size_t> _head_count{0};
   std::atomic<std::size_t> _get_count{0};
+  std::atomic<std::size_t> _suffix_get_count{0};
+  std::atomic<std::size_t> _max_requested_end{0};
   std::thread _thread;
 };
 
@@ -838,4 +860,70 @@ TEST_CASE("split_provider resolver routes mixed parquet files independently", "[
   REQUIRE(routed.contains(local_path));
   CHECK(routed.at(s3_uri) == io_context_type::restful);
   CHECK(is_local_backend(routed.at(local_path)));
+}
+
+TEST_CASE("describe_parquet probes the S3 footer on a cold bind and reuses the metadata store warm",
+          "[s3][routing]")
+{
+  auto const fixture_path = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
+  auto parquet_bytes      = read_binary_file(fixture_path);
+  auto const object_size  = parquet_bytes.size();
+  range_s3_server server(std::move(parquet_bytes));
+  scan_manager_fixture fixture;
+  sirius_scan_manager manager{
+    make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native),
+    *fixture.memory,
+    fixture.topology};
+  std::string const uri = "s3://footer-bucket/nation.parquet";
+
+  // Cold bind opens with open_hint::parquet_footer_probe: one suffix-range GET resolves the size
+  // and stashes the footer that cuDF then reads, so there is no HEAD and no second GET.
+  auto const first = manager.describe_parquet(uri);
+  CHECK(first.object_size == object_size);
+  CHECK(first.total_num_rows == 25);
+  REQUIRE(first.names.size() == 4);
+  CHECK(first.names[0] == "n_nationkey");
+  CHECK(first.names[1] == "n_name");
+  CHECK(first.names[2] == "n_regionkey");
+  CHECK(first.names[3] == "n_comment");
+  CHECK(server.head_count() == 0);
+  CHECK(server.get_count() == 1);
+  CHECK(server.suffix_get_count() == 1);
+
+  // Warm bind: the parsed footer is in the ioctx metadata store, so the open takes
+  // open_hint::generic (a HEAD for the size) and downloads no footer bytes.
+  auto const second = manager.describe_parquet(uri);
+  CHECK(second.object_size == first.object_size);
+  CHECK(second.total_num_rows == first.total_num_rows);
+  CHECK(second.names == first.names);
+  CHECK(server.head_count() == 1);
+  CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("routed S3 cache fill at the object tail is clipped to EOF", "[s3][routing]")
+{
+  constexpr std::size_t page_size = 4096;
+  constexpr std::size_t tail_size = 17;
+  std::vector<std::uint8_t> payload(page_size + tail_size);
+  for (std::size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<std::uint8_t>(i * 31 + 7);
+  }
+  range_s3_server server(payload);
+  scan_manager_fixture fixture;
+  auto cfg       = make_s3_scan_config(server.endpoint(), sirius::scan_manager::io_backend::native);
+  cfg.cache.mode = cucascade::io::cache::cache_mode::cucs;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://tail-cache-bucket/object.bin");
+  REQUIRE(datasource != nullptr);
+
+  std::array<cudf::io::text::byte_range_info, 1> ranges{
+    cudf::io::text::byte_range_info{page_size, tail_size}};
+  datasource->fadvise(ranges, std::nullopt);
+  REQUIRE(datasource->prepare_prefetch(false) == cucascade::io::prepare_result::prepared);
+
+  std::array<std::uint8_t, tail_size> destination{};
+  REQUIRE(datasource->host_read(page_size, destination.size(), destination.data()) == tail_size);
+  CHECK(std::equal(destination.begin(), destination.end(), payload.begin() + page_size));
+  // The cache fills whole pages; the one holding the tail must not ask past the object's end.
+  CHECK(server.max_requested_end() == payload.size());
 }

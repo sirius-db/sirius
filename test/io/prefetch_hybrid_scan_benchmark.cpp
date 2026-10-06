@@ -27,12 +27,12 @@
 //   --nthreads N        reader/decode pool threads (and CUDA streams)
 //   --host_chunk_mib N  host memory pool block size
 //   --chunk_mib N       IO chunk size (REST: target bytes per GET before fusing)
-//   --max_connections N in-flight requests per reactor (REST)
-//   --n_reactors N      reactor count (REST)
+//   --max_connections N in-flight requests per runner (REST)
+//   --n_reactors N      REST runner thread count (rest_n_reactors)
 //
 // Sources:
 //   --dir  local directory, read through io_uring
-//   --s3   object-store prefix, read through the REST reactor.  Everything past
+//   --s3   object-store prefix, read through the REST backend.  Everything past
 //          setup goes through ioctx, so the two differ only in which backend
 //          serves the reads.
 //

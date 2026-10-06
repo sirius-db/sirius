@@ -23,8 +23,10 @@
 #include <cucascade/io/config.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 
 using cucascade::io::cache::cache_mode;
@@ -532,15 +534,23 @@ TEST_CASE("to_io_config carries the scan_manager settings into cuCascade's io_co
           "[scan_manager][config][backend]")
 {
   scan_manager_config cfg{};
-  cfg.uring_n_reactors = 3;
-  cfg.rest_n_reactors  = 5;
-  cfg.cache.mode       = cache_mode::os;
-  cfg.cache.eviction   = eviction_policy::idle;
+  cfg.uring_n_reactors      = 3;
+  cfg.rest_n_reactors       = 5;
+  cfg.cache.mode            = cache_mode::os;
+  cfg.cache.eviction        = eviction_policy::idle;
+  cfg.object_store.endpoint = "http://object-store.test:9000";
+  cfg.kvikio.task_size      = std::size_t{8} << 20;
+  cfg.rest.max_connections  = 17;
 
   auto const io = cfg.to_io_config();
   CHECK(io.backend == cucascade::io::io_backend::native);
   CHECK(io.uring_n_reactors == 3);
   CHECK(io.rest_n_reactors == 5);
+  // A non-default value in each copied sub-config survives the copy.
+  CHECK(io.object_store.endpoint == "http://object-store.test:9000");
+  CHECK(io.kvikio.task_size == std::optional<std::size_t>{std::size_t{8} << 20});
+  CHECK(io.rest.max_connections == 17);
+  CHECK(io.cache.eviction == eviction_policy::idle);
   // Sirius's uring default (readahead off) reaches cuCascade unchanged.
   CHECK(io.uring.n_max_concurrent_scans == 0);
   CHECK_FALSE(io.uring.n_max_concurrent_scans_explicit);

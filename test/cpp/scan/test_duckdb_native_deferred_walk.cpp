@@ -16,6 +16,8 @@
 
 // Metadata walk under a real execution-window lease; no GPU decode is performed here.
 
+#include "io/ioctx_resolver.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
