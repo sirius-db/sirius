@@ -33,7 +33,7 @@ if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_sirius_cuda_link_script
       "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld")
   set(_sirius_cuda_link_interface
-      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/cmake/sirius/sirius-cuda-fatbin.ld>"
+      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_DATADIR}/sirius/sirius-cuda-fatbin.ld>"
   )
   foreach(_target sirius_core sirius_extension)
     if(NOT TARGET ${_target})
@@ -227,6 +227,13 @@ target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
 set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+
+# Keep the embedded DuckDB private when the host exposes another DuckDB
+# globally.
+foreach(target duckdb_static core_functions_extension parquet_extension)
+  target_link_options(sirius_shared PRIVATE
+                      "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${target}>")
+endforeach()
 
 # Discard unused sections pulled in by whole archives.
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"

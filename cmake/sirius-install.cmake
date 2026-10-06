@@ -84,7 +84,10 @@ if(SIRIUS_BUILD_STATIC)
     COMPONENT sirius_library)
   install(
     FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-static-dependencies.cmake"
-          "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+    COMPONENT sirius_library)
+  install(
+    FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
     COMPONENT sirius_library)
 endif()
