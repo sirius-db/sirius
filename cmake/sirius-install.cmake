@@ -1,6 +1,6 @@
 if(VCPKG_BUILD AND NOT PROJECT_IS_TOP_LEVEL)
   install(FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
-          DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius")
+          DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
 endif()
 
 if(NOT PROJECT_IS_TOP_LEVEL)
@@ -20,7 +20,7 @@ endif()
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
-  INSTALL_DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius")
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
   VERSION "${PROJECT_VERSION}"
@@ -33,7 +33,7 @@ install(
 install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
-  DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
   COMPONENT sirius_library)
 
 if(SIRIUS_BUILD_SHARED)
@@ -44,7 +44,7 @@ if(SIRIUS_BUILD_SHARED)
   install(
     EXPORT sirius-targets
     NAMESPACE sirius::
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
     COMPONENT sirius_library)
 endif()
 
@@ -75,16 +75,16 @@ if(SIRIUS_BUILD_STATIC)
   set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME "${sirius_install_component}")
   install(
     FILES "${CMAKE_BINARY_DIR}/corrosion/sirius-static-targetsCorrosion.cmake"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
     COMPONENT sirius_library)
   install(
     EXPORT sirius-static-targets
     NAMESPACE sirius::
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
     COMPONENT sirius_library)
   install(
     FILES "${CMAKE_CURRENT_LIST_DIR}/sirius-static-dependencies.cmake"
           "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/sirius"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
     COMPONENT sirius_library)
 endif()

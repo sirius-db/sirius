@@ -45,7 +45,7 @@ if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_sirius_cuda_link_script
       "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld")
   set(_sirius_cuda_link_interface
-      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_DATADIR}/sirius/sirius-cuda-fatbin.ld>"
+      "$<BUILD_INTERFACE:${_sirius_cuda_link_script}>$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/cmake/sirius/sirius-cuda-fatbin.ld>"
   )
   foreach(_target sirius_core sirius_extension)
     if(NOT TARGET ${_target})
