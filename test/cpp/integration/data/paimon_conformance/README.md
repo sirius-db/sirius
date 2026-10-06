@@ -92,6 +92,9 @@ inventory/hashes, recorded oracle consistency, and actual executable version and
 platform before loading the verified build output. A full run plans 53 cases and
 starts 54 processes: one identity probe, 50 ordinary cases, and three smoke cases.
 Each ordinary/smoke query uses one process for DESCRIBE, rows, and liveness.
+SQL JSON is written to a separate per-case results file, so Sirius fallback
+banners remain in the retained stdout log. Missing, empty, or incomplete SQL
+results still fail, and process failure is checked before result parsing.
 Source-built extensions are unsigned: after receipt validation, their case
 processes use DuckDB's `-unsigned` option. The identity probe and historical
 registry mode keep signature enforcement enabled.

@@ -270,24 +270,37 @@ def run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, repo
         )
         if rejection:
             setup += "SET enable_duckdb_fallback=false;"
-        return execute(
-            [
-                cli,
-                *(["-unsigned"] if args.registry is None else []),
-                "-init",
-                "/dev/null",
-                "-json",
-                "-batch",
-                "-bail",
-                ":memory:",
-                "-c",
-                setup + sql,
-            ],
-            timeout=args.timeout,
-            cwd=run_dir,
-            env=env,
-            log=run_dir / label,
-        )
+        # Engine diagnostics use stdout; keep SQL JSON on its own output channel.
+        # A fixed safe basename avoids shell meta-command quoting of corpus paths.
+        pending = run_dir / "sql-results.json"
+        result = run_dir / (label + ".results.json")
+        pending.unlink(missing_ok=True)
+        result.unlink(missing_ok=True)
+        try:
+            execute(
+                [
+                    cli,
+                    *(["-unsigned"] if args.registry is None else []),
+                    "-init",
+                    "/dev/null",
+                    "-json",
+                    "-batch",
+                    "-bail",
+                    "-cmd",
+                    ".output sql-results.json",
+                    ":memory:",
+                    "-c",
+                    setup + sql,
+                ],
+                timeout=args.timeout,
+                cwd=run_dir,
+                env=env,
+                log=run_dir / label,
+            )
+        finally:
+            if pending.exists():
+                pending.replace(result)
+        return result.read_text()
 
     def query(case, sql, mode, label, setup=""):
         output = command(

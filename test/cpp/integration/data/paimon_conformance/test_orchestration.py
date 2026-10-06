@@ -64,6 +64,11 @@ if os.environ.get('PAIMON_TEST_REQUIRE_UNSIGNED') == '1' and '-unsigned' not in 
     print('Unsigned local extension requires -unsigned', file=sys.stderr)
     sys.exit(1)
 
+print('Engine diagnostic outside the SQL result channel', flush=True)
+if '-cmd' in sys.argv:
+    assert sys.argv[sys.argv.index('-cmd') + 1] == '.output sql-results.json'
+    sys.stdout = open('sql-results.json', 'w')
+
 if 'SET enable_duckdb_fallback=false;' in sql:
     print("GPU plan generation failed: Table function 'paimon_scan' is not supported in Sirius", file=sys.stderr, flush=True)
     if fault == 'rejection_crash':
@@ -92,7 +97,9 @@ results=[[{'extension_version':spec['extension']['version']}],[{'version':spec['
 target = os.environ.get('PAIMON_TEST_TARGET', 'disabled/empty_rows')
 label = 'attached' if attached else mode+'/'+case['id']
 if label == target:
-    if fault == 'missing': results.pop(4)
+    if fault == 'missing_file': os.unlink('sql-results.json')
+    elif fault == 'empty_file': results = []
+    elif fault == 'missing': results.pop(4)
     elif fault == 'extra': results.insert(4, [])
     elif fault == 'reordered': results[3],results[4]=results[4],results[3]
     elif fault == 'wrong_type': results[3][1]['column_type']='BIGINT'
@@ -229,9 +236,16 @@ for result in results: print(json.dumps(result))
             if "ATTACH " in line
         ][0]
         self.assertLess(attached.index("ATTACH "), attached.index("DESCRIBE "))
+        run_dir = next((self.root / "reports").glob("run-*"))
+        self.assertIn("Engine diagnostic", (run_dir / "transparent.stdout").read_text())
+        self.assertNotIn(
+            "Engine diagnostic", (run_dir / "transparent.results.json").read_text()
+        )
 
     def test_incomplete_and_bad_protocol_fail_but_later_cases_run(self):
         for fault in (
+            "missing_file",
+            "empty_file",
             "missing",
             "extra",
             "reordered",
