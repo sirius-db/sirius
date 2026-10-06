@@ -172,17 +172,6 @@ class task_scheduler {
   void start_query(const planner::query& query);
 
   /**
-   * @brief Drop every queued task belonging to @p query_id.
-   *
-   * Clears the scheduler's queue and each GPU executor's queue of that query's pending work,
-   * leaving every other query's tasks in place. In-flight tasks are unaffected.
-   *
-   * Called from the per-query cleanup so a finished or failed query leaves nothing queued that
-   * points into the plan about to be destroyed.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
    * @brief Fail one query by reporting @p error to its own completion handler.
    *
    * Touches no shared subsystem: other in-flight queries keep running. Deliberately does NOT

@@ -117,11 +117,6 @@ void itask_executor::wait_all()
 
 void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
-void itask_executor::drain_query_tasks(sirius::query_id_t query_id)
-{
-  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-}
-
 void itask_executor::drain_and_wait()
 {
   // Guard: if the executor has never been started (or has been stopped),
@@ -199,9 +194,11 @@ void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
 
 void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
 {
-  // Production tasks carry leases from publication, including manager-local tasks. The
-  // scheduler drains every queue before waiting for those leases. No shared thread is stopped.
-  drain_query_tasks(query_id);
+  // Leave accepted staging tasks for the manager: each consumed a device_ready signal.
+  // Removing one here could strand the manager in pop() with no scheduler readiness left.
+  // The GPU manager discards cancelled tasks before preparation and advertises readiness again.
+  // The caller must close publication first, then wait_for_work() after draining workers to
+  // cover staged and manager-local tasks that have not yet been attributed to a pool slot.
   if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
 }
 

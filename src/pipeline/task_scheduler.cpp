@@ -240,7 +240,8 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
   // Drop this query's queued work so management_eventloop cannot dispatch a stale task from it.
   _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
-  // Let in-flight tasks finish, then drop whatever this query still has staged per device.
+  // Drain this query's worker pools. GPU managers consume and discard cancelled staging tasks
+  // themselves so every accepted handoff still leads to another device_ready signal.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->wait_and_drain_query(query_id);
   }
@@ -303,17 +304,6 @@ void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
   }
   if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
   _query_lifecycle.wait_for_work(query_id);
-}
-
-void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
-{
-  // Pending work only, and only this query's: the scheduler's own queue first, then each GPU
-  // executor's staging queue. In-flight tasks are untouched — quiescing those is
-  // wait_for_completion / drain_after_error's job.
-  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_query_tasks(query_id);
-  }
 }
 
 void task_scheduler::management_eventloop()

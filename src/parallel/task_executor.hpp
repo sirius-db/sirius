@@ -107,15 +107,6 @@ class itask_executor {
   void drain_leftover_tasks();
 
   /**
-   * @brief Drop the queued tasks belonging to one query.
-   *
-   * Tasks of other queries are left in place and the queue stays open, so unlike interrupt()
-   * this does not stall any other query's producers or consumers. Only queued work is affected;
-   * a task already dispatched to the thread pool runs to completion.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
    *
    * Stops the kiosk and interrupts the queue so the manager exits, waits for
@@ -141,11 +132,12 @@ class itask_executor {
   void wait_and_validate_empty(sirius::query_id_t query_id);
 
   /**
-   * @brief Wait for in-flight work, then drop @p query_id's queued tasks.
+   * @brief Discard queued pool work and wait for this query's attributed worker slots.
    *
-   * The error-path counterpart of wait_and_validate_empty(). Waiting first guarantees no thread is
-   * still executing a task that references the failing query's plan before the caller lets that
-   * plan be destroyed.
+   * The caller must close publication first. Accepted staging tasks stay queued for the manager
+   * to consume and discard, preserving its readiness handoff. This pool wait does not cover
+   * staged or manager-local tasks before slot attribution: the caller must also wait_for_work()
+   * before releasing query resources.
    */
   void wait_and_drain_query(sirius::query_id_t query_id);
 

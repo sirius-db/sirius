@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "creator/task_creator.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
@@ -192,7 +193,9 @@ struct harness {
   std::shared_ptr<pl::sirius_pipeline> pipeline;
   std::shared_ptr<pl::completion_handler> completion = std::make_shared<pl::completion_handler>();
   std::shared_ptr<pl::sirius_pipeline_task_global_state> global;
+  sirius::exec::query_lifecycle_registry lifecycle;
   std::unique_ptr<pl::task_scheduler> scheduler;
+  std::unique_ptr<sirius::creator::task_creator> creator;
   std::uint64_t next_task_id = 1;
 
   explicit harness(std::size_t devices = 1, bool per_stream = false)
@@ -280,8 +283,13 @@ struct harness {
     sirius::exec::thread_pool_config config;
     config.num_threads        = 1;
     config.thread_name_prefix = "publication-test";
-    scheduler                 = std::make_unique<pl::task_scheduler>(
-      config, *memory.manager, sirius::test::make_test_telemetry_context());
+    lifecycle.open_query(pipeline->get_query_id());
+    scheduler = std::make_unique<pl::task_scheduler>(
+      lifecycle, config, *memory.manager, sirius::test::make_test_telemetry_context());
+    creator = std::make_unique<sirius::creator::task_creator>(
+      lifecycle, sirius::creator::task_creator_config{}, *memory.manager);
+    creator->set_task_scheduler(*scheduler);
+    scheduler->set_task_creator(*creator);
     scheduler->start();
   }
 
@@ -354,6 +362,8 @@ void require_worker_reuse(harness& test)
   next.operator_id = 10;
   auto pipeline = std::make_shared<pl::sirius_pipeline>(pl::pipeline_build_context{nullptr, true});
   pipeline->set_pipeline_id(8);
+  pipeline->set_query_id(sirius::make_query_id(1));
+  test.lifecycle.open_query(pipeline->get_query_id());
   pl::sirius_pipeline_build_state state;
   state.set_pipeline_source(*pipeline, next);
   state.set_pipeline_operators(*pipeline, {next});

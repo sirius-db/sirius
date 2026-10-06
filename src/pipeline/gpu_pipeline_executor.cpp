@@ -158,11 +158,16 @@ void gpu_pipeline_executor::process_task(
       return;
     }
     iteration_completion = gpu_task->get_completion_handler();
+    // Cancellation leaves accepted staging tasks for this manager to consume. Drop them before
+    // memory preparation (which can block), then resume the normal readiness cycle. The task
+    // lease protects its resources even if cancellation races this advisory check.
+    auto const* pipe = gpu_task->get_pipeline();
+    if (!_query_lifecycle.accepts_work(pipe ? pipe->get_query_id() : make_query_id(0))) { return; }
     // Attribute the reserved slot now that the task's query is known, so
     // drain_and_wait(query_id) covers this execution. Not done at reserve() time: the manager
     // parks in pop() holding the slot before any task exists, and counting that against a query
     // would make its drain wait for work that may never arrive.
-    if (auto const* pipe = gpu_task->get_pipeline()) { slot.attach(pipe->get_query_id()); }
+    if (pipe) { slot.attach(pipe->get_query_id()); }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
