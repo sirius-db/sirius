@@ -63,7 +63,6 @@ libcurl = "*"
 pnpm = "*"
 python = ">=3.10"
 pyarrow = ">=14"
-# Local S3 server for the C++ integration tests.
 seaweedfs = ">=4.48"
 
 [tasks]
