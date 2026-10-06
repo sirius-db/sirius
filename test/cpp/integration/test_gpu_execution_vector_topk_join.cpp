@@ -204,7 +204,8 @@ TEST_CASE_METHOD(VectorTopkJoinFixture,
     "SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) DESC LIMIT 4");
   // OFFSET is taken over by the optimizer-time vector join rewrite, which searches LIMIT + OFFSET
   // pairs and leaves DuckDB's TOP_N above it to skip the offset; it must match the CPU.
-  compare_gpu_vs_cpu("SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4 OFFSET 1");
+  compare_gpu_vs_cpu(
+    "SELECT l.id, r.id FROM l, r ORDER BY array_distance(l.v, r.v) LIMIT 4 OFFSET 1");
 }
 
 }  // namespace

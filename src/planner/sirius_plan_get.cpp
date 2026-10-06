@@ -1493,7 +1493,8 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   }
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
-  duckdb::SiriusContext* join_ctx = nullptr;  // the materialize stage restores disk-resident pieces through it
+  duckdb::SiriusContext* join_ctx =
+    nullptr;  // the materialize stage restores disk-resident pieces through it
   if (use_streaming) {
     // Resolved here rather than inside the operator: the operator holds only a scan manager and
     // has no route to the session's index cache, while the planner does. The cache owns the

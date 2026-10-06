@@ -16,11 +16,11 @@
 
 #include "vss/sirius_physical_vector_join_select.hpp"
 
+#include "cuda/vss/brute_force_search.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
 #include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
-#include "cuda/vss/brute_force_search.hpp"
-#include "cuda/vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
 

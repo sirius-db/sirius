@@ -550,10 +550,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
 
   // Squared distances between grid points are whole numbers, so they compare exactly.
   con->Query("SET gpu_execution = false;");
-  auto const reference = ok_rows(*con,
-                                 "SELECT p.id, c.id, round(array_distance(p.vec, c.vec) ^ 2)::BIGINT "
-                                 "FROM ro_probe p, ro_corpus c "
-                                 "WHERE array_distance(p.vec, c.vec) <= 6.0;");
+  auto const reference =
+    ok_rows(*con,
+            "SELECT p.id, c.id, round(array_distance(p.vec, c.vec) ^ 2)::BIGINT "
+            "FROM ro_probe p, ro_corpus c "
+            "WHERE array_distance(p.vec, c.vec) <= 6.0;");
   con->Query("SET gpu_execution = true;");
   REQUIRE(reference.size() > 4000);
 
@@ -561,10 +562,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
   struct unset_on_exit {
     ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_RADIUS_FLUSH_PAIRS"); }
   } const unset;
-  run_ok("CREATE TEMP TABLE ro_joined AS SELECT left_id, right_id, distance FROM "
-         "sirius_knn_join('ro_probe','vec','ro_corpus','vec', search_mode => 'exact', "
-         "metric => 'l2', join_mode => 'threshold', eps => 6.0, left_output_columns => ['id'], "
-         "right_output_columns => ['id']);");
+  run_ok(
+    "CREATE TEMP TABLE ro_joined AS SELECT left_id, right_id, distance FROM "
+    "sirius_knn_join('ro_probe','vec','ro_corpus','vec', search_mode => 'exact', "
+    "metric => 'l2', join_mode => 'threshold', eps => 6.0, left_output_columns => ['id'], "
+    "right_output_columns => ['id']);");
   // Rounded on the CPU: the GPU's FLOAT -> BIGINT cast truncates.
   con->Query("SET gpu_execution = false;");
   auto const joined =

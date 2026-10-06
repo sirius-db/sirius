@@ -26,11 +26,11 @@ target_sources(
           vss/vector_clustering.cu
           vss/ivf_flat_index.cu)
 
-
-# The bounded tile kernel sits at 128 registers for two blocks per SM, and separable compilation
-# makes it spill (a standalone copy on an A5000: 83 TOPS whole-program, 74 with -rdc). The file
-# neither defines nor calls device code across files, so it is its own object library compiled
-# whole-program, with sirius_objects' includes, definitions and options; the targets that take
+# The bounded tile kernel sits at 128 registers for two blocks per SM, and
+# separable compilation makes it spill (a standalone copy on an A5000: 83 TOPS
+# whole-program, 74 with -rdc). The file neither defines nor calls device code
+# across files, so it is its own object library compiled whole-program, with
+# sirius_objects' includes, definitions and options; the targets that take
 # sirius_objects' objects take these too (cmake/sirius-targets.cmake).
 add_library(sirius_whole_program_objects OBJECT vss/bound_gemm.cu)
 set_target_properties(
@@ -40,9 +40,12 @@ set_target_properties(
              CXX_VISIBILITY_PRESET hidden
              CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON)
-target_include_directories(sirius_whole_program_objects
-                           PRIVATE $<TARGET_PROPERTY:sirius_objects,INCLUDE_DIRECTORIES>)
-target_compile_definitions(sirius_whole_program_objects
-                           PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_DEFINITIONS>)
-target_compile_options(sirius_whole_program_objects
-                       PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_OPTIONS>)
+target_include_directories(
+  sirius_whole_program_objects
+  PRIVATE $<TARGET_PROPERTY:sirius_objects,INCLUDE_DIRECTORIES>)
+target_compile_definitions(
+  sirius_whole_program_objects
+  PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_DEFINITIONS>)
+target_compile_options(
+  sirius_whole_program_objects
+  PRIVATE $<TARGET_PROPERTY:sirius_objects,COMPILE_OPTIONS>)

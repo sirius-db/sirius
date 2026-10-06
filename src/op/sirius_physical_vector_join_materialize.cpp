@@ -18,10 +18,10 @@
 
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "pipeline/batch_lock_utils.hpp"
-#include "sirius_context.hpp"
 #include "log/logging.hpp"
+#include "pipeline/batch_lock_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/staging_shortfall.hpp"
 #include "vss/vector_search_internal.hpp"
@@ -80,7 +80,8 @@ cucascade::read_only_data_batch host_or_device_resident(
   if (ro.get_current_tier() != cucascade::memory::Tier::DISK) { return ro; }
   const cucascade::memory::memory_space* host_space = nullptr;
   if (ctx != nullptr) {
-    auto spaces = ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    auto spaces =
+      ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     if (!spaces.empty()) { host_space = spaces.front(); }
   }
   if (host_space == nullptr) {
@@ -90,8 +91,9 @@ cucascade::read_only_data_batch host_or_device_resident(
   std::ignore   = cucascade::data_batch::to_idle(std::move(ro));
   auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, host_space, stream);
   if (!prepared) {
-    throw std::runtime_error(std::string("[sirius_physical_vector_join_materialize] could not restore ") +
-                             what + " from disk");
+    throw std::runtime_error(
+      std::string("[sirius_physical_vector_join_materialize] could not restore ") + what +
+      " from disk");
   }
   return std::visit([](auto& r) { return std::move(r.ro_lock); }, *prepared);
 }
@@ -154,8 +156,11 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
       throw std::runtime_error("[sirius_physical_vector_join_materialize] build-side batch " +
                                std::to_string(id) + " is no longer in the repository");
     }
-    auto ro = host_or_device_resident(
-      batch, batch->to_read_only(), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a build-side batch");
+    auto ro = host_or_device_resident(batch,
+                                      batch->to_read_only(),
+                                      _sirius_ctx,
+                                      ::cuda::stream_ref{stream.value()},
+                                      "a build-side batch");
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
       auto const table = sirius::get_cudf_table_view(ro);
       for (std::size_t c = 0; c < num_output_columns; ++c) {
@@ -247,8 +252,11 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
       throw std::runtime_error("[sirius_physical_vector_join_materialize] probe-side batch " +
                                std::to_string(id) + " is no longer in the repository");
     }
-    auto ro = host_or_device_resident(
-      batch, batch->to_read_only(), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
+    auto ro = host_or_device_resident(batch,
+                                      batch->to_read_only(),
+                                      _sirius_ctx,
+                                      ::cuda::stream_ref{stream.value()},
+                                      "a probe-side batch");
     cudf::table_view table;
     cudf::size_type first = 0;
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
@@ -303,11 +311,11 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   auto const& right = _request.right;
 
   auto left_pin  = _probe_side ? nullptr
-                                      : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                         left.catalog, left.schema, left.table);
+                               : _scan_manager->find_pinned_entry_for_duckdb_table(
+                                  left.catalog, left.schema, left.table);
   auto right_pin = _build_side ? nullptr
-                                      : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                          right.catalog, right.schema, right.table);
+                               : _scan_manager->find_pinned_entry_for_duckdb_table(
+                                   right.catalog, right.schema, right.table);
   if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_materialize] left/right table is no longer pinned");
@@ -582,8 +590,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   std::vector<cucascade::read_only_data_batch> input_batches;
   input_batches.reserve(piece_ptrs.size());
   for (auto const& ptr : piece_ptrs) {
-    input_batches.push_back(
-      host_or_device_resident(ptr, ptr->to_read_only(), _sirius_ctx, stream_ref, "a join output piece"));
+    input_batches.push_back(host_or_device_resident(
+      ptr, ptr->to_read_only(), _sirius_ctx, stream_ref, "a join output piece"));
   }
 
   if (input_batches.empty()) {
@@ -621,7 +629,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
       // Copied on a converter stream of its own; freed on this one instead.
       staged->to_mutable().rebind_stream(stream);
     }
-    auto const tv  = staged ? sirius::get_cudf_table_view(*staged) : sirius::get_cudf_table_view(piece);
+    auto const tv =
+      staged ? sirius::get_cudf_table_view(*staged) : sirius::get_cudf_table_view(piece);
     auto out_table = materialize_piece(partition_idx, tv, *space, stream);
     staged.reset();
     auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
@@ -639,7 +648,7 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
   cucascade::memory::memory_space& space,
   rmm::cuda_stream_view stream)
 {
-  auto const mr = space.get_default_allocator();
+  auto const mr                         = space.get_default_allocator();
   cudf::column_view const left_row_view = pairs.column(0);  // INT32 row index into the left batch
   cudf::column_view const neighbor_view = pairs.column(1);  // INT64 global right id
   cudf::column_view const distance_view = pairs.column(2);  // FLOAT32 distance

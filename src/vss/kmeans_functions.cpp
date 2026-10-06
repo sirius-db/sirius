@@ -16,17 +16,16 @@
 
 #include "vss/kmeans_functions.hpp"
 
+#include "cuda/vss/cudf_raft_interop.hpp"
 #include "data/data_batch_utils.hpp"
-#include "pipeline/batch_lock_utils.hpp"
-
 #include "duckdb/common/exception.hpp"
+#include "pipeline/batch_lock_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/data_batch_probe.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/cluster_fold.hpp"
 #include "vss/cluster_lists.hpp"
-#include "cuda/vss/cudf_raft_interop.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/device_context_guard.hpp"
 #include "vss/distance_metric.hpp"
@@ -99,8 +98,7 @@ kmeans_context resolve_context(duckdb::SiriusContext& ctx,
     throw duckdb::InvalidInputException(fn + ": no HOST memory space available");
   }
 
-  auto pin =
-    ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
+  auto pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
   if (pin == nullptr) {
     throw duckdb::InvalidInputException(fn + ": table '" + table +
                                         "' must be pinned (GPU or HOST tier)");
@@ -667,8 +665,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   } else {
     lists.tier       = cucascade::memory::Tier::HOST;
     lists.host_space = const_cast<cucascade::memory::memory_space*>(c.host_space);
-    lists.chunk_rows = std::min<std::int64_t>(std::min<std::int64_t>(n_rows, staged_rows),
-                                              max_list_elements / dim);
+    lists.chunk_rows =
+      std::min<std::int64_t>(std::min<std::int64_t>(n_rows, staged_rows), max_list_elements / dim);
     auto const n_chunks_h = static_cast<std::size_t>(lists.num_chunks());
     host_chunks.reserve(n_chunks_h);
     for (std::size_t ch = 0; ch < n_chunks_h; ++ch) {
@@ -803,9 +801,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         auto offset         = static_cast<std::size_t>(in_chunk) * row_bytes_v;
         auto remaining      = static_cast<std::size_t>(rows_now) * row_bytes_v;
         while (remaining > 0) {
-          auto const block = offset / block_bytes;
+          auto const block    = offset / block_bytes;
           auto const in_block = offset % block_bytes;
-          auto const bytes = std::min(remaining, block_bytes - in_block);
+          auto const bytes    = std::min(remaining, block_bytes - in_block);
           CUDF_CUDA_TRY(cudaMemcpyAsync(
             alloc->at(block).data() + in_block, src, bytes, copy_kind, stream.value()));
           src += bytes;
@@ -1080,11 +1078,11 @@ void copy_host_list_rows(const cluster_lists& lists,
 {
   auto const* data = ro.get_data();
   if (data == nullptr) { throw std::runtime_error("[vss] cluster list chunk has no data"); }
-  auto const& table = data->cast<cucascade::host_data_representation>().get_host_table();
-  auto const& alloc = *table->allocation;
+  auto const& table      = data->cast<cucascade::host_data_representation>().get_host_table();
+  auto const& alloc      = *table->allocation;
   auto const block_bytes = alloc.block_size();
-  auto offset    = static_cast<std::size_t>(row0) * lists.row_bytes();
-  auto remaining = static_cast<std::size_t>(rows) * lists.row_bytes();
+  auto offset            = static_cast<std::size_t>(row0) * lists.row_bytes();
+  auto remaining         = static_cast<std::size_t>(rows) * lists.row_bytes();
   while (remaining > 0) {
     auto const block    = offset / block_bytes;
     auto const in_block = offset % block_bytes;

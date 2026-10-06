@@ -22,7 +22,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
@@ -155,8 +154,8 @@ struct cluster_lists {
 /// Read-lock chunk @p chunk of HOST-tier lists for staging, bringing it back from the disk
 /// tier first if the downgrade executor moved it there.
 [[nodiscard]] ::cucascade::read_only_data_batch lock_host_list_chunk(const cluster_lists& lists,
-                                                                       std::size_t chunk,
-                                                                       rmm::cuda_stream_view stream);
+                                                                     std::size_t chunk,
+                                                                     rmm::cuda_stream_view stream);
 
 /// Copy rows [row0, row0 + rows) of a locked HOST-tier chunk into device memory at @p dst,
 /// walking its pinned blocks densely. Issued on @p stream and not waited for: keep @p ro alive

@@ -119,7 +119,6 @@ extern "C" int cudaProfilerStop();
 #include "vss/cluster_lists.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
-#include "cuda/vss/ivf_flat_index.hpp"
 #include "vss/kmeans_functions.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_join_binding.hpp"

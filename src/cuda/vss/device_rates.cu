@@ -16,8 +16,9 @@
 
 #include "vss/device_rates.hpp"
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cuda_fp16.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -102,7 +103,7 @@ bool time_best(cudaStream_t stream, F&& launch, double& seconds)
     launch();
     cudaEventRecord(stop, stream);
     float ms = 0;
-    ok = cudaEventSynchronize(stop) == cudaSuccess &&
+    ok       = cudaEventSynchronize(stop) == cudaSuccess &&
          cudaEventElapsedTime(&ms, start, stop) == cudaSuccess && ms > 0;
     double const s = ms * 1e-3;
     seconds        = run == 0 ? s : std::min(seconds, s);
@@ -130,33 +131,36 @@ bool measure_device_rates(device_rates& out)
   void* host                   = nullptr;
   void* dev_a                  = nullptr;
   void* dev_b                  = nullptr;
-  bool ok = cudaMallocHost(&host, kBytes) == cudaSuccess && cudaMalloc(&dev_a, kBytes) == cudaSuccess &&
-            cudaMalloc(&dev_b, kBytes) == cudaSuccess;
+  bool ok                      = cudaMallocHost(&host, kBytes) == cudaSuccess &&
+            cudaMalloc(&dev_a, kBytes) == cudaSuccess && cudaMalloc(&dev_b, kBytes) == cudaSuccess;
 
   int const blocks = sms * 4;
   double s         = 0;
   if (ok) {
     constexpr int kIters = 1 << 14;
-    ok = time_best(
+    ok                   = time_best(
       stream,
       [&] { fma_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<float*>(dev_a), kIters); },
       s);
     out.fp32 = 2.0 * kChains * kIters * static_cast<double>(blocks) * kThreads / s;
   }
-  bool const tensor = major > 7 || (major == 7 && minor >= 2);
+  bool const tensor        = major > 7 || (major == 7 && minor >= 2);
   constexpr double kMmaOps = 2.0 * 16 * 16 * 16 * 4;  // per warp per iteration
   double const warps       = static_cast<double>(blocks) * (kThreads / 32);
   if (ok && tensor) {
     constexpr int kIters = 1 << 10;
-    ok = time_best(
+    ok                   = time_best(
       stream,
-      [&] { mma_kernel<half, float><<<blocks, kThreads, 0, stream>>>(static_cast<float*>(dev_a), kIters); },
+      [&] {
+        mma_kernel<half, float>
+          <<<blocks, kThreads, 0, stream>>>(static_cast<float*>(dev_a), kIters);
+      },
       s);
     out.f16 = kMmaOps * kIters * warps / s;
   }
   if (ok && tensor) {
     constexpr int kIters = 1 << 11;
-    ok = time_best(
+    ok                   = time_best(
       stream,
       [&] {
         mma_kernel<signed char, int>
@@ -171,7 +175,7 @@ bool measure_device_rates(device_rates& out)
   }
   if (ok) {
     constexpr int kCopies = 2;
-    ok = time_best(
+    ok                    = time_best(
       stream,
       [&] {
         for (int i = 0; i < kCopies; ++i) {
@@ -183,7 +187,7 @@ bool measure_device_rates(device_rates& out)
   }
   if (ok) {
     constexpr int kCopies = 10;
-    ok = time_best(
+    ok                    = time_best(
       stream,
       [&] {
         for (int i = 0; i < kCopies; ++i) {

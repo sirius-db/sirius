@@ -25,6 +25,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
@@ -52,7 +53,6 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
@@ -196,17 +196,19 @@ void split_conjunction(unique_ptr<Expression> e, std::vector<unique_ptr<Expressi
 /// vector has no distance, so DuckDB orders or filters it in ways the join does not reproduce;
 /// declining leaves the query to a plan that can fall back to the CPU at run time. Only a column
 /// read straight from a table scan is checked; any other source reports false.
-bool vector_may_hold_nulls(duckdb::ClientContext& context, LogicalOperator& subtree, const ColumnBinding& b)
+bool vector_may_hold_nulls(duckdb::ClientContext& context,
+                           LogicalOperator& subtree,
+                           const ColumnBinding& b)
 {
   if (subtree.type == LogicalOperatorType::LOGICAL_GET) {
     auto& scan = subtree.Cast<duckdb::LogicalGet>();
     if (scan.table_index != b.table_index) { return false; }
     auto table = scan.GetTable();
     if (!table) { return false; }
-    auto const pos = scan.projection_ids.empty() ? b.column_index
-                     : b.column_index < scan.projection_ids.size()
-                       ? scan.projection_ids[b.column_index]
-                       : scan.GetColumnIds().size();
+    auto const pos  = scan.projection_ids.empty() ? b.column_index
+                      : b.column_index < scan.projection_ids.size()
+                        ? scan.projection_ids[b.column_index]
+                        : scan.GetColumnIds().size();
     auto const& ids = scan.GetColumnIds();
     if (pos >= ids.size() || ids[pos].IsRowIdColumn() || ids[pos].IsEmptyColumn()) { return false; }
     try {
@@ -437,12 +439,12 @@ bool is_inequality_join(duckdb::ClientContext& context, LogicalOperator& op)
   if (env != nullptr && std::strcmp(env, "1") == 0) { return true; }
   double const pairs = static_cast<double>(op.children[0]->EstimateCardinality(context)) *
                        static_cast<double>(op.children[1]->EstimateCardinality(context));
-  auto const from_stats   = band_selectivity(join);
-  double const share      = from_stats ? *from_stats
-                            : pairs > 0 ? static_cast<double>(op.EstimateCardinality(context)) / pairs
-                                        : 0.0;
-  auto const threads = std::max<double>(
-    1.0, duckdb::TaskScheduler::GetScheduler(context).NumberOfThreads());
+  auto const from_stats = band_selectivity(join);
+  double const share    = from_stats  ? *from_stats
+                          : pairs > 0 ? static_cast<double>(op.EstimateCardinality(context)) / pairs
+                                      : 0.0;
+  auto const threads =
+    std::max<double>(1.0, duckdb::TaskScheduler::GetScheduler(context).NumberOfThreads());
   double const cpu_per_pair = 8.7e-6 * 24.0 / threads;
   double const gpu_per_pair = 0.73e-9 / current_device_scale().fp32;
   bool const vector_first   = share * cpu_per_pair >= gpu_per_pair;
@@ -840,11 +842,11 @@ class rewriter {
     shape.dim              = static_cast<double>(req.dim);
     shape.corpus_on_device = pin != nullptr && pin->tier == cucascade::memory::Tier::GPU;
     access_path_cost const cost{current_device_scale()};
-    double const brute     = cost.brute(shape);
-    auto describe          = [&](exact_lists_choice const& c) {
+    double const brute = cost.brute(shape);
+    auto describe      = [&](exact_lists_choice const& c) {
       shape.list_bytes_per_value = c.encoding == list_encoding::uint8     ? 1
-                                            : c.encoding == list_encoding::float16 ? 2
-                                                                                   : 4;
+                                        : c.encoding == list_encoding::float16 ? 2
+                                                                               : 4;
       shape.lists_on_device      = c.on_device;
       shape.n_clusters           = static_cast<double>(c.n_clusters);
       shape.inexact_unseeded     = c.encoding == list_encoding::float16 && !c.seeded;
@@ -1368,7 +1370,7 @@ class rewriter {
         vector_may_hold_nulls(_context, *cross_slot->children[1 - pi], corpus_vec)) {
       return false;
     }
-    auto const k          = static_cast<std::int64_t>(topn.limit + topn.offset);
+    auto const k = static_cast<std::int64_t>(topn.limit + topn.offset);
 
     // Nothing above may read the vectors raw; distance calls on the pair become the score.
     bool ok = true;

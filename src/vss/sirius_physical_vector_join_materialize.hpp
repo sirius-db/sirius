@@ -142,7 +142,9 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   std::shared_ptr<sirius::vss::materialized_side_buffer> _probe_side;
 
   std::mutex _drain_mutex;
-  duckdb::SiriusContext* _sirius_ctx{nullptr};  // for the host memory space a disk piece comes back to                  // guards get_next_task_input_data()
+  duckdb::SiriusContext* _sirius_ctx{
+    nullptr};  // for the host memory space a disk piece comes back to                  // guards
+               // get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain
 
   std::mutex _init_mutex;  // guards the one-time init below

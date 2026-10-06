@@ -16,9 +16,9 @@
 
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 
+#include "cuda/vss/knn_merge.hpp"
 #include "data/data_batch_utils.hpp"
 #include "vss/join_result_shaping.hpp"
-#include "cuda/vss/knn_merge.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
