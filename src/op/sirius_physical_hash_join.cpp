@@ -30,6 +30,7 @@
 #include "cudf/table/table_view.hpp"
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
+#include "cudf/unary.hpp"
 #include "cudf/utilities/memory_resource.hpp"
 #include "cudf/version_config.hpp"
 #include "data/data_batch_utils.hpp"
@@ -86,6 +87,38 @@ static void collect_bound_ref_indices(const duckdb::Expression& expr,
   }
   duckdb::ExpressionIterator::EnumerateChildren(
     expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+}
+
+// cuDF 26.08 mixed SEMI/ANTI deduplication derives conditional-column null handling from the
+// equality table. With non-null keys it can collapse NULL and valid residual values that have
+// identical underlying bytes. Append non-null validity flags to the build conditional table so
+// those rows compare differently even when cuDF ignores their masks. Keep the original column
+// indices for the predicate and the original equality keys for hashing. Unlike a row ID, these
+// flags still allow duplicate non-null build rows to be eliminated.
+// TODO: remove once Sirius is on cuDF >= 26.10, which includes rapidsai/cudf#23861.
+static cudf::table_view prepare_mixed_filter_build(
+  duckdb::vector<sirius::join_condition> const& conditions,
+  std::size_t first_residual,
+  bool build_is_left,
+  cudf::table_view const& build,
+  std::vector<std::unique_ptr<cudf::column>>& validity_columns,
+  ::cuda::stream_ref stream)
+{
+  std::unordered_set<std::size_t> indices;
+  for (std::size_t i = first_residual; i < conditions.size(); ++i) {
+    auto const& side = build_is_left ? conditions[i].left : conditions[i].right;
+    auto expression  = sirius::ast::to_duckdb(*side);
+    collect_bound_ref_indices(*expression, indices);
+  }
+  std::vector<cudf::column_view> columns(build.begin(), build.end());
+  for (auto const index : indices) {
+    auto const column = build.column(static_cast<cudf::size_type>(index));
+    if (!column.has_nulls()) { continue; }
+    validity_columns.push_back(
+      cudf::is_valid(column, stream, cudf::get_current_device_resource_ref()));
+    columns.push_back(validity_columns.back()->view());
+  }
+  return cudf::table_view{columns};
 }
 
 // Mixed plain/null-safe keys require different null policies, so route the null-safe keys
@@ -2113,32 +2146,52 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), {}, stream);
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
-    } else if (join_type == duckdb::JoinType::SEMI) {
-      left_indices = cudf::mixed_left_semi_join(
-        left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
-    } else if (join_type == duckdb::JoinType::ANTI) {
-      left_indices = cudf::mixed_left_anti_join(
-        left_eq, right_eq, left_full, right_full, pred->back(), compare_nulls(), stream);
-    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+    } else if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
+      std::vector<std::unique_ptr<cudf::column>> validity_columns;
+      auto build_conditional = prepare_mixed_filter_build(
+        conditions, num_equality_conditions, false, right_full, validity_columns, stream);
+      left_indices = join_type == duckdb::JoinType::SEMI
+                       ? cudf::mixed_left_semi_join(left_eq,
+                                                    right_eq,
+                                                    left_full,
+                                                    build_conditional,
+                                                    pred->back(),
+                                                    compare_nulls(),
+                                                    stream)
+                       : cudf::mixed_left_anti_join(left_eq,
+                                                    right_eq,
+                                                    left_full,
+                                                    build_conditional,
+                                                    pred->back(),
+                                                    compare_nulls(),
+                                                    stream);
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
+               join_type == duckdb::JoinType::RIGHT_ANTI) {
       auto swapped_pred = translator.translate_join_conditions(
         conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
       if (!swapped_pred) {
         throw std::runtime_error(
-          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI "
+          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI/ANTI "
           "mixed join");
       }
-      right_indices = cudf::mixed_left_semi_join(
-        right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
-    } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
-      auto swapped_pred = translator.translate_join_conditions(
-        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
-      if (!swapped_pred) {
-        throw std::runtime_error(
-          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_ANTI "
-          "mixed join");
-      }
-      right_indices = cudf::mixed_left_anti_join(
-        right_eq, left_eq, right_full, left_full, swapped_pred->back(), compare_nulls(), stream);
+      std::vector<std::unique_ptr<cudf::column>> validity_columns;
+      auto build_conditional = prepare_mixed_filter_build(
+        conditions, num_equality_conditions, true, left_full, validity_columns, stream);
+      right_indices = join_type == duckdb::JoinType::RIGHT_SEMI
+                        ? cudf::mixed_left_semi_join(right_eq,
+                                                     left_eq,
+                                                     right_full,
+                                                     build_conditional,
+                                                     swapped_pred->back(),
+                                                     compare_nulls(),
+                                                     stream)
+                        : cudf::mixed_left_anti_join(right_eq,
+                                                     left_eq,
+                                                     right_full,
+                                                     build_conditional,
+                                                     swapped_pred->back(),
+                                                     compare_nulls(),
+                                                     stream);
     } else {
       throw std::runtime_error("Unsupported join type for mixed join: " +
                                duckdb::JoinTypeToString(join_type));

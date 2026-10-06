@@ -68,7 +68,9 @@ constexpr auto PIPELINE_THREADS =
 
 TEST_CASE("each backend publishes its own default scan budget", "[scan_manager][readahead]")
 {
-  CHECK(sirius::io::uring::config{}.n_max_concurrent_scans == PIPELINE_THREADS);
+  // The local (uring) backend defaults to 0 (readahead off): on local NVMe a
+  // prefetch only reorders the executor's own reads against the same device.
+  CHECK(sirius::io::uring::config{}.n_max_concurrent_scans == 0);
   CHECK(sirius::io::rest::config{}.n_max_concurrent_scans == 2 * PIPELINE_THREADS);
   // kvikIO has no prefetching cache to read ahead into, so it publishes no
   // depth at all and there is no knob that could give it one.
@@ -691,6 +693,9 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
   cfg.backend                 = sirius::scan_manager::io_backend::kvikio;
   cfg.cache.mode              = cache_mode::sirius;
   cfg.pipeline_width          = PIPELINE_THREADS;
+  // Local readahead is off by default now; opt it back in so this test still
+  // proves kvikIO is dropped despite a sibling backend carrying positive depth.
+  cfg.uring.n_max_concurrent_scans = PIPELINE_THREADS;
   cfg.apply_cache_mode();
   REQUIRE(cfg.uring.n_max_concurrent_scans > 0);
   REQUIRE(cfg.rest.n_max_concurrent_scans > 0);

@@ -111,7 +111,7 @@ spec='[s3][integration]~[large]~[aws]'
 "$bin" --list-tests --verbosity quiet "$spec"
 ```
 
-The gate lists contain 98, 5, 3 and 3 cases respectively; the deprecated
+The gate lists contain 105, 5, 3 and 3 cases respectively; the deprecated
 TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
 plus `[.]`.
 

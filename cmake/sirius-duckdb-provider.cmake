@@ -45,7 +45,9 @@ target_include_directories(
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/yyjson/include"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/utf8proc/include"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/extension/core_functions/include"
-            "${SIRIUS_DUCKDB_SOURCE_DIR}/extension/parquet/include")
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/extension/parquet/include"
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/parquet"
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/thrift")
 target_compile_definitions(
   sirius_duckdb_dependency
   INTERFACE $<$<OR:$<CONFIG:Debug>,$<BOOL:${FORCE_DEBUG}>>:DEBUG>

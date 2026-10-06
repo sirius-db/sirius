@@ -66,13 +66,19 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
+#include <duckdb/common/serializer/binary_serializer.hpp>
+#include <duckdb/common/serializer/memory_stream.hpp>
+
+#include <atomic>
 #include <numeric>
 #include <utility>
 
@@ -102,9 +108,13 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
         multi_file_bind->file_list->IsEmpty()) {
       return {};
     }
+    auto files = multi_file_bind->file_list->GetAllFiles();
     std::vector<std::string> file_paths;
-    for (auto const& file : multi_file_bind->file_list->GetAllFiles()) {
-      file_paths.push_back(file.path);
+    file_paths.reserve(files.size());
+    // The bulk snapshot owns these strings; transfer them without copying each path again.
+    // The bound file list remains untouched for independent original/candidate captures.
+    for (auto& file : files) {
+      file_paths.push_back(std::move(file.path));
     }
     return file_paths;
   }
@@ -112,6 +122,15 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
 }
 
 namespace {
+std::atomic<uint64_t> next_standalone_plan_generation{1};
+
+uint64_t reserve_standalone_plan_generation()
+{
+  auto const generation = next_standalone_plan_generation.fetch_add(1, std::memory_order_relaxed);
+  if (generation == 0) { throw std::overflow_error("standalone plan generation space exhausted"); }
+  return generation;
+}
+
 bool is_nested_logical_type(duckdb::LogicalType const& type)
 {
   auto const id = type.id();
@@ -170,8 +189,11 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
       column_id, column.name, sirius::from_duckdb(column.type), kind});
   }
-  auto resolved_file_paths = resolve_parquet_scan_file_paths(
-    scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
+  auto resolved_file_paths =
+    scan_op.contract_file_paths.empty()
+      ? resolve_parquet_scan_file_paths(
+          scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters)
+      : std::move(scan_op.contract_file_paths);
   if (scan_op.function.name == "sirius_read_parquet") {
     if (resolved_file_paths.empty()) {
       throw std::runtime_error(
@@ -228,6 +250,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
+  info->read_views             = scan_op.read_views;
 }
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
@@ -355,11 +378,10 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  info->column_ids          = scan_op.column_ids;
-  info->projection_ids      = scan_op.projection_ids;
-  info->returned_types      = scan_op.returned_types;
-  info->output_types        = scan_op.types;
-  info->defer_metadata_walk = scan_op.mvcc_pin_serves_scan;
+  info->column_ids     = scan_op.column_ids;
+  info->projection_ids = scan_op.projection_ids;
+  info->returned_types = scan_op.returned_types;
+  info->output_types   = scan_op.types;
   return info;
 }
 
@@ -379,6 +401,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
   info->sirius_dynamic_filters = dynamic_filters;
+  info->contract_id            = scan.contract_id;
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
@@ -386,7 +409,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
       scan.types,
       scan.estimated_cardinality,
       std::move(ingestible),
-      compressed_materialization_observer);
+      scan.contract_id,
+      compressed_materialization_observer,
+      scan.read_views);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
@@ -427,7 +452,8 @@ void require_complete_native_scan_schema(const sirius::op::sirius_physical_table
 void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context)
+  duckdb::ClientContext& context,
+  scan_contract_provenance const& contract_provenance)
 {
   // Table-in-out functions wear a TABLE_SCAN with children — skip them; wrapping would change
   // a child layout the converter and downstream operators don't expect.
@@ -438,51 +464,56 @@ void wrap_table_scan_source(
   // GPU_SCAN normalization requires one target per output column. Reject an incomplete schema
   // while transparent execution can still fall back to DuckDB.
   require_complete_native_scan_schema(scan);
-  auto sirius_ctx = context.registered_state
-                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                      : nullptr;
+  auto const* entry = lookup_connector(scan.function, scan.bind_data.get(), context);
+  if (!entry || !entry->lower) {
+    throw duckdb::NotImplementedException(
+      "Table function '%s' is not supported in Sirius (unverified scan source)", fn);
+  }
+  if (!scan.read_views) {
+    throw std::runtime_error("GPU scan has no query-local read-view registry");
+  }
 
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
-  bool replace_slot = false;
-  if (fn == "seq_scan") {
-    // Native scans apply AST-capable filters post-decode.
-    leaf         = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
-                              sirius_ctx.get());
-    replace_slot = true;
-  } else if (fn == "iceberg_scan") {
-    // `iceberg_scan` rides the parquet ingestible: an iceberg table's data files ARE parquet, and
-    // the iceberg extension resolves its manifests into the same MultiFileBindData file list
-    // read_parquet produces, so the parquet bind data is built from it unchanged. The iceberg
-    // subclass adds only the table's delete data, and its ingestible applies those deletes to
-    // each decoded batch. Equality deletes are still refused by create_plan(LogicalGet&) before
-    // this point.
-    leaf = make_gpu_scan_leaf(build_iceberg_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
-                              sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
-    replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    // Parquet applies AST filters in the reader; post-decode uses membership only.
-    leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
-                              sirius_ctx.get());
-    replace_slot = true;
-  } else {
-    throw std::runtime_error(
-      "[sirius_physical_plan_generator::wrap_table_scan_source] Unsupported scan function: " + fn);
+  scan.contract_file_paths =
+    resolve_parquet_scan_file_paths(scan.function.name, scan.bind_data.get(), scan.parameters);
+  scan.bound_view = std::make_shared<sirius::op::scan::bound_read_view const>(
+    sirius::op::scan::capture_bound_read_view(scan, context, scan.contract_file_paths));
+
+  sirius::op::scan::column_requirements columns;
+  columns.column_ids     = scan.column_ids;
+  columns.projection_ids = scan.projection_ids;
+  for (auto const& column : scan.column_ids) {
+    if (column.IsRowIdColumn()) columns.requires_row_id = true;
+    if (column.IsVirtualColumn() && column.HasPrimaryIndex()) {
+      columns.virtual_columns.push_back(column.GetPrimaryIndex());
+    }
   }
-  if (replace_slot) {
-    table_scan_slot = std::move(leaf);
-  } else {
-    table_scan_slot->children.push_back(std::move(leaf));
+  sirius::op::scan::predicate_contract predicates;
+  predicates.pushdown_mode = std::to_string(static_cast<uint8_t>(entry->filter_mode));
+  if (scan.table_filters) {
+    duckdb::MemoryStream buffer;
+    duckdb::BinarySerializer::Serialize(*scan.table_filters, buffer);
+    predicates.static_filter_fingerprint.assign(reinterpret_cast<char const*>(buffer.GetData()),
+                                                buffer.GetPosition());
   }
+
+  auto materializer_kind = sirius::op::scan::materializer_kind::parquet;
+  if (entry->kind == sirius::op::scan::source_kind::duckdb_native) {
+    materializer_kind = sirius::op::scan::materializer_kind::duckdb_native;
+  } else if (entry->function_name == "iceberg_scan") {
+    materializer_kind = sirius::op::scan::materializer_kind::iceberg;
+  }
+  scan.contract_id =
+    sirius::op::scan::allocate_scan_contract(*scan.read_views,
+                                             contract_provenance.window_id,
+                                             contract_provenance.finalize_generation,
+                                             scan.scan_node_id,
+                                             scan.bound_view,
+                                             std::move(columns),
+                                             std::move(predicates),
+                                             {materializer_kind, entry->registry_profile},
+                                             scan.duckdb_types,
+                                             scan.table_index);
+  table_scan_slot = entry->lower(scan, op_params, context, entry->filter_mode);
 }
 
 //! Replace a COLUMN_DATA_SCAN, EMPTY_RESULT, or DUMMY_SCAN slot in place with a GPU_VALUES
@@ -816,7 +847,8 @@ void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context,
-  duckdb::SiriusContext* compressed_materialization_observer);
+  duckdb::SiriusContext* compressed_materialization_observer,
+  scan_contract_provenance const& contract_provenance);
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
 //! PARTITION_DISTINCT -> original DISTINCT`. The non-owning `delim_base.distinct` borrow stays
@@ -862,19 +894,23 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                      const sirius::operator_params& op_params,
                      duckdb::ClientContext& context,
-                     duckdb::SiriusContext* compressed_materialization_observer)
+                     duckdb::SiriusContext* compressed_materialization_observer,
+                     scan_contract_provenance const& contract_provenance)
 {
   auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
 
   if (delim_base.join) {
-    insert_gpu_pipeline_operators_recursive(
-      delim_base.join, op_params, context, compressed_materialization_observer);
+    insert_gpu_pipeline_operators_recursive(delim_base.join,
+                                            op_params,
+                                            context,
+                                            compressed_materialization_observer,
+                                            contract_provenance);
   }
   if (delim_base.distinct_root) {
     // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
     for (auto& child_slot : delim_base.distinct_root->children) {
       insert_gpu_pipeline_operators_recursive(
-        child_slot, op_params, context, compressed_materialization_observer);
+        child_slot, op_params, context, compressed_materialization_observer, contract_provenance);
     }
     wrap_delim_distinct(delim_base, op_params);
   }
@@ -906,18 +942,19 @@ void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context,
-  duckdb::SiriusContext* compressed_materialization_observer)
+  duckdb::SiriusContext* compressed_materialization_observer,
+  scan_contract_provenance const& contract_provenance)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
     insert_gpu_pipeline_operators_recursive(
-      child_slot, op_params, context, compressed_materialization_observer);
+      child_slot, op_params, context, compressed_materialization_observer, contract_provenance);
   }
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN:
-      wrap_table_scan_source(slot, op_params, context);
+      wrap_table_scan_source(slot, op_params, context, contract_provenance);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
@@ -957,7 +994,8 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
-      wrap_delim_join(slot, op_params, context, compressed_materialization_observer);
+      wrap_delim_join(
+        slot, op_params, context, compressed_materialization_observer, contract_provenance);
       break;
     default: break;
   }
@@ -973,6 +1011,50 @@ bool compressed_materialization_active(duckdb::ClientContext& context)
 }
 
 }  // namespace
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  auto leaf       = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+                                 scan,
+                                 op_params,
+                                 mode,
+                                 sirius_ctx.get());
+  if (sirius_ctx) { sirius_ctx->observe_native_checkpoint_for_testing(context, "native_leaf"); }
+  return leaf;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(
+    build_parquet_table_info(scan, op_params), scan, op_params, mode, sirius_ctx.get());
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(
+    build_iceberg_table_info(scan, op_params, context), scan, op_params, mode, sirius_ctx.get());
+}
 
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
                                                                     std::string_view operation)
@@ -1018,8 +1100,23 @@ void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalTy
 }
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
-  : context(context)
+  : sirius_physical_plan_generator(
+      context, scan_contract_provenance{std::nullopt, reserve_standalone_plan_generation()})
 {
+}
+
+sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context,
+                                                               scan_contract_provenance provenance)
+  : read_views(std::make_shared<sirius::transparent::read_view_registry>()),
+    contract_provenance(std::move(provenance)),
+    context(context)
+{
+  auto const has_window     = contract_provenance.window_id.has_value();
+  auto const has_generation = contract_provenance.finalize_generation != 0;
+  if (has_window == has_generation) {
+    throw std::invalid_argument(
+      "scan contract provenance requires exactly one of window or plan generation");
+  }
 }
 
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
@@ -1157,7 +1254,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
-  insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
+  insert_gpu_pipeline_operators_recursive(
+    plan, op_params, context, sirius_ctx.get(), contract_provenance);
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

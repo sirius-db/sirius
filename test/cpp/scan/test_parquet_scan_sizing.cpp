@@ -364,10 +364,12 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
 {
   auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
   info->approximate_batch_size = 100;
+  info->contract_id            = 1;
   scan::parquet_gpu_ingestible ingestible{std::move(info)};
   auto coalescer = ingestible.create_batch_coalescer();
 
   auto file = std::make_unique<scan::parquet_file_scan_info>();
+  file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
   file->row_groups.push_back({0, 20, 60, 10, 1});
   file->row_groups.push_back({1, 20, 60, 10, 1});
 
@@ -404,6 +406,7 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
     info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
     info->scan_output_arity      = 1;
     info->approximate_batch_size = cap;
+    info->contract_id            = 1;
     info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
                                      "filename",
                                      sirius::logical_type::make(sirius::type_id::VARCHAR),
@@ -412,6 +415,7 @@ TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
   };
   auto make_file = [] {
     auto file = std::make_unique<scan::parquet_file_scan_info>();
+    file->set_contract_payload(1, {{1, 0, "sizing.parquet", "parquet", "footer"}}, {{}});
     file->row_groups.push_back({0, 20, 60, 10, 1});
     file->row_groups.push_back({1, 20, 60, 10, 1});
     return file;

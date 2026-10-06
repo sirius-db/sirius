@@ -19,6 +19,7 @@
 #include <expression/ast/node.hpp>
 #include <expression/date_trunc_unit.hpp>
 #include <expression/function_id.hpp>
+#include <expression/substring_slice.hpp>
 #include <expression/value.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -55,6 +56,7 @@
 
 // standard library
 #include <algorithm>
+#include <cstddef>
 #include <optional>
 #include <regex>
 #include <string>
@@ -178,29 +180,27 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
   //----------Substring Function----------//
   if (resolved_id == function_id::substring) {
-    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    // DuckDB binds substring as (VARCHAR, BIGINT[, BIGINT]); planning admits only constant bounds
+    // that gpu_substring_slice accepts.
+    D_ASSERT(args.size() == 2 || args.size() == 3);
+    auto const bigint_arg = [&](std::size_t i) {
+      D_ASSERT(args[i]->holds<sirius::ast::constant>());
+      return std::get<int64_t>(args[i]->get<sirius::ast::constant>().payload);
+    };
+    auto const offset = bigint_arg(1);
+    auto const length = args.size() == 3 ? bigint_arg(2) : substring_default_length;
+    auto const slice  = gpu_substring_slice(offset, length);
+    if (!slice) {
+      throw invalid_input_exception(
+        "[expression_evaluator:function] unsupported substring bounds (offset {}, length {})",
+        offset,
+        length);
+    }
 
-    // DuckDB binds substring as (VARCHAR, BIGINT, BIGINT), so the start/len
-    // children are BIGINT constants — the payload variant holds int64_t.
-    D_ASSERT(args[1]->holds<sirius::ast::constant>());
-    D_ASSERT(args[2]->holds<sirius::ast::constant>());
-    auto const start_raw = std::get<int64_t>(args[1]->get<sirius::ast::constant>().payload);
-    auto const len_raw   = std::get<int64_t>(args[2]->get<sirius::ast::constant>().payload);
-
-    // Re-base to 0-indexed and convert <start, len> to <start, stop>. Narrow
-    // to cudf::size_type (int32_t) here because cudf::strings::slice_strings
-    // only accepts int32 bounds — the narrowing is a cudf API constraint,
-    // not a SUBSTRING semantic limit.
-    auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
-    auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
-
+    auto input               = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     auto const input_strings = cudf::strings_column_view(input.get_column_view());
-    auto result_column       = cudf::strings::slice_strings(input_strings,
-                                                      std::optional<cudf::size_type>{start_val},
-                                                      std::optional<cudf::size_type>{stop_val},
-                                                      std::optional<cudf::size_type>{1},
-                                                      _stream,
-                                                      _mr);
+    auto result_column       = cudf::strings::slice_strings(
+      input_strings, slice->start, slice->stop, std::optional<cudf::size_type>{1}, _stream, _mr);
     return evaluate_result(std::move(result_column));
   }
 
