@@ -75,8 +75,8 @@ enum class prefetch_outcome_kind : std::uint8_t {
   /// split -- the readahead got there first, which is the point of it.
   prefetched,
   /// The attempt had nothing to issue: a split with no ranges, or a scan with no
-  /// prefetching cache to issue into (@c cache.mode: os warms the page cache and
-  /// nothing else).  Neither a win nor a miss.
+  /// prefetching cache to issue into (@c cache.mode: os, whose readahead has no
+  /// pinned cache to fill).  Neither a win nor a miss.
   nothing_to_issue,
 
   /// Not an outcome -- the enumerator count, so the counters can be an array

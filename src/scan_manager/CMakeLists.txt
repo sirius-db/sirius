@@ -3,6 +3,7 @@ target_sources(
   PRIVATE late_mat_resolver.cpp
           load_balancing_scan_batch_coalescer.cpp
           insert_delta_job.cpp
+          io_stats_log.cpp
           mvcc_mask_job.cpp
           prefetching_scheduler.cpp
           pinned_chunk_stats.cpp

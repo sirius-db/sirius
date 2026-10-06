@@ -45,6 +45,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/io_stats_log.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 #include "sirius_context.hpp"
 
@@ -141,18 +142,6 @@ prefetch_strategy backend_prefetch_strategy(cucascade::io::io_context_type type)
     case cucascade::io::io_context_type::kvikio: break;
   }
   return prefetch_strategy::eager;
-}
-
-/// The backend's name, for log lines and exception text.
-const char* to_string(cucascade::io::io_context_type type) noexcept
-{
-  switch (type) {
-    case cucascade::io::io_context_type::uring: return "uring";
-    case cucascade::io::io_context_type::restful: return "restful";
-    case cucascade::io::io_context_type::kvikio: return "kvikio";
-    case cucascade::io::io_context_type::s3rdma: return "s3rdma";
-  }
-  return "unknown";
 }
 
 /// Call after @c initialize_cache on a backend that can use the cache.  cuCascade's
@@ -1518,8 +1507,11 @@ void sirius_scan_manager::prepare_for_query(
   // backend fails fast; check the backends already built before this query reads.
   // Outside _routed_io_ctxs_mtx: a restart spawns threads and allocates staging,
   // and check_io_runners takes the leaf _io_runner_check_mtx, so the snapshot is
-  // taken first and the map lock released before any check.
+  // taken first and the map lock released before any check.  A backend's io stats
+  // cover the IO since the previous query boundary, so they are logged before a
+  // restart replaces the runners they count.
   for (auto const& io_ctx : built_io_ctxs) {
+    log_io_stats(*io_ctx);
     check_io_runners(*io_ctx);
   }
 
@@ -1584,8 +1576,9 @@ void sirius_scan_manager::prepare_for_query(
     for (auto const& io_ctx : query_io_ctxs) {
       // Nowhere to read ahead into on this backend, so it has no say in the
       // readahead's terms: it cannot cache at all, or a requested pinned cache
-      // failed to build and has nothing to read ahead into.  `os` mode builds no
-      // pinned cache by design and reads ahead into the page cache instead.
+      // failed to build and has nothing to read ahead into.  `os` mode keeps the
+      // readahead enabled by configuration; it has no pinned cache to fill
+      // (page-cache warming would need cuCascade support).
       if (!io_ctx->can_use_fs_cache() ||
           (_config.cache.use_fs_cache() && io_ctx->cache() == nullptr)) {
         continue;
@@ -2319,6 +2312,22 @@ void sirius_scan_manager::check_io_runners(cucascade::io::ioctx& io_ctx)
         expected);
     }
   }
+}
+
+void sirius_scan_manager::log_io_stats(cucascade::io::ioctx& io_ctx)
+{
+  // Serialized so two queries' boundaries cannot interleave one's diff with the
+  // other's peak reset.
+  std::lock_guard lk{_io_stats_mtx};
+  auto after   = io_stats_snapshot::take(io_ctx);
+  auto& before = _io_stats_snapshots[&io_ctx];  // first boundary: counts from zero
+  if (io_ctx.active_runners() > 0) {
+    SIRIUS_LOG_DEBUG("{}", format_io_stats_delta(io_ctx.type(), before, after));
+  }
+  // `after` becomes the next baseline rather than a fresh sample, so no counter
+  // increment between the two calls is lost; only the peaks restart here.
+  io_ctx.reset_stats_peaks();
+  before = std::move(after);
 }
 
 std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(

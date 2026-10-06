@@ -103,8 +103,8 @@ TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manag
   };
 
   CHECK(budget_for(cache_mode::none) == 0);
-  // `os` has no prefetching cache, but ordering scans ahead of demand still
-  // warms the page cache, so readahead is on.
+  // `os` keeps the readahead enabled by configuration; it has no pinned cache to
+  // fill (page-cache warming would need cuCascade support).
   CHECK(budget_for(cache_mode::os) == backend_budget);
   CHECK(budget_for(cache_mode::cucs) == backend_budget);
 }
@@ -830,13 +830,14 @@ initialize_memory_manager_too_wide_for_cache()
 
 }  // namespace
 
-TEST_CASE("cache.mode os keeps the readahead on: it reads ahead into the page cache",
-          "[scan_manager][readahead]")
+TEST_CASE("cache.mode os keeps the readahead enabled by configuration", "[scan_manager][readahead]")
 {
   auto memory   = initialize_memory_manager(1);
   auto topology = single_gpu_index();
 
-  // `os` builds no pinned cache by design, on a backend that could hold one.
+  // `os` builds no pinned cache by design, on a backend that could hold one.  The
+  // readahead stays enabled but has no pinned cache to fill (page-cache warming
+  // would need cuCascade support), so the readahead is built but issues no IO.
   sirius::scan_manager::sirius_scan_manager manager{
     config_with_uring_budget(cache_mode::os), *memory, topology};
   REQUIRE(manager.io_ctx() != nullptr);

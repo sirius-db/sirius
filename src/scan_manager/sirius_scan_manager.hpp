@@ -30,6 +30,7 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
+#include "scan_manager/io_stats_log.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
 #include "scan_manager/memory_prefetcher.hpp"
 #include "scan_manager/mvcc_mask_cache.hpp"
@@ -1107,6 +1108,13 @@ class sirius_scan_manager {
   /// spawns threads on restart, so never call it under `_routed_io_ctxs_mtx`.
   void check_io_runners(cucascade::io::ioctx& io_ctx);
 
+  /// Per-query DEBUG `[io_stats]` line (@ref format_io_stats_delta) for @p io_ctx:
+  /// what it did since the previous query boundary (since it was built, at its
+  /// first).  Concurrent queries share the window.  Skipped while no runner is
+  /// active (kvikIO has none); peaks are reset either way.  Takes the leaf
+  /// `_io_stats_mtx`.
+  void log_io_stats(cucascade::io::ioctx& io_ctx);
+
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
@@ -1162,6 +1170,11 @@ class sirius_scan_manager {
   /// ioctxs whose runner shortfall has been reported; see @ref check_io_runners.
   /// Guarded by `_io_runner_check_mtx`.
   std::unordered_set<cucascade::io::ioctx const*> _io_runner_shortfall_reported;
+  /// Guards `_io_stats_snapshots`.  A leaf lock.
+  std::mutex _io_stats_mtx;
+  /// Per started ioctx, its stats at the previous query boundary; see @ref log_io_stats.
+  /// Keyed by address: ioctxs live as long as this manager.
+  std::unordered_map<cucascade::io::ioctx const*, io_stats_snapshot> _io_stats_snapshots;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
   /// whole duration, and an unpin from another connection drops only the map slot, leaving
