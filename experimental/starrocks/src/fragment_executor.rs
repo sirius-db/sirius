@@ -6,6 +6,8 @@
 //! dispatch and result-return plumbing can be exercised end to end without a build tree or a GPU.
 
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -38,6 +40,33 @@ pub struct ExportedBatch {
     pub layout: Vec<u8>,
     /// `(address, length)` of each buffer.
     pub src: Vec<(u64, u64)>,
+}
+
+/// What [`OutputDrain::next`] found within its timeout.
+#[derive(Debug)]
+pub enum DrainNext {
+    Batch(ExportedBatch),
+    /// Nothing yet; the fragment may still produce more.
+    Waiting,
+    /// The stream ended and every batch was exported.
+    End,
+}
+
+/// Exports one output stream of a sender fragment while it runs, from any thread.
+pub trait OutputDrain: Send + std::fmt::Debug {
+    /// The next batch, waiting up to `timeout` for one. Errors once the fragment failed.
+    fn next(&mut self, timeout: Duration) -> Result<DrainNext, String>;
+}
+
+/// Asks the executor to hand out drains for some output streams before it runs the fragment,
+/// so those outputs ship while the fragment produces them.
+#[derive(Debug)]
+pub struct DrainHandoff {
+    /// Output stream indices (positions in [`FragmentRun::outputs`]) to drain.
+    pub streams: Vec<usize>,
+    /// Receives one drain per stream, in `streams` order, just before the run starts. Dropped
+    /// unsent when the executor does not stream or the fragment fails before running.
+    pub respond: Sender<Vec<Box<dyn OutputDrain>>>,
 }
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -110,6 +139,8 @@ pub struct FragmentRun<'a> {
     pub broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     pub hash_keys: Vec<usize>,
+    /// Outputs to drain while the fragment runs; the rest stay parked until it finishes.
+    pub drains: Option<DrainHandoff>,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning

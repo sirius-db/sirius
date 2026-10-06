@@ -135,6 +135,14 @@ class streaming_fragment {
   /// @throws the output's poison error, which after a failed run() is that run's cause.
   std::optional<std::shared_ptr<cucascade::data_batch>> pull(stream_id_t id);
 
+  /// The stream behind output `id`, for a consumer that exports batches while run() is still
+  /// producing them: classify() tells "nothing yet" from the end of the stream, which pull()
+  /// cannot before run() returns. The stream outlives this fragment. One that is destroyed
+  /// without having run poisons its outputs, so a consumer waiting on them is released.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a result
+  ///         fragment.
+  [[nodiscard]] std::shared_ptr<batch_stream> output_stream(stream_id_t id) const;
+
   /// False while batches remain, before EOS, and on a poisoned output.
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   [[nodiscard]] bool drained(stream_id_t id) const;
