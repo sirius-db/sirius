@@ -403,7 +403,7 @@ the key; cuCascade's uring reactor checks its own rules (group limits >= 1, the 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
 TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST reactor consumes those values so signing
+`scan_manager.object_store`. The REST backend consumes those values so signing
 and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
@@ -487,15 +487,15 @@ sirius:
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `cucs` | `none` | Which cache the read path goes through. `sirius` is a deprecated alias of `cucs`, still accepted. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the prefetching cache. Only meaningful under `mode: cucs`. Values are lowercase. |
-| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when pinned host-memory allocations (by any user) reach this fraction of capacity. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
 through the kernel page cache instead. `mode: cucs` reads `O_DIRECT` into cuCascade's
 pinned prefetching cache (`fs_cache`).
 
-`eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
-pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+`eviction: lru` keeps idle chunks for reuse and sweeps them, in request-creation order, once
+pinned host allocations pass `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 

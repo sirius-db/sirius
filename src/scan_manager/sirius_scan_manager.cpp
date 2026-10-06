@@ -1471,16 +1471,16 @@ void sirius_scan_manager::prepare_for_query(
     reset(query_id);
   }
 
-  // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
-  // generation counter (cucascade::io::cache::fs_cache::_ticker, bumped in
-  // fs_cache::prepare_for_query, cuCascade src/io/cache/fs_cache.cpp).
-  // chunk_lifecycle::eviction_tier(query_tick) (cucascade/io/cache/types.hpp) scores every
-  // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
-  // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
-  // front of the eviction order. Performance only, never correctness: mark_evicting()
-  // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
-  // just re-reads on a miss. The fix belongs in fs_cache (track the set of live
-  // epochs rather than newest-wins), not here.
+  // KNOWN GAP under concurrent queries: the cache's query epoch is a single GLOBAL counter
+  // (cucascade::io::cache::fs_cache::_ticker, bumped by fs_cache::prepare_for_query). It is
+  // stamped on each prefetch request and drives the per-cycle statistics (summary() deltas),
+  // so a second query starting here folds the first query's remaining prefetch activity into
+  // its own cycle. Eviction itself does not read the epoch: the evictor sweeps finished
+  // prefetch requests in creation order (one pass under eviction: idle; under lru only past
+  // eviction_threshold_fraction, with a second pass that takes subscribed chunks), and
+  // mark_evicting() succeeds only at pin == 0, so a chunk a live reader holds is never
+  // reclaimed. Observability only, never correctness; a per-query epoch would belong in
+  // fs_cache, not here.
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
     _io_ctx->cache()->prepare_for_query();

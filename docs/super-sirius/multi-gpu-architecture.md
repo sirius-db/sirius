@@ -107,7 +107,7 @@ Ownership goes one direction: `SiriusContext` owns everything below it. Connecti
 6. **Register the path-routed backends.** The scan manager's cuCascade `io_context_registry` holds one entry per backend type (`uring` / `restful` / `kvikio`), each a path checker and a factory. A REST ioctx for `s3://` is built on first use and shared by all GPUs.
 7. **Restore cudf device-resource refs on shutdown.** `sirius_memory_reservation_manager`'s destructor first synchronizes each managed GPU (`cudaDeviceSynchronize()`) so pending `cudaFreeAsync` operations against the soon-to-be-destroyed pool complete, then restores cudf's previous device resource ref. The sync step is critical — without it, tests that leave async deallocations un-synchronized can corrupt the driver's per-device pool list and crash the next manager construction on the same device.
 
-After `initialize()`, the engine has per-GPU memory pools, shared backend-specific I/O runner pools, path-based datasource routing, and a manager that translates `(Tier, gpu_id)` into an allocator.
+After `initialize()`, the engine has per-GPU memory pools, the default backend's I/O runner pool (other backends' pools are built on first use), path-based datasource routing, and a manager that translates `(Tier, gpu_id)` into an allocator.
 
 ## Data Residency: Pin Tables
 
@@ -207,12 +207,12 @@ Single-GPU configurations may still opt out via `backend: kvikio`; the per-FileH
 
 The native path:
 
-1. **Managed file reads go through `sirius::io::open_datasource(io_ctx, path)`**, which normalizes the path and calls cuCascade's `cucascade::io::open_datasource`. Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. With single-GPU `backend: kvikio`, local parquet takes the cudf-bundled path instead.
+1. **Managed file reads go through `sirius::io::open_datasource(io_ctx, path)`**, which normalizes the path and calls cuCascade's `cucascade::io::open_datasource`. Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`.
 2. **An ioctx is shared across GPUs.** The ioctx and its runners bind no device at construction. A device read captures the caller's current CUDA device when it is submitted and carries it on the request. The runner that serves the request makes that device current for the H2D copy and records the copy's event on it.
 3. **Paths are resolved through `io_context_registry`.** The registry runs each backend's path checker and returns a backend type. Uring's checker is a filesystem stat, applied after the scan manager strips a leading `file://`. Local files use the shared uring ioctx, `s3://` the REST ioctx. A kvikio catch-all claims what no explicit backend takes. A null datasource means the resolved backend's factory declined to construct, for example an unconfigured object store.
 4. **Pin-table placement is carried by `memory_space`.** All files of a pin go through the same ioctx. The destination GPU comes from the current-device guard and the target space's allocator, and is recorded per chunk for task creation.
 
-Every managed read on the multi-GPU path resolves through `sirius::io::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Local parquet reaches `cudf::io::datasource::create(path)` only under the single-GPU `backend: kvikio` opt-out. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps `cucascade::io::datasource`s through the `datasource*` overload.
+Every managed read on the multi-GPU path resolves through `sirius::io::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Under the single-GPU `backend: kvikio` opt-out the same open path is used, on `kvikio_context`; `cudf::io::datasource::create(path)` remains only as the fallback for a slice that carries no datasource. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps `cucascade::io::datasource`s through the `datasource*` overload.
 
 ## Memory Pressure: Reservations and Downgrade
 
