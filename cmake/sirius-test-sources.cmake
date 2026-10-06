@@ -286,21 +286,14 @@ set(TEST_SOURCES
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
-    test/cpp/utils/utils.cpp)
-# cmake-format: on
-
-# The local S3 harness and its integration tests are optional.
-if(SIRIUS_BUILD_S3_TESTS)
-  list(
-    APPEND
-    TEST_SOURCES
+    test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
-endif()
+# cmake-format: on
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
 # caught by the check-orphan-tests pre-commit hook

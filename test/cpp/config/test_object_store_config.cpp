@@ -134,8 +134,8 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
            "      object_store:\n"
            "        endpoint: http://127.0.0.1:9000\n"
            "        region: us-east-1\n"
-           "        access_key: minioadmin\n"
-           "        secret_key: minioadmin-secret\n"
+           "        access_key: test-access-key\n"
+           "        secret_key: test-secret-key\n"
            "        session_token: TESTSESSIONTOKEN\n"
            "        signing_mode: header\n"
            "        s3_transport: rdma\n"
@@ -150,8 +150,8 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   auto const& os = cfg.get_scan_manager_config().object_store;
   CHECK(os.endpoint == "http://127.0.0.1:9000");
   CHECK(os.region == "us-east-1");
-  CHECK(os.access_key == "minioadmin");
-  CHECK(os.secret_key == "minioadmin-secret");
+  CHECK(os.access_key == "test-access-key");
+  CHECK(os.secret_key == "test-secret-key");
   CHECK(os.session_token == "TESTSESSIONTOKEN");
   CHECK(os.s3_signing_mode == object_store_config::signing_mode::header);
   CHECK(os.s3_transport == object_store_config::transport::RDMA);
@@ -174,8 +174,8 @@ TEST_CASE("sirius_config loads presigned object_store_config signing mode from Y
            "      object_store:\n"
            "        endpoint: http://127.0.0.1:9000\n"
            "        region: us-east-1\n"
-           "        access_key: minioadmin\n"
-           "        secret_key: minioadmin-secret\n"
+           "        access_key: test-access-key\n"
+           "        secret_key: test-secret-key\n"
            "        signing_mode: presigned\n";
     REQUIRE(out);
   }
@@ -202,8 +202,8 @@ TEST_CASE("sirius_config rejects unknown object_store_config signing modes",
            "      object_store:\n"
            "        endpoint: http://127.0.0.1:9000\n"
            "        region: us-east-1\n"
-           "        access_key: minioadmin\n"
-           "        secret_key: minioadmin-secret\n"
+           "        access_key: test-access-key\n"
+           "        secret_key: test-secret-key\n"
            "        signing_mode: query-string\n";
     REQUIRE(out);
   }
@@ -226,8 +226,8 @@ TEST_CASE("sirius_config rejects removed s3_use_async_backend object_store key",
              "      object_store:\n"
              "        endpoint: http://127.0.0.1:9000\n"
              "        region: us-east-1\n"
-             "        access_key: minioadmin\n"
-             "        secret_key: minioadmin-secret\n"
+             "        access_key: test-access-key\n"
+             "        secret_key: test-secret-key\n"
              "        s3_use_async_backend: false\n");
 
   sirius::sirius_config cfg;

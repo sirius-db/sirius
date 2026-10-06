@@ -6,9 +6,9 @@ tests run in the default unit suite.
 
 ## Running the gates
 
-`SIRIUS_BUILD_S3_TESTS` defaults to `ON`, including the local SeaweedFS
-harness. The Pixi environment provides `weed`; no Docker daemon or Go bridge
-build is required. The vcpkg presets disable this optional harness.
+The S3 harness is included whenever the C++ tests are built. The Pixi
+environment provides the prebuilt `weed` executable; no Docker daemon or Go
+toolchain is required. Server startup is opt-in through `SIRIUS_TEST_S3_AUTO`.
 
 | Command | Selection and environment |
 |---|---|
@@ -159,20 +159,22 @@ files. `SIRIUS_TEST_S3_LOCAL_DIR` points to the uploaded local copy used by
 CPU oracles. `MANIFEST.sha256` is written next to that directory and is
 not uploaded.
 
-| Object group | Contents | Upload |
-|---|---|---|
-| `hello.txt` | 16 bytes; HEAD and tiny reads | HTTP + HTTPS |
-| `small.bin` | 20 KiB; exact-byte reads | HTTP + HTTPS |
-| `medium.bin` | 8 MiB; ranges at odd offsets | HTTP + HTTPS |
-| `parquet/*` | Committed parquet files plus runtime-generated `edge_types.parquet` | HTTP + HTTPS |
-| `glob/multi/*` | Two nation copies and `region.parquet` | HTTP + HTTPS |
-| `glob/hive/*` | Hive partition directories | HTTP + HTTPS |
-| `root_a.parquet`, `root_b.parquet` | Bucket-root glob inputs | HTTP + HTTPS |
-| `glob-enc/*` | 12 keys covering percent bytes, spaces, slashes, query/fragment delimiters and partition directories | HTTP + HTTPS |
-| `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE | HTTP + HTTPS |
-| `tpch/sf1/*` | Eight SF1 tables; requires TPCH | HTTP + HTTPS |
-| `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE | HTTP only |
-| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair | HTTP only |
+Fixtures are uploaded once and are available through both HTTP and HTTPS.
+
+| Object group | Contents |
+|---|---|
+| `hello.txt` | 16 bytes; HEAD and tiny reads |
+| `small.bin` | 20 KiB; exact-byte reads |
+| `medium.bin` | 8 MiB; ranges at odd offsets |
+| `parquet/*` | Committed parquet files plus runtime-generated `edge_types.parquet` |
+| `glob/multi/*` | Two nation copies and `region.parquet` |
+| `glob/hive/*` | Hive partition directories |
+| `root_a.parquet`, `root_b.parquet` | Bucket-root glob inputs |
+| `glob-enc/*` | 12 keys covering percent bytes, spaces, slashes, query/fragment delimiters and partition directories |
+| `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE |
+| `tpch/sf1/*` | Eight SF1 tables; requires TPCH |
+| `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE |
+| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair |
 
 The SF10 cache was 2,223,320,375 bytes (about 2.07 GiB), measured on
 2026-05-21, before the DuckDB v1.5.6 pin.
@@ -192,6 +194,7 @@ User inputs:
 | Variable | Purpose |
 |---|---|
 | `SIRIUS_TEST_S3_AUTO` | Start managed SeaweedFS when no endpoint is supplied |
+| `SIRIUS_TEST_WEED` | Override the `weed` executable |
 | `SIRIUS_TEST_S3_STRICT` | Fail on missing prerequisites or failed startup |
 | `SIRIUS_TEST_S3_ENDPOINT` | Use an existing endpoint instead of starting a server |
 | `SIRIUS_TEST_S3_SESSION_TOKEN` | Session token for temporary credentials |

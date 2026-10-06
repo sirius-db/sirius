@@ -38,11 +38,6 @@ option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
-# S3 integration tests start a local SeaweedFS process from the Pixi
-# environment.
-option(SIRIUS_BUILD_S3_TESTS
-       "Build the SeaweedFS-backed S3 integration test harness" ON)
-
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
 endif()

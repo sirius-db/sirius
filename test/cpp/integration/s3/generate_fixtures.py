@@ -22,7 +22,7 @@ known TPCH data as the regular GPU integration suite.
 
 The binary blobs are opaque bytes, not parquet. REST byte-equality tests
 read them through scan_manager create_datasource. Unless --manifest is set,
-MANIFEST.sha256 is written inside out_dir; the container harness overrides
+MANIFEST.sha256 is written inside out_dir; the S3 harness overrides
 that path to keep it outside the uploaded directory.
 """
 

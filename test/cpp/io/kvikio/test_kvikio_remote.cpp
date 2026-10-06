@@ -70,13 +70,12 @@ class scoped_temp_file {
   std::filesystem::path _path;
 };
 
-#ifdef SIRIUS_HAVE_S3_TEST_BACKEND
 using sirius::test::s3::env_or;
 using sirius::test::s3::require_env;
 
 /// Credentials for the managed SeaweedFS instance brought up by
 /// ensure_s3_test_env(); TLS verification is off for its self-signed cert.
-io::object_store_config minio_store()
+io::object_store_config s3_store()
 {
   io::object_store_config os;
   os.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
@@ -86,7 +85,6 @@ io::object_store_config minio_store()
   os.tls_verify = false;
   return os;
 }
-#endif
 
 io::object_store_config configured_store()
 {
@@ -149,7 +147,6 @@ TEST_CASE("kvikio_context clamps local reads past the end of the object", "[kvik
   REQUIRE(ds->host_read(contents.size() + 100, buffer.size(), buffer.data()) == 0);
 }
 
-#ifdef SIRIUS_HAVE_S3_TEST_BACKEND
 TEST_CASE("kvikio_context orders remote device reads behind the destination stream",
           "[s3][integration][kvikio]")
 {
@@ -176,7 +173,7 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
     return;
   }
 
-  auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, minio_store());
+  auto ctx = std::make_shared<io::kvikio_context>(io::kvikio_config{}, s3_store());
   auto ds  = ctx->open_datasource("s3://" + require_env("SIRIUS_TEST_S3_BUCKET") + "/" + key);
   REQUIRE(ds != nullptr);
   REQUIRE(ds->size() == payload.size());
@@ -234,4 +231,3 @@ TEST_CASE("kvikio_context orders remote device reads behind the destination stre
   REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
   REQUIRE(got == payload);
 }
-#endif

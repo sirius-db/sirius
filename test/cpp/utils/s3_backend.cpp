@@ -222,18 +222,14 @@ void terminate_pid(pid_t pid)
 // ---- S3 endpoint addressing -------------------------------------------------
 
 struct s3_endpoint {
-  std::string host;       // always "127.0.0.1"
-  int port{0};            // dynamically-chosen free port
   std::string endpoint;   // "<scheme>://<host>:<port>"
   std::string authority;  // "<host>:<port>" (Host header / signing)
 };
 
-s3_endpoint make_endpoint(std::string const& scheme, std::string host, int port)
+s3_endpoint make_endpoint(std::string const& scheme, int port)
 {
   s3_endpoint ep;
-  ep.host      = std::move(host);
-  ep.port      = port;
-  ep.authority = ep.host + ":" + std::to_string(port);
+  ep.authority = "127.0.0.1:" + std::to_string(port);
   ep.endpoint  = scheme + "://" + ep.authority;
   return ep;
 }
@@ -415,18 +411,14 @@ size_t curl_read_file(char* buffer, size_t size, size_t nitems, void* userdata)
 
 size_t curl_discard(char*, size_t size, size_t nitems, void*) { return size * nitems; }
 
-// Issue a SigV4-signed request to <endpoint><canonical_uri>. For "PUT", body
-// (which may be null for a zero-length CreateBucket) is streamed; for "GET" the
-// response body is discarded. Returns the HTTP status code, or -1 on transport
-// error.
-long s3_request(std::string const& method,
-                s3_endpoint const& ep,
-                std::string const& scheme,
-                std::string const& canonical_uri,
-                std::FILE* body,
-                std::int64_t body_len,
-                std::optional<fs::path> const& ca_bundle,
-                long timeout_seconds = 0)
+// Stream a signed PUT; a null body creates an empty bucket. Returns the HTTP
+// status code, or -1 on transport error.
+long s3_put(s3_endpoint const& ep,
+            std::string const& canonical_uri,
+            std::FILE* body,
+            std::int64_t body_len,
+            std::optional<fs::path> const& ca_bundle,
+            long timeout_seconds = 0)
 {
   sirius::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
@@ -436,7 +428,7 @@ long s3_request(std::string const& method,
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
   // lineitem fixture) without hashing them; SeaweedFS accepts it.
-  auto signed_req = sirius::io::rest::s3::sign_request(method,
+  auto signed_req = sirius::io::rest::s3::sign_request("PUT",
                                                        ep.authority,
                                                        canonical_uri,
                                                        /*query=*/"",
@@ -459,18 +451,16 @@ long s3_request(std::string const& method,
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-  if (method == "PUT") {
-    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-    curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(body_len));
-    curl_easy_setopt(curl, CURLOPT_READFUNCTION, curl_read_file);
-    curl_easy_setopt(curl, CURLOPT_READDATA, body);
-  }
+  curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+  curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(body_len));
+  curl_easy_setopt(curl, CURLOPT_READFUNCTION, curl_read_file);
+  curl_easy_setopt(curl, CURLOPT_READDATA, body);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
-  if (scheme == "https" && ca_bundle.has_value()) {
+  if (ca_bundle.has_value()) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle->c_str());
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
@@ -481,22 +471,12 @@ long s3_request(std::string const& method,
   if (rc == CURLE_OK) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   } else if (timeout_seconds == 0) {
-    std::cerr << "[s3] " << method << " " << url << ": " << curl_easy_strerror(rc) << std::endl;
+    std::cerr << "[s3] PUT " << url << ": " << curl_easy_strerror(rc) << std::endl;
   }
 
   curl_slist_free_all(hdrs);
   curl_easy_cleanup(curl);
   return code;
-}
-
-long s3_put(s3_endpoint const& ep,
-            std::string const& scheme,
-            std::string const& canonical_uri,
-            std::FILE* body,
-            std::int64_t body_len,
-            std::optional<fs::path> const& ca_bundle)
-{
-  return s3_request("PUT", ep, scheme, canonical_uri, body, body_len, ca_bundle);
 }
 
 std::string uri_path_for(std::string const& bucket, std::string const& key)
@@ -510,7 +490,6 @@ std::string uri_path_for(std::string const& bucket, std::string const& key)
 // ListBuckets alone can succeed before the volume server has registered.
 bool wait_s3_ready(pid_t pid,
                    s3_endpoint const& ep,
-                   std::string const& scheme,
                    fs::path const& fixture,
                    std::optional<fs::path> const& ca_bundle)
 {
@@ -524,12 +503,11 @@ bool wait_s3_ready(pid_t pid,
     if (::waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == pid) {
       return false;
     }
-    auto const bucket =
-      s3_request("PUT", ep, scheme, uri_path_for(kBucket, ""), nullptr, 0, ca_bundle, 2);
+    auto const bucket = s3_put(ep, uri_path_for(kBucket, ""), nullptr, 0, ca_bundle, 2);
     if (bucket == 200 || bucket == 204 || bucket == 409) {
       std::rewind(body.get());
-      auto const code = s3_request(
-        "PUT", ep, scheme, uri_path_for(kBucket, kDefaultKey), body.get(), size, ca_bundle, 2);
+      auto const code =
+        s3_put(ep, uri_path_for(kBucket, kDefaultKey), body.get(), size, ca_bundle, 2);
       if (code == 200 || code == 204) return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -537,18 +515,8 @@ bool wait_s3_ready(pid_t pid,
   return false;
 }
 
-void upload_fixtures(s3_endpoint const& ep,
-                     std::string const& scheme,
-                     fs::path const& fixture_dir,
-                     std::optional<fs::path> const& ca_bundle)
+void upload_fixtures(s3_endpoint const& ep, fs::path const& fixture_dir)
 {
-  // Create the bucket (ignore 200/204 and 409 BucketAlreadyOwnedByYou).
-  long bc = s3_put(ep, scheme, uri_path_for(kBucket, ""), nullptr, 0, ca_bundle);
-  if (!(bc == 200 || bc == 204 || bc == 409)) {
-    throw std::runtime_error("create-bucket PUT failed (HTTP " + std::to_string(bc) + ") at " +
-                             ep.endpoint);
-  }
-
   for (auto const& entry : fs::recursive_directory_iterator(fixture_dir)) {
     if (!entry.is_regular_file()) continue;
     std::string key = fs::relative(entry.path(), fixture_dir).generic_string();
@@ -557,7 +525,7 @@ void upload_fixtures(s3_endpoint const& ep,
     auto size    = static_cast<std::int64_t>(entry.file_size());
     std::FILE* f = std::fopen(entry.path().c_str(), "rb");
     if (f == nullptr) throw std::runtime_error("cannot open fixture: " + entry.path().string());
-    long pc = s3_put(ep, scheme, uri_path_for(kBucket, key), f, size, ca_bundle);
+    long pc = s3_put(ep, uri_path_for(kBucket, key), f, size, std::nullopt);
     std::fclose(f);
     if (!(pc == 200 || pc == 204)) {
       throw std::runtime_error("put-object PUT failed for '" + key + "' (HTTP " +
@@ -567,8 +535,8 @@ void upload_fixtures(s3_endpoint const& ep,
 }
 
 // Opt-in (SIRIUS_TEST_S3_LARGE=1): generate the SF10 lineitem parquet with the
-// DuckDB CLI and upload it for the [s3][sql][large] / benchmark tests. Replaces
-// the old `fixtures.sh --perf` path. Both endpoints share the uploaded object.
+// DuckDB CLI and upload it for the [s3][sql][large] tests. Both endpoints share
+// the uploaded object.
 void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
 {
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
@@ -611,7 +579,6 @@ void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
   std::FILE* f    = std::fopen(parquet.c_str(), "rb");
   if (f == nullptr) throw std::runtime_error("cannot open generated SF10 parquet");
   long pc = s3_put(http,
-                   "http",
                    uri_path_for(kBucket, key),
                    f,
                    static_cast<std::int64_t>(fs::file_size(parquet)),
@@ -690,23 +657,16 @@ void maybe_upload_tpch_sf1_fixture(s3_endpoint const& http, fs::path const& work
     auto const bytes   = static_cast<std::int64_t>(fs::file_size(parquet));
     total_bytes += static_cast<std::uintmax_t>(bytes);
 
-    auto upload = [&](s3_endpoint const& instance,
-                      std::string const& scheme,
-                      std::optional<fs::path> const& ca_bundle) {
-      std::FILE* file = std::fopen(parquet.c_str(), "rb");
-      if (file == nullptr) {
-        throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
-      }
-      auto const code =
-        s3_put(instance, scheme, uri_path_for(kBucket, key), file, bytes, ca_bundle);
-      std::fclose(file);
-      if (!(code == 200 || code == 204)) {
-        throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
-                                 std::to_string(code) + ") at " + instance.endpoint);
-      }
-    };
-
-    upload(http, "http", std::nullopt);
+    std::FILE* file = std::fopen(parquet.c_str(), "rb");
+    if (file == nullptr) {
+      throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
+    }
+    auto const code = s3_put(http, uri_path_for(kBucket, key), file, bytes, std::nullopt);
+    std::fclose(file);
+    if (!(code == 200 || code == 204)) {
+      throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
+                               std::to_string(code) + ") at " + http.endpoint);
+    }
   }
 
   setenv("SIRIUS_TEST_S3_TPCH_LOCAL_DIR", fixture_dir.c_str(), /*overwrite=*/1);
@@ -726,8 +686,7 @@ void maybe_upload_glob_scale_fixture(s3_endpoint const& http, fs::path const& fi
     auto const key = "glob-scale/part_" + std::to_string(index) + ".parquet";
     std::FILE* f   = std::fopen(parquet.c_str(), "rb");
     if (f == nullptr) throw std::runtime_error("cannot open glob-scale parquet fixture");
-    auto const code =
-      s3_put(http, "http", uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
+    auto const code = s3_put(http, uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
     std::fclose(f);
     if (!(code == 200 || code == 204)) {
       throw std::runtime_error("glob-scale upload failed for '" + key + "' (HTTP " +
@@ -741,8 +700,8 @@ void maybe_upload_glob_scale_fixture(s3_endpoint const& http, fs::path const& fi
 
 // ---- weed server lifecycle -------------------------------------------------
 
-std::vector<pid_t> g_weed_pids;  // servers to terminate at shutdown
-fs::path g_run_dir;              // this process's run dir, removed at shutdown
+pid_t g_weed_pid{0};  // server to terminate at shutdown
+fs::path g_run_dir;   // this process's run dir, removed at shutdown
 
 struct weed_server {
   pid_t pid{0};
@@ -792,13 +751,13 @@ weed_server start_weed(fs::path const& data_dir,
                                    "-s3.cert.file=" + cert.string(),
                                    "-s3.key.file=" + key.string()};
 
-  pid_t pid = spawn_process(argv, log_path);
-  g_weed_pids.push_back(pid);
+  pid_t pid  = spawn_process(argv, log_path);
+  g_weed_pid = pid;
 
   weed_server srv;
   srv.pid   = pid;
-  srv.http  = make_endpoint("http", "127.0.0.1", s3_http);
-  srv.https = make_endpoint("https", "127.0.0.1", s3_https);
+  srv.http  = make_endpoint("http", s3_http);
+  srv.https = make_endpoint("https", s3_https);
   return srv;
 }
 
@@ -841,15 +800,15 @@ bool bring_up()
     start_weed(data_dir, s3_config, certs_dir / "public.crt", certs_dir / "private.key", weed_log);
 
   std::optional<fs::path> ca = ca_bundle;
-  if (!wait_s3_ready(srv.pid, srv.http, "http", fixture_dir / kDefaultKey, std::nullopt)) {
+  if (!wait_s3_ready(srv.pid, srv.http, fixture_dir / kDefaultKey, std::nullopt)) {
     throw std::runtime_error("SeaweedFS S3 (HTTP) did not become ready at " + srv.http.endpoint);
   }
-  if (!wait_s3_ready(srv.pid, srv.https, "https", fixture_dir / kDefaultKey, ca)) {
+  if (!wait_s3_ready(srv.pid, srv.https, fixture_dir / kDefaultKey, ca)) {
     throw std::runtime_error("SeaweedFS S3 (HTTPS) did not become ready at " + srv.https.endpoint);
   }
 
   // One backend serves both endpoints, so a single upload covers HTTP and HTTPS.
-  upload_fixtures(srv.http, "http", fixture_dir, std::nullopt);
+  upload_fixtures(srv.http, fixture_dir);
   maybe_upload_large_fixture(srv.http, base);
   maybe_upload_tpch_sf1_fixture(srv.http, base);
   maybe_upload_glob_scale_fixture(srv.http, fixture_dir);
@@ -943,7 +902,6 @@ bool put_s3_test_object(std::string_view key, std::span<std::uint8_t const> byte
   instance.authority = std::move(authority);
   auto const bucket  = env_or("SIRIUS_TEST_S3_BUCKET", kBucket);
   auto const code    = s3_put(instance,
-                           scheme,
                            uri_path_for(bucket, std::string{key}),
                            body.get(),
                            static_cast<std::int64_t>(bytes.size()),
@@ -957,10 +915,8 @@ bool put_s3_test_object(std::string_view key, std::span<std::uint8_t const> byte
 
 void shutdown_s3_test_env()
 {
-  for (pid_t pid : g_weed_pids) {
-    terminate_pid(pid);
-  }
-  g_weed_pids.clear();
+  terminate_pid(g_weed_pid);
+  g_weed_pid = 0;
 
   // Remove this run's mutable state (the shared fixture caches are left
   // intact for reuse). Done after the servers are gone so nothing is in use.

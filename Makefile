@@ -118,7 +118,6 @@ list-presets: $(PRESETS_LINK)
 # The test binary starts SeaweedFS on local HTTP and TLS ports when
 # SIRIUS_TEST_S3_AUTO=1. The Pixi environment provides weed; override its path
 # with SIRIUS_TEST_WEED. Fixtures and server cleanup are managed in-process.
-# Build with SIRIUS_BUILD_S3_TESTS=ON to include the harness.
 #
 # `make test`         runs the default Catch2 suite. Without
 #                     SIRIUS_TEST_S3_AUTO it does not start SeaweedFS, and the

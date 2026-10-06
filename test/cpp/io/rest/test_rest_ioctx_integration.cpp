@@ -89,7 +89,7 @@ struct scan_manager_fixture {
     single_gpu_index(/*numa_node=*/0);
 };
 
-scan_manager_config make_minio_rest_config()
+scan_manager_config make_s3_rest_config()
 {
   scan_manager_config cfg{};
   cfg.backend                 = sirius::scan_manager::io_backend::sirius;
@@ -104,9 +104,9 @@ scan_manager_config make_minio_rest_config()
   return cfg;
 }
 
-scan_manager_config make_tls_minio_rest_config()
+scan_manager_config make_tls_s3_rest_config()
 {
-  auto cfg                        = make_minio_rest_config();
+  auto cfg                        = make_s3_rest_config();
   cfg.object_store.endpoint       = require_env("SIRIUS_TEST_S3_HTTPS_ENDPOINT");
   cfg.object_store.tls_verify     = true;
   cfg.object_store.ca_bundle_path = require_env("SIRIUS_TEST_S3_CA_BUNDLE");
@@ -1994,7 +1994,7 @@ TEST_CASE("rest_ioctx reads the SeaweedFS hello fixture through scan_manager cre
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
 
@@ -2025,7 +2025,7 @@ TEST_CASE("rest_ioctx reads exact host ranges and clips EOF on SeaweedFS fixture
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const small  = read_binary_file(local_fixture_path("small.bin"));
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius_scan_manager manager{make_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/small.bin");
   require_rest_ioctx(datasource);
 
@@ -2064,7 +2064,7 @@ TEST_CASE("rest_ioctx fans out host_readv_async_io ranges against the SeaweedFS 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   auto const medium = read_binary_file(local_fixture_path("medium.bin"));
   scan_manager_fixture fixture;
-  auto cfg                 = make_minio_rest_config();
+  auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
   cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
@@ -2180,7 +2180,7 @@ TEST_CASE(
   auto const medium = read_binary_file(local_fixture_path("medium.bin"));
 
   scan_manager_fixture fixture;
-  auto cfg                 = make_minio_rest_config();
+  auto cfg                 = make_s3_rest_config();
   cfg.rest.max_connections = 4;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
@@ -2351,7 +2351,7 @@ TEST_CASE("rest_ioctx reads through the TLS SeaweedFS endpoint with the harness 
 
   auto const bucket = require_env("SIRIUS_TEST_S3_BUCKET");
   scan_manager_fixture fixture;
-  sirius_scan_manager manager{make_tls_minio_rest_config(), *fixture.memory, fixture.topology};
+  sirius_scan_manager manager{make_tls_s3_rest_config(), *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/hello.txt");
   require_rest_ioctx(datasource);
 
