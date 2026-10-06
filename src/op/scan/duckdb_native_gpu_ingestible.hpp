@@ -123,7 +123,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   duckdb_native_scan_info() = default;
 
   duckdb_native_scan_info(std::vector<duckdb_row_group_metadata> row_groups,
-                          std::shared_ptr<sirius::io::sirius_datasource> datasource,
+                          std::shared_ptr<cucascade::io::datasource> datasource,
                           duckdb::SingleFileBlockManager const* block_manager)
     : scan_info(make_fadvise_entries(row_groups, datasource, block_manager)),
       row_groups(std::move(row_groups)),
@@ -135,7 +135,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// Row-group metadata for this unit.
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
-  std::shared_ptr<sirius::io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
   /// Owners of the bytes that host-backed descriptors (host_ptr) point
@@ -160,7 +160,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
  private:
   static std::vector<fadvise_entry> make_fadvise_entries(
     std::vector<duckdb_row_group_metadata> const& row_groups,
-    std::shared_ptr<sirius::io::sirius_datasource> const& datasource,
+    std::shared_ptr<cucascade::io::datasource> const& datasource,
     duckdb::SingleFileBlockManager const* block_manager)
   {
     if (!datasource || block_manager == nullptr) { return {}; }
@@ -209,7 +209,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver resolve) override;
 
   op::scan::filtered_table materialize_metadata_to_table(
     scan_info const& info,

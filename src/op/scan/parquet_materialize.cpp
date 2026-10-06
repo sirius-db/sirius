@@ -16,14 +16,14 @@
 
 #include "op/scan/parquet_materialize.hpp"
 
-#include "io/io_context.hpp"
-#include "io/types.hpp"
-
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_buffer.hpp>
+
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/types.hpp>
 
 #include <algorithm>
 #include <iterator>
@@ -146,7 +146,7 @@ fetched_chunks fetch_chunks(parquet_source const& src,
     out.buffers.emplace_back(static_cast<std::size_t>(range.size()), stream, mr);
   }
 
-  std::vector<io::slice> reads;
+  std::vector<cucascade::io::slice> reads;
   reads.reserve(ranges.size());
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     reads.emplace_back(static_cast<std::size_t>(ranges[i].offset()),

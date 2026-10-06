@@ -32,6 +32,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -188,7 +189,7 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
@@ -224,7 +225,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
   {
@@ -240,7 +241,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
   r.optional("nthreads", opt.nthreads);
@@ -267,10 +268,23 @@ static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
+static void from_yaml(const YAML::Node& node, cucascade::io::cache::config& opt)
 {
   yaml::reader r(node, "cache");
-  r.optional("mode", opt.mode);
+  {
+    // Read as a string so the deprecated spelling `sirius` (the cache's name before it
+    // moved to cuCascade) still selects `cucs`; everything else goes through
+    // cuCascade's own parser, with the reader's usual error format.
+    std::optional<std::string> mode;
+    r.optional("mode", mode);
+    if (mode.has_value()) {
+      if (*mode == "sirius") {
+        opt.mode = cucascade::io::cache::cache_mode::cucs;
+      } else if (!cucascade::io::cache::string_to_enum(std::string_view{*mode}, opt.mode)) {
+        throw std::runtime_error("'cache.mode': invalid enum value '" + *mode + "'");
+      }
+    }
+  }
   r.optional("eviction", opt.eviction);
   r.optional("min_prefetching_budget_fraction",
              opt.min_prefetching_budget_fraction,
@@ -945,7 +959,7 @@ void sirius_config::finalize_derived_config()
   _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
   derive_rest_scan_budget();
-  enforce_sirius_backend_for_multi_gpu();
+  enforce_native_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -981,18 +995,18 @@ void sirius_config::derive_rest_scan_budget()
   _scan_manager_config.rest.n_max_concurrent_scans = derived;
 }
 
-void sirius_config::enforce_sirius_backend_for_multi_gpu()
+void sirius_config::enforce_native_backend_for_multi_gpu()
 {
   size_t num_gpus = std::ranges::count_if(_memory_space_configs, [](auto const& space) {
     return std::holds_alternative<cucascade::memory::gpu_memory_space_config>(space);
   });
-  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::sirius) {
+  if (num_gpus > 1 && _scan_manager_config.backend != scan_manager::io_backend::native) {
     SIRIUS_LOG_WARN(
-      "sirius_config: backend was not 'sirius' but {} GPUs are configured; "
-      "the sirius backend is required for multi-GPU IO routing. Overriding "
-      "backend to 'sirius'.",
+      "sirius_config: backend was not 'native' but {} GPUs are configured; "
+      "the native backend is required for multi-GPU IO routing. Overriding "
+      "backend to 'native'.",
       num_gpus);
-    _scan_manager_config.backend = scan_manager::io_backend::sirius;
+    _scan_manager_config.backend = scan_manager::io_backend::native;
   }
 }
 
@@ -1027,7 +1041,7 @@ void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config co
   _scan_manager_config = std::move(config);
 }
 
-void sirius_config::set_object_store_config(io::object_store_config config) noexcept
+void sirius_config::set_object_store_config(cucascade::io::object_store_config config) noexcept
 {
   _scan_manager_config.object_store = std::move(config);
 }

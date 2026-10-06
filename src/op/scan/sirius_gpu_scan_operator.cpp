@@ -15,8 +15,7 @@
  */
 
 // sirius
-#include "io/cache/types.hpp"
-
+#include <cucascade/io/cache/types.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
@@ -434,7 +433,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Membership channel for the decode-time snapshot (join builds publish
     // during execution — only a snapshot taken at prepare/decode can see them).
     scan_input->dynamic_filters = _dynamic_filters_channel;
-    scan_input->update(io::cache::scan_stage::queued);
+    scan_input->update(cucascade::io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }

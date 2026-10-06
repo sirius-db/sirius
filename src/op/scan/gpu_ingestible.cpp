@@ -35,7 +35,7 @@ filtered_table gpu_ingestible::materialize_table(
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
-    split.update(io::cache::scan_stage::reading);
+    split.update(cucascade::io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(
       split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
     if (split.mvcc_keep_mask.has_mask()) {

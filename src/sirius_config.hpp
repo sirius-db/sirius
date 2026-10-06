@@ -328,7 +328,7 @@ struct sirius_config {
   /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
   /// scan_manager config, which is its only consumer, so the two can never
   /// disagree.
-  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  [[nodiscard]] const cucascade::io::cache::config& get_cache_config() const noexcept
   {
     return _scan_manager_config.cache;
   }
@@ -340,7 +340,7 @@ struct sirius_config {
 
   /// Set the in-memory S3 fallback. Credentials are never loaded from YAML.
   /// Set this before initializing consumers of the scan-manager configuration.
-  void set_object_store_config(io::object_store_config config) noexcept;
+  void set_object_store_config(cucascade::io::object_store_config config) noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -384,10 +384,10 @@ struct sirius_config {
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
-  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::native (the
+  /// native backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from @ref finalize_derived_config.
-  void enforce_sirius_backend_for_multi_gpu();
+  void enforce_native_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are

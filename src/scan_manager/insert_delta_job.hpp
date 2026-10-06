@@ -47,9 +47,9 @@ namespace sirius::exec {
 using cucascade::exec::scoped_dispatcher;
 }  // namespace sirius::exec
 
-namespace sirius::io {
-class sirius_datasource;
-}  // namespace sirius::io
+namespace cucascade::io {
+class datasource;
+}  // namespace cucascade::io
 
 namespace sirius::memory {
 using cucascade::memory::topology_index;
@@ -190,7 +190,7 @@ struct insert_delta_split {
 std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
-  std::shared_ptr<sirius::io::sirius_datasource> datasource,
+  std::shared_ptr<cucascade::io::datasource> datasource,
   duckdb::SingleFileBlockManager const* block_manager,
   op::scan::scan_contract_id contract_id);
 

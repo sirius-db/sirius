@@ -26,7 +26,7 @@
 #include <op/scan/scan_filter_analysis.hpp>
 
 // rmm
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 
 #include <cuda/stream>
 
@@ -139,7 +139,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * null callable indicates no work was claimed (the driver loop skips
    * empty handoffs).
    */
-  virtual metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) = 0;
+  virtual metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver resolve) = 0;
 
   /**
    * @brief Materialize the cudf table for one split. Called by

@@ -16,13 +16,13 @@
 
 #pragma once
 
-#include "io/types.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
+#include <cucascade/io/types.hpp>
 #include <duckdb/main/client_context.hpp>
 
 #include <cstdint>
@@ -34,9 +34,9 @@
 #include <unordered_map>
 #include <vector>
 
-namespace sirius::io {
+namespace cucascade::io {
 class ioctx;
-}  // namespace sirius::io
+}  // namespace cucascade::io
 
 namespace sirius::op::scan {
 
@@ -167,7 +167,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  sirius::io::ioctx* metadata_ioctx,
+  cucascade::io::ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery);
 

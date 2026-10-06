@@ -19,11 +19,11 @@
 // sirius
 #include "op/scan/owning_table_view.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
+#include <cucascade/io/io_context.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/utils.hpp>
-#include <io/io_context.hpp>
-#include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
@@ -184,7 +184,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   bool _have_template           = false;
   bool _produced_any            = false;
   scan_contract_id _contract_id = 0;
-  std::shared_ptr<sirius::io::sirius_datasource> _datasource;
+  std::shared_ptr<cucascade::io::datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
 
@@ -377,7 +377,7 @@ bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
-duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
+duckdb_native_gpu_ingestible::next_split_provider(sirius::io::ioctx_resolver resolve)
 {
   // Backstop: the scan manager already ran the walk on the query thread, so this is a no-op.
   if (metadata_walk_pending()) {
@@ -423,7 +423,9 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                          ")): " + range.viability_failure_reason);
     }
     auto split = std::make_unique<duckdb_native_scan_info>(
-      std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
+      std::move(range.row_groups),
+      cucascade::io::open_datasource(io_ctx, _info->db_path),
+      _block_manager);
     std::vector<split_materializer_certificate> certificates;
     std::vector<split_dependencies> dependencies;
     certificates.reserve(split->row_groups.size());

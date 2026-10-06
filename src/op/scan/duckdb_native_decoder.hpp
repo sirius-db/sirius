@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <io/io_context.hpp>  // ioctx + io_object
+#include <cucascade/cudf/datasource.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 
 // duckdb
@@ -82,7 +82,7 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,
-  sirius::io::sirius_datasource* datasource,
+  cucascade::io::datasource* datasource,
   cucascade::memory::memory_space& mem_space,
   ::cuda::stream_ref stream);
 

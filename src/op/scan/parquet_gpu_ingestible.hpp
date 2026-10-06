@@ -272,7 +272,7 @@ class parquet_file_scan_info : public scan_info {
   std::size_t file_index = 0;
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
-  std::shared_ptr<io::sirius_datasource> datasource;
+  std::shared_ptr<cucascade::io::datasource> datasource;
   /// Pruned row groups for this file, in file order, with byte accounting.
   std::vector<row_group_entry> row_groups;
   /// Per-file reader options. These differ from the plan defaults when the
@@ -349,7 +349,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
-  metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
+  metadata_scan_task_t next_split_provider(sirius::io::ioctx_resolver resolve) override;
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
@@ -393,9 +393,10 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::size_t file_index,
-                                                  std::shared_ptr<io::ioctx> const& io_ctx);
+  std::unique_ptr<scan_info> build_file_scan_info(
+    std::string const& file_path,
+    std::size_t file_index,
+    std::shared_ptr<cucascade::io::ioctx> const& io_ctx);
 
   /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
   [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(

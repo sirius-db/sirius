@@ -23,13 +23,10 @@
 #include "exec/thread_pool.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
-#include "io/cache/prefetching_cache.hpp"
-#include "io/io_context.hpp"
+#include "io/ioctx_resolver.hpp"
 #include "io/parquet_helpers.hpp"
-#include "io/rest/rest_ioctx.hpp"
+#include "io/path_utils.hpp"
 #include "io/s3/duckdb_secret_config.hpp"
-#include "io/sirius_datasource.hpp"
-#include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
@@ -68,7 +65,11 @@
 #include <rmm/cuda_device.hpp>
 
 #include <api/simpatico_codegen.hpp>
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/io/cache/fs_cache.hpp>
+#include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -128,16 +129,33 @@ using sirius::pinned_column_storage_meta;
 /// else is running, so only queue depth hides it; a local device read competes
 /// with the executor's own reads, so issuing one mid-scan reorders the queue
 /// rather than adding throughput.  See @ref prefetch_strategy.
-prefetch_strategy backend_prefetch_strategy(io::io_context_type type) noexcept
+prefetch_strategy backend_prefetch_strategy(cucascade::io::io_context_type type) noexcept
 {
   switch (type) {
-    case io::io_context_type::restful: return prefetch_strategy::eager;
-    case io::io_context_type::uring: return prefetch_strategy::opportunistic;
+    // s3rdma is an object store too (a placeholder in cuCascade today, never built).
+    case cucascade::io::io_context_type::restful:
+    case cucascade::io::io_context_type::s3rdma: return prefetch_strategy::eager;
+    case cucascade::io::io_context_type::uring: return prefetch_strategy::opportunistic;
     // kvikio never reaches here: it cannot use the prefetching cache, so
     // prepare_for_query excludes it before backend selection.
-    case io::io_context_type::kvikio: break;
+    case cucascade::io::io_context_type::kvikio: break;
   }
   return prefetch_strategy::eager;
+}
+
+/// Call after @c initialize_cache on a backend that can use the cache.  cuCascade's
+/// @c ioctx::initialize_cache is @c noexcept and declines silently (its logging is
+/// compiled out) when the cache cannot be constructed or its chunk size differs from
+/// the backend's staging block size; Sirius's own io layer logged those cases.  Say
+/// so here, so a configured cache that did not come up is not invisible.
+void warn_if_cache_not_built(cucascade::io::ioctx& io_ctx)
+{
+  if (io_ctx.cache() != nullptr) { return; }
+  SIRIUS_LOG_WARN(
+    "[sirius_scan_manager] cache.mode is 'cucs' but backend {} did not build its prefetching "
+    "cache (construction failed, or its chunk size differs from the backend's staging block "
+    "size); running without a cache",
+    static_cast<int>(io_ctx.type()));
 }
 
 // Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
@@ -1322,25 +1340,25 @@ sirius_scan_manager::sirius_scan_manager(
     _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
-    _ioctx_registry(config, reservation_manager)
+    _ioctx_registry(config.to_io_config(), reservation_manager)
 {
   if (!_topology_index) {
     throw std::invalid_argument("[sirius_scan_manager] topology_index must be non-null");
   }
 
-  // scan_manager always owns an io_ctx: sirius_datasource (uring) on the
+  // scan_manager always owns an io_ctx: uring_ioctx on the
   // fast path, kvikio_context as the universal fallback so the rest of the
   // scan path (split_provider, scan tasks) always has an ioctx to
   // talk to.  kvikio_context drives kvikio::FileHandle directly so the read
   // path is identical from the caller's point of view.  Both are built by the
   // ioctx registry, which sources the reactor staging resource from the
   // reservation manager it was constructed with.
-  if (_config.backend == scan_manager::io_backend::sirius) {
-    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::uring);
+  if (_config.backend == scan_manager::io_backend::native) {
+    _io_ctx = _ioctx_registry.make_ioctx(cucascade::io::io_context_type::uring);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
     }
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] native backend (uring_ioctx n_runner_threads={})",
                      _config.uring_n_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
@@ -1348,14 +1366,13 @@ sirius_scan_manager::sirius_scan_manager(
         "[sirius_scan_manager] kvikio_context fallback (backend=kvikio) "
         "does not support multi-GPU; topology reports " +
         std::to_string(_topology_index->gpu_ids().size()) +
-        " GPUs.  Set backend=sirius for multi-GPU runs.");
+        " GPUs.  Set backend=native for multi-GPU runs.");
     }
-    _io_ctx = _ioctx_registry.make_ioctx(sirius::io::io_context_type::kvikio);
+    _io_ctx = _ioctx_registry.make_ioctx(cucascade::io::io_context_type::kvikio);
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create kvikio io_context");
     }
-    SIRIUS_LOG_DEBUG(
-      "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
+    SIRIUS_LOG_DEBUG("[sirius_scan_manager] backend=kvikio — using kvikio_context fallback");
   }
 
   // Build the prefetching cache on the ioctx.  Budget=0 keeps the
@@ -1363,8 +1380,9 @@ sirius_scan_manager::sirius_scan_manager(
   // user has disabled prefetching so the construction is always
   // unconditional and there's no "is the cache present" branch to
   // worry about in callers.
-  if (_config.cache.use_prefetching_cache() && _io_ctx->can_use_prefetching_cache()) {
+  if (_config.cache.use_fs_cache() && _io_ctx->can_use_fs_cache()) {
     _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
+    warn_if_cache_not_built(*_io_ctx);
   }
 
   // Reactors are built parked; start() launches their worker threads and
@@ -1401,9 +1419,9 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
   auto const hint =
-    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+    footer_cached ? cucascade::io::open_hint::generic : cucascade::io::open_hint::parquet_footer_probe;
 
   auto datasource = create_datasource(uri, hint);
   if (!datasource) {
@@ -1452,14 +1470,14 @@ void sirius_scan_manager::prepare_for_query(
   }
 
   // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
-  // generation counter (prefetching_cache::_ticker, bumped in
-  // prefetching_cache::prepare_for_query, src/io/cache/prefetching_cache.cpp).
-  // chunk_lifecycle::eviction_tier(query_tick) (src/include/io/cache/types.hpp) scores every
+  // generation counter (cucascade::io::cache::fs_cache::_ticker, bumped in
+  // fs_cache::prepare_for_query, cuCascade src/io/cache/fs_cache.cpp).
+  // chunk_lifecycle::eviction_tier(query_tick) (cucascade/io/cache/types.hpp) scores every
   // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
   // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
   // front of the eviction order. Performance only, never correctness: mark_evicting()
   // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
-  // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
+  // just re-reads on a miss. The fix belongs in fs_cache (track the set of live
   // epochs rather than newest-wins), not here.
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -1497,8 +1515,8 @@ void sirius_scan_manager::prepare_for_query(
   // budget and strategy to unrelated work. A query may genuinely mix local
   // and object-store scans, so inspect every advertised path and deduplicate
   // the shared contexts.
-  std::vector<std::shared_ptr<io::ioctx>> query_io_ctxs;
-  std::unordered_set<io::ioctx const*> seen_query_io_ctxs;
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> query_io_ctxs;
+  std::unordered_set<cucascade::io::ioctx const*> seen_query_io_ctxs;
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto const& op = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
@@ -1538,7 +1556,7 @@ void sirius_scan_manager::prepare_for_query(
     for (auto const& io_ctx : query_io_ctxs) {
       // Nowhere to read ahead into on this backend, so it has no say in the
       // readahead's terms.
-      if (!io_ctx->can_use_prefetching_cache()) { continue; }
+      if (!io_ctx->can_use_fs_cache()) { continue; }
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
     }
@@ -1617,14 +1635,16 @@ void sirius_scan_manager::prepare_for_query(
     }
     if (native) { pause_native_with_key_for_testing(); }
     auto provider = std::make_unique<split_provider>(
-      op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
-        auto io_ctx = ioctx_for_path(file_path);
-        if (!io_ctx) {
-          throw std::runtime_error("scan_manager: no backend supports path: " +
-                                   std::string(file_path));
-        }
-        return io_ctx;
-      });
+      op->get_ingestible(),
+      sirius::io::ioctx_resolver{
+        [this](std::string_view file_path) -> std::shared_ptr<cucascade::io::ioctx> {
+          auto io_ctx = ioctx_for_path(file_path);
+          if (!io_ctx) {
+            throw std::runtime_error("scan_manager: no backend supports path: " +
+                                     std::string(file_path));
+          }
+          return io_ctx;
+        }});
     state->scans.push_back({op, query_scan_manager_state::disk_scan{std::move(provider)}});
   }
 
@@ -1817,11 +1837,12 @@ void sirius_scan_manager::prepare_for_query(
         }
         auto const* sf_bm = dynamic_cast<duckdb::SingleFileBlockManager const*>(
           &duckdb_info->storage->GetAttached().GetStorageManager().GetBlockManager());
-        delta_splits = cut_delta_splits_for_op(*delta_request,
-                                               duckdb_info->projected_cols,
-                                               io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm,
-                                               assignment.op->contract_id());
+        delta_splits =
+          cut_delta_splits_for_op(*delta_request,
+                                  duckdb_info->projected_cols,
+                                  cucascade::io::open_datasource(io_ctx, duckdb_info->db_path),
+                                  sf_bm,
+                                  assignment.op->contract_id());
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",
@@ -2018,24 +2039,24 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
   state.prefetcher = std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space);
 }
 
-std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
-  std::string_view path, sirius::io::open_hint hint)
+std::shared_ptr<cucascade::io::datasource> sirius_scan_manager::create_datasource(
+  std::string_view path, cucascade::io::open_hint hint)
 {
   auto file_path = normalize_path(std::string(path));
   auto io_ctx    = ioctx_for_path(file_path);
   if (!io_ctx) { return nullptr; }  // no backend supports the path
   // Real I/O / HEAD / auth / missing-object errors propagate as exceptions;
   // only "no backend" is reported as nullptr (callers map it to that message).
-  return io_ctx->open_datasource(file_path, hint);
+  return cucascade::io::open_datasource(std::move(io_ctx), std::move(file_path), hint);
 }
 
 void sirius_scan_manager::list_objects_paged(
   std::string const& s3_prefix_uri,
   std::size_t page_size,
-  std::function<bool(sirius::io::rest::s3::list_objects_v2_page const&)> const& sink,
+  std::function<bool(cucascade::io::rest::s3::list_objects_v2_page const&)> const& sink,
   std::optional<std::size_t> max_scanned)
 {
-  // Hand-split rather than uri_parser::parse — a LIST prefix URI legitimately
+  // Hand-split rather than cucascade::io::parse — a LIST prefix URI legitimately
   // has an EMPTY key part (bucket-root glob: "s3://bucket/"), which parse()
   // rejects as an object URI.
   constexpr std::string_view k_scheme = "s3://";
@@ -2076,7 +2097,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize raw ingestible paths before routing, including file:// URIs.
   auto file_path = normalize_path(std::string(path));
@@ -2085,14 +2106,14 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
   return ioctx_for_type(*type, file_path);
 }
 
-std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type, std::string_view path)
+std::shared_ptr<cucascade::io::ioctx> sirius_scan_manager::ioctx_for_type(
+  cucascade::io::io_context_type type, std::string_view path)
 {
   auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
   std::uint64_t config_id = 0;
-  std::shared_ptr<const sirius::io::object_store_config> resolved_config;
+  std::shared_ptr<const cucascade::io::object_store_config> resolved_config;
   auto const uses_object_store_config =
-    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
+    type == cucascade::io::io_context_type::restful || type == cucascade::io::io_context_type::kvikio;
   if (uses_object_store_config && !file_path.empty()) {
     if (auto snapshot = _s3_configs.resolve(file_path)) {
       config_id       = snapshot->id;
@@ -2129,29 +2150,37 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   }
   auto backend_config = _config;
   if (resolved_config) { backend_config.object_store = *resolved_config; }
-  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
+  // The shared registry holds only the default config. A path-scoped S3 config
+  // builds through a throwaway registry; its constructor just registers the
+  // backend factories, which capture the reservation manager, not the registry.
+  auto io_ctx =
+    resolved_config
+      ? cucascade::io::io_context_registry{backend_config.to_io_config(), _reservation_manager}
+          .make_ioctx(type)
+      : _ioctx_registry.make_ioctx(type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
-  if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
+  if (_config.cache.use_fs_cache() && io_ctx->can_use_fs_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
+    warn_if_cache_not_built(*io_ctx);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
   auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
-std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
+std::shared_ptr<cucascade::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
   std::string_view path)
 {
-  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(
-    ioctx_for_type(sirius::io::io_context_type::restful, path));
+  return std::dynamic_pointer_cast<cucascade::io::rest::rest_ioctx>(
+    ioctx_for_type(cucascade::io::io_context_type::restful, path));
 }
 
 void sirius_scan_manager::install_s3_config(std::string_view path,
-                                            sirius::io::object_store_config config)
+                                            cucascade::io::object_store_config config)
 {
   auto scope = normalize_path(std::string(path));
-  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
+  std::vector<std::shared_ptr<cucascade::io::ioctx>> retired;
   {
     // Existing in-flight users retain shared ownership of the old context.
     std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
@@ -2159,7 +2188,7 @@ void sirius_scan_manager::install_s3_config(std::string_view path,
     if (superseded_id) {
       std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
       for (auto const type :
-           {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
+           {cucascade::io::io_context_type::restful, cucascade::io::io_context_type::kvikio}) {
         auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
         if (it != _routed_io_ctxs.end()) {
           retired.push_back(std::move(it->second));
@@ -2292,12 +2321,12 @@ void sirius_scan_manager::reset_caches()
   // Rebuild one context's cache.  shutdown_cache drains the evictor and every
   // in-flight IO before releasing the chunks, so by the time it returns nothing
   // is left pointing into what we are about to replace.
-  auto refresh = [this](sirius::io::ioctx& io_ctx) {
+  auto refresh = [this](cucascade::io::ioctx& io_ctx) {
     bool const had_cache = io_ctx.cache() != nullptr;
     io_ctx.shutdown_cache();
     // Asking the same two questions the wiring in the constructor asks, so a
     // context that was never given a cache is not given one here either.
-    if (!_config.cache.use_prefetching_cache() || !io_ctx.can_use_prefetching_cache()) {
+    if (!_config.cache.use_fs_cache() || !io_ctx.can_use_fs_cache()) {
       // Nothing to rebuild.  Only worth a word when there WAS a cache: a
       // configuration that never had one is not a surprise worth logging on
       // every call.
@@ -2310,6 +2339,7 @@ void sirius_scan_manager::reset_caches()
       return;
     }
     io_ctx.initialize_cache(_reservation_manager, _config.cache, _topology_index);
+    warn_if_cache_not_built(io_ctx);
   };
 
   if (_io_ctx) {
@@ -3141,8 +3171,8 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   auto* cache = _io_ctx ? _io_ctx->cache() : nullptr;
   if (cache == nullptr || !cache->is_armed()) {
     throw std::runtime_error(
-      "pin_table tier='parquet' needs the Sirius prefetching cache: set "
-      "sirius.executor.scan_manager.cache.mode to 'sirius' on a backend that supports it");
+      "pin_table tier='parquet' needs the cuCascade prefetching cache: set "
+      "sirius.executor.scan_manager.cache.mode to 'cucs' on a backend that supports it");
   }
   // Worth warning rather than failing: the pin still populates the cache and
   // still serves reads either way, it is just not durable.
@@ -3160,17 +3190,19 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   // Built locally and published only once every file is pinned: a throw part
   // way through destroys the handles taken so far, which is the rollback --
   // and leaves whatever was already pinned under @p name untouched.
-  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> retained;
+  std::vector<std::shared_ptr<cucascade::io::datasource>> retained;
   retained.reserve(file_paths.size());
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key     = normalize_path(path);
-    auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
-    auto datasource          = create_datasource(
-      path,
-      footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
+    auto const cache_key = normalize_path(path);
+    auto const io_ctx    = ioctx_for_path(path);
+    bool const footer_cached =
+      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+    auto datasource =
+      create_datasource(path,
+                        footer_cached ? cucascade::io::open_hint::generic
+                                      : cucascade::io::open_hint::parquet_footer_probe);
     if (!datasource) {
       throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
     }
@@ -3202,7 +3234,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     // prefetch settles having done nothing.
     datasource->fadvise(ranges, std::nullopt);
     auto const prepared = datasource->prepare_prefetch(/*wait_for_eviction=*/true);
-    if (prepared == sirius::io::prepare_result::allocation_failed) {
+    if (prepared == cucascade::io::prepare_result::allocation_failed) {
       throw std::runtime_error("[pin_table] the prefetching cache could not stage " + path +
                                ": the pool is too small for the requested columns");
     }
