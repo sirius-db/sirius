@@ -84,7 +84,7 @@ struct byte_cut {
   }
 };
 
-//! Input row range `[first_row, end_row)` holding output rows `[lo, hi)`.
+//! Input row range `[input_begin, input_end)` holding output rows `[output_begin, output_end)`.
 struct input_rows {
   std::int64_t const* row_prefix;
   cudf::size_type rows;
@@ -99,18 +99,18 @@ struct input_rows {
   }
 };
 
-//! Copies of input row `first_row + i` that fall in output rows `[lo, hi)`.
+//! Copies of input row `input_begin + i` that fall in output rows `[output_begin, output_end)`.
 struct clipped_count {
   std::int64_t const* row_prefix;
-  cudf::size_type first_row;
-  std::int64_t lo;
-  std::int64_t hi;
+  cudf::size_type input_begin;
+  std::int64_t output_begin;
+  std::int64_t output_end;
   __device__ cudf::size_type operator()(cudf::size_type i) const
   {
-    auto const row   = first_row + i;
+    auto const row   = input_begin + i;
     auto const start = row == 0 ? std::int64_t{0} : row_prefix[row - 1];
-    return static_cast<cudf::size_type>(::cuda::std::min(row_prefix[row], hi) -
-                                        ::cuda::std::max(start, lo));
+    return static_cast<cudf::size_type>(::cuda::std::min(row_prefix[row], output_end) -
+                                        ::cuda::std::max(start, output_begin));
   }
 };
 
@@ -249,18 +249,19 @@ std::unique_ptr<cudf::table> materialize(cudf::table_view const& data,
                                          ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
-  auto const rows = part.end_row - part.first_row;
+  auto const rows = part.input_end - part.input_begin;
   rmm::device_uvector<cudf::size_type> counts(rows, stream, mr);
-  thrust::transform(
-    rmm::exec_policy_nosync(stream, mr),
-    thrust::counting_iterator<cudf::size_type>(0),
-    thrust::counting_iterator<cudf::size_type>(rows),
-    counts.begin(),
-    clipped_count{
-      expansion.row_prefix->view().data<std::int64_t>(), part.first_row, part.lo, part.hi});
+  thrust::transform(rmm::exec_policy_nosync(stream, mr),
+                    thrust::counting_iterator<cudf::size_type>(0),
+                    thrust::counting_iterator<cudf::size_type>(rows),
+                    counts.begin(),
+                    clipped_count{expansion.row_prefix->view().data<std::int64_t>(),
+                                  part.input_begin,
+                                  part.output_begin,
+                                  part.output_end});
   cudf::column_view const count_view{
     cudf::data_type{cudf::type_id::INT32}, rows, counts.data(), nullptr, 0};
-  auto const rows_view = cudf::slice(data, {part.first_row, part.end_row}, stream).front();
+  auto const rows_view = cudf::slice(data, {part.input_begin, part.input_end}, stream).front();
   return cudf::repeat(rows_view, count_view, stream, mr);
 }
 

@@ -132,17 +132,17 @@ void require_exact_tiling(replicate::plan const& expansion,
 
   std::int64_t next = 0;
   for (auto const& part : expansion.slices) {
-    REQUIRE(part.lo == next);
-    REQUIRE(part.hi > part.lo);
-    CHECK(part.hi - part.lo <= caps.max_rows);
+    REQUIRE(part.output_begin == next);
+    REQUIRE(part.output_end > part.output_begin);
+    CHECK(part.output_end - part.output_begin <= caps.max_rows);
     std::int64_t bytes = 0;
-    for (auto row = part.lo; row < part.hi; ++row) {
+    for (auto row = part.output_begin; row < part.output_end; ++row) {
       bytes += output_row_bytes[row];
     }
     CHECK(bytes <= static_cast<std::int64_t>(caps.max_bytes) + max_row_bytes);
-    CHECK(part.first_row == output_row_source[part.lo]);
-    CHECK(part.end_row == output_row_source[part.hi - 1] + 1);
-    next = part.hi;
+    CHECK(part.input_begin == output_row_source[part.output_begin]);
+    CHECK(part.input_end == output_row_source[part.output_end - 1] + 1);
+    next = part.output_end;
   }
   CHECK(next == static_cast<std::int64_t>(output_row_source.size()));
 }
@@ -205,13 +205,13 @@ TEST_CASE("gpu_replicate_impl - a total past INT32_MAX is planned in 64 bits",
     plan_of(cudf::table_view{{data_column->view()}}, counts_column->view(), caps);
 
   REQUIRE(expansion.slices.size() == 3);
-  CHECK(expansion.slices[0].lo == 0);
-  CHECK(expansion.slices[1].lo == std::int64_t{1} << 30);
-  CHECK(expansion.slices[2].lo == std::int64_t{1} << 31);
-  CHECK(expansion.slices[2].hi == (std::int64_t{1} << 31) + 5);
+  CHECK(expansion.slices[0].output_begin == 0);
+  CHECK(expansion.slices[1].output_begin == std::int64_t{1} << 30);
+  CHECK(expansion.slices[2].output_begin == std::int64_t{1} << 31);
+  CHECK(expansion.slices[2].output_end == (std::int64_t{1} << 31) + 5);
   for (auto const& part : expansion.slices) {
-    CHECK(part.first_row == 0);
-    CHECK(part.end_row == 1);
+    CHECK(part.input_begin == 0);
+    CHECK(part.input_end == 1);
   }
 }
 
@@ -226,9 +226,9 @@ TEST_CASE("gpu_replicate_impl - one count above the row cap splits that row",
   REQUIRE(expansion.slices.size() == 4);
   std::vector<std::int64_t> sizes;
   for (auto const& part : expansion.slices) {
-    sizes.push_back(part.hi - part.lo);
-    CHECK(part.first_row == 1);
-    CHECK(part.end_row == 2);
+    sizes.push_back(part.output_end - part.output_begin);
+    CHECK(part.input_begin == 1);
+    CHECK(part.input_end == 2);
   }
   CHECK(sizes == std::vector<std::int64_t>{4, 4, 4, 1});
   auto const output = materialize_all(data, expansion);
@@ -269,7 +269,7 @@ TEST_CASE("gpu_replicate_impl - a long string row is cut by bytes", "[operator][
 
   REQUIRE(expansion.slices.size() == 5);
   for (auto const& part : expansion.slices) {
-    CHECK(part.hi - part.lo == 2);
+    CHECK(part.output_end - part.output_begin == 2);
   }
   auto const first = replicate::materialize(data,
                                             expansion,

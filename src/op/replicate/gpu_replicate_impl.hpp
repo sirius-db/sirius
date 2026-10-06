@@ -44,13 +44,13 @@ struct limits {
   std::size_t max_bytes;     //!< Bytes per output table, exceeded by at most one row; positive.
 };
 
-//! Output rows `[lo, hi)` of the whole expansion, and the input rows `[first_row, end_row)` they
-//! copy.
+//! Output rows `[output_begin, output_end)` of the whole expansion, and the input rows
+//! `[input_begin, input_end)` they copy.
 struct slice {
-  std::int64_t lo;            //!< First output row.
-  std::int64_t hi;            //!< One past the last output row.
-  cudf::size_type first_row;  //!< First input row with a copy in the slice.
-  cudf::size_type end_row;    //!< One past the last input row with a copy in the slice.
+  std::int64_t output_begin;    //!< First output row.
+  std::int64_t output_end;      //!< One past the last output row.
+  cudf::size_type input_begin;  //!< First input row with a copy in the slice.
+  cudf::size_type input_end;    //!< One past the last input row with a copy in the slice.
 };
 
 //! The slices one input table expands into.
@@ -69,7 +69,8 @@ plan plan_slices(cudf::table_view const& data,
                  ::cuda::stream_ref stream,
                  rmm::device_async_resource_ref mr);
 
-//! Output rows `[part.lo, part.hi)` of @p expansion, which `plan_slices` returned for @p data.
+//! Output rows `[part.output_begin, part.output_end)` of @p expansion, which `plan_slices` returned
+//! for @p data.
 std::unique_ptr<cudf::table> materialize(cudf::table_view const& data,
                                          plan const& expansion,
                                          slice const& part,
