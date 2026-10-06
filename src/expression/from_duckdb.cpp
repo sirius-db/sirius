@@ -177,6 +177,32 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
     return nullptr;
   }
 
+  // cuDF casts can wrap where DuckDB CAST throws or TRY_CAST returns NULL. Reject
+  // unsigned integer casts unless the target carrier fits the full source domain.
+  // HUGEINT/UHUGEINT currently use INT64/UINT64 on the GPU.
+  // TODO: Implement checked GPU integer casts: return NULL on overflow for TRY_CAST
+  // and raise an error for CAST, allowing these conversions without CPU fallback.
+  if (source_type.IsUnsigned()) {
+    duckdb::idx_t target_value_bits = 0;
+    switch (target_type.id()) {
+      case duckdb::LogicalTypeId::TINYINT: target_value_bits = 7; break;
+      case duckdb::LogicalTypeId::SMALLINT: target_value_bits = 15; break;
+      case duckdb::LogicalTypeId::INTEGER: target_value_bits = 31; break;
+      case duckdb::LogicalTypeId::BIGINT:
+      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::UTINYINT: target_value_bits = 8; break;
+      case duckdb::LogicalTypeId::USMALLINT: target_value_bits = 16; break;
+      case duckdb::LogicalTypeId::UINTEGER: target_value_bits = 32; break;
+      case duckdb::LogicalTypeId::UBIGINT:
+      case duckdb::LogicalTypeId::UHUGEINT: target_value_bits = 64; break;
+      default: break;
+    }
+    if (target_value_bits != 0 &&
+        duckdb::GetTypeIdSize(source_type.InternalType()) * 8 > target_value_bits) {
+      return nullptr;
+    }
+  }
+
   auto child = from_duckdb(*expr.child);
   if (!child) { return nullptr; }
   return std::make_unique<node>(cast{
