@@ -17,6 +17,12 @@
 #include "catch.hpp"
 #include "io/path_utils.hpp"
 
+#include <cucascade/io/kvikio/kvikio_context.hpp>
+#include <unistd.h>
+
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -98,4 +104,57 @@ TEST_CASE("strip_file_scheme does not throw on input a URI parser rejects", "[pa
   // localhost authority, so the original bytes come back.
   CHECK(strip_file_scheme("file:/") == "/");
   CHECK(strip_file_scheme("file://") == "file://");
+}
+
+//===----------------------------------------------------------------------===//
+// open_datasource
+//
+// The io_object's raw_file_cache_id keys the prefetching cache and the metadata_store, so one
+// file reached under two spellings must get one id. cuCascade's own open strips only the scheme
+// (no `.`/`..` folding), which is why every Sirius open goes through sirius::io::open_datasource.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A regular file at <tmp>/sirius-path-utils-<pid>/dir/data.bin.
+std::filesystem::path make_open_datasource_file()
+{
+  auto const dir = std::filesystem::temp_directory_path() /
+                   ("sirius-path-utils-" + std::to_string(::getpid())) / "dir";
+  std::filesystem::create_directories(dir);
+  auto const file = dir / "data.bin";
+  std::ofstream{file, std::ios::binary} << "open_datasource normalization\n";
+  REQUIRE(std::filesystem::is_regular_file(file));
+  return file;
+}
+
+}  // namespace
+
+TEST_CASE("open_datasource keys a dotted file URI like the bare path", "[path_utils]")
+{
+  auto const file  = make_open_datasource_file();
+  auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  auto const dotted =
+    "file://" + (file.parent_path() / ".." / "dir" / "." / file.filename()).string();
+
+  auto const bare     = sirius::io::open_datasource(ioctx, file.string());
+  auto const from_uri = sirius::io::open_datasource(ioctx, dotted);
+  REQUIRE(bare);
+  REQUIRE(from_uri);
+  CHECK(bare->get_io_object().raw_file_cache_id() == file.string());
+  CHECK(from_uri->get_io_object().raw_file_cache_id() == file.string());
+}
+
+TEST_CASE("open_datasource normalizes the path it forwards with an open hint", "[path_utils]")
+{
+  auto const file  = make_open_datasource_file();
+  auto const ioctx = std::make_shared<cucascade::io::kvikio_context>();
+  // The host-omitted `file:/abs` spelling, with an empty segment.
+  auto const uri = "file:" + file.parent_path().string() + "//" + file.filename().string();
+
+  auto const datasource =
+    sirius::io::open_datasource(ioctx, uri, cucascade::io::open_hint::parquet_footer_probe);
+  REQUIRE(datasource);
+  CHECK(datasource->get_io_object().raw_file_cache_id() == file.string());
+  CHECK(datasource->size() == std::filesystem::file_size(file));
 }

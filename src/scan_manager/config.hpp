@@ -207,9 +207,11 @@ struct memory_prefetcher_config {
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
  * to @c uring_ioctx and @c s3:// URLs to the REST backend, @ref io_backend::kvikio
- * routes local paths to @c kvikio_context. Reads go through
- * @c cucascade::io::datasource either way; the kvikio backend drives
- * @c kvikio::FileHandle directly. Multi-GPU forces @ref io_backend::native.
+ * routes local paths AND @c s3:// reads to @c kvikio_context (kvikIO's own remote
+ * file support); object-store LIST / glob stays on the REST backend either way.
+ * Reads go through @c cucascade::io::datasource either way; the kvikio backend
+ * drives @c kvikio::FileHandle / @c kvikio::RemoteHandle directly. Multi-GPU forces
+ * @ref io_backend::native.
  *
  * The backend sub-configs are cuCascade's own structs; @ref to_io_config hands
  * them to the @c cucascade::io::io_context_registry.
@@ -221,7 +223,7 @@ struct memory_prefetcher_config {
  * Sub-configs:
  *  - @c uring   — uring reactor tunables (local-disk IO path).
  *  - @c rest    — REST reactor tunables (S3/object-store IO path).
- *  - @c kvikio  — kvikIO backend tunables (local-file fallback path).
+ *  - @c kvikio  — kvikIO backend tunables (backend=kvikio: local and s3:// reads).
  *  - @c cache   — caching mode, eviction policy and prefetching-cache tunables.
  *  - @c object_store — object-store credentials and endpoint.
  */
@@ -272,8 +274,9 @@ struct scan_manager_config {
   /// worker-owned.
   cucascade::io::rest::config rest{};
 
-  /// kvikIO backend tunables for the local-file fallback path.  Every field is
-  /// optional; unset leaves kvikIO's own env-seeded default in place.
+  /// kvikIO backend tunables (backend=kvikio serves local and @c s3:// reads with
+  /// it).  Every field is optional; unset leaves kvikIO's own env-seeded default
+  /// in place.
   cucascade::io::kvikio_config kvikio{};
 
   /// The read path's caching configuration: mode, eviction policy and the
@@ -295,6 +298,12 @@ struct scan_manager_config {
     cache.apply_mode();
     uring.use_odirect = cache.use_odirect();
   }
+
+  // to_io_config() copies the kvikio sub-config, which cuCascade declares only when
+  // built with cuDF (and so kvikIO); Sirius always is.
+#ifndef CUCASCADE_HAS_KVIKIO
+#error "Sirius requires cuCascade built with kvikIO (CUCASCADE_HAS_KVIKIO)"
+#endif
 
   /// The cuCascade io configuration for the @c io_context_registry: the backend
   /// sub-configs and runner counts copied verbatim, @ref backend mapped onto

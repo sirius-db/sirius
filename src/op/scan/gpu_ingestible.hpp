@@ -20,14 +20,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
+// sirius
+#include "io/ioctx_resolver.hpp"
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
 
 // rmm
-#include "io/ioctx_resolver.hpp"
-
 #include <cuda/stream>
 
 // standard library

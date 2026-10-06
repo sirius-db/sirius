@@ -17,10 +17,12 @@
 #pragma once
 
 // sirius
-#include <cucascade/cudf/datasource.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
-// cudf
 
+// cucascade
+#include <cucascade/cudf/datasource.hpp>
+
+// cudf
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet_schema.hpp>
 

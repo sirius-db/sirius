@@ -368,7 +368,7 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
   auto discovery =
     sirius::op::scan::discover_from_manifests(context, info->table_path, std::move(inventory));
   info->delete_data = sirius::op::scan::load_delete_payload(
-    context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id, discovery);
+    context, info->table_path, sirius_ctx->get_scan_manager().shared_io_ctx(), snapshot_id, discovery);
   auto const delete_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - delete_started)
                                 .count();

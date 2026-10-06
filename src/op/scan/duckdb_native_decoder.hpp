@@ -17,7 +17,6 @@
 #pragma once
 
 // sirius
-#include <cucascade/cudf/datasource.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
 
 // duckdb
@@ -31,6 +30,7 @@
 #include <cuda/stream>
 
 // cucascade
+#include <cucascade/cudf/datasource.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library

@@ -75,6 +75,7 @@ class fixed_size_host_memory_resource;
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -494,8 +495,14 @@ class sirius_scan_manager {
   /**
    * @brief Construct a new scan manager.
    *
-   * The scan_manager owns a single io_context (uring_ioctx) and optionally
-   * an S3 backend and a prefetch buffer pool, all created from @p config.
+   * The scan_manager owns a default ioctx for local paths (@c uring_ioctx with
+   * backend=native, @c kvikio_context with backend=kvikio), built by the
+   * @c cucascade::io::io_context_registry from @p config, plus the backends other
+   * paths route to (e.g. the REST ioctx for @c s3://), built lazily on first use.
+   * Each ioctx carries its own prefetching cache when @c cache.mode is @c cucs.
+   *
+   * @throws std::runtime_error when the default ioctx cannot be built; the message
+   *         names the most likely cause.
    *
    * @param config Scan-manager configuration (thread pool, IO backend, cache).
    * @param reservation_manager Memory reservation manager for GPU memory.
@@ -590,7 +597,7 @@ class sirius_scan_manager {
   /// because the cache holds what it holds until something evicts it.
   ///
   /// A no-op for any context the configuration or the backend does not give a
-  /// cache to -- @c cache.mode other than @c sirius, or a backend that cannot
+  /// cache to -- @c cache.mode other than @c cucs, or a backend that cannot
   /// serve vector host reads.  Such a context has nothing to drop and nothing
   /// to rebuild, and this leaves it exactly as it was rather than teaching it
   /// to cache.
@@ -881,6 +888,13 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] cucascade::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// \brief Shared ownership of the process-wide ioctx (see @ref io_ctx), for callers
+  ///        that open datasources on it: every datasource co-owns its ioctx.
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> shared_io_ctx() const noexcept
+  {
+    return _io_ctx;
+  }
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.
@@ -1059,6 +1073,40 @@ class sirius_scan_manager {
   std::shared_ptr<cucascade::io::ioctx> ioctx_for_type(cucascade::io::io_context_type type,
                                                     std::string_view path = {});
 
+  /// Why the registry could not build a backend, as far as Sirius can tell.
+  struct ioctx_failure {
+    std::string cause;      ///< the most likely reason, for the log line and exceptions
+    bool by_configuration;  ///< absent by configuration (logged as WARN), not broken (ERROR)
+  };
+
+  /// The most likely reason the registry could not build a backend of @p type.
+  /// cuCascade's factories swallow their exceptions and its logging is compiled
+  /// out, so the cause is derived from Sirius's own config and state. @p scoped
+  /// is the path-scoped S3 config the build used, or nullptr for the default.
+  [[nodiscard]] ioctx_failure explain_ioctx_failure(
+    cucascade::io::io_context_type type,
+    cucascade::io::object_store_config const* scoped = nullptr) const;
+
+  /// Build an ioctx of @p type, logging @ref explain_ioctx_failure when that
+  /// returns nullptr.  Without @p scoped this is `_ioctx_registry.make_ioctx(type)`;
+  /// with a path-scoped S3 config the default config's object store is replaced
+  /// by @p scoped.  An unconfigured object store is a WARN, since that is the
+  /// normal state of a local-only deployment; anything else is an ERROR.
+  [[nodiscard]] std::shared_ptr<cucascade::io::ioctx> make_ioctx_or_explain(
+    cucascade::io::io_context_type type,
+    cucascade::io::object_store_config const* scoped = nullptr);
+
+  /// Give @p io_ctx a prefetching cache when the configuration and the backend
+  /// both allow one, and warn when it could not be built.  Returns whether a cache
+  /// was called for (built or not).
+  bool init_cache_for(cucascade::io::ioctx& io_ctx);
+
+  /// Per-query runner health check for the backends with runner pools (uring,
+  /// restful): restart a pool whose runners all died, and report (once per ioctx)
+  /// a pool running short.  Spawns threads on restart, so never call it under
+  /// `_routed_io_ctxs_mtx`.
+  void check_io_runners(cucascade::io::ioctx& io_ctx);
+
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
@@ -1099,6 +1147,15 @@ class sirius_scan_manager {
   };
   std::unordered_map<routed_ioctx_key, std::shared_ptr<cucascade::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
+  /// Backends that failed to build, keyed like `_routed_io_ctxs`, so a path routed
+  /// to one does not re-run its factory (and repeat the explanation) on every
+  /// lookup.  A config snapshot is immutable, so a retry with the same key could
+  /// only fail the same way; installing a new S3 secret yields a new key.
+  /// Guarded by `_routed_io_ctxs_build_mtx`.
+  std::unordered_set<routed_ioctx_key, routed_ioctx_key_hash> _unavailable_io_ctxs;
+  /// ioctxs whose runner shortfall has been reported; see @ref check_io_runners.
+  std::mutex _io_runner_health_mtx;
+  std::unordered_set<cucascade::io::ioctx const*> _io_runner_shortfall_reported;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
   /// whole duration, and an unpin from another connection drops only the map slot, leaving

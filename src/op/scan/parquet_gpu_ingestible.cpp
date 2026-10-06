@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include "io/path_utils.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/owning_table_view.hpp"
 
@@ -946,11 +947,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
   std::shared_ptr<cucascade::io::datasource> sirius_ds;
   {
-    sirius_ds = cucascade::io::open_datasource(io_ctx,
-                                               file_path,
-                                               footer_cached
-                                                 ? cucascade::io::open_hint::generic
-                                                 : cucascade::io::open_hint::parquet_footer_probe);
+    sirius_ds =
+      sirius::io::open_datasource(io_ctx,
+                                  file_path,
+                                  footer_cached ? cucascade::io::open_hint::generic
+                                                : cucascade::io::open_hint::parquet_footer_probe);
   }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);

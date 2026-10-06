@@ -416,13 +416,13 @@ struct equality_delete_read_result {
 /// Reads an equality-delete file into a GPU table, plus its column names and Iceberg field ids.
 /// Stays on device because the result feeds a cudf::distinct_hash_join directly. @p ioctx must
 /// be non-null: this entry point has no kvikio bypass.
-equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
-                                                      cucascade::io::ioctx& ioctx)
+equality_delete_read_result read_equality_delete_file(
+  std::string const& delete_file_path, std::shared_ptr<cucascade::io::ioctx> const& ioctx)
 {
   ::cuda::stream_ref stream = cudf::get_default_stream();
 
   // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
-  auto datasource = cucascade::io::open_datasource(ioctx.shared_from_this(), delete_file_path);
+  auto datasource = sirius::io::open_datasource(ioctx, delete_file_path);
 
   auto opts =
     cudf::io::parquet_reader_options::builder(cudf::io::source_info{datasource.get()}).build();
@@ -558,7 +558,7 @@ void materialize_positional_deletes(duckdb::ClientContext& context,
 /// Groups equality deletes by (schema, sequence number) so the scan-time applicability check is
 /// one CPU comparison per group.
 void materialize_equality_deletes(std::vector<IcebergDeleteFileEntry> const& eq_entries,
-                                  cucascade::io::ioctx& ioctx,
+                                  std::shared_ptr<cucascade::io::ioctx> const& ioctx,
                                   IcebergDeleteData& data)
 {
   if (eq_entries.empty()) return;
@@ -687,7 +687,7 @@ constexpr bool kEqualityDeleteRouteImplementedToSpec = false;
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  cucascade::io::ioctx* metadata_ioctx,
+  std::shared_ptr<cucascade::io::ioctx> const& metadata_ioctx,
   iceberg_delete_discovery const& discovery)
 {
   g_uncached_read_count.fetch_add(1, std::memory_order_relaxed);
@@ -740,7 +740,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
     }
     data->data_file_manifest_sequence_numbers =
       std::move(discovery.data_file_manifest_sequence_numbers);
-    materialize_equality_deletes(discovery.equality_delete_entries, *metadata_ioctx, *data);
+    materialize_equality_deletes(discovery.equality_delete_entries, metadata_ioctx, *data);
   }
 
   return data;
@@ -751,7 +751,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  cucascade::io::ioctx* metadata_ioctx,
+  std::shared_ptr<cucascade::io::ioctx> metadata_ioctx,
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery)
 {

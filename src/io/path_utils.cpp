@@ -16,12 +16,15 @@
 
 #include "io/path_utils.hpp"
 
+#include <cucascade/cudf/datasource.hpp>
 #include <duckdb/common/path.hpp>
 
 #include <cctype>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace sirius::io {
 
@@ -118,6 +121,18 @@ std::string strip_file_scheme(std::string_view path)
   } catch (...) {
     return local;
   }
+}
+
+std::unique_ptr<cucascade::io::datasource> open_datasource(
+  std::shared_ptr<cucascade::io::ioctx> io_ctx, std::string path)
+{
+  return cucascade::io::open_datasource(std::move(io_ctx), strip_file_scheme(path));
+}
+
+std::unique_ptr<cucascade::io::datasource> open_datasource(
+  std::shared_ptr<cucascade::io::ioctx> io_ctx, std::string path, cucascade::io::open_hint hint)
+{
+  return cucascade::io::open_datasource(std::move(io_ctx), strip_file_scheme(path), hint);
 }
 
 }  // namespace sirius::io

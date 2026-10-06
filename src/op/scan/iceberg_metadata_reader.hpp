@@ -157,7 +157,8 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
  * first drops deletes silently and returns rows the table removed.
  *
  * @param metadata_ioctx Routes the equality-delete parquet and footer reads. Single-GPU is
- *                       sufficient (planning-time reads). Must outlive the call; nullptr throws.
+ *                       sufficient (planning-time reads). Shared because every datasource
+ *                       opened on it co-owns it; nullptr throws.
  * @param snapshot_id    The snapshot the SCAN was bound to. Callers on the GPU path always pass
  *                       one: an unpinned iceberg_scan is declined at plan time precisely so that
  *                       this pass cannot resolve "current" independently and pair one snapshot's
@@ -167,7 +168,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 std::shared_ptr<const IcebergDeleteData> load_delete_payload(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  cucascade::io::ioctx* metadata_ioctx,
+  std::shared_ptr<cucascade::io::ioctx> metadata_ioctx,
   std::optional<uint64_t> snapshot_id,
   iceberg_delete_discovery const& discovery);
 

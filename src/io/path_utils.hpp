@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <cucascade/cudf/datasource.hpp>  // cucascade::io::{datasource, ioctx, open_hint}
+
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -47,5 +50,28 @@ namespace sirius::io {
  * Never throws.
  */
 [[nodiscard]] std::string strip_file_scheme(std::string_view path);
+
+/**
+ * @brief Open a datasource for @p path on @p io_ctx after normalizing it with
+ *        @ref strip_file_scheme.
+ *
+ * Every Sirius open goes through here rather than @c cucascade::io::open_datasource
+ * directly. The old @c ioctx::open_datasource member normalized with duckdb::Path
+ * semantics (this file's @ref strip_file_scheme); cuCascade's free function applies
+ * only its own scheme strip, which does not fold `.`/`..` or empty segments. The
+ * io_object's @c raw_file_cache_id keys the prefetching cache (fs_cache) and the
+ * metadata_store, so a path must be canonical the same way the scan manager's
+ * @c normalize_path() makes it, or one file is cached under two keys and a
+ * metadata_store lookup by the normalized path misses.
+ *
+ * @throws Whatever @c cucascade::io::open_datasource throws (unsupported or
+ *         unreachable path, null @p io_ctx).
+ */
+[[nodiscard]] std::unique_ptr<cucascade::io::datasource> open_datasource(
+  std::shared_ptr<cucascade::io::ioctx> io_ctx, std::string path);
+
+/// As above, forwarding @p hint to the backend (e.g. @c open_hint::parquet_footer_probe).
+[[nodiscard]] std::unique_ptr<cucascade::io::datasource> open_datasource(
+  std::shared_ptr<cucascade::io::ioctx> io_ctx, std::string path, cucascade::io::open_hint hint);
 
 }  // namespace sirius::io
