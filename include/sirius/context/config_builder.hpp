@@ -131,7 +131,8 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * applied. Editing or deleting the file after loading has no effect on this
    * builder. Loading does not discover hardware or resolve hardware-dependent values.
    *
-   * The [YAML configuration reference](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md)
+   * The [YAML configuration
+   * reference](https://github.com/sirius-db/sirius/blob/main/docs/super-sirius/configuration.md)
    * lists supported fields, defaults, byte units, and constraints. Settings belong
    * under the top-level `sirius` key; omitted settings use built-in defaults.
    * For example, `sirius.yaml` can contain:
