@@ -6,23 +6,32 @@ reads, NULL/decimal/string/date values, empty tables, and multiple partitions/fi
 The suite compares values and SQL types, then checks connection liveness. It does
 not implement or demonstrate a GPU Paimon scan.
 
-## Qualified reader artifacts
+## Pinned source build
 
-`qualified-artifacts.json` records qualified readers separately from the authored
-answers, keyed by DuckDB version and platform. The `linux_amd64` records cover:
+The optional native suite builds `paimon.duckdb_extension` from source before
+reading the corpus. It needs no hosted Paimon binary or community installation.
+`source-build.json` pins the extension, native reader and DuckDB source archives
+by commit, size and SHA256, together with the build options. Native dependencies
+use the upstream bundled versions and checksums. The recipe supports DuckDB
+v1.5.6 on Linux x86_64; other versions/platforms require a reviewed recipe update.
 
-- DuckDB **v1.5.5**: duckdb-paimon
-  `5e89198235c8be6a402f2b02ef54f249914eee29`.
-- DuckDB **v1.5.6**: duckdb-paimon
-  `e49d491a103e30399d2d0cdc9c2f7efaf138d200`.
+Build through the repository's locked Pixi environment. The local-filesystem
+recipe disables OSS, S3 and REST and produces a loadable extension for the Sirius
+CLI. It does not add a Paimon dependency to ordinary Sirius builds. Cold builds
+compile native dependencies including Arrow and Parquet and take longer than
+reading this small corpus.
 
-Both sources pin native Paimon
-`53f9c86d45aabb0a6f1a379271da07d7a9f27a3d`. Each registry entry records its own
-uncompressed artifact size and SHA256. Provisioning requires a verified retained
-URL; an entry without one intentionally refuses a cold download.
+A build receipt records the source recipe, builder and Pixi lock hashes, compiler
+versions, target executable identity/hash, and output size/hash. The runner
+requires that receipt by default and rejects stale inputs, a changed executable,
+or changed extension bytes. This is provenance from a trusted local/CI builder,
+not a signed attestation or a promise of byte-identical rebuilds. A successful
+build does not qualify reader correctness; conformance must pass separately.
 
-Qualification covers the committed fixtures, not general Paimon support. Sirius
-GPU regressions exercise the surrounding engine; Paimon reads use the CPU path.
+`qualified-artifacts.json` retains historical community-binary identities for
+explicit `--registry` investigations. Those results do not qualify a newly built
+reader. Qualification covers the committed fixtures, not general Paimon support.
+Sirius GPU regressions exercise the surrounding engine; Paimon reads use the CPU.
 Dated validation results and delivery status belong in the pull request.
 
 Known limit: [duckdb-paimon #95](https://github.com/polardb/duckdb-paimon/issues/95)
@@ -48,32 +57,39 @@ the Linux CUDA environment, the same unittest command can run through an isolate
 CPU-only Pixi environment containing Python 3.12. The fake CLI tests check harness
 decisions; they do not qualify native Paimon behavior.
 
-After a qualification record has a verified retained URL, provision separately:
+Build the test dependency into a **new** directory (Python 3.12 is recommended):
 
 ```bash
-pixi run python3 test/cpp/integration/data/paimon_conformance/qualified_extension.py \
-  --duckdb build/release/duckdb --output build/paimon-conformance/extensions
+pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
+  --duckdb build/release/duckdb --output build/paimon-conformance/source-build --jobs 4
 ```
 
-The downloader requires a public HTTPS URL with the artifact SHA256 as a path
-component and serves uncompressed `.duckdb_extension` bytes. The qualification
-record must include the measured `size_bytes` before downloading. It verifies
-length and hash before atomically publishing the file. Short/long bodies and
-transport/read failures receive up to three attempts; a complete body of the
-qualified length with the wrong hash fails without retrying. A matching existing artifact is
-reusable, but a local cache alone is not a reproducible distribution source.
+The builder refuses an existing output directory, including a failed build. Use
+another directory for a retry; logs from the failed attempt remain available.
+Source downloads retry transport failures up to three times; checksum mismatches
+fail immediately. The optional `--source-cache DIR` accepts previously downloaded
+archives named `<sha256>.tar.gz`, verifying their length and checksum before use.
+Native dependency archives can use the same naming convention; only entries
+whose hashes appear in the pinned native `third_party/versions.txt` are reused.
+A missing cache entry downloads normally; a corrupt entry fails. The default
+needs no cache. This cache contains source archives, never prebuilt libraries.
 
-Then read the committed corpus with the normal Sirius executable:
+Then read the committed corpus using the same Sirius executable:
 
 ```bash
-pixi run python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
+pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
   --duckdb build/release/duckdb \
-  --paimon-extension build/paimon-conformance/extensions/paimon.duckdb_extension
+  --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension
 ```
+
+The default receipt is `build-receipt.json` beside the extension; use
+`--build-receipt` if it was relocated separately. Keep the receipt and extension
+together when moving them. Historical byte qualification instead requires an
+explicit `--registry` and its exact binary; there is no automatic fallback.
 
 The runner never downloads or installs extensions. It checks exact warehouse
 inventory/hashes, recorded oracle consistency, and actual executable version and
-platform before loading the qualified artifact. A full run plans 53 cases and
+platform before loading the verified build output. A full run plans 53 cases and
 starts 54 processes: one identity probe, 50 ordinary cases, and three smoke cases.
 Each ordinary/smoke query uses one process for DESCRIBE, rows, and liveness.
 
@@ -115,7 +131,7 @@ a maintainer must make that revision available on a base-repository ref. A fork
 can dispatch only when its default branch contains the workflow and its required
 runners are available.
 
-Provisioning/case diagnostics are uploaded even on failure. Normal PR/merge-group
+Build/case diagnostics, receipts and nested CMake logs are uploaded even on failure. Normal PR/merge-group
 checks run the CPU harness in its own required job, independently of lint and
 thread-sweep checks, with a Paimon-specific summary. Workflow validation requires
 a completed real run with retained reports; local checks alone do not establish
@@ -170,14 +186,17 @@ the committed files/cases, not a new independent read. `metadata_revision` recor
 that distinction. Runtime comparisons detect drift, but coordinated edits of
 both expected answers and recorded observations still require independent review.
 
-## Requalifying a reader
+## Updating the source recipe
 
-Retain candidate bytes outside the corpus; record their actual version, platform,
-source/native revisions, uncompressed byte size, and SHA256. Use a separate candidate registry via
-`--registry` for investigation, without treating the candidate as accepted.
-Keep the filename `paimon.duckdb_extension`: DuckDB derives the extension entry
-point from that basename. Run native conformance, relocation/offline checks, and
-appropriate Sirius GPU fallback/regressions. Investigate disagreements against authored answers and
-independent reader evidence. Publish the accepted bytes at a retained
-content-addressed URL, verify a cold download, and add the reviewed qualification
-record and evidence.
+Review the exact extension/native/DuckDB commits, source archive checksums,
+upstream dependency pins and patches, compiler environment, and build options.
+Update the recipe deliberately; never select the newest upstream branch during
+a test run. A DuckDB upgrade requires a compatible recipe and fresh validation.
+
+Build in a clean directory without prebuilt dependency caches. Verify source
+retrieval from an empty archive cache, run native conformance, then repeat against
+a relocated corpus with networking disabled after building. Run the appropriate
+Sirius GPU fallback/regressions with the newly built extension. Investigate
+mismatches against authored answers and independent reader evidence. Record the
+actual build receipt and test results; do not copy a historical binary's passing
+status onto a new build. No permanent binary publication is required.

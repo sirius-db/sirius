@@ -14,6 +14,7 @@ import tempfile
 import traceback
 
 from qualified_extension import select_qualification
+from build_extension import validate_receipt
 
 from corpus_checks import (
     digest,
@@ -373,8 +374,16 @@ def main(argv=None):
     parser.add_argument("corpus", type=Path, nargs="?", default=HERE)
     parser.add_argument("--duckdb", type=Path, default=ROOT / "build/release/duckdb")
     parser.add_argument("--paimon-extension", type=Path, required=True)
-    parser.add_argument(
-        "--registry", type=Path, default=HERE / "qualified-artifacts.json"
+    provenance = parser.add_mutually_exclusive_group()
+    provenance.add_argument(
+        "--build-receipt",
+        type=Path,
+        help="Source build receipt (default: beside the extension)",
+    )
+    provenance.add_argument(
+        "--registry",
+        type=Path,
+        help="Explicit historical byte-qualified registry instead of a source build receipt",
     )
     parser.add_argument(
         "--output",
@@ -431,16 +440,20 @@ def main(argv=None):
         extension = args.paimon_extension.resolve(strict=True)
         cli = args.duckdb.resolve(strict=True)
         identity = probe_identity(cli, run_dir, args.timeout)
-        spec["extension"] = select_qualification(args.registry, identity)
+        if args.registry:
+            spec["extension"] = select_qualification(args.registry, identity)
+            report["registry_sha256"] = digest(args.registry)
+            if digest(extension) != spec["extension"]["sha256"]:
+                raise ValueError(
+                    "Unqualified Paimon artifact: registry SHA256 mismatch"
+                )
+        else:
+            receipt = args.build_receipt or extension.with_name("build-receipt.json")
+            spec["extension"] = validate_receipt(receipt, extension, cli, identity)
         report.update(
             duckdb={"path": str(cli), "sha256": digest(cli), **identity},
             extension=spec["extension"],
-            registry_sha256=digest(args.registry),
         )
-        if digest(extension) != spec["extension"]["sha256"]:
-            raise ValueError(
-                "Unqualified Paimon artifact: expected the version and SHA256 in qualified-artifacts.json"
-            )
         run_cases(args, corpus, spec, cases, manifest, extension, cli, run_dir, report)
         report["state"] = "passed"
     except BaseException as error:

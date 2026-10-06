@@ -21,9 +21,5 @@
       "version": "e49d491"
     }
   ],
-  "format_version": 1,
-  "pending": {
-    "delivery": "Actual GitHub workflow execution and independent review of the final revision remain pending.",
-    "retained_artifact": "Both readers have local fixture qualification but no verified retained content-addressed URL; cold provisioning intentionally fails."
-  }
+  "format_version": 1
 }

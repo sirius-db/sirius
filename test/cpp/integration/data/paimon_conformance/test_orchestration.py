@@ -103,7 +103,9 @@ for result in results: print(json.dumps(result))
         )
         self.cli.chmod(0o755)
 
-    def run_suite(self, selected=(), fault="", target="disabled/empty_rows"):
+    def run_suite(
+        self, selected=(), fault="", target="disabled/empty_rows", source=False
+    ):
         (self.corpus / "expectations.json").write_text(canonical_json(self.spec))
         args = [
             str(self.corpus),
@@ -116,6 +118,9 @@ for result in results: print(json.dumps(result))
             "--output",
             str(self.root / "reports"),
         ]
+        if source:
+            index = args.index("--registry")
+            del args[index : index + 2]
         for case in selected:
             args.extend(["--case", case])
         error = None
@@ -130,6 +135,54 @@ for result in results: print(json.dumps(result))
             next((self.root / "reports").glob("run-*/report.json")).read_text()
         )
         return report, error
+
+    def test_source_receipt_default_rejects_missing_evidence(self):
+        report, error = self.run_suite(selected=("append_b",), source=True)
+        self.assertIsInstance(error, FileNotFoundError)
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual(report["executed_cases"], 0)
+        self.assertEqual(report["not_run_cases"], report["planned_cases"])
+
+    def test_source_receipt_acceptance_and_tampering_at_real_entry_point(self):
+        import build_extension as builder
+
+        recipe = builder.read_recipe()
+        self.cli.write_text(
+            self.cli.read_text()
+            .replace("v1.5.5", recipe["duckdb_version"])
+            .replace("5e89198", recipe["extension_version"])
+        )
+        identity = {"version": recipe["duckdb_version"], "platform": recipe["platform"]}
+        receipt = {
+            "format_version": 1,
+            "state": "built",
+            "recipe_sha256": digest(builder.RECIPE),
+            "builder_sha256": digest(Path(builder.__file__)),
+            "pixi_lock_sha256": digest(builder.ROOT / "pixi.lock"),
+            "sources": recipe["sources"],
+            "cmake_options": recipe["cmake_options"],
+            "duckdb_identity": identity,
+            "duckdb_sha256": digest(self.cli),
+            "duckdb_source_id": recipe["sources"]["duckdb"]["commit"][:8],
+            "toolchain": {key: "test tool" for key in ("cc", "cxx", "cmake", "ninja")},
+            "build_environment": {key: "" for key in builder.BUILD_ENVIRONMENT_KEYS},
+            "sha256": digest(self.extension),
+            "size_bytes": self.extension.stat().st_size,
+        }
+        path = self.root / "build-receipt.json"
+        path.write_text(json.dumps(receipt))
+        report, error = self.run_suite(selected=("append_b",), source=True)
+        self.assertIsNone(error)
+        self.assertEqual(report["state"], "passed")
+        self.assertEqual(report["executed_cases"], 5)
+        self.assertEqual(report["extension"]["kind"], "source_build")
+        shutil.rmtree(self.root / "reports")
+        self.extension.write_bytes(b"corrupted after build")
+        report, error = self.run_suite(selected=("append_b",), source=True)
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(report["state"], "failed")
+        self.assertEqual(report["executed_cases"], 0)
+        self.assertEqual(report["not_run_cases"], 5)
 
     def test_complete_suite_one_process_per_case(self):
         report, error = self.run_suite()

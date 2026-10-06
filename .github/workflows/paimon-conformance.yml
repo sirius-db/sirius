@@ -19,7 +19,7 @@ concurrency:
 jobs:
   conformance:
     runs-on: [self-hosted, ubuntu-24.04, gpu-2xt4]
-    timeout-minutes: 20
+    timeout-minutes: 90
     env:
       SIRIUS_LOG_LEVEL: warn
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
@@ -68,25 +68,30 @@ jobs:
           github-token: ${{ github.token }}
           path: build/paimon-conformance/artifact
 
-      - name: Extract and provision qualified extension
+      - name: Extract matching Sirius build
         run: |
           set -euo pipefail
           {
             tar -xf build/paimon-conformance/artifact/build.tar
-            pixi run python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
+            pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_provenance.py \
               --run build/paimon-conformance/build-run.json --expected-sha "$GITHUB_SHA" \
               --checkout-sha-file build/release/sirius-build-sha.txt \
               | tee build/paimon-conformance/build-provenance.json
-            pixi run python3 test/cpp/integration/data/paimon_conformance/qualified_extension.py \
-              --duckdb build/release/duckdb --output build/paimon-conformance/extensions
           } 2>&1 | tee -a build/paimon-conformance/setup.log
+
+      - name: Build pinned Paimon test dependency
+        run: |
+          set -euo pipefail
+          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/build_extension.py \
+            --duckdb build/release/duckdb --output build/paimon-conformance/source-build --jobs 4 \
+            2>&1 | tee -a build/paimon-conformance/setup.log
 
       - name: Run Paimon cases
         run: |
           set -euo pipefail
-          pixi run python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
+          pixi run --locked python3 test/cpp/integration/data/paimon_conformance/run_conformance.py \
             --duckdb build/release/duckdb \
-            --paimon-extension build/paimon-conformance/extensions/paimon.duckdb_extension \
+            --paimon-extension build/paimon-conformance/source-build/paimon.duckdb_extension \
             2>&1 | tee build/paimon-conformance/conformance.log
 
       - name: Summarize Paimon result including setup failures
@@ -97,11 +102,12 @@ jobs:
           {
             echo '## Paimon conformance'
             printf 'Job status: **%s**\n' "$JOB_STATUS"
-            echo 'If no case report exists, provisioning/build retrieval did not complete; cases are NOT RUN.'
+            echo 'If no case report exists, source building/build retrieval did not complete; cases are NOT RUN.'
             echo 'Build artifacts expire after one day. An expired/missing artifact requires a new matching build, never substitution with another revision.'
             echo '```'
             cat build/paimon-conformance/build-provenance.json 2>/dev/null || true
             tail -60 build/paimon-conformance/setup.log 2>/dev/null || true
+            tail -60 build/paimon-conformance/source-build/build.log 2>/dev/null || true
             tail -60 build/paimon-conformance/conformance.log 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -115,7 +121,11 @@ jobs:
             build/paimon-conformance/*.log
             build/paimon-conformance/*.json
             build/paimon-conformance/run-*/
-            build/paimon-conformance/extensions/*.stdout
-            build/paimon-conformance/extensions/*.stderr
+            build/paimon-conformance/source-build/build.log
+            build/paimon-conformance/source-build/build-receipt.json
+            build/paimon-conformance/source-build/*.stdout
+            build/paimon-conformance/source-build/*.stderr
+            build/paimon-conformance/source-build/build/**/*.log
+            build/paimon-conformance/source-build/build/**/CMakeCache.txt
           if-no-files-found: warn
           retention-days: 14
