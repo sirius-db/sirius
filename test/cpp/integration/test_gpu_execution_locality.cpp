@@ -18,6 +18,8 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
+#include "utils/sirius_test_env.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -84,8 +86,8 @@ TEST_CASE("pipeline tasks can have different preferred_device_ids", "[data_local
 TEST_CASE("global state preferred_device_id serves as pipeline default", "[data_locality]")
 {
   // SCHED-04: Pipeline-level default from global state
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    nullptr, sirius::test::make_test_telemetry_context());
 
   REQUIRE_FALSE(global_state->get_preferred_device_id().has_value());
 
@@ -101,9 +103,9 @@ TEST_CASE("global state preferred_device_id serves as pipeline default", "[data_
 TEST_CASE("local state preferred_device_id takes precedence over global", "[data_locality]")
 {
   // SCHED-01: Per-task locality score (local) overrides pipeline default (global)
-  auto local_state = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
-  auto global_state =
-    std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(nullptr);
+  auto local_state  = std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(nullptr);
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    nullptr, sirius::test::make_test_telemetry_context());
 
   global_state->set_preferred_device_id(0);
   local_state->set_preferred_device_id(1);
@@ -217,10 +219,7 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
   // This test requires actual multi-GPU hardware
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("requires 2+ GPUs for scan distribution test -- skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // Verify that the system actually has multiple GPU devices accessible
   for (int i = 0; i < device_count; ++i) {
@@ -253,12 +252,7 @@ TEST_CASE("scan batches distributed across multiple GPUs", "[.][data_locality][m
 TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
           "[data_locality][multi_gpu][mgpu_07_adaptive_scan]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("requires 2+ GPUs for MGPU-07 adaptive scan + P2P scenario -- skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // 2-GPU memory manager + peer access already enabled at SiriusContext
   // initialize() level (Plan 07-01 MGPU-06). This TEST_CASE runs outside the
@@ -270,9 +264,9 @@ TEST_CASE("adaptive scan + P2P path distributes asymmetric preload (MGPU-07)",
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(512ull << 20)
     .set_reservation_fraction_per_gpu(0.75)
-    .set_per_host_capacity(1ull << 30)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(0.75);
+    .set_per_numa_region_capacity(1ull << 30)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75);
   auto space_configs = builder.build();
   auto mem_mgr =
     std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));

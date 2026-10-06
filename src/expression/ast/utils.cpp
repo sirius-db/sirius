@@ -57,9 +57,9 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
       using T = std::decay_t<decltype(alt)>;
 
       if constexpr (std::is_same_v<T, reference>) {
-        return std::make_unique<node>(reference{alt.column_index, alt.return_type});
+        return std::make_unique<node>(reference{alt.column_index, alt.return_type()});
       } else if constexpr (std::is_same_v<T, constant>) {
-        return std::make_unique<node>(constant{alt.payload, alt.return_type});
+        return std::make_unique<node>(constant{alt.payload, alt.return_type()});
       } else if constexpr (std::is_same_v<T, comparison>) {
         return std::make_unique<node>(comparison{alt.op, xform(alt.left), xform(alt.right)});
       } else if constexpr (std::is_same_v<T, conjunction>) {
@@ -79,7 +79,8 @@ std::unique_ptr<node> rebuild(node const& src, Xform const& xform)
         return std::make_unique<node>(
           case_expr{std::move(cases), xform(alt.else_), alt.return_type()});
       } else if constexpr (std::is_same_v<T, cast>) {
-        return std::make_unique<node>(cast{xform(alt.child), alt.target_type, alt.try_cast});
+        return std::make_unique<node>(
+          cast{xform(alt.child), alt.target_type, alt.try_cast, alt.kind});
       } else if constexpr (std::is_same_v<T, unary_op>) {
         return std::make_unique<node>(unary_op{alt.op, xform(alt.child)});
       } else if constexpr (std::is_same_v<T, coalesce>) {

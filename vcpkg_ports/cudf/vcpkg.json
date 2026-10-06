@@ -9,7 +9,6 @@
       "host": true,
       "name": "vcpkg-cmake-config"
     },
-    "arrow",
     "cccl",
     "dlpack",
     "flatbuffers",
@@ -17,6 +16,8 @@
     "kvikio",
     "nanoarrow",
     "nvcomp",
+    "nvjitlink",
+    "nvrtc",
     "nvtx3",
     "rmm",
     "roaring",
@@ -27,5 +28,5 @@
   "license": "Apache-2.0",
   "name": "cudf",
   "supports": "linux",
-  "version-string": "26.06.00"
+  "version-string": "26.08.01"
 }

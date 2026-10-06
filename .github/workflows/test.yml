@@ -14,15 +14,13 @@
 name: Test
 
 on:
-  push:
-    branches:
-      - dev
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
   build:
@@ -30,6 +28,10 @@ jobs:
       SCCACHE_GHA_ENABLED: true
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
+      # CPU build runners have no GPU/driver; assert `__cuda` for the matrix's
+      # CUDA version so its platform resolves. (The GPU test-run job below
+      # detects the real driver.)
+      CONDA_OVERRIDE_CUDA: ${{ matrix.cuda.version }}
     strategy:
       matrix:
         cuda:
@@ -42,21 +44,23 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "cpu-xl"]', matrix.cuda.runner)) }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - name: Init build submodules
+        run: git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
+          environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
       - name: Configure sccache backend
@@ -68,13 +72,39 @@ jobs:
             echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           fi
+          # Use 'sirius' prefix for sccache cache
+          echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
 
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - name: Build
         env:
-          CUDAARCHS: "89" # 75 for T4 capability; 89 for L4 capability
-        run: make -j$(nproc)
+          CUDAARCHS: "75" # 75 for T4 capability; 89 for L4 capability
+        run: |
+          set -o pipefail
+          make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Check installed Sirius package
+        run: |
+          sirius_test_dir="$(mktemp -d)"
+          trap 'rm -rf "$sirius_test_dir"' EXIT
+          cmake --install build/release --prefix "$sirius_test_dir/install" --component sirius_library
+          cmake -E rename "$sirius_test_dir/install" "$sirius_test_dir/relocated"
+          cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
+          cmake --build "$sirius_test_dir/consumer"
+
+      - name: Surface build errors
+        if: failure()
+        run: |
+          echo '## Build errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package build artifacts
         run: tar -cf build.tar build/release/
@@ -101,22 +131,23 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
-              run-on-pr: ${{ fromJSON(github.event_name == 'pull_request' && 'false' || 'null') }}
+              run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
-    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xl4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 90 # extra budget for the merge-queue SF10 S3 large gate
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
+          environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -126,10 +157,59 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build.tar
 
+      - name: Provision DuckDB extensions the tests load
+        # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
+        # and an INSTALL inside the test would silently paper over an unprovisioned runner
+        # instead of failing with the install command. So provisioning happens here, out of
+        # band. avro comes in as an iceberg dependency but is named explicitly so a failure
+        # says which extension is missing.
+        #
+        # This resolves only because OVERRIDE_GIT_DESCRIBE (cmake/CMakePresets.json) gives the
+        # build a real DuckDB version. Against the dummy v0.0.1 a shallow submodule would
+        # otherwise produce, there is no extension repository to install from.
+        run: |
+          for attempt in 1 2 3; do
+            if ./build/release/duckdb -c "INSTALL avro; INSTALL iceberg;"; then
+              exit 0
+            fi
+            echo "::warning::Extension install attempt ${attempt} failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
+          exit 1
+
       - name: Run C++ unit tests
         run: |
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+          python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
+
+      - name: Iceberg conformance (correctness + connection liveness)
+        timeout-minutes: 20
+        # The C++ suite asserts routes and rows, but every case shares one in-process
+        # connection, so it cannot observe the failure mode this guards: a RUNTIME GPU fallback
+        # poisons the connection and the NEXT GPU query on it deadlocks forever. This harness
+        # runs each case in its own duckdb process and issues a second query on the same
+        # connection, which is the only automated check that a decline happened at plan time
+        # rather than at execution. It also compares rows against pyiceberg's own recorded
+        # output -- an external oracle, where the in-tree fixtures only agree with themselves.
+        run: |
+          set -o pipefail
+          python3 test/cpp/integration/data/iceberg_conformance/run_conformance.py \
+            test/cpp/integration/data/iceberg_conformance \
+            --duckdb ./build/release/duckdb 2>&1 | tee /tmp/conformance.log
+
+      - name: Surface test failures
+        if: failure()
+        run: |
+          echo '## Iceberg conformance failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -60 /tmp/conformance.log >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -h -B 5 -A 10 'FAILED:' build/release/extension/sirius/test/cpp/log/*/unittest.log \
+            | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs
         if: always()
@@ -146,6 +226,13 @@ jobs:
           chmod -R a+r test_datasets/
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
+      - name: S3 integration tests
+        run: make s3-test
+
+      - name: S3 large integration tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: make s3-test-large
 
       - name: TPC-H performance snapshot
         id: tpch
@@ -177,18 +264,6 @@ jobs:
           name: tpch-run-${{ github.run_id }}-cuda-${{ matrix.cuda.version }}
           path: ${{ steps.tpch.outputs.run_dir }}
           retention-days: 14
-
-      # S3 integration gate. The backend is a SeaweedFS `weed` process the test
-      # binary spawns itself (no Docker), so the standard gate is cheap enough to
-      # run on PR CI; the expensive SF10 SQL-over-S3 gate (multi-minute fixture
-      # generation + large upload) is left to the merge queue.
-      - name: S3 integration tests
-        if: ${{ matrix.cuda.version == '13' }}
-        run: make s3-test
-
-      - name: S3 large SQL-over-S3 tests
-        if: ${{ matrix.cuda.version == '13' && github.event_name == 'merge_group' }}
-        run: make s3-test-large
 
   test:
     runs-on: ubuntu-slim

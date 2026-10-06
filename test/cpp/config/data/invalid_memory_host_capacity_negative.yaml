@@ -1,0 +1,4 @@
+sirius:
+  memory:
+    host:
+      capacity_bytes: -1

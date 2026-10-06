@@ -16,44 +16,50 @@
 
 #pragma once
 
+#include <cstdint>
+#include <span>
+#include <string_view>
+
 namespace sirius::test {
 
 /**
- * @brief Lazily bring up the S3 test backend for the [s3] integration tests.
+ * @brief Lazily bring up the SeaweedFS test backend for the [s3] integration tests.
  *
  * On the first call it:
- *   1. spawns a single SeaweedFS `weed server` process (no Docker) that serves
- *      the S3 API over both plain HTTP and self-signed TLS at once — both
- *      listeners share one filer backend — on dynamically-chosen free ports,
- *   2. generates the local fixtures (`generate_fixtures.py`) and uploads them
- *      once (over HTTP) using Sirius's own SigV4 signer + libcurl, and
- *   3. publishes the `SIRIUS_TEST_S3_*` env vars the [s3] tests consume.
- * The `weed` process is torn down at process exit (see @ref
- * shutdown_s3_test_env); on Linux it also inherits a parent-death signal so a
- * crashed test binary takes it down too.
+ *   1. starts a local SeaweedFS process serving HTTP and self-signed TLS,
+ *   2. generates and uploads fixtures using Sirius's SigV4 signer and libcurl,
+ *   3. publishes the SIRIUS_TEST_S3_* environment variables.
+ * The process is terminated by shutdown_s3_test_env(); Linux also sends it
+ * SIGKILL if the test process dies. The weed binary comes from PATH (Pixi),
+ * or SIRIUS_TEST_WEED when set.
  *
- * The call is idempotent and cheap after the first success — safe to invoke
- * before every [s3] test from the Catch2 listener.
+ * The call is idempotent and cheap after the first success; main calls it once
+ * before the tests run.
  *
  * Bring-up is **opt-in** via the @c SIRIUS_TEST_S3_AUTO env var so the default
- * `make test` suite never spawns a server. Behavior:
+ * `make test` suite never starts a server. Behavior:
  *   - If @c SIRIUS_TEST_S3_ENDPOINT is already set (manual run / real AWS), it is
  *     used as-is and no server is started → returns true.
- *   - Else if @c SIRIUS_TEST_S3_AUTO is not truthy, returns false (tests skip,
- *     exactly as before).
+ *   - Else if @c SIRIUS_TEST_S3_AUTO is not truthy, returns false. Callers use
+ *     skip_or_fail_unless() to report a skip or fail under STRICT.
  *   - Else the server is brought up. On success returns true; on failure it
  *     returns false (skip) unless @c SIRIUS_TEST_S3_STRICT is truthy, in which
  *     case it throws std::runtime_error so the job goes red.
- *
- * The `weed` binary is resolved from @c PATH (provided by the pixi env's
- * `seaweedfs` package); override with the @c SIRIUS_TEST_WEED env var.
  *
  * @return true if the [s3] tests should run (env is ready), false to skip.
  */
 bool ensure_s3_test_env();
 
 /**
- * @brief Terminate the `weed` server started by @ref ensure_s3_test_env.
+ * @brief PUT a small object into the managed HTTP SeaweedFS instance.
+ *
+ * @return false when the S3 environment is externally managed; throws on an
+ * upload failure.
+ */
+bool put_s3_test_object(std::string_view key, std::span<std::uint8_t const> bytes);
+
+/**
+ * @brief Terminate the SeaweedFS process started by @ref ensure_s3_test_env.
  *
  * Safe to call when nothing was started and safe to call more than once. Invoked
  * once from unittest.cpp's main() before exit.

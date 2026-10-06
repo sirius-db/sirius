@@ -94,16 +94,16 @@ std::unique_ptr<duckdb::Expression> to_duckdb(reference const& alt)
   // BoundReferenceExpression::return_type directly to decide whether a cast is
   // needed, so the real type must be preserved. Fall back to INTEGER only when
   // the node carries no type (default-constructed SQLNULL sentinel).
-  auto return_type = alt.return_type.id() == sirius::type_id::SQLNULL
+  auto return_type = alt.return_type().id() == sirius::type_id::SQLNULL
                        ? duckdb::LogicalType{duckdb::LogicalTypeId::INTEGER}
-                       : sirius::to_duckdb(alt.return_type);
+                       : sirius::to_duckdb(alt.return_type());
   return from_duck_derived_ptr(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
     std::move(return_type), static_cast<duckdb::idx_t>(alt.column_index)));
 }
 
 std::unique_ptr<duckdb::Expression> to_duckdb(constant const& alt)
 {
-  auto duck_value = sirius::to_duckdb(alt.payload, alt.return_type);
+  auto duck_value = sirius::to_duckdb(alt.payload, alt.return_type());
   return from_duck_derived_ptr(
     duckdb::make_uniq<duckdb::BoundConstantExpression>(std::move(duck_value)));
 }
@@ -236,7 +236,7 @@ std::unique_ptr<duckdb::Expression> to_duckdb(function_call const& alt)
 
   // Minimal ScalarFunction stub: name + empty argument-types + return_type +
   // null function pointer. The downstream executor specialization
-  // (gpu_execute_function.cpp) dispatches via the function-name lookup, never
+  // (function.cpp) dispatches via the function-name lookup, never
   // invokes function_ptr_t or inspects arguments().
   auto name = std::string{sirius::to_duckdb_function_name(alt.function())};
   duckdb::ScalarFunction stub_fn(

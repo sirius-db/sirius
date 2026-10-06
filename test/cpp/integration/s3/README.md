@@ -1,112 +1,231 @@
 # S3 integration tests
 
-Catch2 `[s3]` tests for the S3 backend — from the lower-level `s3_ioctx` and
-retry/cache paths through `scan_manager`, parquet split-provider routing,
-`describe_parquet`, and the SQL-over-S3 surface.
+Catch2 tests cover REST range reads, retries, cache reads, scan-manager
+`create_datasource`, `describe_parquet`, and SQL over S3. Loopback routing
+tests run in the default unit suite.
 
-## How the S3 backend is managed
+## Running the gates
 
-The S3 backend is a **SeaweedFS `weed` process started by the test binary
-itself** — no Docker. The harness lives in `test/cpp/utils/s3_backend.*` and is
-driven from `unittest.cpp`'s `main()`. There is **no** `make s3-up`/`s3-down`,
-no `docker-compose.yml`, and no `env.sh` to source — when opted in, the binary:
+`SIRIUS_BUILD_S3_TESTS` defaults to `ON`, including the local SeaweedFS
+harness. The Pixi environment provides `weed`; no Docker daemon or Go bridge
+build is required. The vcpkg presets disable this optional harness.
 
-1. spawns a single `weed server` that serves the S3 API over **both** plain HTTP
-   (`-s3.port`) and self-signed TLS (`-s3.port.https`) at once — both listeners
-   share one filer backend — on **dynamically-chosen free ports**,
-2. generates a self-signed cert in-process and points `weed` at it, and enforces
-   the test access/secret keys via an `-s3.config` identities file,
-3. generates the local fixtures (`generate_fixtures.py`) and uploads them
-   **once** (over HTTP) using Sirius's own SigV4 signer + libcurl, and
-4. publishes the `SIRIUS_TEST_S3_*` env vars the tests already consume.
+| Command | Selection and environment |
+|---|---|
+| `make test` | Default unit suite; does not start a server unless opted in |
+| `make s3-test` | Non-large, non-AWS S3 integration cases; AUTO and STRICT enabled |
+| `make s3-test-large` | Two processes: cache-enabled SF10 cases plus SF1 TPC-H and glob-scale, then cache-disabled SF10 cases |
+| `make s3-test-aws` | Manual AWS cases; STRICT enabled; supply the endpoint, bucket and temporary credentials |
+| `make s3-tpch` | Deprecated; still enables TPCH and runs both tiny and SF1 suites |
+| `make s3-test-aws-sigv4` | Deprecated; forwards to `s3-test-aws` |
+| `make s3-test-aws-broker` | Deprecated; prints a warning and runs nothing |
 
-The process is torn down at process exit; on Linux it also inherits a
-parent-death signal (`PR_SET_PDEATHSIG`) so a crashed test binary takes it down
-too. The `weed` binary is resolved from `PATH` (the pixi `seaweedfs` package);
-override with `SIRIUS_TEST_WEED`.
-
-### Opt-in
-
-Bring-up is gated by `SIRIUS_TEST_S3_AUTO=1` so the default `make test` suite
-never spawns a server. The behavior:
-
-- `SIRIUS_TEST_S3_ENDPOINT` already set → used as-is, no server started
-  (this is how the real-AWS `[s3][aws]` gates and manual runs work).
-- `SIRIUS_TEST_S3_AUTO` not set → tests skip, exactly as before.
-- `SIRIUS_TEST_S3_AUTO=1` → the server comes up. Failure skips, unless
-  `SIRIUS_TEST_S3_STRICT=1`, which makes a bring-up failure abort the run
-  (non-zero exit) instead of silently going green.
-
-## Requirements
-
-- The `weed` binary on `PATH` — provided by the pixi `seaweedfs` package (or set
-  `SIRIUS_TEST_WEED` to a `weed` of your choice). No Docker.
-- Python 3.9+ (stdlib only) and `openssl` at run time, both from the pixi env.
-- For the large gate: the in-tree `build/release/duckdb` CLI (or
-  `SIRIUS_TEST_DUCKDB`) and an SF1 `lineitem` parquet at
-  `test_datasets/tpch_parquet_sf1/lineitem.parquet` (or `SIRIUS_TEST_S3_LARGE_SOURCE`),
-  which the harness replicates 10x to reach ~SF10 scale. Generate the SF1 source
-  with `scripts/tpch_to_parquet.sql`. The DuckDB build has no `tpch` extension, so
-  `CALL dbgen` is not used.
-
-## Typical flow
+The S3 make targets pass `--order decl` to run cases in declaration order.
+The manual equivalent of `make s3-test` is:
 
 ```bash
-# Default Catch2 suite — does not start the S3 backend.
-make test
-
-# Standard S3 correctness gate (auto-managed SeaweedFS, strict mode), runs every
-# non-large, non-aws [s3][integration] test including the SQL-over-S3 subset.
-make s3-test
-
-# Opt-in large-SF10 SQL-over-S3 gate. The harness generates + uploads
-# lineitem_sf10.parquet once (cached across the per-case invocations) and runs
-# the [s3][sql][large] tests. Much slower than s3-test.
-make s3-test-large
-
-# Manually, without the Makefile:
 SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
-  build/release/extension/sirius/test/cpp/sirius_unittest "[s3]~[large]~[aws]"
+  build/release/extension/sirius/test/cpp/sirius_unittest --order decl "[s3][integration]~[large]~[aws]"
 ```
 
-## SeaweedFS version
+## Tags and gates
 
-The `weed` version is pinned by the pixi `seaweedfs` dependency (`pixi.toml`).
-To bump it, edit that pin and confirm `make s3-test` still passes.
+Every S3 case carries `[s3]`. Gate membership comes from the full
+Makefile selector, not from any one tag:
+
+| Gate | Selector |
+|---|---|
+| `make s3-test` | `[s3][integration]~[large]~[aws]` |
+| `make s3-test-large`, first process | `[s3][sql][large][large-cache],[s3][integration][sql][tpch][large],[s3][large][glob-scale]` |
+| `make s3-test-large`, second process | `[s3][sql][large][large-nocache]` |
+| `make s3-test-aws` | `[s3][aws]` |
+| `make s3-tpch` (deprecated) | `[s3][integration][sql][tpch]` |
+
+Adjacent tags mean AND; commas separate OR alternatives. Keep the
+gate tags when retagging a case. `[integration]` also tells the listener
+in `test/cpp/unittest.cpp` to resume the shared integration DuckDB
+environment.
+
+The S3 tag vocabulary is:
+
+| Role | Tags |
+|---|---|
+| Gate selection | `[s3]`, `[integration]`, `[sql]`, `[large]`, `[large-cache]`, `[large-nocache]`, `[tpch]`, `[glob-scale]`, `[aws]` |
+| Execution path | `[transparent]` marks the `SET gpu_execution` path |
+| Topics | `[rest]`, `[sigv4]`, `[list]`, `[filesystem]`, `[glob]`, `[routing]`, `[describe_parquet]`, `[config]`, `[footerbind]`, `[pushdown]`, `[nested]`, `[fallback]`, `[kvikio]` |
+| File topics | `[uri_parser]`, `[object_store_config]` |
+| Slow cases | `[stress]` |
+
+Use at most two topic tags per case. No make target selects on the
+topic, file-topic or stress tags. Unit cases without `[integration]`,
+`[large]` or `[aws]` run in `make test` unless hidden.
+
+The large gate selects three SF10 cases with `[large-cache]` and three
+with `[large-nocache]`. The tiny `[tpch]` suite runs in `s3-test`;
+`[tpch][large]` selects SF1 in the first large process, alongside the
+1001-object `[glob-scale]` case. `[aws]` cases belong to the manual
+real-AWS gate.
+
+Without an external endpoint, SeaweedFS-backed cases skip when
+`SIRIUS_TEST_S3_AUTO` is unset. The gates set
+`SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
+SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
+GLOB_SCALE switches; the targets export them for the appropriate
+process. The three harness-PUT cases skip against an external endpoint,
+even in strict mode.
+
+Catch2's `[.]` hides a case from an unfiltered run only. A hidden case
+still runs when it matches an explicit positive name or tag selector,
+subject to that selector's exclusions. These 15 hidden cases run in
+`make s3-test`:
+
+- `DuckDB external file cache invalidates an overwritten S3 range by ETag`
+- `gpu_execution rejects operations on nested S3 parquet columns cleanly`
+- `gpu_execution S3 nested parquet projections match local DuckDB CPU`
+- `rest_ioctx generated LIST scale obeys the default safety caps`
+- `S3 pushdown non-pruned aggregate still matches the local parquet oracle`
+- `S3 pushdown selective filters still match the local parquet oracle`
+- `S3 pushdown shape-C zero-side joins match the local parquet oracle`
+- `S3 pushdown zero-input grouped aggregate still emits no groups`
+- `S3 pushdown zero-input ungrouped aggregates emit SQL identity and null values`
+- `S3 pushdown zero-input ungrouped count emits the aggregate identity row`
+- `sirius_httpfs exposes S3 ETags as DuckDB version tags`
+- `sirius_httpfs glob helper throws instead of silently truncating matched files`
+- `sirius_httpfs opens through FileOpener and reads positional ranges`
+- `sirius_httpfs positional reads fail on short reads and negative sizes`
+- `transparent S3 TPC-H Q1-Q22 match the tiny local CPU oracle`
+
+Before changing tags, compare the case-name lists for every gate
+selector above. Run one command per selector, keeping the entire
+selector in one quoted argument:
+
+```bash
+bin=build/release/extension/sirius/test/cpp/sirius_unittest
+spec='[s3][integration]~[large]~[aws]'
+
+# Catch2 v2
+"$bin" --list-test-names-only "$spec"
+
+# Catch2 v3
+"$bin" --list-tests --verbosity quiet "$spec"
+```
+
+The gate lists contain 105, 5, 3 and 3 cases respectively; the deprecated
+TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
+plus `[.]`.
+
+## SeaweedFS lifecycle
+
+The binary starts one SeaweedFS process with HTTP and HTTPS listeners sharing
+one backend, using dynamically selected loopback ports. It generates a
+self-signed certificate with `openssl`, uploads fixtures with SigV4 and libcurl,
+and publishes the environment used by the tests.
+
+An existing `SIRIUS_TEST_S3_ENDPOINT` is used as-is. Otherwise,
+`SIRIUS_TEST_S3_AUTO=1` opts into server startup. SQL, httpfs and TPC-H
+tests pass missing required `SIRIUS_TEST_S3_*` settings to
+`skip_or_fail_unless`: a skip, or a failure with `SIRIUS_TEST_S3_STRICT=1`.
+REST, describe_parquet and kvikio tests use that helper only for
+`ensure_s3_test_env`. Once an endpoint is set, missing BUCKET,
+ACCESS_KEY or SECRET_KEY fails those tests regardless of STRICT.
+
+The LARGE, TPCH and GLOB_SCALE switches use the same skip-or-fail rule.
+Live HEAD/GET and query errors fail regardless of STRICT, except that
+SF10 tests report a failed describe of the SF10 object as a skip unless
+STRICT is set. The three tests that PUT objects into managed SeaweedFS skip when
+the endpoint is externally managed; device tests also report unavailable CUDA.
+The PUT cases cover ETag invalidation, kvikio stream ordering, and
+`transparent S3 glob rejects parquet files whose schemas differ instead of decoding them together`.
+
+`unittest.cpp` terminates and reaps the server before exiting. On Linux the
+server also receives SIGKILL if the test process dies. Each process has its own
+working directory under `<tmp>/sirius-s3-seaweedfs-<uid>`, removed at shutdown.
+
+Requirements: `weed` (provided and locked by Pixi), Python 3.9+, and `openssl`.
+Set `SIRIUS_TEST_WEED` to use another executable. SF1 and SF10 generation need the built
+DuckDB CLI or `SIRIUS_TEST_DUCKDB`, which loads the TPC-H extension to generate
+the data. The SF1 and SF10 fixtures are cached across processes; file locks serialize
+concurrent generation. Set `TMPDIR` to a disk with several GB free for large
+fixtures and the server data. SeaweedFS also requires the disk to remain above
+its default 1% free-space reserve.
+
+After changing the SeaweedFS version, run `make s3-test`.
 
 ## Fixtures
 
-`generate_fixtures.py` writes deterministic blobs (seeded PRNG) plus copies of
-the standard TPCH Parquet fixtures, so a second run produces identical files and
-the sha256 manifest stays stable. The harness writes them under a temp dir and
-points `SIRIUS_TEST_S3_LOCAL_DIR` at it.
+`generate_fixtures.py` creates deterministic blobs and copies the
+committed parquet fixtures. The harness adds the edge-type and special-key
+files. `SIRIUS_TEST_S3_LOCAL_DIR` points to the uploaded local copy used by
+CPU oracles. `MANIFEST.sha256` is written next to that directory and is
+not uploaded.
 
-| file | size | purpose |
+| Object group | Contents | Upload |
 |---|---|---|
-| `hello.txt` | 16 B | HEAD + tiny-range read |
-| `small.bin` | 20 KiB | bit-equal full-object read via `datasource_factory` |
-| `medium.bin` | 8 MiB | multi-range reads at odd offsets |
-| `parquet/*.parquet` | varies | standard TPCH Parquet fixtures reused by the S3 datasource, scan-manager, split-provider, and SQL-over-S3 tests. |
-| `tpch/lineitem_sf10.parquet` | ~1.5 GiB | opt-in large fixture, generated only when `SIRIUS_TEST_S3_LARGE=1` (`make s3-test-large`). |
+| `hello.txt` | 16 bytes; HEAD and tiny reads | HTTP + HTTPS |
+| `small.bin` | 20 KiB; exact-byte reads | HTTP + HTTPS |
+| `medium.bin` | 8 MiB; ranges at odd offsets | HTTP + HTTPS |
+| `parquet/*` | Committed parquet files plus runtime-generated `edge_types.parquet` | HTTP + HTTPS |
+| `glob/multi/*` | Two nation copies and `region.parquet` | HTTP + HTTPS |
+| `glob/hive/*` | Hive partition directories | HTTP + HTTPS |
+| `root_a.parquet`, `root_b.parquet` | Bucket-root glob inputs | HTTP + HTTPS |
+| `glob-enc/*` | 12 keys covering percent bytes, spaces, slashes, query/fragment delimiters and partition directories | HTTP + HTTPS |
+| `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE | HTTP + HTTPS |
+| `tpch/sf1/*` | Eight SF1 tables; requires TPCH | HTTP + HTTPS |
+| `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE | HTTP only |
+| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair | HTTP only |
 
-A single `weed` filer backend serves both the HTTP and HTTPS endpoints, so the
-fixtures are uploaded once and visible on both. The HTTPS path uses the generated
-CA bundle (`SIRIUS_TEST_S3_CA_BUNDLE`) so `s3_ioctx` exercises TLS verification
-rather than disabling certificate checks.
+The SF10 cache was 2,223,320,375 bytes (about 2.07 GiB), measured on
+2026-05-21, before the DuckDB v1.5.6 pin.
+`maybe_upload_large_fixture` generates it with DuckDB's
+`CALL dbgen(sf=10)` and `COPY ... (FORMAT PARQUET)`; size depends on the
+generator version and encoding. It is reused when non-empty, not regenerated
+on every run.
 
-The S3 Parquet tests use `parquet/nation.parquet`, whose TPCH contents are fixed
-and small enough for direct row-level assertions: 25 nations, keys 0-24, and
-five nations per region.
+`nation.parquet` has 25 rows, keys 0-24, and five nations per region.
+The HTTPS tests use the generated CA bundle so `rest_ioctx` checks the
+certificate. SeaweedFS uses region `us-east-1`.
 
-## Notes
+## Environment
 
-- The backend uses region `us-east-1`; `SIRIUS_TEST_S3_REGION` matches.
-- When `SIRIUS_TEST_S3_*` is not set the tests `SUCCEED`/`WARN` with a skip
-  message rather than failing — intentional so the default `sirius_unittest` run
-  stays green where the S3 backend was not brought up.
-- When `SIRIUS_TEST_S3_STRICT=1`, once the env is present, live failures (e.g.
-  `HEAD` or `datasource_factory::create` errors) fail the test instead of
-  skipping. `make s3-test` enables this.
-- SQL-over-S3 tests cover `sirius_read_parquet('s3://...')` directly and the
-  `gpu_execution('... read_parquet("s3://...") ...')` rewrite path. The large
-  variants are tagged `[s3][sql][large]` and hidden from the default run.
+User inputs:
+
+| Variable | Purpose |
+|---|---|
+| `SIRIUS_TEST_S3_AUTO` | Start managed SeaweedFS when no endpoint is supplied |
+| `SIRIUS_TEST_S3_STRICT` | Fail on missing prerequisites or failed startup |
+| `SIRIUS_TEST_S3_ENDPOINT` | Use an existing endpoint instead of starting a server |
+| `SIRIUS_TEST_S3_SESSION_TOKEN` | Session token for temporary credentials |
+| `SIRIUS_TEST_S3_LARGE` | Generate/upload SF10 lineitem |
+| `SIRIUS_TEST_S3_TPCH` | Generate/upload all eight SF1 tables |
+| `SIRIUS_BENCH_S3_TPCH` | Deprecated; generates/uploads SF1 only, without enabling the SF1 test case |
+| `SIRIUS_TEST_S3_GLOB_SCALE` | Upload the 1001-object glob fixture |
+| `SIRIUS_TEST_S3_PARQUET_SOURCE` | Override the source parquet directory |
+| `SIRIUS_TEST_DUCKDB` | Override the CLI used for SF10/SF1 generation |
+| `SIRIUS_BENCH_S3_KEY` | Override the SF10 object key used for upload and reads |
+
+Published by managed startup; supply the applicable values yourself for an
+external endpoint:
+
+| Variable | Value |
+|---|---|
+| `SIRIUS_TEST_S3_ENDPOINT` | HTTP endpoint |
+| `SIRIUS_TEST_S3_HTTPS_ENDPOINT` | HTTPS endpoint |
+| `SIRIUS_TEST_S3_REGION` | Signing region |
+| `SIRIUS_TEST_S3_ACCESS_KEY`, `SIRIUS_TEST_S3_SECRET_KEY` | Credentials |
+| `SIRIUS_TEST_S3_BUCKET` | Fixture bucket |
+| `SIRIUS_TEST_S3_LOCAL_DIR` | Local oracle root |
+| `SIRIUS_TEST_S3_CA_BUNDLE` | Generated certificate |
+| `SIRIUS_TEST_S3_TPCH_LOCAL_DIR` | SF1 oracle directory, when TPCH is enabled |
+| `SIRIUS_PR6_LARGE_LOCAL_PARQUET` | SF10 oracle file, when LARGE is enabled |
+| `SIRIUS_TEST_S3_KEY` | Default object key; no current test reads it |
+
+Deprecated manual overrides retain their precedence and warn only when used:
+
+| Variable | Replacement |
+|---|---|
+| `SIRIUS_PR6_LARGE_S3_KEY` | `SIRIUS_BENCH_S3_KEY`, also used by the uploader |
+| `SIRIUS_BENCH_WORK_DIR` | `SIRIUS_PR6_LARGE_LOCAL_PARQUET` pointing to the file |
+
+`SIRIUS_BENCH_WORK_DIR` has lower priority than
+`SIRIUS_PR6_LARGE_LOCAL_PARQUET`. Managed LARGE startup always sets the
+latter, so it silently ignores `SIRIUS_BENCH_WORK_DIR`.

@@ -16,590 +16,1179 @@
 
 #include "io/uring/uring_reactor.hpp"
 
-#include "driver_types.h"
+#include "cucascade/cuda/event.hpp"
+#include "exec/thread_util.hpp"
+#include "io/cache/types.hpp"
+#include "io/details/slot_pool.hpp"
+#include "io/io_request.hpp"
 #include "io/types.hpp"
+#include "io/uring/types.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <fcntl.h>
 #include <log/logging.hpp>
-#include <numa.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 #include <algorithm>
+#include <array>
+#include <cassert>
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <deque>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <optional>
-#include <ranges>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
 
-namespace sirius::io {
+namespace sirius::io::uring {
 
-// ---------------------------------------------------------------------------
-// uring_reactor
-// ---------------------------------------------------------------------------
+namespace {
 
-std::unique_ptr<uring_io_object> uring_reactor::create_io_object(std::string path)
+// Staging geometry: the reactor stages through whole host-resource blocks, so the slot
+// count is derived from a fixed 64 MiB pinned budget per reactor (the footprint before
+// the slot size was tied to the resource's block size) and clamped to [1, MAX_NUM_SLOTS].
+constexpr std::size_t STAGING_BUDGET_BYTES = 64UL << 20;
+constexpr std::size_t MAX_NUM_SLOTS        = 64;
+constexpr std::size_t MAX_PLAIN_READ_SIZE  = 1UL << 30;
+constexpr std::chrono::milliseconds POLL_INTERVAL{20};
+constexpr auto POLL_INTERVAL_US =
+  std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
+
+[[nodiscard]] constexpr std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
 {
-  if (!supports(path))
-    throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
-
-  file_descriptor fd{::open(path.c_str(), O_RDONLY)};
-  if (!fd)
-    throw std::runtime_error("uring_reactor::create_io_object: open failed: " + path + ": " +
-                             strerror(errno));
-
-  file_descriptor fd_direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
-  if (!fd_direct)
-    throw std::runtime_error("uring_reactor::create_io_object: O_DIRECT open failed: " + path +
-                             ": " + strerror(errno));
-
-  auto file_size = size(fd.get());
-  return std::make_unique<uring_io_object>(
-    std::move(path), std::move(fd), std::move(fd_direct), file_size);
+  return rhs > std::numeric_limits<std::size_t>::max() - lhs
+           ? std::numeric_limits<std::size_t>::max()
+           : lhs + rhs;
 }
 
-size_t uring_reactor::size(int fd)
+[[nodiscard]] constexpr std::size_t align_down(std::size_t value, std::size_t alignment) noexcept
 {
-  struct stat st{};
-  if (::fstat(fd, &st) != 0)
-    throw std::runtime_error("uring_reactor::size: fstat failed: " + std::string(strerror(errno)));
-  return static_cast<size_t>(st.st_size);
+  return alignment == 0 ? value : value - value % alignment;
 }
 
-uring_reactor::uring_reactor(unsigned ring_entries, size_t bounce_slot_size, int numa_node)
-  : _ring_entries(ring_entries), _bounce_slot_size(bounce_slot_size), _numa_node(numa_node)
+[[nodiscard]] constexpr std::size_t align_up(std::size_t value, std::size_t alignment) noexcept
 {
-  for (int i = 0; i < static_cast<int>(NUM_CHUNKS); ++i) {
-    void* raw = nullptr;
-    if (_numa_node >= 0) {
-      raw = numa_alloc_onnode(bounce_slot_size, _numa_node);
-      if (raw == nullptr) {
-        throw std::runtime_error("uring_reactor: numa_alloc_onnode failed for node=" +
-                                 std::to_string(_numa_node));
-      }
-      cudaError_t reg_err =
-        cudaHostRegister(raw,
-                         bounce_slot_size,
-                         static_cast<unsigned>(cudaHostRegisterPortable | cudaHostRegisterMapped));
-      if (reg_err != cudaSuccess) {
-        numa_free(raw, bounce_slot_size);
-        throw std::runtime_error(std::string("uring_reactor: cudaHostRegister failed: ") +
-                                 cudaGetErrorString(reg_err));
-      }
-    } else {
-      CUDA_CHECK(cudaHostAlloc(&raw, bounce_slot_size, cudaHostAllocPortable));
+  if (alignment == 0) return value;
+  auto const remainder = value % alignment;
+  if (remainder == 0) return value;
+  return saturating_add(value, alignment - remainder);
+}
+
+[[nodiscard]] constexpr bool is_fixed_buffer_error(int errc) noexcept
+{
+  return errc == EOPNOTSUPP || errc == EINVAL || errc == EFAULT || errc == ENOBUFS ||
+         errc == ENOMEM;
+}
+
+[[nodiscard]] std::error_code canceled_error() noexcept
+{
+  return std::make_error_code(std::errc::operation_canceled);
+}
+
+struct ring_deleter {
+  void operator()(io_uring* ring) const noexcept
+  {
+    if (ring != nullptr) {
+      io_uring_queue_exit(ring);
+      delete ring;
     }
-    _bounce[i].buf = raw;
-    _cb_args[i]    = {this, i};
+  }
+};
+
+using unique_ring_ptr = std::unique_ptr<io_uring, ring_deleter>;
+
+[[nodiscard]] unique_ring_ptr make_ring(unsigned depth)
+{
+#if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
+  auto preferred = std::make_unique<io_uring>();
+  io_uring_params params{};
+  params.flags =
+    IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
+  if (auto const rc = io_uring_queue_init_params(depth, preferred.get(), &params); rc == 0) {
+    return unique_ring_ptr{preferred.release()};
+  }
+#endif
+
+  auto fallback = std::make_unique<io_uring>();
+  auto const rc = io_uring_queue_init(depth, fallback.get(), 0);
+  if (rc < 0) {
+    throw std::system_error(std::error_code{-rc, std::generic_category()},
+                            "uring_reactor: io_uring_queue_init");
+  }
+  return unique_ring_ptr{fallback.release()};
+}
+
+class unique_ring {
+ public:
+  explicit unique_ring(unsigned depth) : _ring(make_ring(depth)) {}
+
+  [[nodiscard]] io_uring_sqe* get_sqe() const noexcept { return io_uring_get_sqe(_ring.get()); }
+
+  [[nodiscard]] unsigned peek(std::span<io_uring_cqe*> cqes) const noexcept
+  {
+    return io_uring_peek_batch_cqe(_ring.get(), cqes.data(), cqes.size());
   }
 
-  _worker = std::thread([this] { worker_loop(); });
+  void seen(io_uring_cqe* cqe) const noexcept { io_uring_cqe_seen(_ring.get(), cqe); }
+
+  void submit(std::size_t expected, std::size_t& inflight)
+  {
+    std::size_t submitted = 0;
+    while (submitted < expected) {
+      auto const rc = io_uring_submit(_ring.get());
+      if (rc <= 0) {
+        auto const error = rc < 0 ? -rc : EIO;
+        throw std::system_error(std::error_code{error, std::generic_category()},
+                                "uring_reactor: io_uring_submit");
+      }
+      submitted += static_cast<std::size_t>(rc);
+      inflight += static_cast<std::size_t>(rc);
+    }
+  }
+
+  [[nodiscard]] int cancel_all_sync() const noexcept
+  {
+    io_uring_sync_cancel_reg cancel{};
+    cancel.fd              = -1;
+    cancel.flags           = IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL;
+    cancel.timeout.tv_sec  = -1;
+    cancel.timeout.tv_nsec = -1;
+    return io_uring_register_sync_cancel(_ring.get(), &cancel);
+  }
+
+  [[nodiscard]] int wait_for(std::chrono::milliseconds timeout) const noexcept
+  {
+    io_uring_cqe* cqe = nullptr;
+    __kernel_timespec ts{};
+    ts.tv_sec     = timeout.count() / 1000;
+    ts.tv_nsec    = (timeout.count() % 1000) * 1'000'000L;
+    auto const rc = io_uring_wait_cqe_timeout(_ring.get(), &cqe, &ts);
+    return rc < 0 && rc != -EINTR && rc != -ETIME ? -rc : 0;
+  }
+
+  [[nodiscard]] int run_deferred_taskwork() const noexcept
+  {
+    // Unlike io_uring_submit_and_wait(), io_uring_get_events() enters the
+    // kernel with to_submit=0.  This is important on the terminal path: a
+    // failed partial submission can leave prepared SQEs in the userspace SQ,
+    // and those entries must not be published after their slots have been
+    // classified as unsubmitted.  GETEVENTS still runs deferred task work and
+    // flushes CQ overflow without consuming any such SQEs.
+    auto const rc = io_uring_get_events(_ring.get());
+    return rc < 0 && rc != -EINTR ? -rc : 0;
+  }
+
+  [[nodiscard]] bool register_buffers(std::span<iovec> buffers) const noexcept
+  {
+    auto const rc = io_uring_register_buffers(_ring.get(), buffers.data(), buffers.size());
+    if (rc < 0) {
+      SIRIUS_LOG_WARN("uring_reactor: fixed buffers disabled: {}", strerror(-rc));
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  unique_ring_ptr _ring;
+};
+
+struct staging_lease {
+  std::vector<slot_pool::token> tokens;
+};
+
+enum class slot_state { idle, reading, copying };
+
+struct io_slot {
+  explicit io_slot(int index, bool fixed_supported) : index(index), fixed_supported(fixed_supported)
+  {
+  }
+
+  int index;
+  bool fixed_supported;
+  bool used_fixed{false};
+  std::size_t bytes_read{0};
+  slot_state state{slot_state::idle};
+  std::unique_ptr<uring_io_op> op;
+  std::vector<iovec> resume_iovecs;
+  std::unique_ptr<cucascade::cuda::cuda_event> copy_event;
+  int event_device{-1};
+
+  void reset() noexcept
+  {
+    op.reset();
+    resume_iovecs.clear();
+    bytes_read = 0;
+    used_fixed = false;
+    state      = slot_state::idle;
+  }
+
+  void prepare_remaining_iovecs()
+  {
+    assert(op != nullptr && state == slot_state::reading);
+    auto& request = op->request;
+    detail::fill_remaining_iovecs(request.iovecs, bytes_read, resume_iovecs);
+    if (resume_iovecs.empty()) {
+      throw std::logic_error("uring_reactor: no buffers remain for an unfinished operation");
+    }
+  }
+
+  void prepare_sqe(io_uring_sqe* sqe) noexcept
+  {
+    assert(sqe != nullptr && op != nullptr && state == slot_state::reading &&
+           !resume_iovecs.empty());
+    auto& request = op->request;
+
+    auto const offset        = request.io_rng.offset + bytes_read;
+    bool const can_use_fixed = op->needs_staging() && op->staging_blocks == 1 &&
+                               resume_iovecs.size() == 1 && bytes_read == 0 && fixed_supported;
+    if (can_use_fixed) {
+      auto const& iov = resume_iovecs.front();
+      io_uring_prep_read_fixed(sqe,
+                               op->fd,
+                               iov.iov_base,
+                               static_cast<unsigned>(iov.iov_len),
+                               static_cast<__u64>(offset),
+                               index);
+      used_fixed = true;
+    } else if (resume_iovecs.size() == 1) {
+      auto const& iov = resume_iovecs.front();
+      io_uring_prep_read(
+        sqe, op->fd, iov.iov_base, static_cast<unsigned>(iov.iov_len), static_cast<__u64>(offset));
+      used_fixed = false;
+    } else {
+      io_uring_prep_readv(sqe,
+                          op->fd,
+                          resume_iovecs.data(),
+                          static_cast<unsigned>(resume_iovecs.size()),
+                          static_cast<__u64>(offset));
+      used_fixed = false;
+    }
+    io_uring_sqe_set_data64(sqe, static_cast<std::uint64_t>(index));
+  }
+};
+
+[[nodiscard]] range staged_physical_range(range logical,
+                                          std::size_t file_size,
+                                          bool use_odirect) noexcept
+{
+  if (!use_odirect) return logical;
+
+  auto const start = align_down(logical.offset, IO_BLOCK_SIZE);
+  auto const end =
+    std::min(align_up(logical.end(), IO_BLOCK_SIZE), align_up(file_size, IO_BLOCK_SIZE));
+  return end > start ? range{start, end - start} : range{start, 0};
 }
 
-uring_reactor::~uring_reactor()
+void attach_common(uring_io_op& op,
+                   std::shared_ptr<const io_object> const& object,
+                   prepared_io_slice const& slice,
+                   std::shared_ptr<grouped_coordinator> const& coordinator)
 {
-  shutdown();
-  // Free bounce slots in the inverse of the allocation policy chosen by
-  // the ctor. shutdown() above joins the worker thread, so no callback
-  // can race the unregister/free.
-  for (auto& slot : _bounce) {
-    if (slot.buf == nullptr) continue;
-    if (_numa_node >= 0) {
-      // Errors here are unrecoverable in a noexcept dtor — log and continue.
-      cudaError_t unreg = cudaHostUnregister(slot.buf);
-      if (unreg != cudaSuccess) {
-        spdlog::warn("uring_reactor: cudaHostUnregister failed: {}", cudaGetErrorString(unreg));
-      }
-      numa_free(slot.buf, _bounce_slot_size);
-    } else {
-      cudaError_t fr = cudaFreeHost(slot.buf);
-      if (fr != cudaSuccess) {
-        spdlog::warn("uring_reactor: cudaFreeHost failed: {}", cudaGetErrorString(fr));
-      }
-    }
-    slot.buf = nullptr;
+  op.request.obj         = object;
+  op.request.coordinator = coordinator;
+  op.request.on_complete = slice.on_complete;
+  if (slice.has_device_request()) {
+    op.request.device_copy            = std::make_unique<device_cpy_request>();
+    op.request.device_copy->req_rng   = slice.rng;
+    op.request.device_copy->d_buffer  = slice.d_buffer;
+    op.request.device_copy->device_id = slice.d_buffer.device_id;
   }
 }
 
-void uring_reactor::interrupt()
+[[nodiscard]] std::unique_ptr<uring_io_op> make_op(
+  std::shared_ptr<const io_object> const& object,
+  prepared_io_slice const& slice,
+  std::shared_ptr<grouped_coordinator> const& coordinator,
+  local_io_object const& file,
+  range physical,
+  bool use_odirect)
 {
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
+  auto op            = std::make_unique<uring_io_op>();
+  op->fd             = use_odirect ? file.odirect_handle() : file.buffered_handle();
+  op->file_size      = file.size();
+  op->use_odirect    = use_odirect;
+  op->request.io_rng = physical;
+  attach_common(*op, object, slice, coordinator);
+  return op;
 }
+
+[[nodiscard]] std::vector<std::unique_ptr<uring_io_op>> plan_slice(
+  std::shared_ptr<const io_object> const& object,
+  prepared_io_slice const& slice,
+  std::shared_ptr<grouped_coordinator> const& coordinator,
+  config const& cfg,
+  std::size_t block_size,
+  std::size_t backlog_bytes,
+  std::size_t free_slots)
+{
+  auto const file = std::dynamic_pointer_cast<local_io_object const>(object);
+  if (file == nullptr) {
+    throw std::invalid_argument("uring_reactor: grouped request contains a foreign io_object");
+  }
+  if (slice.rng.empty()) {
+    throw std::invalid_argument("uring_reactor: zero-sized prepared slice");
+  }
+
+  std::vector<std::unique_ptr<uring_io_op>> result;
+
+  if (slice.needs_staging()) {
+    if (!slice.has_device_request()) {
+      throw std::invalid_argument("uring_reactor: staging requires a device destination");
+    }
+    if (block_size == 0) {
+      throw std::invalid_argument("uring_reactor: staging block size is zero");
+    }
+
+    bool const direct = detail::odirect_available(cfg.use_odirect, file->odirect_handle()) &&
+                        block_size % IO_BLOCK_SIZE == 0;
+    auto const physical = staged_physical_range(slice.rng, file->size(), direct);
+    if (physical.empty()) {
+      throw std::out_of_range("uring_reactor: staged range is outside the object");
+    }
+
+    auto target = detail::dynamic_io_target(backlog_bytes, free_slots, block_size);
+    if (target == 0) target = std::min(block_size, max_dynamic_io_size);
+    std::size_t consumed = 0;
+    while (consumed < physical.size) {
+      auto const bytes = std::min(target, physical.size - consumed);
+      auto op          = make_op(
+        object, slice, coordinator, *file, range{physical.offset + consumed, bytes}, direct);
+      op->staging_blocks = bytes / block_size + (bytes % block_size != 0);
+      result.push_back(std::move(op));
+      consumed += bytes;
+    }
+    return result;
+  }
+
+  if (slice.is_contiguous()) {
+    auto* const base = std::get<std::uint8_t*>(slice.h_buffer.buffer);
+    if (base == nullptr) {
+      throw std::invalid_argument("uring_reactor: contiguous buffer is null");
+    }
+
+    std::size_t consumed = 0;
+    while (consumed < slice.rng.size) {
+      auto const bytes    = std::min(MAX_PLAIN_READ_SIZE, slice.rng.size - consumed);
+      auto const physical = range{slice.rng.offset + consumed, bytes};
+      iovec const buffer{base + consumed, bytes};
+      bool const direct =
+        detail::odirect_available(cfg.use_odirect, file->odirect_handle()) &&
+        detail::is_odirect_compatible(physical, std::span<iovec const>{&buffer, 1});
+      auto op = make_op(object, slice, coordinator, *file, physical, direct);
+      op->request.iovecs.push_back(buffer);
+      result.push_back(std::move(op));
+      consumed += bytes;
+    }
+    return result;
+  }
+
+  auto const chunks = slice.h_buffer.fragments();
+  if (chunks.empty()) {
+    throw std::invalid_argument("uring_reactor: fragmented buffer has no chunks");
+  }
+  if (block_size == 0) { throw std::invalid_argument("uring_reactor: cache block size is zero"); }
+
+  auto target =
+    detail::dynamic_io_target(backlog_bytes, std::max<std::size_t>(1, free_slots), block_size);
+  if (target == 0) target = std::min(block_size, max_dynamic_io_size);
+  auto const max_iovecs = static_cast<std::size_t>(IOV_MAX);
+
+  std::unique_ptr<uring_io_op> current;
+  std::size_t current_end = 0;
+
+  auto flush = [&]() {
+    if (current == nullptr) return;
+    bool const direct =
+      detail::odirect_available(cfg.use_odirect, file->odirect_handle()) &&
+      detail::is_odirect_compatible(current->request.io_rng, current->request.iovecs);
+    current->use_odirect = direct;
+    current->fd          = direct ? file->odirect_handle() : file->buffered_handle();
+    result.push_back(std::move(current));
+  };
+
+  for (auto* chunk : chunks) {
+    if (chunk == nullptr || chunk->data == nullptr) {
+      throw std::invalid_argument("uring_reactor: cache fragment is not allocated");
+    }
+
+    auto const [fill_begin, fill_end] =
+      cache::fill_span(chunk->state.get_fill(), chunk->offset, block_size);
+    if (fill_end <= fill_begin) {
+      throw std::invalid_argument("uring_reactor: cache fragment has an empty fill span");
+    }
+    auto const bytes      = fill_end - fill_begin;
+    bool const contiguous = current != nullptr && current_end == fill_begin;
+    bool const fits_bytes =
+      current != nullptr && bytes <= target - std::min(target, current->request.io_rng.size);
+    bool const fits_iovecs = current != nullptr && current->request.iovecs.size() < max_iovecs;
+
+    if (!contiguous || !fits_bytes || !fits_iovecs) {
+      flush();
+      current     = make_op(object, slice, coordinator, *file, range{fill_begin, 0}, false);
+      current_end = fill_begin;
+    }
+
+    current->request.iovecs.push_back(iovec{chunk->data + (fill_begin - chunk->offset), bytes});
+    current->request.completion_chunks.push_back(chunk);
+    current->request.io_rng.size += bytes;
+    current_end += bytes;
+  }
+  flush();
+  return result;
+}
+
+}  // namespace
+
+uring_reactor::uring_reactor(std::shared_ptr<reactor_context> ctx, std::string_view tname)
+  : _ctx(std::move(ctx)), _tname(tname)
+{
+  if (_ctx == nullptr) {
+    throw std::invalid_argument("uring_reactor: reactor_context must be non-null");
+  }
+  if (_ctx->host_memory_resource() == nullptr) {
+    throw std::invalid_argument("uring_reactor: host memory resource must be non-null");
+  }
+  _config           = _ctx->cfg();
+  _bounce_slot_size = _ctx->host_memory_resource()->get_block_size();
+}
+
+uring_reactor::~uring_reactor() { shutdown(); }
+
+void uring_reactor::start()
+{
+  if (_worker.joinable()) return;
+  if (_bounce_slot_size == 0) {
+    throw std::invalid_argument("uring_reactor: staging block size must be non-zero");
+  }
+
+  auto const slot_count =
+    std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
+  auto const staging_bytes = slot_count * _bounce_slot_size;
+  try {
+    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(staging_bytes);
+  } catch (rmm::out_of_memory const& e) {
+    throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
+                             " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
+                             std::to_string(_bounce_slot_size) + "): " + e.what());
+  }
+  if (_bounce_storage->get_blocks().size() < slot_count) {
+    _bounce_storage.reset();
+    throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
+  }
+
+  std::lock_guard lock(_enqueue_mutex);
+  try {
+    _accepting.store(true, std::memory_order_release);
+    _worker = std::jthread([this](std::stop_token stop_token) { worker_loop(stop_token); },
+                           _stop_source.get_token());
+  } catch (...) {
+    _accepting.store(false, std::memory_order_release);
+    _bounce_storage.reset();
+    throw;
+  }
+  if (!_tname.empty()) {
+    auto const name = _tname + "_worker";
+    std::ignore     = sirius::exec::thread_util::set_thread_name(_worker, name);
+  }
+}
+
+void uring_reactor::interrupt() {}
 
 void uring_reactor::shutdown()
 {
+  {
+    std::lock_guard lock(_enqueue_mutex);
+    _accepting.store(false, std::memory_order_release);
+  }
+
   if (_worker.joinable()) {
-    _stop.store(true, std::memory_order_release);
-    interrupt();
+    _stop_source.request_stop();
     _worker.join();
+    return;
+  }
+
+  std::unique_ptr<grouped_io_request> request;
+  while (_requests.try_dequeue(request)) {
+    if (request == nullptr) continue;
+    _queued_bytes.fetch_sub(request->remaining_bytes(), std::memory_order_relaxed);
+    request->cancel_remaining(canceled_error());
   }
 }
 
-void uring_reactor::cuda_copy_cb(cudaStream_t /*stream*/, cudaError_t status, void* p) noexcept
+void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcept
 {
-  auto* arg = static_cast<cb_arg*>(p);
-  // Write status BEFORE the release-store on cuda_done so a reader that
-  // observes cuda_done == true via acquire also observes this status.
-  arg->self->_bounce[arg->slot].cuda_status = status;
-  arg->self->_bounce[arg->slot].cuda_done.store(true, std::memory_order_release);
-  // Bump the unified wake atomic — the same one queue enqueues and
-  // interrupt() bump.  The reactor's single park point on _wake_seq wakes
-  // on any event, so a stalled CUDA callback no longer blocks the reactor
-  // from observing new host reads or shutdown.
-  arg->self->_wake_seq.fetch_add(1, std::memory_order_release);
-  arg->self->_wake_seq.notify_one();
-}
+  if (request == nullptr) return;
 
-cudf::io::text::byte_range_info uring_reactor::align_to_physical(
-  cudf::io::text::byte_range_info logical, size_t file_size)
-{
-  auto offset    = static_cast<size_t>(logical.offset());
-  auto size      = static_cast<size_t>(logical.size());
-  size_t a_start = offset & ~(IO_BLOCK_SIZE - 1);
-  size_t a_end   = std::min((offset + size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1),
-                          (file_size + IO_BLOCK_SIZE - 1) & ~(IO_BLOCK_SIZE - 1));
-  return {static_cast<int64_t>(a_start), static_cast<int64_t>(a_end - a_start)};
+  auto const bytes = request->remaining_bytes();
+
+  bool enqueued = false;
+  grouped_coordinator::error_type error{canceled_error()};
+  {
+    std::lock_guard lock(_enqueue_mutex);
+    if (_accepting.load(std::memory_order_acquire)) {
+      _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      try {
+        enqueued = _requests.enqueue(std::move(request));
+        if (!enqueued) { error = std::make_error_code(std::errc::no_buffer_space); }
+      } catch (...) {
+        enqueued = false;
+        error    = std::current_exception();
+      }
+      if (!enqueued) { _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed); }
+    }
+  }
+  // Cancellation runs outside the lock: it invokes user callbacks and settles
+  // promises inline, which may re-enter enqueue() on this reactor.
+  if (!enqueued && request != nullptr) { request->cancel_remaining(error); }
 }
 
 bool uring_reactor::supports(std::string_view path)
 {
   std::error_code ec;
-  std::filesystem::path p{path};
-  return std::filesystem::is_regular_file(p, ec) && !ec;
+  return std::filesystem::is_regular_file(std::filesystem::path{path}, ec) && !ec;
 }
 
-void uring_reactor::enqueue_bulk(std::span<device_read_req_type> batch)
+std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string path)
 {
-  if (batch.empty()) return;
-
-  // Capture ctxs before bulk-enqueue: on failure (OOM in moodycamel) items
-  // may already be moved-from, so batch[i].ctx could be null.  The captured
-  // shared_ptrs let us drain ctx->pending via chunk_failed so the
-  // completion handler still fires instead of stranding readers in
-  // wait_while_loading().
-  std::vector<std::shared_ptr<request_context>> ctxs;
-  ctxs.reserve(batch.size());
-  for (auto& r : batch)
-    ctxs.push_back(r.ctx);
-
-  if (!_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
-    auto e = std::make_exception_ptr(
-      std::runtime_error("uring_reactor::enqueue_bulk: queue enqueue failed"));
-    for (auto& ctx : ctxs)
-      ctx->chunk_failed(e);
-    return;
+  if (!supports(path)) {
+    throw std::runtime_error("uring_reactor::create_io_object: unsupported path: " + path);
   }
 
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
+  file_descriptor buffered{::open(path.c_str(), O_RDONLY)};
+  if (!buffered) {
+    throw std::system_error(
+      errno, std::generic_category(), "uring_reactor::create_io_object: buffered open");
+  }
+
+  file_descriptor direct{::open(path.c_str(), O_RDONLY | O_DIRECT)};
+  if (!direct) {
+    SIRIUS_LOG_WARN("uring_reactor: O_DIRECT unavailable for '{}': {}; using buffered I/O",
+                    path,
+                    strerror(errno));
+  }
+
+  auto const file_size = size(buffered.get());
+  return std::make_unique<local_io_object>(
+    std::move(path), std::move(buffered), std::move(direct), file_size);
 }
 
-size_t uring_reactor::host_read(int fd, size_t offset, size_t size, uint8_t* dst)
+std::size_t uring_reactor::size(int native_handle)
 {
-  if (size == 0) return 0;
-  // Loop until either the full requested size is read, EOF (n == 0), or a
-  // real error. pread on a regular file should only return short on EOF, but
-  // we retry defensively against EINTR and any unexpected short-read paths
-  // so callers don't have to.
-  size_t total = 0;
-  while (total < size) {
-    ssize_t n = ::pread(fd, dst + total, size - total, static_cast<off_t>(offset + total));
-    if (n < 0) {
+  struct stat stat_buffer{};
+  if (::fstat(native_handle, &stat_buffer) != 0) {
+    throw std::system_error(errno, std::generic_category(), "uring_reactor::size");
+  }
+  return static_cast<std::size_t>(stat_buffer.st_size);
+}
+
+std::size_t uring_reactor::host_read(local_io_object const& file,
+                                     std::size_t offset,
+                                     std::size_t bytes,
+                                     std::uint8_t* destination)
+{
+  std::size_t completed = 0;
+  while (completed < bytes) {
+    auto const result = ::pread(file.buffered_handle(),
+                                destination + completed,
+                                bytes - completed,
+                                static_cast<off_t>(offset + completed));
+    if (result < 0) {
       if (errno == EINTR) continue;
-      throw std::runtime_error("uring_reactor::host_read pread: " + std::string(strerror(errno)));
+      throw std::system_error(errno, std::generic_category(), "uring_reactor::host_read");
     }
-    if (n == 0) break;  // EOF
-    total += static_cast<size_t>(n);
+    if (result == 0) break;
+    completed += static_cast<std::size_t>(result);
   }
-  return total;
+  return completed;
 }
 
-void uring_reactor::host_read_async(host_read_req_type req)
+cudf::io::text::byte_range_info uring_reactor::align_to_physical(
+  cudf::io::text::byte_range_info logical, std::size_t file_size)
 {
-  // Hold the ctx separately so we can drain pending via chunk_failed if the
-  // enqueue itself fails (otherwise req.ctx may be moved-from and lost).
-  auto ctx = req.ctx;
-  if (!_host_queue.enqueue(std::move(req))) {
-    ctx->chunk_failed(std::make_exception_ptr(
-      std::runtime_error("uring_reactor::host_read_async: queue enqueue failed")));
-    return;
-  }
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
+  if (logical.offset() < 0 || logical.size() <= 0) return {0, 0};
+
+  auto const offset = static_cast<std::size_t>(logical.offset());
+  auto const bytes  = static_cast<std::size_t>(logical.size());
+  auto const begin  = align_down(offset, IO_BLOCK_SIZE);
+  auto const end    = std::min(align_up(saturating_add(offset, bytes), IO_BLOCK_SIZE),
+                            align_up(file_size, IO_BLOCK_SIZE));
+  return end > begin ? cudf::io::text::byte_range_info{static_cast<std::int64_t>(begin),
+                                                       static_cast<std::int64_t>(end - begin)}
+                     : cudf::io::text::byte_range_info{static_cast<std::int64_t>(begin), 0};
 }
 
-void uring_reactor::host_enqueue_bulk(std::span<host_read_req_type> batch)
+std::vector<cudf::io::text::byte_range_info> uring_reactor::align_and_coalesce(
+  std::span<cudf::io::text::byte_range_info const> ranges,
+  std::optional<std::size_t> alignment) noexcept
 {
-  if (batch.empty()) return;
+  try {
+    auto const requested = alignment.value_or(IO_BLOCK_SIZE);
+    auto const effective = std::max<std::size_t>(requested, IO_BLOCK_SIZE);
 
-  // See enqueue_bulk() above for the rationale: snapshot ctxs first so a
-  // partial-move failure on the moodycamel queue still drains ctx->pending
-  // and fires the completion handler instead of deadlocking readers.
-  std::vector<std::shared_ptr<request_context>> ctxs;
-  ctxs.reserve(batch.size());
-  for (auto& r : batch)
-    ctxs.push_back(r.ctx);
-
-  if (!_host_queue.enqueue_bulk(std::make_move_iterator(batch.begin()), batch.size())) {
-    auto e = std::make_exception_ptr(
-      std::runtime_error("uring_reactor::host_enqueue_bulk: queue enqueue failed"));
-    for (auto& ctx : ctxs)
-      ctx->chunk_failed(e);
-    return;
-  }
-
-  _wake_seq.fetch_add(1, std::memory_order_release);
-  _wake_seq.notify_one();
-}
-
-void uring_reactor::worker_loop()
-{
-  unique_ring ring = [this]() -> unique_ring {
-#if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
-    auto r                   = std::make_unique<io_uring>();
-    struct io_uring_params p = {0};
-    // Disable kernel locks (assuming 1 thread per ring)
-    p.flags |= IORING_SETUP_SINGLE_ISSUER;
-
-    // Keep completions on the current CPU, avoid cache thrashing
-    p.flags |= IORING_SETUP_COOP_TASKRUN | IORING_SETUP_DEFER_TASKRUN;
-    int rc = io_uring_queue_init_params(_ring_entries, r.get(), &p);
-    if (rc == 0) {
-      spdlog::debug("uring_device_reactor: ring using SINGLE_ISSUER|DEFER_TASKRUN");
-      return unique_ring{r.release()};
+    std::vector<cudf::io::text::byte_range_info> aligned;
+    aligned.reserve(ranges.size());
+    for (auto const& input : ranges) {
+      if (input.offset() < 0 || input.size() <= 0) continue;
+      auto const offset = static_cast<std::size_t>(input.offset());
+      auto const end =
+        align_up(saturating_add(offset, static_cast<std::size_t>(input.size())), effective);
+      auto const begin = align_down(offset, effective);
+      aligned.emplace_back(static_cast<std::int64_t>(begin),
+                           static_cast<std::int64_t>(end - begin));
     }
-    spdlog::debug(
-      "uring_device_reactor: SINGLE_ISSUER|DEFER_TASKRUN unsupported "
-      "({}), falling back to plain flags",
-      strerror(-rc));
-#endif
-    auto r2 = std::make_unique<io_uring>();
-    int rc2 = io_uring_queue_init(_ring_entries, r2.get(), 0);
-    if (rc2 < 0)
-      throw std::runtime_error("uring_reactor: ring init: " + std::string(strerror(-rc2)));
-    spdlog::debug("uring_reactor: ring using plain flags");
-    return unique_ring{r2.release()};
-  }();
 
-  std::array<iovec, NUM_CHUNKS> iovecs{};
-  for (size_t i = 0; i < NUM_CHUNKS; ++i)
-    iovecs[i] = {_bounce[i].buf, _bounce_slot_size};
-  if (int rc = io_uring_register_buffers(ring.get(), iovecs.data(), NUM_CHUNKS); rc < 0)
-    throw std::runtime_error("uring_device_reactor: io_uring_register_buffers: " +
-                             std::string(strerror(-rc)));
+    std::sort(aligned.begin(), aligned.end(), [](auto const& lhs, auto const& rhs) {
+      return lhs.offset() < rhs.offset();
+    });
 
-  static constexpr uint64_t HOST_TAG = 1ULL << 63;
-
-  enum class slot_state : uint8_t { FREE, READING, COPYING };
-  struct slot_info {
-    slot_state state{slot_state::FREE};
-    device_read_req_type req{};
-    // Cumulative bytes read for the current request across short-read retries.
-    // Reset to 0 on slot acquisition; on each completion we add `cqe->res` and
-    // either re-submit the remainder or proceed to the H2D path.
-    size_t bytes_read{0};
-  };
-  // Heap-allocated wrapper for in-flight host reads. Mirrors the device
-  // slot's bytes_read tracking so we can retry short reads at the same
-  // user_data identity across multiple SQE submissions.
-  struct host_in_flight {
-    host_read_req_type req;
-    size_t bytes_read{0};
-  };
-  std::array<slot_info, NUM_CHUNKS> slots{};
-  std::deque<device_read_req_type> pending;
-  std::deque<host_read_req_type> pending_host;
-  int inflight = 0;
-
-  auto find_free = [&]() -> int {
-    auto it = std::ranges::find_if(slots, [](auto& s) { return s.state == slot_state::FREE; });
-    return it != slots.end() ? static_cast<int>(it - slots.begin()) : -1;
-  };
-  auto has_active = [&]() {
-    return inflight > 0 || !pending.empty() || !pending_host.empty() ||
-           std::ranges::any_of(slots, [](auto& s) { return s.state == slot_state::COPYING; });
-  };
-  auto poll_cuda = [&]() {
-    for (auto i : std::views::iota(size_t{0}, NUM_CHUNKS)) {
-      if (slots[i].state == slot_state::COPYING &&
-          _bounce[i].cuda_done.load(std::memory_order_acquire)) {
-        // cuda_copy_cb stored the stream's status at callback time, before
-        // the release-store on cuda_done.  Read it directly — this is the
-        // state of the stream when our copy finished, not the current state
-        // (which may also include later work the consumer queued).
-        cudaError_t err = _bounce[i].cuda_status;
-        if (err != cudaSuccess) {
-          slots[i].req.ctx->chunk_failed(std::make_exception_ptr(std::runtime_error(
-            std::string("uring_reactor: H2D copy failed: ") + cudaGetErrorString(err))));
-        } else {
-          slots[i].req.ctx->chunk_done();
-        }
-        slots[i] = slot_info{};
+    std::vector<cudf::io::text::byte_range_info> merged;
+    merged.reserve(aligned.size());
+    for (auto const& input : aligned) {
+      if (merged.empty()) {
+        merged.push_back(input);
+        continue;
       }
-    }
-  };
-  auto drain_queue = [&]() {
-    device_read_req_type r;
-    while (_queue.try_dequeue(r))
-      pending.push_back(std::move(r));
-    host_read_req_type hr;
-    while (_host_queue.try_dequeue(hr))
-      pending_host.push_back(std::move(hr));
-  };
-  auto submit_pending = [&]() {
-    int added = 0;
-    // Device reads consume a bounce slot.
-    while (!pending.empty()) {
-      int si = find_free();
-      if (si < 0) break;
-      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) break;
-      auto& req = pending.front();
-      io_uring_prep_read_fixed(sqe,
-                               req.handle,
-                               _bounce[si].buf,
-                               (unsigned)req.io_size,
-                               (unsigned long long)req.file_off,
-                               si);
-      io_uring_sqe_set_data64(sqe, (uint64_t)si);
-      slots[si].state      = slot_state::READING;
-      slots[si].bytes_read = 0;  // fresh request → reset retry accumulator
-      slots[si].req        = std::move(req);
-      pending.pop_front();
-      ++inflight;
-      ++added;
-    }
-    // Host reads: heap-allocate a host_in_flight wrapper so we can carry
-    // cumulative bytes across short-read retries via the same user_data tag.
-    while (!pending_host.empty()) {
-      io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-      if (!sqe) break;
-      auto* hf = new host_in_flight{std::move(pending_host.front()), 0};
-      pending_host.pop_front();
-      io_uring_prep_read(
-        sqe, hf->req.handle, hf->req.dst, (unsigned)hf->req.size, (__u64)hf->req.offset);
-      io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
-      ++inflight;
-      ++added;
-    }
-    if (added > 0) io_uring_submit(ring.get());
-  };
-  auto reap_cqes = [&]() {
-    io_uring_cqe* cqes[NUM_CHUNKS];
-    unsigned n         = io_uring_peek_batch_cqe(ring.get(), cqes, NUM_CHUNKS);
-    bool need_resubmit = false;  // any retry SQE prepared in this pass?
-    for (auto* cqe : std::span{cqes, n}) {
-      uint64_t data = io_uring_cqe_get_data64(cqe);
-      int res       = cqe->res;
-      io_uring_cqe_seen(ring.get(), cqe);
-      --inflight;
-
-      if (data & HOST_TAG) {
-        // Host read completion.
-        auto* hf = reinterpret_cast<host_in_flight*>(data & ~HOST_TAG);
-        if (res < 0) {
-          hf->req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error("reactor host read: " + std::string(strerror(-res)))));
-          delete hf;
-          continue;
-        }
-        size_t rd = static_cast<size_t>(res);
-        hf->bytes_read += rd;
-        bool const fully_read = hf->bytes_read >= hf->req.size;
-        bool const eof        = (rd == 0);
-        if (!fully_read && !eof) {
-          // Short read mid-file: queue a follow-up SQE for the unread tail.
-          // We reuse the same host_in_flight identity so subsequent CQEs
-          // continue to accumulate bytes_read against this request.
-          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-          if (sqe) {
-            io_uring_prep_read(sqe,
-                               hf->req.handle,
-                               hf->req.dst + hf->bytes_read,
-                               (unsigned)(hf->req.size - hf->bytes_read),
-                               (__u64)(hf->req.offset + hf->bytes_read));
-            io_uring_sqe_set_data64(sqe, reinterpret_cast<uint64_t>(hf) | HOST_TAG);
-            ++inflight;
-            need_resubmit = true;
-            spdlog::warn(
-              "uring_reactor: host short read, retrying tail. fd={} offset={} size={} "
-              "bytes_read={} this_rd={}",
-              hf->req.handle,
-              hf->req.offset,
-              hf->req.size,
-              hf->bytes_read,
-              rd);
-            continue;
-          }
-          // SQE exhaustion is unexpected (we have _ring_entries SQEs and
-          // never more than NUM_CHUNKS in flight); fall through and complete
-          // with whatever we have rather than spin.
-          spdlog::warn("uring_reactor: SQE exhausted on host short-read retry");
-        }
-        hf->req.ctx->chunk_done();
-        delete hf;
+      auto& previous            = merged.back();
+      auto const previous_begin = static_cast<std::size_t>(previous.offset());
+      auto const previous_end =
+        saturating_add(previous_begin, static_cast<std::size_t>(previous.size()));
+      auto const input_begin = static_cast<std::size_t>(input.offset());
+      auto const input_end   = saturating_add(input_begin, static_cast<std::size_t>(input.size()));
+      if (input_begin <= previous_end) {
+        previous = {previous.offset(),
+                    static_cast<std::int64_t>(std::max(previous_end, input_end) - previous_begin)};
       } else {
-        // Device read completion.
-        int si      = static_cast<int>(data);
-        auto& sinfo = slots[si];
-        auto& req   = sinfo.req;
-        if (res < 0) {
-          req.ctx->chunk_failed(std::make_exception_ptr(
-            std::runtime_error("reactor read: " + std::string(strerror(-res)))));
-          sinfo = slot_info{};
-          continue;
-        }
-        size_t rd = static_cast<size_t>(res);
-        sinfo.bytes_read += rd;
-        bool const fully_read = sinfo.bytes_read >= req.io_size;
-        bool const eof        = (rd == 0);
-        if (!fully_read && !eof) {
-          io_uring_sqe* sqe = io_uring_get_sqe(ring.get());
-          if (sqe) {
-            io_uring_prep_read_fixed(sqe,
-                                     req.handle,
-                                     (uint8_t*)_bounce[si].buf + sinfo.bytes_read,
-                                     (unsigned)(req.io_size - sinfo.bytes_read),
-                                     (__u64)(req.file_off + sinfo.bytes_read),
-                                     si);
-            io_uring_sqe_set_data64(sqe, (uint64_t)si);
-            ++inflight;
-            need_resubmit = true;
-            spdlog::warn(
-              "uring_reactor: device short read, retrying tail. slot={} file_off={} "
-              "io_size={} bytes_read={} this_rd={}",
-              si,
-              req.file_off,
-              req.io_size,
-              sinfo.bytes_read,
-              rd);
-            continue;
-          }
-          spdlog::warn("uring_reactor: SQE exhausted on device short-read retry");
-        }
-        // Fully read or true EOF: compute user-visible bytes from the
-        // accumulated bytes_read, not just this CQE's `rd`.
-        size_t actual = sinfo.bytes_read > req.data_off
-                          ? std::min(req.data_size, sinfo.bytes_read - req.data_off)
-                          : 0;
-        if (actual > 0 && !req.ctx->failed.load(std::memory_order_relaxed)) {
-          _bounce[si].cuda_done.store(false, std::memory_order_relaxed);
-          _bounce[si].cuda_status = cudaSuccess;
-          if (req.device_id >= 0) cudaSetDevice(req.device_id);
-          cudaError_t cpy_err = cudaMemcpyAsync(req.dst,
-                                                (uint8_t*)_bounce[si].buf + req.data_off,
-                                                actual,
-                                                cudaMemcpyHostToDevice,
-                                                req.stream);
-          if (cpy_err != cudaSuccess) {
-            // Synchronous failure (e.g., invalid pointer / context).  Drain
-            // the sticky error so unrelated runtime calls don't observe it,
-            // fail the slot, and skip the callback registration — there's
-            // no stream work to attach a callback to.
-            cudaGetLastError();
-            req.ctx->chunk_failed(std::make_exception_ptr(
-              std::runtime_error(std::string("uring_reactor: cudaMemcpyAsync failed: ") +
-                                 cudaGetErrorString(cpy_err))));
-            sinfo = slot_info{};
-            continue;
-          }
-          // cudaStreamAddCallback (deprecated but used deliberately): unlike
-          // cudaLaunchHostFunc, the callback fires even if the stream is in
-          // an error state — guaranteeing we never strand the slot in
-          // COPYING waiting for a callback that won't come.
-          cudaStreamAddCallback(req.stream, cuda_copy_cb, &_cb_args[si], 0);
-          sinfo.state = slot_state::COPYING;
-        } else {
-          // After retry-to-completion this only fires when the file truly
-          // ends inside the alignment prefix (actual == 0) or when another
-          // chunk of the same request already failed. The handler still
-          // resolves with total_bytes, so anything in `req.dst` past what
-          // we could read is left untouched — log so it surfaces.
-          spdlog::warn(
-            "uring_reactor: chunk completed with no H2D after retry. "
-            "slot={} file_off={} io_size={} data_off={} data_size={} bytes_read={} actual={} "
-            "ctx_failed={}",
-            si,
-            req.file_off,
-            req.io_size,
-            req.data_off,
-            req.data_size,
-            sinfo.bytes_read,
-            actual,
-            req.ctx->failed.load(std::memory_order_relaxed));
-          req.ctx->chunk_done();
-          sinfo = slot_info{};
-        }
+        merged.push_back(input);
       }
     }
-    if (need_resubmit) io_uring_submit(ring.get());
-  };
-
-  // Single park atomic: _wake_seq is bumped by every event source —
-  // queue enqueues, interrupt(), and cuda_copy_cb.  CQE delivery is the
-  // only exception: those are signalled by the kernel directly, so we
-  // wait on io_uring_wait_cqe_timeout when (and only when) there is
-  // in-flight IO that can produce one.
-  auto any_copying = [&]() {
-    return std::ranges::any_of(slots, [](auto& s) { return s.state == slot_state::COPYING; });
-  };
-
-  while (true) {
-    drain_queue();
-    poll_cuda();  // retire COPYING slots whose callback has fired
-
-    if (_stop.load(std::memory_order_acquire)) break;
-
-    bool work_to_submit = !pending.empty() || !pending_host.empty();
-
-    if (!work_to_submit && inflight == 0 && !any_copying()) {
-      // Fully idle.  Park on _wake_seq with the standard race-guard:
-      // load the seq, re-drain, and only park if still idle.
-      uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-      drain_queue();
-      poll_cuda();
-      if (pending.empty() && pending_host.empty() && inflight == 0 && !any_copying() &&
-          !_stop.load(std::memory_order_acquire)) {
-        _wake_seq.wait(seq, std::memory_order_relaxed);
-      }
-      continue;
-    }
-
-    submit_pending();
-
-    if (inflight > 0) {
-      io_uring_cqe* tmp = nullptr;
-      // Bounded wait so the top-of-loop _stop check is reachable even
-      // when no CQE arrives.  SINGLE_ISSUER means we can't post a NOP
-      // SQE from interrupt() to unblock a plain wait_cqe; the timeout
-      // bounds shutdown latency to SHUTDOWN_POLL_MS instead.
-      static constexpr long SHUTDOWN_POLL_MS = 100;
-      __kernel_timespec ts{};
-      ts.tv_sec  = SHUTDOWN_POLL_MS / 1000;
-      ts.tv_nsec = (SHUTDOWN_POLL_MS % 1000) * 1'000'000L;
-      int rc     = io_uring_wait_cqe_timeout(ring.get(), &tmp, &ts);
-      if (rc < 0 && rc != -EINTR && rc != -ETIME) {
-        spdlog::error("uring_reactor: io_uring_wait_cqe_timeout failed: {}", strerror(-rc));
-        break;
-      }
-      reap_cqes();
-      continue;  // loop top: drain_queue + poll_cuda handle any state change
-    }
-
-    // Here: nothing to submit, no in-flight IO, but has_active is true
-    // because of COPYING slots.  Park on _wake_seq until cuda_copy_cb
-    // (or new queue work / interrupt) bumps it.
-    uint64_t seq = _wake_seq.load(std::memory_order_acquire);
-    poll_cuda();  // race-guard: a callback may have fired since the top
-    drain_queue();
-    if (!pending.empty() || !pending_host.empty() || !any_copying() ||
-        _stop.load(std::memory_order_acquire))
-      continue;
-    _wake_seq.wait(seq, std::memory_order_relaxed);
+    return merged;
+  } catch (...) {
+    return {};
   }
 }
 
-}  // namespace sirius::io
+void uring_reactor::worker_loop(std::stop_token const& stop_token)
+{
+  auto cancel_queued = [&](grouped_coordinator::error_type const& error) noexcept {
+    std::unique_ptr<grouped_io_request> request;
+    while (_requests.try_dequeue(request)) {
+      if (request == nullptr) continue;
+      auto const bytes = request->remaining_bytes();
+      _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+      request->cancel_remaining(error);
+    }
+  };
+
+  try {
+    auto const blocks     = _bounce_storage->get_blocks();
+    auto const slot_count = blocks.size();
+    unique_ring ring{static_cast<unsigned>(2 * slot_count)};
+
+    std::vector<iovec> registered_buffers;
+    registered_buffers.reserve(blocks.size());
+    for (auto* block : blocks) {
+      registered_buffers.push_back(iovec{block, _bounce_slot_size});
+    }
+    bool const fixed_supported = ring.register_buffers(registered_buffers);
+
+    slot_pool available_slots{slot_count};
+    std::vector<io_slot> slots;
+    slots.reserve(slot_count);
+    for (std::size_t index = 0; index < slot_count; ++index) {
+      slots.emplace_back(static_cast<int>(index), fixed_supported);
+    }
+
+    std::array<io_uring_cqe*, MAX_NUM_SLOTS> cqes{};
+    std::vector<int> incomplete;
+    incomplete.reserve(slot_count);
+    std::vector<int> copying;
+    copying.reserve(slot_count);
+    std::vector<std::unique_ptr<uring_io_op>> pending;
+    std::unique_ptr<grouped_io_request> active;
+    std::size_t inflight = 0;
+
+    auto reset_slot = [&](io_slot& slot) noexcept { slot.reset(); };
+
+    auto settle_slot_error = [&](io_slot& slot,
+                                 grouped_coordinator::error_type const& error,
+                                 bool host_data_valid = false) noexcept {
+      if (slot.op != nullptr) slot.op->request.finish_error(error, host_data_valid);
+      reset_slot(slot);
+    };
+
+    auto start_device_copy = [&](io_slot& slot) noexcept {
+      auto& copy = *slot.op->request.device_copy;
+      int device = copy.device_id >= 0 ? copy.device_id : copy.d_buffer.device_id;
+      if (device < 0) {
+        auto const status = cudaGetDevice(&device);
+        if (status != cudaSuccess) {
+          settle_slot_error(slot, status, true);
+          return;
+        }
+      }
+
+      try {
+        rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+        if (slot.copy_event == nullptr || slot.event_device != device) {
+          slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
+          slot.event_device = device;
+        }
+        auto const status =
+          copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
+        if (status != cudaSuccess) {
+          settle_slot_error(slot, status, true);
+          return;
+        }
+        slot.state = slot_state::copying;
+        copying.push_back(slot.index);
+      } catch (...) {
+        settle_slot_error(slot, std::current_exception(), true);
+      }
+    };
+
+    auto finish_host_io = [&](io_slot& slot) noexcept {
+      if (slot.op->request.device_copy != nullptr) {
+        start_device_copy(slot);
+      } else {
+        slot.op->request.finish_success();
+        reset_slot(slot);
+      }
+    };
+
+    auto poll_copy_completions = [&]() noexcept {
+      auto output = copying.begin();
+      for (auto it = copying.begin(); it != copying.end(); ++it) {
+        auto& slot = slots[*it];
+        // An index is in `copying` only while its slot still owns the copying op.  Drop any
+        // entry that was already settled elsewhere instead of completing a foreign op.
+        assert(slot.state == slot_state::copying && slot.op != nullptr);
+        if (slot.state != slot_state::copying || slot.op == nullptr) continue;
+        auto const status = cudaEventQuery(slot.copy_event->get());
+        if (status == cudaErrorNotReady) {
+          *output++ = *it;
+          continue;
+        }
+        if (status == cudaSuccess) {
+          slot.op->request.finish_success();
+          reset_slot(slot);
+        } else {
+          settle_slot_error(slot, status, true);
+        }
+      }
+      copying.erase(output, copying.end());
+    };
+
+    auto fallback_to_buffered = [](io_slot& slot) noexcept {
+      auto const file = std::dynamic_pointer_cast<local_io_object const>(slot.op->request.obj);
+      if (file == nullptr) return false;
+      slot.op->fd          = file->buffered_handle();
+      slot.op->use_odirect = false;
+      slot.used_fixed      = false;
+      return true;
+    };
+
+    auto reap_completions = [&]() {
+      auto const count = ring.peek(cqes);
+      for (auto* cqe : std::span{cqes.data(), count}) {
+        auto const user_data = io_uring_cqe_get_data64(cqe);
+        auto const result    = cqe->res;
+        ring.seen(cqe);
+
+        // Kernels without IORING_FEAT_EXT_ARG implement liburing's timed wait
+        // with an internal timeout SQE.  It is not one of our published read
+        // operations and therefore owns no `inflight` credit.
+        if (user_data == LIBURING_UDATA_TIMEOUT) continue;
+
+        auto const index = static_cast<int>(user_data);
+        if (inflight != 0) --inflight;
+
+        if (index < 0 || static_cast<std::size_t>(index) >= slots.size()) continue;
+        auto& slot = slots[index];
+        if (slot.op == nullptr || slot.state != slot_state::reading) continue;
+
+        if (result < 0) {
+          auto const errc = -result;
+          if (slot.op->use_odirect && detail::is_odirect_runtime_error(errc)) {
+            if (slot.used_fixed) slot.fixed_supported = false;
+            if (!fallback_to_buffered(slot)) {
+              settle_slot_error(slot, std::make_error_code(std::errc::bad_file_descriptor));
+              continue;
+            }
+            incomplete.push_back(index);
+          } else if (slot.used_fixed && is_fixed_buffer_error(errc)) {
+            slot.fixed_supported = false;
+            if (slot.op->use_odirect && !fallback_to_buffered(slot)) {
+              settle_slot_error(slot, std::make_error_code(std::errc::bad_file_descriptor));
+              continue;
+            }
+            slot.used_fixed = false;
+            incomplete.push_back(index);
+          } else {
+            settle_slot_error(slot, std::error_code{errc, std::generic_category()});
+          }
+          continue;
+        }
+
+        auto const completed = static_cast<std::size_t>(result);
+        auto const remaining = slot.op->request.io_rng.size - slot.bytes_read;
+        if (completed > remaining) {
+          settle_slot_error(slot, std::make_error_code(std::errc::io_error));
+          continue;
+        }
+        slot.bytes_read += completed;
+
+        auto const& io_range = slot.op->request.io_rng;
+        auto const available = io_range.offset < slot.op->file_size
+                                 ? std::min(io_range.size, slot.op->file_size - io_range.offset)
+                                 : std::size_t{0};
+        if (slot.bytes_read >= available) {
+          finish_host_io(slot);
+          continue;
+        }
+        if (completed == 0) {
+          settle_slot_error(slot, std::make_error_code(std::errc::io_error));
+          continue;
+        }
+
+        if (slot.op->use_odirect) {
+          std::vector<iovec> remaining_buffers;
+          detail::fill_remaining_iovecs(
+            slot.op->request.iovecs, slot.bytes_read, remaining_buffers);
+          auto const remaining_range =
+            range{io_range.offset + slot.bytes_read, io_range.size - slot.bytes_read};
+          if (!detail::is_odirect_compatible(remaining_range, remaining_buffers)) {
+            if (!fallback_to_buffered(slot)) {
+              settle_slot_error(slot, std::make_error_code(std::errc::bad_file_descriptor));
+              continue;
+            }
+          }
+        }
+        incomplete.push_back(index);
+      }
+    };
+
+    auto submit_slots = [&](std::vector<int> const& indexes) {
+      if (indexes.empty()) return;
+      ring.submit(indexes.size(), inflight);
+    };
+
+    auto resubmit_incomplete = [&]() {
+      std::vector<int> submitted;
+      submitted.reserve(incomplete.size());
+      auto input = incomplete.begin();
+      while (input != incomplete.end()) {
+        auto& slot = slots[*input];
+        try {
+          slot.prepare_remaining_iovecs();
+          auto* sqe = ring.get_sqe();
+          if (sqe == nullptr) break;
+          slot.prepare_sqe(sqe);
+          submitted.push_back(*input);
+        } catch (...) {
+          settle_slot_error(slot, std::current_exception());
+        }
+        ++input;
+      }
+      incomplete.erase(incomplete.begin(), input);
+      submit_slots(submitted);
+    };
+
+    auto dispatch_pending = [&]() {
+      std::vector<int> submitted;
+      submitted.reserve(slot_count);
+      while (!pending.empty()) {
+        auto& candidate = pending.back();
+        if (!candidate->request.coordinator->should_continue()) {
+          candidate->request.finish_error(canceled_error());
+          pending.pop_back();
+          continue;
+        }
+
+        auto const needed = std::max<std::size_t>(1, candidate->staging_blocks);
+        if (available_slots.approx_free() < needed) break;
+
+        auto lease = std::make_shared<staging_lease>();
+        lease->tokens.reserve(needed);
+        for (std::size_t i = 0; i < needed; ++i) {
+          auto token = available_slots.try_acquire_token(static_cast<unsigned>(i));
+          if (!token) throw std::logic_error("uring_reactor: slot reservation lost");
+          lease->tokens.push_back(std::move(token));
+        }
+
+        auto op = std::move(candidate);
+        pending.pop_back();
+        auto const leader = lease->tokens.front().slot_index();
+
+        try {
+          if (op->needs_staging()) {
+            op->request.iovecs.clear();
+            op->request.iovecs.reserve(needed);
+            std::size_t remaining = op->request.io_rng.size;
+            for (auto const& token : lease->tokens) {
+              auto const bytes = std::min(remaining, _bounce_slot_size);
+              op->request.iovecs.push_back(iovec{blocks[token.slot_index()], bytes});
+              remaining -= bytes;
+            }
+            if (remaining != 0) {
+              throw std::logic_error("uring_reactor: insufficient staging blocks");
+            }
+          }
+          op->request.staging_owner = lease;
+
+          auto& slot = slots[leader];
+          assert(slot.state == slot_state::idle && slot.op == nullptr);
+          slot.op         = std::move(op);
+          slot.state      = slot_state::reading;
+          slot.bytes_read = 0;
+
+          slot.prepare_remaining_iovecs();
+          auto* sqe = ring.get_sqe();
+          if (sqe == nullptr) {
+            incomplete.push_back(leader);
+            break;
+          }
+          slot.prepare_sqe(sqe);
+          submitted.push_back(leader);
+        } catch (...) {
+          if (slots[leader].op != nullptr) {
+            settle_slot_error(slots[leader], std::current_exception());
+          } else if (op != nullptr) {
+            op->request.finish_error(std::current_exception());
+          }
+        }
+      }
+      submit_slots(submitted);
+    };
+
+    auto cancel_pending = [&](grouped_coordinator::error_type const& error) noexcept {
+      while (!pending.empty()) {
+        pending.back()->request.finish_error(error);
+        pending.pop_back();
+      }
+    };
+
+    auto cancel_active = [&](grouped_coordinator::error_type const& error) noexcept {
+      if (active == nullptr) return;
+      auto const bytes = active->remaining_bytes();
+      _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+      active->cancel_remaining(error);
+      active.reset();
+    };
+
+    std::exception_ptr fatal_error;
+    try {
+      while (!stop_token.stop_requested()) {
+        poll_copy_completions();
+        reap_completions();
+        resubmit_incomplete();
+
+        if (!pending.empty() && !pending.back()->request.coordinator->should_continue()) {
+          cancel_pending(canceled_error());
+          cancel_active(canceled_error());
+        }
+
+        dispatch_pending();
+
+        if (pending.empty() && active != nullptr) {
+          if (!active->coordinator->should_continue()) {
+            cancel_active(canceled_error());
+          } else if (!active->empty()) {
+            auto const backlog =
+              std::max(_queued_bytes.load(std::memory_order_relaxed), active->remaining_bytes());
+            auto slice = active->take_front();
+            _queued_bytes.fetch_sub(slice.size(), std::memory_order_relaxed);
+
+            try {
+              auto planned = plan_slice(active->obj,
+                                        slice,
+                                        active->coordinator,
+                                        _config,
+                                        _bounce_slot_size,
+                                        backlog,
+                                        available_slots.approx_free());
+              if (planned.empty()) {
+                throw std::logic_error("uring_reactor: slice produced no physical operations");
+              }
+
+              pending.reserve(pending.size() + planned.size());
+              for (auto it = planned.rbegin(); it != planned.rend(); ++it) {
+                pending.push_back(std::move(*it));
+              }
+              active->coordinator->add_tasks(planned.size() - 1);
+            } catch (...) {
+              if (slice.on_complete != nullptr) {
+                (*slice.on_complete)(slice.h_buffer.fragments(), false);
+              }
+              active->coordinator->report_error(std::current_exception());
+              cancel_active(canceled_error());
+            }
+
+            if (active != nullptr && active->empty()) active.reset();
+            dispatch_pending();
+          } else {
+            active.reset();
+          }
+        }
+
+        if (active == nullptr && pending.empty()) {
+          std::unique_ptr<grouped_io_request> next;
+          if (_requests.try_dequeue(next)) {
+            if (next == nullptr) break;
+            active = std::move(next);
+            continue;
+          }
+        }
+
+        if (inflight != 0) {
+          if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
+            throw std::system_error(std::error_code{error, std::generic_category()},
+                                    "uring_reactor: io_uring_wait_cqe_timeout");
+          }
+          reap_completions();
+        } else if (!copying.empty() && pending.empty() && active == nullptr) {
+          auto const index = copying.back();
+          copying.pop_back();
+          auto& slot        = slots[index];
+          auto const status = slot.copy_event->synchronize_no_throw();
+          if (status == cudaSuccess) {
+            slot.op->request.finish_success();
+            reset_slot(slot);
+          } else {
+            settle_slot_error(slot, status, true);
+          }
+          poll_copy_completions();
+        } else if (pending.empty() && active == nullptr) {
+          std::unique_ptr<grouped_io_request> next;
+          if (!_requests.wait_dequeue_timed(next, POLL_INTERVAL_US)) continue;
+          if (next == nullptr) break;
+          active = std::move(next);
+        }
+      }
+    } catch (...) {
+      fatal_error = std::current_exception();
+    }
+
+    // Close admission before draining the queue.  Taking the same mutex as
+    // enqueue() ensures every request that observed _accepting=true has
+    // finished publishing its queue entry before cancel_queued() runs.
+    {
+      std::lock_guard lock(_enqueue_mutex);
+      _accepting.store(false, std::memory_order_release);
+    }
+
+    auto const cancellation = canceled_error();
+    grouped_coordinator::error_type terminal_error =
+      fatal_error != nullptr ? grouped_coordinator::error_type{fatal_error}
+                             : grouped_coordinator::error_type{cancellation};
+    cancel_pending(terminal_error);
+    cancel_active(terminal_error);
+    cancel_queued(terminal_error);
+
+    bool sync_cancel_available = true;
+    auto sync_cancel_inflight  = [&]() noexcept {
+      if (inflight == 0) return true;
+      if (!sync_cancel_available) return false;
+      auto const rc = ring.cancel_all_sync();
+      if (rc >= 0 || rc == -ENOENT) {
+        inflight = 0;
+        return true;
+      }
+      sync_cancel_available = false;
+      SIRIUS_LOG_WARN("uring_reactor: synchronous cancel-all failed: {}", strerror(-rc));
+      return false;
+    };
+
+    if (fatal_error != nullptr) sync_cancel_inflight();
+
+    if (fatal_error == nullptr) {
+      try {
+        while (inflight != 0 || !incomplete.empty()) {
+          resubmit_incomplete();
+          if (inflight == 0) break;
+          if (auto const error = ring.wait_for(POLL_INTERVAL); error != 0) {
+            throw std::system_error(std::error_code{error, std::generic_category()},
+                                    "uring_reactor: drain failed");
+          }
+          reap_completions();
+        }
+      } catch (...) {
+        fatal_error    = std::current_exception();
+        terminal_error = fatal_error;
+        sync_cancel_inflight();
+      }
+    }
+
+    // A fatal submission can leave additional prepared SQEs in the userspace
+    // ring. Keep their operation storage parked, and use only zero-submit
+    // GETEVENTS enters until every operation already visible to the kernel is
+    // quiescent. A timed wait or submit-and-wait here could publish those
+    // untracked entries and make releasing their buffers unsafe.
+    bool terminal_enter_error_logged = false;
+    while (inflight != 0) {
+      auto const before = inflight;
+      try {
+        reap_completions();
+      } catch (...) {
+        fatal_error    = std::current_exception();
+        terminal_error = fatal_error;
+      }
+      if (inflight == 0 || sync_cancel_inflight()) break;
+
+      // In addition to flushing CQ overflow, this enter is required to run
+      // deferred task work when the preferred DEFER_TASKRUN ring is active.
+      if (auto const enter_error = ring.run_deferred_taskwork(); enter_error != 0) {
+        if (!terminal_enter_error_logged) {
+          SIRIUS_LOG_WARN("uring_reactor: terminal GETEVENTS failed: {}", strerror(enter_error));
+          terminal_enter_error_logged = true;
+        }
+        std::this_thread::sleep_for(POLL_INTERVAL);
+        continue;
+      }
+      try {
+        reap_completions();
+      } catch (...) {
+        fatal_error    = std::current_exception();
+        terminal_error = fatal_error;
+      }
+      if (inflight == before) std::this_thread::sleep_for(POLL_INTERVAL);
+    }
+
+    for (auto const index : copying) {
+      auto& slot        = slots[index];
+      auto const status = slot.copy_event->synchronize_no_throw();
+      if (status == cudaSuccess) {
+        slot.op->request.finish_success();
+        reset_slot(slot);
+      } else {
+        settle_slot_error(slot, status, true);
+      }
+    }
+    copying.clear();
+
+    for (auto& slot : slots) {
+      if (slot.op != nullptr) settle_slot_error(slot, terminal_error);
+    }
+  } catch (...) {
+    auto const error = std::current_exception();
+    {
+      std::lock_guard lock(_enqueue_mutex);
+      _accepting.store(false, std::memory_order_release);
+    }
+    cancel_queued(error);
+  }
+}
+
+}  // namespace sirius::io::uring

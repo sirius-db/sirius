@@ -12,14 +12,15 @@ tpch-data/dbgen
 .vscode/
 *.duckdb
 !test/cpp/integration/integration.duckdb
+!test/cpp/integration/data/duckdb/tpcds.duckdb
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
+test_datasets/tpchgen-rs/
 test_datasets/hits_0.parquet
-.claude/*
 .codex/
 runs/
 .venv
@@ -34,7 +35,10 @@ cufile.log
 # Generated nightly environment
 envs/
 compile_commands.json
+*.pch
 .cache
+/sirius-perf-sf1000.yaml
+.rumdl_cache/
 
 # Zed editor settings
 .zed
@@ -44,7 +48,10 @@ AGENTS.override.md
 CLAUDE.local.md
 newplan.md
 telemetry_data/
-log/
+log_analysis/
+nsys_profiles/
+/log/
+.ai-helper/
 
 .planning/
 
@@ -53,3 +60,18 @@ log/
 /test/cpp/integration/s3/fixtures/local/
 /test/cpp/integration/s3/fixtures/generated/
 /test/cpp/integration/s3/certs/
+
+# Host-specific s3-bench perf baselines + per-run history: seeded/accumulated
+# locally per host, deliberately not committed (a run without a baseline
+# bootstrap-skips the delta comparison).
+/doc/s3support/perf-baseline-*.json
+/doc/s3support/perf-history-*.jsonl
+*.local.md
+tools/log_analyzer/__pycache__/
+tools/log_analyzer/metrics/__pycache__/
+test/tpch_performance/__pycache__/
+test/tpch_performance/output/
+test/tpch_performance/log/
+
+PR_digests/
+plans/

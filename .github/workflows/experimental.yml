@@ -28,43 +28,99 @@ jobs:
   starrocks:
     name: starrocks
     runs-on: ubuntu-24.04
+    env:
+      # CPU runner: no GPU/driver. The workspace platforms are CUDA-pinned (the
+      # `engine` feature targets CUDA 13), so assert `__cuda` for the `cn` env to
+      # resolve even though `cn` itself is CUDA-agnostic.
+      CONDA_OVERRIDE_CUDA: "13"
     defaults:
       run:
         working-directory: experimental/starrocks
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: false
 
-      - name: Init starrocks submodule
+      - name: Init starrocks submodules
         working-directory: ${{ github.workspace }}
-        run: git submodule update --init --depth=1 experimental/starrocks/starrocks
+        run: git submodule update --init --depth=1 --jobs 2 experimental/starrocks/starrocks experimental/starrocks/brpc
 
-      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           cache: false
-          pixi-version: v0.70.2
+          pixi-version: v0.71.1
           manifest-path: experimental/starrocks/pixi.toml
           environments: cn
 
+      # Scope by package: `--all` would also reach the sibling rust/ workspace via the
+      # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
-        run: pixi run -e cn cargo fmt --all -- --check
+        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
 
+      # The CN's `sirius-engine` feature is on by default but links a Sirius build
+      # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
+      # the pure-Rust path here. The engine path is exercised on a GPU box via
+      # `pixi run cn-build` / `cn-test`.
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets -- -D warnings
+        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: test
-        run: pixi run -e cn cargo test --workspace
+        run: pixi run -e cn cargo test --workspace --no-default-features
+
+  doris:
+    name: doris
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # CPU runner: no GPU/driver. The workspace platforms are CUDA-pinned (the
+      # `engine` feature targets CUDA 13), so assert `__cuda` for the `be` env to
+      # resolve even though `be` itself is CUDA-agnostic.
+      CONDA_OVERRIDE_CUDA: "13"
+    defaults:
+      run:
+        working-directory: experimental/doris
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: false
+
+      # Only the Doris thrift/proto IDL is needed (the FE is an official binary, never built).
+      - name: Init doris submodule
+        working-directory: ${{ github.workspace }}
+        run: git submodule update --init --depth=1 experimental/doris/doris
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          cache: false
+          pixi-version: v0.71.1
+          manifest-path: experimental/doris/pixi.toml
+          environments: be
+
+      # Scope by package: `--all` would also reach the sibling rust/ workspace via the
+      # `sirius` path dep.
+      - name: fmt
+        run: pixi run -e be cargo fmt --package sirius-doris-be --package doris-plan-translator --package doris-thrift --package doris-proto -- --check
+
+      # The BE's `sirius-engine` feature is on by default but links a Sirius build tree
+      # (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build the
+      # pure-Rust path here. The engine path is exercised on a GPU box via
+      # `pixi run be-build` / `be-test`.
+      - name: clippy
+        run: pixi run -e be cargo clippy --all-targets --no-default-features -- -D warnings
+
+      # Includes tests/corpus.rs, which replays the captured TPC-H dispatch fixtures.
+      - name: test
+        run: pixi run -e be cargo test --workspace --no-default-features
 
   experimental:
     name: experimental
-    runs-on: ubuntu-24.04
-    needs: [starrocks]
+    runs-on: ubuntu-slim
+    needs: [starrocks, doris]
     if: always()
     steps:
       - name: All checks ok
-        if: ${{ needs.starrocks.result == 'success' }}
+        if: ${{ needs.starrocks.result == 'success' && needs.doris.result == 'success' }}
         run: exit 0
       - name: Some checks failed
-        if: ${{ needs.starrocks.result != 'success' }}
+        if: ${{ needs.starrocks.result != 'success' || needs.doris.result != 'success' }}
         run: exit 1

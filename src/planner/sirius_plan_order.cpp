@@ -26,6 +26,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
 {
   D_ASSERT(op.children.size() == 1);
 
+  // Nested columns may pass through this operator, but cannot be sort keys.
+  for (auto const& order : op.orders) {
+    reject_nested_column_operation(*order.expression, "ORDER BY");
+  }
+
   auto plan = create_plan(*op.children[0]);
   if (!op.orders.empty()) {
     duckdb::vector<std::size_t> projection_map;

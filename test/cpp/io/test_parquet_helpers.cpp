@@ -7,12 +7,21 @@
 
 #include "catch.hpp"
 #include "io/parquet_helpers.hpp"
+#include "io/templated_ioctx.hpp"
+#include "op/scan/parquet_materialize.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
+#include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <duckdb.hpp>
 
@@ -20,7 +29,11 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -41,6 +54,12 @@ fs::path fresh_tmp_dir(std::string const& tag)
   fs::remove_all(dir, ec);
   fs::create_directories(dir);
   return dir;
+}
+
+fs::path parquet_fixture(std::string_view file_name)
+{
+  return fs::path{SIRIUS_PROJECT_ROOT} / "test" / "cpp" / "integration" / "data" / "parquet" /
+         file_name;
 }
 
 fs::path write_parquet(duckdb::Connection& con,
@@ -88,6 +107,17 @@ std::vector<duckdb::LogicalType> expected_flat_types()
           duckdb::LogicalType::DOUBLE,
           duckdb::LogicalType::BOOLEAN,
           duckdb::LogicalType::VARCHAR};
+}
+
+void require_struct_child(duckdb::LogicalType const& type,
+                          duckdb::idx_t index,
+                          std::string const& name,
+                          duckdb::LogicalType const& child_type)
+{
+  REQUIRE(type.id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(type) > index);
+  CHECK(duckdb::StructType::GetChildName(type, index) == name);
+  CHECK(duckdb::StructType::GetChildType(type, index) == child_type);
 }
 
 }  // namespace
@@ -141,18 +171,401 @@ TEST_CASE("parquet_helpers extract_schema maps decimal date and timestamp annota
   CHECK(info.types[2] == duckdb::LogicalType::TIMESTAMP);
 }
 
-TEST_CASE("parquet_helpers extract_schema rejects nested top-level columns cleanly",
-          "[parquet_helpers][schema]")
+TEST_CASE("parquet_helpers extract_schema maps top-level struct columns",
+          "[parquet_helpers][schema][nested]")
 {
-  auto const dir       = fresh_tmp_dir("nested");
-  auto [db_owner, con] = sirius::make_test_db_and_connection();
-  auto const path      = write_parquet(con,
-                                  dir,
-                                  "nested_types",
-                                  "CREATE TABLE nested_types AS SELECT "
-                                       "struct_pack(child := 7) AS payload");
+  auto meta = read_metadata(parquet_fixture("nested_struct.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
 
-  auto meta = read_metadata(path);
-  REQUIRE_THROWS_WITH(sirius::io::parquet_helpers::extract_schema(meta),
-                      Catch::Contains("nested parquet types not yet supported"));
+  REQUIRE(info.names == std::vector<std::string>{"id", "payload"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(info.types[1]) == 2);
+  require_struct_child(info.types[1], 0, "a", duckdb::LogicalType::INTEGER);
+  require_struct_child(info.types[1], 1, "b", duckdb::LogicalType::VARCHAR);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps top-level list columns",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_list.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "items"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::LIST);
+  CHECK(duckdb::ListType::GetChildType(info.types[1]) == duckdb::LogicalType::BIGINT);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps parquet map columns to DuckDB MAP",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_map.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "attrs"});
+  REQUIRE(info.types.size() == 2);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::MAP);
+  CHECK(duckdb::MapType::KeyType(info.types[1]) == duckdb::LogicalType::VARCHAR);
+  CHECK(duckdb::MapType::ValueType(info.types[1]) == duckdb::LogicalType::INTEGER);
+}
+
+TEST_CASE("parquet_helpers extract_schema maps deep nested columns and resumes at next scalar",
+          "[parquet_helpers][schema][nested]")
+{
+  auto meta = read_metadata(parquet_fixture("nested_deep.parquet"));
+  auto info = sirius::io::parquet_helpers::extract_schema(meta);
+
+  REQUIRE(info.names == std::vector<std::string>{"id", "struct_of_list", "list_of_struct", "tail"});
+  REQUIRE(info.types.size() == 4);
+  CHECK(info.types[0] == duckdb::LogicalType::INTEGER);
+  CHECK(info.types[3] == duckdb::LogicalType::INTEGER);
+
+  REQUIRE(info.types[1].id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(info.types[1]) == 1);
+  CHECK(duckdb::StructType::GetChildName(info.types[1], 0) == "s");
+  auto const& struct_list_child = duckdb::StructType::GetChildType(info.types[1], 0);
+  REQUIRE(struct_list_child.id() == duckdb::LogicalTypeId::LIST);
+  CHECK(duckdb::ListType::GetChildType(struct_list_child) == duckdb::LogicalType::INTEGER);
+
+  REQUIRE(info.types[2].id() == duckdb::LogicalTypeId::LIST);
+  auto const& list_struct_child = duckdb::ListType::GetChildType(info.types[2]);
+  REQUIRE(list_struct_child.id() == duckdb::LogicalTypeId::STRUCT);
+  REQUIRE(duckdb::StructType::GetChildCount(list_struct_child) == 1);
+  require_struct_child(list_struct_child, 0, "x", duckdb::LogicalType::DOUBLE);
+}
+
+namespace {
+
+/// One file's column chunks staged on the device, which is the shape the bulk
+/// materialize route hands the hybrid scan readers.
+struct staged_chunks {
+  std::vector<rmm::device_buffer> buffers;
+  std::vector<cudf::device_span<std::uint8_t const>> spans;
+};
+
+staged_chunks stage_column_chunks(cudf::io::datasource& source,
+                                  std::span<cudf::io::text::byte_range_info const> ranges,
+                                  ::cuda::stream_ref stream)
+{
+  staged_chunks staged;
+  staged.buffers.reserve(ranges.size());
+  for (auto const& range : ranges) {
+    auto const host = source.host_read(static_cast<std::size_t>(range.offset()),
+                                       static_cast<std::size_t>(range.size()));
+    staged.buffers.emplace_back(host->data(), host->size(), stream);
+  }
+  staged.spans.reserve(staged.buffers.size());
+  for (auto const& buffer : staged.buffers) {
+    staged.spans.emplace_back(static_cast<std::uint8_t const*>(buffer.data()), buffer.size());
+  }
+  return staged;
+}
+
+/// `l_orderkey < 100000` over lineitem.parquet: 100382 of 600572 rows, spread
+/// over all 5 row groups, so an equal count proves row-level filtering.
+struct orderkey_filter {
+  cudf::numeric_scalar<std::int64_t> limit{100000};
+  cudf::ast::literal value{limit};
+  cudf::ast::column_name_reference column{"l_orderkey"};
+  cudf::ast::operation expression{cudf::ast::ast_operator::LESS, column, value};
+};
+
+cudf::io::parquet_reader_options filtered_options(std::vector<std::string> const& paths,
+                                                  std::vector<std::string> columns,
+                                                  cudf::ast::operation const& filter)
+{
+  auto options =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{paths}).filter(filter).build();
+  options.set_column_names(std::move(columns));
+  return options;
+}
+
+/// Rows the single-file bulk route produces for @p options.
+cudf::size_type bulk_row_count(fs::path const& path,
+                               cudf::io::parquet_reader_options const& options,
+                               ::cuda::stream_ref stream)
+{
+  auto source = cudf::io::datasource::create(path.string());
+  auto footer = read_parquet_footer(*source);
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options};
+
+  auto const row_groups = reader.all_row_groups(options);
+  auto const ranges     = reader.all_column_chunks_byte_ranges(row_groups, options);
+  auto const staged     = stage_column_chunks(*source, ranges, stream);
+
+  return reader
+    .materialize_all_columns(
+      row_groups, staged.spans, options, stream, cudf::get_current_device_resource_ref())
+    .tbl->num_rows();
+}
+
+/// A backend that prefers bulk IO -- the one thing `prefers_bulk_materialize`
+/// asks a source's datasource.
+class bulk_object final : public sirius::io::io_object {
+ public:
+  explicit bulk_object(std::string path = "bulk", std::size_t size = 0)
+    : _path(std::move(path)), _size(size)
+  {
+  }
+
+  [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
+  [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
+  [[nodiscard]] std::size_t size() const noexcept override { return _size; }
+
+ private:
+  std::string _path;
+  std::size_t _size;
+};
+
+class bulk_reactor {
+ public:
+  struct config {
+    [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
+    [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
+    std::size_t n_max_concurrent_scans{0};
+  };
+
+  using io_object_type                  = bulk_object;
+  using reactor_config_type             = config;
+  static constexpr bool prefers_bulk_io = true;
+
+  [[nodiscard]] config const& get_config() const noexcept { return _config; }
+  void enqueue(std::unique_ptr<sirius::io::grouped_io_request>) noexcept {}
+  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
+  std::size_t host_read(bulk_object const&, std::size_t, std::size_t size, std::uint8_t*) const
+  {
+    return size;
+  }
+  void start() {}
+  void shutdown() {}
+  void interrupt() {}
+  [[nodiscard]] static std::unique_ptr<bulk_object> create_io_object(std::string)
+  {
+    return std::make_unique<bulk_object>();
+  }
+  [[nodiscard]] static bool supports(std::string_view) { return true; }
+  [[nodiscard]] static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
+    std::span<cudf::io::text::byte_range_info const> ranges, std::optional<std::size_t>)
+  {
+    return {ranges.begin(), ranges.end()};
+  }
+
+ private:
+  config _config;
+};
+
+class bulk_context final : public sirius::io::templated_ioctx<bulk_reactor> {
+ public:
+  using templated_ioctx::templated_ioctx;
+
+  [[nodiscard]] sirius::io::io_context_type type() const noexcept override
+  {
+    return sirius::io::io_context_type::restful;
+  }
+};
+
+sirius::op::scan::parquet_source schema_source(fs::path const& path,
+                                               std::shared_ptr<bulk_context> const& ioctx)
+{
+  return {std::make_shared<sirius::io::sirius_datasource>(
+            ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
+          std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path)),
+          {}};
+}
+
+}  // namespace
+
+TEST_CASE("filtered options still take the bulk materialize route", "[scan][parquet][bulk_filter]")
+{
+  auto const path = parquet_fixture("lineitem.parquet");
+  orderkey_filter const filter;
+  auto const options =
+    filtered_options({path.string()}, {"l_orderkey", "l_quantity"}, filter.expression);
+
+  auto source = cudf::io::datasource::create(path.string());
+  auto footer = read_parquet_footer(*source);
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer->data(), footer->size()), options};
+
+  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> sources;
+  sources.push_back(sirius::op::scan::parquet_source{
+    std::make_shared<sirius::io::sirius_datasource>(ioctx, std::make_shared<bulk_object>()),
+    std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata()),
+    reader.all_row_groups(options)});
+
+  CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options));
+}
+
+TEST_CASE("bulk materialize rejects sources whose schemas differ before reading",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path_a =
+    write_parquet(con, dir, "drift_a", "CREATE TABLE drift_a AS SELECT 1::INTEGER AS x, 'a' AS y");
+  auto const path_b =
+    write_parquet(con, dir, "drift_b", "CREATE TABLE drift_b AS SELECT 2.5::DOUBLE AS x, 'b' AS y");
+  auto const options = cudf::io::parquet_reader_options::builder().build();
+  auto ioctx         = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> sources;
+  for (auto const& path : {path_a, path_b}) {
+    auto metadata = std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path));
+    cudf::io::parquet::experimental::hybrid_scan_reader reader{*metadata, options};
+    sources.push_back(sirius::op::scan::parquet_source{
+      std::make_shared<sirius::io::sirius_datasource>(
+        ioctx, std::make_shared<bulk_object>(path.string(), fs::file_size(path))),
+      std::move(metadata),
+      reader.all_row_groups(options)});
+  }
+
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  CHECK_THROWS_WITH(
+    sirius::op::scan::materialize_parquet(
+      sources, options, {}, cudf::get_default_stream(), cudf::get_current_device_resource_ref()),
+    Catch::Matchers::ContainsSubstring("All sources must have the same schema") &&
+      Catch::Matchers::ContainsSubstring("drift_a") &&
+      Catch::Matchers::ContainsSubstring("drift_b") && Catch::Matchers::ContainsSubstring("'x'"));
+}
+
+TEST_CASE("require_same_parquet_schema accepts a shared schema", "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_shared");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path_a =
+    write_parquet(con, dir, "shared_a", "CREATE TABLE shared_a AS SELECT 1::INTEGER AS x");
+  auto const path_b =
+    write_parquet(con, dir, "shared_b", "CREATE TABLE shared_b AS SELECT 2::INTEGER AS x");
+  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                              schema_source(path_b, ioctx)};
+
+  REQUIRE(sources[0].metadata != sources[1].metadata);
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(sources));
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(
+    std::span<sirius::op::scan::parquet_source const>(sources).first(1)));
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema({}));
+}
+
+TEST_CASE("require_same_parquet_schema rejects column order and extra-column drift",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_columns");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto ioctx = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+
+  SECTION("column order")
+  {
+    auto const path_a = write_parquet(
+      con, dir, "order_a", "CREATE TABLE order_a AS SELECT 1::INTEGER AS x, 2::INTEGER AS y");
+    auto const path_b = write_parquet(
+      con, dir, "order_b", "CREATE TABLE order_b AS SELECT 2::INTEGER AS y, 1::INTEGER AS x");
+    std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                                schema_source(path_b, ioctx)};
+
+    CHECK_THROWS_WITH(
+      sirius::op::scan::require_same_parquet_schema(sources),
+      Catch::Matchers::ContainsSubstring("differ at schema element 1 ('x' INT32 vs 'y' INT32)"));
+  }
+
+  SECTION("extra column")
+  {
+    auto const path_a =
+      write_parquet(con, dir, "extra_a", "CREATE TABLE extra_a AS SELECT 1::INTEGER AS x");
+    auto const path_b = write_parquet(
+      con, dir, "extra_b", "CREATE TABLE extra_b AS SELECT 1::INTEGER AS x, 2::INTEGER AS z");
+    std::vector<sirius::op::scan::parquet_source> const sources{schema_source(path_a, ioctx),
+                                                                schema_source(path_b, ioctx)};
+
+    CHECK_THROWS_WITH(sirius::op::scan::require_same_parquet_schema(sources),
+                      Catch::Matchers::ContainsSubstring("have 2 and 3 schema elements"));
+  }
+}
+
+TEST_CASE("require_same_parquet_schema rejects a difference only in writer metadata",
+          "[scan][parquet][bulk_schema]")
+{
+  auto const dir       = fresh_tmp_dir("bulk_schema_writer");
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto const path =
+    write_parquet(con, dir, "writer", "CREATE TABLE writer AS SELECT 1::INTEGER AS x");
+  auto ioctx   = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  auto source  = schema_source(path, ioctx);
+  auto changed = std::make_shared<cudf::io::parquet::FileMetaData>(*source.metadata);
+  std::vector<sirius::op::scan::parquet_source> const sources{source,
+                                                              {source.datasource, changed, {}}};
+  REQUIRE(changed->schema.size() == 2);
+  CHECK_NOTHROW(sirius::op::scan::require_same_parquet_schema(sources));
+
+  SECTION("root name")
+  {
+    REQUIRE(changed->schema[0].name == "duckdb_schema");
+    changed->schema[0].name = "schema";
+    CHECK_THROWS_WITH(sirius::op::scan::require_same_parquet_schema(sources),
+                      Catch::Matchers::ContainsSubstring("differ at schema element 0") &&
+                        Catch::Matchers::ContainsSubstring("'schema' group"));
+  }
+
+  SECTION("converted type")
+  {
+    REQUIRE(changed->schema[1].converted_type == cudf::io::parquet::ConvertedType::INT_32);
+    changed->schema[1].converted_type = cudf::io::parquet::ConvertedType::UINT_32;
+    CHECK_THROWS_WITH(
+      sirius::op::scan::require_same_parquet_schema(sources),
+      Catch::Matchers::ContainsSubstring("differ at schema element 1 ('x' INT32 vs 'x' INT32") &&
+        Catch::Matchers::ContainsSubstring("; they differ in annotation, width or nesting"));
+  }
+}
+
+TEST_CASE("hybrid scan bulk materialize applies the reader filter like read_parquet",
+          "[scan][parquet][bulk_filter]")
+{
+  auto const path   = parquet_fixture("lineitem.parquet");
+  auto const stream = cudf::get_default_stream();
+  orderkey_filter const filter;
+
+  SECTION("filter column inside the projection")
+  {
+    auto const options =
+      filtered_options({path.string()}, {"l_orderkey", "l_quantity"}, filter.expression);
+    CHECK(cudf::io::read_parquet(options).tbl->num_rows() == 100382);
+    CHECK(bulk_row_count(path, options, stream) == 100382);
+  }
+
+  SECTION("filter column outside the projection")
+  {
+    auto const options =
+      filtered_options({path.string()}, {"l_quantity", "l_shipdate"}, filter.expression);
+    CHECK(cudf::io::read_parquet(options).tbl->num_rows() == 100382);
+    CHECK(bulk_row_count(path, options, stream) == 100382);
+  }
+
+  SECTION("several sources through hybrid_scan_multifile")
+  {
+    auto const options = filtered_options(
+      {path.string(), path.string()}, {"l_orderkey", "l_quantity"}, filter.expression);
+
+    auto source = cudf::io::datasource::create(path.string());
+    auto footer = read_parquet_footer(*source);
+    std::vector<cudf::host_span<std::uint8_t const>> footers(
+      2, cudf::host_span<std::uint8_t const>(footer->data(), footer->size()));
+    cudf::io::parquet::experimental::hybrid_scan_multifile reader{footers, options};
+
+    auto const row_groups     = reader.all_row_groups(options);
+    auto const [ranges, srcs] = reader.all_column_chunks_byte_ranges(row_groups, options);
+    // Both entries are the same file, so every range reads from the one source.
+    auto const staged = stage_column_chunks(*source, ranges, stream);
+
+    CHECK(cudf::io::read_parquet(options).tbl->num_rows() == 200764);
+    CHECK(reader
+            .materialize_all_columns(
+              row_groups, staged.spans, options, stream, cudf::get_current_device_resource_ref())
+            .tbl->num_rows() == 200764);
+  }
 }

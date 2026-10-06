@@ -16,56 +16,82 @@
 
 #include "sirius_engine.hpp"
 
-#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
-#include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
-#include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_iceberg_scan.hpp"
-#include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "op/sirius_physical_order.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
-#include "op/sirius_physical_sort_partition.hpp"
-#include "op/sirius_physical_sort_sample.hpp"
-#include "op/sirius_physical_table_scan.hpp"
-#include "op/sirius_physical_top_n.hpp"
-#include "op/sirius_physical_top_n_merge.hpp"
-#include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "pipeline/sirius_plan_printer.hpp"
+#include "planner/gpu_admission.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius {
 
 namespace {
 
-const telemetry::telemetry_context& get_telemetry_context_from_client_context(
+/// Select the GPU subset this query is admitted with: gpus_per_query caps the fleet, and
+/// within that cap a non-zero admission_bytes_per_gpu narrows further by estimated scan
+/// bytes. With neither set, every active GPU is used.
+std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& plan,
+                                           std::vector<int> gpu_ids,
+                                           const sirius_config& config)
+{
+  auto const& op_params = config.get_operator_params();
+  auto const bpg        = op_params.admission_bytes_per_gpu;
+
+  gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
+  auto const n_gpus = static_cast<int>(gpu_ids.size());
+  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+
+  std::vector<const op::sirius_physical_operator*> scans;
+  planner::collect_gpu_scans(plan, scans);
+  std::vector<planner::scan_estimate> estimates;
+  estimates.reserve(scans.size());
+  for (auto const* scan : scans) {
+    estimates.push_back(
+      {static_cast<uint64_t>(scan->estimated_cardinality),
+       planner::estimate_bytes_per_row(scan->types, op_params.avg_variable_column_bytes)});
+  }
+
+  // nullopt means at least one scan carried no usable row estimate; admit the full capped
+  // fleet rather than size the query from what is left.
+  auto const total_bytes = planner::total_scan_bytes(estimates);
+  if (!total_bytes.has_value()) { return gpu_ids; }
+
+  auto const k = planner::gpu_count_for_bytes(*total_bytes, bpg, n_gpus);
+  SIRIUS_LOG_INFO("[gpu_alloc] estimated {} MiB over {} scan(s) -> {} of {} GPU(s)",
+                  *total_bytes / (1024 * 1024),
+                  scans.size(),
+                  k,
+                  n_gpus);
+  gpu_ids.resize(static_cast<size_t>(k));
+  return gpu_ids;
+}
+
+std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_client_context(
   duckdb::ClientContext& context)
 {
   if (not context.registered_state) {
@@ -82,45 +108,59 @@ const telemetry::telemetry_context& get_telemetry_context_from_client_context(
 
 }  // namespace
 
-sirius_engine::sirius_engine(duckdb::ClientContext& context, sirius_interface& sirius_iface)
+sirius_engine::sirius_engine(duckdb::ClientContext& context,
+                             sirius::query_id_t query_id,
+                             const std::optional<std::string>& query_label,
+                             const std::optional<std::string>& session_label)
   : context(context),
-    sirius_iface(sirius_iface),
+    query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_group_uuid_(uuid::now_v7()),
-    query_group_observer_(quent::query_group::create_observer(telemetry_context_.context())),
-    query_handle_(
-      quent::query::create(telemetry_context_.context(),
-                           quent::query::Init{
-                             .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-                             .query_group_id = query_group_uuid_,
-                           }))
+    query_handle_(quent::query::create(
+      telemetry_context_->context(),
+      quent::query::Init{
+        .instance_name  = query_label.value_or("unnamed_query"),
+        .query_group_id = telemetry_context_->query_group_id_for(session_label),
+      }))
 {
-  // Declare the query group under this engine
-  query_group_observer_->declaration(query_group_uuid_,
-                                     quent::query_group::Declaration{
-                                       .instance_name = "default_group",
-                                       .engine_id     = telemetry_context_.engine_id(),
-                                     });
 }
 
 sirius_engine::~sirius_engine() { query_handle_->exit(); }
 
 void sirius_engine::reset()
 {
+  // Before the plan: the query indexes it, so it must not outlive a plan swap.
+  query_.reset();
   sirius_physical_plan = nullptr;
   sirius_owned_plan.reset();
   sirius_root_pipelines.clear();
   root_pipeline_idx = 0;
   total_pipelines   = 0;
   sirius_pipelines.clear();
-  new_pipeline_breakers.clear();
   new_scheduled.clear();
 }
 
 void sirius_engine::cancel_tasks()
 {
+  cancel_dynamic_filter_publications();
   sirius_pipelines.clear();
   sirius_root_pipelines.clear();
+}
+
+void sirius_engine::cancel_dynamic_filter_publications() noexcept
+{
+  if (!query_) { return; }
+  auto cancel = [](op::sirius_physical_operator* candidate) noexcept {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(candidate)) {
+      join->cancel_dynamic_filter_publication();
+    }
+  };
+  for (auto const& pipeline : query_->get_pipelines()) {
+    cancel(pipeline->get_source().get());
+    cancel(pipeline->get_sink().get());
+    for (auto const& op_ref : pipeline->operators) {
+      cancel(&op_ref.get());
+    }
+  }
 }
 
 bool sirius_engine::has_result_collector()
@@ -145,17 +185,12 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   query_handle_->planning();
   reset();
   sirius_owned_plan = std::move(plan);
-  // Pre-fetch and fully materialize iceberg delete data before initialize_internal()
-  // assigns operator IDs to pipeline-breaker operators (PARTITION, CONCAT, etc.).
-  // All DuckDB connections are opened under InternalQueryGuard so that
-  // QueryBegin/QueryEnd side-effects on the shared SiriusContext are suppressed.
-  prefetch_iceberg_delete_data(*sirius_owned_plan);
   initialize_internal(*sirius_owned_plan);
 }
 
 void sirius_engine::execute()
 {
-  nvtx3::scoped_range nvtx_range{"sirius::query"};
+  nvtx_scoped_range nvtx_range{"sirius::query"};
   query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -163,34 +198,53 @@ void sirius_engine::execute()
     throw invalid_input_exception("Sirius context is not initialized.");
   }
 
-  // Create the query with the pipelines
-  sirius_ctx->create_query(std::move(new_scheduled),
-                           telemetry::query_telemetry_info{
-                             .query_id  = query_handle_->uuid(),
-                             .worker_id = telemetry_context_.worker_id(),
-                           });
-  auto future = sirius_ctx->get_task_scheduler().start_query();
+  // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
+  // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
+  // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
+  auto const telemetry_uuid = query_handle_->uuid();
+  SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
+                  query_id_,
+                  telemetry_uuid.high_bits,
+                  telemetry_uuid.low_bits);
+
+  // This query's completion signal. Owned here, shared down to every task via its pipeline's
+  // global state, so no cross-query subsystem holds a "current query" handler.
+  completion_handler_ = std::make_shared<pipeline::completion_handler>();
+  auto future         = completion_handler_->get_awaitable();
+
+  // Create the query with the pipelines. It is owned here, alongside the plan it indexes.
+  query_ = sirius_ctx->create_query(std::move(new_scheduled),
+                                    query_id_,
+                                    completion_handler_,
+                                    telemetry::query_telemetry_info{
+                                      .telemetry_query_id = telemetry_uuid,
+                                      .worker_id          = telemetry_context_->worker_id(),
+                                      .query_id           = query_id_,
+                                    });
+  sirius_ctx->get_task_scheduler().start_query(*query_);
   try {
     future.get();
-    sirius_ctx->get_task_scheduler().wait_for_completion();
+    sirius_ctx->get_task_scheduler().wait_for_completion(query_id_);
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    cancel_dynamic_filter_publications();
     // Drain all in-flight GPU tasks before returning.  QueryEnd() will call
     // clear_all_repositories() immediately after execute() throws; without
     // this drain, tasks still running in the thread pool hold raw pointers to
     // those repositories and cause a use-after-free / heap corruption.
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   } catch (...) {
     SIRIUS_LOG_ERROR("Unknown error executing query");
-    sirius_ctx->get_task_scheduler().drain_after_error();
+    cancel_dynamic_filter_publications();
+    sirius_ctx->get_task_scheduler().drain_after_error(query_id_);
     throw;
   }
 
   // All tasks completed — operators and pipelines are still alive here.
   // Warn about any intermediate operators that were never finalized.
-  if (auto query = sirius_ctx->get_query()) {
-    for (const auto& pipeline : query->get_pipelines()) {
+  if (query_) {
+    for (const auto& pipeline : query_->get_pipelines()) {
       for (const auto& op_ref : pipeline->get_operators()) {
         const auto& op = op_ref.get();
         if (!op.finalized.load()) {
@@ -203,149 +257,6 @@ void sirius_engine::execute()
   }
 }
 
-duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(
-  op::sirius_physical_operator* op)
-{
-  if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" ||
-        scan_physical_op.function.name == "read_parquet") {
-      // Gather the configured GPU device ids so the parquet-scan op can build
-      // one translated filter tree per GPU (scalars end up on the right device
-      // for each task's dispatch target). Falls back to the current device if
-      // SiriusContext is not yet registered.
-      std::vector<int> gpu_device_ids;
-      auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-      if (ctx != nullptr) {
-        for (auto const* space :
-             ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-          gpu_device_ids.push_back(space->get_device_id());
-        }
-      }
-      return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op,
-                                                                 std::move(gpu_device_ids));
-    } else if (scan_physical_op.function.name == "iceberg_scan") {
-      return construct_iceberg_scan_operator(scan_physical_op);
-    } else if (scan_physical_op.function.name == "seq_scan") {
-      return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
-    } else {
-      throw std::runtime_error("Unsupported scan function: " + scan_physical_op.function.name);
-    }
-  } else if (op->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
-    auto& group_by_physical_op = op->Cast<op::sirius_physical_grouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_grouped_aggregate_merge>(&group_by_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::ORDER_BY) {
-    auto& order_by_physical_op = op->Cast<op::sirius_physical_order>();
-    return duckdb::make_uniq<op::sirius_physical_merge_sort>(&order_by_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::TOP_N) {
-    auto& topn_physical_op = op->Cast<op::sirius_physical_top_n>();
-    return duckdb::make_uniq<op::sirius_physical_top_n_merge>(&topn_physical_op);
-  } else if (op->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
-    auto& ungrouped_agg_physical_op = op->Cast<op::sirius_physical_ungrouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
-      &ungrouped_agg_physical_op);
-  } else {
-    throw internal_exception("Unsupported operator type" +
-                             SiriusPhysicalOperatorToString(op->type) +
-                             " for constructing sirius specific operator.");
-  }
-}
-
-/// Resolve the Iceberg table path from the scan operator.
-/// For file-based scans: parameters[0] contains the path.
-/// For REST catalog scans: parameters is empty; derive path from bind_data's
-/// first data file (strip /data/filename.parquet to get the table root).
-static std::string resolve_iceberg_table_path(op::sirius_physical_table_scan& scan_op)
-{
-  if (!scan_op.parameters.empty()) { return scan_op.parameters[0].ToString(); }
-
-  // REST catalog: derive from bind_data file list.
-  if (scan_op.bind_data) {
-    auto& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
-    if (bind_data.file_list && !bind_data.file_list->IsEmpty()) {
-      auto files = bind_data.file_list->GetAllFiles();
-      if (!files.empty()) {
-        auto const& first_path = files[0].path;
-        // Strip "/data/<filename>" to get table root.
-        auto data_pos = first_path.rfind("/data/");
-        if (data_pos != std::string::npos) { return first_path.substr(0, data_pos); }
-      }
-    }
-  }
-  return {};
-}
-
-duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_iceberg_scan_operator(
-  op::sirius_physical_table_scan& scan_op)
-{
-  auto iceberg_scan = duckdb::make_uniq<op::sirius_physical_iceberg_scan>(&scan_op);
-
-  auto table_path = resolve_iceberg_table_path(scan_op);
-  if (!table_path.empty()) {
-    auto it = iceberg_delete_data_cache_.find(table_path);
-    if (it != iceberg_delete_data_cache_.end()) { iceberg_scan->delete_data = it->second; }
-  }
-
-  return iceberg_scan;
-}
-
-void sirius_engine::prefetch_iceberg_delete_data(op::sirius_physical_operator& plan)
-{
-  // Walk the plan tree and fully materialize delete data for every iceberg scan.
-  // This runs in initialize() BEFORE initialize_internal() so that operator IDs
-  // for pipeline-breaker nodes (PARTITION, CONCAT, …) haven't been assigned yet.
-  // All DuckDB connections (for positional-delete reads, snapshot queries) are
-  // opened under a single InternalQueryGuard to prevent transaction side-effects.
-
-  if (plan.type != op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    if (plan.type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-      auto& collector = plan.Cast<op::sirius_physical_result_collector>();
-      prefetch_iceberg_delete_data(collector.plan);
-    } else {
-      for (auto& child : plan.children) {
-        prefetch_iceberg_delete_data(*child);
-      }
-    }
-    return;
-  }
-
-  auto& scan_op = plan.Cast<op::sirius_physical_table_scan>();
-  if (scan_op.function.name != "iceberg_scan") { return; }
-
-  std::string const table_path = resolve_iceberg_table_path(scan_op);
-  if (table_path.empty()) { return; }
-  if (iceberg_delete_data_cache_.count(table_path)) { return; }  // already fetched
-
-  // Extract snapshot parameters if present (for snapshot-aware delete discovery).
-  std::optional<uint64_t> snapshot_id;
-  auto sid_it = scan_op.named_parameters.find("snapshot_from_id");
-  if (sid_it != scan_op.named_parameters.end() && !sid_it->second.IsNull()) {
-    snapshot_id = sid_it->second.GetValue<uint64_t>();
-  }
-
-  // Opening secondary connections triggers QueryBegin/QueryEnd on the shared
-  // SiriusContext.  InternalQueryGuard suppresses those side-effects.
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    SIRIUS_LOG_WARN("[sirius_engine] SiriusContext not available; treating iceberg '{}' as V1.",
-                    table_path);
-    iceberg_delete_data_cache_.emplace(table_path, std::make_shared<op::scan::IcebergDeleteData>());
-    return;
-  }
-
-  duckdb::SiriusContext::InternalQueryGuard guard(*sirius_ctx);
-
-  auto& scan_mgr  = sirius_ctx->get_scan_manager();
-  auto datasource = scan_mgr.create_datasource(table_path);
-  if (!datasource) {
-    throw std::runtime_error(
-      "[sirius_engine] read_iceberg_delete_data: no IO backend supports path: " + table_path);
-  }
-  auto data =
-    op::scan::read_iceberg_delete_data(context, table_path, datasource->io_ctx(), snapshot_id);
-  iceberg_delete_data_cache_.emplace(table_path, std::move(data));
-}
-
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 {
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -354,41 +265,75 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       "Sirius context is not initialized. Check that SIRIUS_DISABLE is not set "
       "and review extension loading logs for errors.");
   }
-  const sirius::operator_params& op_params = sirius_ctx_ptr->get_config().get_operator_params();
 
   sirius_physical_plan = &plan;
 
-  // Create plan-time build context (decoupled from engine)
-  pipeline::pipeline_build_context build_ctx;
-  build_ctx.preserve_insertion_order =
-    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context);
-  build_ctx.num_gpus = static_cast<int>(sirius_ctx_ptr->get_config().get_hw_topology().gpus.size());
+  std::vector<int> gpu_ids;
+  for (auto const* space : sirius_ctx_ptr->get_memory_manager().get_memory_spaces_for_tier(
+         cucascade::memory::Tier::GPU)) {
+    if (space != nullptr) { gpu_ids.push_back(space->get_device_id()); }
+  }
+  std::sort(gpu_ids.begin(), gpu_ids.end());
+  gpu_ids.erase(std::unique(gpu_ids.begin(), gpu_ids.end()), gpu_ids.end());
+
+  // Admit the query here, before anything downstream is built, so that the build context,
+  // partition->GPU routing and the scan round-robin all derive from this one list. Order
+  // matters: task_creator holds it, and create_query later reads it back for scan_manager.
+  auto const full_gpu_count = gpu_ids.size();
+  std::vector<int> active_gpu_ids =
+    compute_admission_gpu_ids(plan, std::move(gpu_ids), sirius_ctx_ptr->get_config());
+  sirius_ctx_ptr->get_task_creator().set_active_gpu_ids(query_id_, active_gpu_ids, full_gpu_count);
+  try {
+    std::string gpu_list;
+    for (auto id : active_gpu_ids) {
+      if (!gpu_list.empty()) { gpu_list += ", "; }
+      gpu_list += std::to_string(id);
+    }
+    SIRIUS_LOG_INFO("[gpu_alloc] query allocated {} GPU(s): [{}]", active_gpu_ids.size(), gpu_list);
+  } catch (...) {  // best-effort observability
+  }
+
+  auto query_operator_params =
+    std::make_shared<sirius::operator_params>(sirius_ctx_ptr->get_config().get_operator_params());
+  query_operator_params->like_swar_fastpath = duckdb::like_swar_fastpath_enabled(context);
+
+  // Create the plan-time context with one immutable snapshot of query policy.
+  const pipeline::pipeline_build_context build_ctx{
+    sirius_ctx_ptr->get_telemetry_context(),
+    duckdb::Settings::Get<duckdb::PreserveInsertionOrderSetting>(context),
+    std::move(active_gpu_ids),
+    std::move(query_operator_params)};
+
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*sirius_physical_plan,
+                                                                  /*parent=*/nullptr);
+  sirius::planner::sirius_physical_plan_generator::mark_fusable_merge_pipelines(
+    context, *sirius_physical_plan);
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
-  auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+  auto root_pipeline = std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
   root_pipeline->build(*sirius_physical_plan);
   root_pipeline->ready();
   root_pipeline->get_pipelines(sirius_root_pipelines, false);
   root_pipeline_idx = 0;
 
   // Convert meta-pipelines into execution-ready pipelines
-  pipeline::sirius_pipeline_converter converter(
-    build_ctx, op_params, &iceberg_delete_data_cache_, &context);
+  pipeline::sirius_pipeline_converter converter(build_ctx);
   auto result = converter.convert(*root_pipeline);
 
+  auto repo_manager = sirius_ctx_ptr->get_data_repository_manager(query_id_);
+  if (!repo_manager) {
+    throw sirius::internal_exception(
+      "sirius_engine::initialize_internal: no data repository manager registered for query {}; "
+      "the engine must run inside a SiriusContext execution window",
+      query_id_);
+  }
+
   // Materialize plan-time wiring descriptors into runtime repositories and ports.
-  pipeline::materialize_repository_wiring(result.repository_wirings,
-                                          sirius_ctx_ptr->get_data_repository_manager());
+  pipeline::materialize_repository_wiring(result.repository_wirings, *repo_manager);
 
-  new_scheduled         = std::move(result.scheduled_pipelines);
-  new_pipeline_breakers = std::move(result.inserted_operators);
-  total_pipelines       = result.meta_pipeline_count;
-
-  // NOTE: dead code preserved for operator ID numbering stability
-  auto invalid_op = make_uniq<op::sirius_physical_operator>(
-    op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<sirius::logical_type>{}, 0);
+  new_scheduled   = std::move(result.scheduled_pipelines);
+  total_pipelines = result.meta_pipeline_count;
 
   // Collect all pipelines for progress tracking
   root_pipeline->get_pipelines(sirius_pipelines, true);

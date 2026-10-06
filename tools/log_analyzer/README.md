@@ -35,6 +35,7 @@ set of metrics this parser depends on.
 ├── _index.csv                  # one row per kept analytical query
 ├── _summary.json               # totals, parser version, format-drift warnings
 ├── _pipeline_aggregates.csv    # one row per (query, pipeline_id) — cross-query
+├── _operator_aggregates.csv    # one row per (query, pipeline_id, operator_id) — cross-query
 └── 2026-05-20_14-25-02.368/    # one folder per kept query, name = QueryBegin ts
     ├── query.sql               # SQL text as it appeared in the log (often truncated)
     ├── query_meta.json         # begin/end ts, duration, status, per-metric counts
@@ -59,10 +60,17 @@ set of metrics this parser depends on.
 
 ### `_pipeline_aggregates.csv`
 
-One row per (query, pipeline_id) summarizing all the per-task metrics for that
-pipeline within that query. Designed so a skill can answer questions like
-"which pipeline used the most memory across all TPC-H Q9 runs?" without having
-to walk each per-query folder.
+One row per (query, pipeline_id) holding the metrics that are only meaningful
+at the pipeline level: the pipeline begin/end window, its set of operator
+types, pipeline-wide output/timing sums, and all of the memory-reservation and
+memory-history figures. The memory metrics live here (not in the per-operator
+table) because the log emits them once per task for the whole pipeline chain —
+they carry no `operator_id` and cannot be attributed to a single operator.
+
+Per-operator input/output/timing sums live in `_operator_aggregates.csv` (see
+below). The per-task **input** sums are intentionally *not* in this table:
+summing `input_num_rows` across a pipeline double-counts data that flows from
+one operator into the next, which produced misleading numbers.
 
 | Column | Source | Notes |
 |---|---|---|
@@ -71,10 +79,8 @@ to walk each per-query folder.
 | `pipeline_id` | grouping key |  |
 | `pipeline_begin` | `min(timestamp)` from `task_inputs.csv` | earliest task input |
 | `pipeline_end` | `max(timestamp)` from `task_outputs.csv` | latest task output |
-| `num_tasks` | `count(*)` from `task_outputs.csv` |  |
+| `num_tasks` | distinct `task_id` count from `task_outputs.csv` | falls back to row count for pre-multi-GPU logs (no `task=` field) |
 | `operator_types` | comma-joined distinct op types from `task_outputs.csv` | first-seen order; sourced from outputs so scan pipelines (`GPU_PARQUET_SCAN`, `DUCKDB_SCAN`) — which emit no task_inputs — are still populated |
-| `sum_input_num_rows` | sum from `task_inputs.csv` |  |
-| `sum_input_size_bytes` | sum from `task_inputs.csv` |  |
 | `sum_output_num_rows` | sum from `task_outputs.csv` |  |
 | `sum_output_size_bytes` | sum from `task_outputs.csv` |  |
 | `sum_output_peak_allocated_bytes` | sum from `task_outputs.csv` |  |
@@ -95,6 +101,37 @@ to walk each per-query folder.
 > per-task work. Summing them across tasks produces a misleading number; we
 > use min/max instead. `history_reservation_bytes` (from `memory_history.csv`)
 > is a separate per-record figure and IS summed.
+
+### `_operator_aggregates.csv`
+
+One row per (query, pipeline_id, operator_id) summarizing the per-task metrics
+attributed to an individual operator. Grouped from `task_inputs.csv` /
+`task_outputs.csv` (the only metrics that carry an `operator_id`), so — unlike
+the pipeline table — the input sums here are correct: each operator's inputs
+are its own, not the whole pipeline's.
+
+Rows are sorted by `query_begin_ts`, then `pipeline_id`, then `operator_begin`
+(so the operators within each pipeline appear in the order they run — `min(task_id)`
+cannot order them because every task flows through every operator and so shares
+the same min), then `operator_id` as a final tiebreak.
+
+| Column | Source | Notes |
+|---|---|---|
+| `query_begin_ts` | QueryBegin line | grouping / sort key |
+| `sql_preview` | first 120 chars of SQL | for human readability |
+| `pipeline_id` | grouping / sort key |  |
+| `operator_id` | grouping key | from the `(id=N)` field |
+| `operator_type` | from `task_outputs.csv` | single type for this operator |
+| `operator_begin` | `min(timestamp)` from `task_outputs.csv` | earliest output for this operator |
+| `operator_end` | `max(timestamp + execution_time_ms)` from `task_outputs.csv` | latest completion for this operator |
+| `num_tasks` | distinct `task_id` count from `task_outputs.csv` | falls back to row count for pre-multi-GPU logs |
+| `sum_input_num_rows` | sum from `task_inputs.csv` |  |
+| `sum_input_size_bytes` | sum from `task_inputs.csv` |  |
+| `sum_output_num_rows` | sum from `task_outputs.csv` |  |
+| `sum_output_size_bytes` | sum from `task_outputs.csv` |  |
+| `sum_output_peak_allocated_bytes` | sum from `task_outputs.csv` |  |
+| `sum_execution_time_ms` | sum from `task_outputs.csv` |  |
+| `max_execution_time_ms` | max from `task_outputs.csv` |  |
 
 ### `pipeline_plan.json`
 
@@ -156,12 +193,26 @@ leading whitespace, case-insensitive) starts with `select ` or `with `.
 Skipped: ATTACH, USE, SET, CREATE VIEW, CREATE TABLE, BEGIN, COMMIT, LOAD,
 INSTALL, DROP, COPY, CALL, RESET, INSERT, …
 
+## Keyed execution windows (SHAPE 1.7)
+
+Current logs carry a correlation key on every execution-window line:
+`[window] begin/end instance=<ptr> connection=<N> window=<N> query=<N>
+outcome=<ok|unwind|cleanup_failed|begin_failed|->`, and the pool/SQL lines
+inside a window repeat the same key. When `[window]` lines are present the
+segmenter pairs segments by `(instance, connection, window)` — the
+authoritative boundary — and joins the SQL by `(instance, connection, query)`.
+`QuerySegment` then exposes `instance`, `connection_id`, `window_id`,
+`query_id` and `outcome`. `verify_query_lifecycle_segments.py` runs a
+concurrent two-connection scenario against the real engine and cross-checks
+the segmenter's output line-by-line against a raw parse of the same log.
+
 ## Incomplete queries
 
 A `QueryBegin` with no matching `QueryEnd` (log truncated, crash) is still
-parsed with `status="incomplete"` in `query_meta.json` and `_index.csv`. The
-matching for QueryEnd stops at the next QueryBegin to avoid swallowing the
-following query.
+parsed with `status="incomplete"` in `query_meta.json` and `_index.csv`. On
+keyed logs an incomplete window is capped at the next window-begin; on legacy
+keyless logs the positional matching for QueryEnd stops at the next QueryBegin
+to avoid swallowing the following query.
 
 ## Format drift detection
 
@@ -199,7 +250,7 @@ tools/log_analyzer/
 ├── parse_logs.py        # CLI orchestrator
 ├── segmenter.py         # Splits log into per-query segments
 ├── plan_parser.py       # Parses === Pipeline Overview === block
-├── aggregator.py        # Builds _pipeline_aggregates.csv
+├── aggregator.py        # Builds _pipeline_aggregates.csv + _operator_aggregates.csv
 ├── patterns.py          # All anchors + regexes (single source of truth)
 ├── validators.py        # Format-drift tracking
 ├── metrics/

@@ -18,11 +18,19 @@
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/data_utils.hpp"
 
 #include <catch.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <op/sirius_physical_concat.hpp>
+#include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 
+#include <array>
 #include <numeric>
 
 using namespace duckdb;
@@ -35,7 +43,106 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+struct partition_barrier_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius_physical_hash_join> join;
+  sirius_physical_partition* probe_partition = nullptr;
+  sirius_physical_partition* build_partition = nullptr;
+};
+
+partition_barrier_fixture make_partition_barrier_fixture(duckdb::JoinType join_type)
+{
+  partition_barrier_fixture fixture;
+  fixture.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  fixture.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+
+  auto make_child = [] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      1);
+  };
+
+  duckdb::JoinCondition condition;
+  condition.left =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  condition.right =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  conditions.push_back(std::move(condition));
+
+  fixture.join = duckdb::make_uniq<sirius_physical_hash_join>(
+    *fixture.logical_join,
+    make_child(),
+    make_child(),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    duckdb::vector<std::size_t>{},
+    duckdb::vector<std::size_t>{},
+    duckdb::vector<sirius::logical_type>{},
+    1);
+
+  auto wrap_side = [&](std::size_t child_idx, bool is_build) {
+    auto child       = std::move(fixture.join->children[child_idx]);
+    auto child_types = child->types;
+    auto partition =
+      duckdb::make_uniq<sirius_physical_partition>(child_types, 1, fixture.join.get(), is_build);
+    auto* partition_ptr = partition.get();
+    partition->children.push_back(std::move(child));
+
+    auto concat =
+      duckdb::make_uniq<sirius_physical_concat>(child_types, 1, fixture.join.get(), is_build);
+    concat->children.push_back(std::move(partition));
+    fixture.join->children[child_idx] = std::move(concat);
+    return partition_ptr;
+  };
+
+  fixture.probe_partition = wrap_side(0, false);
+  fixture.build_partition = wrap_side(1, true);
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*fixture.join, nullptr);
+  return fixture;
+}
 }  // namespace
+
+TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence",
+          "[physical_partition][partition_barrier]")
+{
+  auto fixture = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  REQUIRE(fixture.probe_partition->get_parent_op()->type == SiriusPhysicalOperatorType::CONCAT);
+  REQUIRE(fixture.probe_partition->get_parent_op()->get_parent_op() == fixture.join.get());
+
+  sirius_physical_operator order_by{
+    SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
+  CHECK(fixture.probe_partition->input_barrier_for(order_by) == MemoryBarrierType::PIPELINE);
+
+  for (auto producer_type : std::array{SiriusPhysicalOperatorType::PARTITION,
+                                       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE,
+                                       SiriusPhysicalOperatorType::TOP_N,
+                                       SiriusPhysicalOperatorType::SORT_PARTITION}) {
+    CAPTURE(producer_type);
+    sirius_physical_operator producer{producer_type, duckdb::vector<sirius::logical_type>{}, 0};
+    CHECK(fixture.probe_partition->input_barrier_for(producer) == MemoryBarrierType::FULL);
+  }
+
+  sirius_physical_operator projection{
+    SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
+  CHECK(fixture.probe_partition->input_barrier_for(projection) == MemoryBarrierType::PARTIAL);
+}
+
+TEST_CASE("sirius_physical_partition barrier hook preserves build and right-family barriers",
+          "[physical_partition][partition_barrier]")
+{
+  sirius_physical_operator projection{
+    SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
+
+  auto inner = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  CHECK(inner.build_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
+
+  auto right = make_partition_barrier_fixture(duckdb::JoinType::RIGHT);
+  CHECK(right.probe_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
+}
 
 TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single partition key",
                    "[physical_partition]",
@@ -104,8 +211,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::move(table), *space, cudf::get_default_stream());
-  auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+  auto input_batch = data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   // this cardinality is not real, we are setting here this large in order to force more partitions
   // to be made
@@ -128,7 +234,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 is int32_t
@@ -228,8 +334,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::move(table), *space, cudf::get_default_stream());
-  auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+  auto input_batch = data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   std::size_t partition_size = 10000000;
   // this cardinality is not real, we are setting here this large in order to force more partitions
@@ -253,7 +358,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                                                              estimated_cardinality);
 
   sirius_physical_partition partitioner(
-    partitioner_types, estimated_cardinality, &grouped_aggregator, false, partition_size);
+    partitioner_types, estimated_cardinality, &grouped_aggregator, false);
 
   // Compute num_partitions from estimated bytes: cardinality * bytes_per_row / partition_size
   // col0 is Traits::type, col1 and col2 are int32_t
@@ -312,8 +417,7 @@ TEST_CASE(
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(
     std::move(table), *space, cudf::get_default_stream());
-  auto input_batch =
-    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
+  auto input_batch = data_batch::make(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   std::size_t estimated_cardinality = num_values;
 
@@ -349,4 +453,196 @@ TEST_CASE(
   REQUIRE(sirius::get_cudf_table_view(
             *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
             .num_rows() == num_values);
+}
+
+namespace {
+
+struct sizing_source : sirius_physical_operator {
+  sizing_source() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
+
+  std::optional<std::size_t> total_source_output_bytes() const override { return projected_bytes; }
+  std::optional<std::size_t> projected_bytes;
+};
+
+struct sizing_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit sizing_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+  bool is_pipeline_finished() const override { return finished; }
+  bool finished = false;
+};
+
+// Observe the sizing input at the consumer boundary, without context-level test counters.
+// NESTED_LOOP_JOIN supplies a key-free partition; these tests exercise scheduling, not hashing.
+struct sizing_consumer : sirius_physical_partition_consumer_operator {
+  sizing_consumer()
+    : sirius_physical_partition_consumer_operator(
+        SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, {}, 0)
+  {
+  }
+
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override
+  {
+    inputs.push_back(in.total_bytes);
+    count = natural_num_partitions(in.total_bytes, target_bytes, 1);
+    return partition_strategy{
+      count, false, false, partition_placement::unpinned(static_cast<std::size_t>(count))};
+  }
+
+  uint64_t target_bytes = 1;
+  int count             = 0;
+  std::vector<uint64_t> inputs;
+};
+
+struct partition_sizing_fixture {
+  explicit partition_sizing_fixture(bool enabled = true)
+    : partition({}, 0, &consumer, false, nullptr, enabled)
+  {
+    // This fixture bypasses plan conversion, which normally assigns IDs before port wiring.
+    source.operator_id    = 0;
+    partition.operator_id = 1;
+    consumer.operator_id  = 2;
+
+    auto* space = memory_manager->get_memory_space(Tier::GPU, 0);
+    REQUIRE(space != nullptr);
+    auto stream = default_stream();
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(
+      std::vector<int32_t>(100, 1), stream, get_resource_ref(*space)));
+    auto representation = std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::move(columns)), *space, stream);
+    received_bytes = representation->get_size_in_bytes();
+    REQUIRE(received_bytes > 0);
+    consumer.target_bytes = received_bytes;
+    repo.add_data_batch(data_batch::make(sirius::get_next_batch_id(), std::move(representation)));
+
+    source.set_pipeline(producer);
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_source(*producer, source);
+    build_state.set_pipeline_operators(*producer, {source});
+    build_state.set_pipeline_sink(
+      *producer, sirius::optional_ptr<sirius_physical_operator>(&source), 0);
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = enabled ? MemoryBarrierType::PARTIAL : MemoryBarrierType::FULL;
+    port->repo         = &repo;
+    port->src_pipeline = producer;
+    partition.add_port("default", std::move(port));
+  }
+
+  void finish(std::size_t bytes)
+  {
+    producer->get_memory_history().record(
+      sirius::pipeline::task_memory_record{bytes, bytes, bytes});
+    producer->finished = true;
+  }
+
+  decltype(sirius::test::operator_utils::initialize_memory_manager()) memory_manager =
+    sirius::test::operator_utils::initialize_memory_manager();
+  sirius::pipeline::pipeline_build_context context{nullptr, true};
+  std::shared_ptr<sizing_pipeline> producer = std::make_shared<sizing_pipeline>(context);
+  sizing_source source;
+  shared_data_repository repo;
+  sizing_consumer consumer;
+  sirius_physical_partition partition;
+  std::size_t received_bytes = 0;
+};
+
+}  // namespace
+
+TEST_CASE("partition sizing uses a projection and keeps its first decision",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = 4 * f.received_bytes;
+  auto hint                = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  // Scheduling and sizing must agree even if the source projection changes between them.
+  f.source.projected_bytes = 6 * f.received_bytes;
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
+  CHECK(f.consumer.count == 4);
+  // The consumer's placement is latched with the count.
+  REQUIRE(f.consumer.placement() != nullptr);
+  CHECK(f.consumer.placement()->num_partitions() == 4);
+
+  // A later sizing attempt must keep the count, even when the final total differs.
+  f.finish(8 * f.received_bytes);
+  CHECK_FALSE(f.partition.get_next_task_input_data());
+  CHECK(f.consumer.inputs.size() == 1);
+}
+
+TEST_CASE("partition sizing waits for an estimate even with a queued batch",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  auto hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK(hint->producer == &f.source);
+  CHECK(f.consumer.inputs.empty());
+
+  // Completion supplies an exact total even when no projection was available.
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+  CHECK(f.partition.no_history_peak_memory_estimate({1, f.received_bytes}) == 0);
+}
+
+TEST_CASE("partition sizing uses completed output instead of a stale source projection",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = 8 * f.received_bytes;
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("partition sizing floors a projection at the bytes already received",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = f.received_bytes / 2;
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("disabled partition estimation waits for completion and uses measured input",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f(false);
+  f.source.projected_bytes = 4 * f.received_bytes;
+  auto hint                = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("partition sizing preserves integer bytes above double precision",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  constexpr uint64_t bytes = (uint64_t{1} << 53) + 1;
+  f.consumer.target_bytes  = bytes;
+  SECTION("projected") { f.source.projected_bytes = bytes; }
+  SECTION("upstream complete") { f.finish(bytes); }
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{bytes});
+  CHECK(f.consumer.count == 1);
 }

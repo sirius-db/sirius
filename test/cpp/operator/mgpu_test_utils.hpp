@@ -32,6 +32,7 @@
 
 #include "pipeline/task_scheduler.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cuda_runtime.h>
@@ -67,9 +68,16 @@ struct mgpu_env_params {
   uint64_t concat_batch_bytes         = 100'000'000;
   uint64_t max_build_hash_table_bytes = 90'000'000;
   double usage_limit_fraction         = 0.4;
-  int pipeline_num_threads            = 4;
-  int task_creator_num_threads        = 4;
-  int duckdb_scan_num_threads         = 2;
+  // Absolute per-GPU usage cap in bytes. When non-zero this is emitted as
+  // `usage_limit_bytes` (mutually exclusive with usage_limit_fraction per
+  // sirius_config.cpp:201) so a test can impose a small fixed budget that
+  // forces OOM/reschedule regardless of the host GPU's physical capacity —
+  // essential on big-memory parts (e.g. GB200 ~186 GB) where a fraction
+  // would never trigger pressure at unit-test data scales.
+  uint64_t usage_limit_bytes   = 0;
+  int pipeline_num_threads     = 4;
+  int task_creator_num_threads = 4;
+  int duckdb_scan_num_threads  = 2;
 };
 
 /**
@@ -85,11 +93,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << params.num_gpus
     << "\n"
        "  memory:\n"
-       "    gpu:\n"
-       "      usage_limit_fraction: "
-    << params.usage_limit_fraction
-    << "\n"
-       "      reservation_limit_fraction: 1.0\n"
+       "    gpu:\n";
+  if (params.usage_limit_bytes != 0) {
+    f << "      usage_limit_bytes: " << params.usage_limit_bytes << "\n";
+  } else {
+    f << "      usage_limit_fraction: " << params.usage_limit_fraction << "\n";
+  }
+  f << "      reservation_limit_fraction: 1.0\n"
        "    host:\n"
        "      capacity_bytes: 32000000000\n"
        "      initial_number_pools: 10\n"
@@ -97,17 +107,10 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
        "      block_size: 1048576\n"
        "  executor:\n"
        "    scan_manager:\n"
-       "      use_sirius_datasource: true\n"
+       "      backend: sirius\n"
        "    pipeline:\n"
        "      num_threads: "
     << params.pipeline_num_threads
-    << "\n"
-       "    duckdb_scan:\n"
-       "      num_threads: "
-    << params.duckdb_scan_num_threads
-    << "\n"
-       "      cache: "
-    << params.cache
     << "\n"
        "    task_creator:\n"
        "      num_threads: "
@@ -115,12 +118,11 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
     << "\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: "
     << params.scan_task_batch_size
     << "\n"
-       "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: "
     << params.hash_partition_bytes
@@ -133,22 +135,13 @@ inline void write_mgpu_yaml(std::filesystem::path const& yaml_path,
 }
 
 /**
- * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible.
- * Matches the Catch2 v2 WARN+return convention used by the other MGPU tests.
+ * @brief Skip the rest of the TEST_CASE if fewer than 2 GPUs are visible
+ * (see sirius::test::has_gpus). Callers must be tagged [multi_gpu].
  *
  * @return true if the host has >=2 GPUs; the caller MUST still `return;`
  *         when this returns false.
  */
-inline bool require_two_gpus()
-{
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("MGPU operator test requires >=2 GPUs; single-GPU host — skipping");
-    return false;
-  }
-  return true;
-}
+inline bool require_two_gpus() { return sirius::test::has_gpus(2); }
 
 /**
  * @brief RAII wrapper that pauses any active shared test env (so our local
@@ -182,10 +175,9 @@ class scoped_mgpu_env {
    * @brief Test-only accessor for the underlying task_scheduler.
    *
    * Returns a non-owning reference to the task_scheduler instance owned
-   * by the SiriusContext that this fixture wraps. Intended for tests
-   * that need to call test-only mutators (e.g.,
-   * `set_no_pref_rr_counter_for_testing`) between query setup and
-   * execution. Lifetime: the returned reference is valid for the
+   * by the SiriusContext that this fixture wraps. Intended for tests that
+   * need to reach the scheduler between query setup and execution.
+   * Lifetime: the returned reference is valid for the
    * lifetime of the scoped_mgpu_env instance (the SiriusContext is
    * shared across every connection opened against this env via the
    * extension callback's `OnConnectionOpened`).
@@ -219,8 +211,8 @@ inline void generate_parquet_surface(std::filesystem::path const& dir,
                                      int num_files)
 {
   std::filesystem::create_directories(dir);
-  setenv("SIRIUS_DISABLE", "1", 1);
   {
+    sirius::util::env_guard const disabled("SIRIUS_DISABLE", "1");
     duckdb::DuckDB gen_db(nullptr);
     duckdb::Connection gen(gen_db);
     auto create = gen.Query("CREATE TABLE t AS " + create_select_sql + ";");
@@ -234,7 +226,6 @@ inline void generate_parquet_surface(std::filesystem::path const& dir,
       REQUIRE_FALSE(copy->HasError());
     }
   }
-  unsetenv("SIRIUS_DISABLE");
 }
 
 /**
@@ -344,17 +335,20 @@ class scoped_log_dir {
 };
 
 /**
- * @brief Run @p inner_query through gpu_execution on @p con. Returns
- * whether both GPU and CPU reference execution produced identical row
- * sets (string-compare after ORDER BY). Disables fallback so GPU errors
- * are not silently hidden.
+ * @brief Compare @p inner_query through `gpu_execution` with a reference execution.
+ *
+ * The reference may be transparently intercepted by Sirius unless
+ * @p force_cpu_reference is true. Disables fallback so GPU errors are not
+ * silently hidden.
  *
  * The comparison mirrors the one in test_gpu_execution_tpch.cpp's
  * compare_gpu_vs_cpu but stripped down to what the operator MGPU tests
  * need: same row count, same string-ToString on every value after a
  * normalized ORDER BY.
  */
-inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& inner_query)
+inline void require_gpu_matches_cpu(duckdb::Connection& con,
+                                    std::string const& inner_query,
+                                    bool force_cpu_reference = false)
 {
   auto fb = con.Query("SET enable_duckdb_fallback = false;");
   REQUIRE(fb);
@@ -370,7 +364,23 @@ inline void require_gpu_matches_cpu(duckdb::Connection& con, std::string const& 
   if (gpu_result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError()); }
   REQUIRE_FALSE(gpu_result->HasError());
 
+  // The reference run. By default the plain SELECT is transparently intercepted
+  // and run on the GPU again (a GPU-vs-GPU consistency check). When
+  // force_cpu_reference is set, disable interception around it so it executes on
+  // DuckDB CPU — a true correctness oracle, and immune to GPU memory pressure
+  // (so a tight usage_limit_bytes can't turn the reference into a false
+  // failure). Mirrors compare_gpu_vs_cpu's SET gpu_execution=false pattern.
+  if (force_cpu_reference) {
+    auto off = con.Query("SET gpu_execution=false;");
+    REQUIRE(off);
+    REQUIRE_FALSE(off->HasError());
+  }
   auto cpu_result = con.Query(clean_query + ";");
+  if (force_cpu_reference) {
+    auto on = con.Query("SET gpu_execution=true;");
+    REQUIRE(on);
+    REQUIRE_FALSE(on->HasError());
+  }
   REQUIRE(cpu_result);
   REQUIRE_FALSE(cpu_result->HasError());
 

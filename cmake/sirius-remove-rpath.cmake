@@ -1,0 +1,1 @@
+file(RPATH_REMOVE FILE "${EXTENSION}")

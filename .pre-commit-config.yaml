@@ -15,7 +15,7 @@
 # Global exclusions, csv are excluded because they are often test answers, and experimental is out of lint scope.
 # .patch files are verbatim diffs: formatters (trailing-whitespace, end-of-file-fixer)
 # strip the leading context space on blank lines and corrupt `git apply`.
-exclude: \.csv$|\.patch$|^legacy/queries/.*|^experimental/.*
+exclude: \.csv$|\.patch$|^experimental/.*|^src/include/third_party/.*
 
 repos:
   # Standard hooks
@@ -23,11 +23,15 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
-        exclude: 'test/cpp/integration/integration\.duckdb'
+        # Vendored TPC-H / TPC-DS test databases live here and are intentionally large.
+        exclude: 'test/cpp/integration/data/duckdb/.*\.duckdb'
       - id: check-case-conflict
       - id: check-json
       - id: check-merge-conflict
       - id: check-symlinks
+        # These tracked links target the optional .claude/claude-tools submodule,
+        # which lint CI intentionally leaves uninitialized.
+        exclude: '^\.claude/(commands/(commit-push-pr|review)\.md|skills/skill-creator)$'
       - id: check-toml
       - id: check-yaml
       - id: debug-statements
@@ -36,15 +40,20 @@ repos:
       - id: end-of-file-fixer
         exclude: |
           (?x)^(
-            ^legacy/queries/.*|
             ^python/cudf/cudf/tests/data/vocab.txt|
-            .*version-hint\.text$
+            .*version-hint\.text$|
+            ^test/cpp/integration/data/iceberg_conformance/.*\.json$
           )
       - id: mixed-line-ending
       - id: pretty-format-json
         args: [--autofix]
+        # The iceberg conformance corpus is verbatim pyiceberg output, and that is the whole
+        # point of it: the expectations are Apache's, not ours. --autofix re-indents AND sorts
+        # keys, so formatting it would leave the in-tree copy differing from what gen_corpus.py
+        # writes — every regeneration would fail lint, and every lint fix would move the corpus
+        # further from the reference implementation. check-json still validates these files.
+        exclude: '^test/cpp/integration/data/iceberg_conformance/.*\.json$'
       - id: trailing-whitespace
-        exclude: 'test/sql/clickbench-sirius\.test'
   - repo: https://github.com/psf/black
     rev: 25.1.0
     hooks:
@@ -78,9 +87,15 @@ repos:
           [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
   - repo: local
     hooks:
+      - id: rumdl
+        name: rumdl check --fix
+        entry: pixi run --locked rumdl check --fix
+        language: system
+        types: [markdown]
+        require_serial: true
       - id: check-orphan-tests
         name: check for orphaned test files
         entry: python3 scripts/check_orphan_tests.py
         language: system
-        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|test/cpp/orphan_test_allowlist\.txt)$
+        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|cmake/sirius-.*\.cmake|test/cpp/orphan_test_allowlist\.txt)$
         pass_filenames: false

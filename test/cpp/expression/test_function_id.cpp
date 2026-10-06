@@ -19,7 +19,7 @@
 //
 // Round-trips every supported function_id through to_duckdb_function_name /
 // from_duckdb_function_name, verifies the substring/substr alias collapse
-// (D-SUB-1), the std::nullopt return on unknown names, and locks the 27-entry
+// (D-SUB-1), the std::nullopt return on unknown names, and locks the 30-entry
 // ABI cardinality at compile time.
 
 #include "catch.hpp"
@@ -41,8 +41,8 @@ using sirius::to_duckdb_function_name;
 static_assert(std::is_enum_v<function_id>, "sirius::function_id must be an enum class.");
 static_assert(sizeof(function_id) == 2,
               "sirius::function_id is uint16_t-backed (D-01 — locked ABI).");
-static_assert(static_cast<uint16_t>(function_id::error) + 1 == 27,
-              "sirius::function_id has exactly 27 entries (D-01 — locked ABI).");
+static_assert(static_cast<uint16_t>(function_id::constant_or_null) + 1 == 30,
+              "sirius::function_id has exactly 30 entries (D-01 — locked ABI).");
 
 // ============================================================================
 // Round-trip every function_id entry through the name mappers
@@ -100,6 +100,16 @@ TEST_CASE("ast_function_id - mod round-trips through name mappers", "[ast_functi
   auto const id = from_duckdb_function_name(name);
   REQUIRE(id.has_value());
   REQUIRE(*id == function_id::mod);
+}
+
+TEST_CASE("ast_function_id - Substrait arithmetic names resolve to arithmetic ids",
+          "[ast_function_id]")
+{
+  REQUIRE(from_duckdb_function_name("add") == function_id::add);
+  REQUIRE(from_duckdb_function_name("subtract") == function_id::sub);
+  REQUIRE(from_duckdb_function_name("multiply") == function_id::mul);
+  REQUIRE(from_duckdb_function_name("divide") == function_id::div);
+  REQUIRE(from_duckdb_function_name("modulus") == function_id::mod);
 }
 
 TEST_CASE("ast_function_id - substring round-trips through name mappers", "[ast_function_id]")
@@ -181,6 +191,38 @@ TEST_CASE("ast_function_id - regexp_replace round-trips through name mappers", "
   auto const id = from_duckdb_function_name(name);
   REQUIRE(id.has_value());
   REQUIRE(*id == function_id::regexp_replace);
+}
+
+TEST_CASE("ast_function_id - concat round-trips through name mappers", "[ast_function_id]")
+{
+  auto const name = to_duckdb_function_name(function_id::concat);
+  REQUIRE(name == "concat");
+  auto const id = from_duckdb_function_name(name);
+  REQUIRE(id.has_value());
+  REQUIRE(*id == function_id::concat);
+}
+
+TEST_CASE("ast_function_id - concat_operator round-trips through name mappers", "[ast_function_id]")
+{
+  auto const name = to_duckdb_function_name(function_id::concat_operator);
+  REQUIRE(name == "||");
+  auto const id = from_duckdb_function_name(name);
+  REQUIRE(id.has_value());
+  REQUIRE(*id == function_id::concat_operator);
+}
+
+TEST_CASE("ast_function_id - concat() and || resolve to distinct ids (different NULL semantics)",
+          "[ast_function_id]")
+{
+  // concat() ignores NULL args; the || operator propagates NULL, so they must
+  // map to separate function ids.
+  auto const id_fn = from_duckdb_function_name("concat");
+  auto const id_op = from_duckdb_function_name("||");
+  REQUIRE(id_fn.has_value());
+  REQUIRE(id_op.has_value());
+  REQUIRE(*id_fn == function_id::concat);
+  REQUIRE(*id_op == function_id::concat_operator);
+  REQUIRE(*id_fn != *id_op);
 }
 
 TEST_CASE("ast_function_id - year round-trips through name mappers", "[ast_function_id]")
@@ -289,6 +331,16 @@ TEST_CASE("ast_function_id - error round-trips through name mappers", "[ast_func
   auto const id = from_duckdb_function_name(name);
   REQUIRE(id.has_value());
   REQUIRE(*id == function_id::error);
+}
+
+TEST_CASE("ast_function_id - constant_or_null round-trips through name mappers",
+          "[ast_function_id]")
+{
+  auto const name = to_duckdb_function_name(function_id::constant_or_null);
+  REQUIRE(name == "constant_or_null");
+  auto const id = from_duckdb_function_name(name);
+  REQUIRE(id.has_value());
+  REQUIRE(*id == function_id::constant_or_null);
 }
 
 // ============================================================================

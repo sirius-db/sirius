@@ -14,82 +14,21 @@
  * limitations under the License.
  */
 
+// GPU-vs-CPU correctness for ORDER BY / TOP-N with NULLs in the sort key,
+// across every (ASC|DESC) x (NULLS FIRST|LAST) combination (issue #1095).
+//
+// Uses the shared file-backed GpuExecutionFixture so the source table is read
+// through the real GPU DuckDB-native scan, and compares position-sensitively
+// (compare_gpu_vs_cpu_ordered) so NULL placement is actually verified rather
+// than sorted away.
+
 #include <catch.hpp>
 #include <duckdb.hpp>
-#include <utils/sirius_test_env.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 
-#include <cstdint>
-#include <memory>
 #include <string>
-#include <utility>
 
 namespace {
-
-void require_ok(duckdb::Connection& con, const std::string& sql)
-{
-  auto result = con.Query(sql);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-}
-
-std::string strip_trailing_sql(const std::string& sql)
-{
-  auto clean = sql;
-  while (!clean.empty() && (clean.back() == ';' || clean.back() == ' ' || clean.back() == '\n' ||
-                            clean.back() == '\t')) {
-    clean.pop_back();
-  }
-  return clean;
-}
-
-std::string sql_string_literal(const std::string& value)
-{
-  std::string escaped = "'";
-  for (char c : value) {
-    if (c == '\'') { escaped += '\''; }
-    escaped += c;
-  }
-  escaped += "'";
-  return escaped;
-}
-
-std::string query_single_value(duckdb::Connection& con, const std::string& sql)
-{
-  auto result = con.Query(sql);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-  return result->GetValue(0, 0).ToString();
-}
-
-class runtime_setting_guard {
- public:
-  runtime_setting_guard(duckdb::Connection& con, std::string setting, uint64_t value)
-    : con(con),
-      setting(std::move(setting)),
-      old_value(query_single_value(
-        con, "SELECT value FROM duckdb_settings() WHERE name = '" + this->setting + "'"))
-  {
-    require_ok(con, "SET " + this->setting + " = " + std::to_string(value));
-  }
-
-  ~runtime_setting_guard() { restore(); }
-
- private:
-  void restore()
-  {
-    auto result = con.Query("SET " + setting + " = " + old_value);
-    if (!result || result->HasError()) {
-      WARN("Failed to restore " << setting << " to " << old_value
-                                << (result ? ": " + result->GetError() : ""));
-    }
-  }
-
-  duckdb::Connection& con;
-  std::string setting;
-  std::string old_value;
-};
 
 struct null_order_case {
   std::string sort_direction;
@@ -108,64 +47,52 @@ std::string case_name(const null_order_case& order_case)
   return order_case.sort_direction + " NULLS " + order_case.null_position;
 }
 
-class OrderNullsGPUExecutionFixture {
+// Sets a runtime setting for a scope and restores its PREVIOUS value on
+// destruction (not the default), so the setting survives a REQUIRE failure that
+// unwinds out of the test without clobbering an outer override.
+class scoped_setting {
+ public:
+  scoped_setting(sirius::test::GpuExecutionFixture& fixture,
+                 std::string name,
+                 const std::string& value)
+    : fixture(fixture), name(std::move(name)), old_value(read_setting(fixture, this->name))
+  {
+    fixture.run_ok("SET " + this->name + " = " + value + ";");
+  }
+  ~scoped_setting() { fixture.con->Query("SET " + name + " = " + old_value + ";"); }
+
+  scoped_setting(const scoped_setting&)            = delete;
+  scoped_setting& operator=(const scoped_setting&) = delete;
+
+ private:
+  static std::string read_setting(sirius::test::GpuExecutionFixture& fixture,
+                                  const std::string& name)
+  {
+    auto result =
+      fixture.con->Query("SELECT value FROM duckdb_settings() WHERE name = '" + name + "'");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).ToString();
+  }
+
+  sirius::test::GpuExecutionFixture& fixture;
+  std::string name;
+  std::string old_value;
+};
+
+class OrderNullsGPUExecutionFixture : public sirius::test::GpuExecutionFixture {
  public:
   OrderNullsGPUExecutionFixture()
   {
-    REQUIRE(sirius::test::g_integration_env != nullptr);
-    REQUIRE(sirius::test::g_integration_env->is_active());
-    con = std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
-
-    require_ok(*con, "SET enable_duckdb_fallback = false");
-    require_ok(*con,
-               "CREATE TEMP TABLE ord_n AS "
-               "SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE CAST(i % 100 AS INTEGER) END AS k, "
-               "       CAST(i AS INTEGER) AS id "
-               "FROM range(30000) AS t(i)");
+    // Every 7th row has a NULL key; keys otherwise cycle 0..99 so ties exercise
+    // the secondary `id` ordering. Persist to disk for the native GPU scan.
+    run_ok(
+      "CREATE TABLE ord_n AS "
+      "SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE CAST(i % 100 AS INTEGER) END AS k, "
+      "       CAST(i AS INTEGER) AS id "
+      "FROM range(30000) AS t(i);");
+    run_ok("CHECKPOINT;");
   }
-
-  void compare_gpu_vs_cpu_ordered(const std::string& query)
-  {
-    const auto clean_query = strip_trailing_sql(query);
-    require_ok(*con, "DROP TABLE IF EXISTS order_nulls_gpu_result");
-    require_ok(*con, "DROP TABLE IF EXISTS order_nulls_cpu_result");
-    require_ok(*con,
-               "CREATE TEMP TABLE order_nulls_gpu_result AS "
-               "SELECT row_number() OVER () AS observed_position, * "
-               "FROM gpu_execution(" +
-                 sql_string_literal(clean_query) + ")");
-    require_ok(*con,
-               "CREATE TEMP TABLE order_nulls_cpu_result AS "
-               "SELECT row_number() OVER () AS observed_position, * "
-               "FROM (" +
-                 clean_query + ") cpu_result");
-    require_empty(
-      "SELECT * FROM order_nulls_gpu_result "
-      "EXCEPT ALL "
-      "SELECT * FROM order_nulls_cpu_result",
-      "GPU minus CPU");
-    require_empty(
-      "SELECT * FROM order_nulls_cpu_result "
-      "EXCEPT ALL "
-      "SELECT * FROM order_nulls_gpu_result",
-      "CPU minus GPU");
-  }
-
- private:
-  void require_empty(const std::string& sql, const std::string& direction)
-  {
-    auto result = con->Query("SELECT count(*) FROM (" + sql + ") diff");
-    REQUIRE(result);
-    if (result->HasError()) { UNSCOPED_INFO(direction << ": " << result->GetError()); }
-    REQUIRE_FALSE(result->HasError());
-
-    const auto count = result->GetValue(0, 0).GetValue<int64_t>();
-    if (count != 0) { UNSCOPED_INFO(direction << " returned " << count << " unexpected rows"); }
-    REQUIRE(count == 0);
-  }
-
- public:
-  std::unique_ptr<duckdb::Connection> con;
 };
 
 }  // namespace
@@ -174,7 +101,9 @@ TEST_CASE_METHOD(OrderNullsGPUExecutionFixture,
                  "gpu_execution ORDER BY places NULLs correctly for ASC and DESC",
                  "[integration][gpu_execution][order_by][nulls]")
 {
-  runtime_setting_guard max_sort_partition_bytes(*con, "max_sort_partition_bytes", 65536);
+  // Shrink the sort partition so the 30k rows span multiple partitions and the
+  // merge path (not just a single-partition sort) is exercised with NULL keys.
+  scoped_setting sort_partition(*this, "max_sort_partition_bytes", "65536");
 
   for (const auto& order_case : kNullOrderCases) {
     DYNAMIC_SECTION(case_name(order_case))
@@ -195,6 +124,9 @@ TEST_CASE_METHOD(OrderNullsGPUExecutionFixture,
   for (const auto& order_case : kNullOrderCases) {
     DYNAMIC_SECTION(case_name(order_case))
     {
+      // Single sort key only (no tie-break): with LIMIT 50 the boundary
+      // k-value has far more than 50 ties, so the emitted k-values are
+      // deterministic even though which rows fill the ties is not.
       compare_gpu_vs_cpu_ordered(
         "SELECT k "
         "FROM ord_n "

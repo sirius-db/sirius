@@ -20,7 +20,6 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_operator_type.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 
 #include <algorithm>
@@ -276,7 +275,7 @@ std::string render_content_line(const plan_printer_config& config,
 // ============================================================================
 
 sirius_plan_printer::sirius_plan_printer(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
   : pipelines_(pipelines)
 {
 }
@@ -316,9 +315,6 @@ std::vector<std::string> sirius_plan_printer::get_operator_detail_lines(
     case op::SiriusPhysicalOperatorType::TABLE_SCAN:
       scan_name = op.Cast<op::sirius_physical_table_scan>().function.name;
       break;
-    case op::SiriusPhysicalOperatorType::PARQUET_SCAN:
-      scan_name = op.Cast<op::sirius_physical_parquet_scan>().function.name;
-      break;
     default: break;
   }
   if (!scan_name.empty()) { lines.push_back("  scan: " + scan_name); }
@@ -342,7 +338,7 @@ std::string sirius_plan_printer::build_operator_chain(const sirius_pipeline& pip
   return ss.str();
 }
 
-duckdb::shared_ptr<sirius_pipeline> sirius_plan_printer::find_root_pipeline() const
+std::shared_ptr<sirius_pipeline> sirius_plan_printer::find_root_pipeline() const
 {
   for (auto& p : pipelines_) {
     auto sink = p->get_sink();

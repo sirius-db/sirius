@@ -1,0 +1,35 @@
+--- a/cpp/src/preprocessing/quantize/detail/pq.cuh
++++ b/cpp/src/preprocessing/quantize/detail/pq.cuh
+@@ -254,7 +254,7 @@
+   raft::device_matrix_view<DataT, IdxT, raft::row_major> dataset,
+   raft::device_matrix_view<const MathT, uint32_t, raft::row_major> pq_centers,
+   raft::device_matrix_view<const DataT, uint32_t, raft::row_major> vq_centers,
+-  std::optional<raft::device_vector_view<const uint32_t, int64_t>> vq_labels,
++  const uint32_t* vq_labels,
+   const uint32_t pq_bits,
+   bool use_subspaces)
+ {
+@@ -266,7 +266,7 @@
+   const uint32_t pq_len = raft::div_rounding_up_unsafe(dataset.extent(1), pq_centers.extent(1));
+ 
+   LabelT vq_label = 0;
+-  if (vq_labels.has_value()) { vq_label = vq_labels.value()(row_ix); }
++  if (vq_labels != nullptr) { vq_label = vq_labels[row_ix]; }
+   cuvs::preprocessing::quantize::detail::bitfield_view_t code_view{&codes(row_ix, 0), pq_bits};
+   for (uint32_t j = lane_id; j < pq_len; j += SubWarpSize) {
+     const CodeT code = code_view[j];
+@@ -329,7 +329,13 @@
+   }(pq_bits);
+   dim3 blocks(raft::div_rounding_up_safe<IdxT>(n_rows, kBlockSize / threads_per_vec), 1, 1);
+   kernel<<<blocks, threads, 0, stream>>>(
+-    codes, out_vectors, pq_centers, vq_centers, vq_labels, pq_bits, use_subspaces);
++    codes,
++    out_vectors,
++    pq_centers,
++    vq_centers,
++    vq_labels ? vq_labels->data_handle() : nullptr,
++    pq_bits,
++    use_subspaces);
+   RAFT_CUDA_TRY(cudaPeekAtLastError());
+ 
+   return codes;

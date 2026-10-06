@@ -116,18 +116,11 @@ For detecting non-deterministic behavior (e.g., race conditions):
 3. If any differ, report which runs diverged and flag as potential race condition
 4. This can automatically trigger the `/race-check` skill if inconsistency is detected
 
-## Code Scope: New Sirius vs Legacy
+## Code Scope
 
-These skills target **new Sirius** only:
-- **New Sirius:** files using `namespace sirius` -- the active codebase
-- **Legacy Sirius:** files using `namespace duckdb` -- deprecated, should be ignored
-
-**Exception:** The following legacy files are still used by new Sirius and should be included:
-- `src/include/log/*` -- logging infrastructure
-- `src/expression_executor/*` -- expression evaluation
-- `src/sirius_extension.cpp` -- extension entry point
-
-When searching for relevant code, filter to `namespace sirius` files plus the exceptions above.
+The active engine includes code in both `namespace sirius` and `namespace duckdb`.
+Search the relevant `src/` paths and follow call sites; namespace alone does not
+identify whether code participates in execution.
 
 ## Autonomy Mode
 

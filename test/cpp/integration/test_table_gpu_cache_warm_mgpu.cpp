@@ -56,7 +56,6 @@ namespace {
  *
  * Keep aligned with integration-2gpu.yaml except for the two knobs
  * that actually drive the hazard:
- *   - executor.duckdb_scan.cache: table_gpu (warm preload path)
  *   - operator_params.hash_partition_bytes: 1 MiB (force partitioning
  *     of the ~64 MiB self-join working set so sirius_physical_partition's
  *     MGPU floor of `num_gpus` partitions kicks in).
@@ -79,17 +78,13 @@ void write_config(fs::path const& yaml_path)
        "  executor:\n"
        "    pipeline:\n"
        "      num_threads: 4\n"
-       "    duckdb_scan:\n"
-       "      num_threads: 2\n"
-       "      cache: table_gpu\n"
        "    task_creator:\n"
        "      num_threads: 2\n"
        "    downgrade:\n"
        "      num_threads: 1\n"
-       "      monitor_period_ms: 10\n"
+       "      monitor_period: 10ms\n"
        "  operator_params:\n"
        "    scan_task_batch_size: 100000000\n"
-       "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 1000000\n"
        "    concat_batch_bytes: 100000000\n"
@@ -128,16 +123,9 @@ void generate_parquet_surface(fs::path const& tmp_dir, int num_files, int rows_p
 }  // namespace
 
 TEST_CASE("gpu_execution - table_gpu cache warm cross-GPU hazard (follow-up #17)",
-          "[mgpu][followup-17][gpu_execution]")
+          "[mgpu][followup-17][gpu_execution][multi_gpu]")
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN(
-      "follow-up #17 repro requires >=2 GPUs; single-GPU host — skipping "
-      "(per Catch2 v2 WARN+return convention)");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   // The Catch2 listener in unittest.cpp pauses shared envs for TEST_CASEs
   // without [shared_context] or [integration] tags. Be defensive: walk the

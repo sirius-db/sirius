@@ -8,7 +8,7 @@ vcpkg_from_github(
   REF
   v${VERSION}
   SHA512
-  c3959c0e2ddec29cfd5a5978e8499e7e51fac02c609b847aa826159209112d1e0c6ec05aea4f8f0cea81157055b202ff2c318d68b943c3623c4d4f9022b7c119
+  0ea7efa882e13431c4faba60bbc805522436735ed91922987448aa5e64137b44937b66fc2d6bcf8658f2bda71f90fcc0f369cc384cdd481848cbefb5b30c0836
   HEAD_REF
   main)
 
@@ -18,9 +18,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
+  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
   HEAD_REF
   main)
 
@@ -45,7 +45,7 @@ vcpkg_replace_string(
 
 # Ensure vcpkg CCCL headers are found before pixi/conda system CCCL headers. The
 # pixi compiler injects -I flags for its bundled CCCL which may be an older
-# version.
+# version. RMM still includes cuda/stream_ref, deprecated by CCCL 3.4.3.
 vcpkg_cmake_configure(
   SOURCE_PATH
   "${SOURCE_PATH}/cpp"
@@ -56,8 +56,8 @@ vcpkg_cmake_configure(
   -DBUILD_BENCHMARKS=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
+  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER"
+)
 
 vcpkg_cmake_install()
 
@@ -72,6 +72,12 @@ file(
 )
 file(INSTALL ${RAPIDS_LOGGER_CMAKE_FILES}
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/rapids_logger")
+
+# Resolve installed dependencies without build-tree paths or CPM downloads.
+configure_file(
+  "${CMAKE_CURRENT_LIST_DIR}/rapids_logger-dependencies.cmake"
+  "${CURRENT_PACKAGES_DIR}/share/rapids_logger/rapids_logger-dependencies.cmake"
+  COPYONLY)
 
 # create_logger_macros.cmake calls configure_file() on logger_macros.hpp.in,
 # resolved relative to its own install dir. kvikio/cudf 26.06 invoke this macro
@@ -101,16 +107,6 @@ execute_process(
     "${CURRENT_PACKAGES_DIR}/share/rapids_logger/rapids_logger-targets.cmake")
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME rmm CONFIG_PATH lib/cmake/rmm)
-
-# RMM still exports shared CUDA::cudart in its installed target file even when
-# built as a static library. That pulls libcudart.so into the final Sirius
-# loadable extension alongside libcudart_static.a. Rewrite the exported target
-# to prefer the static CUDA runtime for vcpkg consumers.
-file(READ "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake" _rmm_targets)
-string(REGEX REPLACE "CUDA::cudart([;\">])" "CUDA::cudart_static\\1"
-                     _rmm_targets "${_rmm_targets}")
-file(WRITE "${CURRENT_PACKAGES_DIR}/share/rmm/rmm-targets.cmake"
-     "${_rmm_targets}")
 
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")

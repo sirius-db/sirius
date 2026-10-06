@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace sirius::io::parquet_helpers {
 
@@ -168,6 +169,81 @@ duckdb::LogicalType leaf_to_duckdb_type(pq::SchemaElement const& el)
                            el.name + "'");
 }
 
+// A LIST-annotated group wraps the standard 3-level encoding:
+// `<col>(LIST) -> repeated group -> element`.
+bool is_list_annotated(pq::SchemaElement const& el)
+{
+  if (el.logical_type.has_value() && el.logical_type->type == pq::LogicalType::LIST) {
+    return true;
+  }
+  return el.converted_type.has_value() && *el.converted_type == pq::ConvertedType::LIST;
+}
+
+// A MAP-annotated group wraps `<col>(MAP) -> repeated key_value -> {key, value}`.
+// MAP_KEY_VALUE marks the inner key_value group, not the outer column — not a map.
+bool is_map_annotated(pq::SchemaElement const& el)
+{
+  if (el.logical_type.has_value() && el.logical_type->type == pq::LogicalType::MAP) { return true; }
+  return el.converted_type.has_value() && *el.converted_type == pq::ConvertedType::MAP;
+}
+
+// One mapped subtree: the DuckDB type plus the index of the next sibling in the
+// preorder-flattened schema array.
+struct mapped_subtree {
+  duckdb::LogicalType type;
+  std::size_t next;
+};
+
+// Map the subtree rooted at `idx` (preorder) to a DuckDB LogicalType, advancing
+// past it so the caller resumes at the next sibling. Throws on a truncated or
+// malformed nested subtree.
+mapped_subtree map_subtree(pq::FileMetaData const& meta, std::size_t idx)
+{
+  if (idx >= meta.schema.size()) {
+    throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
+  }
+  auto const& el = meta.schema[idx];
+
+  if (el.num_children == 0) { return {leaf_to_duckdb_type(el), idx + 1}; }
+
+  if (is_map_annotated(el)) {
+    // el -> key_value group (idx+1) -> key (idx+2), value (after key subtree)
+    std::size_t const kv = idx + 1;
+    if (kv >= meta.schema.size() || meta.schema[kv].num_children < 2) {
+      throw std::runtime_error("[parquet_helpers] malformed parquet MAP schema for column '" +
+                               el.name + "'");
+    }
+    auto key   = map_subtree(meta, kv + 1);
+    auto value = map_subtree(meta, key.next);
+    return {duckdb::LogicalType::MAP(std::move(key.type), std::move(value.type)), value.next};
+  }
+
+  if (is_list_annotated(el)) {
+    // el -> repeated middle group (idx+1) -> element (idx+2)
+    std::size_t const mid = idx + 1;
+    if (mid >= meta.schema.size() || meta.schema[mid].num_children < 1) {
+      throw std::runtime_error("[parquet_helpers] malformed parquet LIST schema for column '" +
+                               el.name + "'");
+    }
+    auto element = map_subtree(meta, mid + 1);
+    return {duckdb::LogicalType::LIST(std::move(element.type)), element.next};
+  }
+
+  // Plain group with no LIST/MAP annotation => STRUCT over its children.
+  duckdb::child_list_t<duckdb::LogicalType> children;
+  std::size_t cur = idx + 1;
+  for (int c = 0; c < el.num_children; ++c) {
+    if (cur >= meta.schema.size()) {
+      throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
+    }
+    auto const child_name = meta.schema[cur].name;
+    auto child            = map_subtree(meta, cur);
+    children.emplace_back(child_name, std::move(child.type));
+    cur = child.next;
+  }
+  return {duckdb::LogicalType::STRUCT(std::move(children)), cur};
+}
+
 }  // namespace
 
 schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta)
@@ -175,7 +251,9 @@ schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta)
   if (meta.schema.empty()) { throw std::runtime_error("[parquet_helpers] empty parquet schema"); }
 
   // schema[0] is the root group; its children are the top-level columns laid
-  // out in preorder. A flat leaf column occupies exactly one schema element.
+  // out in preorder. A flat leaf occupies one element; a nested column (STRUCT /
+  // LIST / MAP) occupies a whole subtree that map_subtree consumes recursively,
+  // advancing `idx` past it so the next top-level column is mapped correctly.
   auto const& root = meta.schema.front();
   schema_info out;
   std::size_t idx = 1;
@@ -183,16 +261,10 @@ schema_info extract_schema(cudf::io::parquet::FileMetaData const& meta)
     if (idx >= meta.schema.size()) {
       throw std::runtime_error("[parquet_helpers] malformed parquet schema: truncated");
     }
-    auto const& element = meta.schema[idx];
-    if (element.num_children > 0) {
-      throw std::runtime_error(
-        "[parquet_helpers] nested parquet types not yet supported in sirius_read_parquet "
-        "(column '" +
-        element.name + "')");
-    }
-    out.names.push_back(element.name);
-    out.types.push_back(leaf_to_duckdb_type(element));
-    ++idx;
+    out.names.push_back(meta.schema[idx].name);
+    auto mapped = map_subtree(meta, idx);
+    out.types.push_back(std::move(mapped.type));
+    idx = mapped.next;
   }
   return out;
 }

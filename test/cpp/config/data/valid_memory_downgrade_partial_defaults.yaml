@@ -1,0 +1,8 @@
+sirius:
+  memory:
+    gpu:
+      downgrade_trigger_fraction: 0.7
+      downgrade_stop_fraction: null
+    host:
+      downgrade_trigger_fraction: null
+      downgrade_stop_fraction: 0.85

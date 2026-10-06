@@ -122,7 +122,7 @@ bool same_constant(node const& a, node const& b)
   if (!a.holds<constant>() || !b.holds<constant>()) return false;
   auto const& ca = a.get<constant>();
   auto const& cb = b.get<constant>();
-  if (ca.return_type.id() != cb.return_type.id()) return false;
+  if (ca.return_type().id() != cb.return_type().id()) return false;
   // sirius::value alternatives do not all expose operator==; compare via the
   // variant index plus a targeted check for the primitive alternatives the
   // self-equivalence sweep exercises (int32_t covers the BoundConstantExpression

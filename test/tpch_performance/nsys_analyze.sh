@@ -321,6 +321,41 @@ GROUP BY s.value
 ORDER BY total_s DESC;
 
 .print
+.print #### Device Memory Allocation — cudaMalloc Counts
+.print (Raw cudaMalloc on the query hot path bypasses the RMM pool and forces a device
+.print  sync — a common source of unintended perf degradation. Expect 0 in the query
+.print  window on warm iterations; init-phase pool priming is normal. cudaMallocHost is
+.print  excluded here; host pinned allocs are in the section above.)
+SELECT
+    COUNT(*) AS cudamalloc_total,
+    COALESCE(SUM(CASE WHEN r.start >= (SELECT qstart FROM query_window)
+                       AND r.start <  (SELECT qend FROM query_window)
+                      THEN 1 ELSE 0 END), 0) AS during_query,
+    COALESCE(SUM(CASE WHEN r.start <  (SELECT qstart FROM query_window)
+                      THEN 1 ELSE 0 END), 0) AS init,
+    COALESCE(SUM(CASE WHEN r.start >= (SELECT qend FROM query_window)
+                      THEN 1 ELSE 0 END), 0) AS cleanup
+FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+JOIN StringIds s ON r.nameId = s.id
+WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%';
+
+.print
+.print Breakdown by phase and function (during_query rows first):
+SELECT
+    CASE WHEN r.start <  (SELECT qstart FROM query_window) THEN 'init'
+         WHEN r.start >= (SELECT qend FROM query_window) THEN 'cleanup'
+         ELSE 'during_query' END AS phase,
+    s.value AS function,
+    COUNT(*) AS calls,
+    ROUND(SUM(r.end - r.start) / 1e6, 3) AS total_ms,
+    ROUND(MAX(r.end - r.start) / 1e6, 3) AS max_ms
+FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+JOIN StringIds s ON r.nameId = s.id
+WHERE s.value LIKE 'cudaMalloc%' AND s.value NOT LIKE 'cudaMallocHost%'
+GROUP BY phase, s.value
+ORDER BY (phase = 'during_query') DESC, calls DESC;
+
+.print
 .print #### Init/Cleanup Overhead (excluded from query analysis)
 .print (Top CUDA API calls that occur before first operator or after last operator)
 SELECT

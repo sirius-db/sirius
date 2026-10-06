@@ -26,11 +26,44 @@
 #include "duckdb/planner/planner.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <optional>
+#include <stdexcept>
 
 namespace sirius {
+namespace {
+void collect_read_views(op::sirius_physical_operator const& node,
+                        std::shared_ptr<transparent::read_view_registry>& result)
+{
+  std::shared_ptr<transparent::read_view_registry> candidate;
+  if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+    candidate = node.Cast<op::scan::sirius_gpu_scan_operator>().read_views();
+  } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+    candidate = node.Cast<op::sirius_physical_streaming_source>().read_views();
+  }
+  if (candidate) {
+    if (result && result != candidate) {
+      throw std::runtime_error("finalized GPU plan contains multiple read-view registries");
+    }
+    result = std::move(candidate);
+  }
+  for (auto const& child : node.get_children()) {
+    collect_read_views(child.get(), result);
+  }
+}
+}  // namespace
+
+sirius_prepared_statement_data::sirius_prepared_statement_data(
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared_p,
+  duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_p)
+  : sirius_physical_plan(std::move(sirius_physical_plan_p)), prepared(std::move(prepared_p))
+{
+  if (sirius_physical_plan) { collect_read_views(*sirius_physical_plan, read_views); }
+}
 
 void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,
                                         const duckdb::PendingQueryParameters& parameters)
@@ -40,8 +73,11 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
 }
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
-                                   std::optional<std::string> query_label)
-  : client_context(client_context), query_label(std::move(query_label)) {};
+                                   std::optional<std::string> query_label,
+                                   std::optional<std::string> session_label)
+  : client_context(client_context),
+    query_label(std::move(query_label)),
+    session_label(std::move(session_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const
@@ -94,8 +130,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(
   D_ASSERT(sirius_active_query);
   D_ASSERT(sirius_active_query->is_open_result(pending));
   D_ASSERT(sirius_active_query->sirius_prepared->prepared);
-  auto& engine   = get_sirius_engine();
-  auto& prepared = *sirius_active_query->sirius_prepared->prepared;
+  auto& engine = get_sirius_engine();
   duckdb::unique_ptr<duckdb::QueryResult> result;
   D_ASSERT(engine.has_result_collector());
   SIRIUS_LOG_DEBUG("Fetching result from GPU executor");
@@ -133,13 +168,13 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   begin_query_internal(query);
 
-  bool invalidate_query = true;
   duckdb::unique_ptr<duckdb::PendingQueryResult> pending =
-    sirius_pending_statement_internal(context, statement_p, parameters);
+    sirius_pending_statement_internal(context, statement_p, parameters, query_id);
 
   if (pending->HasError()) { return pending; }
   D_ASSERT(sirius_active_query->is_open_result(*pending));
@@ -150,18 +185,20 @@ sirius_interface::sirius_pending_statement_or_prepared_statement(
 duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_statement_internal(
   duckdb::ClientContext& context,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   D_ASSERT(sirius_active_query);
   auto& statement = *(statement_p->prepared);
 
   bind_prepared_statement_parameters(statement, parameters);
 
-  duckdb::unique_ptr<sirius_engine> temp = duckdb::make_uniq<sirius_engine>(context, *this);
-  auto prop                              = temp->context.GetClientProperties();
-  sirius_active_query->engine            = std::move(temp);
-  auto& engine                           = get_sirius_engine();
-  bool stream_result                     = false;
+  duckdb::unique_ptr<sirius_engine> temp =
+    duckdb::make_uniq<sirius_engine>(context, query_id, query_label, session_label);
+  auto prop                   = temp->context.GetClientProperties();
+  sirius_active_query->engine = std::move(temp);
+  auto& engine                = get_sirius_engine();
+  bool stream_result          = false;
 
   duckdb::unique_ptr<op::sirius_physical_result_collector> sirius_collector =
     duckdb::make_uniq_base<op::sirius_physical_result_collector,
@@ -172,7 +209,9 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
       duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  auto types = sirius::to_duckdb_vec(sirius_collector->get_types());
+  // sirius::logical_type drops STRUCT/LIST/MAP children (and throws for LIST),
+  // so use the full DuckDB result types.
+  auto types = sirius_collector->result_column_types;
   D_ASSERT(types == statement.types);
   engine.initialize(std::move(sirius_collector));
 
@@ -215,11 +254,12 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-  const duckdb::PendingQueryParameters& parameters)
+  const duckdb::PendingQueryParameters& parameters,
+  sirius::query_id_t query_id)
 {
   try {
-    auto pending_query =
-      sirius_pending_statement_or_prepared_statement(context, query, statement_p, parameters);
+    auto pending_query = sirius_pending_statement_or_prepared_statement(
+      context, query, statement_p, parameters, query_id);
 
     if (pending_query->HasError()) {
       if (sirius_active_query) { cleanup_internal(nullptr, false); }
@@ -234,6 +274,16 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     SIRIUS_LOG_DEBUG("Done sirius_execute_query");
 
     return result;
+  } catch (duckdb::SiriusBeginWindowFailureException&) {
+    // Rethrown with its dynamic type intact: this query may have part-mutated the shared runtime,
+    // so the entry points must abort it rather than fall back to CPU.
+    if (sirius_active_query) { cleanup_internal(nullptr, false); }
+    throw;
+  } catch (duckdb::SiriusRuntimeUnavailableException&) {
+    // Rethrown with its dynamic type intact: the entry points route it to the CPU fallback that
+    // preserves its message, which an error-carrying result would let the S3 branch rewrite.
+    if (sirius_active_query) { cleanup_internal(nullptr, false); }
+    throw;
   } catch (std::exception& e) {
     if (sirius_active_query) { cleanup_internal(nullptr, false); }
     return sirius_error_result<duckdb::MaterializedQueryResult>(duckdb::ErrorData(e));

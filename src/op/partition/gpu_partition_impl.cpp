@@ -17,9 +17,11 @@
 #include "op/partition/gpu_partition_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "helper/numeric_narrowing.hpp"
 
 #include <cudf/partitioning.hpp>
-#include <cudf/unary.hpp>
+
+#include <cuda_runtime.h>
 
 namespace sirius {
 namespace op {
@@ -29,8 +31,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   const std::vector<int>& partition_key_idx,
   const std::vector<cudf::data_type>& partition_key_cast_types,
   int num_partitions,
-  rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -53,8 +56,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   std::vector<int> effective_key_idx = partition_key_idx;
   for (size_t i = 0; i < partition_key_cast_types.size(); i++) {
     if (partition_key_cast_types[i].id() != cudf::type_id::EMPTY) {
-      auto cast_col =
-        cudf::cast(input_table.column(partition_key_idx[i]), partition_key_cast_types[i], stream);
+      auto cast_col = sirius::cast_through_rep(
+        input_table.column(partition_key_idx[i]), partition_key_cast_types[i], stream);
       effective_key_idx[i] = static_cast<int>(all_col_views.size());
       all_col_views.push_back(cast_col->view());
       owned_cast_cols.push_back(std::move(cast_col));
@@ -62,6 +65,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   }
   cudf::table_view effective_table(all_col_views);
   const int orig_num_cols = input_table.num_columns();
+
+  // cudf::hash_partition's CUB dispatch calls cudaPeekAtLastError(); a stale sticky
+  // error from an earlier call would be misattributed to the scan inside hash_partition.
+  (void)cudaGetLastError();
 
   auto partition_result = cudf::hash_partition(effective_table,
                                                effective_key_idx,
@@ -95,7 +102,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
       std::make_unique<cudf::table>(sliced_partition_views[i].select(orig_col_indices),
                                     stream,
                                     memory_space.get_default_allocator());
-    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space, stream));
+    output_batches.push_back(
+      make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
   }
 
   return output_batches;
@@ -104,8 +112,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
   const cucascade::read_only_data_batch& input,
   int num_partitions,
-  rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -129,7 +138,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = std::make_unique<cudf::table>(
       sliced_partition_views[i], stream, memory_space.get_default_allocator());
-    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space, stream));
+    output_batches.push_back(
+      make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
   }
 
   return output_batches;

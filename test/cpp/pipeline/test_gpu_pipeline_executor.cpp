@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
@@ -32,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -42,7 +44,10 @@ constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
 class test_gpu_pipeline_task_global_state
   : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state()
+    : sirius_pipeline_task_global_state(nullptr, sirius::test::make_test_telemetry_context())
+  {
+  }
 
   void add_error(std::string message)
   {
@@ -78,7 +83,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<test_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<test_gpu_pipeline_task_local_state>();
@@ -127,7 +132,8 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
     global.executed_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info() const override
+  sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
+    const cucascade::memory::memory_space* /*target_space*/) const override
   {
     sirius::pipeline::reservation_size_info info;
     info.reservation_size = kReservationBytes;
@@ -153,10 +159,10 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
     builder.set_number_of_gpus(1)
       .set_gpu_usage_limit(256 * 1024 * 1024)
       .set_reservation_fraction_per_gpu(0.75)
-      .set_per_host_capacity(1 * 1024 * 1024 * 1024)
-      .use_host_per_gpu()
+      .set_per_numa_region_capacity(1 * 1024 * 1024 * 1024)
+      .use_gpu_id_as_host_id()
       .track_reservation_per_stream(false)
-      .set_reservation_fraction_per_host(0.75);
+      .set_reservation_fraction_per_numa_region(0.75);
     auto space_configs = builder.build();
     manager =
       std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
@@ -178,7 +184,11 @@ TEST_CASE("GPU pipeline executor schedules GPU tasks directly (push-model)",
   config.num_threads        = 2;
   config.thread_name_prefix = "gpu-pipeline-test";
 
-  sirius::pipeline::gpu_pipeline_executor executor(config, mem_space, request_publisher);
+  sirius::pipeline::gpu_pipeline_executor executor(config,
+                                                   mem_space,
+                                                   std::move(request_publisher),
+                                                   nullptr,
+                                                   sirius::test::make_test_telemetry_context());
   auto global_state = std::make_shared<test_gpu_pipeline_task_global_state>();
 
   const int num_tasks = 10;

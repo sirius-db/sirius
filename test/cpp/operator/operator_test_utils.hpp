@@ -34,7 +34,7 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -46,8 +46,7 @@
 
 namespace sirius::test::operator_utils {
 
-using data_repository_mgr =
-  cucascade::data_repository_manager<std::shared_ptr<cucascade::data_batch>>;
+using data_repository_mgr = cucascade::data_repository_manager;
 inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initialize_memory_manager(
   std::size_t n_gpus = 1)
 {
@@ -64,9 +63,9 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   builder.set_number_of_gpus(n_gpus)
     .set_gpu_usage_limit(gpu_capacity / n_gpus)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity / n_gpus)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity / n_gpus)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -77,8 +76,17 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   return manager;
 }
 
+/// Initializes the process-global converter registry unless it is already initialized. Tests that
+/// cache a memory manager across test cases call this on every access, since other tests may shut
+/// the registry down in between.
+inline void ensure_converter_registry()
+{
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
+}
+
 inline cucascade::memory::memory_space* get_default_gpu_space()
 {
+  ensure_converter_registry();
   static auto manager = initialize_memory_manager();
   return const_cast<cucascade::memory::memory_space*>(
     manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
@@ -88,7 +96,7 @@ inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory
   return space.get_default_allocator();
 }
 
-inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }
+inline ::cuda::stream_ref default_stream() { return cudf::get_default_stream(); }
 
 /**
  * @brief Horizontally concatenate multiple data_batch objects into a single data_batch.
@@ -126,10 +134,8 @@ inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
   auto concatenated_table = std::make_unique<cudf::table>(std::move(all_columns));
 
   // Create and return new data_batch
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
-    std::move(concatenated_table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(concatenated_table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 template <typename T>
@@ -176,6 +182,23 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
   }
 }
 
+/// @brief Copy a column's per-row validity to host (true == valid). All-true if no null mask.
+inline std::vector<bool> copy_validity_to_host(const cudf::column_view& col)
+{
+  std::vector<bool> host(col.size(), true);
+  if (col.size() == 0 || col.null_mask() == nullptr) { return host; }
+  auto const total_bits = col.offset() + col.size();
+  auto const num_words  = static_cast<std::size_t>((total_bits + 31) / 32);
+  std::vector<cudf::bitmask_type> words(num_words);
+  cudaMemcpy(
+    words.data(), col.null_mask(), num_words * sizeof(cudf::bitmask_type), cudaMemcpyDeviceToHost);
+  for (cudf::size_type i = 0; i < col.size(); ++i) {
+    auto const bit = i + col.offset();
+    host[i]        = (words[bit / 32] >> (bit % 32)) & 1u;
+  }
+  return host;
+}
+
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
   cucascade::memory::memory_space& space, const std::vector<T>& values, cudf::type_id type_id)
@@ -206,14 +229,51 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
+}
+
+/// @brief Single numeric column batch where @p valids[i]==false makes row i NULL.
+template <typename T>
+inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
+  cucascade::memory::memory_space& space,
+  const std::vector<T>& values,
+  const std::vector<bool>& valids,
+  cudf::type_id type_id)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
+  cudf::size_type null_count = 0;
+  for (cudf::size_type i = 0; i < size; ++i) {
+    if (!valids[i]) {
+      cudf::set_null_mask(mask_ptr, i, i + 1, false, stream);
+      ++null_count;
+    }
+  }
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{type_id}, size, std::move(null_mask), null_count, stream, mr);
+  if (size > 0) {
+    cudaMemcpy(col->mutable_view().data<T>(),
+               values.data(),
+               sizeof(T) * values.size(),
+               cudaMemcpyHostToDevice);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::string>& values,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   auto const strings_count = static_cast<cudf::size_type>(values.size());
@@ -243,7 +303,7 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                   offsets.data(),
                   offsets.size() * sizeof(cudf::size_type),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   // Chars buffer
   rmm::device_buffer chars_buf(total_chars, stream, mr);
@@ -252,14 +312,15 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                     chars.data(),
                     chars.size() * sizeof(char),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   }
 
-  return cudf::make_strings_column(strings_count,
-                                   std::move(offsets_col),
-                                   std::move(chars_buf),
-                                   0,
-                                   rmm::device_buffer{0, stream, mr});
+  return cudf::make_strings_column(
+    strings_count,
+    std::move(offsets_col),
+    std::move(chars_buf),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_string_batch(
@@ -272,10 +333,8 @@ inline std::shared_ptr<cucascade::data_batch> make_string_batch(
   cols.push_back(make_string_column(values, stream, mr));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
@@ -299,10 +358,8 @@ inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 template <typename T>
@@ -333,10 +390,8 @@ inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 template <typename TFirst, typename TSecond>
@@ -430,10 +485,8 @@ inline std::shared_ptr<cucascade::data_batch> make_two_column_batch(
   cols.push_back(std::move(col1));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr =
-    std::make_unique<cucascade::gpu_table_representation>(std::move(table), space, stream);
-  auto batch_id = ::sirius::get_next_batch_id();
-  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+  return ::sirius::make_data_batch(
+    std::move(table), space, stream, ::sirius::telemetry::batch_telemetry_info{});
 }
 
 }  // namespace sirius::test::operator_utils

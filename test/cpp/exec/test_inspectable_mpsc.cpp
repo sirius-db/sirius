@@ -88,6 +88,47 @@ TEST_CASE("inspectable_mpsc multiple items FIFO order", "[inspectable_mpsc]")
   }
 }
 
+TEST_CASE("inspectable_mpsc default ordering is FIFO", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue;
+  REQUIRE(queue.get_ordering() == queue_ordering::FIFO);
+}
+
+TEST_CASE("inspectable_mpsc explicit LIFO ordering pops newest first", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue(queue_ordering::LIFO);
+  REQUIRE(queue.get_ordering() == queue_ordering::LIFO);
+
+  for (int i = 0; i < 5; ++i) {
+    REQUIRE(queue.push(std::make_unique<int>(i)));
+  }
+
+  for (int i = 4; i >= 0; --i) {
+    auto result = queue.try_pop();
+    REQUIRE(result != nullptr);
+    REQUIRE(*result == i);
+  }
+  REQUIRE(queue.try_pop() == nullptr);
+}
+
+TEST_CASE("inspectable_mpsc LIFO blocking pop also pops newest first", "[inspectable_mpsc]")
+{
+  inspectable_mpsc<int> queue(queue_ordering::LIFO);
+  REQUIRE(queue.push(std::make_unique<int>(1)));
+  REQUIRE(queue.push(std::make_unique<int>(2)));
+  REQUIRE(queue.push(std::make_unique<int>(3)));
+
+  auto a = queue.pop();
+  REQUIRE(a != nullptr);
+  REQUIRE(*a == 3);
+  auto b = queue.pop();
+  REQUIRE(b != nullptr);
+  REQUIRE(*b == 2);
+  auto c = queue.pop();
+  REQUIRE(c != nullptr);
+  REQUIRE(*c == 1);
+}
+
 // =============================================================================
 // Emplace tests
 // =============================================================================

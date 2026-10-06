@@ -63,8 +63,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch =
-    sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(
+    std::move(input_table), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
@@ -116,8 +116,8 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch =
-    sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(
+    std::move(input_table), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // AVG is decomposed into SUM + COUNT_VALID internally
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
@@ -170,8 +170,8 @@ TEMPLATE_TEST_CASE(
   auto [input_table, expected_table] =
     sirius::test::make_test_data_for_grouped_aggregate<Traits>(num_groups, 2, stream, mr);
 
-  std::shared_ptr<data_batch> input_batch =
-    sirius::make_data_batch(std::move(input_table), *space, stream);
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(
+    std::move(input_table), *space, stream, sirius::telemetry::batch_telemetry_info{});
 
   // Create aggregate expressions: GROUP BY column 0, SUM(column 1)
   auto agg_result = sirius::test::create_aggregate_expressions<Traits>(

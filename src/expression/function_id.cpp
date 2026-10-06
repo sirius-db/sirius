@@ -28,16 +28,20 @@ namespace sirius {
 namespace {
 
 // Forward table: DuckDB function name -> Sirius function id.
-// `substring` and `substr` are DuckDB-side aliases for the same function id,
-// so this table has one extra entry beyond the enum cardinality.
+// Symbolic SQL operators and their Substrait spellings resolve to the same ids.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 36> kForwardTable = {{
   {"+", function_id::add},
+  {"add", function_id::add},
   {"-", function_id::sub},
+  {"subtract", function_id::sub},
   {"*", function_id::mul},
+  {"multiply", function_id::mul},
   {"/", function_id::div},
+  {"divide", function_id::div},
   {"//", function_id::int_div},
   {"%", function_id::mod},
+  {"modulus", function_id::mod},
   {"substring", function_id::substring},  // canonical name
   {"substr", function_id::substring},     // alias
   {"~~", function_id::like},
@@ -48,6 +52,8 @@ constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable
   {"strlen", function_id::strlen},
   {"length", function_id::length},
   {"regexp_replace", function_id::regexp_replace},
+  {"concat", function_id::concat},       // concat() call — ignores NULL args
+  {"||", function_id::concat_operator},  // || operator (ConcatOperatorFun) — propagates NULL
   {"year", function_id::year},
   {"month", function_id::month},
   {"day", function_id::day},
@@ -60,25 +66,26 @@ constexpr std::array<std::pair<std::string_view, function_id>, 28> kForwardTable
   {"row", function_id::row},
   {"struct_pack", function_id::struct_pack},
   {"error", function_id::error},
+  {"constant_or_null", function_id::constant_or_null},
 }};
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 27> kReverseTable = {
-  "+",           "-",           "*",           "/",          "//",
-  "%",           "substring",   "~~",          "!~~",        "contains",
-  "prefix",      "suffix",      "strlen",      "length",     "regexp_replace",
-  "year",        "month",       "day",         "hour",       "minute",
-  "second",      "millisecond", "microsecond", "date_trunc", "row",
-  "struct_pack", "error",
+constexpr std::array<std::string_view, 30> kReverseTable = {
+  "+",          "-",         "*",           "/",           "//",
+  "%",          "substring", "~~",          "!~~",         "contains",
+  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
+  "concat",     "||",        "year",        "month",       "day",
+  "hour",       "minute",    "second",      "millisecond", "microsecond",
+  "date_trunc", "row",       "struct_pack", "error",       "constant_or_null",
 };
 
-static_assert(static_cast<std::size_t>(function_id::error) + 1 == 27,
-              "function_id::error must be the last entry; cardinality locked at 27.");
-static_assert(kReverseTable.size() == 27,
+static_assert(static_cast<std::size_t>(function_id::constant_or_null) + 1 == 30,
+              "function_id::constant_or_null must be the last entry; cardinality locked at 30.");
+static_assert(kReverseTable.size() == 30,
               "kReverseTable must have one slot per function_id value.");
-static_assert(kForwardTable.size() == 28,
-              "kForwardTable has one extra entry for the substring/substr alias.");
+static_assert(kForwardTable.size() == 36,
+              "kForwardTable includes SQL and Substrait aliases for supported function ids.");
 
 // Walks both tables to ensure every enum value has exactly one canonical
 // forward entry whose name matches the reverse table at the same index.

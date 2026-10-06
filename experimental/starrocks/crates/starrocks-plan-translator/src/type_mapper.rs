@@ -23,6 +23,16 @@ pub(crate) fn bool_type() -> Type {
     }
 }
 
+/// Builds an FP64 type used to lower arithmetic Sirius cannot execute on decimal columns.
+pub(crate) fn fp64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
 /// Maps a StarRocks type descriptor and slot nullability into a Substrait type.
 pub fn map_type_desc(type_desc: &TTypeDesc, nullable: bool) -> Result<Type> {
     let node = scalar_node(type_desc)?;
@@ -171,12 +181,19 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
                     reason: "decimal precision above 38 has no safe v1 Substrait mapping",
                 });
             }
-            r#type::Kind::Decimal(r#type::Decimal {
-                precision,
-                scale: scalar.scale.unwrap_or(0),
-                type_variation_reference: 0,
-                nullability: n,
-            })
+            if precision <= 18 {
+                r#type::Kind::Decimal(r#type::Decimal {
+                    precision,
+                    scale: scalar.scale.unwrap_or(0),
+                    type_variation_reference: 0,
+                    nullability: n,
+                })
+            } else {
+                r#type::Kind::Fp64(r#type::Fp64 {
+                    type_variation_reference: 0,
+                    nullability: n,
+                })
+            }
         }
         TPrimitiveType::DECIMAL256 => {
             return Err(TranslateError::UnsupportedType {
@@ -203,4 +220,26 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
     };
 
     Ok(Type { kind: Some(kind) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decimal(precision: i32) -> TScalarType {
+        TScalarType::new(TPrimitiveType::DECIMAL128, None, Some(precision), Some(2))
+    }
+
+    /// Precision 18 is the last width kept as DECIMAL; 19 and up lower to FP64.
+    #[test]
+    fn decimal_precision_boundary_is_18() {
+        assert!(matches!(
+            map_scalar_type(&decimal(18), true).unwrap().kind,
+            Some(r#type::Kind::Decimal(_))
+        ));
+        assert!(matches!(
+            map_scalar_type(&decimal(19), true).unwrap().kind,
+            Some(r#type::Kind::Fp64(_))
+        ));
+    }
 }

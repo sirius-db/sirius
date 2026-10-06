@@ -14,13 +14,17 @@
  * limitations under the License.
  */
 
-#include <cudf/stream_compaction.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 
 #include <log/logging.hpp>
 #include <op/scan/iceberg_delete_filter.hpp>
 #include <op/scan/iceberg_equality_delete_mask.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
+
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace sirius::op::scan {
 
@@ -34,49 +38,72 @@ equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDele
 }
 
 std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
-                                                           std::string const& data_file_path,
-                                                           int64_t /*first_row*/,
-                                                           rmm::cuda_stream_view stream)
+                                                           batch_layout layout,
+                                                           ::cuda::stream_ref stream,
+                                                           rmm::device_async_resource_ref mr)
 {
   auto const n_rows = tbl->num_rows();
   if (n_rows == 0) { return tbl; }
 
-  // Sequence number filtering: per Iceberg spec, equality deletes only apply
-  // to data files whose sequence number is strictly LOWER than the delete's.
-  // Each group has exactly one sequence number (grouped by schema + seq).
+  // Per spec, equality deletes apply only to data files with a strictly lower sequence number.
+  // That is a per-file answer, but the mask below is per batch, so a batch mixing files that
+  // disagree is refused: keeping them apart is the caller's job.
   auto const& group = _delete_data->equality_delete_groups[_group_index];
-  auto seq_it       = _delete_data->data_file_sequence_numbers.find(data_file_path);
-  if (group.sequence_number > 0 && seq_it != _delete_data->data_file_sequence_numbers.end() &&
-      seq_it->second > 0 && seq_it->second >= group.sequence_number) {
-    // Data file's sequence number >= delete's — deletes don't apply.
-    SIRIUS_LOG_DEBUG(
-      "[equality_delete_filter] Skipping group (data_seq={} >= delete_seq={}) "
-      "for file '{}'",
-      seq_it->second,
-      group.sequence_number,
-      data_file_path);
-    return tbl;
-  }
 
-  // Verify all key columns are present in this chunk.
-  for (auto idx : _data_key_indices) {
-    if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
-      SIRIUS_LOG_WARN("[equality_delete_filter] Key column index {} >= num_columns {}; skipping.",
-                      idx,
-                      tbl->num_columns());
-      return tbl;
+  // An unknown file is refused rather than assumed deletable: answering "applies" would delete
+  // rows from a data file that may post-date the delete.
+  auto applies_to = [&](std::string const& path) {
+    if (group.sequence_number <= 0) { return true; }
+    auto seq_it = _delete_data->data_file_manifest_sequence_numbers.find(path);
+    if (seq_it == _delete_data->data_file_manifest_sequence_numbers.end()) {
+      throw std::invalid_argument(
+        "[equality_delete_filter] no sequence number recorded for data file '" + path +
+        "'; equality deletes apply only to data files strictly older than the delete, so this "
+        "cannot be decided (the manifest-to-scan path translation did not cover this file)");
+    }
+    if (seq_it->second <= 0) { return true; }
+    return seq_it->second < group.sequence_number;
+  };
+
+  bool const first_applies = layout.empty() || applies_to(layout.front().data_file_path);
+  for (auto const& run : layout) {
+    if (applies_to(run.data_file_path) != first_applies) {
+      throw std::invalid_argument(
+        "[equality_delete_filter] batch mixes data files that disagree on whether delete group "
+        "sequence " +
+        std::to_string(group.sequence_number) +
+        " applies; equality deletes need one sequence number per batch");
     }
   }
 
-  // Project data chunk to the equality key columns.
+  if (!first_applies) {
+    SIRIUS_LOG_DEBUG(
+      "[equality_delete_filter] Skipping group (delete_seq={}) — batch's data "
+      "file(s) are at or above it",
+      group.sequence_number);
+    return tbl;
+  }
+
+  // Missing key column means projection widening never reached the scan. Returning the batch
+  // unchanged would drop this group's deletes and hand back deleted rows.
+  for (auto idx : _data_key_indices) {
+    if (idx >= static_cast<cudf::size_type>(tbl->num_columns())) {
+      throw std::invalid_argument("[equality_delete_filter] equality-delete key column index " +
+                                  std::to_string(idx) + " is absent from the decoded batch (" +
+                                  std::to_string(tbl->num_columns()) +
+                                  " columns); the key columns must be appended to the projection");
+    }
+  }
+
   auto data_key_view = tbl->select(_data_key_indices);
 
-  auto build_indices = group.hash_join->left_join(data_key_view, stream);
+  // Both allocations are part of this batch's footprint, so both come from the scan's resource --
+  // the default one is invisible to the accounting that drives downgrade decisions.
+  auto build_indices = group.hash_join->left_join(data_key_view, stream, mr);
 
-  // Anti-join mask entirely on GPU — no host roundtrip.
-  auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream);
+  auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream, mr);
 
-  return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream);
+  return sirius::ApplyRetentionMask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan

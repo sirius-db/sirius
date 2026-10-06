@@ -17,13 +17,17 @@
 #include "catch.hpp"
 #include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
+
+#include <cudf/types.hpp>
 
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
+
+#include <limits>
 
 using namespace sirius::op;
 
@@ -73,8 +77,7 @@ hash_join_fixture make_hash_join()
     duckdb::vector<duckdb::idx_t>{},
     duckdb::vector<duckdb::idx_t>{},
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-    0,
-    nullptr);
+    0);
   return f;
 }
 
@@ -185,30 +188,84 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
   REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
 }
 
-// ---------------------------------------------------------------------------
-// sirius_physical_parquet_scan
-// ---------------------------------------------------------------------------
-
-TEST_CASE("parquet scan no_history_peak_memory_estimate returns 8x bytes",
-          "[no_history_peak_memory_estimate][parquet_scan]")
+TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",
+          "[no_history_peak_memory_estimate][gpu_scan]")
 {
-  // Constructed with all-empty/nullptr args; constructor body is a no-op when
-  // table_filters is nullptr (skips filter-translation path entirely).
-  sirius_physical_parquet_scan scan{/*types=*/{},
-                                    /*function=*/{},
-                                    /*bind_data=*/nullptr,
-                                    /*returned_types=*/{},
-                                    /*column_ids=*/{},
-                                    /*projection_ids=*/{},
-                                    /*names=*/{},
-                                    /*table_filters=*/nullptr,
-                                    /*estimated_cardinality=*/0,
-                                    /*extra_info=*/{},
-                                    /*parameters=*/{},
-                                    /*virtual_columns=*/{},
-                                    /*physical_table_scan=*/nullptr};
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
 
-  REQUIRE(scan.no_history_peak_memory_estimate({0, 0}) == 0);
-  REQUIRE(scan.no_history_peak_memory_estimate({1, 100}) == 800);
-  REQUIRE(scan.no_history_peak_memory_estimate({4, 512}) == 4096);
+  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 100}) ==
+        800);
+  CHECK(scan.no_history_peak_memory_estimate({1, 100, operator_data_type::GPU_SCAN, false, 700}) ==
+        1400);
+  CHECK(scan.no_history_peak_memory_estimate({1, 0, operator_data_type::GPU_SCAN, false, 600}) ==
+        600);
+}
+
+TEST_CASE("GPU scan resident estimate follows actual carrier conversion",
+          "[no_history_peak_memory_estimate][gpu_scan]")
+{
+  scan::sirius_gpu_scan_operator native_scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
+
+  // Five-field aggregate initialization remains source-compatible: the fifth
+  // value is working_set_bytes and the trailing conversion marker defaults off. A resident chunk
+  // the serve site reports as cast-free -- the stacking happy path, where the stored carrier
+  // already equals the plan target -- is charged no destination at all.
+  input_stats cast_free{1, 100, operator_data_type::GPU_SCAN, true, 700};
+  CHECK(cast_free.working_set_bytes == 700);
+  CHECK_FALSE(cast_free.needs_carrier_conversion);
+  CHECK(native_scan.no_history_peak_memory_estimate(cast_free) == 700);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 800, operator_data_type::GPU_SCAN, true, 700}) == 800);
+
+  // A converting chunk whose row count the serve site could not read
+  // (conversion_destination_bytes == 0) keeps the conservative bound: resident working set +
+  // maximum-width destination.
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100, true}) == 900);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 700, true}) == 1500);
+
+  // The serve site computed the exact per-column destination: the reservation becomes working
+  // set + that destination, independent of the 8x bound.
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100, true, 250}) == 350);
+  CHECK(native_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 700, true, 800}) == 1500);
+
+  scan::sirius_gpu_scan_operator sidecar_scan{
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
+    /*estimated_cardinality=*/0,
+    /*ingestible=*/{},
+    /*contract_id=*/1};
+  sidecar_scan.set_physical_types({cudf::data_type{cudf::type_id::INT8}});
+
+  // A native cached carrier converting to a narrow plan sidecar the serve site did not size: the
+  // destination is bounded by the stored source, so working set + source bytes. Fresh reads
+  // retain the legacy maximum-width estimate.
+  CHECK(sidecar_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, true, 100}) == 200);
+  CHECK(sidecar_scan.no_history_peak_memory_estimate(
+          {1, 100, operator_data_type::GPU_SCAN, false, 700}) == 1400);
+}
+
+TEST_CASE("GPU scan no-history estimates saturate instead of wrapping",
+          "[no_history_peak_memory_estimate][gpu_scan]")
+{
+  scan::sirius_gpu_scan_operator scan{
+    /*types=*/{}, /*estimated_cardinality=*/0, /*ingestible=*/{}, /*contract_id=*/1};
+  auto const max                     = std::numeric_limits<std::size_t>::max();
+  auto const multiplication_overflow = max / 8 + 1;
+
+  CHECK(
+    scan.no_history_peak_memory_estimate(
+      {1, multiplication_overflow, operator_data_type::GPU_SCAN, false, multiplication_overflow}) ==
+    max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, multiplication_overflow, operator_data_type::GPU_SCAN, true, 1, true}) == max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, 1, operator_data_type::GPU_SCAN, true, max, true}) == max);
+  CHECK(scan.no_history_peak_memory_estimate(
+          {1, 1, operator_data_type::GPU_SCAN, true, max, true, max}) == max);
 }

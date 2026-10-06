@@ -19,6 +19,15 @@ A data batch flows through the system in these stages:
 8. Cleanup:        batch destroyed when shared_ptr ref count reaches zero
 ```
 
+### Owned vs. view-backed GPU batches
+
+A `gpu_table_representation` holds its data in one of two forms:
+
+- **Owned** — a `std::unique_ptr<cudf::table>`. Built via `sirius::make_data_batch(table, space, stream)`. This is the common case (operators that allocate new output columns).
+- **View-backed (`owning_table_view`)** — a non-owning `cudf::table_view` plus a type-erased (`std::any`) *owner* that keeps the viewed device memory alive. Built via `sirius::make_data_batch_from_view(view, owner, alloc_size, space, stream)`. Used to expose existing columns without copying.
+
+The owner can be any copy-constructible object that keeps the memory alive — e.g. a `read_only_data_batch` lock on a source batch (so the source stays alive and read-only-pinned for the view's lifetime), a `shared_ptr<cudf::table>`, or a composite of both. Producers of view-backed batches include the pinned-table scan path and the PROJECTION operator's zero-copy passthrough paths (see [operators](operators.md)). Downstream code is agnostic: `get_table_view()` works for both forms, and `release_table()` materializes a view-backed batch into an owned table on demand.
+
 ### Batch State Machine
 
 Each `data_batch` (from cuCascade) uses a 3-class reader-writer locking model. Data is only
@@ -44,23 +53,25 @@ Key methods on `data_batch`:
 
 ## Data Repositories
 
-Data repositories are thread-safe containers managed by the `shared_data_repository_manager`:
+Data repositories are thread-safe containers managed by a `shared_data_repository_manager`:
 
-- Keyed by `(operator_id, port_id)` pairs
+- Keyed by `(operator_id, port_id)` pairs — unique *within one query*, not across queries
 - Support partitioned storage (multiple partitions per repository)
 - Provide `add_data_batch()` for producers and `pop_next_data_batch()` for consumers (non-blocking; returns `nullptr` if empty)
 - Track total size and per-partition sizes
-- Registered centrally in `shared_data_repository_manager` for downgrade candidate selection
+- Registered in the query's `shared_data_repository_manager` for downgrade candidate selection
 
-### `shared_data_repository_manager`
+### Query-scoped repository managers
 
-Central registry of all repositories in query execution:
-- Provides `for_each_repository()` iterator for downgrade candidate selection
-- Thread-safe access to all active repositories
+**Files:** `src/data/data_repository_manager_registry.hpp`, `src/query_id.hpp`
+
+Each in-flight query owns its own `shared_data_repository_manager`. The `sirius::data::data_repository_manager_registry` (held by `SiriusContext`) maps `query_id_t` → `shared_ptr<shared_data_repository_manager>`; managers are held by `shared_ptr` because a downgrade worker may still be sweeping a manager when its query ends. The registry exposes `get_all()` (a snapshot) for downgrade candidate selection, and the downgrade executor takes the registry — not a single manager — so it can sweep every active query.
+
+`query_id_t` is a strongly-typed id minted once per `SiriusContext::StandaloneQueryScope`. It drives repository ownership and cleanup scope, scheduling priority (`query_priority_bits`), and log correlation. Operator ids are assigned per plan by `pipeline::assign_operator_ids`, which combined with the per-query manager makes `(operator_id, port_id)` collisions across concurrent queries impossible.
 
 ## Port System
 
-**File:** `src/include/op/sirius_physical_operator.hpp`
+**File:** `src/op/sirius_physical_operator.hpp`
 
 Ports connect pipelines by routing data from one operator's output to another's input:
 
@@ -78,8 +89,19 @@ struct port {
 | Barrier | Behavior | When Used |
 |---------|----------|-----------|
 | `FULL` | Downstream waits until upstream pipeline is **completely finished** before consuming any data | Hash join build side — entire hash table must be built before probing |
-| `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER) |
+| `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER); HASH_GROUP_BY into its fanout PARTITION, when that partition has runtime size estimation enabled |
 | `PIPELINE` | No synchronization — data flows **immediately** | Within a single pipeline |
+
+### Runtime data size estimation
+
+`estimate_port_total_input_bytes(op, port_id)` projects how many bytes will *ultimately* arrive at
+an input port by chaining measured upstream pipeline ratios.
+
+With estimation enabled, a grouped aggregation's `PARTITION` uses a `PARTIAL` ingress and fixes its
+partition count from the projected total. The disabled path and the
+`PARTITION → MERGE_GROUP_BY` edge remain `FULL`.
+
+See [Data Size Estimation](data-size-estimation.md) for the full design.
 
 ### `push_data_batch()`
 
@@ -93,7 +115,7 @@ for (auto& batch : output_batches) {
 }
 ```
 
-`next_port_after_sink` is configured during pipeline construction by `insert_repository()`.
+`next_port_after_sink` is configured when repository wiring is materialized: the pipeline converter emits pure-data `repository_wiring` descriptors at plan time, and `pipeline::materialize_repository_wiring(wirings, *repo_manager)` creates the repositories and calls `source_op->add_next_port_after_sink({next_op, port_id})` at query setup (see [Multi-GPU Architecture](multi-gpu-architecture.md) for the two-phase split).
 
 ### Port Names
 
@@ -117,14 +139,14 @@ lazily populated from each other on demand:
 Key methods:
 - `get_data_batches()` — returns idle batch pointers; if only `_read_only_data_batches` exist, calls `data_batch::to_idle()` on copies to populate `_data_batches`.
 - `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
-- `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches`. Called by the GPU pipeline executor before `execute()`.
+- `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (clones/converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches` and resets `_data_batches` to `std::nullopt` — accessor *i* may reference a cross-GPU *clone* rather than the original batch, so the idle view is lazily rebuilt from the accessors rather than kept alongside them. Called by the GPU pipeline executor before `execute()`.
 - `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
 - Created by `get_next_task_input_data()` from port pops.
 - Passed through the operator chain during `execute()`.
 
 ### `partitioned_operator_data`
 
-Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, HASH_JOIN, MERGE_GROUP_BY, DENSE_COUNT_JOIN) to track which partition the data belongs to. Constructing it with an index takes the exchange's `partition_placement`, and a partition pinned to a GPU becomes the data's preferred device, so the task creator runs every task of a partition on one GPU. Data with no index carries no preference and is placed by locality.
 
 ### Class Hierarchy
 
@@ -138,14 +160,13 @@ operator_data                       (empty generic base)
 
 ### `sirius_converter_registry`
 
-**File:** `src/include/data/sirius_converter_registry.hpp`
+**File:** `src/data/sirius_converter_registry.hpp`
 
 Global singleton for converting between data representations:
-- Registers builtin cuCascade converters + Sirius-specific converters (parquet)
+- Registers builtin cuCascade converters
 - Thread-safe initialization via mutex
 - Used by:
   - Downgrade tasks: GPU representation → HOST representation
-  - Scan tasks: Parquet representation → GPU table representation
   - GPU pipeline tasks: HOST representation → GPU representation (`lock_or_prepare_batch`)
 
 ### Conversion Examples
@@ -154,14 +175,14 @@ Global singleton for converting between data representations:
 |------|----|------|
 | `host_data_representation` | GPU `cudf::table` | GPU task input preparation |
 | GPU `cudf::table` | `host_data_representation` | Downgrade executor |
-| `host_parquet_representation` | GPU `cudf::table` | Parquet materialization |
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/include/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch |
+| `src/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch, source-total hooks |
 | `src/op/sirius_physical_operator.cpp` | Default sink/push implementation |
-| `src/include/data/cached_data_representation.hpp` | Cached data wrappers |
-| `src/include/data/sirius_converter_registry.hpp` | Format conversion registry |
-| `src/include/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |
+| `src/pipeline/data_size_estimator.hpp` | Runtime projection of total bytes arriving at a port |
+| `src/pipeline/pipeline_memory_history.hpp` | Per-pipeline task history; peak-memory estimate and output/input ratio |
+| `src/data/sirius_converter_registry.hpp` | Format conversion registry |
+| `src/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |

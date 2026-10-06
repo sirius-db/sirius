@@ -19,17 +19,28 @@
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "exec/config.hpp"
+#include "exec/multi_index_priority_queue.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline_itask.hpp"
+#include "planner/query.hpp"
+#include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace sirius {
 namespace pipeline {
@@ -37,9 +48,16 @@ namespace pipeline {
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
+  // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
+  // belongs to; see pipeline::index_keys_for.
+  : _task_queue(&index_keys_for), _telemetry_context(std::move(telemetry_context))
 {
+  _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
+    *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
+
   // Self-publisher: schedule() uses this to wake management_eventloop when a
   // new task is pushed, so the loop can re-run the matcher against any device
   // that is already in _ready_devices.
@@ -76,7 +94,8 @@ task_scheduler::task_scheduler(
       std::make_unique<gpu_pipeline_executor>(config,
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
-                                              dg_exec));
+                                              dg_exec,
+                                              _telemetry_context));
   }
 }
 
@@ -84,7 +103,13 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  [[maybe_unused]] auto _ = _task_queue.push(std::move(task));
+  if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+    pipeline_task->telemetry_handle().queued({
+      .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+      .queue_capacity_entries = 1,
+    });
+  }
+  _task_queue.push(std::move(task));
   if (_self_publisher) {
     auto wake                 = std::make_unique<task_request>();
     wake->kind                = task_request_kind::task_available;
@@ -129,47 +154,35 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
   }
 }
 
-void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
+void task_scheduler::start_query(const planner::query& query)
 {
-  // Drain leftover tasks from previous query
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_leftover_tasks();
+  const auto& scans = query.get_scan_operators();
+
+  // A query with no schedulable scan can never complete. Plan generation should have
+  // rejected it, so fail loudly instead of dereferencing an empty vector.
+  if (scans.empty()) {
+    throw std::runtime_error("task_scheduler: query has no schedulable scan sources");
   }
 
-  std::lock_guard lock(_query_mutex);
-  _query = std::move(query);
-
-  _completion_handler = std::make_unique<completion_handler>();
-
-  // Set completion handler on all executors
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_completion_handler(_completion_handler.get());
-  }
-
-  // Reset the round-robin counter so the walk is reproducible across
-  // iterations of the same query (cache=table_gpu warm path keys cache
-  // entries by device_id; without this reset the second iteration's source
-  // tasks would assign to a different GPU and miss the cache entries).
-  _no_pref_rr_counter.store(0, std::memory_order_relaxed);
-}
-
-std::future<void> task_scheduler::start_query()
-{
-  std::scoped_lock lock(_query_mutex);
-  const auto& scans = _query->get_scan_operators();
-
+  // The caller already holds the future from its own completion handler.
   _task_creator->schedule(scans.front());
-
-  return _completion_handler->get_awaitable();
 }
 
-void task_scheduler::terminate_query(std::exception_ptr error)
+void task_scheduler::terminate_query(const std::shared_ptr<completion_handler>& handler,
+                                     std::exception_ptr error)
 {
-  _completion_handler->report_error(std::move(error));
-  stop();
+  // Report-only: this can be reached from a GPU executor's own worker thread (via
+  // notify_downstream_pipelines() in ~gpu_pipeline_task) or from the task_creator's own worker
+  // thread. stop() joins each gpu_pipeline_executor's manager thread and then blocks in that
+  // executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of that
+  // pool's workers, its slot cannot free until this call returns, so wait_all() would never
+  // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
+  // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
+  // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
+  if (handler) { handler->report_error(std::move(error)); }
 }
 
-void task_scheduler::drain_after_error()
+void task_scheduler::drain_after_error(sirius::query_id_t query_id)
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
   // Teardown ordering is load-bearing. The scan/gpu executor drains below run
@@ -194,18 +207,16 @@ void task_scheduler::drain_after_error()
   // stale tasks from the failed query.
   _task_queue.drain();
 
-  // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
+  // Interrupt each GPU executor's publisher loop, wait for in-flight thread-pool
   // tasks to finish, then restart the manager for the next query.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
   }
 
-  // Now that no executor can generate further task_creation_requests, discard
-  // any that accumulated (and release the shared_ptr<data_batch> references they
-  // hold, which would otherwise survive clear_all_repositories at QueryEnd and
-  // show up as inter-iteration "memory leak" warnings). drain_pending_tasks()
-  // reactivates the queue when done.
-  if (_task_creator) { _task_creator->drain_pending_tasks(); }
+  // Now that no executor can generate further task_creation_requests, discard the ones this
+  // query accumulated — they hold raw operator pointers into a plan that QueryEnd is about to
+  // destroy. Scoped to this query: any other in-flight query keeps its pending requests.
+  if (_task_creator) { _task_creator->drain_pending_tasks(query_id); }
 
   // Belt-and-suspenders: the executor restarts above emit device_ready signals,
   // and the management loop may have dispatched a leftover task into an executor
@@ -217,7 +228,7 @@ void task_scheduler::drain_after_error()
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
 
-void task_scheduler::wait_for_completion()
+void task_scheduler::wait_for_completion(sirius::query_id_t query_id)
 {
   // Once the query has signaled completion, NOTHING should still be queued. Rather
   // than drain (which would hide the bug), validate that every queue is empty and
@@ -247,44 +258,69 @@ void task_scheduler::wait_for_completion()
     }
   } catch (...) {
     if (_task_creator) {
-      _task_creator->drain_pending_tasks();
+      _task_creator->drain_pending_tasks(query_id);
       _task_creator->start_thread_pool();
     }
     throw;
   }
   if (_task_creator) {
-    _task_creator->drain_pending_tasks();
+    _task_creator->drain_pending_tasks(query_id);
     _task_creator->start_thread_pool();
+  }
+}
+
+void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
+{
+  // Pending work only, and only this query's: the scheduler's own queue first, then each GPU
+  // executor's staging queue. In-flight tasks are untouched — quiescing those is
+  // wait_for_completion / drain_after_error's job.
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_query_tasks(query_id);
   }
 }
 
 void task_scheduler::management_eventloop()
 {
-  // Pull-signal scheduler. The loop blocks on _task_request_channel for two
-  // event kinds:
-  //   - device_ready  : a gpu_pipeline_executor has reserved a worker thread
-  //                     and is ready to accept a task.
-  //   - task_available: schedule() pushed a new task into _task_queue and is
-  //                     asking us to re-run the matcher in case a device was
-  //                     already waiting.
-  // Tasks remain in _task_queue (downgrade-visible) until we have a ready
-  // device to match them against — this is the property the push model in
-  // PR #732 lost and that this loop restores.
+  telemetry::TaskManagerLoopThreadHandleWrapper manager_thread_telemetry{
+    *_telemetry_context, "task-scheduler-thread", _telemetry_context->shared_group_id()};
+
+  // Each pass tops up the two things the matcher needs — known ready devices
+  // and a non-empty queue — sleeping only for whichever is missing. The queue
+  // sleep (not the channel) is what hears the downgrade executor returning
+  // extracted tasks: that return is a direct _task_queue.push() with no
+  // task_available event, and blocking solely on the channel deadlocked once
+  // every executor had parked (#1467). Both sleeps are interrupted by stop().
   while (_running.load()) {
-    // Block for the next event.
-    auto evt = _task_request_channel.get();
-    if (evt == nullptr) {
-      SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
-      break;
+    // Devices: block only when none is parked (every executor is then busy
+    // and will post device_ready), then drain the pending burst.
+    auto evt = _task_request_channel.try_get();
+    if (!evt && _ready_devices.empty()) {
+      evt = _task_request_channel.get();
+      if (evt == nullptr) {
+        SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
+        break;
+      }
     }
-    if (evt->kind == task_request_kind::device_ready && !evt->is_scan) {
-      _ready_devices.emplace_back(evt->device_id);
+    while (evt) {
+      if (evt->kind == task_request_kind::device_ready) {
+        _ready_devices.emplace_back(evt->device_id);
+      }
+      evt = _task_request_channel.try_get();
     }
-    // Drain any further events that are already queued, so a single matcher
-    // pass handles a burst of ready signals plus task pushes together.
-    while (auto more = _task_request_channel.try_get()) {
-      if (more->kind == task_request_kind::device_ready && !more->is_scan) {
-        _ready_devices.emplace_back(more->device_id);
+
+    // Work: let the creator pre-create for a waiting device (lookahead
+    // strategy only), then sleep until something is pushed.
+    if (_task_queue.empty()) {
+      _query_event_publisher->publish_task_queue_empty();
+      // No query id: the task_creator picks the oldest live query itself, since this loop has
+      // none to inherit.
+      if (_task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(*_ready_devices.begin());
+      }
+      if (!_task_queue.wait()) {
+        SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");
+        break;
       }
     }
 
@@ -299,43 +335,58 @@ void task_scheduler::management_eventloop()
     // binding to guarantee correctness.
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
-      // First try exact preference match.
-      auto task = _task_queue.pop_if(
-        [device_id](const sirius::parallel::itask& t) -> bool {
-          const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-          if (!gpu_task) { return false; }
-          auto pref = gpu_task->get_preferred_device_id();
-          return pref.has_value() && pref.value() == device_id;
-        },
-        /*front_to_back=*/true);
+      std::unique_ptr<sirius::parallel::itask> task;
+
+      // Exact preference match: the device index returns the highest-priority
+      // (lowest value) task preferring exactly this device.
+      task = _task_queue.try_pop_from(exec::gpu_index{device_id}).value_or(nullptr);
       if (!task) {
-        // Fallback: take the first task with NO preference, or whose preferred
-        // device does not exist in _gpu_executors (a stale preference from a
-        // different env / config is meaningless — treat as unpreferred).
-        task = _task_queue.pop_if(
-          [this](const sirius::parallel::itask& t) -> bool {
-            const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);
-            if (!gpu_task) { return true; }
-            auto pref = gpu_task->get_preferred_device_id();
-            if (!pref.has_value()) { return true; }
-            return _gpu_executors.count(pref.value()) == 0;
-          },
-          /*front_to_back=*/true);
+        // Pick a task with no preference (any device will do). Which GPU gets it is decided by
+        // whichever executor signalled ready first, not by any counter.
+        task =
+          _task_queue.try_pop_from(exec::gpu_index{exec::no_preferred_device}).value_or(nullptr);
       }
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices
         // and move on — it will match when an appropriate task arrives.
+        // Only interesting while the queue is NOT empty: work exists but cannot
+        // be placed here, which is a preference mismatch rather than starvation.
+        if (!_task_queue.empty()) {
+          _query_event_publisher->publish_executor_awaiting_task(device_id);
+        }
         ++it;
         continue;
       }
       uint64_t task_id = 0;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
+        {
+          // Priority packs query_id in its high 32 bits (see task_creator); the
+          // queue's key extractor unpacks it the same way.
+          auto const query_id = make_query_id(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+          auto const* pipe = gpu_task->get_pipeline();
+          auto const [operator_id, operator_type] =
+            pipe != nullptr ? pipe->get_source_operator()
+                            : std::pair{op::sirius_physical_operator::invalid_operator_id,
+                                        op::SiriusPhysicalOperatorType::INVALID};
+          _query_event_publisher->publish_task_deployed(
+            query_id, operator_id, operator_type, device_id);
+        }
       }
-      // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
-      // load-bearing — verification greps depend on it.
-      SIRIUS_LOG_INFO(
-        "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+
+      if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+        pipeline_task->telemetry_handle().routing({
+          .instance_name              = "",
+          .preferred_device_id        = device_id,
+          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+        });
+      }
+
+      // // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
+      // // load-bearing — verification greps depend on it.
+      // SIRIUS_LOG_INFO(
+      //   "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
       _gpu_executors.at(device_id)->schedule(std::move(task));
       it = _ready_devices.erase(it);
     }
