@@ -473,7 +473,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar  = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           auto partial = cudf::make_column_from_scalar(*scalar, 1, stream);
           if (widen_partial_to) {
-            partial = cudf::cast(partial->view(), *widen_partial_to, stream);
+            partial = cudf::cast(
+              partial->view(), *widen_partial_to, stream, space->get_default_allocator());
           }
           cols.push_back(std::move(partial));
           if (spec.kind == aggregate_kind::AVG) {

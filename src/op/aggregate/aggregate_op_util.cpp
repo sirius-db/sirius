@@ -24,8 +24,12 @@
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -168,13 +172,13 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
 
 namespace {
 
-/// The unscaled value of a DECIMAL32 or DECIMAL64 scalar, widened to 128 bits.
-__int128 unscaled_value(cudf::scalar const& s, cudf::type_id id, rmm::cuda_stream_view stream)
+/// Device pointer to the unscaled value held by a DECIMAL32 or DECIMAL64 scalar.
+void const* scalar_rep_data(cudf::scalar& s, cudf::type_id id)
 {
   if (id == cudf::type_id::DECIMAL32) {
-    return static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(s).value(stream);
+    return static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(s).data();
   }
-  return static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(s).value(stream);
+  return static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(s).data();
 }
 
 }  // namespace
@@ -193,32 +197,66 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr)
 {
-  struct extremes {
-    int column;
-    std::unique_ptr<cudf::scalar> min;
-    std::unique_ptr<cudf::scalar> max;
-  };
   std::unordered_set<int> widen;
   auto const num_rows = static_cast<unsigned __int128>(table.num_rows());
-  if (num_rows == 0) { return widen; }
+  if (num_rows == 0 || candidates.empty()) { return widen; }
 
-  std::vector<extremes> pending;
-  pending.reserve(candidates.size());
-  for (int col_id : candidates) {
-    auto [lo, hi] = cudf::minmax(table.column(col_id), stream, mr);
-    pending.push_back({col_id, std::move(lo), std::move(hi)});
+  // Per candidate, one 3 x int64 slot {min, max, is_valid}. The minmax scalars are copied into
+  // the slots on the stream, so the host waits for the device and copies back exactly once.
+  constexpr size_t slot_words = 3;
+  size_t const slot_bytes     = slot_words * sizeof(int64_t);
+  rmm::device_buffer slots(candidates.size() * slot_bytes, stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.value()));
+
+  auto copy_to_slot = [&](size_t slot, size_t word, void const* src, size_t bytes) {
+    auto* dst = static_cast<char*>(slots.data()) + slot * slot_bytes + word * sizeof(int64_t);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.value()));
+  };
+  // The scalars own the device memory read by the copies, so they live until the host copy ends.
+  std::vector<std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>> extremes;
+  extremes.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    auto const& col      = table.column(candidates[i]);
+    auto [lo, hi]        = cudf::minmax(col, stream, mr);
+    auto const id        = col.type().id();
+    auto const rep_bytes = id == cudf::type_id::DECIMAL32 ? sizeof(int32_t) : sizeof(int64_t);
+    auto const* lo_data  = scalar_rep_data(*lo, id);
+    auto const* hi_data  = scalar_rep_data(*hi, id);
+    copy_to_slot(i, 0, lo_data, rep_bytes);
+    copy_to_slot(i, 1, hi_data, rep_bytes);
+    copy_to_slot(i, 2, lo->validity_data(), sizeof(bool));
+    extremes.emplace_back(std::move(lo), std::move(hi));
   }
-  for (auto const& e : pending) {
-    auto const type_id = table.column(e.column).type().id();
-    if (!e.min->is_valid(stream)) { continue; }
-    auto const lo = unscaled_value(*e.min, type_id, stream);
-    auto const hi = unscaled_value(*e.max, type_id, stream);
+
+  std::vector<int64_t> host(candidates.size() * slot_words);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    auto const type_id = table.column(candidates[i]).type().id();
+    auto const* slot   = host.data() + i * slot_words;
+    bool is_valid      = false;
+    std::memcpy(&is_valid, slot + 2, sizeof(bool));
+    if (!is_valid) { continue; }  // no valid value: nothing to overflow
+    auto const read = [&](int64_t const* word) -> __int128 {
+      if (type_id == cudf::type_id::DECIMAL32) {
+        int32_t v;
+        std::memcpy(&v, word, sizeof(v));
+        return v;
+      }
+      int64_t v;
+      std::memcpy(&v, word, sizeof(v));
+      return v;
+    };
+    auto const lo = read(slot);
+    auto const hi = read(slot + 1);
     auto const max_abs =
       static_cast<unsigned __int128>(std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi));
     auto const limit = type_id == cudf::type_id::DECIMAL32
                          ? static_cast<unsigned __int128>(std::numeric_limits<int32_t>::max())
                          : static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max());
-    if (num_rows * max_abs > limit) { widen.insert(e.column); }
+    if (num_rows * max_abs > limit) { widen.insert(candidates[i]); }
   }
   return widen;
 }
