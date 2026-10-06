@@ -250,6 +250,13 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     auto const& unit = duckdb::StringValue::Get(frequency);
     if (!parse_gpu_date_trunc_unit(unit)) { return nullptr; }
   }
+  if (*func_id_opt == function_id::constant_or_null) {
+    // The GPU evaluator reads the result value from a constant first argument.
+    if (expr.children.size() < 2 ||
+        expr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+      return nullptr;
+    }
+  }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }

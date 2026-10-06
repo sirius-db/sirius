@@ -62,6 +62,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
+    test/cpp/integration/test_gpu_execution_constant_or_null.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp

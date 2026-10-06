@@ -34,6 +34,7 @@
 // cudf
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/null_mask.hpp>
@@ -46,7 +47,12 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
+
+// rmm
+#include <rmm/device_buffer.hpp>
 
 // standard library
 #include <algorithm>
@@ -54,7 +60,9 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <tuple>
 #include <variant>
+#include <vector>
 
 namespace sirius {
 using evaluate_result = expression_evaluator::evaluate_result;
@@ -443,6 +451,51 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
                                      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED),
                                      _stream,
                                      _mr);
+  }
+
+  //----------constant_or_null----------//
+  // constant_or_null(c, a1, ..., an) is c in every row where all of a1..an are non-NULL and
+  // NULL in the other rows.
+  if (resolved_id == function_id::constant_or_null) {
+    D_ASSERT(args.size() >= 2);
+    auto const num_rows = _input_table.num_rows();
+    rmm::device_buffer null_mask;
+    cudf::size_type null_count = 0;
+    {
+      bool any_null_scalar = false;
+      std::vector<evaluate_result> column_results;
+      std::vector<cudf::column_view> column_views;
+      column_results.reserve(args.size() - 1);
+      column_views.reserve(args.size() - 1);
+      for (std::size_t i = 1; i < args.size(); ++i) {
+        auto result = evaluate(*args[i], evaluation_mode::MATERIALIZE);
+        if (result.is_scalar()) {
+          any_null_scalar |= !result.get_scalar().is_valid(_stream);
+        } else {
+          column_views.push_back(result.get_column_view());
+          column_results.push_back(std::move(result));
+        }
+      }
+      if (any_null_scalar) {
+        null_mask  = cudf::create_null_mask(num_rows, cudf::mask_state::ALL_NULL, _stream, _mr);
+        null_count = num_rows;
+      } else if (!column_views.empty()) {
+        std::tie(null_mask, null_count) =
+          cudf::bitmask_and(cudf::table_view(column_views), _stream, _mr);
+      }
+    }
+
+    auto const value = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    D_ASSERT(value.is_scalar());
+    auto result_column = cudf::make_column_from_scalar(value.get_scalar(), num_rows, _stream, _mr);
+    if (null_count > 0) {
+      result_column->set_null_mask(std::move(null_mask), null_count);
+      if (!cudf::is_fixed_width(result_column->type())) {
+        // Rows that become NULL still hold the constant's payload, which cuDF expects to be empty.
+        result_column = cudf::purge_nonempty_nulls(result_column->view(), _stream, _mr);
+      }
+    }
+    return evaluate_result(std::move(result_column));
   }
 
   // `error()` is a runtime-error-raising function. We deliberately do not
