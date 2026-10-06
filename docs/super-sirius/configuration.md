@@ -320,11 +320,11 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring runners), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 4 uring reactor threads), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `backend` | enum: `native`, `kvikio` | `native` | IO backend for reads. `native` uses cuCascade's native IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `native`. `sirius` is a deprecated alias of `native`, still accepted. Values are lowercase. |
-| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring runner threads for local-disk reads. Each runner allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
-| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST runner threads for object-store (`s3://`) reads, each with its own libcurl event loop and connection pool. |
+| `uring_n_reactors` | int (**> 0**) | 4 | Number of uring reactors for local-disk reads. Each reactor is one worker thread with its own io_uring ring and request queue, and allocates its own pinned staging from the host memory space when the IO context starts: 64 MiB of whole host blocks (at most 64 slots, at least one block). |
+| `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactors for object-store (`s3://`) reads, each one worker thread with its own libcurl event loop and connection pool. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
@@ -368,37 +368,28 @@ sirius:
     scan_manager:
       uring:
         slices_per_pass: 8
-        scheduling:
-          max_background_groups: 2
-          background_slot_fraction: 0.75
+        prefetch_reactors: 1
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default; cuCascade's own is 4) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
-| `slices_per_pass` | int (**0..64**) | 8 | Fairness cap: how many slices of one grouped request a runner turns into physical operations per loop pass before it moves on to the next group it holds. It does not bound a request's queue depth (free staging slots are filled either way); it makes the groups a runner holds share freed slots instead of being served first come, first served. `0` = no cap. |
-| `scheduling.max_active_groups` | int (**1..65536**) | 4 | Non-latency grouped requests (read / write / background) one runner expands at once. A read or background group whose operations are all in flight no longer counts; a write group counts for as long as the runner holds it. |
-| `scheduling.max_latency_groups` | int (**1..65536**) | 2 | Latency-class groups a runner may expand on top of `max_active_groups`, so a small read never waits behind bulk groups. |
-| `scheduling.max_background_groups` | int (**1..65536**) | 2 | Background (prefetch) groups one runner expands at once. Counted inside `max_active_groups`, so read / write groups always keep the remaining expansion slots; a value above `max_active_groups` behaves as `max_active_groups`. |
-| `scheduling.background_slot_fraction` | double [0,1] | 0.75 | Share of a runner's staging slots and in-flight operations that background operations may hold at any time (at least one operation); the rest stays free for demand reads. |
-| `scheduling.reserved_background_slots` | int (**0..65536**) | 8 | Slots (and operations) kept free of read / write operations while the runner holds background work it has not dispatched and background is below its share (clamped to a quarter of the slots and to the background share): demand slows a prefetch down but never stalls it. |
-| `scheduling.reserved_latency_slots` | int (**0..65536**) | 2 | Slots and operations kept free for latency-class operations while latency work is queued or active (clamped to half of each). |
-| `scheduling.write_slot_fraction` | double [0,1] | 0.5 | Share of the staging slots write-class operations may hold (at least one operation). |
-| `scheduling.write_ring_fraction` | double [0,1] | 0.5 | Share of the in-flight operations write-class operations may hold (at least one operation). |
-| `scheduling.write_max_wait_ms` | duration (ms, **0..1 h**) | 20 | Starvation guard: a write that has waited this long is pulled ahead of latency, read and background work. A bare number is milliseconds; a suffixed string (`1.5s`, `500us`) is also accepted. |
+| `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
+| `slices_per_pass` | int (**0..64**) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) at a queue depth of at least 8 per reactor without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
+| `prefetch_reactors` | int (**>= 0**, **< `uring_n_reactors`**) | derived | Reactors, taken from the end of the pool, that serve only prefetch (readahead) reads; the other reactors serve only demand reads, so a consumer's read never queues behind gigabytes of whole-split prefetch. `0` = no split: every read ranks among all reactors. When omitted it is derived (below); an explicit value, `0` included, is never replaced by the derived default. |
 
-Prefetch reads are background class under `cache.mode: cucs` (the prefetching cache,
-`fs_cache`, is the only producer of background reads), so `max_background_groups`,
-`background_slot_fraction` and `reserved_background_slots` are the prefetch-isolation knobs.
-Per runner, at most `max_background_groups` prefetch groups expand at once, prefetches hold at
-most `background_slot_fraction` of the runner's (up to 64) staging slots, and
-`reserved_background_slots` is the floor that keeps a prefetch moving under demand pressure.
+When `prefetch_reactors` is omitted, Sirius derives it once the whole config is loaded: `1` when
+the uring readahead runs (its resolved budget is positive — a cache with a positive
+`n_max_concurrent_scans`, or a positive `max_readahead_scans`) and `uring_n_reactors > 1`, and `0`
+otherwise. Prefetch isolation only pays when there is prefetch traffic: without the readahead the
+reserved reactor would sit idle and demand reads would lose its bandwidth. With the readahead on,
+one reactor is enough to keep it ahead of the executor (measured on TPC-H SF1000 local parquet
+with 4 reactors, `1` beat both `0` and `2`). A non-zero value with a single reactor is ignored with
+a warning (no reactor would be left for demand reads); a value `>= uring_n_reactors` is rejected.
 
-The scheduling block applies to every runner. Sirius rejects a group limit outside 1..65536, a
-reserved-slot count outside 0..65536, a `write_max_wait_ms` outside 0 ms..1 h, a fraction
-outside [0, 1] (or NaN) and a `slices_per_pass` outside 0..64 when it loads the config, naming
-the key; cuCascade's uring reactor checks its own rules (group limits >= 1, the fractions,
-`slices_per_pass`) again when it is built.
+Prefetch reads are those the prefetching cache (`fs_cache`, `cache.mode: cucs`) issues for the
+readahead; every other read, cache fills on a miss included, is a demand read. Sirius rejects a
+negative `prefetch_reactors` and a `slices_per_pass` outside 0..64 when it loads the config, naming
+the key; cuCascade's uring reactor checks `slices_per_pass` again when it is built.
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
@@ -424,11 +415,11 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
 
-Two REST values are deliberately not YAML keys. **Connections per runner** are
-fixed at 64 — the useful number is a property of one runner thread, not of a
-deployment, and more concurrency comes from adding runners (`rest_n_reactors`),
-each with its own engine and connection pool. **Physical GET size** is runner-owned:
-each runner derives a target between 4 MiB and 16 MiB from the queued logical
+Two REST values are deliberately not YAML keys. **Connections per reactor** are
+fixed at 64 — the useful number is a property of one reactor thread, not of a
+deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
+each with its own thread and connection pool. **Physical GET size** is reactor-owned:
+each reactor derives a target between 4 MiB and 16 MiB from the queued logical
 bytes and its currently free connections. Large contiguous requests are balanced
 under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
 cache-chunk boundaries so a chunk is never published before all of its bytes
@@ -691,7 +682,7 @@ per-pool extras.
 | `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
-| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO runner threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
+| `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production (the IO reactor threads are separate: `uring_n_reactors`, `rest_n_reactors`) |
 
 The task-creator, downgrade, and scan-manager pools support optional CPU affinity lists
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
@@ -935,9 +926,9 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO runners, readahead, object store) |
+| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
 | `cucascade/include/cucascade/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
-| `cucascade/include/cucascade/io/uring/config.hpp`, `io/details/scheduling_policy.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs (cuCascade) |
+| `cucascade/include/cucascade/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs (cuCascade) |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 
@@ -963,8 +954,8 @@ sirius:
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
 overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
 conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
-concern.  Each uring runner stages through whole host blocks under a fixed
-64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per runner
+concern.  Each uring reactor stages through whole host blocks under a fixed
+64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
 and even a small device miss occupies that whole block for the duration of
 its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
 so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /

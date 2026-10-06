@@ -422,12 +422,12 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** Repeated parquet reads pay full file-system cost on every query. A pinned-memory cache between the file and cuDF's parquet reader can serve subsequent reads at H2D-copy speed without re-reading from disk.
 
-**Mechanism:** The io layer this PR introduced as `sirius::io` is now consumed from cuCascade (`cucascade::io`; see the [Scan](scan.md#io-layer-cucascade-io) doc). It provides a `cudf::io::datasource` (`cucascade::io::datasource`) backed by io_uring and an optional pinned-memory chunk cache (`fs_cache`, formerly `prefetching_cache`). The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; the context publishes it as grouped requests sharing one coordinator to a shared per-class queue, from which the backend's runner threads pull (prefetches are `background` class, isolated from demand reads by the scheduling policy). A runner chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. A background evictor reclaims the chunks of finished scans (at its next pass under `eviction: idle`; under pinned-host-memory pressure with `lru`); read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
+**Mechanism:** The io layer this PR introduced as `sirius::io` is now consumed from cuCascade (`cucascade::io`; see the [Scan](scan.md#io-layer-cucascade-io) doc). It provides a `cudf::io::datasource` (`cucascade::io::datasource`) backed by io_uring and an optional pinned-memory chunk cache (`fs_cache`, formerly `prefetching_cache`). The cache converts hits, claimed chunks, and gaps into one logical prepared-slice batch; the context splits it into grouped requests sharing one coordinator and pushes each onto the queue of one of the two least-backlogged reactors (prefetches are `prefetch` class; with `uring.prefetch_reactors` > 0 they go only to the last reactors and demand reads only to the rest). A reactor, one worker thread with its own ring, chooses 256 KiB–16 MiB physical operations, uses `O_DIRECT` when the complete operation is compatible, and holds any multi-block CuCascade staging through its CUDA event. Cache-hit H2D copies likewise hold pins and a completion credit until the stream reaches them. A packed `atomic<uint64_t>` state machine combines lifecycle, reader pins, populated extent, and subscribers so coverage checks and claims are one CAS. A background evictor reclaims the chunks of finished scans (at its next pass under `eviction: idle`; under pinned-host-memory pressure with `lru`); read-ahead budgets bound work while completion credits make teardown wait for all cache-owned accesses.
 
 **Code path:**
 - `cucascade/src/cudf/datasource.cpp` — `cudf::io::datasource` implementation
 - `cucascade/src/io/cache/fs_cache.cpp` — chunk cache and evictor
-- `cucascade/src/io/uring/uring_engine.cpp` — io_uring runner engine
+- `cucascade/src/io/uring/uring_reactor.cpp` — io_uring reactor (worker thread, ring, pinned staging)
 - `cucascade/include/cucascade/io/io_request.hpp` — prepared request grouping and exact completion fan-in
 
 ### DuckDB-Native Scan Metadata Walk (PRs #868, #895, #936, #900)
@@ -455,10 +455,10 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 
 **Motivation:** A per-request serial S3 backend staged each chunk as GET → H2D copy → `cudaStreamSynchronize`, serializing the GPU stream once per chunk and leaving request latency unhidden — costly when the reader issues many small ranged reads over high-RTT links.
 
-**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST runner thread drives its own libcurl multi engine), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per runner while host staging stays proportional to the device operations in flight.
+**Mechanism:** The remote read path is an asynchronous, concurrent REST backend that plugs into the same `templated_ioctx<Reactor>` abstraction as the local io_uring backend (now in cuCascade, where each REST reactor's worker thread drives its own libcurl multi handle), so the backend-agnostic machinery (sync→async bridge, completion aggregation, per-request fan-out, device chunking) is shared rather than reimplemented. A device read issues async ranged GETs into pinned host staging, then `cudaMemcpyAsync` H2D, detecting completion by polling a `cudaEvent` (`cudaEventQuery`) rather than synchronizing the stream — so the GET window and copy window overlap and up to `max_connections` operations are in flight per reactor while host staging stays proportional to the device operations in flight.
 
 **Code path:**
-- `cucascade/src/io/rest/rest_engine.cpp`, `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST runner engine, dispatcher and context over the shared `templated_ioctx` base
+- `cucascade/src/io/rest/rest_reactor.cpp`, `cucascade/src/io/rest/rest_ioctx.cpp` — REST reactor and context over the shared `templated_ioctx` base
 - `cucascade/include/cucascade/io/templated_ioctx.hpp` — backend-agnostic async machinery shared with the io_uring path
 
 **Config:** `object_store` config (endpoint / region / credentials / signing mode) under `executor.scan_manager`
@@ -511,7 +511,7 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/scan_manager/balancing_strategy.hpp`, `src/scan_manager/round_robin_strategy.cpp` — device-distribution interface and default
 - `src/scan_manager/split_connector.hpp` — blocking queue between the coalescer and the scan operator
 
-**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io runner-thread counts (`uring_n_reactors` / `rest_n_reactors`)
+**Config:** `scan_task_batch_size` (default: 512 MB) is the requested coalesced batch size; `executor.scan_manager` sets the thread pool and the io reactor counts (`uring_n_reactors` / `rest_n_reactors`)
 
 ### Zone-Map Pruning on Pinned Chunks (PR #1154)
 

@@ -66,7 +66,7 @@ The I/O layer (`cucascade::io`: io_uring / REST / kvikIO backends, the pinned `f
 `cuCascade::cucascade_io` (the `cudf::io::datasource` bridge is in `cuCascade::cucascade_cudf`); `src/io/` keeps only Sirius glue (`path_utils`, `ioctx_resolver`,
 `parquet_helpers`, `s3/sirius_httpfs`). The `src/exec/` headers shared with cuCascade
 (`semi_future`, `thread_pool`, ...) are aliases of `cucascade::exec`. The io internals are
-documented in cuCascade's `docs/io-writes-and-runners.md`.
+documented in the doc comments of cuCascade's headers under `cucascade/include/cucascade/io/`.
 
 All new work targets Super Sirius. Memory spilling / CPU fallback is handled by the downgrade executor
 (`src/downgrade/`, `src/creator/`); see `docs/super-sirius/memory-management.md`.

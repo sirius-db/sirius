@@ -23,7 +23,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
-| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, and how Sirius uses cuCascade's IO layer (uring/REST/kvikIO runners + `fs_cache`) |
+| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, and how Sirius uses cuCascade's IO layer (uring/REST reactors, kvikIO, `fs_cache`) |
 | [Scan Contracts](scan-contracts-design.md) | How scans verify their inputs, protect native reads during checkpoints, and decide whether CPU fallback is allowed |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |

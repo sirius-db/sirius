@@ -103,7 +103,7 @@ Super Sirius uses multiple dedicated thread pools, each with a specific role:
 │  - Worker thread pool: per-scan preparation                    │
 │  - Driver thread: runs split providers sequentially, feeding    │
 │    splits into each scan operator's split_connector            │
-│  - cuCascade io runner threads: io_uring (local disk) and REST  │
+│  - cuCascade io reactor threads: io_uring (local disk) and REST │
 │    (s3://); kvikIO has none. Pinned fs_cache per context        │
 │    under cache.mode: cucs                                       │
 └─────────────────────────────────────────────────────────────────┘
@@ -152,6 +152,6 @@ A query through Super Sirius follows these steps:
 | `src/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
 | `src/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
 | `src/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
-| `src/io/` | Sirius I/O glue (`path_utils`, `ioctx_resolver`, `parquet_helpers`, `s3/sirius_httpfs`); the I/O layer itself (uring / REST / kvikIO backends, `fs_cache`) is cuCascade's `cucascade::io`, documented in its `docs/io-writes-and-runners.md` |
+| `src/io/` | Sirius I/O glue (`path_utils`, `ioctx_resolver`, `parquet_helpers`, `s3/sirius_httpfs`); the I/O layer itself (uring / REST / kvikIO backends, `fs_cache`) is cuCascade's `cucascade::io`, documented in the doc comments of its headers under `cucascade/include/cucascade/io/` |
 | `src/downgrade/downgrade_executor.hpp` | Memory spilling |
 | `src/memory/sirius_memory_reservation_manager.hpp` | Memory management |
