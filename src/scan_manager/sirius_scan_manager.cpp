@@ -2225,7 +2225,7 @@ sirius_scan_manager::ioctx_failure sirius_scan_manager::explain_ioctx_failure(
       }
       return {.cause =
                 "invalid uring configuration (check uring.n_max_concurrent_scans, "
-                "uring.slices_per_pass, uring.prefetch_reactors)",
+                "uring.prefetch_reactors)",
               .by_configuration = false};
     case cucascade::io::io_context_type::kvikio:
       return {.cause = "kvikIO backend could not be constructed (check kvikio.* settings)",

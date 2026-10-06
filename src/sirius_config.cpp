@@ -226,9 +226,9 @@ static void from_yaml(const YAML::Node& node, cucascade::io::rest::config& opt)
   r.reject_unknown();
 }
 
-// The uring reactor re-checks the slices_per_pass rule when it is constructed, but
-// cuCascade's factory then returns nullptr and the cause appears only in cuCascade's
-// (compiled-out) log, so Sirius validates it here and names the key.
+// cuCascade does not validate slices_per_pass (a value above the slot count merely acts
+// as no cap) and its factories report other config errors only through compiled-out
+// logging, so Sirius validates the uring keys here and names the key.
 static void from_yaml(const YAML::Node& node, cucascade::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");

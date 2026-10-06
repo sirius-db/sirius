@@ -314,7 +314,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `details/scheduling_policy.hpp`, `rest/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/sirius_config.cpp` (YAML parsing); the IO sub-configs are cuCascade's, under `cucascade/include/cucascade/io/`: `uring/config.hpp`, `rest/config.hpp`, `kvikio/config.hpp`, `cache/config.hpp`, `object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the cuCascade IO layer that feeds the GPU scan operators.
 
@@ -374,7 +374,7 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `n_max_concurrent_scans` | int | 0 | Readahead budget the local backend publishes, which an unset `max_readahead_scans` defers to (under `opportunistic`, the default for local reads, a positive value switches the readahead on and the pipeline width sets the budget). `0` (Sirius's default, and cuCascade's) keeps the readahead off for local reads, since a local NVMe read competes with the executor's own reads rather than hiding a round trip. An explicit `max_readahead_scans` overrides it. |
-| `slices_per_pass` | int (**0..64**) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) at a queue depth of at least 8 per reactor without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
+| `slices_per_pass` | int (**0..64**) | 8 | Most slices of the active request a reactor turns into physical reads per loop pass before it waits for a completion. A reactor works through one request at a time, in queue order; the default `8` keeps a single many-slice request (a whole-split prefetch, a wide demand read) deep — up to 8 slices per pass, bounded by the reactor's free staging slots — without letting one pass claim every free slot. `0` = no cap: keep going while every planned read finds a free staging slot (each reactor has at most 64). `1` expands one slice per pass, which holds such a request to a depth of 1-2 per reactor. |
 | `prefetch_reactors` | int (**>= 0**, **< `uring_n_reactors`**) | derived | Reactors, taken from the end of the pool, that serve only prefetch (readahead) reads; the other reactors serve only demand reads, so a consumer's read never queues behind gigabytes of whole-split prefetch. `0` = no split: every read ranks among all reactors. When omitted it is derived (below); an explicit value, `0` included, is never replaced by the derived default. |
 
 When `prefetch_reactors` is omitted, Sirius derives it once the whole config is loaded: `1` when
@@ -389,7 +389,7 @@ a warning (no reactor would be left for demand reads); a value `>= uring_n_react
 Prefetch reads are those the prefetching cache (`fs_cache`, `cache.mode: cucs`) issues for the
 readahead; every other read, cache fills on a miss included, is a demand read. Sirius rejects a
 negative `prefetch_reactors` and a `slices_per_pass` outside 0..64 when it loads the config, naming
-the key; cuCascade's uring reactor checks `slices_per_pass` again when it is built.
+the key. cuCascade does not re-check `slices_per_pass`: a value above 64 would simply behave as no cap, since a reactor has at most 64 staging slots.
 
 ### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
 
