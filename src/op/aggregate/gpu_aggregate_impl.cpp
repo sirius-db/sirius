@@ -18,17 +18,15 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/reduction.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
@@ -38,7 +36,6 @@
 #include <rmm/error.hpp>
 
 #include <algorithm>
-#include <limits>
 #include <new>
 #include <optional>
 #include <unordered_set>
@@ -62,73 +59,6 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
                                std::to_string(static_cast<int>(kind)));
   }
 }
-
-namespace {
-
-/// The type a SUM over a column of type @p type is computed in: the next wider decimal type for
-/// DECIMAL32 and DECIMAL64, and nullopt for every other type.
-std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
-{
-  switch (type.id()) {
-    case cudf::type_id::DECIMAL32: return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
-    case cudf::type_id::DECIMAL64: return cudf::data_type(cudf::type_id::DECIMAL128, type.scale());
-    default: return std::nullopt;
-  }
-}
-
-/// The unscaled value of a DECIMAL32 or DECIMAL64 scalar, widened to 128 bits.
-__int128 unscaled_value(cudf::scalar const& s, cudf::type_id id, rmm::cuda_stream_view stream)
-{
-  if (id == cudf::type_id::DECIMAL32) {
-    return static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(s).value(stream);
-  }
-  return static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(s).value(stream);
-}
-
-/// The columns among @p candidates (DECIMAL32 or DECIMAL64) whose SUM over this batch could
-/// overflow the column's own storage width and so must be summed over the next wider decimal type.
-///
-/// A sum of n values of magnitude at most m is at most n * m, so rows * max|value| within the
-/// storage width (2^31-1 or 2^63-1) rules out wrap-around in every group. The bound is exact. It
-/// lets columns with small values, such as TPC-H's DECIMAL(15,2), skip the widening copy and the
-/// 128-bit group accumulation. Nulls are skipped, and a column with no valid value cannot
-/// overflow. All cudf::minmax passes are launched before the first result is read.
-std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
-                                                      std::vector<int> const& candidates,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
-{
-  struct extremes {
-    int column;
-    std::unique_ptr<cudf::scalar> min;
-    std::unique_ptr<cudf::scalar> max;
-  };
-  std::unordered_set<int> widen;
-  auto const num_rows = static_cast<unsigned __int128>(table.num_rows());
-  if (num_rows == 0) { return widen; }
-
-  std::vector<extremes> pending;
-  pending.reserve(candidates.size());
-  for (int col_id : candidates) {
-    auto [lo, hi] = cudf::minmax(table.column(col_id), stream, mr);
-    pending.push_back({col_id, std::move(lo), std::move(hi)});
-  }
-  for (auto const& e : pending) {
-    auto const type_id = table.column(e.column).type().id();
-    if (!e.min->is_valid(stream)) { continue; }
-    auto const lo = unscaled_value(*e.min, type_id, stream);
-    auto const hi = unscaled_value(*e.max, type_id, stream);
-    auto const max_abs =
-      static_cast<unsigned __int128>(std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi));
-    auto const limit = type_id == cudf::type_id::DECIMAL32
-                         ? static_cast<unsigned __int128>(std::numeric_limits<int32_t>::max())
-                         : static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max());
-    if (num_rows * max_abs > limit) { widen.insert(e.column); }
-  }
-  return widen;
-}
-
-}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
   const cucascade::read_only_data_batch& input,

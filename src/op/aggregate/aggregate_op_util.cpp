@@ -21,7 +21,13 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 
+#include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+
+#include <algorithm>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -158,6 +164,63 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   }
 
   return result;
+}
+
+namespace {
+
+/// The unscaled value of a DECIMAL32 or DECIMAL64 scalar, widened to 128 bits.
+__int128 unscaled_value(cudf::scalar const& s, cudf::type_id id, rmm::cuda_stream_view stream)
+{
+  if (id == cudf::type_id::DECIMAL32) {
+    return static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(s).value(stream);
+  }
+  return static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(s).value(stream);
+}
+
+}  // namespace
+
+std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
+{
+  switch (type.id()) {
+    case cudf::type_id::DECIMAL32: return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
+    case cudf::type_id::DECIMAL64: return cudf::data_type(cudf::type_id::DECIMAL128, type.scale());
+    default: return std::nullopt;
+  }
+}
+
+std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
+                                                      std::vector<int> const& candidates,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  struct extremes {
+    int column;
+    std::unique_ptr<cudf::scalar> min;
+    std::unique_ptr<cudf::scalar> max;
+  };
+  std::unordered_set<int> widen;
+  auto const num_rows = static_cast<unsigned __int128>(table.num_rows());
+  if (num_rows == 0) { return widen; }
+
+  std::vector<extremes> pending;
+  pending.reserve(candidates.size());
+  for (int col_id : candidates) {
+    auto [lo, hi] = cudf::minmax(table.column(col_id), stream, mr);
+    pending.push_back({col_id, std::move(lo), std::move(hi)});
+  }
+  for (auto const& e : pending) {
+    auto const type_id = table.column(e.column).type().id();
+    if (!e.min->is_valid(stream)) { continue; }
+    auto const lo = unscaled_value(*e.min, type_id, stream);
+    auto const hi = unscaled_value(*e.max, type_id, stream);
+    auto const max_abs =
+      static_cast<unsigned __int128>(std::max(lo < 0 ? -lo : lo, hi < 0 ? -hi : hi));
+    auto const limit = type_id == cudf::type_id::DECIMAL32
+                         ? static_cast<unsigned __int128>(std::numeric_limits<int32_t>::max())
+                         : static_cast<unsigned __int128>(std::numeric_limits<int64_t>::max());
+    if (num_rows * max_abs > limit) { widen.insert(e.column); }
+  }
+  return widen;
 }
 
 }  // namespace op
