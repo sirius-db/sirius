@@ -42,7 +42,6 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
-boto3 = ">=1.43.68,<2"
 croaring = "*"
 
 [pypi-dependencies]
