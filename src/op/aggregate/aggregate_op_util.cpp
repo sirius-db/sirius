@@ -26,6 +26,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -197,6 +198,31 @@ scalar_rep scalar_rep_of(cudf::scalar& s)
   }
 }
 
+/// A small pinned host buffer for a device-to-host readback. It comes from cuDF's pinned resource,
+/// which Sirius backs with a slab pool for allocations this small (cuDF's default pool is used when
+/// no Sirius context is installed). Allocation and release are ordered on @p stream.
+class pinned_host_buffer {
+ public:
+  pinned_host_buffer(size_t bytes, rmm::cuda_stream_view stream)
+    : mr_(cudf::get_pinned_memory_resource()),
+      stream_(stream),
+      bytes_(bytes),
+      data_(mr_.allocate(stream, bytes, alignof(int64_t)))
+  {
+  }
+  ~pinned_host_buffer() { mr_.deallocate(stream_, data_, bytes_, alignof(int64_t)); }
+  pinned_host_buffer(pinned_host_buffer const&)            = delete;
+  pinned_host_buffer& operator=(pinned_host_buffer const&) = delete;
+
+  int64_t* data() const { return static_cast<int64_t*>(data_); }
+
+ private:
+  rmm::host_device_async_resource_ref mr_;
+  rmm::cuda_stream_view stream_;
+  size_t bytes_;
+  void* data_;
+};
+
 /// |v| as an unsigned 128-bit value. The caller holds v in 128 bits already widened from a 32 or
 /// 64-bit decimal, so negating the most negative 32/64-bit value (-2^31, -2^63) cannot overflow.
 unsigned __int128 magnitude(__int128 v) { return static_cast<unsigned __int128>(v < 0 ? -v : v); }
@@ -254,7 +280,7 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
     extremes.emplace_back(std::move(lo), std::move(hi));
   }
 
-  std::vector<int64_t> host(candidates.size() * slot_words);
+  pinned_host_buffer host(slots.size(), stream);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
     host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.value()));
   stream.synchronize();
