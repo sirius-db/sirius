@@ -248,7 +248,11 @@ varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir
 `--validation/--no-validation` (fixed predicates only, default on; the power run's post-RF1 and
 post-RF2 GPU rows are diffed against pure DuckDB in a child process after every pinned phase
 completes, with the refresh functions replayed on a fresh copy — it cannot share the benchmark
-process, since the host pool does not return memory to the OS on unpin),
+process, since the host pool does not return memory to the OS on unpin. In `--mode both` the
+throughput streams are validated too: the child re-runs the N throughput RF1/RF2 pairs and
+snapshots the CPU results after the baseline and each commit, and every stream's GPU rows must
+match one of those 2N+1 snapshots — which committed refresh state a concurrent query observed is
+a scheduling accident, but it must be one of them),
 `--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
@@ -303,6 +307,11 @@ CPU pass. Ask when an unresolved choice materially changes cost or the intended 
 For comparisons, match the dataset, scale factor, mode, streams, predicates, pinning, config,
 and other execution settings except the variable under test. Report the exact invocation and
 effective config path with the results.
+In `--mode both`, validation also captures throughput results and compares them with the
+post-power baseline and each throughput RF1/RF2 committed state (2N+1 CPU snapshots).
+This checks membership in a collected state, not visibility during the query's transaction.
+Throughput-only mode skips this validation with a warning.
+
 
 Verify that the Sirius extension is built. Refresh and query generation also need `tpch-dbgen`;
 the generation scripts can build it from `test_datasets/tpch-dbgen.zip`. Inspect Sirius logs for
