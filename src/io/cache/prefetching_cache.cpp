@@ -57,19 +57,6 @@ namespace sirius::io::cache {
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
 
-/// Hand every buffer @p generation's chunks still hold back to @p pool.
-/// Pinned chunks are left alone and counted; the caller decides what that
-/// means.  Allocates nothing itself: claimed chunks and each arena's buffer
-/// list go into the generation's pre-reserved scratch, which is never handed
-/// away, so this can run in the noexcept deleter.  (The pool's hand-back copies
-/// the list for the allocator's RAII wrapper — the one allocating step, shared
-/// with the evictor.)
-///
-/// A chunk's buffer and arena are read only after @c mark_evicting has claimed
-/// it: until then a prepare that lost its cancellation race may still attach
-/// a different buffer from a different arena.  A claimed chunk stays
-/// @c evicting — which no prepare can take over — until its own pointer and
-/// arena have been copied out; after its @c mark_empty it is never read again.
 std::size_t reclaim_chunk_buffers(cache_generation& generation,
                                   buffer_pool& pool,
                                   bool only_unsubscribed) noexcept
@@ -89,7 +76,6 @@ std::size_t reclaim_chunk_buffers(cache_generation& generation,
     }
     claimed.push_back(c);  // capacity reserved at creation: one per slot
   }
-  // Group by the arena each claimed buffer actually came from.
   std::ranges::sort(claimed, {}, [](cached_chunk const* c) { return c->numa_node; });
   for (auto run = claimed.begin(); run != claimed.end();) {
     int const numa = (*run)->numa_node;
@@ -107,12 +93,6 @@ std::size_t reclaim_chunk_buffers(cache_generation& generation,
   return stuck;
 }
 
-/// Destroys a generation once its last owner lets go.  Takes the generation
-/// lock exclusively so the evictor, which borrows chunks under the shared side,
-/// never sees a chunk disappear mid-pass; returns the generation's buffers to
-/// the pool it was carved from.  Owns the pool and the lock through
-/// shared_ptrs so a generation released after its cache has been torn down
-/// still destroys safely.
 struct generation_deleter {
   std::shared_ptr<buffer_pool> pool;
   std::shared_ptr<std::shared_mutex> retire_mtx;
@@ -137,9 +117,6 @@ struct generation_deleter {
 
 struct prefetching_cache::cached_copy_retirement {
   std::vector<cached_chunk*> pins;
-  /// Keeps the pinned chunks' generation alive until the copies have passed;
-  /// released right after the pins and before the coordinator credit, so a
-  /// ready future means this read holds no generation any more.
   std::shared_ptr<cache_generation> generation;
   std::shared_ptr<exec::completion_controller::slot> lifetime;
   std::shared_ptr<grouped_coordinator> coordinator;
@@ -409,8 +386,6 @@ void prefetching_cache::reclaim_all_chunks() noexcept
     _file_cache.clear();
     _generations_by_path.clear();
   }
-  // Retired generations some operation still owns are not in the map; their
-  // deleter returns their buffers when that owner lets go.
   current.clear();
   if (stuck > 0) {
     SIRIUS_LOG_WARN(
@@ -458,9 +433,6 @@ std::shared_ptr<cache_generation> prefetching_cache::get_or_create_generation(co
     if (auto it = _file_cache.find(key); it != _file_cache.end()) { return it->second; }
   }
 
-  // Owners of generations this creation retires, dropped only after the map
-  // lock is released: the last release destroys a generation, and that takes
-  // the generation lock.
   std::vector<std::shared_ptr<cache_generation>> superseded;
   std::shared_ptr<cache_generation> created;
   {
@@ -470,9 +442,6 @@ std::shared_ptr<cache_generation> prefetching_cache::get_or_create_generation(co
 
     auto& family = _generations_by_path[obj.object_path()];
     std::erase_if(family, [](auto const& weak) { return weak.expired(); });
-    // A retired generation stays the identity of the opens that hold it: a late
-    // request from one of them continues on it rather than minting a new
-    // generation under the old key, which would wrongly retire the current one.
     for (auto const& weak : family) {
       if (auto alive = weak.lock(); alive && alive->key == key) { return alive; }
     }
@@ -489,12 +458,8 @@ std::shared_ptr<cache_generation> prefetching_cache::get_or_create_generation(co
     auto const n_slots =
       obj.size() / _chunk_size + static_cast<size_t>(obj.size() % _chunk_size != 0);
     created->slots.assign(n_slots, nullptr);
-    // Reclamation runs in noexcept paths later; its scratch is sized now, while
-    // an allocation failure is still an ordinary error.
     created->reclaim_claimed.reserve(n_slots);
     created->reclaim_batch.reserve(n_slots);
-    // Every container this publication touches grows before the map is
-    // written, so a failure leaves nothing half-indexed.
     family.reserve(family.size() + 1);
     superseded.reserve(family.size());
     _file_cache.emplace(key, created);
@@ -646,10 +611,7 @@ cache_handle prefetching_cache::initiate_prefetching_request(const io_object& ob
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { req.preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
-  std::ignore = req.producer->mark_queued();
-  // The evictor's copy names the chunks and the stage machines only: holding
-  // the object too would keep a retired open's footer stash alive until the
-  // evictor next wakes.
+  std::ignore              = req.producer->mark_queued();
   prefetch_request tracked = req;
   tracked.obj.reset();
   _eviction_queue.enqueue(cache_request{std::move(tracked)});
@@ -865,8 +827,6 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
 
   std::vector<cached_chunk*> claimed;
   std::vector<hit_copy> hits;
-  // Outlives the try: the catch below still touches `hits` and `claimed`, so
-  // the generation they point into must survive unwinding.
   std::shared_ptr<cache_generation> generation;
   try {
     std::ignore = _completion_poll.drain_all();
@@ -960,9 +920,6 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
     if (has_backend) {
       auto coordinator = std::make_shared<grouped_coordinator>(logical_bytes, 1);
       result_future    = coordinator->get_future();
-      // The backend future settles only after every physical operation has run
-      // its chunk callback, so this is the last access to the generation from
-      // this read; the owner goes before the credit that readies the caller.
       size_terminal terminal{
         [coordinator, owner = generation](exec::try_t<std::size_t>&& result) mutable noexcept {
           owner.reset();
@@ -1134,8 +1091,6 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
       coordinator   = std::make_shared<grouped_coordinator>(logical_bytes, task_count);
       result_future = coordinator->get_future();
       if (has_backend) {
-        // Same ordering as the host path: the backend future is the last chunk
-        // access of this read's fills, so the owner goes before the credit.
         backend_terminal = size_terminal{
           [coordinator, owner = generation](exec::try_t<std::size_t>&& result) mutable noexcept {
             owner.reset();
@@ -1402,9 +1357,7 @@ bool prefetching_cache::prefetch(cache_handle& handle, exec::invocable<void(bool
         }
       });
     done_owner = std::make_shared<exec::invocable<void(bool) noexcept>>(std::move(on_done));
-    // The handle may be gone by the time the fill lands, so the request's own
-    // terminal keeps the generation until every chunk callback has run.
-    terminal = size_terminal{
+    terminal   = size_terminal{
       [req, done_owner, owner = handle._generation](exec::try_t<size_t>&& res) mutable noexcept {
         owner.reset();
         auto const ok = res.has_value();
@@ -1497,10 +1450,6 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
 
     std::ignore = _completion_poll.drain_all();
 
-    // Everything below dereferences chunks of generations this loop does not
-    // own.  The generation lock keeps their deleter out for the round; a
-    // request whose generation has already lost its last owner names chunks
-    // that are gone or going, and is dropped without being touched.
     std::shared_lock generation_lk(*_retire_mtx);
     std::erase_if(eviction_batch,
                   [](tracked_request const& er) { return er.req.generation.expired(); });

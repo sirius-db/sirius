@@ -78,16 +78,6 @@ namespace sirius::io::cache {
   });
 }
 
-/// One generation of one object in the cache: the chunk slots for a
-/// (path, validator) identity.  Shared-owned.  The cache map holds one owner
-/// while the generation is current; every operation that touches its chunks —
-/// a @ref cache_handle, an in-flight fill, a queued completion, a cached-copy
-/// retirement — holds another for exactly as long as it may dereference them.
-/// When a newer generation of the same path arrives this one is *retired*:
-/// dropped from the map so no new lookup finds it, still intact for its
-/// remaining owners.  The last owner's release reclaims its buffers and frees
-/// it, synchronously; the evictor and the path index only ever borrow (see
-/// @c prefetching_cache::_retire_mtx).
 struct cache_generation {
   /// Materialise a chunk for every offset in @p incoming, fold the matching
   /// entry of @p desired into its populated extent, and count the calling
@@ -114,10 +104,6 @@ struct cache_generation {
   /// lookup is an index instead of a search.
   std::vector<cached_chunk*> slots;
   chunk_arena arena;  ///< owns the chunks `slots` points at; append-only
-  /// Scratch for returning this generation's chunks to the pool, reserved at
-  /// creation and never handed away, so reclamation in the deleter allocates
-  /// nothing itself: the chunks claimed by one pass, and the buffer list for
-  /// one arena of them.
   std::vector<cached_chunk*> reclaim_claimed;
   std::vector<std::byte*> reclaim_batch;
   size_t file_size{0};
@@ -279,8 +265,6 @@ class cache_handle {
 
   cache_handle(prefetch_request req, std::shared_ptr<cache_generation> generation) noexcept;
 
-  /// Declared before @c _req so it is released after the consumer is marked
-  /// disposed: the generation outlives every chunk pointer this handle holds.
   std::shared_ptr<cache_generation> _generation;
   prefetch_request _req;
 };
@@ -443,10 +427,6 @@ class prefetching_cache {
   [[nodiscard]] prepare_result prepare_request(prefetch_request& req,
                                                bool wait_for_eviction = false);
 
-  /// The generation a read of @p obj may touch: the handle's own when it has
-  /// one, otherwise the current generation under @p obj's key.  Null when
-  /// neither exists.  The caller keeps the returned owner for as long as it
-  /// holds any chunk pointer obtained through it.
   [[nodiscard]] std::shared_ptr<cache_generation> generation_for(const io_object& obj,
                                                                  cache_handle* handle) const;
 
@@ -506,13 +486,8 @@ class prefetching_cache {
   /// live reader; any such chunk is left alone and logged instead.
   void reclaim_all_chunks() noexcept;
 
-  /// The current generation under @p obj's key, created on first sight.  A
-  /// creation retires every older generation of the same path.
   std::shared_ptr<cache_generation> get_or_create_generation(const io_object& obj);
 
-  /// Hand back the buffers of @p generation's chunks that no request names and
-  /// no reader pins.  Run at retirement so an abandoned generation's payload
-  /// returns before its last holder lets go of the descriptors.
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
   const config _cfg;
@@ -577,23 +552,12 @@ class prefetching_cache {
   bool _dispose_on_idle{false};
 
   mutable std::shared_mutex _map_mtx;
-  /// Current generation per key.  Retiring removes the entry; the generation
-  /// then lives exactly as long as its remaining owners.
   std::unordered_map<std::string, std::shared_ptr<cache_generation>> _file_cache;
-  /// Every alive generation of a path, current and retired, for the observers
-  /// and for retirement.  Non-owning; expired references are pruned when the
-  /// path is opened again.
   std::unordered_map<std::string,
                      std::vector<std::weak_ptr<cache_generation>>,
                      detail::string_hash,
                      std::equal_to<>>
     _generations_by_path;
-  /// Generation lock.  The evictor touches chunks of generations it does not
-  /// own; it holds this shared while doing so and skips any generation whose
-  /// owners are gone.  A generation's deleter takes it exclusive, so a chunk
-  /// the evictor is looking at cannot be freed under it.  Shared with the
-  /// deleter so a generation released after the cache is gone still destroys
-  /// safely.
   std::shared_ptr<std::shared_mutex> _retire_mtx;
 
   /// One stream-ordered ticket frontier replaces a CUDA event per cached-copy

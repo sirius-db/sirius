@@ -126,10 +126,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// long as the returned io_object — a per-open transport shortcut, not a cache.
   std::shared_ptr<io_object> create_footer_probe_object(std::string path);
 
-  /// Warn once per path when an open carries no strong ETag: such an object is
-  /// cached only within its own open (see @c rest_io_object).  The set of
-  /// warned paths is capped so a bucket of tagless objects cannot grow it
-  /// without bound; once full, further paths warn again.
   std::shared_ptr<io_object> note_unqualified(std::shared_ptr<io_object> obj);
 
   /// Guards the warm-up rate limiter.  Contended once per query at most, and

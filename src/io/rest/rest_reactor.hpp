@@ -126,18 +126,13 @@ struct head_object_result {
  * authorizes against, the object size discovered by a one-time HEAD or suffix
  * probe at construction, and the ETag that response carried.  Does no I/O of
  * its own.
- *
- * The cache id is the object *generation*, not the path: an object replaced in
- * place under the same key must never share cached bytes or parsed metadata
- * with its predecessor.  A strong ETag names a generation; an open without one
- * (missing, weak, or malformed) gets an identity no other open can produce, so
- * it caches only within itself.
  */
 class rest_io_object : public io_object {
  public:
   /// The cache id of an open with a strong validator.  Public so a caller that
   /// knows a path and tag can derive the key without opening the object.
-  [[nodiscard]] static std::string generation_key(std::string_view path, std::string_view strong_tag)
+  [[nodiscard]] static std::string generation_key(std::string_view path,
+                                                  std::string_view strong_tag)
   {
     std::string key;
     key.reserve(path.size() + 1 + strong_tag.size());
@@ -190,10 +185,7 @@ class rest_io_object : public io_object {
   {
   }
 
-  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override
-  {
-    return _cache_id;
-  }
+  [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _cache_id; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
   [[nodiscard]] std::string_view validation_tag() const noexcept override { return _etag; }
@@ -209,8 +201,6 @@ class rest_io_object : public io_object {
   [[nodiscard]] size_t stash_window_lo() const noexcept { return _window_lo; }
 
  private:
-  /// One id per open when there is no strong tag: the counter is process-wide
-  /// so two ioctxs cannot mint the same id for one path.
   [[nodiscard]] static std::string make_cache_id(std::string const& path, std::string const& etag)
   {
     if (is_strong_tag(etag)) { return generation_key(path, etag); }

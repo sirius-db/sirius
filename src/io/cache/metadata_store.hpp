@@ -56,15 +56,8 @@ struct string_hash {
  * skip the parse — without depending on whether the prefetching cache
  * has been initialised.
  *
- * The key is the object's *generation* (path plus validator for an object
- * store), so metadata parsed from one version of an object is never handed to
- * a reader of another.  The store keeps at most one generation per path: a
- * registration replaces whatever that path held, whichever generation it was
- * (validators are opaque, not ordered), and a reader that then misses simply
- * re-parses.  Metadata already handed out stays valid for its holders.
- *
- * Register / lookup only, no eviction beyond that replacement; entries live
- * for the ioctx's lifetime.
+ * Register / lookup only, no eviction beyond registration-time replacement;
+ * entries live for the ioctx's lifetime.
  */
 class metadata_store {
  public:
@@ -100,7 +93,6 @@ class metadata_store {
 
   mutable std::shared_mutex _mtx;
   string_map<std::shared_ptr<io_object_metadata>> _by_key;
-  /// The one registered generation key per object path.
   string_map<std::string> _key_by_path;
 };
 
