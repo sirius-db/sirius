@@ -3292,17 +3292,17 @@ static void LoadInternal(ExtensionLoader& loader)
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
 
-  // Loading the callback's config makes the first NVTX call, so the NVTX
-  // decision must be published before the callback is constructed.
-  duckdb::SiriusContextExtensionCallback::publish_configured_nvtx_injection();
-
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
   auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
-  if (!sirius_disabled) { callback_ptr->initialize_context(); }
+  if (!sirius_disabled) {
+    // Config parsing above must remain NVTX-free. initialize_context creates Quent
+    // before resolving hardware or constructing any instrumented runtime objects.
+    callback_ptr->initialize_context();
+  }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the

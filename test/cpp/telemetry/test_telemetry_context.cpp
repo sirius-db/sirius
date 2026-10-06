@@ -20,15 +20,23 @@
 #include "sirius_extension.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "utils/child_process_environment.hpp"
 
 #include <dlfcn.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
+#include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace sirius;
@@ -65,11 +73,13 @@ class scoped_env_restore {
 std::string uuid_str(const uuid::UUID& id) { return std::string(uuid::to_string(id)); }
 
 /// Read every line of every ndjson file that the quent context wrote.
-std::vector<std::string> read_all_telemetry_lines(const std::filesystem::path& dir)
+std::vector<std::string> read_all_telemetry_lines(const std::filesystem::path& dir,
+                                                  std::string_view entity = {})
 {
   std::vector<std::string> lines;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
-    if (!entry.is_regular_file()) { continue; }
+    if (!entry.is_regular_file() || entry.path().extension() != ".ndjson") { continue; }
+    if (!entity.empty() && entry.path().parent_path().filename().string() != entity) { continue; }
     std::ifstream in(entry.path());
     std::string line;
     while (std::getline(in, line)) {
@@ -96,6 +106,91 @@ bool any_line_with_all(const std::vector<std::string>& lines,
 }
 
 }  // namespace
+
+TEST_CASE("fresh runtime startup captures the libcucascade domain only when opted in",
+          "[telemetry_context][isolated_context]")
+{
+  auto const enable_quent = GENERATE(false, true);
+  auto const nvtx_setting =
+    GENERATE(std::string{"default"}, std::string{"false"}, std::string{"true"});
+  auto const use_ffi = GENERATE(false, true);
+  CAPTURE(enable_quent, nvtx_setting, use_ffi);
+  auto const root =
+    std::filesystem::temp_directory_path() / ("sirius_nvtx_startup_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  auto const config_path = root / "sirius.yaml";
+  auto const output      = root / "telemetry";
+  {
+    std::ofstream config(config_path);
+    config << "sirius:\n"
+              "  topology: { num_gpus: 1 }\n"
+              "  memory:\n"
+              "    gpu: { usage_limit_fraction: 0.1 }\n"
+              "    host: { capacity_bytes: 2Gi, initial_number_pools: 1, pool_size: 128 }\n"
+              "  executor:\n"
+              "    pipeline: { num_threads: 1 }\n"
+              "    task_creator: { num_threads: 1 }\n"
+              "  telemetry:\n"
+              "    enable_quent: "
+           << (enable_quent ? "true" : "false") << '\n';
+    if (nvtx_setting != "default") { config << "    enable_nvtx: " << nvtx_setting << '\n'; }
+    config << "    exporter: ndjson\n"
+              "    output_directory: "
+           << output.string() << '\n';
+    REQUIRE(config.good());
+  }
+
+  // NVTX caches domain handles and Quent's hook is installed once per process.
+  // Use a fresh helper without the unit runner's shared environment startup.
+  // FFI initializes its own runtime; disable the embedded DuckDB's automatic one.
+  sirius::test::child_process_environment environment{
+    {{"SIRIUS_DISABLE", use_ffi ? "1" : "0"},
+     {"SIRIUS_CONFIG_FILE", config_path.string()},
+     {"SIRIUS_LOG_DIR", (root / "logs").string()}},
+    {"NVTX_INJECTION64_PATH", "NVTX_INJECTION32_PATH"}};
+  auto executable =
+    (std::filesystem::canonical("/proc/self/exe").parent_path() / "sirius_nvtx_startup").string();
+  std::string mode  = use_ffi ? "ffi" : "duckdb";
+  char* arguments[] = {executable.data(), mode.data(), nullptr};
+  pid_t child{};
+  REQUIRE(::posix_spawn(
+            &child, executable.c_str(), nullptr, nullptr, arguments, environment.data()) == 0);
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  int status{};
+  bool finished = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto const result = ::waitpid(child, &status, WNOHANG);
+    if (result == child) {
+      finished = true;
+      break;
+    }
+    if (result < 0 && errno != EINTR) { break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (!finished) {
+    (void)::kill(child, SIGKILL);
+    (void)::waitpid(child, &status, 0);
+  }
+  INFO("NVTX startup artifacts: " << root);
+  REQUIRE(finished);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+  if (enable_quent) {
+    REQUIRE(std::filesystem::is_directory(output));
+    REQUIRE_FALSE(read_all_telemetry_lines(output).empty());
+  }
+  auto const lines = std::filesystem::is_directory(output)
+                       ? read_all_telemetry_lines(output, "NvtxEvent")
+                       : std::vector<std::string>{};
+  if (enable_quent && nvtx_setting == "true") {
+    REQUIRE(any_line_with_all(lines, {"\"DomainCreate\"", "\"name\":\"libcucascade\""}));
+    REQUIRE(any_line_with_all(lines, {"\"RangePush\"", "topology:discover"}));
+  } else {
+    REQUIRE(lines.empty());
+  }
+  std::filesystem::remove_all(root);
+}
 
 TEST_CASE("SIRIUS_DISABLE skips automatic NVTX injection discovery",
           "[telemetry_context][isolated_context]")
