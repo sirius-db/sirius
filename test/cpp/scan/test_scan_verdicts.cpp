@@ -173,10 +173,13 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   inspect("SELECT c,a FROM r2a_leaf", {{}});
   inspect("SELECT c FROM r2a_leaf WHERE b=2", {{1}});
   inspect("SELECT c,a+1 FROM r2a_leaf", {{0}});
-  inspect("SELECT c FROM r2a_leaf ORDER BY b", {{1}});
-  inspect("SELECT l.c,r.a+1 FROM r2a_leaf l JOIN r2a_leaf r ON l.a=r.b", {{0}, {0, 1}});
+  // Sort and TOP_N payloads must retain their physical type until host export.
+  inspect("SELECT c FROM r2a_leaf ORDER BY b", {{1, 2}});
+  inspect("SELECT c FROM r2a_leaf ORDER BY b LIMIT 1", {{1, 2}});
+  inspect("SELECT l.c,r.a FROM r2a_leaf l JOIN r2a_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
+  inspect("SELECT l.c,r.a+1 FROM r2a_leaf l JOIN r2a_leaf r ON l.a=r.b", {{0, 2}, {0, 1}});
   inspect("SELECT l.c FROM r2a_leaf l WHERE EXISTS (SELECT 1 FROM r2a_leaf r WHERE r.b=l.a)",
-          {{0}, {1}});
+          {{0, 2}, {1}});
 }
 
 TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,

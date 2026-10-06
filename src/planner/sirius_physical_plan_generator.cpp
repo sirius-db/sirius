@@ -520,6 +520,11 @@ void mark_semantic(column_lineage const& leaves)
   for (auto const& leaf : leaves)
     leaf.scan->semantic_columns.at(leaf.input) = true;
 }
+void mark_semantic_columns(std::vector<column_lineage> const& columns)
+{
+  for (auto const& column : columns)
+    mark_semantic(column);
+}
 column_lineage lineage_at(plan_lineage const& input, std::size_t index)
 {
   if (index < input.columns.size()) return input.columns[index];
@@ -705,6 +710,8 @@ plan_lineage collect_semantic_lineage(
       join(physical, left, right);
     }
     if (result.columns.size() != node.types.size()) all();
+    // Join payloads are concatenated in cuDF before the host exporter can cast them.
+    mark_semantic_columns(result.columns);
   } else if ((node.type == type::ORDER_BY || node.type == type::TOP_N) && children.size() == 1) {
     if (node.type == type::ORDER_BY) {
       auto& order = node.Cast<op::sirius_physical_order>();
@@ -719,6 +726,8 @@ plan_lineage collect_semantic_lineage(
         mark_expression(*key.expression, children[0]);
       result.columns = children[0].columns;
     }
+    // Sort and TOP_N carry their payload through cuDF before host export.
+    mark_semantic_columns(result.columns);
   } else if ((node.type == type::LIMIT || node.type == type::STREAMING_LIMIT ||
               node.type == type::RESULT_COLLECTOR) &&
              children.size() == 1) {

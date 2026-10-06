@@ -189,7 +189,7 @@ TEST_CASE("Parquet footer encoding union accepts levels and empty lists",
   CHECK(f.check().reason == verdict_reason::parquet_codec_unsupported);
 }
 
-TEST_CASE("Parquet D6 requires both export-only usage and an actual export cast",
+TEST_CASE("Parquet D6 allows host-export casts but refuses streaming consumers",
           "[scan][parquet][profile]")
 {
   footer_fixture f;
@@ -198,6 +198,7 @@ TEST_CASE("Parquet D6 requires both export-only usage and an actual export cast"
   REQUIRE(exported.approved);
   CHECK(exported.type_mismatches == 1);
   CHECK(f.contract.profiles->get(exported.profile).columns[0].type_mismatch);
+  // Streaming fragments publish GPU batches directly, so they must take this refusal branch.
   f.contract.host_export_available = false;
   CHECK(f.check({false}).reason == verdict_reason::parquet_type_unqualified);
   f.contract.host_export_available = true;
@@ -511,6 +512,31 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.parquet_type_mismatch_observed == before.parquet_type_mismatch_observed + 1);
   CHECK(after.parquet_type_refusals == before.parquet_type_refusals);
+  // These operators consume payloads in cuDF before host export, so drift is refused early.
+  for (auto const& query :
+       std::vector<std::string>{"SELECT x FROM " + source + " ORDER BY keep",
+                                "SELECT x FROM " + source + " ORDER BY keep LIMIT 1",
+                                "SELECT x FROM " + source + " JOIN (VALUES (1),(2)) v(y) ON x=y"}) {
+    INFO(query);
+    run_ok("SET gpu_execution=false");
+    auto cpu = con->Query(query);
+    REQUIRE_FALSE(cpu->HasError());
+    run_ok("SET gpu_execution=true");
+    before      = sirius::test::get_transparent_execution_stats(*con);
+    auto result = con->Query(query);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(collect_rows(*result) == collect_rows(*cpu));
+    after = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
+    CHECK(after.parquet_type_refusals == before.parquet_type_refusals + 1);
+    CHECK(after.split_physical_rejections[static_cast<std::size_t>(
+            verdict_reason::parquet_type_unqualified)] ==
+          before.split_physical_rejections[static_cast<std::size_t>(
+            verdict_reason::parquet_type_unqualified)] +
+            1);
+    CHECK(after.parquet_reader_calls[directory.file("b.parquet")] ==
+          before.parquet_reader_calls[directory.file("b.parquet")]);
+  }
   for (auto const& query : std::vector<std::string>{
          "SELECT x FROM " + source + " WHERE keep=1 AND x=1",
          "SELECT x, count(*) FROM " + source + " WHERE keep=1 GROUP BY x",
