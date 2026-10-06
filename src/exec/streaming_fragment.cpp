@@ -556,6 +556,25 @@ std::shared_ptr<batch_stream> streaming_fragment::output_stream(stream_id_t id) 
   return _session.output_stream(id);
 }
 
+std::vector<std::shared_ptr<cucascade::data_batch>> streaming_fragment::peek_output(
+  stream_id_t id) const
+{
+  require_built("peek_output()");
+  auto it = _output_repos.find(id);
+  if (it == _output_repos.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no output stream with id " +
+                                          std::to_string(id));
+  }
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const batch_id : it->second->get_batch_ids()) {
+    // A batch popped meanwhile is gone; the caller wants what is parked, not a snapshot.
+    if (auto batch = it->second->get_data_batch_by_id(batch_id)) {
+      batches.push_back(std::move(batch));
+    }
+  }
+  return batches;
+}
+
 bool streaming_fragment::drained(stream_id_t id) const
 {
   require_built("drained()");

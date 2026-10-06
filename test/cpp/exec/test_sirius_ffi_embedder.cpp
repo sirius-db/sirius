@@ -33,14 +33,17 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <substrait/plan.pb.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <source_location>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -495,5 +498,94 @@ TEST_CASE("FFI direct exchange delivers what relay_from does", "[isolated_contex
     return result_i64s(*receiver);
   }();
   CHECK(streamed == relayed);
+  CHECK(exchange->outstanding() == 0);
+}
+
+TEST_CASE("FFI copies a key column out of parked and received batches without taking them",
+          "[isolated_context][sirius_ffi]")
+{
+  sirius::test::scratch_dir scratch("ffi_embedder_key_copy");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+  auto const config = scratch.file("slab.yaml");
+  std::ofstream(config) << "sirius:\n"
+                           "  topology:\n"
+                           "    num_gpus: 1\n"
+                           "  space:\n"
+                           "    gpu:\n"
+                           "      - device_id: 0\n"
+                           "        memory_capacity: 2147483648\n"
+                           "        allocator: slab\n"
+                           "    host:\n"
+                           "      - numa_id: 0\n"
+                           "        memory_capacity: 4294967296\n";
+  auto ctx      = sirius::ffi::make_context_from_config(config);
+  auto exchange = ctx->direct_exchange();
+  REQUIRE(exchange != nullptr);
+  auto const scan = [&] {
+    auto fragment = sirius::ffi::make_fragment(*ctx);
+    fragment->declare_output(0);
+    fragment->build(local_files_plan(path));
+    fragment->run();
+    return fragment;
+  };
+
+  // A parked sender's output.
+  auto parked        = scan();
+  std::uint64_t rows = 0;
+  std::int64_t min   = std::numeric_limits<std::int64_t>::max();
+  std::int64_t max   = std::numeric_limits<std::int64_t>::min();
+  parked->output_key_stats(0, 0, rows, min, max);
+  CHECK(std::tuple{rows, min, max} ==
+        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+  CHECK_THROWS_WITH(parked->output_key_stats(0, 1, rows, min, max),
+                    Catch::Matchers::ContainsSubstring("out of range"));
+
+  // A batch received from a remote sender and sealed, as the CN does on arrival.
+  auto sent            = scan();
+  std::uint64_t remote = 0;
+  {
+    std::uint64_t token     = 0;
+    std::uint64_t sent_rows = 0;
+    std::vector<std::uint64_t> src;
+    auto const layout = sent->export_direct(0, token, sent_rows, src);
+    REQUIRE(layout);
+    auto const dst =
+      exchange->allocate(reinterpret_cast<std::uintptr_t>(layout->data()), layout->size(), remote);
+    for (std::size_t i = 0; i < src.size(); i += 2) {
+      REQUIRE(cudaMemcpy(reinterpret_cast<void*>((*dst)[i]),
+                         reinterpret_cast<void const*>(src[i]),
+                         src[i + 1],
+                         cudaMemcpyDeviceToDevice) == cudaSuccess);
+    }
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    exchange->release(token);
+    exchange->seal(remote);
+  }
+  rows = 0;
+  min  = std::numeric_limits<std::int64_t>::max();
+  max  = std::numeric_limits<std::int64_t>::min();
+  exchange->key_stats(remote, 0, rows, min, max);
+  CHECK(std::tuple{rows, min, max} ==
+        std::tuple{std::uint64_t{5}, std::int64_t{1}, std::int64_t{5}});
+
+  // A receiver reads both copies; the sources keep their batches.
+  auto receiver = sirius::ffi::make_fragment(*ctx);
+  receiver->declare_input_column(0, "a", "BIGINT");
+  receiver->build(stream_read_plan(0));
+  CHECK(receiver->copy_output_column(*parked, 0, 0, 0) == parked->output_batch_count(0));
+  receiver->copy_received_column(0, remote, 0);
+  receiver->close_input(0, 0);
+  receiver->run();
+  auto copied = result_i64s(*receiver);
+  std::sort(copied.begin(), copied.end());
+  CHECK(copied == std::vector<std::int64_t>{1, 1, 2, 2, 3, 3, 4, 4, 5, 5});
+  CHECK(parked->output_row_count(0) == 5);
+  rows = 0;
+  exchange->key_stats(remote, 0, rows, min, max);
+  CHECK(rows == 5);
+  CHECK_THROWS_WITH(exchange->key_stats(remote + 1, 0, rows, min, max),
+                    Catch::Matchers::ContainsSubstring("no sealed batch"));
+  exchange->release(remote);
   CHECK(exchange->outstanding() == 0);
 }

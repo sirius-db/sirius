@@ -143,6 +143,11 @@ class streaming_fragment {
   ///         fragment.
   [[nodiscard]] std::shared_ptr<batch_stream> output_stream(stream_id_t id) const;
 
+  /// The batches parked on output `id` now, left in place.
+  /// @throws sirius::invalid_input_exception before build() or on an unknown id.
+  [[nodiscard]] std::vector<std::shared_ptr<cucascade::data_batch>> peek_output(
+    stream_id_t id) const;
+
   /// False while batches remain, before EOS, and on a poisoned output.
   /// @throws sirius::invalid_input_exception before build() or on an unknown id.
   [[nodiscard]] bool drained(stream_id_t id) const;

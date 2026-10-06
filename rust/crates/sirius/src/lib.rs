@@ -314,6 +314,54 @@ impl Fragment<'_> {
         })
     }
 
+    /// Add the non-null rows, minimum and maximum of signed integer column `column` over every
+    /// batch parked on output stream `stream_id` to `stats`, without draining it.
+    pub fn output_key_stats(
+        &self,
+        stream_id: u64,
+        column: u32,
+        stats: &mut KeyStats,
+    ) -> Result<(), Exception> {
+        self.inner.output_key_stats(
+            stream_id,
+            column,
+            &mut stats.rows,
+            &mut stats.min,
+            &mut stats.max,
+        )
+    }
+
+    /// Push a copy of column `column` of every batch parked on `source`'s output stream into
+    /// input stream `input_stream_id`, leaving the source as it was. Does not close a sender.
+    /// Returns the number of batches copied.
+    pub fn copy_output_column(
+        &mut self,
+        source: &mut Fragment<'_>,
+        source_stream_id: u64,
+        input_stream_id: u64,
+        column: u32,
+    ) -> Result<usize, Exception> {
+        self.inner.pin_mut().copy_output_column(
+            source.inner.pin_mut(),
+            source_stream_id,
+            input_stream_id,
+            column,
+        )
+    }
+
+    /// Push a copy of column `column` of the sealed batch under `token` into input stream
+    /// `input_stream_id`. The token stays for its receiver.
+    pub fn copy_received_column(
+        &mut self,
+        input_stream_id: u64,
+        token: u64,
+        column: u32,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .copy_received_column(input_stream_id, token, column)
+    }
+
     /// Push the batch received under `token` into input stream `stream_id`, consuming the token.
     pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
         self.inner.pin_mut().push_received(stream_id, token)
@@ -378,6 +426,25 @@ pub struct ExportedBatch {
     pub layout: Vec<u8>,
     /// `(address, length)` of each buffer, pairing with the receiver's allocation.
     pub src: Vec<(u64, u64)>,
+}
+
+/// Non-null rows, minimum and maximum of an integer key column, accumulated over batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyStats {
+    pub rows: u64,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl Default for KeyStats {
+    /// No rows yet: `min` and `max` start at the ends of the range.
+    fn default() -> Self {
+        Self {
+            rows: 0,
+            min: i64::MAX,
+            max: i64::MIN,
+        }
+    }
 }
 
 /// What [`OutputDrain::next`] found within its timeout.
@@ -479,6 +546,23 @@ impl DirectExchange {
     /// Tokens neither released nor consumed.
     pub fn outstanding(&self) -> Result<usize, Exception> {
         self.inner.outstanding()
+    }
+
+    /// Add the non-null rows, minimum and maximum of signed integer column `column` of the sealed
+    /// batch under `token` to `stats`, leaving the batch for its receiver.
+    pub fn key_stats(
+        &self,
+        token: u64,
+        column: u32,
+        stats: &mut KeyStats,
+    ) -> Result<(), Exception> {
+        self.inner.key_stats(
+            token,
+            column,
+            &mut stats.rows,
+            &mut stats.min,
+            &mut stats.max,
+        )
     }
 }
 
