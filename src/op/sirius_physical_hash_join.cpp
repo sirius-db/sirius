@@ -856,11 +856,12 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
   // Only the build side can drive broadcast / BUILD_PROBE. Right-family joins are probe-driven
   // (probe partition sizes the join), so they always take the plain STANDARD natural count.
   if (!is_build_side) {
-    return partition_strategy{
-      natural,
-      /*broadcast=*/false,
-      /*build_probe=*/false,
-      partition_placement::round_robin(static_cast<std::size_t>(natural), active_gpu_ids)};
+    return partition_strategy{natural,
+                              /*broadcast=*/false,
+                              /*build_probe=*/false,
+                              natural == 1 ? partition_placement::unpinned(1)
+                                           : partition_placement::round_robin(
+                                               static_cast<std::size_t>(natural), active_gpu_ids)};
   }
 
   bool const is_mark         = join_type == duckdb::JoinType::MARK;
@@ -916,12 +917,15 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                              : (is_mark && num_gpus <= 1) ? 1
                                                           : natural;
   // A lone BUILD_PROBE partition picks its GPU by rotation so several small joins in one query
-  // spread across GPUs instead of all landing on the first.
-  auto placement =
-    build_probe && num_partitions == 1
-      ? partition_placement::round_robin(
-          1, select_gpu_subset(active_gpu_ids, 1, single_partition_rotation))
-      : partition_placement::round_robin(static_cast<std::size_t>(num_partitions), active_gpu_ids);
+  // spread across GPUs instead of all landing on the first. STANDARD builds its hash table
+  // within each task, so a lone partition can follow input locality.
+  auto placement = build_probe && num_partitions == 1
+                     ? partition_placement::round_robin(
+                         1, select_gpu_subset(active_gpu_ids, 1, single_partition_rotation))
+                     : (!build_probe && num_partitions == 1
+                          ? partition_placement::unpinned(1)
+                          : partition_placement::round_robin(
+                              static_cast<std::size_t>(num_partitions), active_gpu_ids));
   return partition_strategy{num_partitions, broadcast, build_probe, std::move(placement)};
 }
 
