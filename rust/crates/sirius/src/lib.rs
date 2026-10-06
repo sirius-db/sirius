@@ -311,7 +311,8 @@ impl Fragment<'_> {
 
     /// Push the batch received under `token` into input stream `stream_id`, consuming the token
     /// unless the call fails before reading it: before `build`, after `run` started, or on an
-    /// undeclared input. A batch whose columns differ from the declared ones is refused.
+    /// undeclared input. A batch on the GPU whose columns differ from the declared ones is
+    /// refused; a sealed batch that spilled to host is not checked.
     pub fn push_received(&mut self, stream_id: u64, token: u64) -> Result<(), Exception> {
         self.inner.pin_mut().push_received(stream_id, token)
     }
@@ -414,6 +415,12 @@ impl DirectExchange {
     /// Free what `token` holds. Unknown and consumed tokens are ignored.
     pub fn release(&self, token: u64) -> Result<(), Exception> {
         self.inner.release(token)
+    }
+
+    /// Holds a fully received batch so it may spill to host while it waits for its receiver. A
+    /// sealed token is still pushed with [`Fragment::push_received`] and freed with `release`.
+    pub fn seal(&self, token: u64) -> Result<(), Exception> {
+        self.inner.seal(token)
     }
 
     /// Tokens neither released nor consumed.

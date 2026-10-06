@@ -143,6 +143,10 @@ class SIRIUS_FFI_EXPORT DirectExchange {
   /// that will not be pushed. Unknown and consumed tokens are ignored.
   void release(std::uint64_t token) const;
 
+  /// Hold a fully received batch so that it may spill to host while it waits for its receiver.
+  /// A sealed token is still pushed with Fragment::push_received and freed with release().
+  void seal(std::uint64_t token) const;
+
   /// Tokens neither released nor consumed.
   [[nodiscard]] std::size_t outstanding() const;
 
@@ -250,8 +254,9 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// Push the batch received under `token` into input stream `stream_id`. Consumes the token
   /// unless it throws before reading it: before build(), without a DirectExchange, after run()
   /// started, or on an undeclared input.
-  /// @throws also on a token that holds no received batch, on a schema mismatch, or when the
-  /// input already ended.
+  /// @throws also on a token that holds no received batch, on a schema mismatch (checked while
+  /// the batch is on the GPU; a sealed batch that spilled to host is not), or when the input
+  /// already ended.
   void push_received(std::uint64_t stream_id, std::uint64_t token);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
