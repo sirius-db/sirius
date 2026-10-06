@@ -22,6 +22,15 @@ project(
   LANGUAGES C CXX CUDA)
 
 include(GNUInstallDirs)
+option(SIRIUS_BUILD_SHARED "Build the shared Sirius library" ON)
+option(SIRIUS_BUILD_STATIC "Build the static Sirius library" OFF)
+if(SIRIUS_BUILD_STATIC AND NOT VCPKG_BUILD)
+  message(
+    FATAL_ERROR "The installed static package requires vcpkg dependencies")
+endif()
+if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
+  message(FATAL_ERROR "Enable at least one Sirius library output")
+endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
 
 # Optional features

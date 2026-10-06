@@ -220,8 +220,31 @@ jobs:
         if: matrix.build.environment == 'vcpkg'
         run: |
           set -o pipefail
-          pixi run -e vcpkg cmake -S duckdb --preset vcpkg-release 2>&1 | tee /tmp/vcpkg.log
-          pixi run -e vcpkg cmake --build build/vcpkg-release --target duckdb duckdb_local_extension_repo 2>&1 | tee -a /tmp/vcpkg.log
+          pixi run -e vcpkg cmake -S . -B build/vcpkg-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100 \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_BUILD=ON -DCPM_LOCAL_PACKAGES_ONLY=ON \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
+            -DSIRIUS_BUILD_STATIC=ON -DSIRIUS_BUILD_TESTS=OFF -DSIRIUS_BUILD_S3_TESTS=OFF 2>&1 | tee /tmp/vcpkg.log
+          pixi run -e vcpkg cmake --build build/vcpkg-release --target sirius_library 2>&1 | tee -a /tmp/vcpkg.log
+
+      - name: Check the installed static package
+        if: matrix.build.environment == 'vcpkg'
+        run: |
+          pixi run -e vcpkg cmake --install build/vcpkg-release --component sirius_library --prefix "$PWD/build/static-stage"
+          mv build/static-stage build/static-install
+          pixi run -e vcpkg cmake -S test/cmake/installed_consumer -B build/static-consumer -G Ninja \
+            -DCMAKE_PREFIX_PATH="$PWD/build/static-install" -DSIRIUS_TARGET=sirius::sirius_static \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_INSTALLED_DIR="$PWD/build/vcpkg-release/vcpkg_installed" -DVCPKG_MANIFEST_INSTALL=OFF
+          pixi run -e vcpkg cmake --build build/static-consumer
+          readelf -d build/static-consumer/consumer > build/static-consumer/dynamic.txt
+          while read -r library; do
+            case "$library" in
+              libcuda.so.1|libnvidia-ml.so.1|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux*.so.*) ;;
+              *) echo "Unexpected runtime dependency: $library"; exit 1 ;;
+            esac
+          done < <(sed -n 's/.*(NEEDED).*\[\(.*\)\].*/\1/p' build/static-consumer/dynamic.txt)
 
       - name: Surface build errors (vcpkg)
         if: failure() && matrix.build.environment == 'vcpkg'
