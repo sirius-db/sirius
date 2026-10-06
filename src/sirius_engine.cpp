@@ -67,7 +67,10 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
 
   gpu_ids           = planner::apply_gpu_cap(std::move(gpu_ids), config.gpus_per_query());
   auto const n_gpus = static_cast<int>(gpu_ids.size());
-  if (bpg == 0 || n_gpus <= 1) { return gpu_ids; }
+  if (bpg == 0) { return gpu_ids; }
+  // On a single GPU the estimate cannot change the allocation, but it is still computed and
+  // logged: the `[gpu_alloc] estimated` line is how the estimate is checked against real scan
+  // sizes, and single-GPU hosts are where that check usually runs.
 
   std::vector<const op::sirius_physical_operator*> scans;
   planner::collect_gpu_scans(plan, scans);
@@ -118,7 +121,7 @@ std::vector<int> compute_admission_gpu_ids(const op::sirius_physical_operator& p
     scans_with_table_rows,
     scans.size(),
     scans_with_known_widths);
-  gpu_ids.resize(static_cast<size_t>(k));
+  if (static_cast<int>(gpu_ids.size()) > k) { gpu_ids.resize(static_cast<size_t>(k)); }
   return gpu_ids;
 }
 
