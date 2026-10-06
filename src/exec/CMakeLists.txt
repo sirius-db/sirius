@@ -4,6 +4,7 @@ target_sources(
           arrow_result_stream.cpp
           batch_stream.cpp
           exchange_inbox.cpp
+          exchange_staging.cpp
           stream_session.cpp
           stream_bind_catalog.cpp
           stream_plan_bindings.cpp

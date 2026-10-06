@@ -16,7 +16,10 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "exec/exchange_inbox.hpp"
+#include "exec/exchange_staging.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -24,6 +27,7 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <cstdint>
@@ -128,4 +132,68 @@ TEST_CASE("exchange_inbox runs an adopted token's on_gone once, however it goes"
   CHECK(taken == 1);
   CHECK(released == 1);
   CHECK(closed == 1);
+}
+
+TEST_CASE("exchange_inbox shows held batches to the downgrade executor once spill is on",
+          "[exchange_inbox]")
+{
+  memory_space gpu(gpu_config());
+  exchange_inbox exchange(gpu);
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  exchange.enable_spill(staging);
+
+  auto const taken    = exchange.adopt(int64_batch(gpu));
+  auto const released = exchange.adopt(int64_batch(gpu));
+  (void)exchange.adopt(int64_batch(gpu));
+  // What the downgrade executor's sweep sees under the reserved query id.
+  auto const manager = registry.get(exchange_staging::query_id);
+  REQUIRE(manager);
+  REQUIRE(manager->get_repositories().size() == 1);
+  auto const& held = *manager->get_repositories().front();
+  CHECK(held.get_batch_ids().size() == 3);
+
+  CHECK(exchange.take_batch(taken)->to_read_only().get_current_tier() ==
+        cucascade::memory::Tier::GPU);
+  exchange.release(released);
+  CHECK(held.get_batch_ids().size() == 1);
+  exchange.close();
+  CHECK(held.get_batch_ids().empty());
+}
+
+TEST_CASE("exchange_staging opens its query so the downgrade executor can borrow it",
+          "[exchange_inbox]")
+{
+  sirius::data::data_repository_manager_registry registry;
+  sirius::exec::query_lifecycle_registry lifecycle;
+  // Without the lifecycle, the downgrade sweep's try_acquire_work fails and skips every exchange
+  // batch: held received batches, parked sender output and stream inputs.
+  CHECK_FALSE(lifecycle.try_acquire_work(exchange_staging::query_id));
+  exchange_staging staging(registry, &lifecycle);
+  CHECK(lifecycle.try_acquire_work(exchange_staging::query_id));
+  CHECK(registry.get(exchange_staging::query_id));
+}
+
+TEST_CASE("exchange_staging lists tracked repositories until they are gone", "[exchange_inbox]")
+{
+  memory_space gpu(gpu_config());
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  auto const manager = registry.get(exchange_staging::query_id);
+  REQUIRE(manager);
+  auto* const view = manager->get_repositories().front();
+
+  auto repository = std::make_shared<cucascade::shared_data_repository>();
+  auto batch      = int64_batch(gpu);
+  auto const id   = batch->get_batch_id();
+  repository->add_data_batch(batch);
+  staging.track(repository);
+  CHECK(staging.tracked() == 1);
+  CHECK(view->get_batch_ids() == std::vector<std::uint64_t>{id});
+  CHECK(view->get_data_batch_by_id(id) == batch);
+  CHECK(view->pop_next_data_batch() == nullptr);  // the view owns nothing
+
+  repository.reset();
+  CHECK(staging.tracked() == 0);
+  CHECK(view->get_batch_ids().empty());
 }
