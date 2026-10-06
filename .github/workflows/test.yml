@@ -86,6 +86,14 @@ jobs:
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
 
+      - name: Check shared DuckDB scan host detection
+        run: |
+          cmake --build build/release --target libduckdb.so
+          cmake -S test/cmake/scan_host -B build/scan-host -G Ninja \
+            -DDUCKDB_LIBRARY="$PWD/build/release/src/libduckdb.so"
+          cmake --build build/scan-host
+          ctest --test-dir build/scan-host --output-on-failure
+
       - name: Check installed Sirius package
         run: |
           sirius_test_dir="$(mktemp -d)"

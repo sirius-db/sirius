@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
 #include "planner/connector_reference_cache.hpp"
+#include "planner/duckdb_host.hpp"
 #include "sirius_registration.hpp"
 
 #include <dlfcn.h>
@@ -35,14 +36,12 @@
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <link.h>
 #include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
 
 #include <array>
 #include <mutex>
 #include <tuple>
-#include <typeinfo>
 #include <unordered_set>
 
 namespace sirius::planner {
@@ -154,48 +153,6 @@ std::array<connector, 6> const entries{make_seq_scan_connector(),
                                        make_iceberg_scan_connector(),
                                        make_sirius_stream_source_connector()};
 
-// The system catalog's dynamic type identifies its DuckDB module independently of
-// mutable function registrations, including Python's RTLD_LOCAL import.
-link_map const* host_module(duckdb::DatabaseInstance& db)
-{
-  auto& catalog = duckdb::Catalog::GetSystemCatalog(db);
-  Dl_info owner{};
-  void* module{};
-  if (!::dladdr1(&typeid(catalog), &owner, &module, RTLD_DL_LINKMAP)) return nullptr;
-  return static_cast<link_map const*>(module);
-}
-
-template <class Factory>
-Factory host_factory(duckdb::DatabaseInstance& db, Factory local_factory, char const* symbol)
-{
-  auto const* module = host_module(db);
-  if (!module) return nullptr;
-  Dl_info implementation{};
-  void* implementation_map{};
-  // Embedded DuckDB may hide its symbols. Its directly linked factory is trusted
-  // only when it belongs to the same module as the host's system catalog.
-  if (::dladdr1(reinterpret_cast<void*>(local_factory),
-                &implementation,
-                &implementation_map,
-                RTLD_DL_LINKMAP) &&
-      implementation_map == module)
-    return local_factory;
-
-  // Use the loader's existing record, without probing a file or changing symbol scope.
-  // The main executable has an empty name and must be opened through its main handle.
-  auto const* name = module->l_name && module->l_name[0] ? module->l_name : nullptr;
-  auto* handle     = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
-  if (!handle) return nullptr;
-  auto close = [](void* value) { ::dlclose(value); };
-  std::unique_ptr<void, decltype(close)> guard(handle, close);
-  auto* factory = ::dlsym(handle, symbol);
-  // A handle can also resolve symbols from dependencies. Only this host may grant trust.
-  if (!factory || !::dladdr1(factory, &implementation, &implementation_map, RTLD_DL_LINKMAP) ||
-      implementation_map != module)
-    return nullptr;
-  return reinterpret_cast<Factory>(factory);
-}
-
 duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
   auto info = duckdb::ExtensionManager::Get(db).GetExtensionInfo("iceberg");
@@ -227,9 +184,9 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Databa
     duckdb::DuckDB reference(nullptr, &config);
     reference.LoadStaticExtension<duckdb::ParquetExtension>();
     // Iceberg derives scan callbacks from Parquet; use the caller's DuckDB factory.
-    auto get_parquet = host_factory(db,
-                                    &duckdb::ParquetScanFunction::GetFunctionSet,
-                                    "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
+    auto get_parquet = detail::host_factory(db,
+                                            &duckdb::ParquetScanFunction::GetFunctionSet,
+                                            "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     if (!get_parquet) return {};
     duckdb::ExtensionLoader parquet_loader(*reference.instance, "parquet");
     auto functions = get_parquet();
@@ -252,15 +209,15 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
 {
   auto& db = duckdb::DatabaseInstance::GetDatabase(context);
   if (name == "seq_scan") {
-    auto get = host_factory(
+    auto get = detail::host_factory(
       db, &duckdb::TableScanFunction::GetFunction, "_ZN6duckdb17TableScanFunction11GetFunctionEv");
     return get ? duckdb::vector<duckdb::TableFunction>{get()}
                : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "parquet_scan" || name == "read_parquet") {
-    auto get = host_factory(db,
-                            &duckdb::ParquetScanFunction::GetFunctionSet,
-                            "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
+    auto get = detail::host_factory(db,
+                                    &duckdb::ParquetScanFunction::GetFunctionSet,
+                                    "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv");
     return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
@@ -369,7 +326,7 @@ std::array<accepted_callbacks, entries.size()> accepted;
 void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
 {
   if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("iceberg")) return;
-  auto const* host = &typeid(duckdb::Catalog::GetSystemCatalog(db));
+  auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(db));
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].function_name != "iceberg_scan") continue;
     auto& cache = accepted[i];
@@ -416,8 +373,8 @@ connector const* lookup_connector(duckdb::TableFunction const& function,
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
     if (entry.function_name != function.name || !entry.bind_data_matches(bind)) continue;
-    // RTTI identifies the host without a loader symbol-table walk on every lookup.
-    auto const* host = &typeid(duckdb::Catalog::GetSystemCatalog(context));
+    // The catalog's destructor identifies its host without a loader lookup per scan.
+    auto const* host = detail::host_code_address(duckdb::Catalog::GetSystemCatalog(context));
     auto& cache      = accepted[i];
     std::lock_guard lock(cache.mutex);
     auto catalog_entry =
