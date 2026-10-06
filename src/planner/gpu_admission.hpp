@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "op/scan/scan_admission_hint.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -25,8 +26,13 @@
 #include <optional>
 #include <vector>
 
+namespace duckdb {
+class ClientContext;
+}  // namespace duckdb
+
 namespace sirius::op {
 class sirius_physical_operator;
+class sirius_physical_table_scan;
 }  // namespace sirius::op
 
 namespace sirius::planner {
@@ -81,6 +87,45 @@ inline uint64_t estimate_bytes_per_row(const std::vector<sirius::logical_type>& 
     total += width;
   }
   return total;
+}
+
+/**
+ * @brief estimate_bytes_per_row with per-column widths where a source could supply them.
+ * `known_widths[i]` replaces @p avg_var_bytes for output column i when it is set and the column
+ * is variable-width. Fixed-width columns keep their cuDF carrier width, which is exact; a
+ * Parquet footer's encoded size would only under-count those. Shorter @p known_widths vectors
+ * leave the remaining columns on the fallback.
+ */
+inline uint64_t estimate_bytes_per_row(const std::vector<sirius::logical_type>& types,
+                                       uint64_t avg_var_bytes,
+                                       const std::vector<std::optional<uint64_t>>& known_widths)
+{
+  constexpr auto k_max = std::numeric_limits<uint64_t>::max();
+  uint64_t total       = 0;
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    const auto& t  = types[i];
+    uint64_t width = avg_var_bytes;
+    if (t.is_fixed_width()) {
+      width = uint64_t{t.fixed_width_byte_size()};
+    } else if (i < known_widths.size() && known_widths[i].has_value()) {
+      width = *known_widths[i];
+    }
+    if (total > k_max - width) { return k_max; }
+    total += width;
+  }
+  return total;
+}
+
+/**
+ * @brief The row count admission sizes a scan from: the planner's filtered estimate, raised to
+ * the table function's unfiltered count when that is known and larger.
+ * Under-estimating rows puts a large query on too few GPUs; over-estimating only keeps today's
+ * allocation. The planner's filter selectivity under-counts TPC-H range and LIKE filters by
+ * 4-5x, so the unfiltered count is the safer floor.
+ */
+inline uint64_t admission_row_count(uint64_t planner_rows, std::optional<uint64_t> unfiltered_rows)
+{
+  return unfiltered_rows.has_value() ? std::max(planner_rows, *unfiltered_rows) : planner_rows;
 }
 
 /**
@@ -142,5 +187,20 @@ inline int gpu_count_for_bytes(uint64_t total_bytes, uint64_t bytes_per_gpu, int
   auto const required = 1ULL + (total_bytes - 1) / bytes_per_gpu;
   return static_cast<int>(std::min<uint64_t>(required, static_cast<uint64_t>(n_gpus)));
 }
+
+/**
+ * @brief Derive a GPU scan's admission hint from its DuckDB table function while the plan
+ *        generator still holds the function and bind data.
+ *
+ * Rows: the table function's `cardinality` callback (`TableScanCardinality` for DuckDB tables,
+ * `MultiFileCardinality` for Parquet), i.e. the row count before any filter. Widths, for
+ * variable-width output columns only: the average uncompressed bytes per value of the first
+ * Parquet file's column chunks, taken only for columns stored verbatim (a dictionary-encoded
+ * chunk's size says nothing about the decoded width); otherwise the table statistics' maximum
+ * string length plus the 4-byte offset word. Anything a source cannot say stays unset. Never
+ * throws: a callback that throws leaves its field unset.
+ */
+op::scan::scan_admission_hint derive_scan_admission_hint(
+  duckdb::ClientContext& context, const op::sirius_physical_table_scan& scan);
 
 }  // namespace sirius::planner
