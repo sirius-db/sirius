@@ -32,6 +32,13 @@ impl FragmentInstanceId {
         Self(Uuid::from_u64_pair(hi as u64, lo as u64))
     }
 
+    /// The `hi` half, which a fragment instance shares with its query: the FE derives instance
+    /// ids as `(query.hi, query.lo + n)` (`ExecutionDAG.setInstanceId`). An exchange frame
+    /// carries only its receiver's instance id, so this is how it is matched to its query.
+    pub(crate) fn query_hi(self) -> u64 {
+        self.0.as_u64_pair().0
+    }
+
     /// The proto form, for routing a frame to this instance.
     pub(crate) fn to_proto(self) -> PUniqueId {
         let (hi, lo) = self.0.as_u64_pair();
