@@ -163,7 +163,9 @@ std::shared_ptr<io_object> rest_ioctx::note_unqualified(std::shared_ptr<io_objec
   SIRIUS_LOG_WARN(
     "rest_ioctx: '{}' opened with {} ETag; its bytes and metadata are cached only within this open",
     path,
-    tag.empty() ? "no" : tag.starts_with("W/") ? "a weak" : "a malformed");
+    tag.empty()             ? "no"
+    : tag.starts_with("W/") ? "a weak"
+                            : "a malformed");
   return obj;
 }
 
