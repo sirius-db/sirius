@@ -409,6 +409,12 @@ impl DirectExchange {
         self.inner.release(token)
     }
 
+    /// Holds a fully received batch so it may spill to host while it waits for its receiver. A
+    /// sealed token is still pushed with [`Fragment::push_received`] and freed with `release`.
+    pub fn seal(&self, token: u64) -> Result<(), Exception> {
+        self.inner.seal(token)
+    }
+
     /// Tokens neither released nor consumed.
     pub fn outstanding(&self) -> Result<usize, Exception> {
         self.inner.outstanding()

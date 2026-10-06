@@ -17,6 +17,7 @@
 #include "exec/streaming_fragment.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "exec/exchange_staging.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -30,7 +31,9 @@
 #include <duckdb/main/query_result.hpp>
 
 #include <algorithm>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -97,6 +100,63 @@ duckdb::shared_ptr<duckdb::PreparedStatementData> synthesize_prepared(
 
 namespace {
 
+/// An output stream's repository. It records each batch's rows when the sink parks it, while it is
+/// on the GPU, so the count of parked rows still holds after batches spill to host.
+class row_counting_repository final : public cucascade::shared_data_repository {
+ public:
+  void add_data_batch(std::shared_ptr<cucascade::data_batch> batch, std::size_t partition) override
+  {
+    if (batch) {
+      auto const read_only = batch->to_read_only();
+      std::lock_guard lock(_rows_mutex);
+      if (read_only.get_current_tier() == cucascade::memory::Tier::GPU) {
+        _rows[batch->get_batch_id()] =
+          static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
+      } else {
+        _uncounted = true;
+      }
+    }
+    cucascade::shared_data_repository::add_data_batch(std::move(batch), partition);
+  }
+
+  std::shared_ptr<cucascade::data_batch> pop_next_data_batch(std::size_t partition) override
+  {
+    return forget(cucascade::shared_data_repository::pop_next_data_batch(partition));
+  }
+
+  std::shared_ptr<cucascade::data_batch> pop_data_batch_by_id(std::uint64_t batch_id,
+                                                              std::size_t partition) override
+  {
+    return forget(cucascade::shared_data_repository::pop_data_batch_by_id(batch_id, partition));
+  }
+
+  /// Rows parked now, or nullopt if a batch arrived already off the GPU.
+  [[nodiscard]] std::optional<std::uint64_t> rows() const
+  {
+    std::lock_guard lock(_rows_mutex);
+    if (_uncounted) { return std::nullopt; }
+    std::uint64_t total = 0;
+    for (auto const& [id, rows] : _rows) {
+      total += rows;
+    }
+    return total;
+  }
+
+ private:
+  std::shared_ptr<cucascade::data_batch> forget(std::shared_ptr<cucascade::data_batch> batch)
+  {
+    if (batch) {
+      std::lock_guard lock(_rows_mutex);
+      _rows.erase(batch->get_batch_id());
+    }
+    return batch;
+  }
+
+  mutable std::mutex _rows_mutex;
+  std::map<std::uint64_t, std::uint64_t> _rows;
+  bool _uncounted{false};
+};
+
 duckdb::SiriusContext& sirius_context_of(duckdb::ClientContext& context)
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -131,7 +191,9 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
       throw sirius::invalid_input_exception("streaming_fragment: duplicate output stream id " +
                                             std::to_string(id));
     }
-    _output_repos[id] = std::make_shared<cucascade::shared_data_repository>();
+    _output_repos[id] = std::make_shared<row_counting_repository>();
+    // Parked output can wait a long time for its receivers; let it spill under pressure.
+    sirius_context_of(_context).get_exchange_staging().track(_output_repos[id]);
   }
 }
 
@@ -256,10 +318,13 @@ void streaming_fragment::build()
     catalog          = catalog_for(_context);
     // declare() replaces any earlier binding of the id.
     for (const auto& [id, input] : _spec.inputs) {
+      // Inputs fill up while their senders finish; let them spill under pressure too.
+      auto repository = std::make_shared<cucascade::shared_data_repository>();
+      sirius_ctx.get_exchange_staging().track(repository);
       catalog->declare(id,
                        stream_input_binding{input.names,
                                             input.types,
-                                            std::make_shared<cucascade::shared_data_repository>(),
+                                            std::move(repository),
                                             input.expected_senders,
                                             nullptr,
                                             input.estimated_rows});
@@ -520,23 +585,14 @@ std::uint64_t streaming_fragment::output_row_count(stream_id_t id) const
     throw sirius::invalid_input_exception("streaming_fragment: no output stream with id " +
                                           std::to_string(id));
   }
-  const auto& repository = *it->second;
-
-  std::uint64_t rows = 0;
-  for (std::size_t partition = 0; partition < repository.num_partitions(); ++partition) {
-    for (auto batch_id : repository.get_batch_ids(partition)) {
-      auto batch = repository.get_data_batch_by_id(batch_id, partition);
-      if (!batch) { continue; }
-      auto read_only = batch->to_read_only();
-      if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
-        throw sirius::invalid_input_exception(
-          "streaming_fragment: batch on output stream " + std::to_string(id) +
-          " is not GPU-resident; counting a spilled batch's rows is not supported yet");
-      }
-      rows += static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
-    }
+  auto const rows = static_cast<const row_counting_repository&>(*it->second).rows();
+  if (!rows) {
+    throw sirius::invalid_input_exception("streaming_fragment: output stream " +
+                                          std::to_string(id) +
+                                          " received a batch that was not GPU-resident; its rows "
+                                          "were not counted");
   }
-  return rows;
+  return *rows;
 }
 
 }  // namespace sirius::exec

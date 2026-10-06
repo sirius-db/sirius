@@ -17,6 +17,9 @@
 #include "exec/exchange_direct.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
+#include "exec/exchange_staging.hpp"
+#include "log/logging.hpp"
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column.hpp>
@@ -33,7 +36,9 @@
 #include <cuda_runtime_api.h>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -241,13 +246,16 @@ direct_export describe_table(cudf::table_view const& table, rmm::cuda_stream_vie
 }
 
 direct_exchange::direct_exchange(cucascade::memory::memory_space& gpu, memory::slab_region region)
-  : _gpu{gpu}, _region{std::move(region)}
+  : _gpu{gpu},
+    _region{std::move(region)},
+    _sealed{std::make_shared<cucascade::shared_data_repository>()}
 {
 }
 
 std::optional<direct_exchange::exported> direct_exchange::export_batch(
   std::shared_ptr<cucascade::data_batch> batch)
 {
+  bring_to_gpu(*batch);
   std::lock_guard const lock{_mutex};
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
   require_open();
@@ -304,12 +312,13 @@ std::pair<std::uint64_t, std::vector<std::uint64_t>> direct_exchange::allocate(
       return rmm::align_up(b.alloc, alignment);
     });
 
+  // Never the blocking make_reservation: a receiver waiting for memory could hold up the senders
+  // whose batches would free it. Making room spills to host instead, which waits on no transfer,
+  // and runs without the lock so other tokens move meanwhile.
+  auto reservation = reserve(total);
   std::lock_guard const lock{_mutex};
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
   require_open();
-  // Never the blocking make_reservation: a receiver waiting for memory could hold up the senders
-  // whose batches would free it.
-  auto reservation = _gpu.make_reservation_or_null(total);
   if (!reservation) {
     throw rmm::out_of_memory(std::format(
       "direct exchange: {} bytes requested, {} available", total, _gpu.get_available_memory()));
@@ -359,7 +368,11 @@ std::unique_ptr<cudf::table> direct_exchange::take(std::uint64_t token)
   }
   auto taken = std::move(*entry);
   _entries.erase(it);
+  return to_table(std::move(taken));
+}
 
+std::unique_ptr<cudf::table> direct_exchange::to_table(received&& taken)
+{
   auto const rows = taken.layout.rows;
   auto buffer     = taken.buffers.begin();
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -385,13 +398,17 @@ void direct_exchange::release(std::uint64_t token)
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
   require_open();
   _entries.erase(token);
+  if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
+    (void)_sealed->pop_data_batch_by_id(sealed->second);
+    _sealed_ids.erase(sealed);
+  }
 }
 
 std::size_t direct_exchange::outstanding() const
 {
   std::lock_guard const lock{_mutex};
   require_open();
-  return _entries.size();
+  return _entries.size() + _sealed_ids.size();
 }
 
 void direct_exchange::close()
@@ -399,7 +416,103 @@ void direct_exchange::close()
   std::lock_guard const lock{_mutex};
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
   _entries.clear();
+  for (auto const& [token, batch_id] : _sealed_ids) {
+    (void)_sealed->pop_data_batch_by_id(batch_id);
+  }
+  _sealed_ids.clear();
   _closed = true;
+}
+
+void direct_exchange::enable_spill(exchange_staging& staging, make_room_fn make_room)
+{
+  std::lock_guard const lock{_mutex};
+  _make_room = std::move(make_room);
+  staging.track(_sealed);
+}
+
+void direct_exchange::seal(std::uint64_t token)
+{
+  std::lock_guard const lock{_mutex};
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_region.device}};
+  require_open();
+  if (_sealed_ids.contains(token)) { return; }
+  auto const it     = _entries.find(token);
+  auto* const entry = it == _entries.end() ? nullptr : std::get_if<received>(&it->second);
+  // A duplicate frame can name a token its first copy already delivered and its receiver
+  // consumed; like release(), that is not an error.
+  if (entry == nullptr) { return; }
+  auto taken = std::move(*entry);
+  _entries.erase(it);
+  auto batch = sirius::make_data_batch(
+    std::move(*to_table(std::move(taken))), _gpu, _gpu.acquire_stream(), {});
+  _sealed_ids.emplace(token, batch->get_batch_id());
+  _sealed->add_data_batch(std::move(batch));
+}
+
+std::shared_ptr<cucascade::data_batch> direct_exchange::take_batch(std::uint64_t token)
+{
+  {
+    std::lock_guard const lock{_mutex};
+    require_open();
+    if (auto const sealed = _sealed_ids.find(token); sealed != _sealed_ids.end()) {
+      auto batch = _sealed->pop_data_batch_by_id(sealed->second);
+      _sealed_ids.erase(sealed);
+      if (!batch) {
+        throw sirius::internal_exception("direct exchange: sealed token {} lost its batch", token);
+      }
+      return batch;
+    }
+  }
+  auto table = take(token);
+  return sirius::make_data_batch(std::move(*table), _gpu, _gpu.acquire_stream(), {});
+}
+
+std::unique_ptr<cucascade::memory::reservation> direct_exchange::reserve(std::size_t bytes)
+{
+  auto reservation = _gpu.make_reservation_or_null(bytes);
+  if (reservation || !_make_room) { return reservation; }
+  // A request may fail without having run: closing any query window drains the downgrade
+  // executor, which cancels what is queued. Only a request that ran and still left too little
+  // is final.
+  constexpr int attempts = 3;
+  for (int attempt = 1; attempt <= attempts; ++attempt) {
+    try {
+      _make_room(bytes);
+      break;
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("direct exchange: making room for {} bytes failed (attempt {} of {}): {}",
+                      bytes,
+                      attempt,
+                      attempts,
+                      e.what());
+    }
+  }
+  return _gpu.make_reservation_or_null(bytes);
+}
+
+void direct_exchange::bring_to_gpu(cucascade::data_batch& batch)
+{
+  // Blocking locks: the batch is about to be sent, and whoever holds it now (the downgrade
+  // executor mid-spill) releases it soon.
+  if (batch.to_read_only().get_current_tier() == cucascade::memory::Tier::GPU) { return; }
+  auto mutable_batch = batch.to_mutable();
+  if (mutable_batch.get_current_tier() == cucascade::memory::Tier::GPU) { return; }
+  auto const bytes = sirius::peak_materialization_bytes(mutable_batch.get_data());
+  auto reservation = reserve(bytes);
+  if (!reservation) {
+    throw rmm::out_of_memory(
+      std::format("direct exchange: {} bytes to bring a spilled batch back, {} available",
+                  bytes,
+                  _gpu.get_available_memory()));
+  }
+  auto const stream = _gpu.acquire_stream();
+  auto* tracker     = _gpu.get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (!tracker->attach_reservation_to_tracker(stream, std::move(reservation))) {
+    throw sirius::internal_exception("direct exchange: this thread already tracks a reservation");
+  }
+  absl::Cleanup detach = [&] { tracker->reset_stream_reservation(stream); };
+  mutable_batch.convert_to<cucascade::gpu_table_representation>(
+    sirius::converter_registry::get(), &_gpu, stream);
 }
 
 void direct_exchange::require_open() const

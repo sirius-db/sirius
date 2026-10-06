@@ -16,7 +16,9 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
+#include "data/data_repository_manager_registry.hpp"
 #include "exec/exchange_direct.hpp"
+#include "exec/exchange_staging.hpp"
 #include "memory/slab_memory_resource.hpp"
 #include "sirius/exception.hpp"
 
@@ -29,6 +31,8 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/error.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -39,6 +43,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -320,4 +325,143 @@ TEST_CASE("direct_exchange release is idempotent and close frees every token", "
   exchange.close();
   CHECK(gpu.get_available_memory() == available);
   CHECK_THROWS_AS(exchange.allocate(layout), sirius::invalid_input_exception);
+}
+
+TEST_CASE("direct_exchange seals a received batch until take_batch or release", "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  std::size_t made_room = 0;
+  exchange.enable_spill(staging, [&](std::size_t) { ++made_room; });
+
+  auto const table = sample_table(gpu.get_default_allocator());
+  auto const sent  = exchange.export_batch(batch_of(gpu, table->view(), table));
+  REQUIRE(sent);
+  auto [token, dst] = exchange.allocate(sent->layout);
+  for (std::size_t i = 0; i < dst.size(); i += 2) {
+    REQUIRE(cudaMemcpy(reinterpret_cast<void*>(dst[i]),
+                       reinterpret_cast<void const*>(sent->src[i]),
+                       dst[i + 1],
+                       cudaMemcpyDeviceToDevice) == cudaSuccess);
+  }
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  exchange.release(sent->token);
+
+  exchange.seal(token);
+  exchange.seal(token);        // idempotent
+  exchange.seal(token + 100);  // unknown: ignored, like release()
+  CHECK(exchange.outstanding() == 1);
+  // The sealed batch is what the downgrade executor's sweep sees under the reserved query id.
+  auto const manager = registry.get(exchange_staging::query_id);
+  REQUIRE(manager);
+  REQUIRE(manager->get_repositories().size() == 1);
+  CHECK(manager->get_repositories().front()->get_batch_ids().size() == 1);
+
+  auto batch = exchange.take_batch(token);
+  REQUIRE(batch);
+  check_same_rows(sirius::get_cudf_table_view(batch->to_read_only()), table->view());
+  CHECK(exchange.outstanding() == 0);
+  CHECK(manager->get_repositories().front()->get_batch_ids().empty());
+  CHECK_THROWS_AS(exchange.take_batch(token), sirius::invalid_input_exception);
+  CHECK(made_room == 0);
+
+  // A sealed token that is released, or still held at close(), is freed.
+  auto const second = exchange.allocate(sent->layout).first;
+  exchange.seal(second);
+  exchange.release(second);
+  CHECK(exchange.outstanding() == 0);
+  auto const third = exchange.allocate(sent->layout).first;
+  exchange.seal(third);
+  exchange.close();
+  CHECK(manager->get_repositories().front()->get_batch_ids().empty());
+}
+
+TEST_CASE("direct_exchange makes room once before refusing an allocation", "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  std::vector<std::size_t> asked;
+  exchange.enable_spill(staging, [&](std::size_t bytes) { asked.push_back(bytes); });
+
+  // Half the slab is taken, then three quarters are asked for: within the slab's size, so the
+  // request is well formed, but more than is left. The reservation fails, room is asked for
+  // once, and the retry fails too because nothing here can spill.
+  auto const slab_rows = [&](double share) {
+    return static_cast<cudf::size_type>(static_cast<double>(exchange.region().len) * share /
+                                        sizeof(std::int64_t));
+  };
+  auto const int64_layout = [](cudf::size_type n) {
+    return encode_layout({n, {{type(cudf::type_id::INT64), 0, false}}});
+  };
+  auto const held = exchange.allocate(int64_layout(slab_rows(0.5))).first;
+  CHECK_THROWS_AS(exchange.allocate(int64_layout(slab_rows(0.75))), rmm::out_of_memory);
+  REQUIRE(asked.size() == 1);
+  CHECK(asked.front() >= static_cast<std::size_t>(slab_rows(0.75)) * sizeof(std::int64_t));
+  exchange.release(held);
+}
+
+TEST_CASE("direct_exchange asks again when making room was cancelled", "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  direct_exchange exchange(gpu, *sirius::memory::find_slab(gpu));
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+
+  auto const int64_layout = [&](double share) {
+    auto const rows = static_cast<cudf::size_type>(static_cast<double>(exchange.region().len) *
+                                                   share / sizeof(std::int64_t));
+    return encode_layout({rows, {{type(cudf::type_id::INT64), 0, false}}});
+  };
+  // The first request is cancelled, as a draining downgrade executor does; the second frees
+  // what blocks the allocation.
+  auto held = exchange.allocate(int64_layout(0.5)).first;
+  int asked = 0;
+  exchange.enable_spill(staging, [&](std::size_t) {
+    if (++asked == 1) { throw std::runtime_error("downgrade executor shutting down"); }
+    exchange.release(std::exchange(held, 0));
+  });
+  auto const [token, buffers] = exchange.allocate(int64_layout(0.75));
+  CHECK(asked == 2);
+  CHECK_FALSE(buffers.empty());
+  exchange.release(token);
+
+  // One that keeps failing gives up after a few attempts, with the pool's own error.
+  held  = exchange.allocate(int64_layout(0.5)).first;
+  asked = 0;
+  exchange.enable_spill(staging, [&](std::size_t) {
+    ++asked;
+    throw std::runtime_error("downgrade executor shutting down");
+  });
+  CHECK_THROWS_AS(exchange.allocate(int64_layout(0.75)), rmm::out_of_memory);
+  CHECK(asked == 3);
+  exchange.release(held);
+}
+
+TEST_CASE("exchange_staging lists tracked repositories until they are gone", "[exchange_direct]")
+{
+  memory_space gpu(slab_config());
+  sirius::data::data_repository_manager_registry registry;
+  exchange_staging staging(registry);
+  auto const manager = registry.get(exchange_staging::query_id);
+  REQUIRE(manager);
+  auto* const view = manager->get_repositories().front();
+
+  auto repository  = std::make_shared<cucascade::shared_data_repository>();
+  auto const table = sample_table(gpu.get_default_allocator());
+  auto batch       = batch_of(gpu, table->view(), table);
+  auto const id    = batch->get_batch_id();
+  repository->add_data_batch(batch);
+  staging.track(repository);
+  CHECK(staging.tracked() == 1);
+  CHECK(view->get_batch_ids() == std::vector<std::uint64_t>{id});
+  CHECK(view->get_data_batch_by_id(id) == batch);
+  CHECK(view->pop_next_data_batch() == nullptr);  // the view owns nothing
+
+  repository.reset();
+  CHECK(staging.tracked() == 0);
+  CHECK(view->get_batch_ids().empty());
 }

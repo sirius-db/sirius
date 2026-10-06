@@ -21,6 +21,7 @@
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "cudf/cudf_utils.hpp"                             // sirius::get_cudf_type
 #include "data/data_batch_utils.hpp"                       // sirius::make_data_batch
+#include "downgrade/downgrade_executor.hpp"                // sirius::parallel::downgrade_executor
 #include "duckdb/catalog/catalog.hpp"                      // duckdb::Catalog
 #include "duckdb/catalog/catalog_transaction.hpp"          // duckdb::CatalogTransaction
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
@@ -230,9 +231,16 @@ struct Context::Impl {
     auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpus.size() == 1) {
       if (auto slab = sirius::memory::find_slab(*gpus.front())) {
-        exchange = std::make_shared<sirius::exec::direct_exchange>(
-          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()),
-          std::move(*slab));
+        auto& gpu =
+          *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id());
+        exchange = std::make_shared<sirius::exec::direct_exchange>(gpu, std::move(*slab));
+        // Exchange data can wait a long time for its receivers. Let it spill to host under
+        // pressure rather than fail the query when a shuffle outgrows the pool.
+        exchange->enable_spill(
+          context->get_exchange_staging(),
+          [ctx = context.get(), space = gpu.get_id()](std::size_t bytes) {
+            ctx->get_downgrade_executor(space).request_free_memory_and_wait(bytes);
+          });
       }
     }
 
@@ -420,6 +428,8 @@ std::unique_ptr<std::vector<std::uint64_t>> DirectExchange::allocate(std::uintpt
 }
 
 void DirectExchange::release(std::uint64_t token) const { exchange_->release(token); }
+
+void DirectExchange::seal(std::uint64_t token) const { exchange_->seal(token); }
 
 std::size_t DirectExchange::outstanding() const { return exchange_->outstanding(); }
 
@@ -638,11 +648,15 @@ void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
   impl_->require_built("push_received()");
   auto& exchange       = impl_->ctx.require_exchange();
   const auto& declared = impl_->fragment->input_spec(stream_id);
-  auto table           = exchange.take(token);
-  check_declared_schema(declared, table->view(), stream_id, "received batch");
-  auto& gpu  = exchange.space();
-  auto batch = sirius::make_data_batch(
-    std::move(table), gpu, gpu.acquire_stream(), telemetry::batch_telemetry_info{});
+  // A sealed batch may have spilled to host; it is checked when it is next on the GPU.
+  auto batch = exchange.take_batch(token);
+  {
+    auto const read_only = batch->to_read_only();
+    if (read_only.get_current_tier() == cucascade::memory::Tier::GPU) {
+      check_declared_schema(
+        declared, sirius::get_cudf_table_view(read_only), stream_id, "received batch");
+    }
+  }
   if (!impl_->fragment->push(stream_id, std::move(batch))) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
                                           " refused a received batch; it had already ended");
