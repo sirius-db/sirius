@@ -205,8 +205,12 @@ struct Context::Impl {
     auto& memory    = context->get_memory_manager();
     auto const gpus = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
     if (gpus.size() == 1) {
-      exchange = std::make_shared<sirius::exec::exchange_inbox>(
-        *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id()));
+      auto& gpu =
+        *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id());
+      exchange = std::make_shared<sirius::exec::exchange_inbox>(gpu);
+      // Received batches can wait a long time for their receivers. Let them spill to host under
+      // pressure rather than fail the query when a shuffle outgrows the pool.
+      exchange->enable_spill(context->get_exchange_staging());
     }
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
@@ -525,6 +529,9 @@ void Fragment::push_received(std::uint64_t stream_id, std::uint64_t token)
   rmm::cuda_set_device_raii const device{rmm::cuda_device_id{exchange.device()}};
   // Refuses an undeclared input or a running fragment before the token is consumed.
   impl_->fragment->require_pushable(stream_id);
+  // push() checks the columns of a batch on the GPU. A batch that spilled to host goes in
+  // unchecked, and nothing checks it when a task brings it back: its columns are the ones its
+  // transport landed, and the spill keeps them.
   auto batch = exchange.take_batch(token);
   if (!impl_->fragment->push(stream_id, std::move(batch))) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +

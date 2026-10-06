@@ -25,12 +25,15 @@
 
 namespace cucascade {
 class data_batch;
+class data_repository;
 namespace memory {
 class memory_space;
 }
 }  // namespace cucascade
 
 namespace sirius::exec {
+
+class exchange_staging;
 
 /**
  * @brief Batches a transport received from another process, held by token until their receiver
@@ -44,6 +47,11 @@ class exchange_inbox {
  public:
   explicit exchange_inbox(cucascade::memory::memory_space& gpu);
 
+  /// Lets held batches spill: they become visible to @p staging, so the downgrade executor may
+  /// move them to host while they wait for their receivers. Without this, a held batch stays on
+  /// the GPU until it is taken.
+  void enable_spill(exchange_staging& staging);
+
   /// Holds @p batch, already received whole, until its receiver takes it by the returned token.
   /// @p on_gone runs once when the token is taken, released or closed, outside the exchange's
   /// lock, so a transport can account for what its landings still hold. It must not throw: close()
@@ -52,7 +60,7 @@ class exchange_inbox {
   [[nodiscard]] std::uint64_t adopt(std::shared_ptr<cucascade::data_batch> batch,
                                     std::function<void()> on_gone = {});
 
-  /// Consumes the token of a received batch.
+  /// Consumes the token of a received batch, possibly spilled to host.
   /// @throws sirius::invalid_input_exception on a token that holds no received batch.
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> take_batch(std::uint64_t token);
 
@@ -78,7 +86,10 @@ class exchange_inbox {
   mutable std::mutex _mutex;
   std::uint64_t _next{1};
   bool _closed{false};
-  std::map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> _held;
+  /// Held batches, by batch id; tracked by the exchange staging once spill is on.
+  std::shared_ptr<cucascade::data_repository> _held;
+  /// Token -> batch id in _held.
+  std::map<std::uint64_t, std::uint64_t> _held_ids;
   /// Callbacks of adopted tokens, run when they go.
   std::map<std::uint64_t, std::function<void()>> _on_gone;
 };

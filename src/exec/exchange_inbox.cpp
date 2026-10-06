@@ -16,11 +16,13 @@
 
 #include "exec/exchange_inbox.hpp"
 
+#include "exec/exchange_staging.hpp"
 #include "sirius/exception.hpp"
 
 #include <rmm/cuda_device.hpp>
 
 #include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <utility>
@@ -28,9 +30,13 @@
 namespace sirius::exec {
 
 exchange_inbox::exchange_inbox(cucascade::memory::memory_space& gpu)
-  : _gpu{gpu}, _device{gpu.get_device_id()}
+  : _gpu{gpu},
+    _device{gpu.get_device_id()},
+    _held{std::make_shared<cucascade::shared_data_repository>()}
 {
 }
+
+void exchange_inbox::enable_spill(exchange_staging& staging) { staging.track(_held); }
 
 std::uint64_t exchange_inbox::adopt(std::shared_ptr<cucascade::data_batch> batch,
                                     std::function<void()> on_gone)
@@ -39,7 +45,8 @@ std::uint64_t exchange_inbox::adopt(std::shared_ptr<cucascade::data_batch> batch
   std::lock_guard const lock{_mutex};
   require_open();
   auto const token = _next++;
-  _held.emplace(token, std::move(batch));
+  _held_ids.emplace(token, batch->get_batch_id());
+  _held->add_data_batch(std::move(batch));
   if (on_gone) { _on_gone.emplace(token, std::move(on_gone)); }
   return token;
 }
@@ -50,15 +57,18 @@ std::shared_ptr<cucascade::data_batch> exchange_inbox::take_batch(std::uint64_t 
   {
     std::lock_guard const lock{_mutex};
     require_open();
-    auto const it = _held.find(token);
-    if (it == _held.end()) {
+    auto const it = _held_ids.find(token);
+    if (it == _held_ids.end()) {
       throw sirius::invalid_input_exception("exchange inbox: token {} holds no received batch",
                                             token);
     }
-    batch = std::move(it->second);
-    _held.erase(it);
+    batch = _held->pop_data_batch_by_id(it->second);
+    _held_ids.erase(it);
   }
   gone(token);
+  if (!batch) {
+    throw sirius::internal_exception("exchange inbox: token {} lost its batch", token);
+  }
   return batch;
 }
 
@@ -69,7 +79,10 @@ void exchange_inbox::release(std::uint64_t token)
     // The batch's buffers are freed on the device they live on.
     rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
     require_open();
-    _held.erase(token);
+    if (auto const it = _held_ids.find(token); it != _held_ids.end()) {
+      (void)_held->pop_data_batch_by_id(it->second);
+      _held_ids.erase(it);
+    }
   }
   gone(token);
 }
@@ -78,7 +91,7 @@ std::size_t exchange_inbox::outstanding() const
 {
   std::lock_guard const lock{_mutex};
   require_open();
-  return _held.size();
+  return _held_ids.size();
 }
 
 void exchange_inbox::close()
@@ -87,7 +100,10 @@ void exchange_inbox::close()
   {
     std::lock_guard const lock{_mutex};
     rmm::cuda_set_device_raii const device{rmm::cuda_device_id{_device}};
-    _held.clear();
+    for (auto const& [token, batch_id] : _held_ids) {
+      (void)_held->pop_data_batch_by_id(batch_id);
+    }
+    _held_ids.clear();
     on_gone.swap(_on_gone);
     _closed = true;
   }
