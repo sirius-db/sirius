@@ -38,7 +38,7 @@ enum class ErrorCode {
 /// #include <sirius/context/config_builder.hpp>
 /// #include <iostream>
 ///
-/// auto config = sirius::ContextConfigBuilder{}.gpu_usage_limit_fraction(1.5).build();
+/// auto config = sirius::ContextConfigBuilder::from_yaml("sirius.yaml");
 /// if (!config) {
 ///   const sirius::Error& error = config.error();
 ///   if (error.code == sirius::ErrorCode::invalid_configuration) {

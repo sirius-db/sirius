@@ -29,7 +29,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <variant>
 
 namespace YAML {
 class Node;
@@ -294,8 +293,6 @@ class configuration_input_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-using gpu_usage_limit = std::variant<double, std::uint64_t>;
-
 class parsed_sirius_config;
 
 struct sirius_config {
@@ -412,7 +409,6 @@ class parsed_sirius_config {
   static parsed_sirius_config from_file(const std::filesystem::path& path);
   static parsed_sirius_config from_node(const YAML::Node& root,
                                         const std::filesystem::path& source_path = {});
-  [[nodiscard]] parsed_sirius_config with_gpu_usage_limit(gpu_usage_limit limit) const;
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;
   [[nodiscard]] const compression_config& get_compression_config() const noexcept;

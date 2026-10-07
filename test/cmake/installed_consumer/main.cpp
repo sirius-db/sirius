@@ -10,8 +10,8 @@ auto* volatile registration    = &sirius::register_duckdb_extension;
 int main()
 {
   sirius::ContextConfigBuilder builder;
-  auto copy = builder;
-  copy.gpu_usage_limit_bytes(8ULL << 30).gpu_usage_limit_fraction(0.5);
+  auto copy                   = builder;
+  builder                     = copy;
   auto* volatile yaml_factory = &sirius::ContextConfigBuilder::from_yaml;
   auto volatile build         = &sirius::ContextConfigBuilder::build;
   return context_factory == nullptr || registration == nullptr || yaml_factory == nullptr ||

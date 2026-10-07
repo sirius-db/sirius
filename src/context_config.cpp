@@ -20,7 +20,6 @@
 #include <yaml-cpp/yaml.h>
 
 #include <fstream>
-#include <optional>
 #include <utility>
 
 namespace sirius {
@@ -31,7 +30,6 @@ struct ContextConfig::Impl {
 
 struct ContextConfigBuilder::Impl {
   parsed_sirius_config config;
-  std::optional<gpu_usage_limit> gpu_limit;
 };
 
 ContextConfig::ContextConfig(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
@@ -79,32 +77,9 @@ std::expected<ContextConfigBuilder, Error> ContextConfigBuilder::from_yaml(
   return ContextConfigBuilder(std::move(impl));
 }
 
-ContextConfigBuilder& ContextConfigBuilder::gpu_usage_limit_bytes(std::uint64_t bytes)
-{
-  auto impl       = std::make_shared<Impl>(*impl_);
-  impl->gpu_limit = bytes;
-  impl_           = std::move(impl);
-  return *this;
-}
-
-ContextConfigBuilder& ContextConfigBuilder::gpu_usage_limit_fraction(double fraction)
-{
-  auto impl       = std::make_shared<Impl>(*impl_);
-  impl->gpu_limit = fraction;
-  impl_           = std::move(impl);
-  return *this;
-}
-
 std::expected<ContextConfig, Error> ContextConfigBuilder::build() const
 {
-  try {
-    auto config =
-      impl_->gpu_limit ? impl_->config.with_gpu_usage_limit(*impl_->gpu_limit) : impl_->config;
-    return ContextConfig(
-      std::make_shared<ContextConfig::Impl>(ContextConfig::Impl{std::move(config)}));
-  } catch (const configuration_input_error& e) {
-    return std::unexpected(Error{ErrorCode::invalid_configuration, e.what()});
-  }
+  return ContextConfig(std::make_shared<ContextConfig::Impl>(ContextConfig::Impl{impl_->config}));
 }
 
 }  // namespace sirius

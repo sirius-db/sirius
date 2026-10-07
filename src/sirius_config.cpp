@@ -871,28 +871,6 @@ try {
                                                       : source_path.string() + ": " + e.what());
 }
 
-parsed_sirius_config parsed_sirius_config::with_gpu_usage_limit(gpu_usage_limit limit) const
-try {
-  if (!impl_->settings.get_memory_space_configs().empty()) {
-    throw configuration_input_error(
-      "GPU usage-limit overrides conflict with non-empty sirius.space lists");
-  }
-  if (auto fraction = std::get_if<double>(&limit);
-      fraction && !yaml::fraction<double>{}(*fraction)) {
-    throw configuration_input_error(
-      "sirius.memory.gpu.usage_limit_fraction must be between 0.0 and 1.0");
-  }
-  auto impl                        = std::make_shared<Impl>(*impl_);
-  impl->gpu_cfg.usage_limit        = limit;
-  impl->use_effective_gpu_capacity = true;
-  return parsed_sirius_config(std::move(impl));
-} catch (const std::bad_alloc&) {
-  throw;
-} catch (const std::exception& e) {
-  throw configuration_input_error(
-    impl_->source_path.empty() ? e.what() : impl_->source_path.string() + ": " + e.what());
-}
-
 sirius_config parsed_sirius_config::resolve(
   const cucascade::memory::system_topology_info& hw_topology) const
 try {

@@ -33,7 +33,7 @@ namespace sirius {
 /**
  * @brief An immutable, validated configuration produced by ContextConfigBuilder::build().
  *
- * A snapshot retains its values independently of subsequent builder edits and
+ * A snapshot retains its values independently of builder reassignment and
  * changes to the source YAML file. Copies share immutable storage and remain
  * valid after the original snapshot or builder is destroyed. Copying from an
  * rvalue also preserves the source snapshot.
@@ -62,9 +62,10 @@ class SIRIUS_EXPORT ContextConfig {
   /// #include <sirius/context/config_builder.hpp>
   ///
   /// auto config = sirius::ContextConfigBuilder{}.build();
-  /// auto replacement = sirius::ContextConfigBuilder{}.gpu_usage_limit_fraction(0.5).build();
-  /// if (config && replacement) {
-  ///   *config = *replacement;
+  /// auto builder = sirius::ContextConfigBuilder::from_yaml("sirius.yaml");
+  /// if (config && builder) {
+  ///   auto replacement = builder->build();
+  ///   if (replacement) { *config = *replacement; }
   /// }
   /// @endcode
   ContextConfig& operator=(const ContextConfig&) noexcept;
