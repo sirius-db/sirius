@@ -198,7 +198,9 @@ struct accumulated_bloom_geometry {
    * @brief Number of chunks per key array.
    */
   [[nodiscard]] std::size_t chunks_per_key() const noexcept
-  { return ::cuda::ceil_div(raw_bytes, chunk_bytes); }
+  {
+    return ::cuda::ceil_div(raw_bytes, chunk_bytes);
+  }
 
   /**
    * @brief Sizes one Bloom array for @p total_rows keys.

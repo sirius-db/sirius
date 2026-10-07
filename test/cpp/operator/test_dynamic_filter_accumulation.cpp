@@ -16,6 +16,7 @@
 
 #include "dynamic_filter_accumulation_test_utils.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+#include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_reservation.hpp"
 #include "utils/host_allocation_fault.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -39,6 +40,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <future>
 #include <limits>
 #include <memory>
@@ -846,6 +848,75 @@ TEST_CASE("only retryable kernel-launch failures are transient",
   REQUIRE_FALSE(error{cudaErrorMemoryAllocation, true, "launch"}.transient_launch_failure());
   REQUIRE_FALSE(error{cudaErrorIllegalAddress, true, "launch"}.transient_launch_failure());
   REQUIRE(error{cudaErrorInvalidValue, true, "launch"}.code() == cudaErrorInvalidValue);
+}
+
+TEST_CASE("each accumulation failure kind sets exactly its counters",
+          "[dynamic_filter][multi_partition]")
+{
+  using op::detail::accumulation_failure;
+  // The cleanup failure join_on_failure raises when it cannot join submitted GPU work.
+  auto const unjoined = [] {
+    try {
+      throw op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "body"};
+    } catch (...) {
+      try {
+        std::throw_with_nested(op::detail::unjoined_gpu_work{});
+      } catch (...) {
+        return std::current_exception();
+      }
+    }
+  }();
+  struct expectation {
+    char const* name;
+    std::exception_ptr error;
+    accumulation_failure kind;
+    bool recoverable;
+    std::uint64_t stats_view::* counter;
+  };
+  auto const cases = std::array{
+    expectation{"unjoined GPU work",
+                unjoined,
+                accumulation_failure::LEAK,
+                false,
+                &stats_view::accumulation_storage_leaks},
+    expectation{"host allocation refusal",
+                std::make_exception_ptr(std::bad_alloc{}),
+                accumulation_failure::ADMISSION,
+                true,
+                &stats_view::accumulations_skipped_admission},
+    expectation{"retryable kernel launch",
+                std::make_exception_ptr(
+                  op::detail::accumulation_cuda_error{cudaErrorLaunchOutOfResources, true, "add"}),
+                accumulation_failure::TRANSIENT,
+                true,
+                &stats_view::accumulations_skipped_transient},
+    expectation{"fatal CUDA call",
+                std::make_exception_ptr(
+                  op::detail::accumulation_cuda_error{cudaErrorIllegalAddress, false, "sync"}),
+                accumulation_failure::ERROR,
+                false,
+                &stats_view::accumulations_skipped_error},
+    expectation{"invariant violation",
+                std::make_exception_ptr(op::detail::accumulation_invariant_error{"invariant"}),
+                accumulation_failure::ERROR,
+                false,
+                &stats_view::accumulations_skipped_error}};
+  for (auto const& expected : cases) {
+    CAPTURE(expected.name);
+    auto const kind = op::detail::classify_failure(expected.error);
+    REQUIRE(kind == expected.kind);
+    REQUIRE(op::detail::recoverable(kind) == expected.recoverable);
+    stats_view counts;
+    op::detail::count_failure(counts, kind);
+    REQUIRE(counts.*expected.counter == 1);
+    // A leak is also an error; every other kind sets only its own counter.
+    std::uint64_t set = 0;
+    for (auto const field : op::dynamic_filter_counter_fields<std::uint64_t>) {
+      set += counts.*field;
+    }
+    REQUIRE(set == (kind == accumulation_failure::LEAK ? 2 : 1));
+    if (kind == accumulation_failure::LEAK) { REQUIRE(counts.accumulations_skipped_error == 1); }
+  }
 }
 
 namespace {

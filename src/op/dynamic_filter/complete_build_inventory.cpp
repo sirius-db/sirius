@@ -72,7 +72,9 @@ complete_build_inventory::batch_entry const* complete_build_inventory::find(
 
 std::optional<cudf::data_type> complete_build_inventory::consistent_type_at(
   std::size_t ordinal) const noexcept
-{ return ordinal < _schema.size() ? _schema[ordinal] : std::nullopt; }
+{
+  return ordinal < _schema.size() ? _schema[ordinal] : std::nullopt;
+}
 
 namespace {
 

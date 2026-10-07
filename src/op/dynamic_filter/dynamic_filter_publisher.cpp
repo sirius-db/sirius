@@ -20,6 +20,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+#include "op/dynamic_filter/detail/accumulation_failure.hpp"
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
@@ -69,39 +70,12 @@ namespace {
 
 using completion = sirius_dynamic_filter_set::completion;
 
+using detail::classify_failure;
+using detail::count_failure;
+using detail::recoverable;
+
 /// A field of the publication counters; a reason an attempt ended is counted by setting it to one.
 using counter_field = std::uint64_t dynamic_filter_stats_snapshot::*;
-
-enum class accumulation_failure : std::uint8_t { ADMISSION, TRANSIENT, ERROR, LEAK };
-
-accumulation_failure classify_failure(std::exception_ptr error) noexcept
-{
-  try {
-    std::rethrow_exception(std::move(error));
-  } catch (detail::unjoined_gpu_work const&) {
-    return accumulation_failure::LEAK;
-  } catch (detail::accumulation_cuda_error const& e) {
-    return e.transient_launch_failure() ? accumulation_failure::TRANSIENT
-                                        : accumulation_failure::ERROR;
-  } catch (std::bad_alloc const&) {
-    return accumulation_failure::ADMISSION;
-  } catch (...) {
-    return accumulation_failure::ERROR;
-  }
-}
-
-bool recoverable(accumulation_failure kind) noexcept
-{ return kind == accumulation_failure::ADMISSION || kind == accumulation_failure::TRANSIENT; }
-
-void count_failure(dynamic_filter_stats_snapshot& outcome, accumulation_failure kind) noexcept
-{
-  switch (kind) {
-    case accumulation_failure::ADMISSION: outcome.accumulations_skipped_admission = 1; break;
-    case accumulation_failure::TRANSIENT: outcome.accumulations_skipped_transient = 1; break;
-    case accumulation_failure::LEAK: outcome.accumulation_storage_leaks = 1; [[fallthrough]];
-    case accumulation_failure::ERROR: outcome.accumulations_skipped_error = 1; break;
-  }
-}
 
 /**
  * @brief The probe storage type of every binding, per admitted key of @p plan; a key that no
@@ -563,7 +537,9 @@ dynamic_filter_publication_session::dynamic_filter_publication_session(
 dynamic_filter_publication_session::~dynamic_filter_publication_session() { cancel(); }
 
 dynamic_filter_publish_plan const& dynamic_filter_publication_session::plan() const noexcept
-{ return _state->plan; }
+{
+  return _state->plan;
+}
 
 void dynamic_filter_publication_session::restrict_replicas_to(
   std::vector<int> const& admitted_gpu_ids)
@@ -752,9 +728,9 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
       std::scoped_lock lock(operation.mutex);
       if (!operation.inventory) { return; }
       auto const* entry = operation.inventory->find(original_id);
-      auto const index = entry != nullptr
-                           ? static_cast<std::size_t>(entry - operation.inventory->batches().data())
-                           : 0;
+      auto const index  = entry != nullptr
+                            ? static_cast<std::size_t>(entry - operation.inventory->batches().data())
+                            : 0;
       // Retry identity precedes representation validation: a completed batch can have been
       // spilled or cloned since its first contribution.
       if (entry != nullptr && operation.claimed[index]) {

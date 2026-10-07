@@ -92,19 +92,25 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
   [[nodiscard]] sirius_physical_operator* get_sibling_partition_op() const
-  { return _sibling_partition_op; }
+  {
+    return _sibling_partition_op;
+  }
 
   bool has_sibling() const { return _has_sibling_partition_op; }
 
   void set_sibling_partition_op(sirius_physical_operator* sibling_partition_op)
-  { _sibling_partition_op = sibling_partition_op; }
+  {
+    _sibling_partition_op = sibling_partition_op;
+  }
 
   /// Hold off sizing until the sibling partition's input pipeline has also finished. Set for
   /// consumers whose `get_partition_strategy` reads `combined_total_bytes`: the driving partition
   /// otherwise measures the pair as soon as its own side completes, while the sibling is still
   /// filling. Costs nothing once the count is decided.
   void set_sizing_requires_sibling_input(bool requires_sibling)
-  { _sizing_requires_sibling_input = requires_sibling; }
+  {
+    _sizing_requires_sibling_input = requires_sibling;
+  }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
@@ -122,10 +128,14 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// partition). Distinct from `key_source` (which only supplies partition keys) and from the batch
   /// receiver in `next_port_after_sink` (a CONCAT, for joins). Set at plan time.
   void set_downstream_consumer_op(sirius_physical_operator* consumer)
-  { _downstream_consumer_op = consumer; }
+  {
+    _downstream_consumer_op = consumer;
+  }
 
   [[nodiscard]] sirius_physical_operator* get_downstream_consumer_op() const
-  { return _downstream_consumer_op; }
+  {
+    return _downstream_consumer_op;
+  }
 
   /// Input positions this partition hashes to place a row — its `key_source`'s keys,
   /// resolved at construction. Exposed for late materialization, which must never let one

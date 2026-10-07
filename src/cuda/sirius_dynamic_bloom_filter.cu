@@ -32,6 +32,7 @@
 #include <cuda/utility>
 #include <thrust/iterator/counting_iterator.h>
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
@@ -211,40 +212,18 @@ void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false
   throw detail::accumulation_cuda_error{status, kernel_launch, call};
 }
 
+using cucascade::cuda::cuda_event;
+
 /**
- * @brief Timing-free CUDA event, created on the device that is current at construction.
+ * @brief Creates a timing-free event on @p device, restoring the current device afterwards.
+ *
+ * @param device The GPU the event belongs to
  */
-class cuda_event final {
- public:
-  cuda_event()
-  {
-    check_cuda(cudaEventCreateWithFlags(&_event, cudaEventDisableTiming), "cudaEventCreate");
-  }
-  ~cuda_event()
-  {
-    if (_event != nullptr && cudaEventDestroy(_event) != cudaSuccess) { (void)cudaGetLastError(); }
-  }
-  cuda_event(cuda_event const&)            = delete;
-  cuda_event& operator=(cuda_event const&) = delete;
-  cuda_event(cuda_event&&)                 = delete;
-  cuda_event& operator=(cuda_event&&)      = delete;
-
-  /**
-   * @brief Creates an event on @p device, restoring the current device afterwards.
-   *
-   * @param device The GPU the event belongs to
-   */
-  [[nodiscard]] static cuda_event on(int device)
-  {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-    return cuda_event{};  // A prvalue: initializes the caller's object without a move.
-  }
-
-  [[nodiscard]] cudaEvent_t get() const noexcept { return _event; }
-
- private:
-  cudaEvent_t _event{};
-};
+[[nodiscard]] cuda_event make_event_on(int device)
+{
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+  return cuda_event{};
+}
 
 /**
  * @brief One published replica of an accumulated key: the array and the partial stream that frees
@@ -665,8 +644,8 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
       _stream{stream},
       _scratch{scratch},
       _slot_bytes{_sources.size() * owner.geometry.chunk_bytes},
-      _ingress_done{cuda_event::on(root.device_id), cuda_event::on(root.device_id)},
-      _merged{cuda_event::on(root.device_id), cuda_event::on(root.device_id)}
+      _ingress_done{make_event_on(root.device_id), make_event_on(root.device_id)},
+      _merged{make_event_on(root.device_id), make_event_on(root.device_id)}
   {
   }
 
@@ -680,13 +659,13 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   void order_after_inserts()
   {
     for (auto* source : _sources) {
-      auto const ready = cuda_event::on(source->device_id);
+      auto const ready = make_event_on(source->device_id);
       record(ready, *source);
       check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
                  "cudaStreamWaitEvent(source ready)");
     }
     if (!_sources.empty()) { return; }
-    auto const root_ready = cuda_event::on(_root.device_id);
+    auto const root_ready = make_event_on(_root.device_id);
     record(root_ready, _root);
     for (auto* target : _targets) {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target->device_id}};
@@ -722,12 +701,12 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   void wait_until_replicas_ready()
   {
     for (auto* target : _targets) {
-      auto const ready = cuda_event::on(target->device_id);
+      auto const ready = make_event_on(target->device_id);
       record(ready, *target);
       check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
                  "cudaStreamWaitEvent(replica ready)");
     }
-    auto const root_done = cuda_event::on(_root.device_id);
+    auto const root_done = make_event_on(_root.device_id);
     record(root_done, _root);
     check_cuda(cudaStreamWaitEvent(_stream.get(), root_done.get(), 0),
                "cudaStreamWaitEvent(root done)");
