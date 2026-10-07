@@ -1,6 +1,9 @@
 {
   global:
     sirius_duckdb_cpp_init;
+    /* Share exception handling with the DuckDB host. */
+    __cxa_*;
+    __gxx_personality_v0;
     InitializeInjectionNvtx2;
     dlopen;
   local:

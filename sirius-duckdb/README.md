@@ -38,6 +38,9 @@ The final extension link bundles those libraries; the
 post-link check rejects unexpected runtime dependencies. NVIDIA driver libraries
 and standard Linux libraries remain external.
 
+Hosts that statically link their C++ runtime must export its exception-handling
+symbols. The supplied DuckDB build enables this with `EXPORT_DYNAMIC_SYMBOLS=ON`.
+
 ```sh
 git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
