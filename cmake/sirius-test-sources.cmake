@@ -78,6 +78,10 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_gpu_execution_vector_threshold_join.cpp
     test/cpp/integration/test_gpu_execution_vector_topk_join.cpp
+    test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
+    test/cpp/integration/test_gpu_execution_kmeans.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_exact_per_row.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_sql_rewrite.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -259,13 +263,16 @@ set(TEST_SOURCES
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp
+    test/cpp/vss/test_brute_force_threshold.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
+    test/cpp/vss/test_device_rates.cpp
     test/cpp/vss/test_distance_metric.cpp
     test/cpp/vss/test_enn_top_k.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_pinned_column.cpp
     test/cpp/vss/test_vector_search.cpp
+    test/cpp/vss/test_vector_clustering.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp

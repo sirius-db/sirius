@@ -88,4 +88,21 @@ threshold_join_result brute_force_threshold(
   std::size_t tile_rows               = 0,
   std::size_t tile_cols               = 0);
 
+/**
+ * @brief The same edge list as @ref brute_force_threshold, from one GEMM and one pass.
+ *
+ * The cuVS-tiled form writes the [queries x corpus] dot products, rewrites every one into a
+ * distance, then compacts: three passes over the matrix. Here the GEMM scores are compared to a
+ * per-row bound equivalent to distance <= eps (L2: |x|^2 - 2 q.x <= eps^2 - |q|^2; cosine over unit
+ * vectors: -q^.x^ <= eps - 1) and matches are appended as they are read, with distances computed
+ * for survivors only. Edge order is unspecified. Metrics: those gemm_search_supports accepts.
+ */
+threshold_join_result gemm_threshold(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  dataset_matrix_view queries,
+  float eps,
+  cuvs::distance::DistanceType metric,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 }  // namespace sirius::vss

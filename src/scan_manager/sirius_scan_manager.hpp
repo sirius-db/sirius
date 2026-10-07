@@ -762,6 +762,12 @@ class sirius_scan_manager {
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
+  /// \brief Look up a pinned table entry by its name (the key used by pin_table /
+  ///        @ref insert_pinned_entry), or nullptr if none is pinned under @p name.
+  ///        The returned pointer is owned by the scan manager and stable until the
+  ///        entry is removed or replaced.
+  [[nodiscard]] const pinned_entry* find_pinned_entry(std::string_view name) const;
+
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or nullptr.
   /// OWNING: the returned shared_ptr keeps the entry alive for as long as the caller holds
   /// it, so a concurrent unpin on another connection cannot pull it out from under the

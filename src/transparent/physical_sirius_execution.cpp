@@ -35,12 +35,15 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <atomic>
+
 namespace sirius::transparent {
 
 // ---------------------------------------------------------------------------
 // Global source state — owns the sirius_interface and the materialized result.
 // ---------------------------------------------------------------------------
 struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
+  std::atomic<duckdb::idx_t> next_batch_index{0};
   duckdb::unique_ptr<sirius::sirius_interface> iface;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
@@ -148,6 +151,17 @@ duckdb::unique_ptr<duckdb::LocalSourceState> PhysicalSiriusExecution::GetLocalSo
   return duckdb::make_uniq<duckdb::LocalSourceState>();
 }
 
+duckdb::OperatorPartitionData PhysicalSiriusExecution::GetPartitionData(
+  duckdb::ExecutionContext&,
+  duckdb::DataChunk&,
+  duckdb::GlobalSourceState& gstate,
+  duckdb::LocalSourceState&,
+  const duckdb::OperatorPartitionInfo&) const
+{
+  auto& state = gstate.Cast<SiriusGlobalSourceState>();
+  return duckdb::OperatorPartitionData(state.next_batch_index.fetch_add(1));
+}
+
 duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
   duckdb::ExecutionContext& context,
   duckdb::DataChunk& chunk,
@@ -238,8 +252,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           try {
             fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
           } catch (duckdb::NotImplementedException&) {
-            // Drop logical_plan_ — we know it can't be copied, so future executes
-            // will skip straight to the replan path.
+            // A sub-plan spliced under a CPU sink (CREATE TABLE AS / COPY / INSERT) has no SQL
+            // text to replan from, so the template itself is consumed: it runs once, which is
+            // all a sink statement asks of it. Otherwise drop it and take the replan path.
+            if (query_sql_.empty()) { fresh_plan = std::move(logical_plan_); }
             logical_plan_.reset();
           }
         }
@@ -364,8 +380,18 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // reached indirectly (e.g. through a view) to the CPU plan. Binds to the
       // TARGET executing connection's state.
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client);
-      state.result =
-        run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      try {
+        state.result =
+          run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      } catch (const std::exception& fallback_error) {
+        // The fallback's own failure says nothing about why the GPU failed, and for
+        // GPU-only rewrite targets (sirius_knn_join) it is actively misleading -- the
+        // user sees "cannot run on the CPU" when the real cause was, say, an OOM. Report
+        // the GPU error, which is the actionable one, with the fallback failure attached.
+        throw duckdb::ExecutorException(
+          "Sirius GPU execution failed: " + gpu_msg +
+          " (CPU fallback also failed: " + std::string(fallback_error.what()) + ")");
+      }
     }
 
     SIRIUS_LOG_INFO("Transparent GPU execution: query completed");

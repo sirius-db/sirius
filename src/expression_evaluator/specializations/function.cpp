@@ -34,6 +34,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/combine.hpp>
@@ -440,6 +441,72 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const num_rows = child_cols[0]->size();
     return cudf::make_structs_column(
       num_rows, std::move(child_cols), 0, rmm::device_buffer{}, _stream, _mr);
+  }
+
+  // Math functions over FLOAT/DOUBLE columns. abs/floor/ceil keep the argument's type; sqrt,
+  // exp and ln are typed DOUBLE by DuckDB, so the unary result is cast to the declared type.
+  // round() uses cudf::round with HALF_UP, DuckDB's rounding rule, on a constant digit count.
+  auto execute_unary_math = [&](cudf::unary_operator op) -> evaluate_result {
+    D_ASSERT(args.size() == 1);
+    auto arg = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    std::unique_ptr<cudf::column> input;
+    if (arg.is_scalar()) {
+      input =
+        cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
+    }
+    auto const in_view = arg.is_scalar() ? input->view() : arg.get_column_view();
+    auto out           = cudf::unary_operation(in_view, op, _stream, _mr);
+    if (out->type() != output_type) { out = cudf::cast(out->view(), output_type, _stream, _mr); }
+    return evaluate_result(std::move(out));
+  };
+  if (resolved_id == function_id::abs) { return execute_unary_math(cudf::unary_operator::ABS); }
+  if (resolved_id == function_id::sqrt) { return execute_unary_math(cudf::unary_operator::SQRT); }
+  if (resolved_id == function_id::floor) { return execute_unary_math(cudf::unary_operator::FLOOR); }
+  if (resolved_id == function_id::ceil) { return execute_unary_math(cudf::unary_operator::CEIL); }
+  if (resolved_id == function_id::exp) { return execute_unary_math(cudf::unary_operator::EXP); }
+  if (resolved_id == function_id::ln) { return execute_unary_math(cudf::unary_operator::LOG); }
+  if (resolved_id == function_id::pow) {
+    return execute_numeric_binary_func(cudf::binary_operator::POW);
+  }
+  if (resolved_id == function_id::round) {
+    D_ASSERT(args.size() == 1 || args.size() == 2);
+    std::int32_t digits = 0;
+    if (args.size() == 2) {
+      auto d = evaluate(*args[1], evaluation_mode::MATERIALIZE);
+      if (!d.is_scalar()) {
+        throw not_implemented_exception(
+          "[expression_evaluator:function] round() needs a constant digit count");
+      }
+      auto const& sc = d.get_scalar();
+      switch (sc.type().id()) {
+        case cudf::type_id::INT8:
+          digits = static_cast<cudf::numeric_scalar<int8_t> const&>(sc).value(_stream);
+          break;
+        case cudf::type_id::INT16:
+          digits = static_cast<cudf::numeric_scalar<int16_t> const&>(sc).value(_stream);
+          break;
+        case cudf::type_id::INT32:
+          digits = static_cast<cudf::numeric_scalar<int32_t> const&>(sc).value(_stream);
+          break;
+        case cudf::type_id::INT64:
+          digits = static_cast<std::int32_t>(
+            static_cast<cudf::numeric_scalar<int64_t> const&>(sc).value(_stream));
+          break;
+        default:
+          throw not_implemented_exception(
+            "[expression_evaluator:function] round() digit count must be an integer");
+      }
+    }
+    auto arg = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    std::unique_ptr<cudf::column> input;
+    if (arg.is_scalar()) {
+      input =
+        cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
+    }
+    auto const in_view = arg.is_scalar() ? input->view() : arg.get_column_view();
+    auto out           = cudf::round(in_view, digits, cudf::rounding_method::HALF_UP, _stream, _mr);
+    if (out->type() != output_type) { out = cudf::cast(out->view(), output_type, _stream, _mr); }
+    return evaluate_result(std::move(out));
   }
 
   // `error()` is a runtime-error-raising function. We deliberately do not

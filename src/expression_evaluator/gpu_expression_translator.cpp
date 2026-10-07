@@ -769,11 +769,82 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case div:
     case int_div: return add_function_expression<cudf::ast::ast_operator::DIV>(alt, table_src);
     case mod: return add_function_expression<cudf::ast::ast_operator::MOD>(alt, table_src);
+    case pow: return add_function_expression<cudf::ast::ast_operator::POW>(alt, table_src);
+    case abs: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::ABS);
+    case sqrt: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::SQRT);
+    case floor:
+      return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::FLOOR);
+    case ceil: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::CEIL);
+    case exp: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::EXP);
+    case ln: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::LOG);
+    case round: return add_round_expression(alt, table_src);
     default:
       SIRIUS_LOG_DEBUG("[expression_translator] Unsupported function: {}",
                        static_cast<int>(alt.function()));
       return std::nullopt;
   }
+}
+
+// cuDF's RINT rounds half to even where DuckDB rounds half away from zero; the difference is
+std::optional<expr_ref> gpu_expression_translator::add_unary_function_expression(
+  sirius::ast::function_call const& alt,
+  cudf::ast::table_reference const table_src,
+  cudf::ast::ast_operator op)
+{
+  if (alt.arguments().size() != 1) { return std::nullopt; }
+  auto arg = add_expression(*alt.arguments()[0], table_src);
+  if (!arg) { return std::nullopt; }
+  auto const wants_double = sirius::get_cudf_type(alt.return_type()).id() == cudf::type_id::FLOAT64;
+  auto const arg_type     = node_logical_type_id(*alt.arguments()[0]);
+  if (arg_type != sirius::type_id::FLOAT && arg_type != sirius::type_id::DOUBLE) {
+    return std::nullopt;
+  }
+  if (wants_double && arg_type != sirius::type_id::DOUBLE) {
+    arg = _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::CAST_TO_FLOAT64, *arg);
+  }
+  return _ast_tree.emplace<cudf::ast::operation>(op, *arg);
+}
+
+// confined to exact ties, which a float score column never produces in practice.
+std::optional<expr_ref> gpu_expression_translator::add_round_expression(
+  sirius::ast::function_call const& alt, cudf::ast::table_reference const table_src)
+{
+  auto const n_args = alt.arguments().size();
+  if (n_args != 1 && n_args != 2) { return std::nullopt; }
+  auto arg = add_expression(*alt.arguments()[0], table_src);
+  if (!arg) { return std::nullopt; }
+  auto const arg_type  = node_logical_type_id(*alt.arguments()[0]);
+  auto const is_double = arg_type == sirius::type_id::DOUBLE;
+  if (!is_double && arg_type != sirius::type_id::FLOAT) { return std::nullopt; }
+  if (n_args == 1) {
+    return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::RINT, *arg);
+  }
+  // The digit count must be a constant integer; anything else stays on the CPU.
+  const auto* digits = std::get_if<sirius::ast::constant>(&alt.arguments()[1]->v);
+  if (digits == nullptr) { return std::nullopt; }
+  std::optional<std::int64_t> n;
+  std::visit(
+    [&](auto const& v) {
+      using T = std::decay_t<decltype(v)>;
+      if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
+        n = static_cast<std::int64_t>(v);
+      }
+    },
+    digits->payload);
+  if (!n.has_value() || *n < 0 || *n > 15) { return std::nullopt; }
+  double scale = 1.0;
+  for (std::int64_t i = 0; i < *n; ++i) {
+    scale *= 10.0;
+  }
+  // Same scalar type as the argument so cuDF sees one type on both sides of the operators.
+  auto scale_lit = is_double ? add_literal_expression<cudf::numeric_scalar<double>>(scale, true)
+                             : add_literal_expression<cudf::numeric_scalar<float>>(
+                                 static_cast<float>(scale), true);
+  if (!scale_lit) { return std::nullopt; }
+  auto scaled =
+    _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::MUL, *arg, *scale_lit);
+  auto rounded = _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::RINT, scaled);
+  return _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::DIV, rounded, *scale_lit);
 }
 
 //===----------AGGREGATE----------===//

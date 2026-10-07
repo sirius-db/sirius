@@ -15,6 +15,7 @@
  */
 
 #include "cuda/vss/knn_merge.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
@@ -35,6 +36,7 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
                                 int64_t n_samples,
                                 int64_t n_parts,
                                 int64_t k,
+                                rmm::cuda_stream_view stream,
                                 rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(n_samples >= 1 && n_parts >= 1 && k >= 1,
@@ -48,15 +50,13 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
                  static_cast<int64_t>(stacked_neighbors.size()) == n_parts * n_samples * k,
                "VSS merge: stacked inputs must be [n_parts * n_samples * k]");
 
-  auto const stream = raft::resource::get_cuda_stream(res);
-
   // Part-major inputs: part p's [n_samples, k] block at row p*n_samples.
   auto const in_dist = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
     stacked_distances.data<float>(), n_parts * n_samples, k);
   auto const in_idx = raft::make_device_matrix_view<const int64_t, int64_t, raft::row_major>(
     stacked_neighbors.data<int64_t>(), n_parts * n_samples, k);
 
-  auto const out_size = static_cast<cudf::size_type>(n_samples * k);
+  auto const out_size = column_size(n_samples * k, "vector join merge");
   auto out_distances  = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::FLOAT32}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
   auto out_neighbors = cudf::make_numeric_column(

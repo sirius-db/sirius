@@ -43,6 +43,11 @@ namespace sirius::vss {
 /// Only @c ivf_flat is built today; the rest are placeholders.
 enum class index_kind : std::uint8_t {
   ivf_flat,
+  /// Not a search index: the centroid matrix of a clustering (sirius_kmeans_fit), held here
+  /// because it wants what an index does -- a name, GPU residency and session lifetime.
+  kmeans_centroids,
+  /// The cluster-ordered copy of a corpus a clustering was built into (cluster_lists).
+  cluster_lists,
   // ivf_pq,  // not supported yet
   // cagra,  // not supported yet
 };
@@ -219,6 +224,13 @@ class cuvs_index_cache {
                                                               std::string_view schema,
                                                               std::string_view table,
                                                               std::string_view column) const;
+
+  /// The names of the entries on this column of the given kind.
+  [[nodiscard]] std::vector<std::string> names_on_column(std::string_view catalog,
+                                                         std::string_view schema,
+                                                         std::string_view table,
+                                                         std::string_view column,
+                                                         index_kind kind) const;
 
   [[nodiscard]] bool contains(std::string_view name) const;
 

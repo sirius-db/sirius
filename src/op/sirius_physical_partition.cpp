@@ -156,11 +156,16 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
              op->type == SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN ||
-             op->type == SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
-    // NLJ and the vector joins are the downstream sizing consumer too;
-    // it always reports a single partition.
+             op->type == SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN ||
+             op->type == SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM) {
+    // NLJ and the vector join are the downstream sizing consumer too; neither has an equality
+    // key to partition on. For the vector join that is not an implementation gap: no
+    // partitioning of vectors can guarantee a probe's nearest neighbour lands in its own
+    // partition, which is why every probe row must see the whole corpus. One partition, and
+    // the corpus is streamed past the probe instead.
     _downstream_consumer_op = op;
     _partition_type         = PartitionType::NONE;
+    if (op->type == SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM) { _num_partitions = 1; }
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
