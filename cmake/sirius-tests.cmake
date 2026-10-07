@@ -1,8 +1,3 @@
-# The public configuration tests use std::expected; other tests use C++20.
-set_source_files_properties(
-  test/cpp/config/test_context_config.cpp
-  PROPERTIES COMPILE_OPTIONS "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
-
 find_package(Catch2 3 REQUIRED CONFIG)
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -16,6 +11,29 @@ else()
   add_dependencies(sirius_unittest sirius_loadable_extension)
   link_extension_libraries(sirius_unittest "")
 endif()
+
+# Compile the public API test separately so engine tests remain C++20.
+add_library(sirius_context_config_test OBJECT
+            test/cpp/config/test_context_config.cpp)
+target_compile_features(sirius_context_config_test PRIVATE cxx_std_23)
+target_compile_definitions(sirius_context_config_test
+                           PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(sirius_context_config_test PROPERTIES CXX_SCAN_FOR_MODULES
+                                                            OFF)
+target_include_directories(
+  sirius_context_config_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(sirius_context_config_test PRIVATE ${sirius_test_library}
+                                                         Catch2::Catch2)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_context_config_test
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_context_config_test BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest
+               PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)

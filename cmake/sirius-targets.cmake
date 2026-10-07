@@ -1,9 +1,9 @@
-# Only the public configuration implementation needs std::expected. Keep engine
-# sources at C++20 for dependency headers that do not compile as C++23 with
-# Clang.
-set_source_files_properties(
-  src/context_config.cpp PROPERTIES COMPILE_OPTIONS
-                                    "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
+# Keep the public configuration implementation's C++23 requirement local.
+add_library(sirius_context_config OBJECT src/context_config.cpp)
+target_compile_features(sirius_context_config PRIVATE cxx_std_23)
+set_target_properties(
+  sirius_context_config PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                   CXX_VISIBILITY_PRESET hidden)
 
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
@@ -27,7 +27,8 @@ foreach(_target sirius_core sirius_shared sirius_extension
   if(NOT TARGET ${_target})
     continue()
   endif()
-  target_sources(${_target} PRIVATE src/planner/connector_registry.cpp)
+  target_sources(${_target} PRIVATE src/planner/connector_registry.cpp
+                                    $<TARGET_OBJECTS:sirius_context_config>)
   set_target_properties(${_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
@@ -106,8 +107,8 @@ if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
 
-foreach(_target sirius_objects sirius_core sirius_extension
-                sirius_loadable_extension sirius_shared)
+foreach(_target sirius_objects sirius_context_config sirius_core
+                sirius_extension sirius_loadable_extension sirius_shared)
   if(NOT TARGET ${_target})
     continue()
   endif()
@@ -116,16 +117,19 @@ foreach(_target sirius_objects sirius_core sirius_extension
                                             "sirius_loadable_extension")
     set(_link_scope "")
   endif()
-  set_target_properties(
-    ${_target}
-    PROPERTIES CXX_SCAN_FOR_MODULES OFF
-               CXX_STANDARD 20
-               CXX_STANDARD_REQUIRED ON
-               CUDA_STANDARD 20
-               CUDA_STANDARD_REQUIRED ON
-               CUDA_SEPARABLE_COMPILATION ON)
-  if(NOT _target STREQUAL "sirius_objects")
-    set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+  if(NOT _target STREQUAL "sirius_context_config")
+    set_target_properties(
+      ${_target}
+      PROPERTIES CXX_STANDARD 20
+                 CXX_STANDARD_REQUIRED ON
+                 CUDA_STANDARD 20
+                 CUDA_STANDARD_REQUIRED ON
+                 CUDA_SEPARABLE_COMPILATION ON)
+    if(NOT _target STREQUAL "sirius_objects")
+      set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                  ON)
+    endif()
   endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
