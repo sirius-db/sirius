@@ -829,17 +829,59 @@ class rewriter {
     return copy;
   }
 
-  /// Picks how an exact join over a pinned corpus runs: brute force over the pinned rows, or every
-  /// cluster of its lists searched (the same answer, from fewer bytes and on tensor cores), by
-  /// access_path_cost on the estimated probe rows. With no lists it builds them first (kept for
-  /// later queries, like an index) when building and searching beats brute force, unless
-  /// SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice;
+  /// `SET vector_join_probes = p` makes a join that can go through cluster lists approximate, as
+  /// `ivfflat.probes` does in pgvector: each probe row searches its p nearest clusters. The lists
+  /// are those of the clustering `vector_join_clustering` names, when it is one of this column's,
+  /// or else lists that would answer exactly. With no such lists the setting does not apply.
+  bool use_approximate_lists(vector_join_request& req,
+                             duckdb::SiriusContext& ctx,
+                             const std::string& catalog,
+                             const std::string& schema,
+                             const std::string& table,
+                             const std::string& column,
+                             std::uint64_t rows)
+  {
+    duckdb::Value setting;
+    if (!_context.TryGetCurrentSetting("vector_join_probes", setting) || setting.IsNull()) {
+      return false;
+    }
+    auto const probes = setting.GetValue<std::int64_t>();
+    if (probes <= 0) { return false; }
+    bool const cosine = req.metric == "cosine";
+    auto const n_rows = static_cast<std::int64_t>(rows);
+    std::optional<exact_lists_choice> choice;
+    if (_context.TryGetCurrentSetting("vector_join_clustering", setting) && !setting.IsNull() &&
+        !setting.ToString().empty()) {
+      choice =
+        find_named_lists(ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
+    }
+    if (!choice) { choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows); }
+    if (!choice) { return false; }
+    req.search_mode = vector_join_search_mode::approx;
+    req.clustering  = choice->clustering;
+    req.n_probes    = std::min(probes, choice->n_clusters);
+    SIRIUS_LOG_INFO(
+      "[vector_join_rewrite] searching '{}' through {} of the {} clusters of '{}' "
+      "(vector_join_probes)",
+      table,
+      req.n_probes,
+      choice->n_clusters,
+      choice->clustering);
+    return true;
+  }
+
+  /// Picks how a join over a pinned corpus runs. Under vector_join_probes, approximately through
+  /// cluster lists (use_approximate_lists). Otherwise exactly: brute force over the pinned rows,
+  /// or every cluster of its lists searched (the same answer, from fewer bytes and on tensor
+  /// cores), by access_path_cost on the estimated probe rows. With no lists it builds them first
+  /// (kept for later queries, like an index) when building and searching beats brute force,
+  /// unless SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice;
   /// SIRIUS_VSS_REWRITE_LISTS=0 is brute.
-  bool use_exact_lists(vector_join_request& req,
-                       duckdb::TableCatalogEntry& table,
-                       const std::string& column,
-                       std::uint64_t rows,
-                       double probe_rows)
+  bool use_lists(vector_join_request& req,
+                 duckdb::TableCatalogEntry& table,
+                 const std::string& column,
+                 std::uint64_t rows,
+                 double probe_rows)
   {
     auto const* env = std::getenv("SIRIUS_VSS_REWRITE_LISTS");
     if (env != nullptr && std::strcmp(env, "0") == 0) { return false; }
@@ -850,8 +892,11 @@ class rewriter {
     if (!sirius_ctx) { return false; }
     auto const& catalog = table.ParentCatalog().GetName();
     auto const& schema  = table.ParentSchema().name;
-    bool const cosine   = req.metric == "cosine";
-    auto choice         = find_exact_lists(
+    if (use_approximate_lists(req, *sirius_ctx, catalog, schema, table.name, column, rows)) {
+      return true;
+    }
+    bool const cosine = req.metric == "cosine";
+    auto choice       = find_exact_lists(
       *sirius_ctx, catalog, schema, table.name, column, cosine, static_cast<std::int64_t>(rows));
     auto pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
       catalog, schema, table.name);
@@ -1577,11 +1622,11 @@ class rewriter {
               returned_names.push_back(rn[j]);
             }
             pinned = true;
-            use_exact_lists(req,
-                            *table,
-                            *name_of(corpus_vec),
-                            right_rows,
-                            static_cast<double>(probe->EstimateCardinality(_context)));
+            use_lists(req,
+                      *table,
+                      *name_of(corpus_vec),
+                      right_rows,
+                      static_cast<double>(probe->EstimateCardinality(_context)));
           } catch (std::exception& e) {
             SIRIUS_LOG_DEBUG("[vector_join_rewrite] top-k pinned corpus declined: {}", e.what());
           }
@@ -2403,7 +2448,7 @@ class rewriter {
     // A constant comparison the operator evaluates itself, masking the corpus before the search
     // (as for the table function's own pushdown); anything else filters the join's output, and so
     // does everything when the search goes through the lists, which take no corpus predicates.
-    bool const via_lists = use_exact_lists(
+    bool const via_lists = use_lists(
       get_ptr->bind_data->Cast<SiriusVectorJoinBindData>().req,
       *table,
       *vec_name,

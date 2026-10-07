@@ -4368,6 +4368,22 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                            // fallback policy into every freshly-created database).
     SetEnableDuckdbFallback);
 
+  // Read by the vector join's SQL rewrite (vss/vector_join_rewrite.cpp) when it plans a join.
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "vector_join_probes",
+                    "Clusters each probe row searches when a vector join written in SQL goes "
+                    "through cluster lists (0, the default: every cluster, an exact answer)",
+                    LogicalType::BIGINT,
+                    Value::BIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "vector_join_clustering",
+                    "Clustering whose lists vector_join_probes searches (empty: lists of the "
+                    "corpus column that would answer exactly)",
+                    LogicalType::VARCHAR,
+                    Value(""));
+
   // Keep internal policy and test hooks out of the normal duckdb_settings() surface. The
   // unittest harness opts in before constructing a database. Centralizing visibility here keeps
   // option registration from growing scattered environment checks.

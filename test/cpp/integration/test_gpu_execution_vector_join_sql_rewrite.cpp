@@ -459,6 +459,67 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "SET vector_join_probes makes a plain SQL join approximate through the lists",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_corpus','vec', name => 'sr_c', n_clusters => 8);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('sr_corpus','vec','sr_c');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      con.Query("RESET vector_join_probes;");
+      con.Query("RESET vector_join_clustering;");
+    }
+  } reset{*con};
+  // Ids are row positions, so the table function's answer reads as the plain SQL one does.
+  auto const topk_sql =
+    "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, array_distance(p.vec, c.vec) "
+    "AS d FROM sr_corpus c ORDER BY d LIMIT 7) n;";
+  auto const radius_sql =
+    "SELECT p.id, c.id FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9;";
+  auto const tvf = [](std::string const& args) {
+    return "sirius_knn_join('sr_probe','vec','sr_corpus','vec', search_mode => 'approx', "
+           "clustering => 'sr_c', n_probes => 2, " +
+           args + ")";
+  };
+  auto const topk_tvf =
+    sorted_rows(*con, "SELECT left_id, right_id, distance FROM " + tvf("k => 7") + ";");
+  auto const radius_tvf = sorted_rows(
+    *con, "SELECT left_id, right_id FROM " + tvf("join_mode => 'threshold', eps => 0.9") + ";");
+
+  run_ok("SET vector_join_probes = 2;");
+  for (auto const& [sql, expected] :
+       {std::pair{topk_sql, topk_tvf}, std::pair{radius_sql, radius_tvf}}) {
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto const got    = sorted_rows(*con, sql);
+    UNSCOPED_INFO("query: " << sql);
+    sirius::test::require_transparent_execution_delta(
+      before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
+    REQUIRE(rows_match(got, expected));
+  }
+  // Two of eight clusters drop some true neighbours, so the approximate answer is not DuckDB's.
+  con->Query("SET gpu_execution = false;");
+  auto const exact = sorted_rows(*con, topk_sql);
+  con->Query("SET gpu_execution = true;");
+  CHECK_FALSE(rows_match(topk_tvf, exact));
+
+  // Naming the clustering selects the same lists; a name that is not this column's is ignored.
+  run_ok("SET vector_join_clustering = 'sr_c';");
+  CHECK(rows_match(sorted_rows(*con, topk_sql), topk_tvf));
+  run_ok("SET vector_join_clustering = 'no_such_clustering';");
+  CHECK(rows_match(sorted_rows(*con, topk_sql), topk_tvf));
+
+  // Every cluster probed, or the setting back at 0, is the exact answer again.
+  run_ok("SET vector_join_probes = 8;");
+  require_gpu_matches_duckdb(*con, topk_sql);
+  run_ok("RESET vector_join_probes;");
+  require_gpu_matches_duckdb(*con, topk_sql);
+  require_gpu_matches_duckdb(*con, radius_sql);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {

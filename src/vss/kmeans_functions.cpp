@@ -345,6 +345,34 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
   return std::nullopt;
 }
 
+std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
+                                                   const std::string& clustering,
+                                                   const std::string& catalog,
+                                                   const std::string& schema,
+                                                   const std::string& table,
+                                                   const std::string& column,
+                                                   bool cosine,
+                                                   std::int64_t n_rows)
+{
+  auto const on_column = ctx.get_cuvs_index_cache().names_on_column(
+    catalog, schema, table, column, index_kind::kmeans_centroids);
+  if (std::find(on_column.begin(), on_column.end(), clustering) == on_column.end()) {
+    return std::nullopt;
+  }
+  auto const* lists = find_cluster_lists(ctx, clustering);
+  auto const entry  = find_clustering_entry(ctx, clustering);
+  if (lists == nullptr || entry == nullptr || lists->n_rows != n_rows ||
+      lists->unit_rows != cosine) {
+    return std::nullopt;
+  }
+  auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
+  return exact_lists_choice{clustering,
+                            entry->meta.n_lists,
+                            lists->encoding,
+                            lists->tier == cucascade::memory::Tier::GPU,
+                            clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample};
+}
+
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering)
 {
   ctx.get_cuvs_index_cache().erase(lists_key(clustering));

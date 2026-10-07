@@ -223,6 +223,18 @@ struct exact_lists_choice {
                                                                  bool cosine,
                                                                  std::int64_t n_rows);
 
+/// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
+/// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join
+/// searches approximately under `vector_join_clustering`, in any encoding. Nullopt otherwise.
+[[nodiscard]] std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
+                                                                 const std::string& clustering,
+                                                                 const std::string& catalog,
+                                                                 const std::string& schema,
+                                                                 const std::string& table,
+                                                                 const std::string& column,
+                                                                 bool cosine,
+                                                                 std::int64_t n_rows);
+
 /// Drop the lists built for @p clustering, if any; a re-fit makes them stale.
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering);
 
