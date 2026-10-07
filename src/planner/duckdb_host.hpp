@@ -24,9 +24,9 @@
 #include <memory>
 
 namespace sirius::planner::detail {
-// On the Linux Itanium C++ ABI, Catalog's first virtual slot is its destructor.
-// DuckCatalog defines that destructor out of line in DuckDB. Unlike RTTI and
-// vtables, its code is not subject to executable copy relocations.
+// Relies on the Linux Itanium C++ ABI, Catalog declaring its destructor as its
+// first virtual member, and DuckCatalog defining it out of line. Recheck when
+// upgrading DuckDB. Unlike RTTI and vtables, code is not subject to copy relocations.
 inline void const* host_code_address(duckdb::Catalog const& catalog)
 {
   void const* vtable{};
