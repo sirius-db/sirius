@@ -59,7 +59,7 @@ class scoped_dispatcher {
 
   // @brief Non-blocking. Always returns immediately. Overflow goes to the
   // dispatcher-local pending queue (unbounded by contract).
-  // After request_stop(), enqueue is a silent no-op.
+  // After request_stop() or a pool submission failure, enqueue is a silent no-op.
   void enqueue(scoped_dispatcher_task auto&& f)
   {
     auto task = wrap(std::forward<decltype(f)>(f));
@@ -85,7 +85,7 @@ class scoped_dispatcher {
 
     std::unique_lock lk(mu_);
     bool ok = cv_slot_.wait(lk, stop_.get_token(), [this] { return inflight_ < max_inflight_; });
-    if (!ok) return false;  // stop requested
+    if (!ok || stop_.stop_requested()) return false;
 
     ++inflight_;
     lk.unlock();
@@ -95,14 +95,28 @@ class scoped_dispatcher {
 
   void request_stop()
   {
-    std::deque<task_t> discarded;
     {
       std::lock_guard lk(mu_);
-      stop_.request_stop();
-      discarded.swap(pending_);
-      if (inflight_ == 0) { cv_done_.notify_all(); }
+      // Keep wait_for_all() blocked until callbacks and discarded captures have retired,
+      // including when another caller is stopping the dispatcher concurrently.
+      ++inflight_;
     }
-    // Captures can release leases and invoke callbacks. Destroy outside mu_.
+    // Stop callbacks may reenter the dispatcher, so request cancellation outside mu_.
+    stop_.request_stop();
+    for (;;) {
+      task_t discarded;
+      {
+        std::lock_guard lk(mu_);
+        if (pending_.empty()) {
+          release_slot_locked();
+          return;
+        }
+        discarded = std::move(pending_.front());
+        pending_.pop_front();
+      }
+      // Destroy outside mu_. Moving one callable at a time avoids allocating a temporary
+      // container, so this cleanup is also usable after an allocation failure in submit().
+    }
   }
 
   void wait_for_all()
@@ -173,12 +187,18 @@ class scoped_dispatcher {
         task = std::move(pending_.front());
         pending_.pop_front();
       } else {
-        --inflight_;
-        cv_slot_.notify_one();
-        if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
+        release_slot_locked();
         return;
       }
     }
+  }
+
+  // Caller holds mu_. Used by workers, cancellation cleanup and failed submissions.
+  void release_slot_locked()
+  {
+    --inflight_;
+    cv_slot_.notify_one();
+    if (inflight_ == 0 && pending_.empty()) { cv_done_.notify_all(); }
   }
 
   void submit(task_t task)
@@ -186,9 +206,11 @@ class scoped_dispatcher {
     try {
       pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); });
     } catch (...) {
-      // Submission failed before a worker acquired the slot. Settle it, including
-      // any concurrently queued tasks, before propagating to the query producer.
-      run({});
+      // No worker owns this slot. Cancel pending work without executing user tasks on the
+      // producer thread, then release the failed slot and propagate the original exception.
+      request_stop();
+      std::lock_guard lk(mu_);
+      release_slot_locked();
       throw;
     }
   }
@@ -200,7 +222,7 @@ class scoped_dispatcher {
   std::condition_variable cv_done_;      // drained signal; not stop-aware
   std::condition_variable_any cv_slot_;  // slot-open signal; stop-aware via wait(token, pred)
   std::deque<task_t> pending_;
-  std::size_t inflight_ = 0;
+  std::size_t inflight_ = 0;  // Worker slots plus active cancellation cleanup calls.
   std::stop_source stop_;
 };
 
