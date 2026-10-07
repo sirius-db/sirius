@@ -26,3 +26,7 @@
 [submodule "starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc
+[submodule "experimental/doris/doris"]
+	path = experimental/doris/doris
+	url = https://github.com/apache/doris
+	shallow = true

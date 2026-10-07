@@ -898,7 +898,7 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
   scan_operator_input foreign_input(std::make_unique<certificate_test_split>(72));
   auto const before = observer.get_transparent_execution_stats();
 
-  REQUIRE_THROWS_WITH(scan.execute(foreign_input, rmm::cuda_stream_view{}),
+  REQUIRE_THROWS_WITH(scan.execute(foreign_input, ::cuda::stream_ref{}),
                       Catch::Matchers::ContainsSubstring("contract"));
   auto const after = observer.get_transparent_execution_stats();
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);

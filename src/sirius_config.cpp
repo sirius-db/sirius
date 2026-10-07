@@ -663,52 +663,32 @@ operator_params operator_defaults_for(
 
 // ================ sirius_config ================= //
 
-sirius_config::sirius_config()
-{
-  cucascade::memory::topology_discovery discovery;
-  // Ask cucascade to populate per-GPU runtime attributes (e.g. hw_decomp) alongside the passive
-  // NVML/sysfs topology so downstream consumers (SiriusContext hw-decompression gating) can read
-  // them off the discovered topology instead of re-querying the CUDA driver on their own.
-  if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
-                         /*with_runtime_attributes=*/true)) {
-    _hw_topology = discovery.get_topology();
-  }
-}
+struct sirius_config::hardware_config {
+  topology topo;
+  gpu_mem_config gpu;
+  host_mem_config host;
+  disk_mem_config disk;
+  bool using_configurator         = true;
+  bool use_effective_gpu_capacity = false;
+  std::optional<YAML::Node> operator_node;
+  std::filesystem::path source_path;
+};
+
+sirius_config::sirius_config() : _hardware_config(std::make_shared<hardware_config>()) {}
 
 void sirius_config::apply_defaults()
 {
-  // Run the configurator with default values to populate memory space configs
-  topology topo;
-  gpu_mem_config gpu_cfg;
-  host_mem_config host_cfg;
-  disk_mem_config disk_cfg;
-
-  cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(
-    resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
-  gpu_cfg.setup_configurator(builder);
-  host_cfg.setup_configurator(builder);
-  disk_cfg.setup_configurator(builder);
-  _memory_space_configs = builder.build(_hw_topology);
-  _operator_params      = operator_params{};
-
-  finalize_derived_config();
-}
-
-telemetry_config sirius_config::read_telemetry_config(
-  const std::filesystem::path& config_path) noexcept
-{
-  try {
-    auto const root = YAML::LoadFile(config_path.string());
-    telemetry_config telemetry;
-    if (auto const node = root["sirius"]["telemetry"]) { from_yaml(node, telemetry); }
-    return telemetry;
-  } catch (...) {
-    return {};
-  }
+  _hardware_config = std::make_shared<hardware_config>();
+  resolve_hardware();
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
+{
+  parse_from_file(config_path);
+  resolve_hardware();
+}
+
+void sirius_config::parse_from_file(const std::filesystem::path& config_path)
 {
   try {
     YAML::Node root;
@@ -813,21 +793,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
               disk_space_configs.end(),
               std::back_inserter(_memory_space_configs));
 
-    bool using_configurator = _memory_space_configs.empty();
-    if (using_configurator) {
-      cucascade::memory::reservation_manager_configurator builder;
-      if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
-        builder.set_number_of_gpus(
-          resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
-      } else {
-        const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
-        builder.set_gpu_ids(gpu_ids);
-      }
-      gpu_cfg.setup_configurator(builder);
-      host_cfg.setup_configurator(builder);
-      disk_cfg.setup_configurator(builder);
-      _memory_space_configs = builder.build(_hw_topology);
-    }
+    bool const using_configurator = _memory_space_configs.empty();
 
     bool const explicit_low_level_gpu_capacity =
       !gpu_space_configs.empty() && std::ranges::all_of(gpu_space_configs, [](auto const& gpu) {
@@ -835,10 +801,21 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       });
     bool const use_effective_gpu_capacity =
       using_configurator ? explicit_high_level_gpu_capacity : explicit_low_level_gpu_capacity;
-    auto resolved_operator_params =
-      operator_defaults_for(_memory_space_configs, use_effective_gpu_capacity);
-    if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
-    _operator_params = std::move(resolved_operator_params);
+    // Validate overrides before runtime startup installs the process-global hook. Keep
+    // the parsed node so explicit values can be applied after capacity-derived defaults.
+    auto parsed_operator_params = operator_params{};
+    if (operator_node) { sirius::from_yaml(*operator_node, parsed_operator_params); }
+    _operator_params = std::move(parsed_operator_params);
+    _hardware_config = std::make_shared<hardware_config>(hardware_config{
+      .topo                       = std::move(topo),
+      .gpu                        = std::move(gpu_cfg),
+      .host                       = std::move(host_cfg),
+      .disk                       = std::move(disk_cfg),
+      .using_configurator         = using_configurator,
+      .use_effective_gpu_capacity = use_effective_gpu_capacity,
+      .operator_node              = std::move(operator_node),
+      .source_path                = config_path,
+    });
 
     finalize_derived_config();
 
@@ -846,6 +823,50 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
   }
+}
+
+void sirius_config::resolve_hardware()
+{
+  if (!_hardware_config) { return; }
+  auto const& pending = *_hardware_config;
+  try {
+    // Discovery now emits libcucascade NVTX, including its first domain declaration.
+    // Runtime callers must create Quent before reaching this point.
+    cucascade::memory::topology_discovery discovery;
+    if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                           /*with_runtime_attributes=*/true)) {
+      _hw_topology = discovery.get_topology();
+    }
+
+    if (pending.using_configurator) {
+      cucascade::memory::reservation_manager_configurator builder;
+      if (std::holds_alternative<size_t>(pending.topo.num_gpus_or_gpu_ids)) {
+        builder.set_number_of_gpus(
+          resolve_num_gpus(std::get<size_t>(pending.topo.num_gpus_or_gpu_ids), _hw_topology));
+      } else {
+        builder.set_gpu_ids(std::get<std::vector<int>>(pending.topo.num_gpus_or_gpu_ids));
+      }
+      pending.gpu.setup_configurator(builder);
+      pending.host.setup_configurator(builder);
+      pending.disk.setup_configurator(builder);
+      _memory_space_configs = builder.build(_hw_topology);
+    }
+
+    auto resolved_operator_params =
+      operator_defaults_for(_memory_space_configs, pending.use_effective_gpu_capacity);
+    if (pending.operator_node) {
+      sirius::from_yaml(*pending.operator_node, resolved_operator_params);
+    }
+    _operator_params = std::move(resolved_operator_params);
+    finalize_derived_config();
+  } catch (const std::exception& e) {
+    if (!pending.source_path.empty()) {
+      throw std::runtime_error("Failed to load config from " + pending.source_path.string() + ": " +
+                               e.what());
+    }
+    throw;
+  }
+  _hardware_config.reset();
 }
 
 void sirius_config::finalize_derived_config()

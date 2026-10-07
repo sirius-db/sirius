@@ -26,6 +26,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace sirius {
@@ -279,17 +280,21 @@ struct compression_config {
 };
 
 struct sirius_config {
+  /// Construction prepares defaults without emitting NVTX. Runtime startup must install
+  /// Quent before resolving the hardware-dependent memory and operator settings.
   sirius_config();
   ~sirius_config() = default;
 
+  /// Parse and resolve immediately, for standalone configuration consumers.
   void load_from_file(const std::filesystem::path& config_path);
   void apply_defaults();
 
-  /// Read only `sirius.telemetry` from @p config_path, without the hardware discovery a
-  /// sirius_config performs (which makes NVTX calls). Returns defaults when the file cannot
-  /// be read or parsed; load_from_file reports those errors.
-  [[nodiscard]] static telemetry_config read_telemetry_config(
-    const std::filesystem::path& config_path) noexcept;
+  /// Validate YAML without topology discovery. Runtime entry points use this before
+  /// creating the configured Quent context, then call resolve_hardware().
+  void parse_from_file(const std::filesystem::path& config_path);
+  /// Discover topology and resolve memory capacities/operator defaults once. Copies of
+  /// a parsed config resolve independently; copies of a resolved config do no more work.
+  void resolve_hardware();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
@@ -350,11 +355,13 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  struct hardware_config;
+
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
-  /// override, in that order. Called from the end of both @ref load_from_file
-  /// and @ref apply_defaults so a missing config file derives the same values
-  /// an empty one does; each step is idempotent.
+  /// override, in that order. Called after parsing and hardware resolution so a
+  /// missing config file derives the same values an empty one does; each step is
+  /// idempotent.
   void finalize_derived_config();
 
   /// When @c _memory_space_configs contains more than one GPU memory space,
@@ -371,6 +378,7 @@ struct sirius_config {
   void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
+  std::shared_ptr<const hardware_config> _hardware_config;
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;

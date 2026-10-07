@@ -330,9 +330,7 @@ When passed `--pinning-mode per-query`, the Sirius engine wraps each query block
 
 The per-query column-set is sourced from `tpch_pin_columns.py` (must be a superset of every column the query references, otherwise the scan falls through to disk). The pin path is a glob whose `FileSystem::GlobFiles` expansion must equal the file list of the corresponding `CREATE VIEW … read_parquet([…])` — otherwise `sirius_scan_manager::create_provider_for` will not match and the cache is silently bypassed.
 
-```bash
-echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
-```
+The OS page cache drop in `performance_test.py` uses `posix_fadvise(DONTNEED)` on the dataset files, so no sudo is needed. (The `run_tpch_*.sh` scripts still use `sudo tee /proc/sys/vm/drop_caches`.)
 
 Output layout (under `--output` root, default `test/tpch_performance/output/`):
 
@@ -756,10 +754,7 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
 - **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
-- **Cold-run benchmarking**: pass `--profile cold` to `performance_test.py` to drop the OS filesystem cache and reset Sirius's prefetching cache before every run. Requires one-time passwordless sudo setup:
-  ```bash
-  echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
-  ```
+- **Cold-run benchmarking**: pass `--profile cold` to `performance_test.py` to drop the OS filesystem cache and reset Sirius's prefetching cache before every run. The page cache is evicted per dataset file with `posix_fadvise(DONTNEED)`; no sudo needed.
 
 ## Parquet Format Notes
 
