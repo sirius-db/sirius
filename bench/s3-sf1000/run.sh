@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
-# TPC-H SF1000 (later SF3000) straight from S3, no pinning: every query scans
-# its inputs over the REST backend, so scan throughput vs the 100 Gbit/s NIC
-# (~12.5 GB/s) is directly visible. Run from the repo root:
+# One TPC-H harness run with a rendered Sirius config. By default the inputs come
+# straight from S3 with no pinning, so every query scans over the REST backend and
+# scan throughput against the NIC (~12.5 GB/s for 100 Gbit/s) is directly visible.
+# Run from the repo root:
 #
-#   bash bench/s3-sf1000/run.sh                          # 1 MiB host blocks, baseline
-#   HOST_BLOCK_SIZE=4194304 NAME=blk4m bash bench/s3-sf1000/run.sh
+#   bash bench/s3-sf1000/run.sh                                   # SF1000 from S3
 #   SPILL_COMPRESSION=1 NAME=spillcomp bash bench/s3-sf1000/run.sh
+#   SF=3000 QUERIES=6 bash bench/s3-sf1000/run.sh
 #
-# All render-config.sh knobs pass through (thread counts, reactors, batch size).
-# Needs a live `aws sso login`: the config is re-rendered with fresh
-# credentials on every invocation, and a run must finish before they expire.
+# Local dataset with pinned input tables (the earlier RTX PRO 6000 setup; see
+# docs/compression/spill-compression-handoff.md for that box's settings):
+#
+#   DATA=/mnt/datasets/tpch/sf1000 PIN=gpu PIN_COMPRESSION=1 bash bench/s3-sf1000/run.sh
+#   DATA=... PIN=mixed PIN_HOST_TABLES="PART CUSTOMER" bash bench/s3-sf1000/run.sh
+#
+# Knobs here (env): SF, DATA, QUERIES, ITERS, NAME,
+#   PIN=none|gpu|host|mixed      input-table pinning; S3 inputs cannot be pinned
+#   PIN_HOST_TABLES="..."        PIN=mixed: tables pinned to host, rest to GPU
+#   PIN_COMPRESSION=1            compress pinned tables with the offline plans
+#   FUSED_SCAN_FILTER=1          experimental fused filter in the compressed-scan decode
+#   EXPR_EVAL=ast_jit            cuDF JIT expression evaluator instead of the AST walker
+# All render-config.sh knobs pass through. S3 inputs need a live `aws sso login`:
+# the config is re-rendered with fresh credentials on every invocation.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -19,10 +31,25 @@ SF="${SF:-1000}"
 DATA="${DATA:-s3://sirius-s3-test/datasets/tpch_sf$SF/}"
 QUERIES="${QUERIES:-1-22}"
 ITERS="${ITERS:-2}"
+PIN="${PIN:-none}"
 export NAME="${NAME:-baseline}"
+export SPILL_DIR="${SPILL_DIR:-/mnt/nvme/sirius_spill}"
 
-mountpoint -q /mnt/nvme || { echo "ERROR: /mnt/nvme not mounted; run setup-nvme-scratch.sh"; exit 1; }
-mkdir -p /mnt/nvme/sirius_spill
+case "$DATA" in
+  s3://*)
+    export NEED_S3=1
+    # pin_table globs local files; an s3:// input cannot be pinned.
+    [ "$PIN" = none ] || { echo "ERROR: PIN=$PIN needs a local DATA path"; exit 1; } ;;
+  *)
+    export NEED_S3=0
+    [ -d "$DATA" ] || { echo "ERROR: dataset not found at $DATA"; exit 1; } ;;
+esac
+
+case "$SPILL_DIR" in
+  /mnt/nvme/*) mountpoint -q /mnt/nvme ||
+                 { echo "ERROR: /mnt/nvme not mounted; run setup-nvme-scratch.sh"; exit 1; } ;;
+esac
+mkdir -p "$SPILL_DIR"
 
 CFG=$(bash "$HERE/render-config.sh")
 export SIRIUS_CONFIG_FILE="$CFG"
@@ -33,15 +60,40 @@ export SIRIUS_LOG_LEVEL="${SIRIUS_LOG_LEVEL:-debug}"
 # Per-query REST reactor counters (bytes, requests, fused reads) to stderr at
 # query end -- the scan-throughput evidence for NIC saturation.
 export SIRIUS_IO_PROFILE=1
-# No CPU replay on a GPU OOM: it would not be a Sirius measurement, and DuckDB
-# has only the ~20 GB the pinned host tier leaves.
-export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET enable_duckdb_fallback = false}"
+# No CPU replay on a GPU OOM: it would not be a Sirius measurement, it is not
+# supported for S3 inputs anyway, and DuckDB has only the host memory the pinned
+# tier leaves (a CPU q18 at SF1000 once OOM-killed a 62 GB box this way).
+PRE_SQL="${SIRIUS_PRE_SQL:-SET enable_duckdb_fallback = false}"
+if [ -n "${EXPR_EVAL:-}" ]; then
+  PRE_SQL="SET expression_evaluator_strategy = '$EXPR_EVAL'; $PRE_SQL"
+fi
+export SIRIUS_PRE_SQL="$PRE_SQL"
 # Spread each read over every REST reactor rather than the historical 2: with 2,
 # extra reactors add no capacity to any one read (see templated_ioctx.hpp).
 export SIRIUS_DISPATCH_FANOUT="${SIRIUS_DISPATCH_FANOUT:-all}"
+[ "${FUSED_SCAN_FILTER:-0}" = 1 ] && export SIRIUS_EXP_FUSED_SCAN_FILTER=1
+
+PIN_ARGS=(--pin none)
+if [ "$PIN" != none ]; then
+  HARNESS_PIN="$PIN"
+  if [ "$PIN" = mixed ]; then
+    # Per-table tiers; the harness pin flag only has to name some tier.
+    HARNESS_PIN=gpu
+    for t in LINEITEM ORDERS PART CUSTOMER SUPPLIER NATION REGION PARTSUPP; do
+      case " ${PIN_HOST_TABLES:-} " in *" $t "*) tier=host ;; *) tier=gpu ;; esac
+      export "SIRIUS_PIN_TIER_$t=$tier"
+    done
+  fi
+  PIN_ARGS=(--pin "$HARNESS_PIN")
+  if [ "${PIN_COMPRESSION:-0}" = 1 ]; then
+    PIN_ARGS+=(--pin-compression --compression-plan-dir
+               "${PLAN_DIR:-$REPO/src/compression/simpatico_codegen/plans/tpch_sf1000}")
+  fi
+fi
 
 echo "data      : $DATA"
 echo "config    : $CFG"
+echo "pin       : $PIN${PIN_HOST_TABLES:+ (host: $PIN_HOST_TABLES)}"
 echo "run name  : sf${SF}_$NAME  (queries $QUERIES, $ITERS iterations)"
 
 cd "$REPO"
@@ -68,7 +120,7 @@ trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 
 pixi run python test/tpch_performance/performance_test.py \
   --input "$DATA" --scale-factor "$SF" \
-  --iterations "$ITERS" --engine gpu --pin none \
+  --iterations "$ITERS" --engine gpu "${PIN_ARGS[@]}" \
   --queries "$QUERIES" --name "sf${SF}_$NAME"
 
 echo "NIC samples: $NICLOG"

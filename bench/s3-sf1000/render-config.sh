@@ -8,8 +8,12 @@
 # They expire with the SSO session, so render right before each run. The output
 # lives outside the repo, mode 0600, and the keys are never echoed.
 #
-# Knobs (env, with defaults):
-#   AWS_PROFILE=joost-aws  S3_REGION=us-east-2
+# Knobs (env, with defaults; the defaults are the tuned values for the 32 GB
+# RTX PRO 4500 / 120 GB box -- see docs/compression/spill-compression-handoff.md
+# for the RTX PRO 6000 / 62 GB settings):
+#   AWS_PROFILE=joost-aws  S3_REGION=us-east-2   NEED_S3=1 (0: no credentials)
+#   GPU_USAGE_FRACTION=0.86  HOST_CAPACITY_BYTES=100000000000
+#   DISK_CAPACITY_BYTES=800000000000  SPILL_DIR=/mnt/nvme/sirius_spill
 #   HOST_BLOCK_SIZE=1048576            (pool_size is derived: 128 MiB per pool)
 #   SCAN_THREADS=16  PIPELINE_THREADS=16  REST_REACTORS=8  REST_MAX_CONNECTIONS=128
 #   (tuned on SF1000 q6 from S3, 2026-10-07: 9.1 s -> ~5 s)
@@ -45,6 +49,11 @@ CACHE_MAX_FRACTION="${CACHE_MAX_FRACTION:-0.2}"
 SPILL_COMPRESSION="${SPILL_COMPRESSION:-0}"
 DEVICE_POOL_BYTES="${DEVICE_POOL_BYTES:-3GiB}"
 NAME="${NAME:-default}"
+NEED_S3="${NEED_S3:-1}"
+GPU_USAGE_FRACTION="${GPU_USAGE_FRACTION:-0.86}"
+HOST_CAPACITY_BYTES="${HOST_CAPACITY_BYTES:-100000000000}"
+DISK_CAPACITY_BYTES="${DISK_CAPACITY_BYTES:-800000000000}"
+SPILL_DIR="${SPILL_DIR:-/mnt/nvme/sirius_spill}"
 
 POOL_BYTES=$((128 * 1024 * 1024))
 (( POOL_BYTES % HOST_BLOCK_SIZE == 0 )) || { echo "HOST_BLOCK_SIZE must divide 128 MiB" >&2; exit 1; }
@@ -86,7 +95,10 @@ fi
 # Credentials straight from the CLI into the file, via python so nothing lands in
 # argv or the terminal.
 umask 077
-creds_json=$(aws configure export-credentials --profile "$AWS_PROFILE" --format process)
+creds_json='{}'
+if [ "$NEED_S3" = 1 ]; then
+  creds_json=$(aws configure export-credentials --profile "$AWS_PROFILE" --format process)
+fi
 
 python3 - "$HERE/sirius-s3.yaml.in" "$OUT" <<PY
 import json, sys, os
@@ -105,20 +117,24 @@ sub = {
     "@HASH_BUILD@": "$HASH_BUILD",
     "@REST_UPKEEP_MS@": "$REST_UPKEEP_MS",
     "@HOST_INITIAL_POOLS@": "$HOST_INITIAL_POOLS",
+    "@GPU_USAGE_FRACTION@": "$GPU_USAGE_FRACTION",
+    "@HOST_CAPACITY_BYTES@": "$HOST_CAPACITY_BYTES",
+    "@DISK_CAPACITY_BYTES@": "$DISK_CAPACITY_BYTES",
+    "@SPILL_DIR@": "$SPILL_DIR",
     "@CACHE@": ("            cache:\n                mode: $CACHE_MODE\n                eviction: $CACHE_EVICTION\n                eviction_threshold_fraction: $CACHE_MAX_FRACTION" if "$CACHE_MODE" != "none" else "            # cache: none (no prefetching cache, no readahead)"),
 }
 for k, v in sub.items():
     s = s.replace(k, v)
 s = s.replace("@REST_EXTRA@\n", """$REST_EXTRA\n""" if """$REST_EXTRA""" else "")
 s = s.replace("@COMPRESSION@", """$COMPRESSION""")
-store = (
+store = "" if not c else (
     "            object_store:\n"
     "                endpoint: https://s3.$S3_REGION.amazonaws.com\n"
     "                region: $S3_REGION\n"
     f"                access_key: \"{c['AccessKeyId']}\"\n"
     f"                secret_key: \"{c['SecretAccessKey']}\"\n"
 )
-if c.get("SessionToken"):
+if c and c.get("SessionToken"):
     store += f"                session_token: \"{c['SessionToken']}\"\n"
 s = s.replace("@OBJECT_STORE@\n", store)
 import re
@@ -126,7 +142,7 @@ assert not re.search(r"@[A-Z_]+@", s), "unfilled placeholder"
 fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     f.write(s)
-exp = c.get("Expiration", "unknown")
-print(f"credentials expire {exp}", file=sys.stderr)
+if c:
+    print(f"credentials expire {c.get('Expiration', 'unknown')}", file=sys.stderr)
 PY
 echo "$OUT"
