@@ -17,15 +17,11 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
-#include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
-#include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
-#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_replicate.hpp"
 #include "op/sirius_physical_union.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -99,18 +95,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 
 namespace {
 
-//! The join a filtering set operation lowers to, and its SQL keyword for messages.
-struct filtering_set_operation {
-  duckdb::JoinType join_type;
-  std::string_view name;
-};
-
-filtering_set_operation filtering_set_operation_of(duckdb::LogicalOperatorType type)
+//! The SQL keyword of a filtering set operation, for messages.
+std::string_view set_operation_keyword(duckdb::LogicalOperatorType type)
 {
   switch (type) {
-    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return {duckdb::JoinType::ANTI, "EXCEPT"};
-    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-      return {duckdb::JoinType::SEMI, "INTERSECT"};
+    case duckdb::LogicalOperatorType::LOGICAL_EXCEPT: return "EXCEPT";
+    case duckdb::LogicalOperatorType::LOGICAL_INTERSECT: return "INTERSECT";
     default: throw duckdb::InternalException("Unrecognized filtering set operation type");
   }
 }
@@ -123,47 +113,6 @@ bool key_needs_collation(duckdb::ClientContext& context,
   duckdb::unique_ptr<duckdb::Expression> key =
     duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column);
   return duckdb::ExpressionBinder::PushCollation(context, key, type);
-}
-
-//! One `IS NOT DISTINCT FROM` condition per column, pairing column `i` of both inputs.
-duckdb::vector<duckdb::JoinCondition> null_safe_column_conditions(
-  duckdb::vector<duckdb::LogicalType> const& types)
-{
-  duckdb::vector<duckdb::JoinCondition> conditions;
-  conditions.reserve(types.size());
-  for (duckdb::idx_t i = 0; i < types.size(); ++i) {
-    duckdb::JoinCondition condition;
-    condition.left       = duckdb::make_uniq<duckdb::BoundReferenceExpression>(types[i], i);
-    condition.right      = duckdb::make_uniq<duckdb::BoundReferenceExpression>(types[i], i);
-    condition.comparison = duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
-    conditions.push_back(std::move(condition));
-  }
-  return conditions;
-}
-
-//! Refuses a planned input whose declared types differ from the set operation's output types.
-void require_input_types(sirius::op::sirius_physical_operator const& input,
-                         duckdb::idx_t input_index,
-                         duckdb::vector<sirius::logical_type> const& output_types,
-                         std::string const& name)
-{
-  if (input.types.size() != output_types.size()) {
-    throw duckdb::NotImplementedException("%s input %d is planned with %d columns, not %d",
-                                          name,
-                                          input_index,
-                                          static_cast<duckdb::idx_t>(input.types.size()),
-                                          static_cast<duckdb::idx_t>(output_types.size()));
-  }
-  for (duckdb::idx_t i = 0; i < output_types.size(); ++i) {
-    if (input.types[i] != output_types[i]) {
-      throw duckdb::NotImplementedException("%s input %d plans column %d as %s, not %s",
-                                            name,
-                                            input_index,
-                                            i,
-                                            input.types[i].to_string(),
-                                            output_types[i].to_string());
-    }
-  }
 }
 
 //! The types an ALL plan carries: per column, the type both planned inputs share, which must be
@@ -391,9 +340,13 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_set_operation_all(
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperation& op)
 {
-  auto const set_op = filtering_set_operation_of(op.type);
-  std::string const name =
-    op.setop_all ? std::string{set_op.name} + " ALL" : std::string{set_op.name};
+  auto const keyword = set_operation_keyword(op.type);
+  // The distinct forms need a DISTINCT above a semi / anti join; only the ALL forms lower here.
+  if (!op.setop_all) {
+    throw duckdb::NotImplementedException("%s (distinct) not supported on the GPU path",
+                                          std::string{keyword});
+  }
+  std::string const name = std::string{keyword} + " ALL";
 
   D_ASSERT(op.children.size() == 2);
   if (op.children.size() != 2) {
@@ -412,8 +365,7 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
     }
     // A group keeps one of its -0.0 / +0.0 rows; DuckDB's ALL forms return the input's own rows.
     auto const type_id = op.types[i].id();
-    if (op.setop_all &&
-        (type_id == duckdb::LogicalTypeId::FLOAT || type_id == duckdb::LogicalTypeId::DOUBLE)) {
+    if (type_id == duckdb::LogicalTypeId::FLOAT || type_id == duckdb::LogicalTypeId::DOUBLE) {
       throw duckdb::NotImplementedException(
         "%s on column %d (%s): floating-point keys not supported on the GPU path",
         name,
@@ -423,48 +375,15 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   }
 
   auto const op_params = current_operator_params(context);
-  if (op.setop_all) {
-    std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
-    // Each tag projection and the union read their input's planned `types`.
-    auto const key_types = reconcile_input_types(arms, op.types, name);
-    return plan_set_operation_all(
-      op.type,
-      std::move(arms),
-      key_types,
-      op.estimated_cardinality,
-      {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
-  }
-
-  auto const output_types = sirius::from_duckdb_vec(op.types);
-
-  auto conditions = sirius::wrap_join_conditions(null_safe_column_conditions(op.types));
-  if (!sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions,
-                                                                       set_op.join_type)) {
-    throw duckdb::NotImplementedException("%s keys not supported by the GPU hash join", name);
-  }
-
-  // Input 0 is the probe and output side, input 1 the build side.
-  auto left  = create_plan(*op.children[0]);
-  auto right = create_plan(*op.children[1]);
-  // The join and its wrappers read each input's declared `types`.
-  require_input_types(*left, 0, output_types, name);
-  require_input_types(*right, 1, output_types, name);
-
-  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
-    op,
-    std::move(left),
-    std::move(right),
-    std::move(conditions),
-    set_op.join_type,
-    duckdb::vector<std::size_t>{},
-    duckdb::vector<std::size_t>{},
-    duckdb::vector<sirius::logical_type>{},
+  std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
+  // The ALL plan is typed from these, so each arm must actually produce them.
+  auto const key_types = reconcile_input_types(arms, op.types, name);
+  return plan_set_operation_all(
+    op.type,
+    std::move(arms),
+    key_types,
     op.estimated_cardinality,
-    op_params.max_build_hash_table_bytes,
-    sirius::op::dynamic_filter_publish_plan{},
-    op_params.hash_partition_bytes,
-    op_params.max_broadcast_join_size,
-    nullptr);
+    {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
 }
 
 }  // namespace sirius::planner

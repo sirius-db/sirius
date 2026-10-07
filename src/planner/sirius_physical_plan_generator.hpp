@@ -201,8 +201,8 @@ class sirius_physical_plan_generator {
     duckdb::LogicalComparisonJoin& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
-  //! Lowers EXCEPT / INTERSECT to a null-safe ANTI / SEMI hash join over their two arms, and their
-  //! ALL forms to tag, UNION ALL, per-group tag sums, and `sirius_physical_replicate`.
+  //! Lowers EXCEPT ALL / INTERSECT ALL to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`; refuses the distinct forms.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
     duckdb::LogicalSetOperation& op);
 

@@ -26,8 +26,8 @@ namespace op {
 
 //! Physical `UNION ALL`: an N-ary, non-materializing fan-in. Bag union computes nothing, so this
 //! operator only routes batches and `execute` is the identity. Distinct `UNION`, `EXCEPT` and
-//! `INTERSECT` never reach it: the plan builder creates it only for a `UNION` whose `setop_all` is
-//! true.
+//! `INTERSECT` never reach it: the plan builder creates it for `UNION ALL` and for the tagged
+//! inputs of `EXCEPT ALL` / `INTERSECT ALL`.
 //!
 //! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a distinct
 //! `port_label(i)` port.
