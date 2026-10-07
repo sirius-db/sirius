@@ -54,7 +54,8 @@ struct admission_decision;
 }  // namespace sirius::scan_manager
 namespace sirius::io {
 class sirius_datasource;
-}
+class io_object_metadata;
+}  // namespace sirius::io
 
 namespace sirius::op::scan {
 class scan_info;
@@ -476,6 +477,8 @@ struct split_materializer_certificate {
 struct parquet_input_approval {
   std::size_t footer_bytes = 0;
   std::vector<std::size_t> row_groups;
+  std::shared_ptr<io::io_object_metadata const> metadata_owner;
+  std::string object_identity;
 };
 struct split_dependencies {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> footer;

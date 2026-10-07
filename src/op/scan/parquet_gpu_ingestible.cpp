@@ -1597,7 +1597,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       std::nullopt,
       _info->profiles,
       std::make_shared<parquet_input_approval const>(
-        parquet_input_approval{footer_len, std::move(retained)})}});
+        parquet_input_approval{footer_len,
+                               std::move(retained),
+                               resolved_metadata,
+                               out->datasource->get_io_object().identity_cache_key()})}});
 
   return out;
 }

@@ -18,9 +18,26 @@
 namespace sirius::io {
 class io_object_metadata {
  public:
-  virtual ~io_object_metadata() = default;
+  virtual ~io_object_metadata() { live_charge_.fetch_sub(charge_, std::memory_order_relaxed); }
+  size_t account_retention() const
+  {
+    std::call_once(accounted_, [this] {
+      charge_ = retained_bytes();
+      live_charge_.fetch_add(charge_, std::memory_order_relaxed);
+    });
+    return charge_;
+  }
+  static size_t live_retained_bytes() noexcept
+  {
+    return live_charge_.load(std::memory_order_relaxed);
+  }
   /// Zero means unaccounted: usable by the scan but not admitted to the cache.
   [[nodiscard]] virtual size_t retained_bytes() const noexcept { return 0; }
+
+ private:
+  mutable std::once_flag accounted_;
+  mutable size_t charge_ = 0;
+  inline static std::atomic<size_t> live_charge_{0};
 };
 
 namespace cache {
