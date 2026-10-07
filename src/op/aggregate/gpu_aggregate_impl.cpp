@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -28,6 +29,7 @@
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -36,6 +38,7 @@
 #include <algorithm>
 #include <new>
 #include <optional>
+#include <unordered_set>
 
 namespace sirius {
 namespace op {
@@ -56,21 +59,6 @@ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
                                std::to_string(static_cast<int>(kind)));
   }
 }
-
-namespace {
-
-/// The type a SUM over a column of type @p type is computed in: the next wider decimal type for
-/// DECIMAL32 and DECIMAL64, and nullopt for every other type.
-std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
-{
-  switch (type.id()) {
-    case cudf::type_id::DECIMAL32: return cudf::data_type(cudf::type_id::DECIMAL64, type.scale());
-    case cudf::type_id::DECIMAL64: return cudf::data_type(cudf::type_id::DECIMAL128, type.scale());
-    default: return std::nullopt;
-  }
-}
-
-}  // namespace
 
 std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
   const cucascade::read_only_data_batch& input,
@@ -300,10 +288,29 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
-  // A SUM over a DECIMAL32 or DECIMAL64 column is computed over the column widened to the next
-  // decimal type, so it cannot overflow the input width. It uses the key
-  // column index + widened_sum_key_offset, which keeps it in a request of its own.
+  // A SUM over a DECIMAL32 or DECIMAL64 column that could overflow the input width in this batch
+  // (see decimal_sums_needing_widening) is computed over the column widened to the next decimal
+  // type. It uses the key column index + widened_sum_key_offset, which keeps it in a request of
+  // its own. Every other decimal SUM runs at the input width and its result is widened below.
   auto const widened_sum_key_offset = input_table.num_columns();
+  std::unordered_set<int> widened_sum_cols;
+  {
+    std::vector<int> candidates;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      bool const is_struct = has_struct_col_indices && !aggregate_struct_col_indices[i].empty();
+      // Only SUM is gated: MIN, MAX and COUNT cannot overflow, and PRODUCT / SUM_OF_SQUARES are
+      // not reachable (get_local_aggregation rejects them).
+      if (is_struct || aggregates[i] != cudf::aggregation::Kind::SUM) { continue; }
+      auto const col_id = aggregate_idx[i];
+      if (widened_decimal_sum_type(input_table.column(col_id).type()) &&
+          std::find(candidates.begin(), candidates.end(), col_id) == candidates.end()) {
+        candidates.push_back(col_id);
+      }
+    }
+    if (!candidates.empty()) {
+      widened_sum_cols = decimal_sums_needing_widening(input_table, candidates, stream, mr);
+    }
+  }
   std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
   std::unordered_map<int, std::vector<size_t>> input_col_to_output_idx;
   std::vector<int> input_col_order;
@@ -316,7 +323,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     } else {
       aggregate_col_id = aggregate_idx[i];
       if (aggregate_kind == cudf::aggregation::Kind::SUM &&
-          widened_decimal_sum_type(input_table.column(aggregate_col_id).type())) {
+          widened_sum_cols.contains(aggregate_col_id)) {
         aggregate_col_id += widened_sum_key_offset;
       }
     }
@@ -419,6 +426,21 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                                                    cudf::data_type(cudf::type_id::INT64),
                                                    stream,
                                                    memory_space.get_default_allocator());
+      }
+    }
+
+    // A decimal SUM that ran at the input width is widened here, on the small per-group result, so
+    // that merge and exchange see the same wider type as before; only the per-row input widening
+    // is skipped. The batch was proven unable to overflow the input width, so this is exact.
+    if (aggregate_col_id >= 0 && aggregate_col_id < widened_sum_key_offset) {
+      auto const widened_type = widened_decimal_sum_type(requests[i].values.type());
+      for (size_t j = 0; widened_type && j < aggregation_result.results.size(); ++j) {
+        if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
+          aggregation_result.results[j] = cudf::cast(aggregation_result.results[j]->view(),
+                                                     *widened_type,
+                                                     stream,
+                                                     memory_space.get_default_allocator());
+        }
       }
     }
 

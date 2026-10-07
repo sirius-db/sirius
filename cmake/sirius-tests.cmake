@@ -33,7 +33,7 @@ target_include_directories(
 )
 
 target_link_libraries(sirius_unittest ${sirius_test_library} duckdb_static
-                      ZLIB::ZLIB Catch2::Catch2)
+                      ZLIB::ZLIB Catch2::Catch2 ${SIRIUS_CURL_TARGET})
 
 target_include_directories(
   sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
@@ -64,16 +64,6 @@ set_target_properties(
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 add_dependencies(sirius_unittest sirius_nvtx_startup)
 
-# S3 container harness: the testcontainers-native bridge plus libcurl for
-# host-side fixture upload (SigV4 signing comes from Sirius). Gated so
-# offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded
-# by SIRIUS_HAVE_TESTCONTAINERS.
-if(SIRIUS_BUILD_S3_TESTS)
-  target_link_libraries(sirius_unittest testcontainers_native
-                        ${SIRIUS_CURL_TARGET})
-  target_compile_definitions(sirius_unittest
-                             PRIVATE SIRIUS_HAVE_TESTCONTAINERS=1)
-endif()
 # DuckDB v1.5.0 unity builds emit strong symbols for static constexpr members
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE

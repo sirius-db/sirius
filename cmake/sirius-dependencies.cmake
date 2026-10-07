@@ -149,15 +149,6 @@ endif()
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
 add_subdirectory(rust/crates/telemetry/bridge)
 
-# Upstream testcontainers-native, fetched + patched at configure time (see
-# cmake/testcontainers_native.cmake), used by the S3 integration test harness to
-# start MinIO containers from the test binary. Builds a Go c-archive, so a Go
-# toolchain (provided by pixi) and network access on the first configure/build
-# are required — hence gated behind SIRIUS_BUILD_S3_TESTS.
-if(SIRIUS_BUILD_S3_TESTS AND (SIRIUS_BUILD_TESTS OR NOT PROJECT_IS_TOP_LEVEL))
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
-endif()
-
 find_package(kvikio REQUIRED CONFIG)
 
 # The legacy DuckDB parent enables only C/CXX.

@@ -17,7 +17,7 @@
 #include "sirius_extension.hpp"
 #include "utils/isolated_checkpoint_test.hpp"
 #include "utils/parquet_fixture_utils.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
@@ -145,7 +145,7 @@ struct s3_test_env {
 
 std::optional<s3_test_env> load_s3_test_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) { return std::nullopt; }
+  if (!sirius::test::ensure_s3_test_env()) { return std::nullopt; }
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -1292,11 +1292,11 @@ TEST_CASE(
   };
   auto const bytes_a = read_bytes(dir.file("a.parquet"));
   auto const bytes_b = read_bytes(dir.file("b.parquet"));
-  if (!sirius::test::put_s3_container_object("schema-drift/a.parquet", bytes_a)) {
-    SUCCEED("managed MinIO is required for the schema drift test");
+  if (!sirius::test::put_s3_test_object("schema-drift/a.parquet", bytes_a)) {
+    SUCCEED("managed SeaweedFS is required for the schema drift test");
     return;
   }
-  REQUIRE(sirius::test::put_s3_container_object("schema-drift/b.parquet", bytes_b));
+  REQUIRE(sirius::test::put_s3_test_object("schema-drift/b.parquet", bytes_b));
 
   auto result =
     fixture.con.Query("SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "schema-drift/*.parquet"));
@@ -2722,11 +2722,11 @@ TEST_CASE("Sirius S3 capture uses the fresh schema from a name-only rebind",
 
   auto const first_key  = "rebind/name-only-first.parquet";
   auto const second_key = "rebind/name-only-second.parquet";
-  if (!sirius::test::put_s3_container_object(first_key, read_binary_file(first_path))) {
-    SUCCEED("managed MinIO is required for the name-only rebind test");
+  if (!sirius::test::put_s3_test_object(first_key, read_binary_file(first_path))) {
+    SUCCEED("managed SeaweedFS is required for the name-only rebind test");
     return;
   }
-  REQUIRE(sirius::test::put_s3_container_object(second_key, read_binary_file(second_path)));
+  REQUIRE(sirius::test::put_s3_test_object(second_key, read_binary_file(second_path)));
 
   auto const first_uri  = s3_uri(env->bucket, first_key);
   auto const second_uri = s3_uri(env->bucket, second_key);

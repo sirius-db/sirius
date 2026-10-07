@@ -7,7 +7,7 @@
 
 #include "catch.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -53,7 +53,7 @@ struct s3_tpch_env {
 
 std::optional<s3_tpch_env> load_s3_tpch_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) return std::nullopt;
+  if (!sirius::test::ensure_s3_test_env()) return std::nullopt;
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
