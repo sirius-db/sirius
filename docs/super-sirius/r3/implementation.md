@@ -106,3 +106,16 @@ Host tests: metadata cache 6 cases / 32 assertions passed, including live-charge
 retention after eviction. A separate actual Parquet-record test verifies alias
 ownership, dynamic-container charge and final release. Syntax checks passed the
 read-view consumption and Parquet preparation translation units.
+
+## S4: Puffin parser separation
+
+Footer JSON/descriptor validation and deletion-vector CRC/Roaring decoding now
+consume memory spans independently of file access. The outer local reader still
+owns framing reads, bounded buffers and the charged allocator; public interfaces,
+validation ordering, limits and error messages are preserved. No remote transport
+or third-party change was introduced.
+
+The existing Puffin corpus passed: 18 cases / 159 assertions, including malformed
+inputs and charged-memory failure behavior. This executable was compiled from
+current production parser, ledger, preparation and failure-classification sources
+with the generated build flags; it does not rely on the stale baseline executable.
