@@ -454,7 +454,7 @@ sirius:
 |-----|------|---------|-------------|
 | `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
-| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Hard cap on the cache's resident bytes, as a fraction of the host tier. Allocations past it are refused (reads over those chunks succeed uncached) and the evictor starts once the cap is reached. `0` means uncapped. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
@@ -462,7 +462,7 @@ through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Siri
 pinned prefetching cache.
 
 `eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
-pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+pool reaches its `eviction_threshold_fraction` cap; `eviction: idle` drops each chunk as soon as
 it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
 than for reuse.
 

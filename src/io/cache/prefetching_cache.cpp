@@ -56,7 +56,16 @@ namespace sirius::io::cache {
 
 namespace {
 using size_terminal = exec::invocable<void(exec::try_t<std::size_t>&&) &&>;
+
+/// A chunk a request named but that holds no staging buffer -- never given one
+/// (the pool's cap refused it) or reclaimed since.  A demand read over it
+/// cannot populate the cache, so it is served uncached.
+[[nodiscard]] bool lacks_buffer(cached_chunk const* chunk) noexcept
+{
+  auto const s = chunk->state.get_state();
+  return s == chunk_state::empty || s == chunk_state::queued;
 }
+}  // namespace
 
 struct prefetching_cache::cached_copy_retirement {
   std::vector<cached_chunk*> pins;
@@ -517,10 +526,18 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   std::size_t n_chunks_needed = std::ranges::count_if(
     chunks, [](cached_chunk* c) { return c->state.get_state() == chunk_state::empty; });
 
+  // allocate_bulk enforces the pool's hard cap: a request that would take the
+  // cache's resident chunks past it is refused like an exhausted pool.  The
+  // request stays queued; a demand read over its chunks is then served through
+  // reactor-owned staging and left uncached, and the readahead backs off
+  // through its memory retry until disposal or eviction makes room.
   int numa_allocated = req.preferred_numa;
   auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
   if (buffers.size() != n_chunks_needed) {
-    auto const shortage = n_chunks_needed - buffers.size();
+    // Over the cap, free only what lets this request fit; otherwise the pool
+    // itself ran dry and the whole remainder is the shortfall.
+    auto const over_cap = _pool->chunks_over_cap(n_chunks_needed);
+    auto const shortage = over_cap != 0 ? over_cap : n_chunks_needed - buffers.size();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     if (!wait_for_eviction) {
       // Get reclamation moving without stalling the scan-input constructor.
@@ -700,11 +717,12 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
     std::ignore = _completion_poll.drain_all();
     await_inflight_prefetch(obj, requests, handle);
     std::vector<prepared_io_slice> prepared;
-    std::size_t logical_bytes = 0;
-    std::size_t n_hits        = 0;
-    std::size_t n_loads       = 0;
-    std::size_t n_misses      = 0;
-    auto admission            = acquire_inflight_io();
+    std::size_t logical_bytes          = 0;
+    std::size_t n_hits                 = 0;
+    std::size_t n_loads                = 0;
+    std::size_t n_misses               = 0;
+    std::size_t n_uncached_over_budget = 0;
+    auto admission                     = acquire_inflight_io();
     if (!admission) { throw std::runtime_error("prefetching_cache is shutting down"); }
     auto lifetime = std::make_shared<exec::completion_controller::slot>(std::move(admission));
 
@@ -777,6 +795,9 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
           continue;
         }
 
+        if (chunk != nullptr && _io_ctx->supports_vector_host_read() && lacks_buffer(chunk)) {
+          ++n_uncached_over_budget;
+        }
         prepared.emplace_back(needed, host_buffer{piece_dst});
         ++n_misses;
       }
@@ -815,6 +836,7 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
     _counters.hits.fetch_add(n_hits, std::memory_order_relaxed);
     _counters.h2d.fetch_add(n_loads, std::memory_order_relaxed);
     _counters.misses.fetch_add(n_misses, std::memory_order_relaxed);
+    _counters.uncached_over_budget.fetch_add(n_uncached_over_budget, std::memory_order_relaxed);
 
     if (has_backend) { return std::move(result_future); }
     return exec::make_semi_future<std::size_t>(logical_bytes);
@@ -862,11 +884,12 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
   std::vector<cached_chunk*> claimed;
   sirius::cuda::device_copy_batch cached_copies;
   std::vector<prepared_io_slice> prepared;
-  std::size_t logical_bytes = 0;
-  std::size_t reads         = 0;
-  std::size_t hits          = 0;
-  std::size_t loads         = 0;
-  std::size_t misses        = 0;
+  std::size_t logical_bytes        = 0;
+  std::size_t reads                = 0;
+  std::size_t hits                 = 0;
+  std::size_t loads                = 0;
+  std::size_t misses               = 0;
+  std::size_t uncached_over_budget = 0;
 
   std::shared_ptr<exec::completion_controller::slot> lifetime;
   std::shared_ptr<prepared_io_completion> completion;
@@ -941,6 +964,13 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
           continue;
         }
 
+        // No buffer to populate: either the chunk was never named, or the
+        // pool's hard cap refused it one.  The latter is still served -- through
+        // reactor-owned bounce staging released when the copy drains -- but is
+        // left uncached so the cache never grows past its budget on demand.
+        if (cache_while_reading && chunk != nullptr && lacks_buffer(chunk)) {
+          ++uncached_over_budget;
+        }
         prepared.emplace_back(needed, device_buffer{device_dst, stream, device_id.value()});
         ++misses;
       }
@@ -989,6 +1019,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
   _counters.hits.fetch_add(hits, std::memory_order_relaxed);
   _counters.h2d.fetch_add(loads, std::memory_order_relaxed);
   _counters.misses.fetch_add(misses, std::memory_order_relaxed);
+  _counters.uncached_over_budget.fetch_add(uncached_over_budget, std::memory_order_relaxed);
 
   if (has_backend) {
     auto io_future = _io_ctx->host_device_readv_async_io(obj, std::move(prepared));
@@ -1067,33 +1098,38 @@ std::string prefetching_cache::summary() const
 {
   // Global totals plus the deltas since the last refresh (the most recent
   // query cycle), reported separately.
-  uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
-  uint64_t const hits  = _counters.hits.load(std::memory_order_relaxed);
-  uint64_t const h2d   = _counters.h2d.load(std::memory_order_relaxed);
-  uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
-  uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
+  uint64_t const reads       = _counters.n_reads.load(std::memory_order_relaxed);
+  uint64_t const hits        = _counters.hits.load(std::memory_order_relaxed);
+  uint64_t const h2d         = _counters.h2d.load(std::memory_order_relaxed);
+  uint64_t const miss        = _counters.misses.load(std::memory_order_relaxed);
+  uint64_t const evict       = _counters.evictions.load(std::memory_order_relaxed);
+  uint64_t const over        = _counters.uncached_over_budget.load(std::memory_order_relaxed);
+  std::size_t const refusals = _pool ? _pool->cap_refusals() : 0;
 
   // What the pool holds right now, so a log line can be read against the host
-  // tier: chunks handed out and not yet reclaimed, against the eviction trigger.
+  // tier: chunks handed out and not yet reclaimed, against the hard cap.
   std::size_t const resident = _pool ? _pool->total_allocated_chunks() * _pool->chunk_size() : 0;
   std::size_t const budget   = _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
 
   return std::format(
     "prefetching_cache: "
-    "resident_bytes={} budget_bytes={} "
-    "global[reads={} hits={} h2d={} miss={} evictions={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
+    "resident_bytes={} budget_bytes={} cap_refusals={} "
+    "global[reads={} hits={} h2d={} miss={} uncached_over_budget={} evictions={}] "
+    "last_cycle[reads={} hits={} h2d={} miss={} uncached_over_budget={} evictions={}]",
     resident,
     budget,
+    refusals,
     reads,
     hits,
     h2d,
     miss,
+    over,
     evict,
     reads - _last_reported.n_reads,
     hits - _last_reported.hits,
     h2d - _last_reported.h2d,
     miss - _last_reported.misses,
+    over - _last_reported.uncached_over_budget,
     evict - _last_reported.evictions);
 }
 
@@ -1110,6 +1146,7 @@ void prefetching_cache::prepare_for_query() noexcept
     _counters.h2d.load(std::memory_order_relaxed),
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
+    _counters.uncached_over_budget.load(std::memory_order_relaxed),
   };
 }
 
@@ -1350,8 +1387,8 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
 
     // When disposing on idle we reclaim everything; otherwise we only evict
     // under memory pressure and stop once enough chunks are free again.  Memory
-    // pressure is scored as outstanding (handed-out) chunks against the pool's
-    // aggregate reserved capacity.
+    // pressure is scored as the pool's own outstanding (handed-out) chunks
+    // against its hard cap -- not system-wide host usage, which includes spills.
     bool const should_evict =
       _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
     if (!should_evict) {

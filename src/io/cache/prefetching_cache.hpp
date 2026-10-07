@@ -309,10 +309,11 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
-  /// Bytes the pool may hold for prefetching before the evictor starts
-  /// reclaiming: @c eviction_threshold_fraction of the host tier, chunk
-  /// aligned.  An eviction trigger here, not a cap; the readahead uses it as
-  /// its resident-byte bound so the two agree.  0 without a pool.
+  /// Hard cap on the cache's resident chunk bytes: @c eviction_threshold_fraction
+  /// of the host tier, chunk aligned.  Allocations past it are refused (a
+  /// demand read over a refused chunk is served uncached); the evictor fires
+  /// once no further chunk fits.  The readahead uses it as its resident-byte
+  /// bound so the two agree.  0 without a pool (or uncapped).
   [[nodiscard]] std::size_t max_prefetching_budget_bytes() const noexcept;
 
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
@@ -493,6 +494,10 @@ class prefetching_cache {
     std::atomic<uint64_t> h2d{0};        // chunks (re)loaded via host->device IO (mark_loading)
     std::atomic<uint64_t> misses{0};     // chunks read fresh (missing / not yet usable)
     std::atomic<uint64_t> evictions{0};  // chunks evicted back to the pool
+    // Missed chunks a request named but that held no buffer (the pool's hard
+    // cap refused it one), served through reactor staging and left uncached.
+    // A subset of `misses`.
+    std::atomic<uint64_t> uncached_over_budget{0};
   };
   struct counters_snapshot {
     uint64_t n_reads{0};
@@ -500,6 +505,7 @@ class prefetching_cache {
     uint64_t h2d{0};
     uint64_t misses{0};
     uint64_t evictions{0};
+    uint64_t uncached_over_budget{0};
   };
 
   counters _counters;

@@ -186,13 +186,16 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_topology()
 }
 
 struct cache_fixture {
-  cache_fixture()
+  /// @p eviction_threshold_fraction sizes the cache's hard cap on resident
+  /// chunk bytes as a fraction of the host tier.
+  explicit cache_fixture(double eviction_threshold_fraction = 0.8)
     : memory(initialize_memory_manager(1)), context(std::make_shared<controlled_context>(1, [] {
         return std::make_unique<controlled_reactor>();
       }))
   {
     sirius::io::cache::config config;
-    config.mode = sirius::io::cache::cache_mode::sirius;
+    config.mode                        = sirius::io::cache::cache_mode::sirius;
+    config.eviction_threshold_fraction = eviction_threshold_fraction;
     config.apply_mode();
     context->initialize_cache(*memory, config, single_gpu_topology());
     datasource = context->open_datasource("controlled://cache-read-arbitration");
@@ -423,4 +426,144 @@ TEST_CASE("a cache whose chunk size differs from the reactor staging block is re
   matched->initialize_cache(*memory, config, single_gpu_topology());
   CHECK(matched->cache() != nullptr);
   matched->shutdown_cache();
+}
+
+// ---------------------------------------------------------------------------
+// The budget is a hard cap on cache-resident bytes
+// ---------------------------------------------------------------------------
+//
+// eviction_threshold_fraction of the host tier bounds what the pool may hand
+// out.  An allocation that would cross it is refused like an exhausted pool;
+// the read over such a chunk still succeeds through reactor-owned staging but
+// leaves nothing cached.  0.0007 of the test host tier (3-4 GiB) is two 1 MiB
+// chunks, so a 4-chunk object can over-run the cap on its own.
+
+namespace {
+
+constexpr double two_chunk_cap = 0.0007;
+
+void fadvise_chunks(sirius::io::sirius_datasource& ds, std::size_t first, std::size_t n)
+{
+  std::array<cudf::io::text::byte_range_info, 1> ranges{cudf::io::text::byte_range_info{
+    static_cast<std::int64_t>(first * chunk_size), static_cast<std::int64_t>(n * chunk_size)}};
+  ds.fadvise(ranges, 0);
+}
+
+}  // namespace
+
+TEST_CASE("the cache cap is two chunks under the test fraction", "[cache][cache_cap]")
+{
+  cache_fixture fixture(two_chunk_cap);
+  auto* cache = fixture.context->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->chunk_size() == chunk_size);
+  CHECK(cache->max_prefetching_budget_bytes() == 2 * chunk_size);
+}
+
+TEST_CASE("a demand read under the cache cap populates a cache chunk", "[cache][cache_cap]")
+{
+  cache_fixture fixture(two_chunk_cap);
+  auto* cache = fixture.context->cache();
+  REQUIRE(cache->max_prefetching_budget_bytes() == 2 * chunk_size);
+  fixture.advise(chunk_size);
+  CHECK(cache->claimed_bytes() == chunk_size);
+
+  std::uint8_t destination{};
+  auto read = fixture.datasource->device_read_async(
+    chunk_size, read_size, &destination, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto load = fixture.context->reactor().take_next();
+  REQUIRE(load != nullptr);
+  // file -> cache chunk -> device: the slice fills the cache allocation.
+  CHECK(load->front().h_buffer.is_fragmented());
+  complete_success(*load);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+
+  INFO("cache: " << cache->summary());
+  CHECK(cache->claimed_bytes() == chunk_size);
+  CHECK(cache->summary().find("uncached_over_budget=0") != std::string::npos);
+}
+
+TEST_CASE("a demand read over the cache cap succeeds uncached", "[cache][cache_cap]")
+{
+  cache_fixture fixture(two_chunk_cap);
+  auto* cache       = fixture.context->cache();
+  auto const budget = cache->max_prefetching_budget_bytes();
+  REQUIRE(budget == 2 * chunk_size);
+
+  // A live request holds the whole cap.
+  auto filler = fixture.context->open_datasource("controlled://cache-cap-filler");
+  fadvise_chunks(*filler, 0, 2);
+  REQUIRE(filler->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  REQUIRE(cache->claimed_bytes() == budget);
+
+  // The demand-side preparation is refused rather than grown past the cap.
+  std::array<cudf::io::text::byte_range_info, 1> ranges{cudf::io::text::byte_range_info{
+    static_cast<std::int64_t>(chunk_size), static_cast<std::int64_t>(read_size)}};
+  fixture.datasource->fadvise(ranges, 0);
+  CHECK(fixture.datasource->prepare_prefetch(false) ==
+        sirius::io::prepare_result::allocation_failed);
+  CHECK(cache->claimed_bytes() <= budget);
+
+  std::uint8_t destination{};
+  auto read = fixture.datasource->device_read_async(
+    chunk_size, read_size, &destination, ::cuda::stream_ref{cudaStream_t{cudaStreamDefault}});
+  auto bounced = fixture.context->reactor().take_next();
+  REQUIRE(bounced != nullptr);
+  CHECK(bounced->front().needs_staging());
+  CHECK_FALSE(bounced->front().is_fragmented());
+  CHECK(bounced->front().has_device_request());
+  complete_success(*bounced);
+  REQUIRE(read.wait_for(2s) == std::future_status::ready);
+  CHECK(read.get() == read_size);
+
+  INFO("cache: " << cache->summary());
+  CHECK(cache->claimed_bytes() <= budget);
+  CHECK(cache->summary().find("uncached_over_budget=1") != std::string::npos);
+  CHECK(cache->summary().find("cap_refusals=0") == std::string::npos);
+}
+
+TEST_CASE("a prefetch allocation over the cache cap recovers after disposal",
+          "[cache][cache_cap][prepare]")
+{
+  cache_fixture fixture(two_chunk_cap);
+  auto* cache       = fixture.context->cache();
+  auto const budget = cache->max_prefetching_budget_bytes();
+  REQUIRE(budget == 2 * chunk_size);
+
+  {
+    auto filler = fixture.context->open_datasource("controlled://cache-cap-filler");
+    fadvise_chunks(*filler, 0, 2);
+    REQUIRE(filler->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  }  // disposed, but LRU keeps its chunks resident: the pool is still at the cap
+
+  REQUIRE(cache->claimed_bytes() == budget);
+  fadvise_chunks(*fixture.datasource, 2, 2);
+  CHECK(fixture.datasource->prepare_prefetch(false) ==
+        sirius::io::prepare_result::allocation_failed);
+  CHECK(cache->claimed_bytes() <= budget);
+
+  // The blocking retry waits for the eviction the refusal requested; the
+  // disposed request's chunks make room, and the cap holds afterwards.
+  CHECK(fixture.datasource->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
+  CHECK(cache->claimed_bytes() <= budget);
+}
+
+TEST_CASE("an empty cache admits one request larger than its cap", "[cache][cache_cap][prepare]")
+{
+  cache_fixture fixture(two_chunk_cap);
+  auto* cache = fixture.context->cache();
+  REQUIRE(cache->max_prefetching_budget_bytes() == 2 * chunk_size);
+  REQUIRE(cache->claimed_bytes() == 0);
+
+  // Four chunks against a two-chunk cap: refused, it would never run at all.
+  fadvise_chunks(*fixture.datasource, 0, 4);
+  CHECK(fixture.datasource->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  CHECK(cache->claimed_bytes() == 4 * chunk_size);
+
+  // ...but it runs alone: nothing else is admitted while it is resident.
+  auto other = fixture.context->open_datasource("controlled://cache-cap-other");
+  fadvise_chunks(*other, 0, 1);
+  CHECK(other->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed);
+  CHECK(cache->claimed_bytes() == 4 * chunk_size);
 }

@@ -110,6 +110,12 @@ class buffer_pool {
   /// Bulk-allocate up to @p n chunks, appending pointers to @p out.
   /// Returns the number actually allocated (may be < n if the pool is
   /// exhausted and cannot grow).
+  ///
+  /// Both allocators enforce the hard cap: a request that would take the
+  /// pool's resident chunks past @ref max_allowed_budget_for_prefetching is
+  /// refused outright (empty result) rather than served, and counted in
+  /// @ref cap_refusals.  An empty pool admits any single request, so a request
+  /// larger than the cap can still run alone instead of never running.
   std::vector<std::byte*> allocate_bulk(size_t n, int& numa_node);
 
   std::vector<std::byte*> allocate_bulk_from(size_t n, int numa_node);
@@ -127,10 +133,31 @@ class buffer_pool {
 
   [[nodiscard]] size_t reservation_size_for_prefetching() const noexcept;
 
+  /// Hard cap on the bytes of chunks the pool may hand out:
+  /// @c eviction_threshold_fraction of the host tier, chunk aligned.  0 means
+  /// uncapped.
   [[nodiscard]] size_t max_allowed_budget_for_prefetching() const noexcept;
 
   [[nodiscard]] size_t max_system_wide_usage() const noexcept;
 
+  /// True when @p n more chunks fit under the hard cap right now (or the pool
+  /// is empty, or uncapped).  A snapshot: the allocators re-check atomically.
+  [[nodiscard]] bool admits(size_t n) const noexcept;
+
+  /// Chunks that would have to be freed for @p n more to fit under the cap
+  /// (0 when they already fit).  A snapshot, used to size eviction demands.
+  [[nodiscard]] size_t chunks_over_cap(size_t n) const noexcept;
+
+  /// Allocation requests refused because they would have crossed the cap.
+  [[nodiscard]] size_t cap_refusals() const noexcept
+  {
+    return _n_cap_refusals.load(std::memory_order_relaxed);
+  }
+
+  /// The pool has no room for another chunk under its cap (and holds more than
+  /// its reserved floor).  Judged on the pool's OWN resident chunks -- not on
+  /// system-wide host usage, which includes spills and would keep a cache that
+  /// is itself small permanently evicting.
   [[nodiscard]] bool should_start_evicting() const noexcept;
 
  private:
@@ -145,7 +172,14 @@ class buffer_pool {
   size_t _max_allowed_budget_for_prefetching{0};
   std::unordered_map<int, size_t> _numa_to_arena_index;
   std::vector<host_arena> _host_arenas;
+  /// Charge @p n chunks against the cap before allocating them.  One CAS, so
+  /// concurrent allocators cannot both pass a check and overshoot together.
+  [[nodiscard]] bool try_charge(size_t n) noexcept;
+
+  [[nodiscard]] bool fits(size_t current, size_t n) const noexcept;
+
   std::atomic<size_t> _n_allocated_chunks{0};
+  std::atomic<size_t> _n_cap_refusals{0};
 };
 
 // ---------------------------------------------------------------------------

@@ -71,29 +71,76 @@ buffer_pool::buffer_pool(cucascade::memory::memory_reservation_manager& reservat
 
 buffer_pool::~buffer_pool() = default;
 
+bool buffer_pool::fits(size_t current, size_t n) const noexcept
+{
+  // An empty pool admits any one request: an oversize request must still be
+  // able to run alone, or a cap smaller than one request deadlocks the reader.
+  if (current == 0 || _max_allowed_budget_for_prefetching == 0) { return true; }
+  auto const cap_chunks = _max_allowed_budget_for_prefetching / _chunk_bytes;
+  return current <= cap_chunks && n <= cap_chunks - current;
+}
+
+bool buffer_pool::admits(size_t n) const noexcept
+{
+  return fits(_n_allocated_chunks.load(std::memory_order_relaxed), n);
+}
+
+size_t buffer_pool::chunks_over_cap(size_t n) const noexcept
+{
+  auto const cur = _n_allocated_chunks.load(std::memory_order_relaxed);
+  if (fits(cur, n)) { return 0; }
+  auto const cap_chunks = _max_allowed_budget_for_prefetching / _chunk_bytes;
+  // Cannot go below an empty pool, which admits anything.
+  return std::min(cur, cur + n - cap_chunks);
+}
+
+bool buffer_pool::try_charge(size_t n) noexcept
+{
+  auto cur = _n_allocated_chunks.load(std::memory_order_relaxed);
+  for (;;) {
+    if (!fits(cur, n)) {
+      _n_cap_refusals.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    if (_n_allocated_chunks.compare_exchange_weak(
+          cur, cur + n, std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
+
 std::vector<std::byte*> buffer_pool::allocate_bulk_from(size_t n, int numa_node)
 {
   if (n == 0) return {};
   auto it = _numa_to_arena_index.find(numa_node);
   if (it == _numa_to_arena_index.end()) return {};
   auto& arena = _host_arenas.at(it->second);
+  if (!try_charge(n)) return {};
   try {
     // allocate_multiple_blocks throws rmm::out_of_memory on exhaustion rather
     // than returning empty, so an OOM here simply means this arena can't serve
     // the request.
     auto blocks = arena.mr->allocate_multiple_blocks(n * _chunk_bytes, arena.reservation.get());
-    if (!blocks) return {};
-    auto out = blocks->release_blocks();
-    _n_allocated_chunks.fetch_add(out.size(), std::memory_order_relaxed);
-    return out;
-  } catch (std::exception const&) {
-    return {};
+    if (blocks) {
+      auto out = blocks->release_blocks();
+      if (out.size() < n) {
+        _n_allocated_chunks.fetch_sub(n - out.size(), std::memory_order_relaxed);
+      }
+      return out;
+    }
+  } catch (std::exception const&) {  // NOLINT(bugprone-empty-catch)
   }
+  _n_allocated_chunks.fetch_sub(n, std::memory_order_relaxed);
+  return {};
 }
 
 std::vector<std::byte*> buffer_pool::allocate_bulk(size_t n, int& numa_node)
 {
   if (n == 0) return {};
+
+  // Charged up front, against the cap, for the whole request; every exit that
+  // hands back fewer than n chunks returns the difference.
+  if (!try_charge(n)) return {};
 
   // Start at the preferred NUMA's arena (if known) and wrap around so every
   // arena is tried before giving up — caching on a remote node still beats a
@@ -110,13 +157,16 @@ std::vector<std::byte*> buffer_pool::allocate_bulk(size_t n, int& numa_node)
       if (!blocks) continue;
       numa_node = arena.numa_id;
       auto out  = blocks->release_blocks();
-      _n_allocated_chunks.fetch_add(out.size(), std::memory_order_relaxed);
+      if (out.size() < n) {
+        _n_allocated_chunks.fetch_sub(n - out.size(), std::memory_order_relaxed);
+      }
       return out;
     } catch (std::exception const&) {
       // This arena is exhausted; fall through to the next one.
       continue;
     }
   }
+  _n_allocated_chunks.fetch_sub(n, std::memory_order_relaxed);
   return {};
 }
 
@@ -152,8 +202,14 @@ size_t buffer_pool::max_system_wide_usage() const noexcept
 
 bool buffer_pool::should_start_evicting() const noexcept
 {
-  if (_n_allocated_chunks * _chunk_bytes <= reservation_size_for_prefetching()) { return false; }
-  return max_system_wide_usage() > max_allowed_budget_for_prefetching();
+  auto const resident = _n_allocated_chunks.load(std::memory_order_relaxed) * _chunk_bytes;
+  if (resident <= reservation_size_for_prefetching()) { return false; }
+  if (_max_allowed_budget_for_prefetching == 0) { return false; }  // uncapped
+  // The cache's own resident bytes, not max_system_wide_usage(): the host tier
+  // also holds spills, so judged system-wide a small cache beside a large spill
+  // set would evict on every round.  Fires once no further chunk fits under
+  // the cap, i.e. the next allocation would be refused.
+  return resident + _chunk_bytes > _max_allowed_budget_for_prefetching;
 }
 
 }  // namespace sirius::io::cache
