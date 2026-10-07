@@ -1516,7 +1516,7 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
                                        std::vector<gather_range>& out_gather,
                                        std::uint64_t* out_payload_bytes)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
   out_header.clear();
   out_gather.clear();
   if (out_payload_bytes) *out_payload_bytes = 0;
@@ -1769,7 +1769,11 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
     std::vector<std::vector<buffer_subset>> plans(cr.leaf_descs.size());
     std::vector<std::vector<bool>> buffer_whole(cr.leaf_descs.size());
     std::vector<bool> leaf_whole(cr.leaf_descs.size(), false);
-    bool subsettable = col_rows > 0;
+    // A mixed-validity column carries one bitmask over ALL of its rows, which this does not
+    // compact: kept whole while its values were compacted, the mask would no longer line up with
+    // them. Served whole instead, which a caller already treats as "decode this chunk whole".
+    // all_null needs no such care: its mask is regenerated from the decoded row count.
+    bool subsettable = col_rows > 0 && cr.validity.kind != validity_kind::mask;
 
     for (std::size_t li = 0; subsettable && li < cr.leaf_descs.size(); ++li) {
       auto const& ld = cr.leaf_descs[li];
@@ -1871,7 +1875,15 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
 
     if (!subsettable) {
       // Emitted whole: sizes and row counts stay exactly as written; only the payload offsets move
-      // to keep the compacted payload dense.
+      // to keep the compacted payload dense -- the validity mask's included, or the reader would
+      // fetch it from wherever the compaction left some other buffer.
+      if (cr.validity.kind == validity_kind::mask) {
+        if (!patch(col_offs.validity_payload_offset_at, dst_offset)) {
+          return "build_chunk_subset_header: header field offset out of range";
+        }
+        append_gather(cr.validity.payload_offset, cr.validity.size_bytes, dst_offset);
+        dst_offset += cr.validity.size_bytes;
+      }
       for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
         auto const& ld = cr.leaf_descs[li];
         for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
