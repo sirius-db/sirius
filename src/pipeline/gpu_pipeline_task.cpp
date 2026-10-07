@@ -41,6 +41,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 namespace sirius {
@@ -414,8 +415,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
-  auto operators                  = pipeline->get_operators();
-  auto start_index                = local_state._start_operator_index;
+  if (not pipeline) { throw std::invalid_argument("task global state has null pipeline"); }
+  auto operators   = pipeline->get_operators();
+  auto start_index = local_state._start_operator_index;
 
   if (start_index > 0) {
     SIRIUS_LOG_INFO("Pipeline {}: resuming task {} from operator index {} (of {})",
@@ -426,8 +428,8 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
   }
 
   auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
-  if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->id();
+  if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
+    executor_thread_resource_id = h->id();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
@@ -641,8 +643,8 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   }
 
   auto executor_thread_resource_id = quent::executor_thread::ExecutorThreadId{quent::nil_uuid()};
-  if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->id();
+  if (auto const& h = telemetry::executor_thread_telemetry_state.handle) {
+    executor_thread_resource_id = h->id();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");

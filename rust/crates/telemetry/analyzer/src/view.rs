@@ -110,7 +110,20 @@ impl<'a> SiriusModelQueryView<'a> {
             .copied()
             .chain(resource_groups.keys().copied())
             .chain(resources.keys().copied())
-            .chain(tasks.keys().copied());
+            .chain(tasks.keys().copied())
+            // Only batches *produced* by this query: a batch's parent in the reference tree is
+            // its producer operator, so a consumer-only batch would dangle outside the view.
+            // Consumer-only batches stay reachable via `try_entity_ref` (`data_batches`).
+            .chain(
+                data_batches
+                    .values()
+                    .filter(|batch| {
+                        batch
+                            .producer_pipeline_uuid()
+                            .is_some_and(|id| pipeline_ids.contains(&id))
+                    })
+                    .map(|batch| batch.id()),
+            );
         let ref_tree_entities = scoped_entity_ids
             .map(|id| model.ref_tree_entity(id).map(|entity| (id, entity)))
             .collect::<AnalyzerResult<HashMap<_, _>>>()?;

@@ -88,6 +88,32 @@ const MEASURE_RATE: &str = "input_bytes_per_sec";
 const UNKNOWN_DIMENSION: &str = "UNKNOWN";
 const IN_TRANSIT_DIMENSION: &str = "IN_TRANSIT";
 
+/// Display order for memory-space dimension keys: GPU, HOST, DISK, other tiers, then the
+/// synthetic IN_TRANSIT and UNKNOWN keys; ties break by device id, then label. Labels follow
+/// cucascade's `memory_space::to_string()`: `memory_space(tier=GPU, device_id=0, limit=…)`.
+fn memory_space_rank(label: &str) -> (u8, u64, &str) {
+    let field = |key: &str| {
+        label
+            .split_once(key)
+            .and_then(|(_, rest)| rest.split([',', ')']).next())
+            .map(str::trim)
+    };
+    let tier = match label {
+        IN_TRANSIT_DIMENSION => 4,
+        UNKNOWN_DIMENSION => 5,
+        _ => match field("tier=") {
+            Some("GPU") => 0,
+            Some("HOST") => 1,
+            Some("DISK") => 2,
+            _ => 3,
+        },
+    };
+    let device_id = field("device_id=")
+        .and_then(|id| id.parse().ok())
+        .unwrap_or(u64::MAX);
+    (tier, device_id, label)
+}
+
 #[derive(Clone, Copy)]
 enum BatchMeasures {
     Neither,
@@ -224,12 +250,14 @@ fn push_space_state_spans<'a, T>(
 }
 
 /// Attribute one task phase to its distinct physical input batches.
-/// A producer may be outside the selected query; the numeric index is global
-/// to the imported engine and rejects ambiguous IDs during model build.
+/// A producer may be outside the selected query; batch numbers resolve on the task's
+/// worker (see `SiriusModel::data_batch_on_worker`), and ambiguous numbers stay unresolved.
 struct BatchAttribution<'a, 'b> {
     model: &'a SiriusModel,
     space_names: &'b HashMap<Uuid, &'a str>,
     pipeline_id: Uuid,
+    /// Worker of `pipeline_id`, resolved once per task rather than once per batch id.
+    worker_id: Uuid,
     state: &'a str,
     measures: BatchMeasures,
 }
@@ -267,11 +295,7 @@ impl<'a> BatchAttribution<'a, '_> {
             if !seen.insert(number) {
                 continue;
             }
-            let batch = self
-                .model
-                .batch_by_number
-                .get(&number)
-                .and_then(|id| self.model.data_batches.get(id));
+            let batch = self.model.data_batch_on_worker(self.worker_id, number);
             let Some(batch) = batch else {
                 self.push_count(builder, span, UNKNOWN_DIMENSION)?;
                 continue;
@@ -1452,6 +1476,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let Some(pipeline_id) = task.pipeline_uuid() else {
                     continue;
                 };
+                let worker_id = self.model.pipeline_worker_id(Some(pipeline_id));
                 let transitions = task.transitions();
                 if let (Some(created), Some(first_compute)) = (
                     transitions.first(),
@@ -1468,6 +1493,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         model: &self.model,
                         space_names: &space_names,
                         pipeline_id,
+                        worker_id,
                         state: "precompute",
                         measures: batch_measures,
                     }
@@ -1488,6 +1514,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         model: &self.model,
                         space_names: &space_names,
                         pipeline_id,
+                        worker_id,
                         state: "computing",
                         measures: batch_measures,
                     }
@@ -1555,7 +1582,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .chain([UNKNOWN_DIMENSION, IN_TRANSIT_DIMENSION])
             .collect();
         let mut ordered_spaces: Vec<&str> = present_spaces.into_iter().collect();
-        ordered_spaces.sort_unstable();
+        ordered_spaces.sort_unstable_by_key(|&label| memory_space_rank(label));
         let dimension_keys: Vec<DimensionKeyDecl> = ordered_spaces
             .into_iter()
             .map(|tier| DimensionKeyDecl {

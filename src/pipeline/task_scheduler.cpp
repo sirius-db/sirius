@@ -31,6 +31,7 @@
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -106,12 +107,17 @@ task_scheduler::task_scheduler(
   }
 }
 
-task_scheduler::~task_scheduler() { stop(); }
+task_scheduler::~task_scheduler()
+{
+  stop();
+  telemetry::exit_from_destructor(_task_queue_telemetry, "scheduler task queue");
+}
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-    pipeline_task->telemetry_fsm().queued({.queue = {_task_queue_telemetry.id()}});
+    pipeline_task->telemetry_fsm().queued(
+      {.queue = {.target = _task_queue_telemetry.id(), .data = {.entries = 1}}});
   }
   _task_queue.push(std::move(task));
   if (_self_publisher) {
@@ -286,12 +292,15 @@ void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
 
 void task_scheduler::management_eventloop()
 {
-  thread_local quent::Handle<quent::TaskManagerLoopThread> scheduler_thread_telemetry_handle =
+  quent::Handle<quent::TaskManagerLoopThread> scheduler_thread_telemetry_handle =
     _telemetry_context->context().task_manager_loop_thread_observer()->handle();
   scheduler_thread_telemetry_handle.spawned({
     .label    = "task-scheduler-thread",
     .group_id = _telemetry_context->shared_group_id(),
   });
+  absl::Cleanup exit_scheduler_thread = [&scheduler_thread_telemetry_handle] {
+    telemetry::exit_from_destructor(scheduler_thread_telemetry_handle, "scheduler thread");
+  };
 
   // Each pass tops up the two things the matcher needs — known ready devices
   // and a non-empty queue — sleeping only for whichever is missing. The queue

@@ -24,12 +24,16 @@ impl TransitionEvent for DataBatchEvent {
 
     fn is_valid_next(&self, next: &Self) -> bool {
         match self {
-            Self::Constructed { .. } => matches!(next, Self::Stationary { .. }),
+            Self::Constructed { .. } => {
+                matches!(next, Self::Stationary { .. } | Self::Destructed { .. })
+            }
             Self::Stationary { .. } => matches!(
                 next,
                 Self::Stationary { .. } | Self::InTransit { .. } | Self::Destructed { .. }
             ),
-            Self::InTransit { .. } => matches!(next, Self::Stationary { .. }),
+            Self::InTransit { .. } => {
+                matches!(next, Self::Stationary { .. } | Self::Destructed { .. })
+            }
             Self::Destructed { .. } => matches!(next, Self::Exit { .. }),
             Self::Exit { .. } => false,
         }

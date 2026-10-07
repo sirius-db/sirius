@@ -269,7 +269,13 @@ fn generated_events_feed_query_bundle() {
         1
     );
     assert_eq!(analyzer.model.data_batches[&id(13)].numeric_id(), Some(77));
-    assert_eq!(analyzer.model.batch_by_number[&77], id(13));
+    assert_eq!(
+        analyzer
+            .model
+            .data_batch_by_number(id(6), 77)
+            .map(|b| b.id()),
+        Some(id(13))
+    );
     assert!(analyzer.model.try_entity_ref(id(13)).is_ok());
 }
 
@@ -548,7 +554,7 @@ fn resource_timelines_and_entity_listing_use_generated_fsms() {
 }
 
 #[test]
-fn duplicate_numeric_batch_id_is_rejected() {
+fn duplicate_numeric_batch_id_on_one_worker_is_left_unresolved() {
     let mut events = fixture();
     events.extend([
         ev(
@@ -575,7 +581,204 @@ fn duplicate_numeric_batch_id_is_rejected() {
         ),
         ev(15, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
     ]);
+    let analyzer = SiriusUiAnalyzer::try_new(id(1), events.into_iter()).unwrap();
+    // Both batches survive; only the ambiguous number lookup is withheld.
+    assert!(analyzer.model.data_batches.contains_key(&id(13)));
+    assert!(analyzer.model.data_batches.contains_key(&id(15)));
+    assert!(analyzer.model.data_batch_by_number(id(6), 77).is_none());
+}
+
+#[test]
+fn same_numeric_batch_id_on_two_workers_resolves_per_worker() {
+    let mut events = fixture();
+    events.extend([
+        ev(
+            40,
+            0,
+            E::Worker(s::WorkerEvent::Init {
+                parent_engine_id: EntityRef::new(id(1), ()),
+                process_id: "43".into(),
+                tag: "worker".into(),
+            }),
+        ),
+        ev(
+            41,
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(4), ()),
+                label: "remote-plan".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(40), ())),
+            }),
+        ),
+        ev(
+            42,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(41), ()),
+                label: "remote-scan".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+        // Same engine-native number (77) as batch 13, but produced on worker 40.
+        ev(
+            43,
+            2,
+            E::DataBatch(s::DataBatchEvent::Constructed {
+                seq: 0,
+                data_batch_id: 77,
+                producer_pipeline_id: EntityRef::new(id(42), ()),
+            }),
+        ),
+        ev(
+            43,
+            3,
+            E::DataBatch(s::DataBatchEvent::Stationary {
+                seq: 1,
+                memory: EntityRef::new(id(8), s::MemorySpaceUsage { bytes: 1 }),
+            }),
+        ),
+        ev(
+            43,
+            8,
+            E::DataBatch(s::DataBatchEvent::Destructed { seq: 2 }),
+        ),
+        ev(43, 8, E::DataBatch(s::DataBatchEvent::Exit { seq: 3 })),
+    ]);
+    let model = SiriusUiAnalyzer::try_new(id(1), events.into_iter())
+        .unwrap()
+        .model;
+    let resolve = |pipeline, number| {
+        model
+            .data_batch_by_number(pipeline, number)
+            .map(|batch| batch.id())
+    };
+    assert_eq!(resolve(id(6), 77), Some(id(13)));
+    assert_eq!(resolve(id(42), 77), Some(id(43)));
+}
+
+#[test]
+fn invalid_query_is_skipped_with_its_plan_subtree() {
+    let mut events = fixture();
+    events.extend([
+        // Query 30 never reaches a final state, so its FSM is incomplete.
+        ev(
+            30,
+            0,
+            E::Query(s::QueryEvent::Init {
+                seq: 0,
+                instance_name: "aborted".into(),
+                query_group_id: EntityRef::new(id(3), ()),
+            }),
+        ),
+        ev(
+            31,
+            0,
+            E::Plan(s::PlanEvent::Declaration {
+                query_id: EntityRef::new(id(30), ()),
+                label: "aborted-plan".into(),
+                edges: vec![],
+                worker_id: Some(EntityRef::new(id(2), ())),
+            }),
+        ),
+        ev(
+            32,
+            0,
+            E::Operator(s::OperatorEvent::Declaration {
+                plan_id: EntityRef::new(id(31), ()),
+                label: "aborted-scan".into(),
+                type_name: "scan".into(),
+                custom_attributes: Default::default(),
+            }),
+        ),
+    ]);
+    let model = SiriusUiAnalyzer::try_new(id(1), events.into_iter())
+        .unwrap()
+        .model;
+    assert!(model.queries.contains_key(&id(4)));
+    assert!(!model.queries.contains_key(&id(30)));
+    assert!(!model.plans.contains_key(&id(31)));
+    assert!(!model.operators.contains_key(&id(32)));
+}
+
+#[test]
+fn invalid_data_batch_is_skipped() {
+    let mut events = fixture();
+    // Batch 16 is constructed but never reaches a final state.
+    events.push(ev(
+        16,
+        2,
+        E::DataBatch(s::DataBatchEvent::Constructed {
+            seq: 0,
+            data_batch_id: 99,
+            producer_pipeline_id: EntityRef::new(id(6), ()),
+        }),
+    ));
+    let model = SiriusUiAnalyzer::try_new(id(1), events.into_iter())
+        .unwrap()
+        .model;
+    assert!(model.data_batches.contains_key(&id(13)));
+    assert!(!model.data_batches.contains_key(&id(16)));
+}
+
+#[test]
+fn exit_before_declaration_is_not_a_duplicate() {
+    let mut events = fixture();
+    events.insert(
+        0,
+        ev(12, 9, E::ExecutorThread(s::ExecutorThreadEvent::Exit)),
+    );
+    assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_ok());
+}
+
+#[test]
+fn duplicate_resource_group_declaration_is_rejected() {
+    let mut events = fixture();
+    events.push(ev(
+        7,
+        1,
+        E::GpuDevice(s::GpuDeviceEvent::Declaration {
+            label: "gpu-0-again".into(),
+            worker_id: EntityRef::new(id(2), ()),
+            ordinal: 0,
+        }),
+    ));
     assert!(SiriusUiAnalyzer::try_new(id(1), events.into_iter()).is_err());
+}
+
+#[test]
+fn resource_group_types_are_snake_case() {
+    let model = SiriusUiAnalyzer::try_new(id(1), fixture().into_iter())
+        .unwrap()
+        .model;
+    assert!(model.resource_group_types.contains_key("gpu_device"));
+    assert!(model.resource_group_types.contains_key("thread_group"));
+    assert!(!model.resource_group_types.contains_key("GpuDevice"));
+}
+
+#[test]
+fn memory_space_dimensions_order_by_tier_then_device() {
+    let mut labels = vec![
+        crate::UNKNOWN_DIMENSION,
+        "memory_space(tier=DISK, device_id=0, limit=1)",
+        crate::IN_TRANSIT_DIMENSION,
+        "memory_space(tier=HOST, device_id=0, limit=1)",
+        "memory_space(tier=GPU, device_id=10, limit=1)",
+        "memory_space(tier=GPU, device_id=2, limit=1)",
+    ];
+    labels.sort_unstable_by_key(|&label| crate::memory_space_rank(label));
+    assert_eq!(
+        labels,
+        [
+            "memory_space(tier=GPU, device_id=2, limit=1)",
+            "memory_space(tier=GPU, device_id=10, limit=1)",
+            "memory_space(tier=HOST, device_id=0, limit=1)",
+            "memory_space(tier=DISK, device_id=0, limit=1)",
+            crate::IN_TRANSIT_DIMENSION,
+            crate::UNKNOWN_DIMENSION,
+        ]
+    );
 }
 
 #[test]

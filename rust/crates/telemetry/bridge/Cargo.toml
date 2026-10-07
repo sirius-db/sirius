@@ -13,11 +13,12 @@ instrumentation-model = { path = "../model" }
 quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
 quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", features = ["io-ndjson", "io-msgpack", "io-postcard"] }
 quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", default-features = false, features = ["ndjson", "msgpack", "postcard"] }
-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
 nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", features = ["static-injection"] }
 
 [build-dependencies]
 cxx-build = "1"
-instrumentation-model = { path = "../model" }
+# Experimental and unstable: quent's `experimental/vibe/codegen/cpp` (LLM-written, unreviewed
+# upstream, `publish = false`). Its generated C++ API can change on any rev bump; there is no
+# stable C++ generator yet.
 quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
 quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }

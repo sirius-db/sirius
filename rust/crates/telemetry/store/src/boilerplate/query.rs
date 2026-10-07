@@ -23,8 +23,8 @@ impl TransitionEvent for QueryEvent {
 
     fn is_valid_next(&self, next: &Self) -> bool {
         match self {
-            Self::Init { .. } => matches!(next, Self::Planning { .. }),
-            Self::Planning { .. } => matches!(next, Self::Executing { .. }),
+            Self::Init { .. } => matches!(next, Self::Planning { .. } | Self::Exit { .. }),
+            Self::Planning { .. } => matches!(next, Self::Executing { .. } | Self::Exit { .. }),
             Self::Executing { .. } => matches!(next, Self::Exit { .. }),
             Self::Exit { .. } => false,
         }

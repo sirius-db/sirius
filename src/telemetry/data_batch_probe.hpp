@@ -79,8 +79,12 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
 
   ~quent_data_batch_probe() override
   {
-    handle_.destructed();
-    handle_.exit();
+    try {
+      handle_.destructed();
+      handle_.exit();
+    } catch (...) {
+      log_current_exception("destructor");
+    }
   }
 
   void created([[maybe_unused]] const uint64_t batch_id,
@@ -99,6 +103,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
                    .data   = {.bytes = data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("created");
     }
   }
 
@@ -141,6 +146,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
         .channel = {.target = {(*maybe_channel_handle).get().id()}, .data = {.bytes = data_size}},
       });
     } catch (...) {
+      log_current_exception("conversion_started");
     }
   }
 
@@ -160,6 +166,7 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
                    .data   = {.bytes = data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("conversion_completed");
     }
   }
 
@@ -179,10 +186,22 @@ class quent_data_batch_probe : public cucascade::idata_batch_probe {
                    .data   = {.bytes = new_data.get_size_in_bytes()}},
       });
     } catch (...) {
+      log_current_exception("data_replaced");
     }
   }
 
  private:
+  /// Logs the in-flight exception. Call only from inside a `catch` block.
+  static void log_current_exception(std::string_view where) noexcept
+  {
+    try {
+      throw;
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_WARN("data batch probe {} failed: {}", where, e.what());
+    } catch (...) {
+      SIRIUS_LOG_WARN("data batch probe {} failed with an unknown exception", where);
+    }
+  }
   /**
    * @brief Construct a probe that forwards state transitions to a telemetry observer.
    *

@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include "log/logging.hpp"
 #include "query_id.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/memory_context.hpp"
 
 #include <cassert>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -108,10 +110,25 @@ class telemetry_context {
   const gpu_device_telemtry_handles& fallback_gpu_device_telemtry_handles() const
   {
     std::call_once(fallback_flag_, [this] {
+      auto device = context_.gpu_device_observer()->handle();
+      device.declaration({
+        .label     = "gpu-fallback",
+        .worker_id = worker_handle_.id(),
+        // Sentinel: the fallback stands in for any undeclared ordinal.
+        .ordinal = std::numeric_limits<uint32_t>::max(),
+      });
+      auto manager_threads = context_.thread_group_observer()->handle();
+      manager_threads.declaration({.label         = "gpu-fallback-manager-threads",
+                                   .worker_id     = worker_handle_.id(),
+                                   .gpu_device_id = device.id()});
+      auto executor_threads = context_.thread_group_observer()->handle();
+      executor_threads.declaration({.label         = "gpu-fallback-executor-threads",
+                                    .worker_id     = worker_handle_.id(),
+                                    .gpu_device_id = device.id()});
       fallback_gpu_device_handles_.emplace(gpu_device_telemtry_handles{
-        .device           = context_.gpu_device_observer()->handle(),
-        .manager_threads  = context_.thread_group_observer()->handle(),
-        .executor_threads = context_.thread_group_observer()->handle(),
+        .device           = std::move(device),
+        .manager_threads  = std::move(manager_threads),
+        .executor_threads = std::move(executor_threads),
       });
     });
     assert(fallback_gpu_device_handles_.has_value());
@@ -152,6 +169,29 @@ void emit_plan_telemetry(const quent::Context& context,
                          quent::Uuid plan_id,
                          query_telemetry_info telemetry_info);
 
-inline thread_local std::optional<quent::Handle<quent::ExecutorThread>>
-  executor_thread_telemetry_handle{std::nullopt};
+/// Emits `exit` from a destructor or scope guard. Those are noexcept, so a failure is logged
+/// rather than propagated. Skips handles whose exit was already emitted.
+template <typename Handle>
+void exit_from_destructor(Handle& handle, std::string_view what) noexcept
+{
+  if (handle.exit_emitted()) { return; }
+  try {
+    handle.exit();
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_ERROR("telemetry: {} exit failed: {}", what, e.what());
+  } catch (...) {
+    SIRIUS_LOG_ERROR("telemetry: {} exit failed", what);
+  }
+}
+
+/// Per pool-thread ExecutorThread handle; emits `exit` when the thread ends.
+struct executor_thread_telemetry {
+  std::optional<quent::Handle<quent::ExecutorThread>> handle;
+  ~executor_thread_telemetry()
+  {
+    if (handle) { exit_from_destructor(*handle, "executor thread"); }
+  }
+};
+inline thread_local executor_thread_telemetry executor_thread_telemetry_state;
+
 }  // namespace sirius::telemetry

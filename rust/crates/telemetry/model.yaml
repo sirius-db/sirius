@@ -230,9 +230,9 @@ fsms:
         attributes:
           instance_name: string
           query_group_id: { scope-ref: QueryGroup }
-        to: [planning]
+        to: [ planning, exit ]
       planning:
-        to: [executing]
+        to: [ executing, exit ]
       executing:
         to: [exit]
       exit: {}
@@ -279,6 +279,7 @@ fsms:
         to: [ computing, finalizing ]
       computing:
         attributes:
+          # The engine-local id
           current_operator_id: u32
           input_bytes: u64
           input_batch_ids: { list: u64 }
@@ -301,7 +302,7 @@ fsms:
         attributes:
           data_batch_id: u64
           producer_pipeline_id: { scope-ref: Operator }
-        to: [ stationary ]
+        to: [ stationary, destructed ]
       stationary:
         attributes:
           memory: { uses: MemorySpace }
@@ -311,7 +312,7 @@ fsms:
           source_memory: { uses: MemorySpace }
           dest_memory: { uses: MemorySpace }
           channel: { uses: Channel }
-        to: [ stationary ]
+        to: [ stationary, destructed ]
       destructed:
         to: [ exit ]
       exit: { }

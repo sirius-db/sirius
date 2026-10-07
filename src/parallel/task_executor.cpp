@@ -44,12 +44,18 @@ itask_executor::itask_executor(
   _task_queue_telemetry.created({
     .worker_id = _telemetry_context->worker_id(),
     .gpu_device_id =
-      _telemetry_context->gpu_device_telemetry_handles(device_id.value_or(0)).device.id(),
+      device_id.has_value()
+        ? std::optional(_telemetry_context->gpu_device_telemetry_handles(*device_id).device.id())
+        : std::nullopt,
     .label = _config.thread_name_prefix + "-task-queue",
   });
 }
 
-itask_executor::~itask_executor() { stop(); }
+itask_executor::~itask_executor()
+{
+  stop();
+  telemetry::exit_from_destructor(_task_queue_telemetry, "executor task queue");
+}
 
 void itask_executor::schedule(std::unique_ptr<itask> task)
 {

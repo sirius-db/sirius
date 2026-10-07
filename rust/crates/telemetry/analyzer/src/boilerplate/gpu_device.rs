@@ -52,7 +52,8 @@ impl Entity for GpuDevice {
     }
 
     fn type_name(&self) -> &str {
-        self.0.type_name()
+        // snake_case like the resource type names, not the payload's `GpuDevice`.
+        "gpu_device"
     }
 
     fn earliest_timestamp(&self) -> TimeUnixNanoSec {

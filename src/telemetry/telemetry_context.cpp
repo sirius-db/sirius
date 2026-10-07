@@ -89,39 +89,40 @@ telemetry_context::telemetry_context(quent::Context&& context,
     .gpu_device_id = std::nullopt,
   });
 
-  if (manager == nullptr) { return; }
   std::unordered_map<int, quent::gpu_device::GpuDeviceId> device_id_to_quent_id;
-  for (const auto* gpu_memory_space :
-       manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    int device_id          = gpu_memory_space->get_device_id();
-    auto gpu_device_handle = gpu_device_observer->handle();
-    gpu_device_handle.declaration({
-      .label     = std::format("gpu-{}", device_id),
-      .worker_id = worker_handle_.id(),
-      .ordinal   = static_cast<uint32_t>(device_id),
-    });
+  if (manager) {
+    for (const auto* gpu_memory_space :
+         manager->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      int device_id          = gpu_memory_space->get_device_id();
+      auto gpu_device_handle = gpu_device_observer->handle();
+      gpu_device_handle.declaration({
+        .label     = std::format("gpu-{}", device_id),
+        .worker_id = worker_handle_.id(),
+        .ordinal   = static_cast<uint32_t>(device_id),
+      });
 
-    auto manager_thread_group = thread_group_observer->handle();
-    manager_thread_group.declaration({
-      .label         = std::format("gpu-{}-manager-threads", device_id),
-      .worker_id     = worker_handle_.id(),
-      .gpu_device_id = gpu_device_handle.id(),
-    });
+      auto manager_thread_group = thread_group_observer->handle();
+      manager_thread_group.declaration({
+        .label         = std::format("gpu-{}-manager-threads", device_id),
+        .worker_id     = worker_handle_.id(),
+        .gpu_device_id = gpu_device_handle.id(),
+      });
 
-    auto executor_thread_group = thread_group_observer->handle();
-    executor_thread_group.declaration({
-      .label         = std::format("gpu-{}-executor-threads", device_id),
-      .worker_id     = worker_handle_.id(),
-      .gpu_device_id = gpu_device_handle.id(),
-    });
+      auto executor_thread_group = thread_group_observer->handle();
+      executor_thread_group.declaration({
+        .label         = std::format("gpu-{}-executor-threads", device_id),
+        .worker_id     = worker_handle_.id(),
+        .gpu_device_id = gpu_device_handle.id(),
+      });
 
-    device_id_to_quent_id.emplace(device_id, gpu_device_handle.id());
-    gpu_group_ids_.emplace(device_id,
-                           gpu_device_telemtry_handles{
-                             .device           = std::move(gpu_device_handle),
-                             .manager_threads  = std::move(manager_thread_group),
-                             .executor_threads = std::move(executor_thread_group),
-                           });
+      device_id_to_quent_id.emplace(device_id, gpu_device_handle.id());
+      gpu_group_ids_.emplace(device_id,
+                             gpu_device_telemtry_handles{
+                               .device           = std::move(gpu_device_handle),
+                               .manager_threads  = std::move(manager_thread_group),
+                               .executor_threads = std::move(executor_thread_group),
+                             });
+    }
   }
 
   memory_context_ =
@@ -165,8 +166,17 @@ telemetry_context::gpu_device_telemetry_handles(int device_id) const
 telemetry_context::~telemetry_context()
 {
   memory_context_.reset();
-  worker_handle_.exit();
-  engine_handle_.exit();
+  for (auto& [device_id, handles] : gpu_group_ids_) {
+    exit_from_destructor(handles.executor_threads, "gpu executor thread group");
+    exit_from_destructor(handles.manager_threads, "gpu manager thread group");
+  }
+  if (fallback_gpu_device_handles_) {
+    exit_from_destructor(fallback_gpu_device_handles_->executor_threads, "fallback executor group");
+    exit_from_destructor(fallback_gpu_device_handles_->manager_threads, "fallback manager group");
+  }
+  exit_from_destructor(shared_thread_group_handle_, "shared thread group");
+  exit_from_destructor(worker_handle_, "worker");
+  exit_from_destructor(engine_handle_, "engine");
 }
 
 void emit_plan_telemetry(const quent::Context& context,

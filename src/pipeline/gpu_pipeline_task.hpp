@@ -324,7 +324,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// This is used in the destructor to unsubscribe.
   std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
   /// MemorySpace used by the task reservation (nil id = none).
-  quent::Uuid _reservation_memory_resource_id{};
+  quent::Uuid _reservation_memory_resource_id{quent::nil_uuid()};
   uint64_t _reservation_bytes = 0;
 };
 

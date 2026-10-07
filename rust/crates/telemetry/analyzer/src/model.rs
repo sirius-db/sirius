@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeSet, hash_map::Entry};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use sirius_telemetry_store::SiriusEvent;
 
 use quent_analyzer::{
@@ -13,6 +13,7 @@ use quent_analyzer::{
     resource::{Resource, ResourceTypeDecl, Usage, Using, collection::ResourceCollection},
 };
 use quent_events::Event;
+use quent_query_engine_analyzer::{OperatorEntity, PlanEntity};
 use quent_query_engine_analyzer::{
     OperatorEntityMut, QueryEngineModel, QueryEngineModelMut, plan_tree::PlanTree,
 };
@@ -32,6 +33,28 @@ use crate::{
 
 pub(crate) const MEMORY_SPACE_BYTES_CAPACITY_NAME: &str = "bytes";
 const SHARED_THREAD_GROUP_LABEL: &str = "shared-thread-group";
+
+/// Removes entities whose ref-tree parent is in `dropped_parents`; returns the removed ids so
+/// the caller can cascade to the next level.
+fn drop_orphans<T: RefTreeEntity>(
+    entities: &mut HashMap<Uuid, T>,
+    dropped_parents: &HashSet<Uuid>,
+) -> HashSet<Uuid> {
+    let mut dropped = HashSet::default();
+    if dropped_parents.is_empty() {
+        return dropped;
+    }
+    entities.retain(|id, entity| {
+        let orphaned = entity
+            .parent_id()
+            .is_some_and(|parent| dropped_parents.contains(&parent));
+        if orphaned {
+            dropped.insert(*id);
+        }
+        !orphaned
+    });
+    dropped
+}
 
 fn derive_resource_scope_types(
     model: &SiriusModel,
@@ -101,7 +124,11 @@ pub struct SiriusModel {
     pub(crate) executor_threads: HashMap<Uuid, ExecutorThread>,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
-    pub(crate) batch_by_number: HashMap<u64, Uuid>,
+    /// Engine-native batch numbers are only unique per worker process, so the index is keyed
+    /// by (worker, number). `None` marks a number seen twice on one worker (ambiguous).
+    // TODO(dhruv9vats): drop this index once Task.computing references DataBatch entities
+    // directly (`input_batches: { list: { ref: DataBatch } }`), see model.yaml.
+    pub(crate) batch_by_number: HashMap<(Uuid, u64), Option<Uuid>>,
     pub(crate) resource_group_types: HashMap<String, ResourceGroupTypeDecl>,
 }
 
@@ -343,6 +370,32 @@ impl SiriusModel {
         }
         Ok(())
     }
+
+    /// Worker that owns `operator_id` (operator -> plan -> worker); nil when unknown.
+    pub(crate) fn pipeline_worker_id(&self, operator_id: Option<Uuid>) -> Uuid {
+        operator_id
+            .and_then(|id| self.operators.get(&id))
+            .and_then(|operator| operator.plan_id())
+            .and_then(|plan_id| self.plans.get(&plan_id))
+            .and_then(|plan| plan.worker_id())
+            .unwrap_or_else(Uuid::nil)
+    }
+
+    /// Resolves a batch number as seen by a task of `pipeline_id`.
+    #[cfg(test)]
+    pub(crate) fn data_batch_by_number(
+        &self,
+        pipeline_id: Uuid,
+        number: u64,
+    ) -> Option<&DataBatch> {
+        self.data_batch_on_worker(self.pipeline_worker_id(Some(pipeline_id)), number)
+    }
+
+    /// Resolves a batch number on an already-resolved worker; `None` if unknown or ambiguous.
+    pub(crate) fn data_batch_on_worker(&self, worker_id: Uuid, number: u64) -> Option<&DataBatch> {
+        let id = (*self.batch_by_number.get(&(worker_id, number))?)?;
+        self.data_batches.get(&id)
+    }
 }
 
 impl FsmCollection for SiriusModel {
@@ -507,6 +560,10 @@ pub struct SiriusModelBuilder {
     executor_threads: HashMap<Uuid, ExecutorThread>,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
+    /// Ids of resources and resource groups whose declaration event was ingested. Tracked
+    /// explicitly (not via map membership) so an `exit` arriving before the declaration is not
+    /// mistaken for a second declaration.
+    declared: HashSet<Uuid>,
 }
 
 impl SiriusModelBuilder {
@@ -534,6 +591,7 @@ impl SiriusModelBuilder {
             executor_threads: HashMap::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
+            declared: HashSet::default(),
         })
     }
 
@@ -544,7 +602,7 @@ impl SiriusModelBuilder {
             data,
         } = event;
 
-        let is_resource_declaration = matches!(
+        let is_declaration = matches!(
             &data,
             SiriusEvent::MemorySpace(sirius_telemetry_store::MemorySpaceEvent::Declaration { .. })
                 | SiriusEvent::Channel(sirius_telemetry_store::ChannelEvent::Declaration { .. })
@@ -555,10 +613,16 @@ impl SiriusModelBuilder {
                 | SiriusEvent::ExecutorThread(
                     sirius_telemetry_store::ExecutorThreadEvent::Spawned { .. }
                 )
+                | SiriusEvent::GpuDevice(
+                    sirius_telemetry_store::GpuDeviceEvent::Declaration { .. }
+                )
+                | SiriusEvent::ThreadGroup(
+                    sirius_telemetry_store::ThreadGroupEvent::Declaration { .. }
+                )
         );
-        if is_resource_declaration && self.contains_resource(id) {
+        if is_declaration && !self.declared.insert(id) {
             return Err(AnalyzerError::Validation(format!(
-                "resource {id} has multiple declarations"
+                "entity {id} has multiple declarations"
             )));
         }
 
@@ -726,23 +790,33 @@ impl SiriusModelBuilder {
         }
     }
 
-    fn contains_resource(&self, id: Uuid) -> bool {
-        self.memories.contains_key(&id)
-            || self.channels.contains_key(&id)
-            || self.task_queues.contains_key(&id)
-            || self.task_manager_loop_threads.contains_key(&id)
-            || self.executor_threads.contains_key(&id)
-    }
-
     pub(crate) fn try_build(self) -> AnalyzerResult<SiriusModel> {
         let engine = self.engine.ok_or_else(|| {
             AnalyzerError::IncompleteEntity(format!("engine {} has no events", self.engine_id))
         })?;
-        let queries = self
-            .queries
-            .into_iter()
-            .map(|(id, builder)| Query::try_from_builder(builder).map(|query| (id, query)))
-            .collect::<AnalyzerResult<HashMap<_, _>>>()?;
+        // Invalid FSMs (truncated traces, topology violations) are skipped with a warning rather
+        // than failing the whole model. A skipped query takes its plan subtree with it, since
+        // plans, operators and ports would otherwise be orphaned in the ref tree.
+        let mut queries = HashMap::default();
+        let mut dropped_queries = HashSet::default();
+        for (query_id, builder) in self.queries {
+            match Query::try_from_builder(builder) {
+                Ok(query) => {
+                    queries.insert(query_id, query);
+                }
+                Err(err) => {
+                    tracing::warn!(%query_id, %err, "skipping invalid query FSM and its plans");
+                    dropped_queries.insert(query_id);
+                }
+            }
+        }
+        let mut plans = self.plans;
+        let mut operators = self.operators;
+        let mut ports = self.ports;
+        let dropped_plans = drop_orphans(&mut plans, &dropped_queries);
+        let dropped_operators = drop_orphans(&mut operators, &dropped_plans);
+        drop_orphans(&mut ports, &dropped_operators);
+
         let resource_types = [
             Memory::resource_type_decl(),
             Channel::resource_type_decl(),
@@ -759,9 +833,9 @@ impl SiriusModelBuilder {
             workers: self.workers,
             query_groups: self.query_groups,
             queries,
-            plans: self.plans,
-            operators: self.operators,
-            ports: self.ports,
+            plans,
+            operators,
+            ports,
             resource_types,
             gpu_devices: self.gpu_devices,
             thread_groups: self.thread_groups,
@@ -802,7 +876,19 @@ impl SiriusModelBuilder {
         }
 
         for (task_id, task_builder) in self.tasks {
-            let task = Task::from_builder(task_builder)?;
+            let task = match Task::from_builder(task_builder) {
+                Ok(task) => task,
+                Err(err) => {
+                    tracing::warn!(%task_id, %err, "skipping invalid task FSM");
+                    continue;
+                }
+            };
+            if task
+                .pipeline_uuid()
+                .is_some_and(|operator_id| dropped_operators.contains(&operator_id))
+            {
+                continue;
+            }
             model.add_resource_users(task.type_name(), task.usages())?;
             if let Some(operator_id) = task.pipeline_uuid()
                 && let Some(task_span) = task.active_span()
@@ -814,13 +900,39 @@ impl SiriusModelBuilder {
         }
 
         for (data_batch_id, data_batch_builder) in self.data_batches {
-            let data_batch = DataBatch::from_builder(data_batch_builder)?;
-            if let Some(number) = data_batch.numeric_id()
-                && let Some(existing) = model.batch_by_number.insert(number, data_batch_id)
+            let data_batch = match DataBatch::from_builder(data_batch_builder) {
+                Ok(data_batch) => data_batch,
+                Err(err) => {
+                    tracing::warn!(%data_batch_id, %err, "skipping invalid data batch FSM");
+                    continue;
+                }
+            };
+            if data_batch
+                .producer_pipeline_uuid()
+                .is_some_and(|operator_id| dropped_operators.contains(&operator_id))
             {
-                return Err(AnalyzerError::Validation(format!(
-                    "numeric data batch id {number} is ambiguous between {existing} and {data_batch_id}"
-                )));
+                continue;
+            }
+            if let Some(number) = data_batch.numeric_id() {
+                // operator -> plan -> worker; nil when unknown
+                let worker = model.pipeline_worker_id(data_batch.producer_pipeline_uuid());
+                match model.batch_by_number.entry((worker, number)) {
+                    Entry::Vacant(e) => {
+                        e.insert(Some(data_batch_id));
+                    }
+                    Entry::Occupied(mut e) => {
+                        // `None` once already ambiguous (third and later sightings).
+                        let existing = *e.get();
+                        tracing::warn!(
+                            number,
+                            %worker,
+                            ?existing,
+                            %data_batch_id,
+                            "ambiguous numeric batch id on one worker; left unresolved"
+                        );
+                        e.insert(None);
+                    }
+                }
             }
             model.add_resource_users(data_batch.type_name(), data_batch.usages())?;
             if let Some(operator_id) = data_batch.producer_pipeline_uuid()
@@ -837,6 +949,8 @@ impl SiriusModelBuilder {
             .values()
             .filter_map(|task| {
                 let pipeline_id = task.pipeline_uuid()?;
+                // Resolved once per task, not once per batch number.
+                let worker = model.pipeline_worker_id(Some(pipeline_id));
                 Some(
                     task.transitions()
                         .iter()
@@ -848,7 +962,7 @@ impl SiriusModelBuilder {
                                 input_batch_ids
                                     .iter()
                                     .copied()
-                                    .map(move |number| (number, pipeline_id)),
+                                    .map(move |number| (number, pipeline_id, worker)),
                             ),
                             _ => None,
                         })
@@ -857,9 +971,9 @@ impl SiriusModelBuilder {
             })
             .flatten()
             .collect::<Vec<_>>();
-        for (number, pipeline_id) in associations {
-            if let Some(batch_id) = model.batch_by_number.get(&number)
-                && let Some(batch) = model.data_batches.get_mut(batch_id)
+        for (number, pipeline_id, worker) in associations {
+            if let Some(Some(batch_id)) = model.batch_by_number.get(&(worker, number)).copied()
+                && let Some(batch) = model.data_batches.get_mut(&batch_id)
             {
                 batch.add_consumer(pipeline_id);
             }

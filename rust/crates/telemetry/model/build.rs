@@ -5,6 +5,7 @@ use std::path::Path;
 use quent_instrumentation_build::{Options, generate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    quent_build_info::emit_source();
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../model.yaml");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", model.display());

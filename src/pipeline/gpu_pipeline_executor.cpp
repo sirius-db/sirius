@@ -31,6 +31,7 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -73,12 +74,18 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
           thread_id_counter]() mutable noexcept {
     const int32_t thread_id = thread_id_counter->fetch_add(1, std::memory_order_relaxed);
 
-    telemetry::executor_thread_telemetry_handle =
-      telemetry_context->context().executor_thread_observer()->handle();
-    telemetry::executor_thread_telemetry_handle->spawned({
-      .label    = std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
-      .group_id = telemetry_context->gpu_device_telemetry_handles(device_id).executor_threads.id(),
-    });
+    try {
+      auto& thread_handle = telemetry::executor_thread_telemetry_state.handle;
+      thread_handle.reset();
+      thread_handle = telemetry_context->context().executor_thread_observer()->handle();
+      thread_handle->spawned({
+        .label = std::format("{}-gpu{}-exec-{}", thread_prefix, device_id, thread_id),
+        .group_id =
+          telemetry_context->gpu_device_telemetry_handles(device_id).executor_threads.id(),
+      });
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_ERROR("get_per_thread_init telemetry failed: {}", e.what());
+    }
 
     // Per-thread init runs on a worker thread just spawned by the
     // bounded_pool. cudaSetDevice pins this thread to the executor's GPU
@@ -105,6 +112,9 @@ void gpu_pipeline_executor::manager_loop()
     .group_id = _telemetry_context->gpu_device_telemetry_handles(_memory_space->get_device_id())
                   .manager_threads.id(),
   });
+  absl::Cleanup exit_manager_thread = [&manager_thread_handle] {
+    telemetry::exit_from_destructor(manager_thread_handle, "executor manager thread");
+  };
 
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   sirius::util::enable_log_on_default_stream();
@@ -155,7 +165,7 @@ void gpu_pipeline_executor::manager_loop()
       .input_basis          = reservation_info.input_basis,
       .peak_estimate        = reservation_info.peak_memory_estimate,
       .bytes_to_materialize = reservation_info.bytes_to_materialize_input,
-      .manager_thread       = {manager_thread_handle.id()},
+      .manager_thread       = {.target = manager_thread_handle.id(), .data = {}},
     });
     // Clamp the reservation request to what this memory space can actually
     // grant (its reservation limit). The history-based estimate can balloon far
@@ -468,11 +478,11 @@ void gpu_pipeline_executor::manager_loop()
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
           if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
+            pipeline_task->set_telemetry_finalized();
             pipeline_task->telemetry_fsm().finalizing({
               .success = false,
             });
             pipeline_task->telemetry_fsm().exit();
-            pipeline_task->set_telemetry_finalized();
           }
           this->schedule(std::move(new_task));
           return;

@@ -21,7 +21,6 @@ quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev
 quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
-uuid = "1"
 
 [build-dependencies]
 quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }

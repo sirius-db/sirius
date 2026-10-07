@@ -1358,12 +1358,11 @@ dependencies = [
 name = "instrumentation-model"
 version = "0.1.0"
 dependencies = [
- "quent-events",
+ "quent-build-info",
  "quent-instrumentation",
  "quent-instrumentation-build",
  "quent-yaml",
  "serde",
- "uuid",
 ]
 
 [[package]]
@@ -3044,7 +3043,6 @@ dependencies = [
  "tokio",
  "tracing",
  "ts-rs",
- "uuid",
 ]
 
 [[package]]
@@ -3204,7 +3202,6 @@ dependencies = [
  "cxx",
  "cxx-build",
  "instrumentation-model",
- "nvtx-bridge",
  "nvtx-injection",
  "quent-dynamic-attributes",
  "quent-instrumentation",

@@ -16,10 +16,12 @@
 
 #include "catch.hpp"
 #include "duckdb.hpp"
+#include "scan/test_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_extension.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <dlfcn.h>
 
@@ -123,8 +125,38 @@ TEST_CASE("static NVTX injection path resolves the host initializer", "[telemetr
   CHECK(::dlclose(handle) == 0);
 }
 
-TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telemetry_context]")
+TEST_CASE("telemetry_context without a memory manager uses the fallback GPU group",
+          "[telemetry_context]")
 {
+  const auto out_dir = std::filesystem::temp_directory_path() /
+                       ("sirius_telemetry_nomgr_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(out_dir);
+  telemetry_config config;
+  config.enable_quent     = true;
+  config.output_directory = out_dir.string();
+  config.engine_name      = "test-engine";
+
+  std::string worker_id, fallback_id;
+  {
+    auto context = telemetry_context::create(make_quent_context(config), config, nullptr);
+    REQUIRE(context->get_memory_context() != nullptr);
+    const auto& gpu0 = context->gpu_device_telemetry_handles(0);
+    // No manager means no declared devices: every ordinal resolves to the one fallback group.
+    REQUIRE(gpu0.device.id() == context->gpu_device_telemetry_handles(1).device.id());
+    worker_id   = uuid_str(context->worker_id().raw());
+    fallback_id = uuid_str(gpu0.device.id().raw());
+  }
+  const auto lines = read_all_telemetry_lines(out_dir);
+  REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
+  REQUIRE(any_line_with_all(lines, {"\"gpu-fallback\"", worker_id, fallback_id}));
+  std::filesystem::remove_all(out_dir);
+}
+
+TEST_CASE("telemetry_context nests threads under per-GPU device groups",
+          "[telemetry_context][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  auto manager       = initialize_memory_manager(2);
   const auto out_dir = std::filesystem::temp_directory_path() /
                        ("sirius_telemetry_test_" + std::to_string(::getpid()));
   std::filesystem::remove_all(out_dir);
@@ -138,7 +170,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id;
   {
     auto context =
-      telemetry_context::create(std::move(make_quent_context(config)), config, /*manager=*/nullptr);
+      telemetry_context::create(std::move(make_quent_context(config)), config, manager.get());
     const auto& gpu0 = context->gpu_device_telemetry_handles(0);
     worker_id        = uuid_str(context->worker_id().raw());
     gpu0_id          = uuid_str(gpu0.device.id().raw());

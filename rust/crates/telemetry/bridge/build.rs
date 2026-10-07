@@ -29,7 +29,9 @@ fn copy_headers(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../model.yaml");
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", model.display());
+    println!("cargo:rerun-if-env-changed=SIRIUS_TELEMETRY_BRIDGE_INCLUDE_DIR");
     let schema = quent_yaml::parse_from_file(model)?.schema;
     let options = quent_schema_codegen_cpp::Options {
         crate_name: "telemetry-bridge".to_owned(),
@@ -51,8 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .include(&include_dir)
         .std("c++20")
         .compile("telemetry_bridge");
-    let public_include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    copy_headers(&include_dir, &public_include)?;
-    println!("cargo:include={}", include_dir.display());
+    // Only CMake builds need the headers outside OUT_DIR. Copy just the trees C++ includes;
+    // the rest of include_dir mirrors absolute OUT_DIR paths and is not public API.
+    if let Some(public_include) = std::env::var_os("SIRIUS_TELEMETRY_BRIDGE_INCLUDE_DIR") {
+        let public_include = Path::new(&public_include);
+        for subtree in ["rust", "telemetry-bridge/gen"] {
+            copy_headers(&include_dir.join(subtree), &public_include.join(subtree))?;
+        }
+        println!("cargo:rerun-if-changed={}", public_include.display());
+    }
     Ok(())
 }
