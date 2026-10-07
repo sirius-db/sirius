@@ -10,14 +10,12 @@ wrapper. The engine and wrapper gitlinks record the supported revision.
 ## Shared development build
 
 Shared linkage is the default. From the repository root, use the existing
-Conda/Pixi environment to build Sirius and install it into a local prefix:
+Conda/Pixi environment. The root Makefile builds Sirius and its tests, installs
+Sirius into `build/release/install`, then builds the wrapper against it:
 
 ```sh
 git submodule update --init duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-pixi run cmake --preset release -DSIRIUS_BUILD_TESTS=OFF
-pixi run cmake --build build/release --target sirius_library
-pixi run cmake --install build/release --component sirius_library --prefix "$PWD/build/dev-install"
-pixi run make -C sirius-duckdb release EXT_FLAGS="-DCMAKE_PREFIX_PATH=$PWD/build/dev-install"
+pixi run make
 ```
 
 Run DuckDB with the environment's shared libraries on its runtime search path:
@@ -28,9 +26,9 @@ pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
   -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
-After changing Sirius,
-rebuild and reinstall the shared library, then restart DuckDB. Rebuild the wrapper
-when its code or the library interface changes. No Conda package build is needed.
+After changing Sirius, rerun `pixi run make`, then restart DuckDB. Use
+`pixi run make release` to build only Sirius and its tests. No Conda package build
+is needed.
 
 ## Static distribution build
 

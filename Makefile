@@ -19,7 +19,7 @@ MAIN_BUILD_TARGETS ?= sirius_library
 
 BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
-.PHONY: all release debug reldebug relwithdebinfo debug-release \
+.PHONY: all sirius-duckdb release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	test test_release test_debug test_reldebug clean list-presets \
 	s3-test s3-test-large s3-tpch \
@@ -28,7 +28,12 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
 CMAKE_INPUTS := CMakePresets.json cmake/CMakePresets.json CMakeLists.txt $(wildcard cmake/*.cmake)
 
-all: release
+all: sirius-duckdb
+
+sirius-duckdb: release
+	$(CMAKE) --install build/release --prefix "$(CURDIR)/build/release/install" --component sirius_library
+	$(MAKE) -C sirius-duckdb release SIRIUS_DUCKDB_LINKAGE=shared \
+		EXT_FLAGS="$(EXT_FLAGS) -Usirius_DIR -DCMAKE_PREFIX_PATH='$(CURDIR)/build/release/install' -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
 build/%/build.ninja: $(CMAKE_INPUTS)
 	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))"
@@ -85,7 +90,7 @@ test_reldebug: relwithdebinfo
 	$(RUN_UNIT_TESTS) --build-dir build/relwithdebinfo $(UNITTEST_ARGS)
 
 clean:
-	rm -rf build
+	rm -rf build sirius-duckdb/build
 
 list-presets:
 	$(CMAKE) --list-presets

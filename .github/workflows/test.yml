@@ -105,12 +105,6 @@ jobs:
             -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
           cmake --build "$sirius_test_dir/consumer"
 
-      - name: Build the DuckDB extension against the shared library
-        run: |
-          cmake --install build/release --prefix "$PWD/build/release/install" --component sirius_library
-          make -C sirius-duckdb release \
-            EXT_FLAGS="-DCMAKE_PREFIX_PATH=$PWD/build/release/install -DSIRIUS_DUCKDB_LINKAGE=shared -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
-
       - name: Surface build errors
         if: failure()
         run: |

@@ -58,10 +58,12 @@ git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 ```
 
-Build with Pixi (uses all available cores). The default target is `release` (GCC Release):
+Build with Pixi (uses all available cores). The default builds Sirius, its C++ tests,
+and the shared DuckDB extension in GCC Release mode:
 
 ```bash
-pixi run make                        # GCC Release (default)
+pixi run make                        # Sirius and DuckDB extension (GCC Release)
+pixi run make release                # Sirius and C++ tests only
 pixi run make clang-relwithdebinfo   # Clang RelWithDebInfo
 pixi run make clang-debug            # Clang Debug
 ```
@@ -72,7 +74,7 @@ If the build exhausts memory, reduce parallelism:
 CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
 ```
 
-Build the extension separately using [its Makefile](../sirius-duckdb/README.md).
+The extension can also be built separately using [its Makefile](../sirius-duckdb/README.md).
 
 ```bash
 pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"

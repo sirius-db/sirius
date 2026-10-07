@@ -31,8 +31,8 @@ Run commands through `pixi run <cmd>` (don't drop into the interactive `pixi she
 command runs in the activated environment:
 
 ```bash
-pixi run make                              # library and C++ tests (uses all cores)
-pixi run make clean                        # wipe the build dir (after a failed build, before rebuilding)
+pixi run make                              # library, C++ tests, and DuckDB extension (uses all cores)
+pixi run make clean                        # wipe the library and wrapper build dirs
 
 pixi run make test                         # build + run the C++ unit tests (scripts/run_unit_tests.py); make test_debug for debug
 

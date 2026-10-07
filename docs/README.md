@@ -58,8 +58,6 @@ git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run make TEST_BUILD_TARGET=
-pixi run cmake --install build/release --component sirius_library --prefix "$PWD/build/install"
-pixi run make -C sirius-duckdb release EXT_FLAGS="-DCMAKE_PREFIX_PATH=$PWD/build/install -DSIRIUS_DUCKDB_LINKAGE=shared"
 pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 

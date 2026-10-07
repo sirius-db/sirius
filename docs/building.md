@@ -3,17 +3,19 @@
 ## Separate DuckDB extension
 
 [`sirius-duckdb/`](../sirius-duckdb/README.md) contains the independent extension
-setup, with its own DuckDB checkout, Pixi environment, and Makefile. It consumes
+setup, with its own DuckDB checkout and Makefile. It consumes
 an installed shared or static Sirius CMake package and runs GPU SQL tests
-through the normal DuckDB extension test target. The root build produces only the Sirius libraries and C++ tests.
+through the normal DuckDB extension test target. The root CMake project builds the Sirius libraries and C++ tests.
+
+For local development, `pixi run make` builds Sirius and its C++ tests, installs
+Sirius under `build/release/install`, and builds the shared DuckDB extension in
+`sirius-duckdb/`. Use `pixi run make release` for just Sirius and its C++ tests,
+or invoke standalone CMake directly:
 
 ```bash
 pixi run cmake --preset release
 pixi run cmake --build --preset release --target sirius_library sirius_unittest
 ```
-
-`pixi run make` builds the same targets. Build the extension separately from
-`sirius-duckdb/` using its Makefile.
 
 ## Shared implementation objects
 
