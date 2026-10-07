@@ -3366,8 +3366,8 @@ TEST_CASE("S3 late physical refusal follows a published GPU batch and never repl
                    "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
                      directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    if (!sirius::test::put_s3_container_object(std::string("r2a-late/") + file,
-                                               read_binary_file(directory.path() / file))) {
+    if (!sirius::test::put_s3_test_object(std::string("r2a-late/") + file,
+                                          read_binary_file(directory.path() / file))) {
       SUCCEED("managed MinIO is required to upload the late-failure fixture");
       return;
     }
@@ -3448,8 +3448,8 @@ TEST_CASE("S3 mixed Parquet schemas flush between files on first and repeated re
     fixture.con,
     "COPY (SELECT 20::DOUBLE x) TO " + directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
   for (auto file : {"a.parquet", "b.parquet"}) {
-    REQUIRE(sirius::test::put_s3_container_object(std::string("r2a-d7/") + file,
-                                                  read_binary_file(directory.path() / file)));
+    REQUIRE(sirius::test::put_s3_test_object(std::string("r2a-d7/") + file,
+                                             read_binary_file(directory.path() / file)));
   }
   auto local = require_query_ok(
     fixture.con, "SELECT x FROM read_parquet(" + directory.file_literal("*.parquet") + ")");
