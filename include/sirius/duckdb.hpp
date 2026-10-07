@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <sirius/export.hpp>
+
 namespace duckdb {
 class ExtensionLoader;
 }
@@ -33,7 +35,6 @@ namespace sirius {
 ///   sirius::register_duckdb_extension(loader);
 /// }
 /// @endcode
-__attribute__((visibility("default"))) void register_duckdb_extension(
-  duckdb::ExtensionLoader& loader);
+SIRIUS_EXPORT void register_duckdb_extension(duckdb::ExtensionLoader& loader);
 
 }  // namespace sirius
