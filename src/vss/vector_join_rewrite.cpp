@@ -1511,7 +1511,6 @@ class rewriter {
     req.k           = k;
     req.dim         = static_cast<std::int64_t>(call.dim);
     req.output_type = cos ? vector_join_output_type::similarity : vector_join_output_type::distance;
-    req.probe_from_scan = true;
 
     auto const probe_bindings  = probe->GetColumnBindings();
     auto const corpus_bindings = corpus->GetColumnBindings();
@@ -1534,20 +1533,36 @@ class rewriter {
       vector_out =
         vector_out || (used.count(sub_bindings[j]) && sub_cols[j].probe_col == probe_vec);
     }
-    req.left.from_relation = true;
-    for (std::size_t i = 0; i < probe_bindings.size(); ++i) {
-      auto const name = "p" + std::to_string(i);
-      req.left.relation_columns.push_back(name);
-      if (probe_bindings[i] == probe_vec) { req.left.column = name; }
-      if (!emit.count(probe_bindings[i]) || (probe_bindings[i] == probe_vec && !vector_out)) {
-        continue;
+    // A probe that is a pinned table read whole -- a self-join over it, say -- is read from its
+    // pin, as the corpus is, rather than scanned onto the device ahead of the join and spilled
+    // back while the join catches up.
+    std::uint64_t pinned_probe_rows = 0;
+    bool const probe_pinned = !probe_scalar && !vector_out &&
+                              pinned_probe_side(probe,
+                                                probe_vec,
+                                                emit,
+                                                req.left,
+                                                returned_types,
+                                                returned_names,
+                                                probe_pos,
+                                                pinned_probe_rows);
+    req.probe_from_scan = !probe_pinned;
+    if (!probe_pinned) {
+      req.left.from_relation = true;
+      for (std::size_t i = 0; i < probe_bindings.size(); ++i) {
+        auto const name = "p" + std::to_string(i);
+        req.left.relation_columns.push_back(name);
+        if (probe_bindings[i] == probe_vec) { req.left.column = name; }
+        if (!emit.count(probe_bindings[i]) || (probe_bindings[i] == probe_vec && !vector_out)) {
+          continue;
+        }
+        req.left.output_columns.push_back(name);
+        probe_pos.emplace_back(probe_bindings[i], returned_types.size());
+        returned_types.push_back(probe->types[i]);
+        returned_names.push_back("left_" + name);
       }
-      req.left.output_columns.push_back(name);
-      probe_pos.emplace_back(probe_bindings[i], returned_types.size());
-      returned_types.push_back(probe->types[i]);
-      returned_names.push_back("left_" + name);
+      if (req.left.column.empty()) { return false; }
     }
-    if (req.left.column.empty()) { return false; }
 
     // Corpus columns the subquery emits and something above reads.
     std::vector<ColumnBinding> corpus_cols;
@@ -1656,9 +1671,9 @@ class rewriter {
     returned_types.push_back(duckdb::LogicalType::FLOAT);
     returned_names.push_back(cos ? "similarity" : "distance");
 
-    bind.left_rows         = probe->EstimateCardinality(_context);
+    bind.left_rows         = probe_pinned ? pinned_probe_rows : probe->EstimateCardinality(_context);
     bind.right_rows        = right_rows;
-    bind.probe_is_relation = true;
+    bind.probe_is_relation = !probe_pinned;
     auto const probe_rows  = bind.left_rows;
 
     auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
@@ -1674,12 +1689,14 @@ class rewriter {
     for (std::size_t i = 0; i < returned_types.size(); ++i) {
       get->AddColumnId(i);
     }
-    get->input_table_types = probe->types;
-    for (auto const& name :
-         get->bind_data->Cast<SiriusVectorJoinBindData>().req.left.relation_columns) {
-      get->input_table_names.push_back(name);
+    if (!probe_pinned) {
+      get->input_table_types = probe->types;
+      for (auto const& name :
+           get->bind_data->Cast<SiriusVectorJoinBindData>().req.left.relation_columns) {
+        get->input_table_names.push_back(name);
+      }
+      get->children.push_back(std::move(probe));
     }
-    get->children.push_back(std::move(probe));
     if (!pinned) { get->children.push_back(std::move(corpus)); }
     get->SetEstimatedCardinality(std::max<duckdb::idx_t>(probe_rows, 1) *
                                  static_cast<duckdb::idx_t>(k));
@@ -1744,11 +1761,12 @@ class rewriter {
       }
     }
     remap_above(p);
-    SIRIUS_LOG_INFO("[vector_join_rewrite] {} {} rewritten to sirius_knn_join_rel ({})",
+    SIRIUS_LOG_INFO("[vector_join_rewrite] {} {} rewritten to sirius_knn_join_rel ({}, {})",
                     cos ? "cosine" : "l2",
                     mode == vector_join_mode::per_row_top_k  ? "LATERAL top-" + std::to_string(k)
                     : mode == vector_join_mode::global_top_k ? "global top-" + std::to_string(k)
                                                              : std::string("all-pairs distance"),
+                    probe_pinned ? "pinned probe" : "probe relation",
                     pinned ? "pinned corpus" : "corpus relation");
     return true;
   }

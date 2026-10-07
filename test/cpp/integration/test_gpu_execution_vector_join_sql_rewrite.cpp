@@ -582,3 +582,28 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "array_distance(p.vec, c.vec) AS d FROM sr_floats c ORDER BY d LIMIT 5) n;");
   CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive > before.pairs_exhaustive);
 }
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a probe that is a pinned table is read from its pin",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // A self-join over a pinned table reads both sides from the pin; a probe with a filter is still
+  // scanned. DuckDB's answers either way.
+  SqlRewriteTables tables(*this);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT a.id, n.id, n.d FROM sr_probe a, LATERAL (SELECT b.id, array_distance(a.vec, b.vec) "
+    "AS d FROM sr_probe b ORDER BY d LIMIT 3) n;");
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT a.id, n.id FROM sr_corpus a, LATERAL (SELECT b.id, array_cosine_similarity(a.vec, "
+    "b.vec) AS s FROM sr_corpus b ORDER BY s DESC LIMIT 2) n WHERE a.id < 50;");
+  // The 30 self-pairs at distance 0, then the closest pair in both orders.
+  require_gpu_matches_duckdb(*con,
+                             "SELECT a.id, b.id, array_distance(a.vec, b.vec) AS d FROM sr_probe "
+                             "a, sr_probe b ORDER BY d LIMIT 32;");
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, array_distance(p.vec, c.vec) "
+    "AS d FROM sr_corpus c WHERE c.cat = 3 ORDER BY d LIMIT 4) n;");
+}
