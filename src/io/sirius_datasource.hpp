@@ -116,9 +116,11 @@ class sirius_datasource : public cudf::io::datasource {
   /// Backend-parsed metadata for this datasource's io_object, looked up in the
   /// ioctx's metadata store (null when no cache or no entry). Independent of
   /// the prefetching machinery.
-  [[nodiscard]] std::shared_ptr<io_object_metadata> metadata() const;
+  [[nodiscard]] std::shared_ptr<io_object_metadata> metadata(
+    std::string const& profile = "parquet-v1") const;
 
-  [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata);
+  [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata,
+                                    std::string const& profile = "parquet-v1");
 
   // ---- cudf::io::datasource overrides ---------------------------------------
 

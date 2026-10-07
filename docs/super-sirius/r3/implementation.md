@@ -70,3 +70,25 @@ Host-only Catch2 verification: 2 cases, 19 assertions passed using `pixi run
 local same-size mtime changes, identity after unlink while the fd is retained,
 and invalid-fd reporting. Full backend compilation is pending environment setup:
 the current include tree is missing cuda/std/iterator during synchronization.
+
+## S2: cache integration and retention
+
+Added process-shared metadata retention with per-store access namespaces, 1 GiB
+estimated retained charge, LRU, 30-minute idle expiry and a 60-second maintenance
+worker. Maintenance is interruptible and bounded to 256 removals per lock hold;
+objects are destroyed outside the manager lock. Oversized/unaccounted entries
+bypass retention. Candidates do not refresh idle time or authorize a hit.
+
+Footer lookup checks backend identity and reader profile. Raw prefetch keys use
+the same identity, and REST data-range requests attach the open's If-Match tag.
+Known-size/remote-kvikio opens without a tag use open-local identity. Local uring
+captures size and mtime together. Parser profiles conservatively include column
+selection and reader options; custom nested column schemas bypass retention.
+This can increase warm parses and remains a performance qualification item.
+
+Host cache tests: 5 cases / 28 assertions passed, including namespaces, profile
+and identity mismatch, replacement order, LRU, byte cap, oversized bypass,
+idle expiry without new accesses, shared ownership and concurrent insertion.
+Compilation checks using actual generated compiler flags passed the metadata
+store, resolver, kvikio, REST, uring, prefetch and datasource translation units;
+full build and integration execution remain in progress.

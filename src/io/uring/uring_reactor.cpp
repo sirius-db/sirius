@@ -580,9 +580,14 @@ std::unique_ptr<local_io_object> uring_reactor::create_io_object(std::string pat
                     strerror(errno));
   }
 
-  auto const file_size = size(buffered.get());
+  object_identity captured;
+  if (!capture_local_identity(buffered.get(), captured)) {
+    throw std::system_error(
+      errno, std::generic_category(), "uring_reactor::create_io_object: fstat");
+  }
+  auto const file_size = captured.size;
   return std::make_unique<local_io_object>(
-    std::move(path), std::move(buffered), std::move(direct), file_size);
+    std::move(path), std::move(buffered), std::move(direct), file_size, "", std::move(captured));
 }
 
 std::size_t uring_reactor::size(int native_handle)

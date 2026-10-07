@@ -23,6 +23,7 @@
 #include <cudf/io/parquet_schema.hpp>
 
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -62,6 +63,81 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
     const noexcept
   {
     return _file_metadata;
+  }
+
+  /// Conservative retained allocation estimate, computed outside cache locks.
+  /// Includes vector capacities and nested statistics, not compressed footer bytes.
+  [[nodiscard]] std::size_t retained_bytes() const noexcept override
+  {
+    size_t bytes = sizeof(*this) + sizeof(cudf::io::parquet::FileMetaData) + 64;
+    auto add     = [&](size_t n) {
+      bytes = n > std::numeric_limits<size_t>::max() - bytes ? std::numeric_limits<size_t>::max()
+                                                                 : bytes + n;
+    };
+    auto vector = [&](auto const& v) {
+      add(v.capacity() * sizeof(typename std::decay_t<decltype(v)>::value_type));
+    };
+    auto optional_vector = [&](auto const& v) {
+      if (v) vector(*v);
+    };
+    auto string = [&](auto const& v) { add(v.capacity() + 1); };
+    vector(original_schema);
+    vector(original_logical_annotations);
+    string(arrow_schema);
+    if (!_file_metadata) return bytes;
+    auto const& f = *_file_metadata;
+    vector(f.schema);
+    for (auto const& s : f.schema) {
+      string(s.name);
+      vector(s.children_idx);
+    }
+    vector(f.key_value_metadata);
+    for (auto const& kv : f.key_value_metadata) {
+      string(kv.key);
+      string(kv.value);
+    }
+    string(f.created_by);
+    optional_vector(f.column_orders);
+    vector(f.row_groups);
+    for (auto const& rg : f.row_groups) {
+      vector(rg.columns);
+      optional_vector(rg.sorting_columns);
+      for (auto const& c : rg.columns) {
+        string(c.file_path);
+        auto const& m = c.meta_data;
+        vector(m.encodings);
+        vector(m.path_in_schema);
+        for (auto const& p : m.path_in_schema)
+          string(p);
+        optional_vector(m.statistics.min);
+        optional_vector(m.statistics.max);
+        optional_vector(m.statistics.min_value);
+        optional_vector(m.statistics.max_value);
+        optional_vector(m.encoding_stats);
+        if (m.size_statistics) {
+          optional_vector(m.size_statistics->repetition_level_histogram);
+          optional_vector(m.size_statistics->definition_level_histogram);
+        }
+        if (c.offset_index) {
+          vector(c.offset_index->page_locations);
+          optional_vector(c.offset_index->unencoded_byte_array_data_bytes);
+        }
+        if (c.column_index) {
+          auto const& ci = *c.column_index;
+          add(ci.null_pages.capacity());
+          vector(ci.min_values);
+          vector(ci.max_values);
+          for (auto const& v : ci.min_values)
+            vector(v);
+          for (auto const& v : ci.max_values)
+            vector(v);
+          optional_vector(ci.null_counts);
+          optional_vector(ci.repetition_level_histogram);
+          optional_vector(ci.definition_level_histogram);
+        }
+      }
+    }
+    return bytes;
   }
 
   [[nodiscard]] std::size_t footer_byte_len() const noexcept { return _footer_byte_len; }
