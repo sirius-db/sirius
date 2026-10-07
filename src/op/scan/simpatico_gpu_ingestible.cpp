@@ -106,6 +106,8 @@ class simpatico_batch_coalescer : public batch_coalescer {
       // the read to the std::ifstream fallback in open_hpln_source -- no io_uring, no O_DIRECT, no
       // reads in flight -- for every coalesced split, which is all of them.
       _current->io_ctx = split->io_ctx;
+      // Likewise the contract: a coalesced split that lost it is rejected by the scan operator.
+      _current->set_contract_payload(split->contract_id(), {}, {});
     }
     // Ascending ids keep a batch's rows in file order and its reads sequential. The walk hands
     // chunks out in order, but several dispatcher threads may claim them, so the coalescer can
@@ -554,6 +556,9 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
     // decode will actually return rather than by the chunk it came from.
     split->num_rows      = live.num_rows;
     split->decoded_bytes = estimate_decoded_bytes(*_info, split->num_rows);
+    // The scan operator rejects a split not stamped with its scan's contract. A .hpln split
+    // carries no per-slice materializer certificates: the file's trailer is re-read per split.
+    split->set_contract_payload(_info->contract_id, {}, {});
     return split;
   };
 }
