@@ -26,11 +26,44 @@
 #include "duckdb/planner/planner.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <optional>
+#include <stdexcept>
 
 namespace sirius {
+namespace {
+void collect_read_views(op::sirius_physical_operator const& node,
+                        std::shared_ptr<transparent::read_view_registry>& result)
+{
+  std::shared_ptr<transparent::read_view_registry> candidate;
+  if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+    candidate = node.Cast<op::scan::sirius_gpu_scan_operator>().read_views();
+  } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+    candidate = node.Cast<op::sirius_physical_streaming_source>().read_views();
+  }
+  if (candidate) {
+    if (result && result != candidate) {
+      throw std::runtime_error("finalized GPU plan contains multiple read-view registries");
+    }
+    result = std::move(candidate);
+  }
+  for (auto const& child : node.get_children()) {
+    collect_read_views(child.get(), result);
+  }
+}
+}  // namespace
+
+sirius_prepared_statement_data::sirius_prepared_statement_data(
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared_p,
+  duckdb::unique_ptr<op::sirius_physical_operator> sirius_physical_plan_p)
+  : sirius_physical_plan(std::move(sirius_physical_plan_p)), prepared(std::move(prepared_p))
+{
+  if (sirius_physical_plan) { collect_read_views(*sirius_physical_plan, read_views); }
+}
 
 void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement,
                                         const duckdb::PendingQueryParameters& parameters)

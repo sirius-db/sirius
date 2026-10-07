@@ -181,6 +181,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager);
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id);
 
 }  // namespace sirius::scan_manager

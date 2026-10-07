@@ -866,7 +866,7 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::try_create(
       owned->arrays.reserve(state->keys.size());
       for (std::size_t index = 0; index < state->keys.size(); ++index) {
         owned->arrays.push_back(std::make_unique<rmm::device_buffer>(
-          geometry.raw_bytes, rmm::cuda_stream_view{owned->stream->value()}, lease->allocator()));
+          geometry.raw_bytes, owned->stream_ref(), lease->allocator()));
         check_cuda(cudaMemsetAsync(
                      owned->arrays.back()->data(), 0, geometry.raw_bytes, owned->stream->value()),
                    "cudaMemsetAsync(accumulated Bloom)");
@@ -973,8 +973,7 @@ accumulated_bloom_builder::finish(rmm::cuda_device_id root_device,
     auto const scratch_bytes =
       std::min<std::size_t>(2, total_chunks) * sources.size() * geometry.chunk_bytes;
     try {
-      scratch = std::make_unique<rmm::device_buffer>(
-        scratch_bytes, rmm::cuda_stream_view{stream.get()}, scratch_mr);
+      scratch = std::make_unique<rmm::device_buffer>(scratch_bytes, stream, scratch_mr);
     } catch (rmm::out_of_memory const&) {
       SIRIUS_LOG_DEBUG("[accumulated_bloom_builder::finish] publication scratch refused.");
       return std::nullopt;

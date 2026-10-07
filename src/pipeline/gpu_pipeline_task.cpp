@@ -696,7 +696,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                      pipeline->get_pipeline_id());
     throw oom_reschedule_exception(
       std::move(local_state._input_data),
-      0,
+      local_state._start_operator_index,
       std::string("OOM while preparing batches for processing: ") + oom.what());
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
@@ -812,8 +812,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         }
       }
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-      // Mid-pipeline retries use intermediate input units and must not affect the aggregate ratio.
-      // An OOM before processing restarts at index 0 with the original input and remains eligible.
+      // A prepare OOM resumes at the attempt's current start index. Only a start index of 0 keeps
+      // the original input and remains ratio-eligible. Mid-pipeline retries use intermediate input
+      // units and must not affect the aggregate ratio.
       bool const ratio_eligible = local_state._start_operator_index == 0;
       global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
       SIRIUS_LOG_TRACE(

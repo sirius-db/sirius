@@ -34,7 +34,8 @@
 #include "expression/date_trunc_unit.hpp"
 #include "expression/function_id.hpp"
 #include "expression/join_condition.hpp"  // sirius::comparison_type, sirius::from_duckdb(ExpressionType)
-#include "expression/value.hpp"           // sirius::from_duckdb(Value const&, logical_type const&)
+#include "expression/substring_slice.hpp"
+#include "expression/value.hpp"         // sirius::from_duckdb(Value const&, logical_type const&)
 #include "helper/type_conversions.hpp"  // sirius::from_duckdb(LogicalType const&)
 
 // duckdb
@@ -177,6 +178,32 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
     return nullptr;
   }
 
+  // cuDF casts can wrap where DuckDB CAST throws or TRY_CAST returns NULL. Reject
+  // unsigned integer casts unless the target carrier fits the full source domain.
+  // HUGEINT/UHUGEINT currently use INT64/UINT64 on the GPU.
+  // TODO: Implement checked GPU integer casts: return NULL on overflow for TRY_CAST
+  // and raise an error for CAST, allowing these conversions without CPU fallback.
+  if (source_type.IsUnsigned()) {
+    duckdb::idx_t target_value_bits = 0;
+    switch (target_type.id()) {
+      case duckdb::LogicalTypeId::TINYINT: target_value_bits = 7; break;
+      case duckdb::LogicalTypeId::SMALLINT: target_value_bits = 15; break;
+      case duckdb::LogicalTypeId::INTEGER: target_value_bits = 31; break;
+      case duckdb::LogicalTypeId::BIGINT:
+      case duckdb::LogicalTypeId::HUGEINT: target_value_bits = 63; break;
+      case duckdb::LogicalTypeId::UTINYINT: target_value_bits = 8; break;
+      case duckdb::LogicalTypeId::USMALLINT: target_value_bits = 16; break;
+      case duckdb::LogicalTypeId::UINTEGER: target_value_bits = 32; break;
+      case duckdb::LogicalTypeId::UBIGINT:
+      case duckdb::LogicalTypeId::UHUGEINT: target_value_bits = 64; break;
+      default: break;
+    }
+    if (target_value_bits != 0 &&
+        duckdb::GetTypeIdSize(source_type.InternalType()) * 8 > target_value_bits) {
+      return nullptr;
+    }
+  }
+
   auto child = from_duckdb(*expr.child);
   if (!child) { return nullptr; }
   return std::make_unique<node>(cast{
@@ -184,6 +211,25 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
     /*target_type=*/sirius::from_duckdb(target_type),
     /*try_cast=*/expr.try_cast,
   });
+}
+
+std::optional<int64_t> bigint_constant(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return std::nullopt; }
+  auto const& value = expr.Cast<duckdb::BoundConstantExpression>().value;
+  if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) { return std::nullopt; }
+  return value.GetValue<int64_t>();
+}
+
+// The GPU evaluator applies one slice to every row, so it needs constant BIGINT bounds that
+// gpu_substring_slice can map onto DuckDB's semantics.
+bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
+{
+  if (expr.children.size() != 2 && expr.children.size() != 3) { return false; }
+  auto const offset = bigint_constant(*expr.children[1]);
+  auto const length =
+    expr.children.size() == 3 ? bigint_constant(*expr.children[2]) : substring_default_length;
+  return offset && length && gpu_substring_slice(*offset, *length);
 }
 
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
@@ -204,6 +250,14 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     auto const& unit = duckdb::StringValue::Get(frequency);
     if (!parse_gpu_date_trunc_unit(unit)) { return nullptr; }
   }
+  if (*func_id_opt == function_id::constant_or_null) {
+    // The GPU evaluator reads the result value from a constant first argument.
+    if (expr.children.size() < 2 ||
+        expr.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+      return nullptr;
+    }
+  }
+  if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);

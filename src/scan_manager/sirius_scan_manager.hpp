@@ -511,6 +511,11 @@ class sirius_scan_manager {
 
   using ingestible_table_info = op::scan::ingestible_table_info;
 
+  /// Install the immutable S3 configuration resolved for @p path on the
+  /// client thread while binding a query. Matching scans and LIST/glob calls
+  /// reuse this snapshot; subsequent replacement affects only future lookups.
+  void install_s3_config(std::string_view path, sirius::io::object_store_config config);
+
   /// \brief Prepare per-scan state for the given query.
   ///
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
@@ -548,6 +553,10 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   void reset(sirius::query_id_t query_id);
 
+  /// Drain and drop this query's scan work while retaining checkpoint protection.
+  /// Used after mandatory cleanup fails, when releasing storage leases is unsafe.
+  void drain_query(sirius::query_id_t query_id);
+
   /// \brief Drop every query's state. Teardown only (stop(), the destructor, and the
   ///        failed-query backstop).
   void reset_all();
@@ -578,6 +587,14 @@ class sirius_scan_manager {
   /// pins ARE chunks in the cache being destroyed, so none of them can survive
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
+
+  /// Retain a checkpoint key until this execution window is reset. Pinning may hold
+  /// keys without registering scan providers, so their lifetime is tracked separately.
+  void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
+  [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
+  [[nodiscard]] std::size_t checkpoint_key_count() const noexcept;
+  [[nodiscard]] std::size_t checkpoint_key_count(sirius::query_id_t query_id) const noexcept;
 
   /// \brief Start the worker thread pool. Idempotent.
   void start();
@@ -953,10 +970,6 @@ class sirius_scan_manager {
     //! scan. Its slot map is keyed by operator id, which restarts at 0 per query.
     std::unique_ptr<load_balancing_scan_batch_coalescer> metadata_processor;
 
-    //! Prevents DuckDB checkpoints from replacing row groups between this query's pinned
-    //! validation and completion. Released when the state dies at reset(query_id).
-    std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> checkpoint_locks;
-
     //! This query's background host->GPU upgrader for queued pinned-cache splits (built in
     //! start_metadata_processing when the memory_prefetcher config block enables it, torn
     //! down first in drain(): it holds shared_ptrs to the operators' connectors and must
@@ -1020,13 +1033,15 @@ class sirius_scan_manager {
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.
-  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type);
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type,
+                                                    std::string_view path = {});
 
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
-  /// backend cannot be built.  The returned ioctx stays owned by this manager.
-  sirius::io::rest::rest_ioctx* rest_ioctx_for_list();
+  /// backend cannot be built. The caller shares ownership for the full LIST so
+  /// credential rotation cannot retire the context while a request is in flight.
+  std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -1036,14 +1051,29 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
-  /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
-  /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
-  /// threads + cache allocation happen outside the map mutex), while
+  /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
+  /// by the immutable resolved-config snapshot, not merely by backend type, so
+  /// credentials/endpoints can differ by path. `_routed_io_ctxs_build_mtx` serializes construction
+  /// (reactor threads + cache allocation happen outside the map mutex), while
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::ioctx>>
+  sirius::io::scoped_object_store_configs _s3_configs;
+  struct routed_ioctx_key {
+    sirius::io::io_context_type type;
+    std::uint64_t config_id;
+    bool operator==(routed_ioctx_key const&) const = default;
+  };
+  struct routed_ioctx_key_hash {
+    std::size_t operator()(routed_ioctx_key const& key) const noexcept
+    {
+      auto const type_hash = std::hash<sirius::io::io_context_type>{}(key.type);
+      auto const id_hash   = std::hash<std::uint64_t>{}(key.config_id);
+      return type_hash ^ (id_hash + 0x9e3779b9 + (type_hash << 6) + (type_hash >> 2));
+    }
+  };
+  std::unordered_map<routed_ioctx_key, std::shared_ptr<sirius::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
@@ -1104,6 +1134,14 @@ class sirius_scan_manager {
   /// hands over its own.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  struct checkpoint_lock_entry {
+    duckdb::AttachedDatabase* database;
+    duckdb::unique_ptr<duckdb::StorageLockKey> key;
+  };
+  void release_checkpoint_keys(sirius::query_id_t query_id);
+  std::map<sirius::query_id_t, std::vector<checkpoint_lock_entry>> _checkpoint_locks;
+  mutable std::mutex _checkpoint_locks_mutex;
+
   io::io_context_registry _ioctx_registry;
 };
 

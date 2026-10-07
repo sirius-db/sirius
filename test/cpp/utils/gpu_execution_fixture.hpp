@@ -283,6 +283,7 @@ class GpuExecutionFixture {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after_gpu_stats.read_view_mismatches == before_gpu_stats.read_view_mismatches);
     // Exactly one GPU execution, no fallback: proves the query ran on the GPU.
     sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 
