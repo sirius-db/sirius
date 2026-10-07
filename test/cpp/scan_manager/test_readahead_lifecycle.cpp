@@ -16,11 +16,14 @@
 
 #include "catch.hpp"
 #include "exec/config.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/rest/config.hpp"
+#include "io/sirius_datasource.hpp"
 #include "io/uring/config.hpp"
 #include "memory/topology_index.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -37,6 +40,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -708,4 +715,289 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
 
   manager.prepare_for_query(query.get(), false, std::vector<int>{0});
   CHECK_FALSE(manager.has_readahead_for_testing());
+}
+
+// ===========================================================================
+// resident-byte budget
+// ===========================================================================
+//
+// The gatekeeper returns a ticket when a prefetch LANDS, so it caps IO in
+// flight, not bytes held.  The byte budget is what stops landed-but-unconsumed
+// prefetches from filling the pinned host tier.
+
+namespace {
+/// A split with byte ranges but no datasource: enough to give it a footprint
+/// and a record to charge, without any IO behind it.
+std::shared_ptr<sirius::op::scan::scan_info> split_of(std::vector<std::int64_t> sizes)
+{
+  sirius::op::scan::scan_info::fadvise_entry entry;
+  std::int64_t offset = 0;
+  for (auto const size : sizes) {
+    entry.ranges.emplace_back(offset, size);
+    offset += size;
+  }
+  std::vector<sirius::op::scan::scan_info::fadvise_entry> hints;
+  hints.push_back(std::move(entry));
+  return std::make_shared<sirius::op::scan::scan_info>(std::move(hints));
+}
+}  // namespace
+
+TEST_CASE("a split's footprint is the sum of its fadvise ranges and is taken once",
+          "[scan_manager][readahead][resident]")
+{
+  auto split = split_of({100, 200, 0});
+  CHECK(split->prefetch_footprint_bytes() == 300);
+
+  split->set_readahead_resident_bytes(300);
+  CHECK(split->take_readahead_resident_bytes() == 300);
+  CHECK(split->take_readahead_resident_bytes() == 0);
+}
+
+TEST_CASE("the byte budget charges, refunds, and releases exactly once",
+          "[scan_manager][readahead][resident]")
+{
+  using sirius::scan_manager::readahead_byte_budget;
+  std::atomic<std::uint64_t> peak{0};
+  readahead_byte_budget budget{1000};
+  auto first  = split_of({600});
+  auto second = split_of({600});
+
+  CHECK(budget.admits(600));
+  CHECK(budget.charge(*first, 600, &peak) == 600);
+  CHECK(budget.resident() == 600);
+  CHECK(peak.load() == 600);
+  // A second split of the same size would overrun the budget; a small one fits.
+  CHECK_FALSE(budget.admits(600));
+  CHECK(budget.admits(400));
+
+  SECTION("a prefetch that issued no IO is refunded")
+  {
+    budget.release(*first);
+    CHECK(budget.resident() == 0);
+  }
+  SECTION("a refund and a later dispose do not release twice")
+  {
+    budget.charge(*second, 400, &peak);
+    budget.release(*first);  // e.g. no IO went out
+    budget.release(*first);  // ...and the split is disposed later
+    CHECK(budget.resident() == 400);
+    CHECK(peak.load() == 1000);
+  }
+}
+
+TEST_CASE("nothing resident always admits, so an oversize split cannot deadlock",
+          "[scan_manager][readahead][resident]")
+{
+  using sirius::scan_manager::readahead_byte_budget;
+  readahead_byte_budget tiny{100};
+  CHECK(tiny.admits(1'000'000));
+
+  readahead_byte_budget unlimited{0};
+  auto split = split_of({1'000'000});
+  unlimited.charge(*split, 1'000'000, nullptr);
+  CHECK(unlimited.admits(1'000'000));
+}
+
+TEST_CASE("a charge against an already-disposed split is released at once",
+          "[scan_manager][readahead][resident]")
+{
+  // The consumer disposed the split before the readahead recorded its charge,
+  // so the dispose found nothing to release.  The charge must notice.
+  using sirius::scan_manager::readahead_byte_budget;
+  readahead_byte_budget budget{1000};
+  auto split = split_of({500});
+  split->set_scan_stage(scan_stage::disposed);
+  budget.charge(*split, 500, nullptr);
+  CHECK(budget.resident() == 0);
+}
+
+TEST_CASE("the readahead summary reports the resident budget",
+          "[scan_manager][readahead][resident][counters]")
+{
+  auto sm = make_event_publisher();
+  readahead_scan_manager m{*sm, 4, 4096};
+  CHECK(m.max_resident_bytes() == 4096);
+  CHECK(m.resident_bytes() == 0);
+  auto const line = m.summary();
+  INFO(line);
+  CHECK(line.find("resident_waits=0 host_pressure_waits=0") != std::string::npos);
+  CHECK(line.find("resident[peak=0 now=0 max=4096]") != std::string::npos);
+}
+
+namespace {
+/// A real on-disk file, so the uring backend can open it and prefetches do IO.
+struct readahead_data_file {
+  std::filesystem::path path;
+
+  explicit readahead_data_file(std::size_t bytes)
+  {
+    path = std::filesystem::temp_directory_path() /
+           ("sirius_readahead_resident_" + std::to_string(::getpid()) + "_" +
+            std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    std::ofstream out(path, std::ios::binary);
+    std::vector<char> data(bytes, 'r');
+    out.write(data.data(), static_cast<std::streamsize>(bytes));
+  }
+
+  ~readahead_data_file()
+  {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+};
+
+template <typename Pred>
+bool eventually(Pred pred, std::chrono::milliseconds budget = std::chrono::milliseconds{3000})
+{
+  auto const deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (pred()) { return true; }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  return pred();
+}
+
+/// A uring-backed scan manager with a prefetching cache, used only for its
+/// datasources: the readahead under test is built by the test itself.
+struct resident_fixture {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
+    initialize_memory_manager(1);
+  std::shared_ptr<const sirius::memory::topology_index> topology = single_gpu_index();
+  std::unique_ptr<sirius::scan_manager::sirius_scan_manager> manager;
+  /// One cache chunk per split, laid out a chunk apart, so no two splits share
+  /// a chunk and each prefetch does IO of its own.
+  std::int64_t split_bytes{0};
+  std::unique_ptr<readahead_data_file> file;
+  single_scan_query query;
+  std::shared_ptr<sirius::event::query_event_publisher> publisher = make_event_publisher();
+
+  resident_fixture()
+  {
+    scan_manager_config cfg;
+    cfg.thread_pool.num_threads = 3;
+    cfg.uring_n_reactors        = 1;
+    cfg.cache.mode              = cache_mode::sirius;
+    cfg.cache.eviction          = eviction_policy::lru;
+    cfg.max_readahead_scans     = 0;
+    cfg.apply_cache_mode();
+    manager = std::make_unique<sirius::scan_manager::sirius_scan_manager>(cfg, *memory, topology);
+    auto* cache = manager->io_ctx()->cache();
+    REQUIRE(cache != nullptr);
+    REQUIRE(cache->is_armed());
+    split_bytes = static_cast<std::int64_t>(cache->chunk_size());
+    file        = std::make_unique<readahead_data_file>(8 * cache->chunk_size());
+  }
+
+  struct split_input {
+    std::shared_ptr<sirius::io::sirius_datasource> datasource;
+    std::shared_ptr<sirius::op::scan::scan_info> info;
+    std::unique_ptr<sirius::op::scan::scan_operator_input> input;
+  };
+
+  split_input make_split(std::shared_ptr<readahead_scan_manager> const& readahead, int index)
+  {
+    split_input out;
+    out.datasource = manager->create_datasource(file->path.string());
+    REQUIRE(out.datasource != nullptr);
+    std::vector<sirius::op::scan::scan_info::fadvise_entry> hints;
+    hints.push_back(
+      {out.datasource, {cudf::io::text::byte_range_info{index * split_bytes, split_bytes}}});
+    out.info  = std::make_shared<sirius::op::scan::scan_info>(std::move(hints));
+    out.input = std::make_unique<sirius::op::scan::scan_operator_input>(out.info, readahead, 1, 0);
+    return out;
+  }
+};
+
+bool prefetched(sirius::op::scan::scan_info const& info)
+{
+  return info.get_prefetch_state() == sirius::op::scan::scan_info::prefetch_state::prefetched;
+}
+}  // namespace
+
+TEST_CASE("the readahead does not issue past its resident budget until a split is disposed",
+          "[scan_manager][readahead][resident]")
+{
+  resident_fixture fx;
+  auto const split = static_cast<std::size_t>(fx.split_bytes);
+  // Room for one split and a half: the second must wait for the first to go.
+  auto readahead = std::make_shared<readahead_scan_manager>(*fx.publisher, 4, split + split / 2);
+  readahead->prepare_for_query(fx.query.get());
+  readahead->start(sirius::scan_manager::prefetch_strategy::eager);
+
+  auto first  = fx.make_split(readahead, 0);
+  auto second = fx.make_split(readahead, 2);
+  auto third  = fx.make_split(readahead, 4);
+
+  REQUIRE(eventually([&] { return prefetched(*first.info); }));
+  REQUIRE(eventually([&] { return readahead->counters().resident_waits.load() > 0; }));
+  // Give a worker that ignored the budget every chance to issue the rest.
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(prefetched(*second.info));
+  CHECK_FALSE(prefetched(*third.info));
+  CHECK(readahead->resident_bytes() == split);
+
+  // Disposing the first frees its bytes, which admits exactly one more.
+  first.input.reset();
+  REQUIRE(eventually([&] { return prefetched(*second.info); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(prefetched(*third.info));
+  CHECK(readahead->resident_bytes() == split);
+
+  second.input.reset();
+  REQUIRE(eventually([&] { return prefetched(*third.info); }));
+  third.input.reset();
+  CHECK(eventually([&] { return readahead->resident_bytes() == 0; }));
+  CHECK(readahead->counters().resident_peak.load() <= split + split / 2);
+  INFO(readahead->summary());
+  readahead->stop();
+}
+
+TEST_CASE("the readahead issues a split larger than its budget when nothing is resident",
+          "[scan_manager][readahead][resident]")
+{
+  resident_fixture fx;
+  auto const split = static_cast<std::size_t>(fx.split_bytes);
+  auto readahead   = std::make_shared<readahead_scan_manager>(*fx.publisher, 4, split / 2);
+  readahead->prepare_for_query(fx.query.get());
+  readahead->start(sirius::scan_manager::prefetch_strategy::eager);
+
+  auto first  = fx.make_split(readahead, 0);
+  auto second = fx.make_split(readahead, 2);
+
+  // Oversize, but alone: issued rather than parked forever.
+  REQUIRE(eventually([&] { return prefetched(*first.info); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(prefetched(*second.info));
+
+  first.input.reset();
+  CHECK(eventually([&] { return prefetched(*second.info); }));
+  second.input.reset();
+  CHECK(eventually([&] { return readahead->resident_bytes() == 0; }));
+  readahead->stop();
+}
+
+TEST_CASE("host pressure holds the readahead back while anything is resident",
+          "[scan_manager][readahead][resident]")
+{
+  resident_fixture fx;
+  std::atomic<bool> pressure{true};
+  // No byte bound: only the probe stands in the way.
+  auto readahead = std::make_shared<readahead_scan_manager>(
+    *fx.publisher, 4, 0, [&pressure] { return pressure.load(); });
+  readahead->prepare_for_query(fx.query.get());
+  readahead->start(sirius::scan_manager::prefetch_strategy::eager);
+
+  auto first  = fx.make_split(readahead, 0);
+  auto second = fx.make_split(readahead, 2);
+
+  // Nothing resident, so pressure alone does not stop the first.
+  REQUIRE(eventually([&] { return prefetched(*first.info); }));
+  REQUIRE(eventually([&] { return readahead->counters().host_pressure_waits.load() > 0; }));
+  CHECK_FALSE(prefetched(*second.info));
+
+  pressure = false;
+  CHECK(eventually([&] { return prefetched(*second.info); }));
+  first.input.reset();
+  second.input.reset();
+  readahead->stop();
 }

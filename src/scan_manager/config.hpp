@@ -129,6 +129,11 @@ inline bool enum_to_string(io_backend b, std::string& s)
 struct readahead_plan {
   std::size_t budget{0};
   prefetch_strategy strategy{prefetch_strategy::eager};
+  /// Bytes the readahead may hold pinned in landed-but-unconsumed prefetches at
+  /// once; 0 means unlimited.  @c budget caps IO in flight, which says nothing
+  /// about how much a fast backend leaves resident between landing and the
+  /// consumer disposing the split -- this is what bounds that.
+  std::size_t max_resident_bytes{0};
 };
 
 /// The scan depth and scheduling preference published by one IO backend.
@@ -232,6 +237,14 @@ struct scan_manager_config {
   /// strategy whatever the backend.
   std::optional<prefetch_strategy> readahead_strategy{};
 
+  /// Bytes the readahead may hold in prefetched splits the consumer has not yet
+  /// disposed.  Unset (the default) takes the smallest prefetching budget
+  /// (@c cache.eviction_threshold_fraction of the host tier) among the caches
+  /// the query reads through, so the eviction threshold also bounds what the
+  /// readahead keeps resident; see @ref resolve_readahead.  @c 0 means no byte
+  /// bound -- only the scan count (@ref max_readahead_scans) applies.
+  std::optional<std::size_t> max_readahead_bytes{};
+
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
   /// non-scan deployment is only useful while the executor could still take
@@ -278,10 +291,17 @@ struct scan_manager_config {
   /// backend serving the scans — its @c n_max_concurrent_scans and the
   /// preference implied by its reactor type — and are what an unset
   /// @ref max_readahead_scans / @ref readahead_strategy defers to.
-  [[nodiscard]] readahead_plan resolve_readahead(std::size_t backend_budget,
-                                                 prefetch_strategy backend_strategy) const noexcept
+  /// @p cache_resident_budget is the smallest prefetching budget among the
+  /// query's caches (0 when none is armed), which an unset
+  /// @ref max_readahead_bytes defers to.
+  [[nodiscard]] readahead_plan resolve_readahead(
+    std::size_t backend_budget,
+    prefetch_strategy backend_strategy,
+    std::size_t cache_resident_budget = 0) const noexcept
   {
-    readahead_plan plan{.budget = 0, .strategy = readahead_strategy.value_or(backend_strategy)};
+    readahead_plan plan{.budget             = 0,
+                        .strategy           = readahead_strategy.value_or(backend_strategy),
+                        .max_resident_bytes = max_readahead_bytes.value_or(cache_resident_budget)};
     // An explicit budget is the whole answer, zero (off) included.
     if (max_readahead_scans.has_value()) {
       plan.budget = *max_readahead_scans;

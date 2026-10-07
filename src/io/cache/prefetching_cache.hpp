@@ -309,6 +309,12 @@ class prefetching_cache {
   /// rather than a value to compute an exact target from.
   [[nodiscard]] std::size_t claimed_bytes() const noexcept;
 
+  /// Bytes the pool may hold for prefetching before the evictor starts
+  /// reclaiming: @c eviction_threshold_fraction of the host tier, chunk
+  /// aligned.  An eviction trigger here, not a cap; the readahead uses it as
+  /// its resident-byte bound so the two agree.  0 without a pool.
+  [[nodiscard]] std::size_t max_prefetching_budget_bytes() const noexcept;
+
   /// Ask the evictor to free at least @p bytes_to_free bytes of staging memory.
   ///
   /// Asynchronous and best-effort: this enqueues the demand and returns.  The

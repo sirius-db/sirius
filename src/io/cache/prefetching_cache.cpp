@@ -1112,6 +1112,11 @@ std::size_t prefetching_cache::claimed_bytes() const noexcept
   return _pool ? _pool->total_allocated_bytes() : 0;
 }
 
+std::size_t prefetching_cache::max_prefetching_budget_bytes() const noexcept
+{
+  return _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
+}
+
 void prefetching_cache::evict(std::size_t bytes_to_free)
 {
   // Nothing to free, nothing holding memory, or a cache on its way down -- in

@@ -1563,20 +1563,49 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   {
     std::vector<backend_readahead_policy> backend_policies;
     backend_policies.reserve(query_io_ctxs.size());
+    // The resident-byte bound an unset `max_readahead_bytes` defers to: the
+    // tightest prefetching budget among the caches this query reads into.  The
+    // gatekeeper only caps IO in flight -- a ticket returns when a prefetch
+    // lands -- so without this a fast backend fills the pinned host tier with
+    // landed-but-unconsumed prefetches, and the cache's eviction threshold,
+    // being only a trigger, never stops it.
+    std::size_t cache_resident_budget = 0;
     for (auto const& io_ctx : query_io_ctxs) {
       // Nowhere to read ahead into on this backend, so it has no say in the
       // readahead's terms.
       if (!io_ctx->can_use_prefetching_cache()) { continue; }
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
+      if (auto* cache = io_ctx->cache(); cache != nullptr && cache->is_armed()) {
+        if (auto const bytes = cache->max_prefetching_budget_bytes(); bytes > 0) {
+          cache_resident_budget =
+            cache_resident_budget == 0 ? bytes : std::min(cache_resident_budget, bytes);
+        }
+      }
     }
     auto const backend = select_readahead_backend(backend_policies);
-    auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
+    auto const plan =
+      _config.resolve_readahead(backend.budget, backend.strategy, cache_resident_budget);
 
     if (plan.budget > 0) {
+      // Hold the readahead back while any host space wants memory returned:
+      // prefetched chunks are pinned host memory, and REST staging and spills
+      // draw from the same tier without a reservation of their own.
+      std::function<bool()> host_under_pressure = [this] {
+        for (auto const* space :
+             _reservation_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+          if (space != nullptr && space->should_downgrade_memory()) { return true; }
+        }
+        return false;
+      };
+      SIRIUS_LOG_DEBUG("[sirius_scan_manager] readahead: scans={} max_resident_bytes={}",
+                       plan.budget,
+                       plan.max_resident_bytes);
       // Registers its mailbox for the query's lifetime; unregistered in reset().
-      state->readahead =
-        std::make_shared<readahead_scan_manager>(*_query_event_publisher, plan.budget);
+      state->readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher,
+                                                                  plan.budget,
+                                                                  plan.max_resident_bytes,
+                                                                  std::move(host_under_pressure));
       state->readahead->prepare_for_query(query);
       state->readahead->start(plan.strategy);
     }

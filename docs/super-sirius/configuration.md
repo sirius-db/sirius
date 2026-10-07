@@ -324,6 +324,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `max_readahead_bytes` | bytes | — (unset) | Bytes the readahead may hold in prefetched splits that have landed but not yet been disposed. Unset takes the smallest prefetching budget (`cache.eviction_threshold_fraction` of the host tier) among the armed caches the query reads through; `0` means no byte bound. Accepts byte strings (`2GiB`). See below. |
 | `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
@@ -349,6 +350,13 @@ When the readahead ends up `opportunistic` (either way), an *unset* `max_readahe
 against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
 deployment is only useful while a pipeline thread could still pick up another scan. An explicit
 `max_readahead_scans` wins over that substitution.
+
+`max_readahead_scans` caps IO *in flight* — a slot comes back when a prefetch lands — so on its own it
+does not bound how many landed-but-unconsumed prefetches sit pinned in the host tier.
+`max_readahead_bytes` does: the readahead holds a candidate back while issuing it would take the
+resident total past the budget, and also while any HOST memory space reports it should downgrade
+(`memory_space::should_downgrade_memory()`), until a split is disposed. With nothing resident it
+always issues, so a split larger than the budget runs alone rather than stalling.
 
 Both are resolved against a single backend: the live one publishing the widest
 `n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
