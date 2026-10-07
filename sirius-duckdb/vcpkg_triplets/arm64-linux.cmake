@@ -23,3 +23,5 @@ if(VCPKG_CUDA_ARCHITECTURES STREQUAL "")
       "Set VCPKG_CUDA_ARCHITECTURES to an explicit CUDA architecture list")
 endif()
 set(VCPKG_ENV_PASSTHROUGH VCPKG_CUDA_VERSION VCPKG_CUDA_ARCHITECTURES)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/sirius/source-inputs.cmake")

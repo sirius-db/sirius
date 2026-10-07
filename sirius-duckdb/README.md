@@ -32,8 +32,8 @@ is needed.
 
 ## Static distribution build
 
-The Makefile builds and installs Sirius from the local checkout before building
-the extension. Its vcpkg manifest supplies only third-party static dependencies.
+The local vcpkg overlay port builds and installs Sirius from this checkout,
+alongside its static dependencies. The extension uses that installed package.
 The final extension link bundles those libraries; the
 post-link check rejects unexpected runtime dependencies. NVIDIA driver libraries
 and standard Linux libraries remain external.
@@ -56,15 +56,15 @@ The Makefile exports this from Pixi's `CUDAARCHS`. Direct vcpkg users must set
 Use separate build directories when switching toolchains or linkage modes.
 
 Both linkage modes use the local engine sources, including uncommitted changes.
-The wrapper Makefile installs its engine build under
-`build/sirius-<linkage>/<configuration>/install`. Rerunning Make rebuilds changed
-sources; vcpkg's third-party dependency caches remain reusable. Distribution CI
-uses the same flow, with `configure_ci` initializing the engine's submodules.
+The static port hashes source contents and filenames, including the engine's
+submodules, so source edits invalidate Sirius's package without invalidating
+third-party dependency caches. Distribution CI uses the same port, with
+`configure_ci` initializing the engine's submodules.
 
-To consume an existing Sirius installation instead of building the local engine,
-set `SIRIUS_INSTALL_DIR` to its absolute prefix. The root Makefile uses this to
-reuse its `build/release/install` package. The wrapper CMake project itself only
-uses `find_package(sirius)` and never builds the engine.
+For shared builds, first build/install Sirius with the root Makefile or CMake,
+then pass its prefix as `SIRIUS_INSTALL_DIR` (or use CMake's normal package search
+path). The root Makefile does this automatically. The wrapper CMake project only
+uses `find_package(sirius)` and never builds the engine itself.
 
 Both builds produce
 `build/release/extension/sirius/sirius.duckdb_extension` under this directory.

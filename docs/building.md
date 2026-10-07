@@ -85,24 +85,24 @@ The wrapper owns the vcpkg dependency setup. Build and install the local static
 library without building the extension:
 
 ```bash
-git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/extension-ci-tools
-pixi run -e vcpkg make -C sirius-duckdb sirius-release \
-  SIRIUS_DUCKDB_LINKAGE=static \
-  VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
+git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg
+VCPKG_CUDA_ARCHITECTURES=100 pixi run -e vcpkg sirius-duckdb/vcpkg/vcpkg install \
+  --x-manifest-root=sirius-duckdb --x-feature=static \
+  --x-install-root=build/static-install
 ```
 
-The installed package is in `sirius-duckdb/build/sirius-static/release/install`.
-Vcpkg supplies third-party dependencies; Sirius is built from the checkout,
-including uncommitted changes. Set `VCPKG_CUDA_ARCHITECTURES` to select the GPU
-architecture list for Sirius and its dependencies.
+The installed package and dependencies are in `build/static-install/<triplet>`.
+The Sirius overlay port builds this checkout, including uncommitted changes.
+Replace `100` with the GPU architecture list you need;
+`VCPKG_CUDA_ARCHITECTURES` applies to Sirius and its dependencies.
 
 Consumers use `find_package(sirius CONFIG REQUIRED COMPONENTS static)` and link
 `sirius::sirius_static`, with the dependency packages available through the vcpkg
 toolchain. The final consumer chooses its compiler-runtime linkage.
 
 For extension development, use the shared library with Conda/Pixi dependencies.
-For distribution, the wrapper Makefile builds the local static package and
-the final extension link bundles its dependencies. See the
+For distribution, vcpkg builds the local static package and the final extension
+link bundles its dependencies. See the
 [wrapper instructions](../sirius-duckdb/README.md) for both paths.
 
 Static consumers select their own compiler runtime linkage. The distribution
