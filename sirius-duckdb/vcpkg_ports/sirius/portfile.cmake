@@ -1,6 +1,6 @@
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
-set(sirius_url https://github.com/mbrobbel/sirius.git)
+set(sirius_url https://github.com/sirius-db/sirius.git)
 set(sirius_ref 72c326f0e2c813fe5a10f014564fbc6d36b5fb7f)
 vcpkg_from_git(OUT_SOURCE_PATH SOURCE_PATH URL "${sirius_url}" REF
                "${sirius_ref}")
