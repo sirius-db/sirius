@@ -52,8 +52,8 @@ std::unique_ptr<cudf::table> import(sirius::test::arrow_batch& batch,
                                     const std::vector<std::string>& names,
                                     const std::vector<sirius::logical_type>& types)
 {
-  return sirius::import_arrow_host_table(&batch.schema,
-                                         &batch.array,
+  return sirius::import_arrow_host_table(&batch.array,
+                                         &batch.schema,
                                          "test batch",
                                          names,
                                          types,
@@ -106,6 +106,18 @@ TEST_CASE("arrow_host_import: a window on the struct selects its rows from every
           std::vector<std::int64_t>{2, 3, 4, 5, 6});
 }
 
+TEST_CASE("arrow_host_import: a window counts only the nulls inside it", "[arrow_host_import]")
+{
+  // Nulls at rows 0 and 3; the window [2, 7) holds only row 3's.
+  auto batch = arrow_batch_from_sql(
+    "SELECT CASE WHEN i IN (0, 3) THEN NULL ELSE i END::BIGINT AS a FROM range(10) t(i)");
+  batch->array.offset = 2;
+  batch->array.length = 5;
+  auto table          = import(*batch, {"a"}, declared({duckdb::LogicalType::BIGINT}));
+  REQUIRE(table->get_column(0).size() == 5);
+  REQUIRE(table->get_column(0).null_count() == 1);
+}
+
 TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before any copy",
           "[arrow_host_import]")
 {
@@ -153,6 +165,12 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
     batch->array.children = nullptr;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("missing or released"));
     batch->array.children = children;
+  }
+  SECTION("a format cudf refuses")
+  {
+    column.format = "tts";  // time32[s]: cudf has no time type
+    REQUIRE_THROWS_AS(import(*batch, {"a"}, bigint), sirius::invalid_input_exception);
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("was refused by cudf"));
   }
   SECTION("more rows than cudf holds")
   {
