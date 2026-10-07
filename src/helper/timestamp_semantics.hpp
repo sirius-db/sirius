@@ -27,10 +27,12 @@
 
 namespace sirius::temporal {
 
-// Sirius temporal semantics currently match DuckDB: signed epoch ticks, exactly
-// +/-MAX reserved for infinity, MIN finite, and NULL propagated. Frontends must
-// normalize to this representation before using these helpers. No frontend types
-// or frontend identity are needed by the GPU evaluator.
+/**
+ * Sirius temporal semantics currently match DuckDB: signed epoch ticks, exactly
+ * +/-MAX reserved for infinity, MIN finite, and NULL propagated. Frontends must
+ * normalize to this representation before using these helpers. No frontend types
+ * or frontend identity are needed by the GPU evaluator.
+ */
 
 /**
  * Returns a nullable BOOL8 mask: true for finite values, false for +/-infinity,
