@@ -60,6 +60,12 @@ for q in $QUERIES; do
   dir=$(ls -dt "$OUTDIR"/tpch_*_"${NAME}_q$q" 2>/dev/null | head -1)
   if [ $rc -eq 0 ] && [ -n "$best" ]; then
     status=ok
+  elif grep -qE 'Token has expired|Error when retrieving token|NoCredentials|Unable to locate credentials' "$log"; then
+    # Nothing after this can run either: stop the arm rather than record every
+    # remaining query as failed. Resume with QUERIES=... after `aws sso login`.
+    printf 'q%s\t%s\t%s\t%s\n' "$q" credentials_expired - - | tee -a "$OUT"
+    echo "S3 credentials expired; stopping. Re-run 'aws sso login' and resume." >&2
+    break
   elif [ "$after" -gt "$before" ]; then
     status=watchdog_killed      # host memory floor hit during this query
   elif [ $rc -eq 137 ]; then
