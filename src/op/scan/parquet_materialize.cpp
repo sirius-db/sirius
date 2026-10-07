@@ -223,12 +223,32 @@ std::unique_ptr<cudf::table> materialize_bulk(
   // had fully landed, so the backend never saw more than one file's worth of
   // requests at a time. Peak device memory is unchanged -- every source's buffers
   // were already held until the decode either way.
+  //
+  // Every read must be waited out before its buffers can be released. An issue
+  // that throws part-way -- typically an OOM allocating a later source's chunks,
+  // which is routine under memory pressure and retried by the executor -- would
+  // otherwise unwind `pending` and free the earlier sources' buffers while their
+  // reads are still in flight, and the backend then copies into freed device
+  // memory (seen as a SIGSEGV in cuMemcpyBatchAsync on the REST reactor thread).
+  // std::future's destructor does not wait, so the drain has to be explicit, and
+  // a failed read must not skip waiting on the others for the same reason.
   std::vector<pending_chunks> pending;
   pending.reserve(sources.size());
-  for (std::size_t i = 0; i < sources.size(); ++i) {
-    pending.push_back(issue_chunks(sources[i], options, ranges_for(ranges, i), stream, mr));
+  auto drain = [&pending]() noexcept {
+    for (auto& p : pending) {
+      if (p.done.valid()) { p.done.wait(); }
+    }
+  };
+  try {
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+      pending.push_back(issue_chunks(sources[i], options, ranges_for(ranges, i), stream, mr));
+    }
+  } catch (...) {
+    drain();
+    throw;
   }
 
+  drain();
   for (auto& p : pending) {
     std::ignore = p.done.get();
   }
