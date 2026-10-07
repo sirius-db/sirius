@@ -641,7 +641,86 @@ void test_str_split_plan_shapes_roundtrip()
   memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
 }
 
+// Validity survives both serialization paths. The sidecar is not a leaf, so it
+// travels in its own per-column header record rather than through describe() --
+// this covers the file path, the pinned in-memory path, and the two fast paths
+// that write no payload bytes at all.
+void test_validity_sidecar_roundtrip()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  // Mixed validity: a real bitmask is written to the payload region.
+  auto mixed = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  std::vector<std::int32_t> host(128);
+  for (int r = 0; r < 128; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 31 + 7) % 5000);
+  if (cudaMemcpy(mixed->mutable_view().head<std::int32_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("validity_sidecar: cudaMemcpy failed");
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 70, 96, /*valid=*/false, stream);
+  mixed->set_null_count(27);
+  cudf::table_view mixed_tbl({mixed->view()});
+  io_roundtrip("validity_mixed", mixed_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_mixed_mem", mixed_tbl, "input -> delta -> differences\n");
+
+  // All null: nothing is written to the payload, so this also checks that the
+  // reader rebuilds the mask from the kind alone.
+  auto all_null = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  all_null->set_null_count(64);
+  cudf::table_view an_tbl({all_null->view()});
+  io_roundtrip("validity_all_null", an_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_all_null_mem", an_tbl, "input -> delta -> differences\n");
+
+  // Nullable STRING through str_split, where validity used to be a routed channel.
+  std::vector<bool> valid = {true, false, true, true, false, true};
+  auto strs = make_strings_table({"alpha", "", "gamma", "delta", "x", "zeta"}, valid, stream);
+  io_roundtrip("validity_strings", strs->view(), "input -> str_split\n");
+  memory_roundtrip("validity_strings_mem", strs->view(), "input -> str_split\n");
+}
+
 }  // namespace
+
+// DECIMAL128 through bitpack, over BOTH serialization seams.
+//
+// This is the only layer that can catch a meta channel whose cudf dtype is
+// narrower than its real elements. describe() derives a channel's serialized
+// length as size() * size_of(type), so a 16-byte chunk_min/chunk_divisors
+// mislabelled as INT32 ships a quarter of itself and decode reads the rest as
+// whatever follows. An in-memory roundtrip cannot see it: compress_with_plan ->
+// decompress binds those columns by pointer and never consults the dtype.
+//
+// The values are small multiples of 100 rather than magnitudes above 2^64, so
+// bitpack's `_gwide` flag stays clear and the folded-in GCD actually reduces --
+// the 128-bit divisor path is otherwise skipped entirely.
+void test_decimal128_bitpack_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 17);
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  // The spill path stages through build_compressed_table_header, not the file
+  // writer, so cover that seam too.
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+}
+
+// The same column under the plan the spill path actually emits, which names the
+// four original channels and leaves `chunk_divisors` to ride along as a trailing
+// one. A channel that is written but not named is exactly where a width bug
+// hides, so pin it explicitly rather than relying on the bare-op form above.
+void test_decimal128_bitpack_named_channels()
+{
+  auto t = make_decimal128_table(1, 4096, 19);
+  io_roundtrip("decimal128_bitpack_named",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  memory_roundtrip("decimal128_bitpack_named_memory",
+                   t->view(),
+                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+}
 
 int main()
 {
@@ -676,6 +755,9 @@ int main()
     {"error_bad_version", test_error_bad_version},
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
+    {"validity_sidecar", test_validity_sidecar_roundtrip},
+    {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
+    {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
   };
 
   int failures = 0;

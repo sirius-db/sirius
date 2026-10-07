@@ -39,9 +39,10 @@
 //
 // Dtypes
 // ------
-// All four integer widths supported by the fused JIT path: int8_t, int16_t,
-// int32_t, int64_t.  Each dtype runs an independent set of synthetic fixtures
-// with values scaled to stay within the type's representable range.
+// Every integer width supported by the fused JIT path: int8_t, int16_t, int32_t,
+// int64_t and __int128 (the storage of a DECIMAL128 column).  Each dtype runs an
+// independent set of synthetic fixtures with values scaled to stay within the
+// type's representable range.
 //
 // Parallelization
 // ---------------
@@ -107,6 +108,17 @@ std::string cu_err_str(CUresult r)
 // Synthetic data — values scaled to fit within T's representable range
 // so the same template works for all supported widths.
 // ---------------------------------------------------------------------
+// A common factor folded into every value of the 16-byte fixture.
+//
+// bitpack reduces a per-chunk GCD and divides the range by it before taking the
+// bit width. Values with no shared factor reduce to a GCD of 1, which exercises
+// the reduction but never its result. 100 is the realistic case -- a DECIMAL(38,2)
+// holding whole units -- and is what makes the divisor actually divide. Only the
+// 128-bit fixture carries it, so the narrower dtypes keep their existing
+// coverage unchanged.
+template <typename T>
+constexpr T kFactor = sizeof(T) == 16 ? T{100} : T{1};
+
 template <typename T>
 std::vector<T> synth_data(int64_t n)
 {
@@ -124,7 +136,7 @@ std::vector<T> synth_data(int64_t n)
       case 2: v = -(kRange / 10) + pos % (kRange / 2); break;  // crosses zero
       case 3: v = (pos * 7) % kRange; break;                   // varied residuals
     }
-    data[i] = static_cast<T>(v);
+    data[i] = static_cast<T>(v) * kFactor<T>;
   }
   return data;
 }
@@ -156,7 +168,7 @@ std::vector<T> synth_rle_data(int64_t n)
         break;
       }
     }
-    data[i] = static_cast<T>(v);
+    data[i] = static_cast<T>(v) * kFactor<T>;
   }
   return data;
 }
@@ -297,8 +309,11 @@ struct DtypeSpec {
   const char* name;
   const char* cxx;
 };
-constexpr std::array<DtypeSpec, 4> kDtypes = {
-  {{"i8", "int8_t"}, {"i16", "int16_t"}, {"i32", "int32_t"}, {"i64", "int64_t"}}};
+constexpr std::array<DtypeSpec, 5> kDtypes = {{{"i8", "int8_t"},
+                                               {"i16", "int16_t"},
+                                               {"i32", "int32_t"},
+                                               {"i64", "int64_t"},
+                                               {"i128", "__int128"}}};
 
 // Type-erased per-dtype runner (built at shard startup with pre-generated data).
 // Captures the typed data vectors by shared_ptr so the std::function is copyable.
@@ -377,15 +392,16 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
   const std::size_t total    = kDtypes.size() * n_shapes;
 
   // Build one type-erased runner per dtype (pre-generates data once per shard).
-  std::array<ShapeRunner, 4> runners = {
+  std::array<ShapeRunner, kDtypes.size()> runners = {
     make_dtype_runner<int8_t>(n, arch, kDtypes[0].cxx),
     make_dtype_runner<int16_t>(n, arch, kDtypes[1].cxx),
     make_dtype_runner<int32_t>(n, arch, kDtypes[2].cxx),
     make_dtype_runner<int64_t>(n, arch, kDtypes[3].cxx),
+    make_dtype_runner<__int128>(n, arch, kDtypes[4].cxx),
   };
 
-  std::array<int, 4> passed_per_dtype = {};
-  std::array<int, 4> total_per_dtype  = {};
+  std::array<int, kDtypes.size()> passed_per_dtype = {};
+  std::array<int, kDtypes.size()> total_per_dtype  = {};
 
   for (std::size_t flat = shard_idx; flat < total; flat += n_shards) {
     const std::size_t di    = flat / n_shapes;
@@ -492,9 +508,9 @@ int run_orchestrator()
   }
 
   // Collect per-dtype passed/total from each shard.
-  std::array<long long, 4> total_passed = {};
-  std::array<long long, 4> total_total  = {};
-  bool any_failed                       = false;
+  std::array<long long, kDtypes.size()> total_passed = {};
+  std::array<long long, kDtypes.size()> total_total  = {};
+  bool any_failed                                    = false;
 
   for (unsigned i = 0; i < n_shards; ++i) {
     std::string buf;

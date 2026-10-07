@@ -118,7 +118,8 @@ class convertible_gpu_pipeline_task : public convertible_data {
     std::vector<std::size_t> totals(target_spaces.size(), 0);
     bool any_converted = false;
 
-    for (const auto& batch : batches) {
+    for (std::size_t i = 0; i < batches.size(); ++i) {
+      const auto& batch = batches[i];
       if (!batch) { continue; }
 
       // Quick check: skip batches already at a target space (avoid unnecessary locking)
@@ -135,13 +136,21 @@ class convertible_gpu_pipeline_task : public convertible_data {
         if (at_target) { continue; }
       }
 
-      // Delegate to convertible_data_batch which handles to_mutable() internally
-      sirius::convertible_data_batch batch_converter(batch);
+      // Delegate to convertible_data_batch which handles to_mutable() internally.
+      //
+      // The batch's originating repository is what makes this path eligible for
+      // spill compression: without it the converter has no key for the plan
+      // register and declines outright. It is recorded positionally when the
+      // batch is popped from its port (sirius_physical_operator::
+      // get_next_task_input_data), so it is the batch's real producing edge and
+      // resolves the offline per-table plans through column lineage — not just a
+      // stable grouping key.
+      sirius::convertible_data_batch batch_converter(batch, operator_data->source_repo_for(i));
       auto result = batch_converter.convert(target_spaces, stream, res_mgr, blocking);
       if (result) {
         any_converted = true;
-        for (std::size_t i = 0; i < result->size(); ++i) {
-          totals[i] += (*result)[i];
+        for (std::size_t t = 0; t < result->size(); ++t) {
+          totals[t] += (*result)[t];
         }
       }
     }

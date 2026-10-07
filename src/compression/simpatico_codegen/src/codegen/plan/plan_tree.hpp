@@ -6,6 +6,7 @@
 #include "codegen/plan/operator_registry.hpp"  // ChannelId
 #include "codegen/plan/plan_dsl.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/plan/validity.hpp"
 
 #include <cudf/types.hpp>
 
@@ -113,6 +114,13 @@ struct PlanNode {
 
 struct PlanTree {
   std::vector<PlanNode> nodes;
+
+  // The column's validity, detached from the dataflow the nodes describe.
+  // compress_column strips it off the input before the walk and decompress_column
+  // reattaches it after, so no node -- and no plan DSL -- ever refers to it.
+  // Default-constructed (all_valid) for a column with no nulls, which costs
+  // nothing to carry.
+  validity_sidecar validity;
 };
 
 std::optional<PlanTree> plan_tree_from_dsl(std::string_view dsl, std::string* error_out = nullptr);

@@ -63,6 +63,16 @@ task_scheduler::task_scheduler(
   // that is already in _ready_devices.
   _self_publisher.emplace(_task_request_channel.make_publisher());
 
+  // Every task entering the queue must wake the management loop, whichever path
+  // put it there. Doing this on the queue rather than in schedule() is what
+  // covers the downgrade executor returning a task it borrowed for spilling.
+  _task_queue.set_on_push([this]() {
+    if (!_self_publisher) { return; }
+    auto wake                 = std::make_unique<task_request>();
+    wake->kind                = task_request_kind::task_available;
+    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
+  });
+
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
@@ -109,12 +119,10 @@ void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
       .queue_capacity_entries = 1,
     });
   }
+  // The wake-up is published by the queue's on_push callback (installed in the
+  // constructor), not here: every push must wake the management loop, including
+  // the downgrade path's direct push(), which does not come through schedule().
   _task_queue.push(std::move(task));
-  if (_self_publisher) {
-    auto wake                 = std::make_unique<task_request>();
-    wake->kind                = task_request_kind::task_available;
-    [[maybe_unused]] auto _ok = _self_publisher->send(std::move(wake));
-  }
 }
 
 void task_scheduler::start()
@@ -311,12 +319,19 @@ void task_scheduler::management_eventloop()
 
     // Work: let the creator pre-create for a waiting device (lookahead
     // strategy only), then sleep until something is pushed.
+    //
+    // This second sleep site is what makes a bare `queue.push()` visible to the
+    // management loop, which otherwise only wakes on request-channel events. It
+    // supersedes the local on_push workaround (4b2fadda): the downgrade executor
+    // returning a borrowed task now wakes this loop through the queue's own CV.
+    // The empty-vector guard the workaround needed is folded in below — the
+    // creator is only asked to look ahead when a device is actually ready.
     if (_task_queue.empty()) {
       _query_event_publisher->publish_task_queue_empty();
       // No query id: the task_creator picks the oldest live query itself, since this loop has
       // none to inherit.
       if (_task_creator && !_ready_devices.empty()) {
-        _task_creator->schedule_lookahead(*_ready_devices.begin());
+        _task_creator->schedule_lookahead(_ready_devices.front());
       }
       if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");

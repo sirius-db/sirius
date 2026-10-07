@@ -171,6 +171,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// Conservatively false: a backend opts in.
   [[nodiscard]] virtual bool prefers_bulk_io() const noexcept { return false; }
 
+  /// Backend-specific perf counters, formatted for a log/stderr dump, with the
+  /// counters zeroed on the way out so successive calls report per-window
+  /// deltas.  Empty when the backend keeps no counters.  Best-effort
+  /// observability: implementations read racy relaxed atomics and must not
+  /// throw.
+  [[nodiscard]] virtual std::string perf_report_and_reset() noexcept { return {}; }
+
   /// The smallest unit this backend can address, in bytes.  A read is widened
   /// out to a multiple of it before being issued: a local file opened O_DIRECT
   /// can only transfer whole pages, while an object store addresses single

@@ -42,7 +42,7 @@ std::vector<OperatorInfo> const& operator_registry()
   static const std::vector<OperatorInfo> kTable = {
     {OpId::Delta,          "delta",           {"differences"},                                                        true,  false, true,  true},
     {OpId::Rle,            "rle",             {"runs", "values"},                                                     true,  false, true,  true},
-    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"},                   true,  false, false, true},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true},
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false},
@@ -56,9 +56,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false},
     {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false},
-    // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
-    // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars"},                                                   true,  false, true,  false},
   };
   // clang-format on
   return kTable;

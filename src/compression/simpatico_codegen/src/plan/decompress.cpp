@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 #include "codegen/util/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -67,6 +68,11 @@ const char* codegen_dtype_str_for(cudf::data_type type)
     case cudf::type_id::UINT64: return "uint64";
     case cudf::type_id::FLOAT32: return "float32";
     case cudf::type_id::FLOAT64: return "float64";
+    // The narrower decimals and the chrono types are stored as their integer
+    // storage type, so they arrive here already as INT32/INT64. DECIMAL128 is
+    // the exception: cudf has no 128-bit integer type_id, so its storage column
+    // stays DECIMAL128 and has to be named here.
+    case cudf::type_id::DECIMAL128: return "int128";
     default: return nullptr;
   }
 }
@@ -92,7 +98,8 @@ std::string codegen_kind_for_compressor(std::string const& c)
 // list → unknown kind.
 std::vector<std::string> consumed_slots(std::string const& kind)
 {
-  if (kind == "bitpack") return {"chunk_min", "chunk_count", "chunk_bits", "packed"};
+  if (kind == "bitpack")
+    return {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"};
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};
@@ -1302,6 +1309,16 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 
   bool const selecting    = sel != nullptr && sel->active();
   bool const substituting = pred != nullptr && pred->active();
+  // A selection compacts the value rows, while the stored bitmask describes
+  // every row of the chunk. Returning it verbatim would misalign validity with
+  // values, so a nullable column is refused here; a caller that wants both
+  // reattaches the mask itself against the same selection it passed in.
+  if (selecting && !tree.validity.empty() && !sel->caller_reattaches_validity) {
+    if (error_out) {
+      *error_out = "decompress: selection on a null-masked column is not supported";
+    }
+    return nullptr;
+  }
   // The requested route must be the one this plan actually supports: a
   // mismatch would silently decode full width where the caller sized the
   // output from the survivor count.
@@ -1435,6 +1452,11 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // soon as we return, so the gather must have completed.
     cudaStreamSynchronize(stream.get());
   }
+  // Reattach the validity the compress side detached. The walk decodes a
+  // null-free column, so this is the only place the mask re-enters the picture.
+  // A selecting decode is either all-valid or served an opting-in caller, which
+  // compacts the sidecar itself against the selection it supplied.
+  if (col && !selecting) { attach_validity(*col, tree.validity, stream, mr); }
   return col;
 }
 

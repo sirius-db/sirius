@@ -66,6 +66,37 @@ inline std::unique_ptr<cudf::table> make_int64_table(int num_cols, int num_rows,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+// DECIMAL128, the only 16-byte dtype the codegen path supports.
+//
+// The values are deliberately SMALL multiples of a common factor rather than
+// magnitudes that need the full 128 bits. A fixture whose values exceed 2^64
+// latches bitpack's `_gwide` flag on its first element, which forces the divisor
+// to 1 and skips the folded-in GCD reduction entirely -- so the wide fixtures
+// leave the 128-bit divisor path untested. Mantissas of a DECIMAL(38,2) holding
+// whole units (every value a multiple of 100, spanning a narrow range) are both
+// the realistic shape and the one that actually exercises it: the GCD reduces to
+// 100 and the residual packs into a handful of bits.
+inline std::unique_ptr<cudf::table> make_decimal128_table(int num_cols, int num_rows, int seed)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<__int128> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        static_cast<__int128>(100) * static_cast<__int128>((r * 17 + c * 1013 + seed) % 1000);
+    auto col = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, 0}, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<__int128>(),
+                   host.data(),
+                   host.size() * sizeof(__int128),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_decimal128_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 // Unsigned tables spanning the full range (values above 2^31 / 2^63) so the
 // codegen's unsigned->signed reinterpretation is exercised, not just small keys.
 inline std::unique_ptr<cudf::table> make_uint32_table(int num_cols, int num_rows, int seed)

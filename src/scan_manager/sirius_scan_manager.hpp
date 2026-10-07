@@ -859,6 +859,12 @@ class sirius_scan_manager {
   ///        was configured with @c backend=kvikio.
   [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
+  /// \brief Concatenated @c perf_report_and_reset() of every live ioctx (the
+  ///        default one plus any path-routed backend), for the per-query
+  ///        observability dump.  Backends with no counters contribute nothing,
+  ///        so this is empty unless something instrumented actually ran.
+  [[nodiscard]] std::string io_perf_report_and_reset() noexcept;
+
   /// Where the readahead subscribes for execution events.  Set once at startup;
   /// the readahead itself is per-query, so it registers and unregisters around
   /// its own lifetime rather than this one.

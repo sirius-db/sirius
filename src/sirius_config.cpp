@@ -196,6 +196,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  // Connections per reactor. Observed peak in-flight pins at this value
+  // regardless of reactor count or scan budget, so it has to be reachable
+  // from config to test the concurrency ceiling.
+  r.optional("max_connections", opt.max_connections, yaml::greater_than<std::size_t>{0});
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
   r.optional("stall_time_s", opt.stall_time_s);
@@ -394,6 +398,26 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
     return std::isfinite(value) && value >= 0.0;
   });
   r.optional("input_plan_dir", opt.input_plan_dir);
+  r.optional("enable_spill_compression", opt.enable_spill_compression);
+  r.optional(
+    "spill_explore_beam_width", opt.spill_explore_beam_width, yaml::greater_than<uint32_t>{0});
+  r.optional("spill_explore_max_bytes", yaml::bytes(opt.spill_explore_max_bytes));
+  r.optional("spill_replan_after_uses", opt.spill_replan_after_uses);
+  r.optional("spill_error_tolerance", opt.spill_error_tolerance, yaml::greater_than<uint32_t>{0});
+  r.optional("spill_replan_change_threshold", opt.spill_replan_change_threshold);
+  r.optional("spill_explore_sample_rows", yaml::bytes(opt.spill_explore_sample_rows));
+  r.optional("spill_min_batch_bytes", yaml::bytes(opt.spill_min_batch_bytes));
+  r.optional("enable_output_compression", opt.enable_output_compression);
+  r.optional("output_compression_min_ratio", opt.output_compression_min_ratio);
+  r.optional("output_compression_min_compress_gbps", opt.output_compression_min_compress_gbps);
+  r.optional("output_compression_min_decompress_gbps", opt.output_compression_min_decompress_gbps);
+  r.optional("output_compression_min_batch_bytes",
+             yaml::bytes(opt.output_compression_min_batch_bytes));
+  r.optional("enable_device_compression_downgrade", opt.enable_device_compression_downgrade);
+  r.optional("device_pool_bytes", yaml::bytes(opt.device_pool_bytes));
+  r.optional("spill_release_columns_early", opt.spill_release_columns_early);
+  r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction);
+  r.optional("spill_encode_min_headroom_fraction", opt.spill_encode_min_headroom_fraction);
   r.reject_unknown();
 }
 
@@ -403,6 +427,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
+  r.optional("wait_timeout", opt.downgrade_wait_timeout);
   r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
   r.reject_unknown();
 }

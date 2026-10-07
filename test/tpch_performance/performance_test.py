@@ -606,7 +606,15 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
              Read-only avoids write locks / accidental WAL and is correct for a
              read-only benchmark; it mirrors how run_tpch_duckdb.sh opens the file.
     """
+    # DuckDB's CPU engine allocates outside Sirius's memory management, so at large
+    # scale factors an unbounded in-memory run exhausts host RAM and takes the
+    # machine down. Opt-in via env so existing callers are unaffected:
+    #   DUCKDB_MEMORY_LIMIT=40GB DUCKDB_TEMP_DIRECTORY=/mnt/nvme/duckdb_tmp
     config = {"allow_unsigned_extensions": "true"}
+    if os.environ.get("DUCKDB_MEMORY_LIMIT"):
+        config["memory_limit"] = os.environ["DUCKDB_MEMORY_LIMIT"]
+    if os.environ.get("DUCKDB_TEMP_DIRECTORY"):
+        config["temp_directory"] = os.environ["DUCKDB_TEMP_DIRECTORY"]
     s3_source = data_source != "duckdb" and is_s3_source(source)
     if s3_source:
         # s3:// must resolve through Sirius's own sirius_httpfs, not DuckDB's
@@ -630,6 +638,26 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        # Spill, downgrade and compression statistics are logged at `debug`; at the
+        # default `info` a run produces timings with no way to explain them.
+        _level = os.environ.get("SIRIUS_LOG_LEVEL")
+        if _level:
+            con.execute(f"SET sirius_log_level='{_level}'")
+            log(f"Sirius log level set to {_level}")
+        # Applied for every run, not only the nsys path in _build_nsys_temp_sql.
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})")
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
+        # Likewise for SIRIUS_PRE_SQL, which carries settings such as
+        # enable_duckdb_fallback.
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
 
     if data_source != "duckdb":
         log("Registering TPC-H parquet views")
@@ -680,11 +708,21 @@ def _query_dir(benchmark_dir, engine_name, qnum):
     return qdir
 
 
-def _write_result(benchmark_dir, engine_name, qnum, rows):
-    path = os.path.join(_query_dir(benchmark_dir, engine_name, qnum), "result.txt")
-    with open(path, "w") as f:
-        for row in rows:
-            f.write(repr(row) + "\n")
+def _write_result(benchmark_dir, engine_name, qnum, rows, it=None):
+    """Write `result.txt` (last iteration wins) and, when `it` is given, a
+    per-iteration copy.
+
+    `result.txt` alone validates only the final iteration, so a run whose fast
+    iterations are fast *because* they lost batches would still pass.
+    """
+    qdir = _query_dir(benchmark_dir, engine_name, qnum)
+    paths = [os.path.join(qdir, "result.txt")]
+    if it is not None:
+        paths.append(os.path.join(qdir, f"result_iter{it}.txt"))
+    body = "".join(repr(row) + "\n" for row in rows)
+    for path in paths:
+        with open(path, "w") as f:
+            f.write(body)
 
 
 class RuntimeCsv:
@@ -1625,6 +1663,16 @@ def parse_args():
             "by comparing the saved <engine>/q<N>/result.txt files. Byte-exact "
             f"match first, then abs_tol={VALIDATION_ABS_TOL} on float columns "
             "(strict equality elsewhere). Requires --engine both."
+        ),
+    )
+    p.add_argument(
+        "--reference-dir",
+        type=str,
+        default=None,
+        help=(
+            "Validate against the duckdb/q<N>/result.txt files of an earlier "
+            "benchmark directory instead of running the CPU engine again. Lets "
+            "--validation be used with --engine gpu."
         ),
     )
     p.add_argument(

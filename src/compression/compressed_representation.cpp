@@ -292,6 +292,14 @@ compressed_device_representation::compressed_device_representation(
 
 bool compressed_device_representation::has_table() const noexcept { return _blob != nullptr; }
 
+const simpatico::compressed_table& compressed_device_representation::table(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref scratch_mr) const
+{
+  // const on the representation, not on the blob: the blob is shared and its table is
+  // a cache, so filling it in does not change what this representation holds.
+  return _blob->ensure_table(stream, scratch_mr);
+}
+
 const simpatico::compressed_table& compressed_device_representation::table() const noexcept
 {
   return _blob->table;

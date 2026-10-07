@@ -256,11 +256,13 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // make_fixed_width_column, not make_numeric_column: the latter rejects
+    // DECIMAL and chrono leaves with "Invalid, non-numeric type".
+    auto col           = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -323,7 +325,71 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+//
+// 12: a per-column validity sidecar record sits beside each column's plan tree (see
+//     push_validity), so a nullable column compresses instead of falling back.
+//
+// 14: Bitpack carries a trailing `chunk_divisors` channel (the folded-in common
+//     divisor). It is trailing so plan text naming only the original four
+//     channels stays valid, but a v13 payload has no such buffer, so the exact
+//     version match is what keeps an old payload from being bound without it.
+//
+// 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
+//     because the 128-bit gather spans five uint32 words. The count is part of the
+//     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
+static constexpr std::uint8_t kVersion = 14;
+
+// Per-column validity record, written right after num_rows:
+//
+//   kind (uint8)                        [validity_kind]
+//   if kind != all_valid: null_count (int64 LE)
+//   if kind == mask:      size_bytes (uint64 LE) + payload_offset (uint64 LE)
+//
+// An all-valid column costs exactly one byte, and an all-null one costs nine
+// with no payload at all -- only a genuinely mixed column pays for a bitmask.
+// The mask is appended to the payload region like any leaf buffer, so callers
+// that stage the payload themselves need no special case for it.
+static void push_validity(std::vector<std::uint8_t>& hdr,
+                          validity_sidecar const& v,
+                          std::vector<payload_buffer_ref>& out_buffers,
+                          std::uint64_t& payload_offset)
+{
+  push_le(hdr, static_cast<std::uint8_t>(v.kind));
+  if (v.kind == validity_kind::all_valid) return;
+
+  push_le(hdr, v.null_count);
+  if (v.kind != validity_kind::mask) return;
+
+  auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
+  push_le(hdr, size_bytes);
+  push_le(hdr, payload_offset);
+  out_buffers.push_back(payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes});
+  payload_offset += size_bytes;
+}
+
+// Parsed form of the record above; the mask bytes are pulled from the payload
+// later (reconstruct_from_records), like every leaf buffer.
+struct ValidityRecord {
+  validity_kind kind           = validity_kind::all_valid;
+  std::int64_t null_count      = 0;
+  std::uint64_t size_bytes     = 0;
+  std::uint64_t payload_offset = 0;
+};
+
+// Inverse of push_validity. Returns false on a truncated or unknown record.
+static bool read_validity(Reader& r, ValidityRecord& v)
+{
+  std::uint8_t k;
+  if (!r.read_le(k)) return false;
+  if (k > static_cast<std::uint8_t>(validity_kind::mask)) return false;
+  v.kind = static_cast<validity_kind>(k);
+  if (v.kind == validity_kind::all_valid) return true;
+
+  if (!r.read_le(v.null_count)) return false;
+  if (v.kind != validity_kind::mask) return true;
+
+  return r.read_le(v.size_bytes) && r.read_le(v.payload_offset);
+}
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -413,6 +479,7 @@ struct ColRecord {
   std::uint8_t dtype_tag = 0;
   std::int32_t scale     = 0;  // fixed-point scale for the column dtype (0 otherwise)
   std::int64_t num_rows  = 0;
+  ValidityRecord validity;
   PlanTree tree;
   std::vector<leaf_desc> leaf_descs;
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
@@ -450,6 +517,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     if (!r.read_le(cr.dtype_tag)) return bad("truncated col dtype");
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
+    if (!read_validity(r, cr.validity)) return bad("truncated/unknown col validity");
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");
@@ -534,6 +602,17 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     *plan_tree     = std::move(cr.tree);
     auto& nodes    = plan_tree->nodes;
 
+    // Rebuild the validity sidecar. all_valid and all_null carry no payload, so
+    // only a mixed column costs a fetch here.
+    auto& validity      = plan_tree->validity;
+    validity.kind       = cr.validity.kind;
+    validity.null_count = cr.validity.null_count;
+    if (validity.kind == validity_kind::mask) {
+      auto const sz = static_cast<std::size_t>(cr.validity.size_bytes);
+      validity.mask = rmm::device_buffer(sz, stream, mr);
+      if (sz > 0) fetch(cr.validity.payload_offset, sz, validity.mask.data(), stream);
+    }
+
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
       auto const& boffs = cr.buf_offsets[li];
@@ -577,32 +656,79 @@ std::string write_compressed_table(compressed_table const& table,
                                    ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
-  // Build the header + payload buffer list once (shared with the in-memory
-  // writer), then gather the payload into one contiguous blob for the file.
   std::vector<std::uint8_t> hdr;
   std::vector<payload_buffer_ref> buffers;
   std::uint64_t payload_bytes = 0;
   std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
   if (!err.empty()) return err;
 
-  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
-  for (auto const& b : buffers) {
-    if (b.size_bytes > 0 && b.device_ptr) {
-      cudaMemcpyAsync(payload.data() + b.offset,
-                      b.device_ptr,
-                      static_cast<std::size_t>(b.size_bytes),
-                      cudaMemcpyDeviceToHost,
-                      stream.get());
-    }
+  // Stream the payload through a bounded pinned window rather than materializing
+  // it whole. The obvious form -- one host vector of payload_bytes, D2H every
+  // buffer into it, then write -- costs a transient host allocation as large as
+  // the batch at the moment a spill is already conceding memory pressure, and
+  // pageable memory forces the driver to stage each D2H through its own bounce
+  // buffers anyway. Each buffer already carries the file offset it belongs at, so
+  // the copies can be issued window by window and written as they land.
+  constexpr std::size_t kWindowBytes = 32ULL * 1024 * 1024;
+
+  void* staging = nullptr;
+  if (cudaMallocHost(&staging, kWindowBytes) != cudaSuccess || staging == nullptr) {
+    return "failed to allocate pinned staging window for '" + path + "'";
   }
-  stream.sync();  // D→H copies must complete before the file write
+  auto* staging_bytes = static_cast<std::uint8_t*>(staging);
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return "failed to open '" + path + "' for writing";
+  if (!f) {
+    cudaFreeHost(staging);
+    return "failed to open '" + path + "' for writing";
+  }
   f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-  f.write(reinterpret_cast<const char*>(payload.data()),
-          static_cast<std::streamsize>(payload.size()));
-  if (!f) return "write error on '" + path + "'";
+
+  // Buffers are emitted in ascending offset order by build_compressed_table_header,
+  // so a sequential write reproduces the payload layout without seeking. Assert it
+  // rather than trust it: an out-of-order entry would silently corrupt the file.
+  std::uint64_t expected_offset = 0;
+  for (auto const& b : buffers) {
+    if (b.size_bytes == 0) { continue; }
+    if (b.offset != expected_offset) {
+      cudaFreeHost(staging);
+      return "payload buffers are not in ascending offset order for '" + path + "'";
+    }
+    std::uint64_t done = 0;
+    while (done < b.size_bytes) {
+      const std::size_t chunk =
+        static_cast<std::size_t>(std::min<std::uint64_t>(b.size_bytes - done, kWindowBytes));
+      if (b.device_ptr != nullptr) {
+        const auto rc = cudaMemcpyAsync(staging_bytes,
+                                        static_cast<const std::uint8_t*>(b.device_ptr) + done,
+                                        chunk,
+                                        cudaMemcpyDeviceToHost,
+                                        stream.get());
+        if (rc != cudaSuccess) {
+          cudaFreeHost(staging);
+          return std::string{"D2H copy failed for '"} + path + "': " + cudaGetErrorString(rc);
+        }
+        stream.sync();  // the window is reused on the next iteration
+      } else {
+        // A sized buffer with no device pointer contributes its extent to the
+        // payload but has nothing to copy. The previous implementation wrote a
+        // value-initialized host vector, so those bytes reached the file as zeros;
+        // reproduce that instead of skipping them and truncating the payload.
+        std::memset(staging_bytes, 0, chunk);
+      }
+      f.write(reinterpret_cast<const char*>(staging_bytes),
+              static_cast<std::streamsize>(chunk));
+      if (!f) {
+        cudaFreeHost(staging);
+        return "write error on '" + path + "'";
+      }
+      done += chunk;
+    }
+    expected_offset += b.size_bytes;
+  }
+
+  cudaFreeHost(staging);
+  if (!f) { return "write error on '" + path + "'"; }
   return {};
 }
 
@@ -635,17 +761,22 @@ compressed_table read_compressed_table(std::string const& path,
 
   // Bounds-check every buffer up front so a truncated file is reported here
   // rather than faulting mid-copy, then copy each buffer straight to device.
+  auto in_payload = [&](std::uint64_t off, std::size_t sz) {
+    // Subtraction form: `off + sz` could overflow for a corrupt/hostile file's
+    // huge declared offset and wrap below payload_total, passing the check and
+    // then faulting in fetch(). Compare against the remaining space instead so
+    // it can never overflow.
+    return sz == 0 || (off <= payload_total && sz <= payload_total - off);
+  };
   for (auto const& cr : col_records) {
+    if (cr.validity.kind == validity_kind::mask &&
+        !in_payload(cr.validity.payload_offset, static_cast<std::size_t>(cr.validity.size_bytes)))
+      return fail("payload out of bounds");
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
         std::uint64_t const off = cr.buf_offsets[li][bi];
-        // Subtraction form: `off + sz` could overflow for a corrupt/hostile
-        // file's huge declared offset and wrap below payload_total, passing the
-        // check and then faulting in fetch(). Compare against the remaining space
-        // instead so it can never overflow.
-        if (sz > 0 && (off > payload_total || sz > payload_total - off))
-          return fail("payload out of bounds");
+        if (!in_payload(off, sz)) return fail("payload out of bounds");
       }
     }
   }
@@ -771,6 +902,10 @@ std::string build_compressed_table_header(compressed_table const& table,
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
     PlanTree const& tree = col.plan_tree ? *col.plan_tree : kEmptyTree;
+
+    // Validity rides beside the tree, not inside it: it is not a leaf and has no
+    // node, so it is written here rather than through describe().
+    push_validity(hdr, tree.validity, out_buffers, payload_offset);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);

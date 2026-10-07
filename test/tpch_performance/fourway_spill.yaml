@@ -1,0 +1,55 @@
+# 4-way arm 'spill': SPILL compression: compress on the way out to host/disk
+# Derived from ~/.sirius/sirius.yaml — the real working config: 0.95 device
+# usage, downgrade trigger at 0.6 (so ~35% of the GPU stays free for the
+# compressor to allocate in), and a disk tier. Two keys the current build's
+# reader rejects were dropped: executor.duckdb_scan and
+# operator_params.default_scan_task_varchar_size.
+# The two arms differ ONLY in the spill-compression settings.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_fraction: 0.30
+      reservation_limit_fraction: 0.9
+      downgrade_trigger_fraction: 0.6
+      downgrade_stop_fraction: 0.4
+    host:
+      capacity_bytes: 28000000000
+      initial_number_pools: 10
+      pool_size: 512
+      block_size: 1048576
+    disk:
+      disk_id: 0
+      capacity_bytes: 100000000000
+      downgrade_root_dirs: "/tmp/sirius_disk_memory"
+  executor:
+    pipeline:
+      num_threads: 4
+      thread_name_prefix: "sirius_pipeline_executor"
+    downgrade:
+      num_threads: 1
+      thread_name_prefix: "sirius_downgrade_executor"
+  operator_params:
+    scan_task_batch_size: 134217728   # 128 MB
+    max_sort_partition_bytes: 0               # 0: auto (33% GPU memory)
+    hash_partition_bytes: 134217728           # 128 MB
+    concat_batch_bytes: 134217728             # 128 MB
+  compression:
+    # Pin-table compression is a separate feature; off in BOTH arms so the
+    # comparison isolates the spill path.
+    enable_pin_table_compression: false
+    min_batch_size_bytes: 0
+    max_compressed_fraction: 0.75
+    column_threads: 4
+    # Offline per-table plans, reached by the spill path through column lineage.
+    input_plan_dir: /home/jhoozemans/workspace/sirius/sirius/src/compression/simpatico_codegen/plans/tpch_sf1000
+    enable_spill_compression: true
+    spill_explore_beam_width: 8
+    spill_explore_max_bytes: 8388608
+    spill_explore_sample_rows: 65536
+    spill_replan_after_uses: 128
+    spill_error_tolerance: 3
+    spill_replan_change_threshold: 0.20
+    enable_output_compression: false
+    enable_device_compression_downgrade: false

@@ -265,10 +265,13 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
 
   const std::size_t live = static_cast<std::size_t>(live_packed_bytes);
 
-  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2);
-  // three guard words keep the last element's gather in-bounds.  They travel
-  // as part of the stored payload so num_rows already accounts for them.
-  constexpr std::size_t kGuardWords = 3;
+  // simpatico_bitunpack_one loads three consecutive uint32 words (w0/w1/w2),
+  // and its 128-bit counterpart loads five (a 128-bit value at an arbitrary bit
+  // offset spans ceil((128+31)/32) = 5 words). Five guard words keep the last
+  // element's gather in-bounds for either. They travel as part of the stored
+  // payload so num_rows already accounts for them; sizing them unconditionally
+  // costs 8 bytes per bitpack buffer and keeps one layout for every width.
+  constexpr std::size_t kGuardWords = 5;
   const std::size_t guard_bytes     = kGuardWords * sizeof(std::uint32_t);
 
   rmm::device_buffer dense(live + guard_bytes, stream, mr);
@@ -440,7 +443,7 @@ const char* dtype_to_cxx(const char* dtype)
   // the original float type_id so cudf reinterprets the bits correctly.
   if (s == "float32") return "int32_t";
   if (s == "float64") return "int64_t";
-  // Byte types (string sub-channels: chars, null_mask, keys_chars) map to the
+  // Byte types (string sub-channels: chars, keys_chars) map to the
   // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
   // The output column retains the original UINT8 type_id.
   if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";
@@ -451,6 +454,9 @@ const char* dtype_to_cxx(const char* dtype)
   // codecs roundtrip either way); the output column keeps the original UINT type.
   if (s == "uint32" || s == "uint32_t") return "int32_t";
   if (s == "uint64" || s == "uint64_t") return "int64_t";
+  // DECIMAL128 storage. NVRTC needs --device-int128 (see nvrtc_compiler.cpp);
+  // the ops are emulated, so this is for reach, not speed.
+  if (s == "int128" || s == "__int128") return "__int128";
   return nullptr;
 }
 
@@ -703,8 +709,8 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
       const std::size_t len = it->second.length;
       const bool is_off     = (b.field == "rle_runs_offsets" || b.field == "bp_offsets");
       const bool is_perchk =
-        (b.field == "chunk_min" || b.field == "chunk_bits" || b.field == "chunk_count" ||
-         b.field == "references" || b.field == "offsets" || is_off);
+        (b.field == "chunk_min" || b.field == "chunk_divisors" || b.field == "chunk_bits" ||
+         b.field == "chunk_count" || b.field == "references" || b.field == "offsets" || is_off);
       const std::size_t need = static_cast<std::size_t>(num_chunks) + (is_off ? 1u : 0u);
       if (is_perchk && len < need) {
         std::fprintf(stderr,
@@ -1392,6 +1398,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       switch (node.op) {
         case cc::OpKind::Bitpack: {
           const auto i_min  = find_buffer_idx(spec.buffers, node_id, "chunk_min");
+          const auto i_divs = find_buffer_idx(spec.buffers, node_id, "chunk_divisors");
           const auto i_cnt  = find_buffer_idx(spec.buffers, node_id, "chunk_count");
           const auto i_bits = find_buffer_idx(spec.buffers, node_id, "chunk_bits");
           const auto i_pkd  = find_buffer_idx(spec.buffers, node_id, "packed");
@@ -1440,8 +1447,19 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // the column's original_type.  For the values channel this matches
           // original_type, but for the runs channel (int32 counts) it must
           // be INT32 regardless of the column dtype.
+          //
+          // The dtype is not cosmetic: describe() derives a channel's serialized
+          // length from it as size() * size_of(type), so a dtype narrower than the
+          // buffer's real elements truncates the payload. A 16-byte channel with no
+          // arm here fell through to INT32 and shipped a quarter of chunk_min and
+          // chunk_divisors; decode then read them back as __int128 on a 16-byte
+          // stride and reconstructed chunk_min + divisor * residual from garbage.
+          // That is invisible to an in-memory roundtrip, which binds these columns
+          // by pointer and never consults the dtype -- only a serialized roundtrip
+          // (i.e. a spill) sees it.
           const cudf::data_type bp_elem_type =
-            (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            (spec.buffers[i_min].elem_size == 16)  ? cudf::data_type(cudf::type_id::DECIMAL128, 0)
+            : (spec.buffers[i_min].elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
@@ -1449,6 +1467,12 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             bp_elem_type,
             static_cast<cudf::size_type>(num_chunks),
             std::move(bufs[i_min]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto divs_col = std::make_unique<cudf::column>(
+            bp_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_divs]),
             cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
             0);
           auto cnt_col = std::make_unique<cudf::column>(
@@ -1493,6 +1517,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           rep->buffers.emplace_back("chunk_count", std::move(cnt_col));
           rep->buffers.emplace_back("chunk_bits", std::move(bits_col));
           rep->buffers.emplace_back("packed", std::move(pkd_col));
+          // Trailing, so a reader that knows only the first four still binds them.
+          rep->buffers.emplace_back("chunk_divisors", std::move(divs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
         }
@@ -1874,6 +1900,14 @@ bool launch_encode_fused_tree(CodegenHead const& head,
     case cudf::type_id::DECIMAL64:
       dtype           = "int64";
       storage_type_id = cudf::type_id::INT64;
+      break;
+    // DECIMAL128's storage is __int128, for which cudf has no integer type_id.
+    // The storage column therefore stays DECIMAL128 (scale 0 -- the scale is
+    // restored from the stored column dtype by apply_stored_dtype, as for the
+    // narrower decimals); it is just a 16-byte fixed-width column here.
+    case cudf::type_id::DECIMAL128:
+      dtype           = "int128";
+      storage_type_id = cudf::type_id::DECIMAL128;
       break;
     // Chrono columns are physically their integer storage (DATE32 = days as
     // int32, timestamps/durations as int64); like DECIMAL, encode/decode run

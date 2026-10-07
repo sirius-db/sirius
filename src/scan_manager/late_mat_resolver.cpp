@@ -89,9 +89,10 @@ std::optional<resolved_pinned_column> resolve_pinned_column(late_mat::column_ori
   view.pin_generation = origin.generation;
 
   if (uses_device_chunks(*entry)) {
-    // Every uncompressed gather shape (single-batch, multi-batch fixed-width, multi-batch
-    // variable-width) propagates validity; only a compressed origin cannot (materialize.cpp's
-    // require_non_null, at decode time).
+    // Every gather shape propagates validity: the uncompressed ones (single-batch, multi-batch
+    // fixed-width, multi-batch variable-width) natively, and a compressed one through the decode
+    // routes (materialize.cpp's attach_selected_validity). A chunk with no blob is refused below,
+    // since its validity sidecar is unreadable along with everything else about it.
     for (auto const& chunk : entry->device_chunks) {
       late_mat::batch_source source;
       source.num_rows = chunk_rows(chunk);

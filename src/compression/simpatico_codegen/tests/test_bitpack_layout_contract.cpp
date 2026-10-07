@@ -55,8 +55,11 @@ std::unique_ptr<cudf::table> make_layout_fixture()
         host[static_cast<std::size_t>(i)] = pos;
         break;
       default:
-        // Partial final chunk with a 16-bit range.
-        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 0;
+        // Partial final chunk with a 16-bit range. The filler is 1, not 0, so the
+        // chunk's common divisor is 1: with 0s the GCD would be 65535 and bitpack
+        // would divide the range out to a single bit, which is correct but would
+        // stop this chunk exercising a wide bit width.
+        host[static_cast<std::size_t>(i)] = pos == kPartialRows - 1 ? 65535 : 1;
         break;
     }
   }
@@ -153,6 +156,7 @@ void test_compact_persistence_and_decode()
   auto const description  = compressed.describe(stream);
   auto const& leaf        = find_bitpack_leaf(description);
   auto const& counts_desc = find_buffer(leaf, "chunk_count");
+  auto const& divs_desc   = find_buffer(leaf, "chunk_divisors");
   auto const& bits_desc   = find_buffer(leaf, "chunk_bits");
   auto const& packed_desc = find_buffer(leaf, "packed");
 
@@ -161,6 +165,11 @@ void test_compact_persistence_and_decode()
   expect(counts == std::vector<std::int32_t>({1024, 1024, 1024, kPartialRows}),
          "unexpected per-chunk counts");
   expect(bits == std::vector<std::uint8_t>({0, 1, 10, 16}), "unexpected per-chunk bit widths");
+  // The folded-in common divisor: chunk 0 is a run of 7s so its GCD is 7, and the
+  // range divides out to zero bits. The other chunks contain coprime values, so
+  // their divisor is the no-op 1.
+  auto const divisors = copy_buffer<std::int32_t>(divs_desc);
+  expect(divisors == std::vector<std::int32_t>({7, 1, 1, 1}), "unexpected per-chunk divisors");
 
   std::uint64_t expected_words = 0;
   for (std::size_t i = 0; i < counts.size(); ++i) {
@@ -176,10 +185,11 @@ void test_compact_persistence_and_decode()
   }
   // The persisted packed column is the dense Compact words plus the guard words that keep
   // the decode gather addressable: simpatico_bitunpack_one loads packed[word_in ..
-  // word_in + 2] unconditionally, so the last element reaches two words past the final
-  // live word. Anything wider than this means the OverAllocate encode stride leaked into
-  // the persisted rep.
-  constexpr std::uint64_t kDecodeGuardWords = 3;  // compact_bitpack_packed; covers that reach
+  // word_in + 2] unconditionally, and its 128-bit counterpart reaches word_in + 4 (a
+  // 128-bit value at an arbitrary bit offset spans ceil((128+31)/32) = 5 words), so the
+  // buffer is sized for the wider of the two regardless of dtype. Anything wider than
+  // this means the OverAllocate encode stride leaked into the persisted rep.
+  constexpr std::uint64_t kDecodeGuardWords = 5;  // compact_bitpack_packed; covers that reach
   expect(expected_words == 361, "fixture no longer exercises the intended compact sizes");
   expect(packed_desc.num_rows == expected_words + kDecodeGuardWords,
          "persisted packed column is not compact words plus decode guard");

@@ -96,6 +96,21 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
 
+  /**
+   * @brief Bound the retry floor by what the reserving space could ever grant.
+   *
+   * The floor doubles on every OOM and never shrinks, so without a bound it walks
+   * past the space's own capacity: measured on TPC-H q18/SF3000 it reached 127.8 GB
+   * against an 83.3 GiB GPU tier. A floor larger than the space guarantees that
+   * every later attempt asks for something unsatisfiable, which is a livelock
+   * rather than a diagnosis. 0 means "not known yet" and leaves the floor uncapped.
+   */
+  void set_retry_reservation_floor_cap(std::size_t cap_bytes) noexcept
+  {
+    _retry_reservation_floor_cap = cap_bytes;
+    _retry_reservation_floor     = clamp_to_floor_cap(_retry_reservation_floor);
+  }
+
   void update_retry_reservation_floor_after_oom(std::size_t current_reservation_bytes,
                                                 std::size_t live_allocated_bytes,
                                                 std::optional<std::size_t> requested_bytes) noexcept
@@ -104,18 +119,30 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
     next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
     next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
-    _retry_reservation_floor = std::max(_retry_reservation_floor, next_floor);
+    _retry_reservation_floor =
+      clamp_to_floor_cap(std::max(_retry_reservation_floor, next_floor));
   }
 
   void inherit_retry_reservation_floor(const gpu_pipeline_task_local_state& previous) noexcept
   {
+    // The cap travels with the floor: a rescheduled task is created before the
+    // executor hands it a space, so without this the inherited floor would be
+    // unbounded until the next reservation attempt re-applied the cap.
+    if (_retry_reservation_floor_cap == 0) {
+      _retry_reservation_floor_cap = previous._retry_reservation_floor_cap;
+    }
     _retry_reservation_floor =
-      std::max(_retry_reservation_floor, previous._retry_reservation_floor);
+      clamp_to_floor_cap(std::max(_retry_reservation_floor, previous._retry_reservation_floor));
   }
 
   [[nodiscard]] std::size_t get_retry_reservation_floor() const noexcept
   {
     return _retry_reservation_floor;
+  }
+
+  [[nodiscard]] std::size_t get_retry_reservation_floor_cap() const noexcept
+  {
+    return _retry_reservation_floor_cap;
   }
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
@@ -139,8 +166,16 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     const cucascade::memory::memory_space* target_space) const;
 
  private:
+  /// Clamp to the cap when one is known; 0 means the cap is not established yet.
+  [[nodiscard]] std::size_t clamp_to_floor_cap(std::size_t bytes) const noexcept
+  {
+    return (_retry_reservation_floor_cap > 0) ? std::min(bytes, _retry_reservation_floor_cap)
+                                              : bytes;
+  }
+
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
-  std::size_t _retry_reservation_floor = 0;
+  std::size_t _retry_reservation_floor     = 0;
+  std::size_t _retry_reservation_floor_cap = 0;
 };
 
 /**

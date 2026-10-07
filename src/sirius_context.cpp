@@ -16,6 +16,10 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/compression_converters.hpp"
+#include "compression/compression_device_pool.hpp"
+#include "compression/plan_register.hpp"
+#include "compression/spill_context.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -77,6 +81,8 @@
 #include <cstdio>   // for fprintf/fileno (fallback banner)
 #include <cstdlib>  // for std::getenv
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -214,6 +220,33 @@ bool sirius_disabled_by_env()
 }
 
 }  // namespace
+
+/// Scan @p dir and install every table plan it holds into the global register.
+///
+/// Called from both SiriusContext::initialize() and the
+/// `pin_table_input_compression_plan_dir` setter, so that setting the directory
+/// by SQL loads the plans rather than assigning a field nothing reads again.
+void load_compression_plan_dir(std::string const& dir)
+{
+  if (dir.empty()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::size_t loaded = 0;
+  for (auto const& entry : fs::directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file()) { continue; }
+    std::ifstream f(entry.path());
+    std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (dsl.empty()) { continue; }
+    sirius::compression::plan_register::global().set_table_plan(entry.path().stem().string(),
+                                                                std::move(dsl));
+    ++loaded;
+  }
+  if (ec) {
+    SIRIUS_LOG_WARN("[compression] cannot scan plan dir '{}': {}", dir, ec.message());
+  } else {
+    SIRIUS_LOG_INFO("[compression] loaded {} table plan(s) from '{}'", loaded, dir);
+  }
+}
 
 // ================= sirius_context ================= //
 
@@ -522,6 +555,18 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
   } catch (...) {
   }
 
+  // Per-query IO counters (REST reactor reads, fused requests), gated because
+  // reading them resets them. Observability only: never let it fail the query end.
+  try {
+    static bool const io_profile = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
+    if (io_profile && scan_manager_) {
+      if (auto report = scan_manager_->io_perf_report_and_reset(); !report.empty()) {
+        std::cerr << "\n" << report << std::endl;
+      }
+    }
+  } catch (...) {
+  }
+
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
   // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
@@ -556,6 +601,20 @@ std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
     }
   } catch (...) {
   }
+
+  // Drop every per-query spill-compression entry. These are keyed by
+  // shared_data_repository*, and this query's repositories are erased just below, so
+  // holding them any longer both leaks and risks a later repository at a recycled
+  // address picking up an unrelated edge's plans and verdicts. Nothing is carried
+  // across queries: the next one re-seeds from the offline table plans via lineage.
+  //
+  // NOTE: this clears the register globally, while #1327 made repositories per-query.
+  // With two queries in flight, one finishing drops the other's learned plans and
+  // verdicts mid-query. That costs re-seeding, not correctness — the maps are a memo,
+  // and a missing entry re-derives from the table plans — but the register should be
+  // keyed by query_id to match the registry. Left as-is here because scoping it is a
+  // design change, not a rebase resolution.
+  sirius::compression::plan_register::global().clear_spill_state();
 
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.
   // Any batches still present are leaked — operators should have popped everything.
@@ -840,6 +899,45 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   for (auto const& gpu : topo.gpus) {
     SIRIUS_LOG_INFO(
       "  GPU {}: {} (numa={}, pci={})", gpu.id, gpu.name, gpu.numa_node, gpu.pci_bus_id);
+  }
+
+  // Mirror the compression settings the cuCascade converters read. They run
+  // without a SiriusContext, so anything they need must be pushed to process
+  // globals here — otherwise a YAML-configured deployment never reaches them
+  // (the DuckDB SET handlers push on change, but only after startup).
+  {
+    auto const& comp = config_.get_compression_config();
+    sirius::compression::set_spill_compression_settings(comp.enable_spill_compression,
+                                                        comp.spill_explore_beam_width,
+                                                        comp.spill_explore_max_bytes,
+                                                        comp.max_compressed_fraction,
+                                                        comp.spill_replan_after_uses,
+                                                        comp.spill_error_tolerance,
+                                                        comp.spill_replan_change_threshold,
+                                                        comp.spill_explore_sample_rows,
+                                                        comp.spill_min_batch_bytes,
+                                                        comp.spill_release_columns_early,
+                                                        comp.spill_encode_reserve_fraction,
+                                                        comp.spill_encode_min_headroom_fraction);
+    // Before any query runs, so the arena comes off the top of a device that is
+    // still empty rather than being asked for once the query pool has grown.
+    if (comp.enable_spill_compression && comp.device_pool_bytes > 0) {
+      sirius::compression::init_compression_device_pool(comp.device_pool_bytes);
+    }
+    sirius::compression::set_output_compression_settings(
+      comp.enable_output_compression,
+      comp.output_compression_min_ratio,
+      comp.output_compression_min_compress_gbps,
+      comp.output_compression_min_decompress_gbps,
+      comp.max_compressed_fraction,
+      comp.output_compression_min_batch_bytes,
+      comp.enable_device_compression_downgrade);
+
+    // Load every offline table plan up front. These used to be read lazily inside
+    // pin_table()'s bind, one table at a time — so a query that never pinned
+    // anything never loaded them, and the spill path (which reaches them through
+    // column lineage, not through pinning) found nothing.
+    load_compression_plan_dir(comp.input_plan_dir);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
@@ -1140,6 +1238,13 @@ void SiriusContext::terminate()
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
+
+  // The asynchronous spill-plan explorer runs beam searches on its own thread and
+  // allocates from compression_device_mr(). Stop it here: after the downgrade
+  // executors (the only submitters, so no new search can be queued) and before the
+  // memory manager and CUDA context below. Left to its static destructor at process
+  // exit it would run nvrtc/CUDA work against a context that is already gone.
+  sirius::shutdown_explore_worker();
 
   task_scheduler_.reset();
   task_creator_.reset();

@@ -73,6 +73,7 @@ std::size_t dtype_elem_size(const std::string& name)
   if (name == "int16_t") return 2;
   if (name == "int32_t") return 4;
   if (name == "int64_t") return 8;
+  if (name == "__int128") return 16;
   return 0;  // 0 => unsupported (caller throws)
 }
 
@@ -83,10 +84,11 @@ std::size_t dtype_elem_size(const std::string& name)
 // elements (exact width == counterpart width).
 const char* exact_unsigned(std::size_t elem_size)
 {
-  return (elem_size == 8)   ? "uint64_t"
-         : (elem_size == 2) ? "uint16_t"
-         : (elem_size == 1) ? "uint8_t"
-                            : "uint32_t";
+  return (elem_size == 16)  ? "unsigned __int128"
+         : (elem_size == 8)  ? "uint64_t"
+         : (elem_size == 2)  ? "uint16_t"
+         : (elem_size == 1)  ? "uint8_t"
+                             : "uint32_t";
 }
 
 // Substitute a value source's __POS__ token with the given position expr.
@@ -517,15 +519,51 @@ __device__ __forceinline__ uint64_t simpatico_bitunpack_one(
     return stitched & mask;
 }
 
+// 5-word gather: the 128-bit counterpart of the above. A 128-bit value starting
+// at an arbitrary bit offset spans ceil((128+31)/32) = 5 uint32 words, so the
+// 3-word stitch cannot reach it. Same shape otherwise: unconditional loads, no
+// data dependency between them.
+__device__ __forceinline__ unsigned __int128 simpatico_bitunpack_one_128(
+    const uint32_t* __restrict__ packed, int bits, int32_t idx) {
+    using u128 = unsigned __int128;
+    const uint64_t bp      = static_cast<uint64_t>(static_cast<uint32_t>(idx))
+                           * static_cast<uint32_t>(bits);
+    const int32_t  word_in = static_cast<int32_t>(bp >> 5);
+    const int32_t  bit_in  = static_cast<int32_t>(bp & 31);
+    u128 v =  static_cast<u128>(packed[word_in    ])
+           | (static_cast<u128>(packed[word_in + 1]) << 32)
+           | (static_cast<u128>(packed[word_in + 2]) << 64)
+           | (static_cast<u128>(packed[word_in + 3]) << 96);
+    v >>= bit_in;
+    // Guarded: at bit_in == 0 the top word contributes nothing and the shift
+    // would be by 128, which is undefined.
+    if (bit_in != 0) {
+        v |= static_cast<u128>(packed[word_in + 4]) << (128 - bit_in);
+    }
+    const u128 mask = (bits == 128) ? ~static_cast<u128>(0)
+                                    : ((static_cast<u128>(1) << bits) - 1);
+    return v & mask;
+}
+
+// cuda::std::make_unsigned has no __int128 specialisation in this toolkit, so
+// name the counterpart directly.
+template <class T> struct simpatico_unsigned { using type = typename ::cuda::std::make_unsigned<T>::type; };
+template <> struct simpatico_unsigned<__int128> { using type = unsigned __int128; };
+
 // Random-access bitpack read at per-chunk position `idx`, with the
 // constant-chunk (bits==0) short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
-                                          int32_t bits, T minv, int32_t idx) {
-    using U = typename ::cuda::std::make_unsigned<T>::type;
+                                          int32_t bits, T minv, T divv, int32_t idx) {
+    using U = typename simpatico_unsigned<T>::type;
     if (bits == 0) return minv;
-    const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
-    return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+    if constexpr (sizeof(T) == 16) {
+        const unsigned __int128 v = simpatico_bitunpack_one_128(packed_base, bits, idx);
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(divv) * static_cast<U>(v));
+    } else {
+        const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(divv) * static_cast<U>(v));
+    }
 }
 
 }  // namespace
@@ -603,9 +641,11 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   const std::string idstr = std::to_string(id);
 
   const std::string p_min  = "chunk_min_" + idstr;
+  const std::string p_divs = "chunk_divisors_" + idstr;
   const std::string p_bits = "chunk_bits_" + idstr;
   const std::string p_pkd  = "packed_" + idstr;
   const std::string v_min  = "bpmin_" + idstr;
+  const std::string v_div  = "bpdiv_" + idstr;
   const std::string v_bits = "bpbits_" + idstr;
   const std::string v_base = "bpbase_" + idstr;
 
@@ -613,15 +653,18 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   add_param("const " + elem_type + "* __restrict__", p_min);
   add_param("const uint8_t* __restrict__", p_bits);
   add_param("const uint32_t* __restrict__", p_pkd);
+  add_param("const " + elem_type + "* __restrict__", p_divs);
   add_buffer(id, "chunk_min", esize);
   add_buffer(id, "chunk_bits", sizeof(std::uint8_t));
   add_buffer(id, "packed", sizeof(std::uint32_t));
+  add_buffer(id, "chunk_divisors", esize);
 
   // Per-chunk scalar prelude (loaded once per block).
   body_ << "    // --- node " << id << ": Bitpack (" << elem_type << ") value source ---\n"
         << "    const int32_t " << v_bits << " = static_cast<int32_t>(" << p_bits
         << "[chunk_id]);\n"
-        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n";
+        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n"
+        << "    const " << elem_type << " " << v_div << " = " << p_divs << "[chunk_id];\n";
 
   // Decode reads the Compact per-chunk ``bp_offsets`` layout; every stored
   // bitpack rep is dense (the fused encode path compacts in place).
@@ -635,7 +678,8 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   ValueSource vs;
   vs.elem_type = elem_type;
   vs.read_expr =
-    "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", (__POS__))";
+    "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", " + v_div +
+    ", (__POS__))";
   return vs;
 }
 
@@ -952,7 +996,8 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
           << "[chunk_id + 1],\n"
           << "                                static_cast<int32_t>(chunk_bits_" << idstr
           << "[chunk_id + 1]),\n"
-          << "                                chunk_min_" << idstr << "[chunk_id + 1], 0);\n";
+          << "                                chunk_min_" << idstr << "[chunk_id + 1],\n"
+          << "                                chunk_divisors_" << idstr << "[chunk_id + 1], 0);\n";
   } else {
     body_ << "        next0 = delta_first_" << idstr << "[chunk_id + 1];\n";
   }
@@ -1342,13 +1387,14 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
     if (vit->second->op == ::codegen::OpKind::Bitpack) {
       body_ << "        struct " << vstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            " << elem_type << " min; int32_t base;\n"
+            << "            " << elem_type << " min; " << elem_type << " div; int32_t base;\n"
             << "            __device__ __forceinline__ " << elem_type
             << " operator()(int32_t idx) const noexcept {\n"
-            << "                return simpatico_bp_at(packed + base, bits, min, idx);\n"
+            << "                return simpatico_bp_at(packed + base, bits, min, div, idx);\n"
             << "            }\n"
             << "        } " << vread << " { packed_" << v_child_id << ", bpbits_" << v_child_id
-            << ", bpmin_" << v_child_id << ", bpbase_" << v_child_id << " };\n";
+            << ", bpmin_" << v_child_id << ", bpdiv_" << v_child_id << ", bpbase_"
+            << v_child_id << " };\n";
     } else {
       // Raw leaf
       body_ << "        struct " << vstruct << " {\n"
@@ -1369,14 +1415,15 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
       bitpack_value_source(*rit->second, "int32_t");  // emits kernel params
       body_ << "        struct " << cstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            int32_t min; int32_t base;\n"
+            << "            int32_t min; int32_t div; int32_t base;\n"
             << "            __device__ __forceinline__ int32_t operator()(int32_t idx) const "
                "noexcept {\n"
             << "                return static_cast<int32_t>(simpatico_bp_at(packed + base, bits, "
-               "min, idx));\n"
+               "min, div, idx));\n"
             << "            }\n"
             << "        } " << cread << " { packed_" << c_child_id << ", bpbits_" << c_child_id
-            << ", bpmin_" << c_child_id << ", bpbase_" << c_child_id << " };\n"
+            << ", bpmin_" << c_child_id << ", bpdiv_" << c_child_id << ", bpbase_"
+            << c_child_id << " };\n"
             << "        ::codegen::block_rle_decompress_fv<" << elem_type << ", "
             << ::codegen::kChunkSize << ", " << tbs_ << ">(\n"
             << "            " << vread << ", " << cread << ",\n"

@@ -57,6 +57,13 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
 
+  /// Per-reactor read counters for SIRIUS_IO_PROFILE; reading resets them.
+  ///
+  /// Wall time alone cannot separate a read path that is bandwidth-bound from one
+  /// that is starved of outstanding work: both just look slow. Request size and
+  /// realised in-flight depth do separate them.
+  [[nodiscard]] std::string perf_report_and_reset() noexcept override;
+
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
   /// regardless of bucket population).  @p sink returns false to stop early —
