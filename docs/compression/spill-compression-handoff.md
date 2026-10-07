@@ -194,19 +194,30 @@ ratios on the heavy spillers: 2.3–4.7× (q3 471 → 121 GB, q9 325 → 114 GB)
 
 The pattern across both scale factors: **compression pays when spills would
 otherwise reach disk, is a wash when they fit in the host tier, and under extreme
-spill pressure can turn a completion into a GPU retry-limit failure** (next
-section).
+spill pressure can turn a completion into a GPU retry-limit failure** — through the
+retry policy and the compression arena's device over-commit, not slower eviction
+(next section).
 
 ## Open items
 
-- **The GPU retry limit under slow eviction — the most important open problem.**
-  Whenever freeing GPU memory gets slower, waiting tasks burn through their 100 OOM
-  retries and the query fails: SF3000 q3 and q13 complete with the cache off and
-  compression off, but fail with compression on (1,838 and 1,518 retries; a
-  compressed spill frees memory only after encoding) and fail with the capped cache
-  on (spills going to disk). Candidates: back off between retries instead of
-  retrying at the rate failures arrive, give the limit headroom while a downgrade
-  is in flight, or skip compression when spill pressure is extreme.
+- **The GPU retry policy cannot wait for memory — the most important open problem.**
+  SF3000 q3 and q13 complete with the cache off and compression off, but fail at
+  the retry limit with compression on (1,838 and 1,518 retries) or with the cache
+  on. Not because compressed spills free memory slowly: downgrades in the
+  compression runs were fast (~39 GB/s). The retry budget is 100 per original task
+  for its whole life, never reset on progress, with a fixed 50 ms sleep
+  (`gpu_pipeline_executor.cpp`, sized for ~5 s of SF100 contention) that waits on
+  no eviction; a downgrade that frees 0 bytes still lets the task retry. In the
+  compression runs everything evictable had already been spilled (1,605
+  predicate-only requests in the last 5 s freeing nothing) and the device was
+  physically over-committed — the 0.86 pool reserves ~30 GB plus the 3 GiB arena on
+  a ~33.7 GB card — giving real `cudaErrorMemoryAllocation` failures (1,313 in q3,
+  809 in q13; 0 with compression off) that the defragmenter will not trim for
+  (it requires free space >= 10x the request). With the cache on, the host tier is
+  wedged by readahead (above), so GPU memory has nowhere to spill. Candidates:
+  count a retry only when a full reservation was granted, wait on a
+  memory-release event instead of a fixed sleep, reset on query progress with a
+  wall-clock backstop; subtract the compression arena from the GPU pool size.
 - **Lazy per-thread stream pools in the compressed decode path.**
   `simpatico::thread_device_stream_pool` (`src/util/stream_pool.cpp`) creates 4
   CUDA streams the first time each thread decodes. Deep in a memory-starved query
