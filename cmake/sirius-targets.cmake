@@ -1,7 +1,3 @@
-if(NOT "cxx_std_23" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
-  message(FATAL_ERROR "The Sirius public API requires a C++23 compiler")
-endif()
-
 # Only the public configuration implementation needs std::expected. Keep engine
 # sources at C++20 for dependency headers that do not compile as C++23 with
 # Clang.
