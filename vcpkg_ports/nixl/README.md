@@ -28,26 +28,4 @@ GPU ports; CUDA driver libraries are runtime dependencies.
 Installed Sirius consumers should use the standalone shared package or the vcpkg
 static package described in [Building Sirius](../../docs/building.md). The legacy
 installed DuckDB export set does not discover Sirius's dependencies and is not
-supported for NIXL-enabled consumers.
-
-## Isolated validation
-
-From the Sirius checkout:
-
-```sh
-pixi run -e vcpkg vcpkg/vcpkg install nixl:x64-linux --classic \
-  --overlay-ports=vcpkg_ports --overlay-triplets=vcpkg_triplets \
-  --x-install-root=build/exchange-vcpkg-installed
-pixi run -e vcpkg cmake -S test/cmake/nixl -B build/nixl-static-probe \
-  -DCMAKE_PREFIX_PATH="$PWD/build/exchange-vcpkg-installed/x64-linux"
-pixi run -e vcpkg cmake --build build/nixl-static-probe
-pixi run -e vcpkg ctest --test-dir build/nixl-static-probe --output-on-failure
-```
-
-The probe exercises the installed `nixl::nixl` target, GPU memory registration,
-a 1 MiB GPU transfer, and a transfer completion notification between two agents.
-The two agents run in one process.
-CTest checks TCP and shared memory enabled transport with CUDA copy, audits
-dynamic dependencies, and builds a shared consumer with the BFD linker, hidden
-archive symbols, and unresolved symbols forbidden. The shared memory case also
-enables TCP because NIXL requires a control transport with peer failure handling.
+supported for installed consumers.

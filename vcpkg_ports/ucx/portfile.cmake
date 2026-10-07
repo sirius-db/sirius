@@ -64,9 +64,6 @@ vcpkg_configure_make(
   NVCC=${UCX_NVCC})
 vcpkg_install_make()
 
-# Upstream's CUDA pkg-config entry is empty and omits static registration.
-configure_file("${CMAKE_CURRENT_LIST_DIR}/ucx.pc.in"
-               "${CURRENT_PACKAGES_DIR}/lib/pkgconfig/ucx.pc" @ONLY)
 vcpkg_fixup_pkgconfig()
 
 file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/ucx-config.cmake"

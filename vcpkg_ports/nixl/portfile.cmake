@@ -42,10 +42,6 @@ set(NIXL_CUDA_STUBDIR "${NIXL_CUDA_LIBDIR}/stubs")
 if(NOT EXISTS "${NIXL_CUDA_STUBDIR}/libcuda.so")
   message(FATAL_ERROR "NIXL requires the CUDA toolkit driver stub library")
 endif()
-# UCX pkg-config keeps toolkit paths out of the installed package.
-string(APPEND VCPKG_LINKER_FLAGS
-       " -L\"${NIXL_CUDA_LIBDIR}\" -L\"${NIXL_CUDA_STUBDIR}\"")
-
 vcpkg_configure_meson(
   SOURCE_PATH
   "${SOURCE_PATH}"
