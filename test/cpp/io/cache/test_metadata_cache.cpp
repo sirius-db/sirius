@@ -126,3 +126,20 @@ TEST_CASE("Metadata shared global manager and concurrent bounded publication", "
   CHECK(c.statistics().retained_bytes == 0);
   CHECK(c.statistics().entries == 0);
 }
+
+TEST_CASE("Metadata live charge survives eviction until the last reader releases it",
+          "[metadata_cache]")
+{
+  auto baseline = io_object_metadata::live_retained_bytes();
+  cache_type c(policy());
+  auto v = std::make_shared<value>(1234);
+  c.put(1, "held", "p", tag(), 1, v);
+  auto reader = c.get(1, "held", "p", tag());
+  CHECK(io_object_metadata::live_retained_bytes() == baseline + 1234);
+  c.erase_scope(1);
+  v.reset();
+  CHECK(c.statistics().retained_bytes == 0);
+  CHECK(io_object_metadata::live_retained_bytes() == baseline + 1234);
+  reader.reset();
+  CHECK(io_object_metadata::live_retained_bytes() == baseline);
+}

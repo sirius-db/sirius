@@ -42,7 +42,8 @@ namespace sirius::op::scan {
 /// Lives with the parquet ingestible (its only producer/consumer): the bind
 /// path (@c sirius_scan_manager::describe_parquet) parses and parks it, and the
 /// metadata scan (@c parquet_gpu_ingestible::build_file_scan_info) reuses it.
-class parquet_metadata final : public sirius::io::io_object_metadata {
+class parquet_metadata final : public sirius::io::io_object_metadata,
+                               public std::enable_shared_from_this<parquet_metadata> {
  public:
   parquet_metadata(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                    std::size_t footer_byte_len,
@@ -57,12 +58,14 @@ class parquet_metadata final : public sirius::io::io_object_metadata {
       _file_metadata(std::move(file_metadata)),
       _footer_byte_len(footer_byte_len)
   {
+    account_retention();
   }
 
-  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> const& file_metadata()
-    const noexcept
+  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata() const
   {
-    return _file_metadata;
+    // Export an alias that owns the entire evidence record, including accounting.
+    // Removing the cache entry cannot free evidence still used by a split.
+    return {shared_from_this(), _file_metadata.get()};
   }
 
   /// Conservative retained allocation estimate, computed outside cache locks.

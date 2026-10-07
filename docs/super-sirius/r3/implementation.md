@@ -92,3 +92,17 @@ idle expiry without new accesses, shared ownership and concurrent insertion.
 Compilation checks using actual generated compiler flags passed the metadata
 store, resolver, kvikio, REST, uring, prefetch and datasource translation units;
 full build and integration execution remain in progress.
+
+## S3: retained physical evidence
+
+Prepared file approvals now own the metadata record and captured object identity;
+consumption checks that identity against the datasource. Exported footer pointers
+alias the complete record's owner, so even a footer-only consumer keeps schema
+evidence and accounting alive after cache replacement/expiry. Live record charge
+is distinct from cache retention and decremented only at final destruction; it
+is an estimate, not an allocator-enforced total process budget.
+
+Host tests: metadata cache 6 cases / 32 assertions passed, including live-charge
+retention after eviction. A separate actual Parquet-record test verifies alias
+ownership, dynamic-container charge and final release. Syntax checks passed the
+read-view consumption and Parquet preparation translation units.

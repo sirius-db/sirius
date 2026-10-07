@@ -104,7 +104,7 @@ void metadata_cache::put(uint64_t scope,
                          std::shared_ptr<io_object_metadata> value)
 {
   if (!value) return;
-  auto bytes  = value->retained_bytes();
+  auto bytes  = value->account_retention();
   auto lookup = key(scope, path, profile);
   // Conservative charge includes duplicate index key, list/map nodes and buckets.
   auto overhead =
