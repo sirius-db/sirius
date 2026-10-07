@@ -36,31 +36,23 @@ struct ArrowArray;
 namespace sirius {
 
 /**
- * @brief Copy one host-memory Arrow record batch (a struct array) to the device as a
- * `cudf::table` whose column types equal `get_cudf_type(types[i])`.
+ * @brief Copy one host Arrow record batch (a struct array) to the device as a `cudf::table` whose
+ * column types equal `get_cudf_type(types[i])`. Columns bind by position.
  *
- * The checks run before any buffer is copied, except that a format outside the scalar set
- * (date64, time, binary, string view, nested) is type-checked after its copy:
- * - Shapes the engine cannot consume are refused by name: dictionary encoding, 64-bit offsets
- *   (`large_utf8`, `large_binary`, `large_list`), timezone-aware timestamps, `decimal256`,
- *   struct-level nulls, and a column declared `HUGEINT`/`UHUGEINT` (no 128-bit integer on the GPU).
- * - A scalar column whose format disagrees with its declared type is refused. A `decimal128`
- *   must carry the declared scale and at most the declared precision; it is narrowed to the
- *   declared width after the copy, because Arrow producers emit `decimal128` at any precision.
- * - The struct's own `offset`/`length` window is honoured: `cudf::from_arrow_column` reads each
- *   child by its own offset, so the window is pushed into each child first.
+ * Refused before any copy: dictionary encoding, 64-bit offsets, timezone-aware timestamps,
+ * `decimal256`, struct-level nulls, a column declared `HUGEINT`, `UHUGEINT` or nested, a scalar
+ * format that disagrees with its declared type, and a `decimal128` with another scale or a larger
+ * precision. Other formats (date64, time, binary, string view, nested) are type-checked after
+ * their copy. A `decimal128` is narrowed to the declared width before the next column is copied.
+ * The struct's `offset`/`length` window is honoured, which `cudf::from_arrow_column` ignores.
  *
- * Columns are imported one at a time and narrowed before the next is copied, so the transient
- * device footprint is one column at its arriving width, not the whole batch.
+ * Copies run on `stream`; the caller syncs it before the producer releases the structs. A throw
+ * after a copy started syncs `stream` first. The input is never released.
  *
- * The copies run on `stream`; the caller synchronizes before letting the producer release the
- * structs. On an error after the copy started, `stream` is synchronized before the throw. The
- * input is never released.
- *
- * @param what Message prefix naming the batch, e.g. `"Arrow batch for stream 3"`.
- * @throws sirius::invalid_input_exception on null or released structs, a non-struct top level, a
- *         column-count mismatch, a window past a child, a refused shape, or a type mismatch. Each
- *         per-column message names the column by index and declared name.
+ * @param what Message prefix naming the batch.
+ * @param names Declared column names, for messages; as many as `types`.
+ * @param mr Allocates the returned columns.
+ * @throws sirius::invalid_input_exception on a refused batch, naming the column.
  */
 std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
                                                      const ArrowArray* array,
