@@ -160,15 +160,16 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Copy one host Arrow record batch to the GPU as a batch of input `stream_id` from
-  /// `sender_id`. Legal between build() and run(); does not close the sender. The batch lands on
-  /// the Context's first GPU with no memory reservation and is not spillable, so everything pushed
-  /// before run() must fit in GPU memory beside other work.
+  /// Copy one host Arrow record batch to the GPU as a batch of an input stream. Legal between
+  /// build() and run(); does not close the sender. The batch lands on the Context's first GPU with
+  /// no memory reservation and is not spillable, so everything pushed before run() must fit in GPU
+  /// memory beside other work. Columns bind by position and must have the declared types; a
+  /// decimal128 is narrowed to the declared precision's width.
+  /// @param stream_id A declared input stream.
+  /// @param sender_id A declared sender of that stream that has not closed.
   /// @param array_addr An `ArrowArray*` holding a struct array (Arrow C Data Interface).
   /// @param schema_addr Its `ArrowSchema*`. Both stay the caller's: the copy completes before
   ///        return and neither is released.
-  /// Columns bind by position and must have the declared types; a decimal128 is narrowed to the
-  /// declared precision's width.
   /// @throws before build(), once run() started, on an undeclared stream or sender, a closed
   /// sender or ended stream, or a batch `sirius::import_arrow_host_table()` refuses
   /// (src/helper/arrow_host_import.hpp lists the refused shapes, e.g. a column declared HUGEINT,
