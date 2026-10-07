@@ -160,19 +160,20 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
-  /// Import one host-memory Arrow record batch (Arrow C Data Interface, a struct array) into
-  /// input stream `stream_id` as sender `sender_id`. The buffers are copied to the GPU before
-  /// this returns, so the caller may release `*array_addr` and `*schema_addr` at once; they are
-  /// never released here. Does not close the sender. Legal between build() and run(). The copy
-  /// takes no memory reservation, and queued batches are not spillable: everything pushed before
-  /// run() must fit in GPU memory beside whatever else runs on the GPU. A sender that already
-  /// closed may still push while another sender of the stream is open.
-  /// Column types must match the declared ones; a decimal128 is narrowed to the declared
-  /// precision's width.
-  /// @throws before build(), once run() started, on an undeclared stream or sender, null or
-  /// released structs, a column-count or type mismatch, a decimal with a different scale or a
-  /// larger precision, dictionary encoding, 64-bit offsets, a timezone-aware timestamp, a
-  /// decimal256, struct-level nulls, a column declared HUGEINT, or a stream that already ended.
+  /// Copy one host Arrow record batch to the GPU as a batch of input `stream_id` from
+  /// `sender_id`. Legal between build() and run(); does not close the sender. The batch lands on
+  /// the Context's first GPU with no memory reservation and is not spillable, so everything pushed
+  /// before run() must fit in GPU memory beside other work.
+  /// @param array_addr An `ArrowArray*` holding a struct array (Arrow C Data Interface).
+  /// @param schema_addr Its `ArrowSchema*`. Both stay the caller's: the copy completes before
+  ///        return and neither is released.
+  /// Columns bind by position and must have the declared types; a decimal128 is narrowed to the
+  /// declared precision's width.
+  /// @throws before build(), once run() started, on an undeclared stream or sender, a closed
+  /// sender or ended stream, null or released structs, a column-count or type mismatch, a decimal
+  /// with another scale or a larger precision, dictionary encoding, 64-bit offsets, a
+  /// timezone-aware timestamp, a decimal256, struct-level nulls, or a column declared HUGEINT,
+  /// UHUGEINT or nested.
   void push_arrow(std::uint64_t stream_id,
                   std::uint32_t sender_id,
                   std::uintptr_t array_addr,

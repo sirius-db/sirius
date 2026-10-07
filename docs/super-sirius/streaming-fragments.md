@@ -240,14 +240,11 @@ host-memory Arrow record batch (Arrow C Data Interface), for an embedder that pr
 CPU. `import_arrow_host_table()` checks the batch against the declared schema, then imports one
 column at a time with `cudf::from_arrow_column` on a pool stream, narrowing a `decimal128` to the
 declared precision's width. The stream is synchronized before return, so the caller may release
-the structs at once. `streaming_fragment::push()` then hands the batch to the session.
+the structs at once. `streaming_fragment::push_arrow()` owns the checks, copy and push;
+the batch lands on the context's first GPU.
 
-- **Checks run before the copy.** Refused by name: dictionary encoding, 64-bit offsets,
-  timezone-aware timestamps, `decimal256`, struct-level nulls, and columns declared `HUGEINT`. A
-  scalar type mismatch, a different decimal scale, or a larger decimal precision is refused. The
-  struct's own `offset`/`length` is honoured; `cudf::from_arrow_column` would ignore it. A
-  format outside the scalar set (date64, time, binary, string view, nested) is type-checked
-  after its copy.
+- **Checks run before the copy**, as listed on `import_arrow_host_table()`. Columns bind by
+  position, and a closed sender or ended stream is refused.
 - **Store-and-forward.** Legal from `build()`'s return until `run()`, from any thread and
   concurrently; it takes no `Context` lock, so it may overlap another fragment's `run()`. `run()`
   still needs every input closed.

@@ -34,6 +34,9 @@
 #include <string>
 #include <vector>
 
+struct ArrowArray;
+struct ArrowSchema;
+
 namespace duckdb {
 class QueryResult;
 }  // namespace duckdb
@@ -111,7 +114,8 @@ class streaming_fragment {
 
   /// Move every parked batch on `source`'s output `source_stream_id` into this fragment's
   /// input `input_stream_id`, then close `sender_id` on it. Checks schema, shared context,
-  /// sender, and phase (source ran, this fragment built but not run) before any data moves.
+  /// phase (source ran, this fragment built but not run), and refuses what push_arrow() refuses
+  /// before any data moves.
   /// @return number of batches moved.
   std::size_t relay_from(streaming_fragment& source,
                          stream_id_t source_stream_id,
@@ -121,20 +125,17 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build(), or on an unknown id or sender.
   void close_input(stream_id_t id, sender_id_t sender);
 
-  /// Push one batch into input `id` as `sender`. Legal between build() and run(), from any
-  /// thread. Does not close the sender. A sender that already closed may still push while
-  /// another sender of the same input is open.
+  /// Copy one host Arrow record batch to the first GPU as a batch of input `id` from `sender`;
+  /// see import_arrow_host_table() for what it accepts. Synchronized before return; the structs
+  /// are never released and the sender stays open. Legal between build() and run(), from any
+  /// thread.
   /// @throws sirius::invalid_input_exception before build(), once run() started, on an unknown
-  ///         id, a sender outside the declared set, or an input that already ended.
-  void push(stream_id_t id, sender_id_t sender, std::shared_ptr<cucascade::data_batch> batch);
-
-  /// The checks push() runs, for a caller that wants to refuse before building the batch.
-  /// @throws what push() throws.
-  void check_push(stream_id_t id, sender_id_t sender) const;
-
-  /// The declared names, types, and senders of input `id`.
-  /// @throws sirius::invalid_input_exception on an unknown id.
-  [[nodiscard]] const stream_input_spec& input_spec(stream_id_t id) const;
+  ///         id, a sender outside the declared set or already closed, an ended input, or a batch
+  ///         import_arrow_host_table() refuses.
+  void push_arrow(stream_id_t id,
+                  sender_id_t sender,
+                  const ArrowArray* array,
+                  const ArrowSchema* schema);
 
   /// nullopt means no batch is parked now, not EOS; use drained(id) for EOS.
   /// @throws sirius::invalid_input_exception before run() or on an unknown id.
@@ -166,6 +167,10 @@ class streaming_fragment {
   enum class phase : std::uint8_t { declared, build_failed, built, running, ran, run_failed };
 
   void require_built(const char* what) const;
+  /// Refuses a push from `sender` into `id` as push_arrow() documents; returns the declared input.
+  const stream_input_spec& check_push(stream_id_t id, sender_id_t sender) const;
+  /// @throws sirius::invalid_input_exception when the input ended since check_push().
+  void push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch);
   duckdb::unique_ptr<op::sirius_physical_operator> make_streaming_sink(
     duckdb::unique_ptr<op::sirius_physical_operator> subtree);
   duckdb::unique_ptr<op::sirius_physical_operator> make_result_collector(

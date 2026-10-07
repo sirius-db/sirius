@@ -31,6 +31,7 @@
 #include <catch.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -124,10 +125,15 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
         *batch, {"a", "b"}, declared({duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT})),
       ContainsSubstring("the stream declares 2"));
   }
-  SECTION("declared HUGEINT")
+  SECTION("declared 128-bit integer or nested")
   {
-    REQUIRE_THROWS_WITH(import(*batch, {"a"}, declared({duckdb::LogicalType::HUGEINT})),
-                        ContainsSubstring("no 128-bit integer"));
+    for (const auto& type :
+         std::vector<duckdb::LogicalType>{duckdb::LogicalType::HUGEINT,
+                                          duckdb::LogicalType::UHUGEINT,
+                                          duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT)}) {
+      REQUIRE_THROWS_WITH(import(*batch, {"a"}, declared({type})),
+                          ContainsSubstring("which cannot be imported"));
+    }
   }
   SECTION("released structs")
   {
@@ -135,6 +141,24 @@ TEST_CASE("arrow_host_import: refuses mismatched and unsupported batches before 
     batch->array.release = nullptr;
     REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("already released"));
     batch->array.release = release;
+  }
+  SECTION("a released or missing column")
+  {
+    auto& child   = *batch->array.children[0];
+    auto release  = child.release;
+    child.release = nullptr;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("missing or released"));
+    child.release         = release;
+    auto* children        = batch->array.children;
+    batch->array.children = nullptr;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("missing or released"));
+    batch->array.children = children;
+  }
+  SECTION("more rows than cudf holds")
+  {
+    batch->array.length = std::int64_t{std::numeric_limits<cudf::size_type>::max()} + 1;
+    REQUIRE_THROWS_WITH(import(*batch, {"a"}, bigint), ContainsSubstring("longer than cudf's"));
+    batch->array.length = 3;
   }
   SECTION("a window past a child")
   {

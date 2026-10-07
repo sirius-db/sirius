@@ -409,6 +409,8 @@ TEST_CASE("FFI push_arrow refuses bad calls and leaves the fragment runnable",
   auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
   auto fragment = sirius::ffi::make_fragment(*ctx);
   fragment->declare_input_column(0, "a", "BIGINT");
+  fragment->declare_input_sender(0, 0);
+  fragment->declare_input_sender(0, 1);
   auto ids   = sirius::test::arrow_batch_from_sql("SELECT i::BIGINT AS a FROM range(1, 4) t(i)");
   auto names = sirius::test::arrow_batch_from_sql("SELECT 'x' AS a");
   auto push  = [&](std::uint64_t stream, std::uint32_t sender, sirius::test::arrow_batch& batch) {
@@ -423,7 +425,9 @@ TEST_CASE("FFI push_arrow refuses bad calls and leaves the fragment runnable",
 
   push(0, 0, *ids);
   fragment->close_input(0, 0);
-  REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("already ended"));
+  REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("already closed"));
+  fragment->close_input(0, 1);
+  REQUIRE_THROWS_WITH(push(0, 1, *ids), ContainsSubstring("already ended"));
   fragment->run();
   REQUIRE(result_i64s(*fragment) == std::vector<std::int64_t>{1, 2, 3});
   REQUIRE_THROWS_WITH(push(0, 0, *ids), ContainsSubstring("before run()"));

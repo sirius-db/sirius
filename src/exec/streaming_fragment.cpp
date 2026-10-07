@@ -16,6 +16,8 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "data/data_batch_utils.hpp"  // sirius::make_data_batch
+#include "helper/arrow_host_import.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -25,6 +27,8 @@
 #include "sirius_interface.hpp"  // sirius_prepared_statement_data
 
 #include <cudf/types.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <duckdb/main/query_result.hpp>
 
@@ -372,10 +376,6 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
       "source.run() first, otherwise an empty stream is indistinguishable from a finished one "
       "and the input would be closed early");
   }
-  if (_phase != phase::built) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: relay_from() must run before this fragment's run()");
-  }
   if (&source._context != &_context) {
     throw sirius::invalid_input_exception(
       "streaming_fragment: relay_from() requires both fragments to share a ClientContext");
@@ -386,21 +386,8 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
       "QueryResult via take_result(), not a relayable stream");
   }
 
-  auto declared_it = _spec.inputs.find(input_stream_id);
-  if (declared_it == _spec.inputs.end()) {
-    throw sirius::invalid_input_exception("streaming_fragment: relay target input stream " +
-                                          std::to_string(input_stream_id) +
-                                          " was never declared on this fragment");
-  }
-  const auto& declared_senders = declared_it->second.expected_senders;
-  if (!declared_senders.empty() && declared_senders.count(sender_id) == 0) {
-    throw sirius::invalid_input_exception(
-      "streaming_fragment: sender " + std::to_string(sender_id) +
-      " is not in the expected set for input stream " + std::to_string(input_stream_id));
-  }
-
   {
-    const auto& declared = declared_it->second.types;
+    const auto& declared = check_push(input_stream_id, sender_id).types;
     const auto& produced = source.sink_types();
     if (produced.size() != declared.size()) {
       throw sirius::invalid_input_exception(
@@ -420,11 +407,7 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
 
   std::size_t moved = 0;
   while (auto batch = source._session.pull(source_stream_id)) {
-    if (!_session.push(input_stream_id, *batch)) {
-      throw sirius::invalid_input_exception("streaming_fragment: input stream " +
-                                            std::to_string(input_stream_id) +
-                                            " refused a batch; it had already ended");
-    }
+    push(input_stream_id, *batch);
     ++moved;
   }
   _session.close_input(input_stream_id, sender_id);
@@ -437,25 +420,46 @@ void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
   _session.close_input(id, sender);
 }
 
-void streaming_fragment::push(stream_id_t id,
-                              sender_id_t sender,
-                              std::shared_ptr<cucascade::data_batch> batch)
+void streaming_fragment::push_arrow(stream_id_t id,
+                                    sender_id_t sender,
+                                    const ArrowArray* array,
+                                    const ArrowSchema* schema)
 {
-  check_push(id, sender);
-  // The stream can still end between check_push() and here; the session refuses it then.
-  if (!_session.push(id, std::move(batch))) {
-    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
-                                          " refused a batch; it had already ended");
+  const auto& declared = check_push(id, sender);
+  auto& memory         = sirius_context_of(_context).get_memory_manager();
+  const auto gpus      = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpus.empty()) {
+    throw sirius::internal_exception("streaming_fragment: push_arrow() found no GPU memory space");
   }
+  auto& gpu = *memory.get_memory_space(cucascade::memory::Tier::GPU, gpus.front()->get_device_id());
+  // The embedder's thread may have another device current.
+  const rmm::cuda_set_device_raii device{rmm::cuda_device_id{gpu.get_device_id()}};
+  // A pool stream: syncing cudf's default (legacy) stream would be a device-wide barrier.
+  auto stream = gpu.acquire_stream();
+  auto table =
+    import_arrow_host_table(schema,
+                            array,
+                            "streaming_fragment: Arrow batch for stream " + std::to_string(id),
+                            declared.names,
+                            declared.types,
+                            stream,
+                            gpu.get_default_allocator());
+  stream.sync();
+  push(id, make_data_batch(std::move(table), gpu, stream, telemetry::batch_telemetry_info{}));
 }
 
-void streaming_fragment::check_push(stream_id_t id, sender_id_t sender) const
+const stream_input_spec& streaming_fragment::check_push(stream_id_t id, sender_id_t sender) const
 {
-  require_built("push()");
+  require_built("push");
   if (_phase != phase::built) {
-    throw sirius::invalid_input_exception("streaming_fragment: push() must happen before run()");
+    throw sirius::invalid_input_exception("streaming_fragment: push must happen before run()");
   }
-  const auto& senders = input_spec(id).expected_senders;
+  auto it = _spec.inputs.find(id);
+  if (it == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no input stream with id " +
+                                          std::to_string(id));
+  }
+  const auto& senders = it->second.expected_senders;
   if (!senders.empty() && senders.count(sender) == 0) {
     throw sirius::invalid_input_exception("streaming_fragment: sender " + std::to_string(sender) +
                                           " is not in the expected set for input stream " +
@@ -463,18 +467,21 @@ void streaming_fragment::check_push(stream_id_t id, sender_id_t sender) const
   }
   if (_session.input_closed(id)) {
     throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
-                                          " refused a batch; it had already ended");
+                                          " already ended");
   }
-}
-
-const stream_input_spec& streaming_fragment::input_spec(stream_id_t id) const
-{
-  auto it = _spec.inputs.find(id);
-  if (it == _spec.inputs.end()) {
-    throw sirius::invalid_input_exception("streaming_fragment: no input stream with id " +
-                                          std::to_string(id));
+  if (_session.sender_closed(id, sender)) {
+    throw sirius::invalid_input_exception("streaming_fragment: sender " + std::to_string(sender) +
+                                          " already closed input stream " + std::to_string(id));
   }
   return it->second;
+}
+
+void streaming_fragment::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
+{
+  if (!_session.push(id, std::move(batch))) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " already ended");
+  }
 }
 
 std::optional<std::shared_ptr<cucascade::data_batch>> streaming_fragment::pull(stream_id_t id)

@@ -31,6 +31,7 @@
 #include <bit>       // std::popcount
 #include <charconv>  // std::from_chars
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -78,8 +79,7 @@ std::optional<decimal_format> parse_decimal(std::string_view format)
 void refuse_unsupported_shape(std::string_view what,
                               std::size_t index,
                               const std::string& name,
-                              const ArrowSchema& child,
-                              const logical_type& declared)
+                              const ArrowSchema& child)
 {
   const auto refuse = [&](std::string_view reason) {
     throw invalid_input_exception("{}: column {} ({}) {}", what, index, name, reason);
@@ -96,10 +96,6 @@ void refuse_unsupported_shape(std::string_view what,
   }
   if (const auto decimal = parse_decimal(format); decimal && decimal->bitwidth == 256) {
     refuse("is a decimal256; cudf has no 256-bit decimal");
-  }
-  if (declared.id() == type_id::HUGEINT || declared.id() == type_id::UHUGEINT) {
-    refuse("is declared " + declared.to_string() +
-           "; the GPU has no 128-bit integer, so declare a DECIMAL or a 64-bit integer");
   }
 }
 
@@ -210,11 +206,15 @@ void validate_batch(const ArrowSchema* schema,
       array->n_children,
       types.size());
   }
-  if (array->offset < 0 || array->length < 0) {
-    throw invalid_input_exception("{}: the struct has a negative offset ({}) or length ({})",
-                                  what,
-                                  array->offset,
-                                  array->length);
+  constexpr std::int64_t max_rows = std::numeric_limits<cudf::size_type>::max();
+  if (array->offset < 0 || array->length < 0 || array->length > max_rows ||
+      array->offset > std::numeric_limits<std::int64_t>::max() - array->length) {
+    throw invalid_input_exception(
+      "{}: the struct window (offset {}, length {}) is invalid or longer than cudf's {} rows",
+      what,
+      array->offset,
+      array->length,
+      max_rows);
   }
   // A null struct row has no place in a table; cudf would import its children as present.
   if (const auto* validity = validity_of(*array);
@@ -224,13 +224,19 @@ void validate_batch(const ArrowSchema* schema,
                                   what);
   }
   for (std::size_t i = 0; i < types.size(); ++i) {
-    if (array->children[i]->length < array->offset + array->length) {
+    const auto* child_schema = schema->children == nullptr ? nullptr : schema->children[i];
+    const auto* child_array  = array->children == nullptr ? nullptr : array->children[i];
+    if (child_schema == nullptr || child_array == nullptr || child_schema->release == nullptr ||
+        child_array->release == nullptr) {
+      throw invalid_input_exception("{}: column {} ({}) is missing or released", what, i, names[i]);
+    }
+    if (child_array->length < array->offset + array->length) {
       throw invalid_input_exception(
         "{}: column {} ({}) has {} rows but the batch spans rows [{}, {})",
         what,
         i,
         names[i],
-        array->children[i]->length,
+        child_array->length,
         array->offset,
         array->offset + array->length);
     }
@@ -247,8 +253,17 @@ std::vector<cudf::data_type> check_columns(const ArrowSchema& schema,
   expected.reserve(types.size());
   for (std::size_t i = 0; i < types.size(); ++i) {
     const auto& child = *schema.children[i];
-    refuse_unsupported_shape(what, i, names[i], child, types[i]);
-    expected.push_back(get_cudf_type(types[i]));
+    refuse_unsupported_shape(what, i, names[i], child);
+    // No 128-bit integer on the GPU, and nested children are not type-checked.
+    const auto declared = types[i].id();
+    if (declared == type_id::HUGEINT || declared == type_id::UHUGEINT ||
+        cudf::is_nested(expected.emplace_back(get_cudf_type(types[i])))) {
+      throw invalid_input_exception("{}: column {} ({}) is declared {}, which cannot be imported",
+                                    what,
+                                    i,
+                                    names[i],
+                                    types[i].to_string());
+    }
     const auto carried = cudf_type_of_format(format_of(child));
     if (carried && *carried != expected[i] && !differs_in_width_only(*carried, expected[i])) {
       throw_type_mismatch(what, i, names[i], types[i], expected[i], *carried);

@@ -82,6 +82,9 @@ class stream_session {
   /// True once every expected sender has closed the input. @throws on unknown input id.
   [[nodiscard]] bool input_closed(stream_id_t id) const;
 
+  /// @throws on unknown input id.
+  [[nodiscard]] bool sender_closed(stream_id_t id, sender_id_t sender) const;
+
   // -----------------------------------------------------------------------
   // Consumer side — output streams
   // -----------------------------------------------------------------------
