@@ -407,7 +407,8 @@ class parsed_sirius_config {
  public:
   parsed_sirius_config();
   static parsed_sirius_config from_file(const std::filesystem::path& path);
-  static parsed_sirius_config from_node(const YAML::Node& root);
+  static parsed_sirius_config from_node(const YAML::Node& root,
+                                        const std::filesystem::path& source_path = {});
   [[nodiscard]] parsed_sirius_config with_gpu_usage_limit(gpu_usage_limit limit) const;
   [[nodiscard]] const telemetry_config& get_telemetry_config() const noexcept;
   [[nodiscard]] const operator_params& get_operator_params() const noexcept;

@@ -31,7 +31,6 @@ struct ContextConfig::Impl {
 
 struct ContextConfigBuilder::Impl {
   parsed_sirius_config config;
-  std::string source;
   std::optional<gpu_usage_limit> gpu_limit;
 };
 
@@ -68,15 +67,14 @@ std::expected<ContextConfigBuilder, Error> ContextConfigBuilder::from_yaml(
       Error{ErrorCode::configuration_io, "Cannot read configuration file: " + path.string()});
   }
 
-  auto impl    = std::make_shared<Impl>();
-  impl->source = path.string();
+  auto impl = std::make_shared<Impl>();
   try {
     auto root    = YAML::Load(contents);
-    impl->config = parsed_sirius_config::from_node(root);
+    impl->config = parsed_sirius_config::from_node(root, path);
   } catch (const YAML::Exception& e) {
-    return std::unexpected(Error{ErrorCode::malformed_yaml, impl->source + ": " + e.what()});
+    return std::unexpected(Error{ErrorCode::malformed_yaml, path.string() + ": " + e.what()});
   } catch (const configuration_input_error& e) {
-    return std::unexpected(Error{ErrorCode::invalid_configuration, impl->source + ": " + e.what()});
+    return std::unexpected(Error{ErrorCode::invalid_configuration, e.what()});
   }
   return ContextConfigBuilder(std::move(impl));
 }
@@ -105,9 +103,7 @@ std::expected<ContextConfig, Error> ContextConfigBuilder::build() const
     return ContextConfig(
       std::make_shared<ContextConfig::Impl>(ContextConfig::Impl{std::move(config)}));
   } catch (const configuration_input_error& e) {
-    return std::unexpected(
-      Error{ErrorCode::invalid_configuration,
-            impl_->source.empty() ? e.what() : impl_->source + ": " + e.what()});
+    return std::unexpected(Error{ErrorCode::invalid_configuration, e.what()});
   }
 }
 

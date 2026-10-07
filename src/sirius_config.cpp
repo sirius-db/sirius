@@ -728,36 +728,27 @@ void sirius_config::apply_defaults()
 
 parsed_sirius_config parsed_sirius_config::from_file(const std::filesystem::path& path)
 {
+  YAML::Node root;
   try {
-    auto parsed       = from_node(YAML::LoadFile(path.string()));
-    auto impl         = std::make_shared<Impl>(*parsed.impl_);
-    impl->source_path = path;
-    return parsed_sirius_config(std::move(impl));
+    root = YAML::LoadFile(path.string());
+  } catch (const std::bad_alloc&) {
+    throw;
   } catch (const std::exception& e) {
-    throw std::runtime_error("Failed to load config from " + path.string() + ": " + e.what());
+    throw configuration_input_error(path.string() + ": " + e.what());
   }
+  return from_node(root, path);
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
 {
-  try {
-    YAML::Node root;
-    try {
-      root = YAML::LoadFile(config_path.string());
-    } catch (const YAML::Exception& e) {
-      throw std::runtime_error("failed to parse YAML: " + std::string(e.what()));
-    }
-
-    *this = parsed_sirius_config::from_node(root).resolve(discover_configuration_topology());
-  } catch (const std::exception& e) {
-    throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
-                             e.what());
-  }
+  *this = parsed_sirius_config::from_file(config_path).resolve(discover_configuration_topology());
 }
 
-parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
-{
+parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root,
+                                                     const std::filesystem::path& source_path)
+try {
   auto impl                             = std::make_shared<Impl>();
+  impl->source_path                     = source_path;
   auto& settings                        = impl->settings;
   auto& topo                            = impl->topo;
   auto& gpu_cfg                         = impl->gpu_cfg;
@@ -770,90 +761,81 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
   std::vector<cucascade::memory::host_memory_space_config> host_space_configs;
   std::vector<cucascade::memory::disk_memory_space_config> disk_space_configs;
 
-  try {
-    yaml::reader top(root);
-    auto sirius_node = top.optional_node("sirius");
-    top.reject_unknown();
+  yaml::reader top(root);
+  auto sirius_node = top.optional_node("sirius");
+  top.reject_unknown();
 
-    if (!sirius_node) { throw std::runtime_error("missing top-level 'sirius' key"); }
+  if (!sirius_node) { throw std::runtime_error("missing top-level 'sirius' key"); }
 
-    yaml::reader r(*sirius_node, "sirius");
+  yaml::reader r(*sirius_node, "sirius");
 
-    // Topology
-    r.optional("topology", topo);
-    settings._gpus_per_query = topo.gpus_per_query;
+  // Topology
+  r.optional("topology", topo);
+  settings._gpus_per_query = topo.gpus_per_query;
 
-    // High-level memory config (mutually exclusive with space config)
-    if (auto mem_node = r.optional_node("memory")) {
-      yaml::reader mr(*mem_node, "sirius.memory");
-      if (auto n = mr.optional_node("gpu")) {
-        high_level_memory_configured = true;
-        yaml::reader gpu_reader(*n, "sirius.memory.gpu");
-        explicit_high_level_gpu_capacity =
-          gpu_reader.has_value("usage_limit_bytes") || gpu_reader.has_value("usage_limit_fraction");
-        gpu_mem_config::from_yaml(*n, gpu_cfg);
-      }
-      if (auto n = mr.optional_node("host")) {
-        high_level_memory_configured = true;
-        host_mem_config::from_yaml(*n, host_cfg);
-      }
-      if (auto n = mr.optional_node("disk")) {
-        high_level_memory_configured = true;
-        disk_mem_config::from_yaml(*n, disk_cfg);
-      }
-      mr.reject_unknown();
+  // High-level memory config (mutually exclusive with space config)
+  if (auto mem_node = r.optional_node("memory")) {
+    yaml::reader mr(*mem_node, "sirius.memory");
+    if (auto n = mr.optional_node("gpu")) {
+      high_level_memory_configured = true;
+      yaml::reader gpu_reader(*n, "sirius.memory.gpu");
+      explicit_high_level_gpu_capacity =
+        gpu_reader.has_value("usage_limit_bytes") || gpu_reader.has_value("usage_limit_fraction");
+      gpu_mem_config::from_yaml(*n, gpu_cfg);
     }
-
-    // Executors
-    if (auto exec_node = r.optional_node("executor")) {
-      yaml::reader er(*exec_node, "sirius.executor");
-      if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
-      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
-      if (auto n = er.optional_node("pipeline"))
-        from_yaml(*n, settings._gpu_pipeline_executor_config);
-      if (auto n = er.optional_node("downgrade"))
-        from_yaml(*n, settings._downgrade_executor_config);
-      er.reject_unknown();
+    if (auto n = mr.optional_node("host")) {
+      high_level_memory_configured = true;
+      host_mem_config::from_yaml(*n, host_cfg);
     }
-
-    // Parse operator settings below and record which batch sizes are explicit,
-    // so hardware resolution only fills in omitted values.
-    operator_node = r.optional_node("operator_params");
-
-    // Telemetry
-    if (auto n = r.optional_node("telemetry")) {
-      sirius::from_yaml(*n, settings._telemetry_config);
+    if (auto n = mr.optional_node("disk")) {
+      high_level_memory_configured = true;
+      disk_mem_config::from_yaml(*n, disk_cfg);
     }
-
-    // Compression
-    if (auto n = r.optional_node("compression")) {
-      sirius::from_yaml(*n, settings._compression_config);
-    }
-
-    // Explicit space configs (low-level API)
-    if (auto space_node = r.optional_node("space")) {
-      yaml::reader sr(*space_node, "sirius.space");
-      if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
-      if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
-      if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
-      sr.reject_unknown();
-    }
-
-    bool const explicit_space_configured =
-      !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
-    if (high_level_memory_configured && explicit_space_configured) {
-      throw std::runtime_error(
-        "sirius.memory and non-empty sirius.space lists are mutually exclusive");
-    }
-
-    r.reject_unknown();
-  } catch (const std::runtime_error& e) {
-    throw configuration_input_error(e.what());
+    mr.reject_unknown();
   }
 
-  // Build memory space configs
-  settings._memory_space_configs.clear();
+  // Executors
+  if (auto exec_node = r.optional_node("executor")) {
+    yaml::reader er(*exec_node, "sirius.executor");
+    if (auto n = er.optional_node("task_creator")) from_yaml(*n, settings._task_creator_config);
+    if (auto n = er.optional_node("scan_manager")) from_yaml(*n, settings._scan_manager_config);
+    if (auto n = er.optional_node("pipeline"))
+      from_yaml(*n, settings._gpu_pipeline_executor_config);
+    if (auto n = er.optional_node("downgrade")) from_yaml(*n, settings._downgrade_executor_config);
+    er.reject_unknown();
+  }
 
+  // Parse operator settings below and record which batch sizes are explicit,
+  // so hardware resolution only fills in omitted values.
+  operator_node = r.optional_node("operator_params");
+
+  // Telemetry
+  if (auto n = r.optional_node("telemetry")) { sirius::from_yaml(*n, settings._telemetry_config); }
+
+  // Compression
+  if (auto n = r.optional_node("compression")) {
+    sirius::from_yaml(*n, settings._compression_config);
+  }
+
+  // Explicit space configs (low-level API)
+  if (auto space_node = r.optional_node("space")) {
+    yaml::reader sr(*space_node, "sirius.space");
+    if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
+    if (auto n = sr.optional_node("host")) read_yaml_vec(*n, host_space_configs);
+    if (auto n = sr.optional_node("disk")) read_yaml_vec(*n, disk_space_configs);
+    sr.reject_unknown();
+  }
+
+  bool const explicit_space_configured =
+    !gpu_space_configs.empty() || !host_space_configs.empty() || !disk_space_configs.empty();
+  if (high_level_memory_configured && explicit_space_configured) {
+    throw std::runtime_error(
+      "sirius.memory and non-empty sirius.space lists are mutually exclusive");
+  }
+
+  r.reject_unknown();
+
+  // Build memory space configs
   std::copy(gpu_space_configs.begin(),
             gpu_space_configs.end(),
             std::back_inserter(settings._memory_space_configs));
@@ -870,22 +852,23 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
   impl->use_effective_gpu_capacity = settings._memory_space_configs.empty()
                                        ? explicit_high_level_gpu_capacity
                                        : explicit_low_level_gpu_capacity;
-  try {
-    if (operator_node) {
-      sirius::from_yaml(*operator_node, settings._operator_params);
-      yaml::reader r(*operator_node, "operator_params");
-      for (auto [name, member] : batch_settings) {
-        if (r.has_value(name)) { impl->explicit_batch_settings.push_back(member); }
-      }
+  if (operator_node) {
+    sirius::from_yaml(*operator_node, settings._operator_params);
+    yaml::reader r(*operator_node, "operator_params");
+    for (auto [name, member] : batch_settings) {
+      if (r.has_value(name)) { impl->explicit_batch_settings.push_back(member); }
     }
-  } catch (const std::runtime_error& e) {
-    throw configuration_input_error(e.what());
   }
   return parsed_sirius_config(std::move(impl));
+} catch (const std::bad_alloc&) {
+  throw;
+} catch (const std::exception& e) {
+  throw configuration_input_error(source_path.empty() ? e.what()
+                                                      : source_path.string() + ": " + e.what());
 }
 
 parsed_sirius_config parsed_sirius_config::with_gpu_usage_limit(gpu_usage_limit limit) const
-{
+try {
   if (!impl_->settings.get_memory_space_configs().empty()) {
     throw configuration_input_error(
       "GPU usage-limit overrides conflict with non-empty sirius.space lists");
@@ -899,6 +882,11 @@ parsed_sirius_config parsed_sirius_config::with_gpu_usage_limit(gpu_usage_limit 
   impl->gpu_cfg.usage_limit        = limit;
   impl->use_effective_gpu_capacity = true;
   return parsed_sirius_config(std::move(impl));
+} catch (const std::bad_alloc&) {
+  throw;
+} catch (const std::exception& e) {
+  throw configuration_input_error(
+    impl_->source_path.empty() ? e.what() : impl_->source_path.string() + ": " + e.what());
 }
 
 sirius_config parsed_sirius_config::resolve(
