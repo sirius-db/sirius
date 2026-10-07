@@ -104,5 +104,6 @@ the final extension link bundles its dependencies. See the
 Static consumers select their own compiler runtime linkage. The distribution
 extension uses `-static-libgcc -static-libstdc++` to bundle those runtimes.
 
-To include extension-loading checks in the C++ suite, set `SIRIUS_EXTENSION_PATH`
-to the built wrapper's absolute path when running `make test`. CI supplies this path.
+`make test` builds the shared wrapper and sets `SIRIUS_EXTENSION_PATH` for
+extension-loading checks. When running `scripts/run_unit_tests.py` or the test
+binary directly, set this variable to the wrapper's absolute path. CI supplies it.

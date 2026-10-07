@@ -34,6 +34,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # All paths configurable via environment variables
 DUCKDB="${DUCKDB:-$PROJECT_DIR/sirius-duckdb/build/release/duckdb}"
+SIRIUS_EXTENSION="${SIRIUS_EXTENSION_PATH:-$PROJECT_DIR/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension}"
+DUCKDB_ARGS=(-unsigned -bail -cmd "LOAD '${SIRIUS_EXTENSION//\'/\'\'}';")
 ITERATIONS=${ITERATIONS:-2}
 # Per-query timeout in seconds (covers both iterations + nsys overhead).
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-90}
@@ -46,6 +48,7 @@ if [ $# -lt 1 ]; then
     echo "Environment variables:"
     echo "  SIRIUS_CONFIG_FILE - path to Sirius config (required)"
     echo "  DUCKDB             - path to DuckDB binary (default: sirius-duckdb/build/release/duckdb)"
+    echo "  SIRIUS_EXTENSION_PATH - path to the Sirius extension (default: wrapper release build)"
     echo "  PARQUET_DIR        - path to parquet data directory (default: test_datasets/tpch_parquet_sf<SF>)"
     echo "  QUERY_DIR          - path to TPC-H query SQL files (default: test/tpch_performance/tpch_queries/orig)"
     echo "  OUTPUT_DIR         - output directory for profiles (default: nsys_profiles/sf<SF>)"
@@ -67,7 +70,13 @@ OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/nsys_profiles/sf${SF}}"
 
 if [ ! -f "$DUCKDB" ]; then
     echo "ERROR: DuckDB binary not found: $DUCKDB"
-    echo "  Build with: pixi run make -j12"
+    echo "  Build with: pixi run make"
+    exit 1
+fi
+
+if [ ! -f "$SIRIUS_EXTENSION" ]; then
+    echo "ERROR: Sirius extension not found: $SIRIUS_EXTENSION"
+    echo "  Build with: pixi run make"
     exit 1
 fi
 
@@ -226,7 +235,7 @@ EOF
         --force-overwrite=true \
         --stats=false \
         --export=sqlite \
-        "$DUCKDB" -f "$TEMP_SQL" \
+        "$DUCKDB" "${DUCKDB_ARGS[@]}" -f "$TEMP_SQL" \
         > "$RESULT_FILE" 2>&1
     EXIT_CODE=$?
     END_TIME=$(date +%s.%N)
@@ -294,3 +303,5 @@ echo "Profiles saved to: $OUTPUT_DIR/"
 echo "Analyze with:      ./test/tpch_performance/nsys_analyze.sh $OUTPUT_DIR/"
 echo "Open in nsys-ui:   nsys-ui $OUTPUT_DIR/q<N>.nsys-rep"
 echo "Query SQLite:      sqlite3 $OUTPUT_DIR/q<N>.sqlite"
+
+[ "$FAILED" -eq 0 ]

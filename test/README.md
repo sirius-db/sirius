@@ -3,7 +3,9 @@ This directory contains all the tests for this extension. The `cpp` directory ho
 
 ## C++ unit tests
 
-CI and `make test` run the C++ unit tests with `scripts/run_unit_tests.py`. `make test` builds the release build first, and `make test_debug` does the same with the debug build:
+CI and `make test` run the C++ unit tests with `scripts/run_unit_tests.py`. `make test` builds the release library and wrapper first, and sets `SIRIUS_EXTENSION_PATH`
+to include extension-loading checks. `make test_debug` builds the debug library and tests;
+set `SIRIUS_EXTENSION_PATH` explicitly to test a compatible wrapper with that build:
 ```bash
 pixi run make test
 pixi run python scripts/run_unit_tests.py                                # without rebuilding

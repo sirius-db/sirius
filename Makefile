@@ -80,7 +80,8 @@ RUN_UNIT_TESTS = python3 scripts/run_unit_tests.py
 
 test: test_release
 
-test_release: release
+test_release: export SIRIUS_EXTENSION_PATH ?= $(CURDIR)/sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
+test_release: sirius-duckdb
 	$(RUN_UNIT_TESTS) --build-dir build/release $(UNITTEST_ARGS)
 
 test_debug: debug
