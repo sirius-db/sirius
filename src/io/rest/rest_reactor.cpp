@@ -1525,6 +1525,15 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           auto const free_connections =
             occupied < _config.max_connections ? _config.max_connections - occupied : 1;
           request = next_fresh(free_connections);
+          // next_fresh hands fused runs to `ready` rather than returning them, and
+          // reports nullptr once the group is drained. Breaking out here would
+          // strand those fused reads: with nothing else in flight, no event wakes
+          // the loop again until the upkeep timer (a 15 s stall per split by
+          // default, seen on every probe scan that starts on an idle reactor).
+          if (request == nullptr && !ready.empty()) {
+            request = std::move(ready.front());
+            ready.pop_front();
+          }
         }
         if (request == nullptr) break;
         if (!request->op->coordinator->should_continue()) {
