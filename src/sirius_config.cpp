@@ -945,8 +945,7 @@ try {
   throw;
 } catch (const std::exception& e) {
   if (impl_->source_path.empty()) { throw; }
-  throw std::runtime_error("Failed to resolve config from " + impl_->source_path.string() + ": " +
-                           e.what());
+  throw std::runtime_error(impl_->source_path.string() + ": " + e.what());
 }
 
 void sirius_config::finalize_derived_config()
