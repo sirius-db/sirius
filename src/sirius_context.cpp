@@ -286,6 +286,74 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
   }
 }
 
+namespace {
+
+bool is_word_char(unsigned char c) noexcept { return std::isalnum(c) != 0 || c == '_'; }
+
+/// Position just past the whole-word, case-insensitive occurrence of @p word
+/// at or after @p from, or npos.
+std::size_t find_word(std::string const& sql, std::string_view word, std::size_t from) noexcept
+{
+  for (std::size_t i = from; i + word.size() <= sql.size(); ++i) {
+    bool match = true;
+    for (std::size_t k = 0; k < word.size() && match; ++k) {
+      match = std::tolower(static_cast<unsigned char>(sql[i + k])) == word[k];
+    }
+    if (!match) { continue; }
+    auto const end = i + word.size();
+    if ((i == 0 || !is_word_char(static_cast<unsigned char>(sql[i - 1]))) &&
+        (end == sql.size() || !is_word_char(static_cast<unsigned char>(sql[end])))) {
+      return end;
+    }
+  }
+  return std::string::npos;
+}
+
+std::size_t skip_spaces(std::string const& sql, std::size_t i) noexcept
+{
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i])) != 0) {
+    ++i;
+  }
+  return i;
+}
+
+/// True when the argument list starting at @p i (just past the function name)
+/// is exactly one plain string literal: `( '…' )`.  Anything else — a
+/// concatenation, a function call, a parameter — assembles the SQL at bind
+/// time, where no lexical rule can see it.
+bool single_literal_argument(std::string const& sql, std::size_t i) noexcept
+{
+  i = skip_spaces(sql, i);
+  if (i >= sql.size() || sql[i] != '(') { return false; }
+  i = skip_spaces(sql, i + 1);
+  if (i >= sql.size() || sql[i] != '\'') { return false; }
+  for (++i; i < sql.size(); ++i) {
+    if (sql[i] != '\'') { continue; }
+    if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+      ++i;
+      continue;
+    }
+    break;
+  }
+  if (i >= sql.size()) { return false; }
+  i = skip_spaces(sql, i + 1);
+  return i < sql.size() && sql[i] == ')';
+}
+
+/// A statement whose text must not reach the log: it mentions SECRET, or it
+/// hands SQL to gpu_execution() in a form other than one plain literal.
+bool carries_credentials(std::string const& sql) noexcept
+{
+  if (find_word(sql, "secret", 0) != std::string::npos) { return true; }
+  for (auto at = find_word(sql, "gpu_execution", 0); at != std::string::npos;
+       at      = find_word(sql, "gpu_execution", at)) {
+    if (!single_literal_argument(sql, at)) { return true; }
+  }
+  return false;
+}
+
+}  // namespace
+
 void SiriusContext::QueryBegin(ClientContext& context)
 {
   // Suppress logging for internal connections (e.g. internal metadata lookups).
@@ -311,24 +379,28 @@ void SiriusContext::QueryBegin(ClientContext& context)
   // decorates.
   try {
     auto query = context.GetCurrentQuery();
-    // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
-    // trim leading/trailing whitespace, and log the full normalized query so
-    // log_analysis tools can correlate by SQL text without truncation.
     std::string normalized_query;
-    normalized_query.reserve(query.size());
-    bool in_ws = true;  // skip leading whitespace
-    for (char c : query) {
-      bool is_ws = std::isspace(static_cast<unsigned char>(c)) != 0;
-      if (is_ws) {
-        if (!in_ws) { normalized_query.push_back(' '); }
-        in_ws = true;
-      } else {
-        normalized_query.push_back(c);
-        in_ws = false;
+    if (carries_credentials(query)) {
+      normalized_query = "<credential statement redacted>";
+    } else {
+      // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
+      // trim leading/trailing whitespace, and log the full normalized query so
+      // log_analysis tools can correlate by SQL text without truncation.
+      normalized_query.reserve(query.size());
+      bool in_ws = true;  // skip leading whitespace
+      for (char c : query) {
+        bool is_ws = std::isspace(static_cast<unsigned char>(c)) != 0;
+        if (is_ws) {
+          if (!in_ws) { normalized_query.push_back(' '); }
+          in_ws = true;
+        } else {
+          normalized_query.push_back(c);
+          in_ws = false;
+        }
       }
-    }
-    if (!normalized_query.empty() && normalized_query.back() == ' ') {
-      normalized_query.pop_back();
+      if (!normalized_query.empty() && normalized_query.back() == ' ') {
+        normalized_query.pop_back();
+      }
     }
     // ONE line carrying both the correlation key and the SQL (two separate lines
     // could interleave with another connection's logging); execution windows and
