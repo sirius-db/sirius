@@ -19,12 +19,12 @@
 #
 # Typical merge:
 #   tools/merge-guard.sh snapshot
-#   git merge --no-commit --no-ff upstream/dev
+#   git merge --no-commit --no-ff upstream/main
 #   ...resolve...
 #   tools/merge-guard.sh check  &&  git commit
 #
 # Add an anchor when landing work a future merge could revert wholesale --
-# anything large in a file dev also edits.
+# anything large in a file upstream also edits.
 set -uo pipefail
 
 REPO="$(git rev-parse --show-toplevel)"
@@ -63,6 +63,8 @@ spill-compression-arena	src/compression/compression_device_pool.hpp	init_compres
 spill-arena-install	src/sirius_context.cpp	init_compression_device_pool
 spill-encode-plan-entrypoints	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	compressed_table compress_columns(
 pushdown-graceful-decline	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	declined_members
+spill-sources-in-build	src/compression/CMakeLists.txt	spill_context.cpp
+lineage-source-in-build	src/planner/CMakeLists.txt	column_origin.cpp
 ANCHORS
 }
 

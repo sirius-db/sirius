@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Merge upstream/dev into this branch with the checks that actually catch losses.
+# Merge upstream/main into this branch with the checks that actually catch losses.
 #
 # Order matters, and it is empirical. On the 2026-08-25 merge:
 #   - merge-guard caught nothing (the anchored registrations survived)
-#   - the LINKER caught two silent losses: taking dev's simpatico_codegen.cpp
+#   - the LINKER caught two silent losses: taking upstream's simpatico_codegen.cpp
 #     wholesale dropped this branch's two compress_columns() definitions and the
-#     reject_sliced_columns() helper, none of which dev ever had.
+#     reject_sliced_columns() helper, none of which upstream ever had.
 # So the build is the primary check, and merge-guard covers the one class the
 # build cannot see: symbols that are REGISTERED rather than CALLED. Nothing
 # references a converter registration, so dropping all nine still links --
 # which is exactly how eed19f08 went unnoticed for a week.
 #
-#   tools/merge-dev.sh            # merge upstream/dev
+#   tools/merge-dev.sh            # merge upstream/main
 #   tools/merge-dev.sh <ref>      # merge some other ref
 #
 # Leaves the merge staged but UNCOMMITTED on success, so you commit deliberately.
@@ -46,7 +46,7 @@ if [ "${1:-}" = "--verify" ]; then
   exit 0
 fi
 
-REF="${1:-upstream/dev}"
+REF="${1:-upstream/main}"
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
 PRE=$(git rev-parse HEAD)
