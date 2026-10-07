@@ -610,24 +610,25 @@ TEST_CASE("scan_manager re-primes routed S3 cache on every query", "[s3][routing
   REQUIRE(routed_cache != nullptr);
   REQUIRE(routed_cache->query_epoch() == 0);
 
-  auto* default_cache = manager.io_ctx()->cache();
-  REQUIRE(default_cache != nullptr);
-  REQUIRE(default_cache->query_epoch() == 0);
+  // The default (local) ioctx's cache is built only when a query reads through
+  // it, and these queries do not: an S3 workload must not reserve host memory
+  // for a local cache it never uses.
+  REQUIRE(manager.io_ctx()->cache() == nullptr);
 
   // The queries intentionally have no scan operators: routed caches must still
-  // advance once per query, matching the default ioctx's query-wide refresh.
+  // advance once per query, as the default ioctx's would.
   // Distinct query ids because per-query state is keyed by id — the epoch bump is per
   // prepare_for_query call, and using one id twice would exercise the stale-state replacement
   // path rather than the two-queries case this gate is about.
   auto q1 = make_empty_query(sirius::make_query_id(1));
   manager.prepare_for_query(q1, true, {});
   REQUIRE(routed_cache->query_epoch() == 1);
-  REQUIRE(default_cache->query_epoch() == 1);
+  REQUIRE(manager.io_ctx()->cache() == nullptr);
 
   auto q2 = make_empty_query(sirius::make_query_id(2));
   manager.prepare_for_query(q2, true, {});
   REQUIRE(routed_cache->query_epoch() == 2);
-  REQUIRE(default_cache->query_epoch() == 2);
+  REQUIRE(manager.io_ctx()->cache() == nullptr);
 }
 
 TEST_CASE("scan_manager tolerates a routed S3 ioctx when cache.mode is none", "[s3][routing]")

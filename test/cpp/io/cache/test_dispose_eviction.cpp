@@ -143,7 +143,7 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
   auto topology = single_gpu_index_for_dispose();
 
   sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -185,7 +185,7 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   auto topology = single_gpu_index_for_dispose();
 
   sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 
@@ -250,7 +250,7 @@ TEST_CASE("scan inputs populate the cache without a readahead manager",
   cfg.max_readahead_scans = 0;
   cfg.apply_cache_mode();
   sirius_scan_manager manager{cfg, *memory, topology};
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
   REQUIRE(cache->is_armed());
 

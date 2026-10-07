@@ -881,7 +881,7 @@ struct resident_fixture {
     cfg.max_readahead_scans     = 0;
     cfg.apply_cache_mode();
     manager = std::make_unique<sirius::scan_manager::sirius_scan_manager>(cfg, *memory, topology);
-    auto* cache = manager->io_ctx()->cache();
+    auto* cache = manager->ensure_default_cache();
     REQUIRE(cache != nullptr);
     REQUIRE(cache->is_armed());
     split_bytes = static_cast<std::int64_t>(cache->chunk_size());

@@ -92,7 +92,7 @@ scan_manager_config config_with_cache(sirius::io::cache::cache_mode mode)
 /// something real to drop.  Returns the bytes it ended up holding.
 std::size_t claim_some_cache(sirius_scan_manager& manager, temp_data_file const& file)
 {
-  auto* cache = manager.io_ctx()->cache();
+  auto* cache = manager.ensure_default_cache();
   REQUIRE(cache != nullptr);
 
   std::vector<cudf::io::text::byte_range_info> ranges;
@@ -145,7 +145,7 @@ TEST_CASE("reset_caches replaces a populated cache with an empty one",
 
   sirius_scan_manager manager{
     config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
-  auto* before = manager.io_ctx()->cache();
+  auto* before = manager.ensure_default_cache();
   REQUIRE(before != nullptr);
   bool const was_armed = before->is_armed();
 
@@ -194,7 +194,7 @@ TEST_CASE("reset_caches is idempotent", "[scan_manager][cache][reset_cache]")
 
   sirius_scan_manager manager{
     config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
-  REQUIRE(manager.io_ctx()->cache() != nullptr);
+  REQUIRE(manager.ensure_default_cache() != nullptr);
 
   manager.reset_caches();
   manager.reset_caches();
@@ -226,7 +226,7 @@ TEST_CASE("reset_caches reclaims still-resident chunk buffers, not just evicted 
 
   sirius_scan_manager manager{
     config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
-  REQUIRE(manager.io_ctx()->cache() != nullptr);
+  REQUIRE(manager.ensure_default_cache() != nullptr);
 
   // Baseline AFTER construction: the scan manager's own io/uring buffers are
   // blocks too, and they legitimately stay held while `manager` is alive. Only
@@ -254,11 +254,82 @@ TEST_CASE("reset_caches is a no-op where the configuration does not cache",
 
   sirius_scan_manager manager{
     config_with_cache(sirius::io::cache::cache_mode::none), *memory, topology};
-  // Caching off, so no cache was ever built...
-  REQUIRE(manager.io_ctx()->cache() == nullptr);
+  // Caching off, so no cache was ever built, nor will one be on demand...
+  REQUIRE(manager.ensure_default_cache() == nullptr);
 
   manager.reset_caches();
 
   // ...and the reset must not be what teaches this context to cache.
   CHECK(manager.io_ctx()->cache() == nullptr);
+}
+
+// ===========================================================================
+// the default cache is built on first use
+// ===========================================================================
+//
+// Every cache reserves min_prefetching_budget_fraction of the host tier when it
+// is built, so an object-store-only workload must not pay for a local cache it
+// never reads through.
+
+TEST_CASE("the default cache is not built until something uses it",
+          "[scan_manager][cache][lazy_cache]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_reset();
+
+  sirius_scan_manager manager{
+    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+  CHECK(manager.io_ctx()->cache() == nullptr);
+
+  // A reset must not be what builds it either: only caches that existed are
+  // rebuilt.
+  manager.reset_caches();
+  CHECK(manager.io_ctx()->cache() == nullptr);
+
+  auto* cache = manager.ensure_default_cache();
+  REQUIRE(cache != nullptr);
+  CHECK(manager.io_ctx()->cache() == cache);
+  // Idempotent: a second ask hands back the same cache.
+  CHECK(manager.ensure_default_cache() == cache);
+}
+
+TEST_CASE("concurrent first uses build the default cache once", "[scan_manager][cache][lazy_cache]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_reset();
+
+  sirius_scan_manager manager{
+    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+
+  constexpr int n_threads = 8;
+  std::vector<sirius::io::cache::prefetching_cache*> seen(n_threads, nullptr);
+  {
+    std::vector<std::jthread> threads;
+    threads.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+      threads.emplace_back([&manager, &seen, i] { seen[i] = manager.ensure_default_cache(); });
+    }
+  }
+  REQUIRE(seen.front() != nullptr);
+  for (auto* cache : seen) {
+    CHECK(cache == seen.front());
+  }
+  CHECK(manager.io_ctx()->cache() == seen.front());
+}
+
+TEST_CASE("the cache summary reports the bytes it holds", "[scan_manager][cache][lazy_cache]")
+{
+  temp_data_file file(8ull << 20);  // 8 MiB
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_reset();
+
+  sirius_scan_manager manager{
+    config_with_cache(sirius::io::cache::cache_mode::sirius), *memory, topology};
+  auto const claimed = claim_some_cache(manager, file);
+  REQUIRE(claimed > 0);
+
+  auto const line = manager.io_ctx()->cache()->summary();
+  INFO(line);
+  CHECK(line.find("resident_bytes=" + std::to_string(claimed) + " ") != std::string::npos);
+  CHECK(line.find("budget_bytes=") != std::string::npos);
 }

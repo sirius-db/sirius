@@ -1073,10 +1073,18 @@ std::string prefetching_cache::summary() const
   uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
   uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
+  // What the pool holds right now, so a log line can be read against the host
+  // tier: chunks handed out and not yet reclaimed, against the eviction trigger.
+  std::size_t const resident = _pool ? _pool->total_allocated_chunks() * _pool->chunk_size() : 0;
+  std::size_t const budget   = _pool ? _pool->max_allowed_budget_for_prefetching() : 0;
+
   return std::format(
     "prefetching_cache: "
+    "resident_bytes={} budget_bytes={} "
     "global[reads={} hits={} h2d={} miss={} evictions={}] "
     "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
+    resident,
+    budget,
     reads,
     hits,
     h2d,

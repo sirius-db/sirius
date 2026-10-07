@@ -1376,14 +1376,9 @@ sirius_scan_manager::sirius_scan_manager(
       "[sirius_scan_manager] sirius_datasource disabled — using kvikio_context fallback");
   }
 
-  // Build the prefetching cache on the ioctx.  Budget=0 keeps the
-  // cache unarmed (no background threads); we pass that whenever the
-  // user has disabled prefetching so the construction is always
-  // unconditional and there's no "is the cache present" branch to
-  // worry about in callers.
-  if (_config.cache.use_prefetching_cache() && _io_ctx->can_use_prefetching_cache()) {
-    _io_ctx->initialize_cache(reservation_manager, _config.cache, _topology_index);
-  }
+  // The prefetching cache is NOT built here: see ensure_default_cache.  A
+  // cache reserves its prefetching floor of the host tier at construction, and
+  // a workload that only reads s3:// never touches this ioctx's.
 
   // Reactors are built parked; start() launches their worker threads and
   // allocates per-reactor staging.  No-op for the kvikio fallback (no reactors).
@@ -1394,6 +1389,16 @@ sirius_scan_manager::~sirius_scan_manager()
 {
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+  }
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    for (auto const& [type, io_ctx] : _routed_io_ctxs) {
+      if (io_ctx && io_ctx->cache()) {
+        SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary (backend {}): {}",
+                        static_cast<int>(type),
+                        io_ctx->cache()->summary());
+      }
+    }
   }
   // Drain the dispatcher (and the worker pool) first so no in-flight
   // metadata-scan / sequencer task can still be reaching into the
@@ -1482,43 +1487,6 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     reset(query_id);
   }
 
-  // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
-  // generation counter (prefetching_cache::_ticker, bumped in
-  // prefetching_cache::prepare_for_query, src/io/cache/prefetching_cache.cpp).
-  // chunk_lifecycle::eviction_tier(query_tick) (src/include/io/cache/types.hpp) scores every
-  // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
-  // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
-  // front of the eviction order. Performance only, never correctness: mark_evicting()
-  // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
-  // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
-  // epochs rather than newest-wins), not here.
-  if (_io_ctx && _io_ctx->cache()) {
-    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
-    _io_ctx->cache()->prepare_for_query();
-  }
-
-  // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
-  // reused across queries; advance their caches to this query too, or a routed
-  // cache's epoch freezes at build time and a later query serves the prior
-  // query's cached chunks as current. Same global-epoch caveat as above.
-  {
-    std::lock_guard lk{_routed_io_ctxs_mtx};
-    for (auto& [type, io_ctx] : _routed_io_ctxs) {
-      if (io_ctx && io_ctx->cache()) { io_ctx->cache()->prepare_for_query(); }
-    }
-  }
-
-  auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
-
-  auto state             = std::make_shared<query_scan_manager_state>();
-  state->pruning_enabled = enable_pinned_zone_map_pruning;
-  // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
-  // pending queue and the pool, not by a per-query cap.
-  state->dispatcher =
-    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
-  state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
-
   // ioctxs are process/query-manager resources and remain alive across query
   // boundaries. Build this set from the scans in *this* query so a context
   // created for an earlier query (or for an object-store LIST) cannot lend its
@@ -1537,6 +1505,60 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       }
     }
   }
+
+  // The default ioctx's cache is built the first time a query reads through it
+  // (see ensure_default_cache), not up front.
+  if (_io_ctx && std::ranges::any_of(query_io_ctxs,
+                                     [this](auto const& io_ctx) { return io_ctx == _io_ctx; })) {
+    std::ignore = ensure_default_cache();
+  }
+
+  // KNOWN GAP under concurrent queries: the prefetch cache's query epoch is a single GLOBAL
+  // generation counter (prefetching_cache::_ticker, bumped in
+  // prefetching_cache::prepare_for_query, src/io/cache/prefetching_cache.cpp).
+  // chunk_lifecycle::eviction_tier(query_tick) (src/include/io/cache/types.hpp) scores every
+  // chunk whose tick is older than the newest as tier 0 — evict first — so a second query
+  // starting here demotes all of the first query's prefetched-but-unconsumed chunks to the
+  // front of the eviction order. Performance only, never correctness: mark_evicting()
+  // succeeds only at pin == 0, so a chunk a live reader holds cannot be reclaimed; the query
+  // just re-reads on a miss. The fix belongs in prefetching_cache (track the set of live
+  // epochs rather than newest-wins), not here.
+  //
+  // One summary per cache that exists -- the routed ones included, since an
+  // object-store query reads through those and the default cache then says
+  // nothing about it.  Logged before prepare_for_query so last_cycle[...] is the
+  // cycle that just ended.
+  if (_io_ctx && _io_ctx->cache()) {
+    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+    _io_ctx->cache()->prepare_for_query();
+  }
+
+  // Routed ioctxs (e.g. the restful context serving s3://) are built lazily and
+  // reused across queries; advance their caches to this query too, or a routed
+  // cache's epoch freezes at build time and a later query serves the prior
+  // query's cached chunks as current. Same global-epoch caveat as above.
+  {
+    std::lock_guard lk{_routed_io_ctxs_mtx};
+    for (auto& [type, io_ctx] : _routed_io_ctxs) {
+      if (io_ctx && io_ctx->cache()) {
+        SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary (backend {}): {}",
+                        static_cast<int>(type),
+                        io_ctx->cache()->summary());
+        io_ctx->cache()->prepare_for_query();
+      }
+    }
+  }
+
+  auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
+
+  auto state             = std::make_shared<query_scan_manager_state>();
+  state->pruning_enabled = enable_pinned_zone_map_pruning;
+  // Deliberately NOT divided by the query count: a lone query must still be able to use the
+  // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
+  // pending queue and the pool, not by a per-query cap.
+  state->dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
+  state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   // Settle the readahead's terms before building it: the budget rations device
   // IO between the readahead and the executor, so it has to be in place before
@@ -2134,6 +2156,17 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
   return it->second;
 }
 
+sirius::io::cache::prefetching_cache* sirius_scan_manager::ensure_default_cache()
+{
+  if (!_io_ctx) { return nullptr; }
+  std::lock_guard lk{_default_cache_mtx};
+  if (_io_ctx->cache() == nullptr && _config.cache.use_prefetching_cache() &&
+      _io_ctx->can_use_prefetching_cache()) {
+    _io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
+  }
+  return _io_ctx->cache();
+}
+
 sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
 {
   auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
@@ -2250,28 +2283,27 @@ void sirius_scan_manager::reset_caches()
 
   // Rebuild one context's cache.  shutdown_cache drains the evictor and every
   // in-flight IO before releasing the chunks, so by the time it returns nothing
-  // is left pointing into what we are about to replace.
+  // is left pointing into what we are about to replace.  Only a cache that
+  // existed is rebuilt: the default one is built lazily, and a reset must not
+  // be what allocates it for a workload that never read through it.
   auto refresh = [this](sirius::io::ioctx& io_ctx) {
     bool const had_cache = io_ctx.cache() != nullptr;
+    if (!had_cache) { return; }
     io_ctx.shutdown_cache();
     // Asking the same two questions the wiring in the constructor asks, so a
     // context that was never given a cache is not given one here either.
     if (!_config.cache.use_prefetching_cache() || !io_ctx.can_use_prefetching_cache()) {
-      // Nothing to rebuild.  Only worth a word when there WAS a cache: a
-      // configuration that never had one is not a surprise worth logging on
-      // every call.
-      if (had_cache) {
-        SIRIUS_LOG_INFO(
-          "[sirius_scan_manager] dropped the prefetching cache for backend {}; the "
-          "configuration does not support caching, so none was rebuilt",
-          static_cast<int>(io_ctx.type()));
-      }
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager] dropped the prefetching cache for backend {}; the "
+        "configuration does not support caching, so none was rebuilt",
+        static_cast<int>(io_ctx.type()));
       return;
     }
     io_ctx.initialize_cache(_reservation_manager, _config.cache, _topology_index);
   };
 
   if (_io_ctx) {
+    std::lock_guard default_lk{_default_cache_mtx};
     if (_io_ctx->cache()) {
       // The last account of what this cache did, on the way out -- the counters
       // go with it, so this is the final moment they mean anything.
@@ -3061,7 +3093,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   std::vector<std::string> const& file_paths,
   std::optional<std::vector<std::string>> const& cols)
 {
-  auto* cache = _io_ctx ? _io_ctx->cache() : nullptr;
+  auto* cache = ensure_default_cache();
   if (cache == nullptr || !cache->is_armed()) {
     throw std::runtime_error(
       "pin_table tier='parquet' needs the Sirius prefetching cache: set "
