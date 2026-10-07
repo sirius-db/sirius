@@ -1393,12 +1393,13 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will actually read + parse the footer.  On a warm
-  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
-  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  // Footer-probe only when we will probably read + parse the footer.  When the
+  // metadata_store holds a parsed footer for this path, a suffix GET would most
+  // likely download bytes we won't reuse — a plain HEAD resolves the size, and
+  // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -1409,10 +1410,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   }
 
   // Reuse a previously parsed footer when present — a prior bind or scan of the
-  // same file parks it in the ioctx metadata store, which lives for the ioctx's
-  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
-  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
-  // so the footer is parsed exactly once per file per process.
+  // same object generation parks it in the ioctx metadata store, which lives
+  // for the ioctx's lifetime. On a miss, fetch + Thrift-parse the footer and
+  // park it so the subsequent scan can reuse it. Mirrors
+  // parquet_gpu_ingestible::build_file_scan_info.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   if (auto cached = datasource->metadata()) {
     if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
@@ -3071,11 +3072,10 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key = normalize_path(path);
-    auto const io_ctx    = ioctx_for_path(path);
-    bool const footer_cached =
-      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-    auto datasource = create_datasource(
+    auto const cache_key     = normalize_path(path);
+    auto const io_ctx        = ioctx_for_path(path);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
     if (!datasource) {
@@ -3083,7 +3083,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     }
 
     // Same footer resolution as describe_parquet / build_file_scan_info, so a
-    // file is parsed at most once per process however it is first touched.
+    // footer already parsed for this generation is reused however it was first touched.
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     if (auto cached_md = datasource->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached_md))) {
