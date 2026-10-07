@@ -1,0 +1,76 @@
+# Sirius config template: TPC-H from S3 on an RTX PRO 4500 Blackwell (32 GB)
+# g-class EC2 box (32 vCPU, 120 GB RAM, 100 Gbit/s NIC, 866 GB instance-store
+# NVMe at /mnt/nvme). Rendered by render-config.sh, which fills the @...@
+# placeholders and appends the object-store credentials -- never put keys here.
+#
+# Derived from bench/compress-spills-v2/sirius-rtx6000.yaml (96 GB GPU, 62 GB
+# RAM, 8 vCPU). Deltas: GPU budgets scaled ~1/3, host tier scaled up to most of
+# this box's RAM, scan/pipeline threads scaled to 32 cores, input from S3 over
+# the REST backend instead of local NVMe.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            # Applied to cudaMemGetInfo total and reserved eagerly. 0.86 rather than
+            # ~0.95 so the spill-compression arm can carve its arena out of the
+            # same total: both arms run at this fraction and the A/B measures
+            # compression, not pool size (see compression.device_pool_bytes).
+            usage_limit_fraction: 0.86
+            reservation_limit_fraction: 0.9
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            # Pinned (cudaHostAlloc) and not reclaimable by the kernel. 100 GB of
+            # 120 GB: inputs come from S3, so there is no page cache to protect,
+            # and DuckDB never runs a CPU replay (enable_duckdb_fallback=false in
+            # the run script) -- the remaining ~20 GB covers DuckDB, Python, the
+            # CUDA driver, REST staging and the OS.
+            capacity_bytes: 100000000000
+            # Pool bytes are held constant across block sizes (block_size *
+            # pool_size = 128 MiB), so the 1 MiB vs 4 MiB A/B changes only the
+            # block granularity. initial_number_pools x 128 MiB is pinned at startup (default
+            # 384 = 48 GiB): pinning on demand mid-query cost q1 ~4 s on a cold cache.
+            block_size: @HOST_BLOCK_SIZE@
+            pool_size: @HOST_POOL_SIZE@
+            initial_number_pools: @HOST_INITIAL_POOLS@
+        disk:
+            disk_id: 0
+            capacity_bytes: 800000000000     # 800 GB of the 866 GB instance store
+            downgrade_root_dirs: "/mnt/nvme/sirius_spill"
+    executor:
+        scan_manager:
+            memory_prefetcher:
+                enable: true
+                num_threads: 4
+            num_threads: @SCAN_THREADS@
+            # sirius backend: REST reactors for s3:// URLs.
+            backend: sirius
+            rest_n_reactors: @REST_REACTORS@
+@CACHE@
+            rest:
+                max_connections: @REST_MAX_CONNECTIONS@
+                # 15 s is the code default. Lowering it once masked a lost wakeup
+                # for fused reads in rest_reactor (fixed); keep it a knob so a
+                # regression shows up as ~upkeep-interval stalls again.
+                upkeep_interval_ms: @REST_UPKEEP_MS@
+@REST_EXTRA@
+@OBJECT_STORE@
+        pipeline:
+            num_threads: @PIPELINE_THREADS@
+        downgrade:
+            num_threads: 2
+        task_creator:
+            num_threads: 2
+    operator_params:
+        scan_task_batch_size: @SCAN_BATCH@
+        max_sort_partition_bytes: 0          # 0: auto
+        hash_partition_bytes: @HASH_PARTITION@
+        concat_batch_bytes: 2GB
+        max_build_hash_table_bytes: @HASH_BUILD@
+    compression:
+@COMPRESSION@
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB
