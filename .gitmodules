@@ -1,4 +1,4 @@
-# Keep DuckDB gitlinks and sirius-duckdb/vcpkg_ports/sirius/portfile.cmake in sync.
+# Keep the engine and wrapper DuckDB gitlinks in sync.
 # When changing DuckDB versions, update cmake/sirius-duckdb-provider.cmake,
 # cmake/CMakePresets.json, pixi.toml, sirius-duckdb/Makefile, and
 # .github/workflows/distribution.yml.

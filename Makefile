@@ -33,7 +33,8 @@ all: sirius-duckdb
 sirius-duckdb: release
 	$(CMAKE) --install build/release --prefix "$(CURDIR)/build/release/install" --component sirius_library
 	$(MAKE) -C sirius-duckdb release SIRIUS_DUCKDB_LINKAGE=shared \
-		EXT_FLAGS="$(EXT_FLAGS) -Usirius_DIR -DCMAKE_PREFIX_PATH='$(CURDIR)/build/release/install' -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+		SIRIUS_INSTALL_DIR="$(CURDIR)/build/release/install" \
+		EXT_FLAGS="$(EXT_FLAGS) -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
 
 build/%/build.ninja: $(CMAKE_INPUTS)
 	$(CMAKE) --preset $* -DSIRIUS_DUCKDB_SOURCE_DIR="$(abspath $(DUCKDB_DIR))"

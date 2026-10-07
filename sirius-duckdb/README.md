@@ -32,13 +32,14 @@ is needed.
 
 ## Static distribution build
 
-The wrapper's vcpkg manifest has a `static` feature that installs Sirius and its
-static dependencies. The final extension link bundles those libraries; the
+The Makefile builds and installs Sirius from the local checkout before building
+the extension. Its vcpkg manifest supplies only third-party static dependencies.
+The final extension link bundles those libraries; the
 post-link check rejects unexpected runtime dependencies. NVIDIA driver libraries
 and standard Linux libraries remain external.
 
 ```sh
-git submodule update --init sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+git submodule update --init duckdb substrait cucascade sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
   SIRIUS_DUCKDB_LINKAGE=static \
   VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
@@ -51,11 +52,16 @@ The Makefile exports this from Pixi's `CUDAARCHS`. Direct vcpkg users must set
 `VCPKG_CUDA_ARCHITECTURES` explicitly.
 Use separate build directories when switching toolchains or linkage modes.
 
-The Sirius port pins its source and vendored dependency revisions. Update these
-pins together with the engine's submodules. The `configure_ci` hook updates the
-Sirius source revision to the current commit when building in this repository
-on GitHub Actions. Only Sirius's binary cache key changes;
-dependency caches remain reusable. The wrapper owns the vcpkg manifest, ports, and triplets.
+Both linkage modes use the local engine sources, including uncommitted changes.
+The wrapper Makefile installs its engine build under
+`build/sirius-<linkage>/<configuration>/install`. Rerunning Make rebuilds changed
+sources; vcpkg's third-party dependency caches remain reusable. Distribution CI
+uses the same flow, with `configure_ci` initializing the engine's submodules.
+
+To consume an existing Sirius installation instead of building the local engine,
+set `SIRIUS_INSTALL_DIR` to its absolute prefix. The root Makefile uses this to
+reuse its `build/release/install` package. The wrapper CMake project itself only
+uses `find_package(sirius)` and never builds the engine.
 
 Both builds produce
 `build/release/extension/sirius/sirius.duckdb_extension` under this directory.

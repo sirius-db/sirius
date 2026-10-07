@@ -13,9 +13,25 @@
   "features": {
     "static": {
       "dependencies": [
-        "sirius"
+        "cudf",
+        "cuvs",
+        "raft",
+        "cuco",
+        "nvrtc",
+        "yaml-cpp",
+        "abseil",
+        "numactl",
+        "liburing",
+        "openssl",
+        "roaring",
+        {
+          "features": [
+            "http2"
+          ],
+          "name": "curl"
+        }
       ],
-      "description": "Build and link Sirius and its dependencies statically"
+      "description": "Static third-party dependencies for Sirius"
     }
   },
   "overrides": [
