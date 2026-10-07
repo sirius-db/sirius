@@ -169,45 +169,45 @@ void require_input_types(sirius::op::sirius_physical_operator const& input,
 //! The types an ALL plan carries: per column, the type both planned inputs share, which must be
 //! the declared type or, for an aggregate result, `planned_aggregate_type` of it.
 duckdb::vector<sirius::logical_type> reconcile_input_types(
-  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> const& inputs,
+  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> const& arms,
   duckdb::vector<duckdb::LogicalType> const& declared_types,
   std::string const& name)
 {
-  for (duckdb::idx_t input = 0; input < inputs.size(); ++input) {
-    if (inputs[input]->types.size() != declared_types.size()) {
+  for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
+    if (arms[arm]->types.size() != declared_types.size()) {
       throw duckdb::NotImplementedException("%s input %d is planned with %d columns, not %d",
                                             name,
-                                            input,
-                                            static_cast<duckdb::idx_t>(inputs[input]->types.size()),
+                                            arm,
+                                            static_cast<duckdb::idx_t>(arms[arm]->types.size()),
                                             static_cast<duckdb::idx_t>(declared_types.size()));
     }
   }
-  duckdb::vector<sirius::logical_type> types;
+  duckdb::vector<sirius::logical_type> key_types;
   for (duckdb::idx_t i = 0; i < declared_types.size(); ++i) {
     auto const declared = sirius::from_duckdb(declared_types[i]);
     auto const narrowed = sirius::from_duckdb(
       sirius_physical_plan_generator::planned_aggregate_type(declared_types[i]));
-    for (duckdb::idx_t input = 0; input < inputs.size(); ++input) {
-      auto const& planned = inputs[input]->types[i];
+    for (duckdb::idx_t arm = 0; arm < arms.size(); ++arm) {
+      auto const& planned = arms[arm]->types[i];
       if (planned != declared && planned != narrowed) {
         throw duckdb::NotImplementedException("%s input %d plans column %d as %s, not %s",
                                               name,
-                                              input,
+                                              arm,
                                               i,
                                               planned.to_string(),
                                               declared.to_string());
       }
     }
-    if (inputs[0]->types[i] != inputs[1]->types[i]) {
+    if (arms[0]->types[i] != arms[1]->types[i]) {
       throw duckdb::NotImplementedException("%s inputs plan column %d as %s and %s",
                                             name,
                                             i,
-                                            inputs[0]->types[i].to_string(),
-                                            inputs[1]->types[i].to_string());
+                                            arms[0]->types[i].to_string(),
+                                            arms[1]->types[i].to_string());
     }
-    types.push_back(inputs[0]->types[i]);
+    key_types.push_back(arms[0]->types[i]);
   }
-  return types;
+  return key_types;
 }
 
 //! The connection's `operator_params`; defaults when no SiriusContext is registered.
@@ -225,13 +225,13 @@ std::unique_ptr<sirius::ast::node> column_reference(std::size_t column, sirius::
     sirius::ast::reference{static_cast<std::uint32_t>(column), std::move(type)});
 }
 
-//! Input @p input's tag values for an ALL form. Per group, the tag columns sum to `m - n` for
+//! Arm @p arm's tag values for an ALL form. Per group, the tag columns sum to `m - n` for
 //! EXCEPT ALL, and to `m` and `n` for INTERSECT ALL, where `m` and `n` count the group's rows in
-//! inputs 0 and 1.
-std::vector<std::int8_t> input_tags(duckdb::LogicalOperatorType type, std::size_t input)
+//! arms 0 and 1.
+std::vector<std::int8_t> input_tags(duckdb::LogicalOperatorType op_type, std::size_t arm)
 {
-  bool const left = input == 0;
-  switch (type) {
+  bool const left = arm == 0;
+  switch (op_type) {
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
       return {left ? std::int8_t{1} : std::int8_t{-1}};
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
@@ -267,12 +267,12 @@ std::unique_ptr<sirius::ast::node> lesser_of(std::unique_ptr<sirius::ast::node> 
 
 //! A group's copies from its tag sums at columns @p first_sum onward: `max(m - n, 0)` for EXCEPT
 //! ALL, `min(m, n)` for INTERSECT ALL.
-std::unique_ptr<sirius::ast::node> copy_count(duckdb::LogicalOperatorType type,
+std::unique_ptr<sirius::ast::node> copy_count(duckdb::LogicalOperatorType op_type,
                                               std::size_t first_sum)
 {
   auto const bigint = sirius::logical_type::make(sirius::type_id::BIGINT);
   auto const sum = [&](std::size_t offset) { return column_reference(first_sum + offset, bigint); };
-  switch (type) {
+  switch (op_type) {
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
       return greater_of(sum(0),
                         std::make_unique<sirius::ast::node>(
@@ -282,38 +282,38 @@ std::unique_ptr<sirius::ast::node> copy_count(duckdb::LogicalOperatorType type,
   }
 }
 
-//! References to columns `0 .. types.size() - 1`, one per key.
+//! References to columns `0 .. key_types.size() - 1`, one per key.
 duckdb::vector<std::unique_ptr<sirius::ast::node>> key_references(
-  duckdb::vector<sirius::logical_type> const& types)
+  duckdb::vector<sirius::logical_type> const& key_types)
 {
   duckdb::vector<std::unique_ptr<sirius::ast::node>> references;
-  for (std::size_t i = 0; i < types.size(); ++i) {
-    references.push_back(column_reference(i, types[i]));
+  for (std::size_t i = 0; i < key_types.size(); ++i) {
+    references.push_back(column_reference(i, key_types[i]));
   }
   return references;
 }
 
 //! UNION ALL of the inputs, each projected to its key columns followed by its tags.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> union_tagged_inputs(
-  duckdb::LogicalOperatorType type,
-  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> inputs,
-  duckdb::vector<sirius::logical_type> const& types,
+  duckdb::LogicalOperatorType op_type,
+  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> arms,
+  duckdb::vector<sirius::logical_type> const& key_types,
   std::size_t estimated_cardinality)
 {
   auto const tinyint = sirius::logical_type::make(sirius::type_id::TINYINT);
-  auto union_types   = types;
-  union_types.insert(union_types.end(), input_tags(type, 0).size(), tinyint);
+  auto union_types   = key_types;
+  union_types.insert(union_types.end(), input_tags(op_type, 0).size(), tinyint);
   auto tagged_union =
     duckdb::make_uniq<sirius::op::sirius_physical_union>(union_types, estimated_cardinality);
-  for (std::size_t input = 0; input < inputs.size(); ++input) {
-    auto tag_list = key_references(types);
-    for (auto const tag : input_tags(type, input)) {
+  for (std::size_t arm = 0; arm < arms.size(); ++arm) {
+    auto tag_list = key_references(key_types);
+    for (auto const tag : input_tags(op_type, arm)) {
       tag_list.push_back(
         std::make_unique<sirius::ast::node>(sirius::ast::constant{sirius::value{tag}, tinyint}));
     }
-    auto const input_cardinality = inputs[input]->estimated_cardinality;
-    tagged_union->children.push_back(push_projection(
-      std::move(inputs[input]), union_types, std::move(tag_list), input_cardinality));
+    auto const arm_cardinality = arms[arm]->estimated_cardinality;
+    tagged_union->children.push_back(
+      push_projection(std::move(arms[arm]), union_types, std::move(tag_list), arm_cardinality));
   }
   return tagged_union;
 }
@@ -322,13 +322,13 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> union_tagged_inputs(
 //! them.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> sum_tags_per_group(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> tagged_union,
-  duckdb::vector<sirius::logical_type> const& types,
+  duckdb::vector<sirius::logical_type> const& key_types,
   std::size_t tag_count,
   std::size_t estimated_cardinality)
 {
   auto const tinyint   = sirius::logical_type::make(sirius::type_id::TINYINT);
   auto const bigint    = sirius::logical_type::make(sirius::type_id::BIGINT);
-  auto const key_count = types.size();
+  auto const key_count = key_types.size();
   duckdb::vector<std::unique_ptr<sirius::ast::node>> sum_list;
   for (std::size_t tag = 0; tag < tag_count; ++tag) {
     std::vector<std::unique_ptr<sirius::ast::node>> arguments;
@@ -336,24 +336,24 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sum_tags_per_group(
     sum_list.push_back(std::make_unique<sirius::ast::node>(sirius::ast::aggregate{
       sirius::aggregate_id::sum, std::move(arguments), bigint, /*distinct=*/false}));
   }
-  auto aggregate_types = types;
+  auto aggregate_types = key_types;
   aggregate_types.insert(aggregate_types.end(), tag_count, bigint);
   auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
-    aggregate_types, std::move(sum_list), key_references(types), estimated_cardinality);
+    aggregate_types, std::move(sum_list), key_references(key_types), estimated_cardinality);
   aggregate->children.push_back(std::move(tagged_union));
   return aggregate;
 }
 
 //! Projects @p tag_sums to its key columns followed by the group's copy count.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> append_copy_count(
-  duckdb::LogicalOperatorType type,
+  duckdb::LogicalOperatorType op_type,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> tag_sums,
-  duckdb::vector<sirius::logical_type> const& types,
+  duckdb::vector<sirius::logical_type> const& key_types,
   std::size_t estimated_cardinality)
 {
-  auto count_list = key_references(types);
-  count_list.push_back(copy_count(type, types.size()));
-  auto count_types = types;
+  auto count_list = key_references(key_types);
+  count_list.push_back(copy_count(op_type, key_types.size()));
+  auto count_types = key_types;
   count_types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   return push_projection(
     std::move(tag_sums), std::move(count_types), std::move(count_list), estimated_cardinality);
@@ -363,21 +363,25 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> append_copy_count(
 //! sum the tags per group of every column, turn the sums into copies, and repeat each group's
 //! row that many times.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_set_operation_all(
-  duckdb::LogicalOperatorType type,
-  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> inputs,
-  duckdb::vector<sirius::logical_type> const& types,
+  duckdb::LogicalOperatorType op_type,
+  std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> arms,
+  duckdb::vector<sirius::logical_type> const& key_types,
   std::size_t estimated_cardinality,
   sirius::op::gpu_replicate_impl::limits replicate_limits)
 {
-  auto const tag_count = input_tags(type, 0).size();
-  auto tagged_union    = union_tagged_inputs(type, std::move(inputs), types, estimated_cardinality);
+  auto const tag_count = input_tags(op_type, 0).size();
+  auto tagged_union =
+    union_tagged_inputs(op_type, std::move(arms), key_types, estimated_cardinality);
   auto tag_sums =
-    sum_tags_per_group(std::move(tagged_union), types, tag_count, estimated_cardinality);
+    sum_tags_per_group(std::move(tagged_union), key_types, tag_count, estimated_cardinality);
   auto count_projection =
-    append_copy_count(type, std::move(tag_sums), types, estimated_cardinality);
+    append_copy_count(op_type, std::move(tag_sums), key_types, estimated_cardinality);
 
   auto replicate = duckdb::make_uniq<sirius::op::sirius_physical_replicate>(
-    types, static_cast<cudf::size_type>(types.size()), replicate_limits, estimated_cardinality);
+    key_types,
+    static_cast<cudf::size_type>(key_types.size()),
+    replicate_limits,
+    estimated_cardinality);
   replicate->children.push_back(std::move(count_projection));
   return replicate;
 }
@@ -420,13 +424,13 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
 
   auto const op_params = current_operator_params(context);
   if (op.setop_all) {
-    std::array inputs{create_plan(*op.children[0]), create_plan(*op.children[1])};
+    std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
     // Each tag projection and the union read their input's planned `types`.
-    auto const types = reconcile_input_types(inputs, op.types, name);
+    auto const key_types = reconcile_input_types(arms, op.types, name);
     return plan_set_operation_all(
       op.type,
-      std::move(inputs),
-      types,
+      std::move(arms),
+      key_types,
       op.estimated_cardinality,
       {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
   }
