@@ -72,6 +72,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "sirius_registration.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <cudf/cudf_utils.hpp>

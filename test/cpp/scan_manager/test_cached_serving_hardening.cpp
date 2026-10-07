@@ -771,7 +771,8 @@ TEST_CASE("cached provider serves a chunk's row ranges as the chunk can take the
 
     std::vector<std::size_t> cols{0};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+      std::make_shared<pinned_entry const>(std::move(entry)),
+      cols, plan, sirius::telemetry::batch_telemetry_info{});
     auto const batches = drain(*provider);
 
     REQUIRE(batches.size() == 1);
@@ -795,7 +796,8 @@ TEST_CASE("cached provider serves a chunk's row ranges as the chunk can take the
 
     std::vector<std::size_t> cols{0, 1};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+      std::make_shared<pinned_entry const>(std::move(entry)),
+      cols, plan, sirius::telemetry::batch_telemetry_info{});
     auto const batches = drain(*provider);
 
     REQUIRE(batches.size() == 1);
@@ -818,7 +820,8 @@ TEST_CASE("cached provider serves a chunk's row ranges as the chunk can take the
 
     std::vector<std::size_t> cols{0};
     auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
-      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+      std::make_shared<pinned_entry const>(std::move(entry)),
+      cols, plan, sirius::telemetry::batch_telemetry_info{});
     auto const batches = drain(*provider);
 
     REQUIRE(batches.size() == 2);

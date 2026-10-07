@@ -327,64 +327,46 @@ class ioctx_hpln_source final : public hpln_source {
                                  std::to_string(_size) + " B object");
       }
     }
-    if (_ds->supports_vector_host_read()) {
-      submit_vectored(requests, policy, what);
-    } else {
-      submit_one_by_one(requests, what);
-    }
+    submit_ranges(requests, policy, what);
   }
 
  private:
   /// One dispatch per batch of requests, batched so no more than `max_bytes_in_flight` is
-  /// outstanding. The segment list has to outlive the future -- the reactor references its iovecs
-  /// until the reads are reaped -- which is why a batch is awaited before the next is built.
-  void submit_vectored(std::span<hpln_request const> requests,
-                       hpln_io_policy const& policy,
-                       char const* what)
+  /// outstanding. Each destination buffer is its own slice: the reactor fuses file-adjacent slices
+  /// and splits oversized ones itself, so a request scattered over several allocations needs no
+  /// special shape. The slices have to outlive the future, which is why a batch is awaited before
+  /// the next is built. Through the datasource rather than the io_context, so a read takes the
+  /// prefetching cache whenever the backend has one -- the same path parquet's ranged reads take.
+  void submit_ranges(std::span<hpln_request const> requests,
+                     hpln_io_policy const& policy,
+                     char const* what)
   {
     std::size_t i = 0;
     while (i < requests.size()) {
-      std::vector<io::io_object_segment> segments;
+      std::vector<io::slice> slices;
       std::uint64_t batch_bytes = 0;
+      std::size_t batch_ranges  = 0;
       while (i < requests.size() &&
-             (segments.empty() || batch_bytes + requests[i].bytes <= policy.max_bytes_in_flight)) {
-        auto const& r = requests[i];
-        io::io_object_segment seg(static_cast<std::size_t>(r.offset),
-                                  static_cast<std::size_t>(r.dst.front().bytes),
-                                  r.dst.front().data);
-        for (std::size_t d = 1; d < r.dst.size(); ++d) {
-          seg.append(
-            iovec{static_cast<void*>(r.dst[d].data), static_cast<std::size_t>(r.dst[d].bytes)});
+             (batch_ranges == 0 || batch_bytes + requests[i].bytes <= policy.max_bytes_in_flight)) {
+        auto const& r     = requests[i];
+        std::uint64_t at  = r.offset;
+        for (auto const& d : r.dst) {
+          if (d.bytes > 0) {
+            slices.emplace_back(
+              static_cast<std::size_t>(at), static_cast<std::size_t>(d.bytes), d.data);
+          }
+          at += d.bytes;
         }
         batch_bytes += r.bytes;
-        segments.push_back(std::move(seg));
+        ++batch_ranges;
         ++i;
       }
-      auto fut              = _io_ctx->host_read_ranges_async_io(_ds->get_io_object(), segments);
-      std::size_t const got = std::move(fut).get();
+      if (slices.empty()) { continue; }
+      std::size_t const got = _ds->host_read_ranges_async(slices).get();
       if (got != batch_bytes) {
         throw std::runtime_error("[hpln io] '" + _path + "': short read of the " + what + ": got " +
                                  std::to_string(got) + " of " + std::to_string(batch_bytes) +
-                                 " B over " + std::to_string(segments.size()) + " ranges");
-      }
-    }
-  }
-
-  /// Backends without a vector read (kvikio) still have to work; they simply pay per range.
-  void submit_one_by_one(std::span<hpln_request const> requests, char const* what)
-  {
-    for (auto const& r : requests) {
-      std::uint64_t at = r.offset;
-      for (auto const& d : r.dst) {
-        auto const got = _io_ctx->host_read_io(_ds->get_io_object(),
-                                               static_cast<std::size_t>(at),
-                                               static_cast<std::size_t>(d.bytes),
-                                               d.data);
-        if (got != d.bytes) {
-          throw std::runtime_error("[hpln io] '" + _path + "': short read of the " + what + " at " +
-                                   describe(at, d.bytes) + ": got " + std::to_string(got));
-        }
-        at += d.bytes;
+                                 " B over " + std::to_string(batch_ranges) + " ranges");
       }
     }
   }

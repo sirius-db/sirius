@@ -560,7 +560,7 @@ TEST_CASE("hpln checksums - a corrupt payload is an error, not wrong values",
   verifying.verify_payload = true;
   REQUIRE_THROWS_WITH(
     sirius::read_hpln_chunks_into_pinned(path, *env().host_space, want, verifying),
-    Catch::Matchers::Contains("payload of chunk 1") && Catch::Matchers::Contains("CRC32C"));
+    Catch::Matchers::ContainsSubstring("payload of chunk 1") && Catch::Matchers::ContainsSubstring("CRC32C"));
 
   // The policy, stated as a test rather than as a comment: verification costs a pass over every
   // byte read, so it is off by default and the same corrupt file stages without complaint. The
@@ -595,7 +595,7 @@ TEST_CASE("hpln checksums - corrupt metadata is refused without being asked",
     REQUIRE(sg.has_value());
     REQUIRE(sg->bytes > 0);
     flip_byte(path, sg->offset + sg->bytes / 2);
-    REQUIRE_THROWS_WITH(sirius::read_hpln_schema(path), Catch::Matchers::Contains(expected));
+    REQUIRE_THROWS_WITH(sirius::read_hpln_schema(path), Catch::Matchers::ContainsSubstring(expected));
   };
 
   corrupt_segment("hdr", simpatico::hpln_segment::header, "header of chunk");

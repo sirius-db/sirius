@@ -38,7 +38,7 @@
 #include "compression/simpatico_test_utils.hpp"
 #include "io/datasource_factory.hpp"
 #include "operator/operator_test_utils.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -157,8 +157,7 @@ std::vector<std::uint8_t> read_file(fs::path const& path)
 std::shared_ptr<sirius::io::ioctx> make_uring_ioctx()
 {
   sirius::scan_manager::scan_manager_config cfg{};
-  cfg.use_sirius_datasource = true;
-  auto ctx                  = sirius::io::make_uring_ioctx_factory(*env().mgr)(cfg);
+  auto ctx = sirius::io::make_uring_ioctx_factory(*env().mgr)(cfg);
   if (ctx) { ctx->start(); }
   return ctx;
 }
@@ -169,7 +168,6 @@ std::shared_ptr<sirius::io::ioctx> make_rest_ioctx(std::string const& endpoint,
                                                           std::string const& region)
 {
   sirius::scan_manager::scan_manager_config cfg{};
-  cfg.use_sirius_datasource   = true;
   cfg.object_store.endpoint   = endpoint;
   cfg.object_store.region     = region;
   cfg.object_store.access_key = access_key;
@@ -178,7 +176,6 @@ std::shared_ptr<sirius::io::ioctx> make_rest_ioctx(std::string const& endpoint,
   cfg.rest.request_timeout_s  = 30;
   cfg.rest.max_connections    = 4;
   cfg.rest_n_reactors         = 1;
-  cfg.enable_prefetch_cache   = false;
   auto ctx                    = sirius::io::make_rest_ioctx_factory(*env().mgr)(cfg);
   if (ctx) { ctx->start(); }
   return ctx;
@@ -731,7 +728,7 @@ TEST_CASE("hpln io - a .hpln in an object store is read through the REST io_cont
           "[s3][integration][hpln_io]")
 {
   if (no_gpu()) { return; }
-  if (!sirius::test::ensure_s3_container_env()) { return; }
+  if (!sirius::test::ensure_s3_test_env()) { return; }
   auto const* bucket   = std::getenv("SIRIUS_TEST_S3_BUCKET");
   auto const* endpoint = std::getenv("SIRIUS_TEST_S3_ENDPOINT");
   auto const* access   = std::getenv("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -747,7 +744,7 @@ TEST_CASE("hpln io - a .hpln in an object store is read through the REST io_cont
   auto const expected = write_fixture(path);
   auto const object   = read_file(path);
   auto const key      = "hpln_io_" + std::to_string(::getpid()) + ".hpln";
-  if (!sirius::test::put_s3_container_object(key, object)) {
+  if (!sirius::test::put_s3_test_object(key, object)) {
     WARN("S3 environment is externally managed — skipping");
     fs::remove_all(dir);
     return;
