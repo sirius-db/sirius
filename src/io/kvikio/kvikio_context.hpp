@@ -75,6 +75,7 @@ class kvikio_io_object final : public kvikio_object {
     : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
   {
     _has_identity = capture_local_identity(_handle.fd(), _identity);
+    if (_has_identity) _file_size = _identity.size;
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }

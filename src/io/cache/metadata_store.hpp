@@ -46,54 +46,23 @@ struct string_hash {
 
 }  // namespace detail
 
-/**
- * @brief Thread-safe per-file metadata cache, keyed by an io_object's
- *        raw_file_cache_id().
- *
- * Owned by @c ioctx and always present, independent of the
- * @c prefetching_cache.  Callers that have parsed file metadata (e.g.
- * a parquet footer) park it here so a later scan of the same path can
- * skip the parse — without depending on whether the prefetching cache
- * has been initialised.
- *
- * Register / lookup only, no eviction beyond registration-time replacement;
- * entries live for the ioctx's lifetime.
- */
+/// Per-ioctx access namespace over the process-wide retention manager.
+/// Path-only lookup is a candidate hint, never permission to consume metadata.
 class metadata_store {
  public:
-  metadata_store()                                 = default;
+  metadata_store() : _cache(metadata_cache::global()), _scope(next_open_generation()) {}
+  ~metadata_store() { _cache->erase_scope(_scope); }
   metadata_store(metadata_store const&)            = delete;
   metadata_store& operator=(metadata_store const&) = delete;
-  metadata_store(metadata_store&&)                 = delete;
-  metadata_store& operator=(metadata_store&&)      = delete;
-
-  /// Record the metadata for @p obj's cache key, dropping any other generation
-  /// of the same path.  A null @p metadata is silently ignored — symmetric with
-  /// the older @c prefetching_cache::register_metadata contract so callers that
-  /// pass through pre-parsed metadata don't have to null-check.
-  void register_metadata(io_object const& obj, std::shared_ptr<io_object_metadata> metadata);
-
-  /// True when some generation of @p object_path is registered.  A hint for
-  /// choosing how to open the object (a known footer needs no probe), never a
-  /// source of metadata: only an exact-key lookup is.
-  [[nodiscard]] bool has_path(std::string_view object_path) const noexcept;
-
-  /// Look up the metadata for @p obj's cache key.  Returns nullptr on
-  /// miss.
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(io_object const& obj) const;
-
-  /// As above but keyed directly by @c raw_file_cache_id().  Returns nullptr on
-  /// miss.  Looked up heterogeneously, so passing a @c string_view or a string
-  /// literal allocates nothing.
-  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(std::string_view cache_key) const;
+  void register_metadata(io_object const& obj,
+                         std::shared_ptr<io_object_metadata> metadata,
+                         std::string const& profile = "parquet-v1");
+  [[nodiscard]] std::shared_ptr<io_object_metadata> get_metadata(
+    io_object const& obj, std::string const& profile = "parquet-v1") const;
+  [[nodiscard]] bool has_candidate(std::string_view path) const;
 
  private:
-  template <typename V>
-  using string_map = std::unordered_map<std::string, V, detail::string_hash, std::equal_to<>>;
-
-  mutable std::shared_mutex _mtx;
-  string_map<std::shared_ptr<io_object_metadata>> _by_key;
-  string_map<std::string> _key_by_path;
+  std::shared_ptr<metadata_cache> _cache;
+  uint64_t _scope;
 };
-
 }  // namespace sirius::io::cache

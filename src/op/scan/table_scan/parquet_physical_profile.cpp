@@ -169,7 +169,38 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
   cudf::io::parquet_reader_options const& options,
   bool* cache_hit)
 {
-  if (auto cached = std::dynamic_pointer_cast<parquet_metadata>(source.metadata())) {
+  // Profile all schema-affecting reader options. Custom nested column schemas
+  // are not yet serialised; bypass cache instead of conflating their results.
+  bool const cacheable = !options.get_column_schema().has_value();
+  std::string profile  = "parquet-v1:";
+  auto append          = [&](auto v) { profile += std::to_string(v) + ":"; };
+  append(options.is_enabled_convert_strings_to_categories());
+  append(options.is_enabled_use_pandas_metadata());
+  append(options.is_enabled_use_arrow_schema());
+  append(options.is_enabled_allow_mismatched_pq_schemas());
+  append(options.is_enabled_ignore_missing_columns());
+  append(options.is_enabled_case_sensitive_names());
+  append(static_cast<int>(options.get_timestamp_type().id()));
+  append(static_cast<int>(options.get_decimal_width()));
+  if (options.get_column_names()) {
+    profile += "names:";
+    for (auto const& name : *options.get_column_names()) {
+      profile += std::to_string(name.size()) + ":" + name;
+    }
+  }
+  if (options.get_column_indices()) {
+    profile += "indices:";
+    for (auto index : *options.get_column_indices())
+      append(index);
+  }
+  if (options.get_column_field_ids()) {
+    profile += "fields:";
+    for (auto id : *options.get_column_field_ids())
+      append(id);
+  }
+  auto cached =
+    cacheable ? std::dynamic_pointer_cast<parquet_metadata>(source.metadata(profile)) : nullptr;
+  if (cached) {
     if (cache_hit) *cache_hit = true;
     return cached;
   }
@@ -204,7 +235,7 @@ std::shared_ptr<parquet_metadata> resolve_parquet_metadata(
                                                    probe.original_schema(),
                                                    std::move(arrow_schema),
                                                    probe.original_logical_annotations());
-  std::ignore = source.store_metadata(result);
+  if (cacheable) std::ignore = source.store_metadata(result, profile);
   return result;
 }
 std::unique_ptr<cudf::io::datasource::buffer> fetch_plaintext_parquet_footer(

@@ -63,13 +63,19 @@ class local_io_object : public io_object {
                   file_descriptor fd,
                   file_descriptor fd_direct,
                   size_t file_size,
-                  std::string_view hash = "")
+                  std::string_view hash    = "",
+                  object_identity captured = {})
     : _path(std::move(path)),
       _fd(std::move(fd)),
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size)
   {
-    _has_identity = capture_local_identity(_fd.get(), _identity);
+    _has_identity = captured.kind == identity_kind::local_stat;
+    if (_has_identity)
+      _identity = std::move(captured);
+    else
+      _has_identity = capture_local_identity(_fd.get(), _identity);
+    if (_has_identity) _file_size = _identity.size;
     if (hash.empty()) {
       _hash = _path;
     } else {

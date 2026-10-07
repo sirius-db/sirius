@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/invocable.hpp"
+#include "io/cache/metadata_cache.hpp"
 #include "io/object_identity.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -132,11 +133,6 @@ class io_object : public std::enable_shared_from_this<io_object> {
 
  private:
   uint64_t const _open_generation = next_open_generation();
-};
-
-class io_object_metadata {
- public:
-  virtual ~io_object_metadata() = default;
 };
 
 struct range {

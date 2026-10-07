@@ -27,7 +27,6 @@
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
@@ -646,15 +645,11 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   return {};
 }
 
-/// Strip a leading "file://" scheme and canonicalize the case-insensitive S3
-/// scheme. Bucket and key bytes remain byte-identical because they are part of
-/// the object-store identity and may be case-sensitive.
-std::string normalize_path(std::string const& p)
-{
-  auto normalized = sirius::io::strip_file_scheme(p);
-  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
-  return normalized;
-}
+/// Strip a leading "file://" scheme (case-insensitive) so the path can be
+/// resolved by a local-file backend. Thin alias for the shared helper — kept so
+/// the cache-key and routing call sites below read as they did, while there is
+/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
+std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -1415,13 +1410,12 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will probably read + parse the footer.  When the
-  // metadata_store holds a parsed footer for this path, a suffix GET would most
-  // likely download bytes we won't reuse — a plain HEAD resolves the size, and
-  // the exact-generation lookup below decides whether the footer is reused.
+  // Footer-probe only when we will actually read + parse the footer.  On a warm
+  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
+  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -1431,12 +1425,14 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
                              uri);
   }
 
-  // Resolve through the shared path so describe_parquet publishes the same
-  // complete footer evidence as scans and pinned parquet tables, including the
-  // raw schema and logical annotations normalized away by cuDF.
+  // Reuse a previously parsed footer when present — a prior bind or scan of the
+  // same file parks it in the ioctx metadata store, which lives for the ioctx's
+  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
+  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
+  // so the footer is parsed exactly once per file per process.
   auto const reader_options = cudf::io::parquet_reader_options::builder().build();
-  auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, uri, reader_options);
-  auto const file_metadata = metadata->file_metadata();
+  auto file_metadata =
+    op::scan::resolve_parquet_metadata(*datasource, 0, uri, reader_options)->file_metadata();
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
@@ -1452,8 +1448,7 @@ void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   bool enable_pinned_zone_map_pruning,
   const std::vector<int>& allocated_gpu_ids,
-  std::shared_ptr<pipeline::completion_handler> completion,
-  std::function<bool()> interrupted)
+  std::shared_ptr<pipeline::completion_handler> completion)
 {
   auto const query_id = query.query_id();
   _execution_completion.store(completion);
@@ -1500,18 +1495,18 @@ void sirius_scan_manager::prepare_for_query(
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
-  auto preparation         = _config.preparation.resolve(_config.thread_pool.num_threads);
-  auto state               = std::make_shared<query_scan_manager_state>(std::move(preparation));
+  auto state = std::make_shared<query_scan_manager_state>(
+    _config.preparation.resolve(_config.thread_pool.num_threads));
   state->query_token       = sirius::value_of(query_id);
   state->physical_counters = _physical_counters;
   state->pruning_enabled   = enable_pinned_zone_map_pruning;
   if (!completion) completion = std::make_shared<pipeline::completion_handler>();
   state->completion = completion;
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Dispatchers yield between tasks; the shared pool selects older queries
-  // first and preserves FIFO order within each query's priority.
-  state->dispatcher = std::make_unique<exec::scoped_dispatcher>(
-    _thread_pool, _thread_pool.num_threads(), sirius::query_priority_bits(query_id));
+  // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
+  // pending queue and the pool, not by a per-query cap.
+  state->dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
   state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   // ioctxs are process/query-manager resources and remain alive across query
@@ -1975,11 +1970,10 @@ void sirius_scan_manager::prepare_for_query(
     _query_states.emplace(query_id, state);
   }
 
-  start_metadata_processing(*state, std::move(interrupted));
+  start_metadata_processing(*state);
 }
 
-void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
-                                                    std::function<bool()> interrupted)
+void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state)
 {
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
@@ -2004,7 +1998,6 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
     if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
       state.metadata_processor->register_coordinator_source(
         scan.op, *disk->provider, *state.coordinator);
-  state.coordinator->set_interrupt_check(std::move(interrupted));
   state.coordinator->arm();
 }
 
@@ -2026,8 +2019,6 @@ void sirius_scan_manager::run_preparation_on_query_thread(sirius::query_id_t id)
     observation.preparation_runner    = stats.runner;
     observation.preparation_publisher = stats.publisher;
     observation.preparation_runs      = stats.runs;
-    observation.partial_emissions     = stats.partial_emissions;
-    observation.max_residence         = stats.max_residence;
   }
 }
 
@@ -2101,7 +2092,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto rest = rest_ioctx_for_list(s3_prefix_uri);
+  auto* rest = rest_ioctx_for_list();
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2116,7 +2107,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto rest = rest_ioctx_for_list(s3_uri);
+  auto* rest = rest_ioctx_for_list();
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2126,96 +2117,50 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
-  // Normalize raw ingestible paths before routing, including file:// URIs.
+  // Normalize here so every caller (incl. the scan resolver, which forwards raw
+  // ingestible paths) routes `file://` the same way create_datasource does.
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type, file_path);
+  return ioctx_for_type(*type);
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type, std::string_view path)
+  sirius::io::io_context_type type)
 {
-  auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
-  std::uint64_t config_id = 0;
-  std::shared_ptr<const sirius::io::object_store_config> resolved_config;
-  auto const uses_object_store_config =
-    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
-  if (uses_object_store_config && !file_path.empty()) {
-    if (auto snapshot = _s3_configs.resolve(file_path)) {
-      config_id       = snapshot->id;
-      resolved_config = std::move(snapshot->config);
-    }
-  }
-  // ID 0 denotes the manager's default config; installed snapshots have
-  // unique non-zero IDs, so a credential rotation cannot reuse an old ioctx.
-  auto const cache_key = routed_ioctx_key{type, config_id};
-  if (_io_ctx && _io_ctx->type() == type && !resolved_config) { return _io_ctx; }
+  // The local default `_io_ctx` already serves uring/kvikio; only an off-default
+  // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
+  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
-      return it->second;
-    }
+    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
   }
-  // Serialize construction, not ordinary lookups. A waiting builder rechecks
-  // the scope so it cannot publish an ioctx with superseded credentials.
-  std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
-  if (uses_object_store_config && !file_path.empty()) {
-    auto latest          = _s3_configs.resolve(file_path);
-    auto const latest_id = latest ? latest->id : 0;
-    if (latest_id != config_id) {
-      build_lk.unlock();
-      return ioctx_for_type(type, file_path);
-    }
-  }
+  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
+  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
+  // park every concurrent lookup behind one long critical section. The build
+  // mutex serializes builders instead, so two first-touches of the same type
+  // never construct twice (a losing ioctx would need drain/stop teardown).
+  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
-      return it->second;
-    }
+    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
   }
-  auto backend_config = _config;
-  if (resolved_config) { backend_config.object_store = *resolved_config; }
-  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
+  auto io_ctx = _ioctx_registry.make_ioctx(type);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
   return it->second;
 }
 
-std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
-  std::string_view path)
+sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
 {
-  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(
-    ioctx_for_type(sirius::io::io_context_type::restful, path));
-}
-
-void sirius_scan_manager::install_s3_config(std::string_view path,
-                                            sirius::io::object_store_config config)
-{
-  auto scope = normalize_path(std::string(path));
-  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
-  {
-    // Existing in-flight users retain shared ownership of the old context.
-    std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
-    auto superseded_id = _s3_configs.install(scope, std::move(config));
-    if (superseded_id) {
-      std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
-      for (auto const type :
-           {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
-        auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
-        if (it != _routed_io_ctxs.end()) {
-          retired.push_back(std::move(it->second));
-          _routed_io_ctxs.erase(it);
-        }
-      }
-    }
-  }
+  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
+  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
@@ -3220,7 +3165,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
   for (auto const& path : file_paths) {
     auto const cache_key     = normalize_path(path);
     auto const io_ctx        = ioctx_for_path(path);
-    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_candidate(cache_key);
     auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
@@ -3228,11 +3173,11 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
       throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
     }
 
-    // Use the shared resolver so a pin publishes complete footer evidence and
-    // later scans reuse the exact same metadata record.
+    // Same footer resolution as describe_parquet / build_file_scan_info, so a
+    // file is parsed at most once per process however it is first touched.
     auto const probe_options = cudf::io::parquet_reader_options::builder().build();
-    auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, path, probe_options);
-    auto const file_metadata = metadata->file_metadata();
+    auto file_metadata =
+      op::scan::resolve_parquet_metadata(*datasource, 0, path, probe_options)->file_metadata();
 
     if (file_metadata->row_groups.empty()) { continue; }
     std::vector<cudf::size_type> row_groups(file_metadata->row_groups.size());

@@ -25,7 +25,6 @@
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
-#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -52,10 +51,8 @@
 #include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
-#include <cudf/version_config.hpp>
 
 #include <cuda/std/utility>
 
@@ -66,7 +63,6 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
-#include <duckdb/common/exception.hpp>
 #include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
@@ -89,7 +85,6 @@
 #include <future>
 #include <iterator>
 #include <memory>
-#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -111,7 +106,9 @@ namespace {
 /// null_count answers it — and handing one to filter_row_groups_with_stats
 /// faults rather than merely mis-pruning.
 ///
-/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST.
+/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST, and
+/// convert_table_filters_to_expression only drops it when it is a column's
+/// top-level filter, so one nested in a conjunction still reaches here.
 bool expression_has_null_predicate(duckdb::Expression const& expr)
 {
   auto const expr_type = expr.GetExpressionType();
@@ -224,7 +221,7 @@ bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
 /// post-decode.
 ///
 /// Only the top level is split: a compound conjunct (an OR, or a nested AND)
-/// for which @p is_dropped holds is dropped whole. Conservative, not wrong.
+/// containing anything unsafe is dropped whole. Conservative, not wrong.
 template <typename Predicate>
 duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression const& expr,
                                                          Predicate is_dropped)
@@ -251,9 +248,11 @@ duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression cons
 
 /// Every `<col> IS [NOT] NULL` filter usable for null_count row-group pruning.
 ///
-/// Read from the TableFilterSet independently of min/max pruning. Null-count
-/// pruning only eliminates whole row groups; mixed groups still require the
-/// row-level predicate after decoding.
+/// Read from the TableFilterSet rather than from the converted expression,
+/// because convert_table_filters_to_expression DROPS a column's top-level
+/// IS_NOT_NULL before building the expression. Collecting downstream of that
+/// would leave the ordinary `WHERE v IS NOT NULL` with no pruning at all, which
+/// is the common form of the predicate.
 ///
 /// Both a top-level filter and one nested in a conjunction qualify. A
 /// conjunction is an AND of per-column filters, so each null test in it must
@@ -324,9 +323,7 @@ std::string strip_file_uri(std::string const& p)
 }
 
 std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
-  std::span<row_group_slice const> slices,
-  std::shared_ptr<cudf::io::parquet_reader_options const> const& reader_options,
-  column_chunk_range_cache& cache);
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options);
 std::vector<scan_info::fadvise_entry> parquet_fadvise_entries(
   std::span<row_group_slice const> slices,
   std::span<std::vector<cudf::io::text::byte_range_info> const> per_slice_ranges);
@@ -550,7 +547,6 @@ class parquet_batch_coalescer : public batch_coalescer {
       _produced_any = true;
       out.push_back(emit_current());
     }
-    _ranges_cache.clear();
     return out;
   }
 
@@ -558,7 +554,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::unique_ptr<scan_info> emit_current()
   {
     auto reader_options   = _run_reader_options ? _run_reader_options : _reader_options;
-    auto per_slice_ranges = slice_column_chunk_ranges(_slices, reader_options, _ranges_cache);
+    auto per_slice_ranges = slice_column_chunk_ranges(_slices, *reader_options);
     auto hints            = parquet_fadvise_entries(_slices, per_slice_ranges);
     auto split            = std::make_unique<parquet_split_info>(std::move(hints));
     split->rg_slices      = std::move(_slices);
@@ -595,12 +591,12 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
+  std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
   /// Reader options of the current run. Projected and natural reads cannot share
   /// a split.
   std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
-  column_chunk_range_cache _ranges_cache;
 
   /// First fully-pruned file, kept as the source for flush()'s empty-split
   /// fallback when the whole scan produced no slice.
@@ -626,15 +622,13 @@ class parquet_batch_coalescer : public batch_coalescer {
 /// scan hands cuDF one chunk-data span per range, in exactly the order the
 /// reader enumerated them.
 std::vector<std::vector<cudf::io::text::byte_range_info>> slice_column_chunk_ranges(
-  std::span<row_group_slice const> slices,
-  std::shared_ptr<cudf::io::parquet_reader_options const> const& reader_options,
-  column_chunk_range_cache& cache)
+  std::span<row_group_slice const> slices, cudf::io::parquet_reader_options const& reader_options)
 {
   std::vector<std::vector<cudf::io::text::byte_range_info>> per_slice(slices.size());
   for (std::size_t i = 0; i < slices.size(); ++i) {
     if (!slices[i].file_metadata) { continue; }
     per_slice[i] =
-      cache.ranges(slices[i].file_metadata, reader_options, slices[i].row_group_indices);
+      column_chunk_ranges(*slices[i].file_metadata, reader_options, slices[i].row_group_indices);
   }
   return per_slice;
 }
@@ -787,7 +781,8 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       bind.returned_types,
                                                       _plan->batch_position_by_column_id,
                                                       _plan->partition_primary_indices,
-                                                      _virtual_types);
+                                                      _virtual_types,
+                                                      _plan->has_user_virtual_columns());
     if (duckdb_expression) {
       // Validate before scan tasks retranslate and dereference the predicate.
       if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
@@ -825,9 +820,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
         _static_pushdown_expression = std::move(stats_candidate);
       } else if (stats_candidate) {
         _static_pushdown_is_complete = false;
-        _static_pushdown_expression  = conjuncts_without(
-          *stats_candidate,
-          [](duckdb::Expression const& conjunct) { return is_unsafe_for_stats_filter(conjunct); });
+        _static_pushdown_expression  = stats_safe_conjuncts(*stats_candidate);
         // Whatever survives must itself be safe, or the crash returns.
         D_ASSERT(!_static_pushdown_expression ||
                  !is_unsafe_for_stats_filter(*_static_pushdown_expression));
@@ -835,23 +828,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
           "[parquet_gpu_ingestible] Predicate is unsupported by the row-group stats filter; "
           "pushing only the safe conjuncts ({}), full predicate applied post-decode: {}",
           _static_pushdown_expression ? _static_pushdown_expression->ToString() : "none",
-          _duckdb_filter_expression->ToString());
-      }
-
-      _reader_pushdown_expression  = _static_pushdown_expression;
-      _reader_pushdown_is_complete = _static_pushdown_is_complete;
-      if (_static_pushdown_expression &&
-          has_unreliable_bloom_filter_equality(*_static_pushdown_expression)) {
-        _reader_pushdown_is_complete = false;
-        _reader_pushdown_expression =
-          conjuncts_without(*_static_pushdown_expression, [](duckdb::Expression const& conjunct) {
-            return has_unreliable_bloom_filter_equality(conjunct);
-          });
-        SIRIUS_LOG_DEBUG(
-          "[parquet_gpu_ingestible] Predicate has an equality on a column with an unreliable "
-          "bloom filter probe. Pushing only the other conjuncts into the reader ({}), full "
-          "predicate applied post-decode: {}",
-          _reader_pushdown_expression ? _reader_pushdown_expression->ToString() : "none",
           _duckdb_filter_expression->ToString());
       }
     }
@@ -893,7 +869,8 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                             bind.returned_types,
                                             _plan->batch_position_by_column_id,
                                             _plan->partition_primary_indices,
-                                            _virtual_types),
+                                            _virtual_types,
+                                            _plan->has_user_virtual_columns()),
         answerable_positions);
     }
   }
@@ -970,22 +947,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
-    } catch (duckdb::IOException const& error) {
+    } catch (std::exception const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
-    } catch (io::credential_error const& error) {
-      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
-                                                    error.what());
-    } catch (std::system_error const& error) {
-      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
-                                                    error.what());
-    } catch (cudf::logic_error const& error) {
-      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
-                                                    error.what());
-    } catch (duckdb::InterruptException const&) {
-      throw;
-    } catch (std::bad_alloc const&) {
-      throw;
     }
   };
 }
@@ -1009,13 +973,15 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  // Probe only when the footer will probably be read: once the metadata store
-  // holds a parsed footer for this path, a suffix GET would most likely download
-  // bytes nothing consumes, and the open only needs the size; the exact
-  // generation lookup below decides reuse. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
-  auto sirius_ds           = io_ctx->open_datasource(
-    file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+  // Probe only when the footer will actually be read: once the metadata store
+  // holds this file's parsed footer, a suffix GET would download bytes nothing
+  // consumes, and the open only needs the size. Mirrors describe_parquet.
+  bool const footer_cached = io_ctx->metadata_store().has_candidate(file_path);
+  std::shared_ptr<io::sirius_datasource> sirius_ds;
+  {
+    sirius_ds = io_ctx->open_datasource(
+      file_path, footer_cached ? io::open_hint::generic : io::open_hint::parquet_footer_probe);
+  }
   if (!sirius_ds && has_uri_scheme(file_path)) {
     throw std::runtime_error("[parquet_gpu_ingestible] no backend supports path: " + file_path);
   }
@@ -1047,18 +1013,6 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   } catch (unsupported_physical_input const& error) {
     if (_info->profiles->counters && !_info->physical_schema)
       _info->profiles->counters->record(error.reason);
-    throw;
-  } catch (duckdb::IOException const&) {
-    throw;
-  } catch (io::credential_error const&) {
-    throw;
-  } catch (std::system_error const&) {
-    throw;
-  } catch (duckdb::InterruptException const&) {
-    throw;
-  } catch (std::bad_alloc const&) {
-    throw;
-  } catch (std::logic_error const&) {
     throw;
   } catch (std::exception const& error) {
     if (_info->physical_schema && !_info->physical_schema->fields.empty()) {
@@ -1677,8 +1631,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   sirius::op::dynamic_filter_snapshot dynamic_snapshot;
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
-  if (_reader_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_reader_pushdown_expression);
+  if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
@@ -1829,7 +1783,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // The reader discharged the row filter only if it pushed the WHOLE predicate.
   // After a partial push the dropped conjuncts still have to be applied below.
   bool const reader_applied_full_filter =
-    ast_expression.has_value() && _reader_pushdown_is_complete;
+    ast_expression.has_value() && _static_pushdown_is_complete;
 
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};
