@@ -18,7 +18,11 @@
 // partition_strategy that carries it, and the partitioned_operator_data constructor that stamps a
 // partition's device as the task's preferred device. GPU-free.
 
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "op/partition_placement.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
@@ -176,4 +180,49 @@ TEST_CASE("partition consumers require an explicitly installed placement",
   consumer.set_placement(placement);
   REQUIRE(consumer.placement() == placement);
   REQUIRE(consumer.placement()->device_for(3) == 5);
+}
+
+TEST_CASE("stateless single-partition consumers leave task placement to locality",
+          "[partition_placement][unit]")
+{
+  using namespace sirius::op;
+  auto types = [] {
+    return duckdb::vector<sirius::logical_type>{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+  };
+  duckdb::LogicalComparisonJoin logical_join(duckdb::JoinType::INNER);
+  logical_join.types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT};
+  auto child         = [&] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION, types(), 0);
+  };
+  sirius_physical_nested_loop_join nlj(
+    logical_join, child(), child(), {}, duckdb::JoinType::INNER, 0);
+  sirius_physical_grouped_aggregate_merge merge(types(), {}, {}, {}, {}, {}, false, false, 0);
+  sirius_physical_dense_count_join dense(types(), 0, 0, 0, std::nullopt, 1024);
+  for (auto* consumer :
+       std::vector<sirius_physical_partition_consumer_operator*>{&nlj, &merge, &dense}) {
+    consumer->set_active_gpu_ids({3, 7});
+    partition_sizing_input in{};
+    in.total_bytes          = 1024;
+    in.combined_total_bytes = 2048;
+    auto const strategy     = consumer->get_partition_strategy(in);
+    REQUIRE(strategy.num_partitions == 1);
+    REQUIRE_FALSE(strategy.broadcast);
+    REQUIRE_FALSE(strategy.build_probe);
+    partitioned_operator_data input(no_batches(), 0, strategy.placement);
+    CHECK(input.get_partition_idx() == std::optional<std::size_t>{0});
+    CHECK_FALSE(input.get_preferred_device_id().has_value());
+  }
+
+  // Large inputs retain the existing distribution; NLJ always has one partition.
+  for (auto* consumer : std::vector<sirius_physical_partition_consumer_operator*>{&merge, &dense}) {
+    partition_sizing_input in{};
+    in.total_bytes          = 24 * sirius::config::DEFAULT_HASH_PARTITION_BYTES;
+    in.combined_total_bytes = in.total_bytes;
+    auto const strategy     = consumer->get_partition_strategy(in);
+    REQUIRE(strategy.num_partitions > 1);
+    CHECK(strategy.placement == partition_placement::round_robin(strategy.num_partitions, {3, 7}));
+  }
 }

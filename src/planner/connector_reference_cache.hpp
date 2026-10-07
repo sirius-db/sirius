@@ -18,32 +18,42 @@
 
 #include <duckdb/function/table_function.hpp>
 
+#include <unordered_map>
 #include <utility>
 
 namespace sirius::planner::detail {
 
-// One cache per connector in the loaded Sirius module. The registry serializes access.
+// Trusted definitions are isolated by DuckDB host module. The registry serializes access.
 // Empty results are final for planning lookups, just like successful resolutions.
 // Only an independent factory or an extension-load bootstrap may publish definitions.
 class connector_reference_cache {
  public:
   template <class Resolver>
-  duckdb::vector<duckdb::TableFunction> const& get_or_resolve(Resolver&& resolve)
+  duckdb::vector<duckdb::TableFunction> const& get_or_resolve(void const* host, Resolver&& resolve)
   {
-    if (!resolved) publish(std::forward<Resolver>(resolve)());
-    return functions;
+    auto& entry = hosts[host];
+    if (!entry.resolved) publish(host, std::forward<Resolver>(resolve)());
+    return entry.functions;
   }
 
-  bool has_verified_functions() const { return !functions.empty(); }
-
-  void publish(duckdb::vector<duckdb::TableFunction> verified)
+  bool has_verified_functions(void const* host) const
   {
-    functions = std::move(verified);
-    resolved  = true;
+    auto entry = hosts.find(host);
+    return entry != hosts.end() && !entry->second.functions.empty();
+  }
+
+  void publish(void const* host, duckdb::vector<duckdb::TableFunction> verified)
+  {
+    auto& entry     = hosts[host];
+    entry.functions = std::move(verified);
+    entry.resolved  = true;
   }
 
  private:
-  duckdb::vector<duckdb::TableFunction> functions;
-  bool resolved = false;
+  struct host_reference {
+    duckdb::vector<duckdb::TableFunction> functions;
+    bool resolved = false;
+  };
+  std::unordered_map<void const*, host_reference> hosts;
 };
 }  // namespace sirius::planner::detail

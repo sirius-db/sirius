@@ -155,9 +155,8 @@ TEST_CASE_METHOD(ParquetNullPredicateFixture,
 }
 
 // Both sides reference the SAME column on purpose: TableFilterSet is keyed by
-// column, so a cross-column form would either not be pushed down at all (OR) or
-// be split into per-column filters whose top-level IS_NOT_NULL is dropped
-// before the expression is built — leaving these branches unexercised.
+// column, so this exercises an indivisible per-column OR rather than separate
+// top-level conjuncts.
 //
 // An OR cannot be split, so nothing is pushed.
 TEST_CASE_METHOD(ParquetNullPredicateFixture,
@@ -169,9 +168,8 @@ TEST_CASE_METHOD(ParquetNullPredicateFixture,
                              " WHERE (v IS NULL OR v > 5990) AND id > 5900 ORDER BY id");
 }
 
-// A nested IS NOT NULL survives convert_table_filters_to_expression (which only
-// drops it as a column's top-level filter) and lowers to IS_NULL + NOT in the
-// cuDF AST, reaching the same stats-filter path.
+// A nested IS NOT NULL, like the top-level form, lowers to IS_NULL + NOT in the
+// cuDF AST and must stay out of the min/max stats-filter path.
 //
 // NOTE: any comparison on a column already implies it is non-null, so DuckDB's
 // filter combiner may fold the IS NOT NULL away before it ever reaches us. The

@@ -63,6 +63,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -130,6 +131,7 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
 #include "io/types.hpp"                // sirius::io::ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
@@ -264,6 +266,12 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   // after the runtime is latched unavailable.
   if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
     sirius_ctx->throw_runtime_unavailable();
+  }
+
+  if (sirius::io::s3::is_s3_path(uri)) {
+    auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
+      context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
+    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
   }
 
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
@@ -3292,17 +3300,17 @@ static void LoadInternal(ExtensionLoader& loader)
   auto& db     = loader.GetDatabaseInstance();
   auto& config = DBConfig::GetConfig(db);
 
-  // Loading the callback's config makes the first NVTX call, so the NVTX
-  // decision must be published before the callback is constructed.
-  duckdb::SiriusContextExtensionCallback::publish_configured_nvtx_injection();
-
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
   auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr         = callback.get();
   bool const sirius_disabled = callback_ptr->is_disabled();
 
-  if (!sirius_disabled) { callback_ptr->initialize_context(); }
+  if (!sirius_disabled) {
+    // Config parsing above must remain NVTX-free. initialize_context creates Quent
+    // before resolving hardware or constructing any instrumented runtime objects.
+    callback_ptr->initialize_context();
+  }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the
@@ -3315,6 +3323,10 @@ static void LoadInternal(ExtensionLoader& loader)
   SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusRegistration::RegisterGPUFunctions(db);
   if (!sirius_disabled) { sirius::planner::register_scan_source_callbacks(db); }
+
+  // SIRIUS_S3 is Sirius's S3 secret type. Registering it here lets clients use
+  // CREATE SECRET without installing DuckDB's httpfs extension.
+  sirius::io::s3::register_sirius_s3_secret(SecretManager::Get(db));
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes

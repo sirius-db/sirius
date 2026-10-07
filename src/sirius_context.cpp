@@ -38,7 +38,6 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
-#include "telemetry/nvtx_injection.hpp"
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
@@ -806,6 +805,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   config_            = config;
   auto quent_context = sirius::telemetry::make_quent_context(config_.get_telemetry_config());
+  config_.resolve_hardware();
 
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
@@ -1880,19 +1880,6 @@ void install_configured_log_sink(DatabaseInstance* db)
   }
 }
 
-void publish_nvtx_injection(const std::filesystem::path& config_path)
-{
-  auto const telemetry = sirius::sirius_config::read_telemetry_config(config_path);
-  sirius::telemetry::detail::configure_nvtx_injection(
-    telemetry.enable_quent && telemetry.enable_nvtx, telemetry.nvtx_injection_lib);
-}
-
-void SiriusContextExtensionCallback::publish_configured_nvtx_injection()
-{
-  if (sirius_disabled_by_env()) { return; }
-  if (auto const config_path = get_config_file_path()) { publish_nvtx_injection(*config_path); }
-}
-
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   : disabled_(sirius_disabled_by_env())
 {
@@ -1938,6 +1925,9 @@ void SiriusContextExtensionCallback::initialize_context()
   sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
+  // DuckDB's registered option defaults must include the resolved memory capacities
+  // and operator sizes, not just the parsed YAML overrides.
+  config_  = context->get_config();
   context_ = std::move(context);
 }
 
@@ -1994,7 +1984,7 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 
   auto config_path = get_config_file_path();
   if (config_path && std::filesystem::exists(*config_path)) {
-    config_.load_from_file(*config_path);
+    config_.parse_from_file(*config_path);
     SIRIUS_LOG_INFO("Loaded Sirius configuration from file: {}", *config_path);
   } else if (config_path) {
     // SIRIUS_CONFIG_FILE was explicitly set but points to a non-existent file — error
@@ -2005,7 +1995,7 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    config_.apply_defaults();
+    // The default-constructed config is resolved by initialize() after Quent exists.
   }
 }
 

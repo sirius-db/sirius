@@ -22,20 +22,21 @@ project(
   LANGUAGES C CXX CUDA)
 
 include(GNUInstallDirs)
+option(SIRIUS_BUILD_SHARED "Build the shared Sirius library" ON)
+option(SIRIUS_BUILD_STATIC "Build the static Sirius library" OFF)
+if(SIRIUS_BUILD_STATIC AND NOT VCPKG_BUILD)
+  message(
+    FATAL_ERROR "The installed static package requires vcpkg dependencies")
+endif()
+if(NOT SIRIUS_BUILD_SHARED AND NOT SIRIUS_BUILD_STATIC)
+  message(FATAL_ERROR "Enable at least one Sirius library output")
+endif()
 option(SIRIUS_BUILD_TESTS "Build Sirius C++ tests" OFF)
 
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
-
-# The [s3] integration tests launch MinIO via a patched build of upstream
-# testcontainers-native, fetched + patched at configure time and built as a Go
-# c-archive — so it needs a Go toolchain and network at configure/build time. ON
-# by default (the pixi env provides Go); turn OFF for offline / Go-less /
-# release / package builds, which then skip the S3 container harness entirely.
-option(SIRIUS_BUILD_S3_TESTS
-       "Build the testcontainers-backed S3 integration test harness" ON)
 
 if(VCPKG_BUILD)
   set(_VCPKG_INC "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")

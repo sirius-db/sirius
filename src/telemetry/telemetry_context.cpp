@@ -22,6 +22,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_config.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
+#include "telemetry/nvtx_injection.hpp"
 
 #include <unistd.h>
 
@@ -37,6 +38,8 @@ namespace sirius::telemetry {
 
 quent::Context make_quent_context(const sirius::telemetry_config& config)
 {
+  detail::configure_nvtx_injection(config.enable_quent && config.enable_nvtx,
+                                   config.nvtx_injection_lib);
   if (not config.enable_quent) { return quent::Context::none(); }
   if (config.exporter == "ndjson") { return quent::Context::ndjson(config.output_directory); }
   if (config.exporter == "msgpack") { return quent::Context::msgpack(config.output_directory); }

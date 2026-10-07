@@ -20,3 +20,14 @@ corrosion_set_env_vars(
 # INSTALL_INTERFACE counterpart.
 target_include_directories(
   telemetry_bridge INTERFACE $<BUILD_INTERFACE:${TELEMETRY_BRIDGE_INCLUDE_DIR}>)
+
+# Corrosion's installer exports the archive location, but not its native links.
+get_target_property(telemetry_native_libraries telemetry_bridge-static
+                    INTERFACE_LINK_LIBRARIES)
+if(VCPKG_BUILD)
+  list(REMOVE_ITEM telemetry_native_libraries gcc_s)
+endif()
+if(telemetry_native_libraries)
+  target_link_libraries(telemetry_bridge
+                        INTERFACE ${telemetry_native_libraries})
+endif()

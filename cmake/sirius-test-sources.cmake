@@ -63,6 +63,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
     test/cpp/integration/test_gpu_execution_constant_or_null.cpp
+    test/cpp/integration/test_gpu_execution_cross_product.cpp
     test/cpp/integration/test_gpu_execution_decimal_sum_overflow.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
@@ -83,6 +84,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
+    test/cpp/integration/test_required_null_scan.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
@@ -137,6 +139,7 @@ set(TEST_SOURCES
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
+    test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
@@ -163,6 +166,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_partition_placement.cpp
     test/cpp/operator/test_cross_schedule.cpp
+    test/cpp/operator/aggregate/test_decimal_sum_widening.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
@@ -286,22 +290,15 @@ set(TEST_SOURCES
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
-    test/cpp/utils/utils.cpp)
-# cmake-format: on
-
-# The testcontainers-backed S3 harness only compiles when its dependency is
-# built; unittest.cpp guards its use behind SIRIUS_HAVE_TESTCONTAINERS.
-if(SIRIUS_BUILD_S3_TESTS)
-  list(
-    APPEND
-    TEST_SOURCES
-    test/cpp/utils/s3_container.cpp
+    test/cpp/utils/utils.cpp
+    test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
+    test/cpp/io/s3/test_duckdb_secret_config.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
-endif()
+# cmake-format: on
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
 # caught by the check-orphan-tests pre-commit hook
