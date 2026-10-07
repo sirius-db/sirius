@@ -17,6 +17,7 @@
 #pragma once
 
 #include "exec/invocable.hpp"
+#include "io/object_identity.hpp"
 
 #include <cudf/io/datasource.hpp>
 
@@ -94,6 +95,22 @@ class io_object : public std::enable_shared_from_this<io_object> {
  public:
   virtual ~io_object() = default;
 
+  [[nodiscard]] uint64_t open_generation() const noexcept { return _open_generation; }
+
+  /// An absent backend validator is scoped to this owned open, never to a path.
+  [[nodiscard]] virtual object_identity identity() const
+  {
+    auto tag = validation_tag();
+    return {tag.empty() ? identity_kind::opened_handle : identity_kind::object_tag,
+            size(),
+            tag.empty() ? std::to_string(_open_generation) : std::string(tag)};
+  }
+
+  [[nodiscard]] std::string identity_cache_key() const
+  {
+    return identity().cache_key(object_path());
+  }
+
   /// Stable identifier used as the prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
   /// otherwise-equal paths (versioned S3 keys, normalized URLs, …).
@@ -112,6 +129,9 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// earlier; an empty tag disables validation-based caching above —
   /// degraded performance, never wrong bytes.
   [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
+
+ private:
+  uint64_t const _open_generation = next_open_generation();
 };
 
 class io_object_metadata {
