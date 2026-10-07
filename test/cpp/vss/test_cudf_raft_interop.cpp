@@ -62,8 +62,11 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
 
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Same layout as make_fixed_size_float_list, but with parent row `null_row`
@@ -78,7 +81,8 @@ std::unique_ptr<cudf::column> make_list_with_null_parent_row(std::vector<float> 
   auto child    = std::move(contents.children[1]);
 
   auto mask = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), null_row, null_row + 1, false);
+  cudf::set_null_mask(
+    reinterpret_cast<cudf::bitmask_type*>(mask.data()), null_row, null_row + 1, false);
 
   return cudf::make_lists_column(n_rows, std::move(offsets), std::move(child), 1, std::move(mask));
 }
@@ -95,13 +99,18 @@ std::unique_ptr<cudf::column> make_list_with_null_child_element(std::vector<floa
   auto child    = std::move(contents.children[1]);
 
   auto child_mask = cudf::create_null_mask(child->size(), cudf::mask_state::ALL_VALID);
-  cudf::set_null_mask(
-    static_cast<cudf::bitmask_type*>(child_mask.data()), null_element, null_element + 1, false);
+  cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(child_mask.data()),
+                      null_element,
+                      null_element + 1,
+                      false);
   child->set_null_mask(std::move(child_mask), 1);
 
   // Parent rows all valid (null_count 0); the null lives in the values child.
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 }  // namespace

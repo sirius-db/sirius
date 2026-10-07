@@ -35,7 +35,7 @@ For example, in a GROUP BY query after pipeline splitting (see [Physical Plan Ge
 
 ## Physical Operators
 
-**File:** `src/include/op/sirius_physical_operator.hpp`, `src/op/sirius_physical_operator.cpp`
+**File:** `src/op/sirius_physical_operator.hpp`, `src/op/sirius_physical_operator.cpp`
 
 See [Operators](operators.md) for the complete operator reference.
 
@@ -79,7 +79,7 @@ parallel::itask                          // base: local_state + global_state + e
 
 ### `gpu_pipeline_task`
 
-**File:** `src/include/pipeline/gpu_pipeline_task.hpp`, `src/pipeline/gpu_pipeline_task.cpp`
+**File:** `src/pipeline/gpu_pipeline_task.hpp`, `src/pipeline/gpu_pipeline_task.cpp`
 
 **State classes:**
 - `gpu_pipeline_task_global_state` — holds the `sirius_pipeline` to execute
@@ -181,7 +181,7 @@ Every batch is fed through `lock_or_prepare_batch`. There is no early-exit short
 
 **Layer 4 — `lock_or_prepare_batch` does the actual clone/conversion.**
 
-`src/include/pipeline/batch_lock_utils.hpp`:
+`src/pipeline/batch_lock_utils.hpp`:
 
 ```cpp
 inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
@@ -253,7 +253,7 @@ If you cannot satisfy the contract — for example, your operator legitimately n
 
 ## Pipeline Executor
 
-**File:** `src/include/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
+**File:** `src/pipeline/task_scheduler.hpp`, `src/pipeline/task_scheduler.cpp`
 
 The `task_scheduler` is the top-level GPU-pipeline orchestrator. It owns the shared pipeline-task
 queue, one `gpu_pipeline_executor` per active GPU, and the management thread that matches queued
@@ -317,7 +317,7 @@ for the consumer semantics.
 
 ## GPU Pipeline Executor
 
-**File:** `src/include/pipeline/gpu_pipeline_executor.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`
+**File:** `src/pipeline/gpu_pipeline_executor.hpp`, `src/pipeline/gpu_pipeline_executor.cpp`
 
 One `gpu_pipeline_executor` exists per GPU device. It manages a thread pool for executing GPU pipeline tasks.
 
@@ -400,7 +400,7 @@ gpu_executor → task_request_publisher.send() → task_scheduler.management_eve
 
 ## Completion Handler
 
-**File:** `src/include/pipeline/completion_handler.hpp`
+**File:** `src/pipeline/completion_handler.hpp`
 
 Thread-safe signaling for query completion using promise/future:
 
@@ -416,7 +416,7 @@ and only the first call takes effect.
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 
-**File:** `src/include/pipeline/oom_reschedule_exception.hpp`
+**File:** `src/pipeline/oom_reschedule_exception.hpp`
 
 Retryable execution failures are modeled as a small exception hierarchy: `task_reschedule_exception` is the base, with two subclasses —
 
@@ -454,16 +454,16 @@ This ensures that when `drain_after_error()` returns, no tasks are referencing o
 
 | File | Purpose |
 |------|---------|
-| `src/include/pipeline/task_scheduler.hpp` | Top-level executor |
+| `src/pipeline/task_scheduler.hpp` | Top-level executor |
 | `src/pipeline/task_scheduler.cpp` | Event loop, query lifecycle |
-| `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
+| `src/pipeline/gpu_pipeline_executor.hpp` | Per-GPU executor |
 | `src/pipeline/gpu_pipeline_executor.cpp` | Manager loop, OOM handling |
-| `src/include/pipeline/gpu_pipeline_task.hpp` | GPU task class |
+| `src/pipeline/gpu_pipeline_task.hpp` | GPU task class |
 | `src/pipeline/gpu_pipeline_task.cpp` | Task execution |
-| `src/include/pipeline/completion_handler.hpp` | Promise/future completion |
-| `src/include/pipeline/oom_reschedule_exception.hpp` | OOM retry mechanism |
-| `src/include/pipeline/sirius_pipeline.hpp` | Pipeline structure |
-| `src/include/pipeline/sirius_pipeline_itask.hpp` | Task interface |
-| `src/include/pipeline/task_request.hpp` | Executor↔pipeline request |
-| `src/include/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
-| `src/include/parallel/task_executor.hpp` | `itask_executor` base class for all executors |
+| `src/pipeline/completion_handler.hpp` | Promise/future completion |
+| `src/pipeline/oom_reschedule_exception.hpp` | OOM retry mechanism |
+| `src/pipeline/sirius_pipeline.hpp` | Pipeline structure |
+| `src/pipeline/sirius_pipeline_itask.hpp` | Task interface |
+| `src/pipeline/task_request.hpp` | Executor↔pipeline request |
+| `src/exec/bounded_thread_pool.hpp` | Slot-based thread pool with RAII concurrency control |
+| `src/parallel/task_executor.hpp` | `itask_executor` base class for all executors |

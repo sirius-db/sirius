@@ -13,6 +13,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
@@ -1152,11 +1153,12 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
   cudf::numeric_scalar<std::int32_t> const step(width, true, stream);
   auto offsets =
     cudf::sequence(static_cast<cudf::size_type>(survivors + 1), init, step, stream, mr);
-  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
-                                       std::move(offsets),
-                                       std::move(out_chars),
-                                       0,
-                                       rmm::device_buffer(0, stream, mr));
+  auto col =
+    cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                              std::move(offsets),
+                              std::move(out_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   cudaStreamSynchronize(stream.get());
   return col;
 }
@@ -1269,11 +1271,12 @@ std::unique_ptr<cudf::column> try_str_split_path(PlanTree const& tree,
       return nullptr;
     }
   }
-  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
-                                       std::move(out_offsets),
-                                       std::move(out_chars),
-                                       0,
-                                       rmm::device_buffer(0, stream, mr));
+  auto col =
+    cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
+                              std::move(out_offsets),
+                              std::move(out_chars),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
   // The phase-1 lengths column and src_offsets free on return; the launches
   // synced above, and make_strings_column launched nothing — sync once more
   // for the same caller-may-free discipline as the other compacted routes.

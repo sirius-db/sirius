@@ -14,15 +14,13 @@
 name: Test
 
 on:
-  push:
-    branches:
-      - dev
   pull_request:
   merge_group:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel only existing PR runs
 
 jobs:
   build:
@@ -46,7 +44,7 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
@@ -78,6 +76,8 @@ jobs:
           echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - name: Build
         env:
@@ -85,6 +85,25 @@ jobs:
         run: |
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: Build shared DuckDB scan host tests
+        run: |
+          cmake --build build/release --target libduckdb.so
+          cmake -S test/cmake/scan_host -B build/release/scan-host -G Ninja \
+            -DDUCKDB_LIBRARY="$PWD/build/release/src/libduckdb.so"
+          cmake --build build/release/scan-host
+
+      - name: Check installed Sirius package
+        run: |
+          sirius_test_dir="$(mktemp -d)"
+          trap 'rm -rf "$sirius_test_dir"' EXIT
+          cmake --install build/release --prefix "$sirius_test_dir/install" --component sirius_library
+          cmake -E rename "$sirius_test_dir/install" "$sirius_test_dir/relocated"
+          cmake --no-warn-unused-cli -S test/cmake/installed_consumer -B "$sirius_test_dir/consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$sirius_test_dir/relocated" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_Git=TRUE
+          cmake --build "$sirius_test_dir/consumer"
 
       - name: Surface build errors
         if: failure()
@@ -119,12 +138,12 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop non-PR CUDA variants; otherwise, run the full matrix.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
     runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "gpu-2xt4"]', matrix.cuda.runner)) }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CUDA_CACHE_PATH: /home/runner/actions-runner/_work/.cuda-cache
       SIRIUS_LOG_LEVEL: trace
@@ -144,6 +163,14 @@ jobs:
 
       - name: Extract build artifacts
         run: tar -xf build.tar
+
+      - name: Check shared DuckDB scan host detection
+        # The legacy DuckDB library includes Sirius and needs the driver libraries.
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/release/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ./build/release/scan-host/scan_host_pie
+          ./build/release/scan-host/scan_host_pic
+          ./build/release/scan-host/scan_host_nonpie
 
       - name: Provision DuckDB extensions the tests load
         # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
@@ -168,20 +195,8 @@ jobs:
 
       - name: Run C++ unit tests
         run: |
-          set -o pipefail
           nvidia-smi
-          timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
-
-      # The late-materialization gate is read from the environment once per process, so the
-      # feature is entirely absent from the run above. Without this step the end-to-end case
-      # (planning -> scan substitution -> transport -> restoration) returns successfully without
-      # executing, and a green suite says nothing about the feature.
-      - name: Run late-materialization tests with the gate on
-        run: |
-          set -o pipefail
-          SIRIUS_EXP_LATE_MAT=1 \
-            timeout 20m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort \
-            "[late_mat],[deferred_query],[native_filter]" 2>&1 | tee /tmp/unittest_late_mat.log
+          python3 scripts/run_unit_tests.py --require-gpus 2 -- --abort
 
       - name: Iceberg conformance (correctness + connection liveness)
         timeout-minutes: 20
@@ -207,8 +222,8 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
-          grep -B 5 -A 10 'FAILED:' /tmp/unittest_late_mat.log | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          grep -h -B 5 -A 10 'FAILED:' build/release/extension/sirius/test/cpp/log/*/unittest.log \
+            | head -80 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload unit test logs
@@ -226,6 +241,13 @@ jobs:
           chmod -R a+r test_datasets/
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
+      - name: S3 integration tests
+        run: make s3-test
+
+      - name: S3 large integration tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: make s3-test-large
 
       - name: TPC-H performance snapshot
         id: tpch

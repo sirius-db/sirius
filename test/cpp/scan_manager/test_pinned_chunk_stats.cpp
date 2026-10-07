@@ -645,7 +645,7 @@ std::unique_ptr<cudf::column> make_gpu_col(cudf::type_id id,
     cudf::size_type null_count = 0;
     for (std::size_t i = 0; i < validity.size(); ++i) {
       if (validity[i]) { continue; }
-      cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()),
+      cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(mask.data()),
                           static_cast<cudf::size_type>(i),
                           static_cast<cudf::size_type>(i + 1),
                           false,

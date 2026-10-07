@@ -20,6 +20,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
 #include <cuda/stream>
@@ -249,17 +250,12 @@ TEST_CASE("Tasks extracted and RAII-returned while executors are parked still ru
   sched.stop();
 }
 
-TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler]")
+TEST_CASE("Task scheduler dispatches tasks with device preference", "[task_scheduler][multi_gpu]")
 {
   // Multi-GPU device-preference dispatch needs a real 2-GPU host; skip on
   // single-GPU machines (mirrors the require_two_gpus() convention used by the
   // MGPU operator tests in mgpu_test_utils.hpp).
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("Task scheduler device-preference test requires >=2 GPUs; single-GPU host — skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   auto manager = initialize_memory_manager(2);
   sirius::exec::thread_pool_config gpu_config{2};

@@ -10,6 +10,7 @@
     ]
   },
   "dependencies": [
+    "catch2",
     "cudf",
     "cuvs",
     "raft",

@@ -24,6 +24,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -67,8 +68,11 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
 
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Upload a host query vector to the device (search requires a device pointer)
@@ -252,7 +256,7 @@ TEST_CASE("build_ivf_flat_index_from_batches rejects n_lists larger than every b
                                                         Metric::L2SqrtExpanded,
                                                         mr,
                                                         cudf::get_default_stream()),
-                      Catch::Contains("no batch has at least n_lists=4"));
+                      Catch::Matchers::ContainsSubstring("no batch has at least n_lists=4"));
 }
 
 TEST_CASE("build_ivf_flat_index_from_batches rejects all-empty input", "[vss]")
@@ -268,7 +272,7 @@ TEST_CASE("build_ivf_flat_index_from_batches rejects all-empty input", "[vss]")
                                                         Metric::L2SqrtExpanded,
                                                         mr,
                                                         cudf::get_default_stream()),
-                      Catch::Contains("all batches are empty"));
+                      Catch::Matchers::ContainsSubstring("all batches are empty"));
 }
 
 TEST_CASE("build_ivf_flat_index_from_batches trains on a later batch when the first is too small",

@@ -1,9 +1,9 @@
-# When changing the duckdb submodule, also update OVERRIDE_GIT_DESCRIBE
-# in cmake/CMakePresets.json to match the new version.
+# When changing the duckdb submodule, update OVERRIDE_GIT_DESCRIBE in
+# cmake/sirius-duckdb-provider.cmake and cmake/CMakePresets.json, plus pixi.toml.
 [submodule "duckdb"]
 	path = duckdb
-	url = https://github.com/sirius-db/duckdb
-	branch = v1.5.5-patches
+	url = https://github.com/duckdb/duckdb.git
+	branch = v1.5-variegata
 	ignore = dirty
 [submodule "substrait"]
 	path = substrait
@@ -13,9 +13,6 @@
 	path = cucascade
 	url = https://github.com/NVIDIA/cuCascade.git
 	branch = main
-[submodule "duckdb-python"]
-	path = duckdb-python
-	url = https://github.com/duckdb/duckdb-python.git
 [submodule ".claude/claude-tools"]
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git
@@ -29,3 +26,7 @@
 [submodule "starrocks/brpc"]
 	path = experimental/starrocks/brpc
 	url = https://github.com/apache/brpc
+[submodule "experimental/doris/doris"]
+	path = experimental/doris/doris
+	url = https://github.com/apache/doris
+	shallow = true

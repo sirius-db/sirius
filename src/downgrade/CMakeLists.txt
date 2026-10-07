@@ -1,0 +1,1 @@
+target_sources(sirius_objects PRIVATE downgrade_executor.cpp)

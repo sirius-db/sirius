@@ -124,6 +124,11 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate
         reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         break;
       }
+      case cudf::aggregation::Kind::MERGE_SETS: {
+        reduce_aggregation = cudf::make_merge_sets_aggregation<cudf::reduce_aggregation>(
+          cudf::null_equality::EQUAL, cudf::nan_equality::ALL_EQUAL);
+        break;
+      }
       case cudf::aggregation::Kind::NTH_ELEMENT: {
         if (!merge_nth_index[c].has_value()) {
           throw std::runtime_error(

@@ -40,6 +40,7 @@
 #include <late_mat/pin_uniqueness.hpp>
 #include <memory/topology_index.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <utils/duckdb_table_identity.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -348,8 +349,9 @@ void pin_columns(sirius_scan_manager& manager,
                  ::cuda::stream_ref stream)
 {
   sirius::scan_manager::cache_entry_info info;
-  info.table_name = table;
-  info.names      = names;
+  info.table_name     = table;
+  info.table_identity = sirius::test::test_table_identity(42);
+  info.names          = names;
   for (std::size_t i = 0; i < names.size(); ++i) {
     info.column_ids.emplace_back(static_cast<duckdb::idx_t>(i));
   }
@@ -372,8 +374,9 @@ std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
                                                ::cuda::stream_ref stream)
 {
   sirius::scan_manager::cache_entry_info info;
-  info.table_name = table;
-  info.names      = names;
+  info.table_name     = table;
+  info.table_identity = sirius::test::test_table_identity(42);
+  info.names          = names;
   for (std::size_t i = 0; i < names.size(); ++i) {
     info.column_ids.emplace_back(static_cast<duckdb::idx_t>(i));
   }

@@ -201,14 +201,18 @@ std::unique_ptr<cudf::table> duckdb_chunk_staging::build(rmm::cuda_stream_view s
   for (std::size_t c = 0; c < _columns.size(); c++) {
     auto& s = _columns[c];
 
-    rmm::device_buffer null_mask{};
+    auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
     if (s.null_count > 0) {
       // cudf reads the mask a word at a time, so it must be allocation-sized rather than only
       // large enough for the rows that happen to carry a null.
       s.mask_words.resize(
         cudf::bitmask_allocation_size_bytes(_num_rows) / sizeof(cudf::bitmask_type), 0);
-      null_mask = to_device(
-        s.mask_words.data(), s.mask_words.size() * sizeof(cudf::bitmask_type), stream, mr);
+      null_mask = cudf::create_null_mask(_num_rows, cudf::mask_state::UNINITIALIZED, stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(null_mask.data(),
+                                    s.mask_words.data(),
+                                    s.mask_words.size() * sizeof(cudf::bitmask_type),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
     }
 
     if (s.is_varchar) {
@@ -225,7 +229,7 @@ std::unique_ptr<cudf::table> duckdb_chunk_staging::build(rmm::cuda_stream_view s
           cudf::data_type{cudf::type_id::INT64},
           _num_rows + 1,
           to_device(s.offsets.data(), s.offsets.size() * sizeof(std::int64_t), stream, mr),
-          rmm::device_buffer{0, stream, mr},
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0);
       } else {
         std::vector<std::int32_t> narrow(s.offsets.begin(), s.offsets.end());
@@ -233,7 +237,7 @@ std::unique_ptr<cudf::table> duckdb_chunk_staging::build(rmm::cuda_stream_view s
           cudf::data_type{cudf::type_id::INT32},
           _num_rows + 1,
           to_device(narrow.data(), narrow.size() * sizeof(std::int32_t), stream, mr),
-          rmm::device_buffer{0, stream, mr},
+          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
           0);
       }
       columns.push_back(

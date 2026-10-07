@@ -22,6 +22,7 @@
 #include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/device_buffer.hpp>

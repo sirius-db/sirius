@@ -20,8 +20,10 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <memory>
 #include <string>
 
 namespace {
@@ -34,7 +36,8 @@ class UniqueJoinFixture : public sirius::test::GpuExecutionFixture {
     // compressed_materialization wraps GROUP BY keys in __internal_compress_integral_*
     // calls the GPU translator rejects. Disabling both preserves the plan shape under
     // test; it applies to the GPU and CPU passes alike, so comparisons stay fair.
-    run_ok("SET disabled_optimizers='deliminator,compressed_materialization';");
+    optimizer_guard = std::make_unique<sirius::test::disabled_optimizers_guard>(
+      *con, "deliminator,compressed_materialization");
 
     run_ok("CREATE TABLE dim (id INTEGER PRIMARY KEY, name VARCHAR);");
     run_ok("INSERT INTO dim VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');");
@@ -61,12 +64,10 @@ class UniqueJoinFixture : public sirius::test::GpuExecutionFixture {
     run_ok("CHECKPOINT;");
   }
 
-  ~UniqueJoinFixture()
-  {
-    // The connection is shared across tests, so restore the optimizer set. Plain Query
-    // (not run_ok) — never assert during unwinding.
-    if (con) { con->Query("SET disabled_optimizers='';"); }
-  }
+ private:
+  // disabled_optimizers is database wide and the shared connection keeps Sirius's own mask in
+  // it, so the guard appends to the current value and restores it exactly.
+  std::unique_ptr<sirius::test::disabled_optimizers_guard> optimizer_guard;
 };
 
 }  // namespace

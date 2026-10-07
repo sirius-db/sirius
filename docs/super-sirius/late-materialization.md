@@ -188,15 +188,17 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   calibrated against a device-memory gather.
 - **A pin's lifecycle is `pin_table`/`unpin_table`, not the downgrade executor** — pinned entries
   are not spilled to reclaim memory the way ordinary data batches are, so a chunk backing an
-  installed deferral does not move tiers mid-query on its own. What DOES change it — an explicit
-  `unpin_table`, a re-pin that replaces the entry, or an in-place column merge — bumps or
-  invalidates the entry's generation (`pin_entry_handle`, `column_origin.hpp`). A consumer
-  resolving an origin against a generation that no longer matches gets `nullopt`, never a stale or
-  dangling pointer. Fail-closed here means the PORT THROWS, not that the query quietly re-reads:
-  by that point the scan has already emitted rowids in place of the values, so there is nothing to
-  fall back to locally. A re-read happens only if an outer layer catches the error and replays the
-  query. The guarantee is that changed data is never materialized against — not that the query
-  survives it unaided.
+  installed deferral does not move tiers mid-query on its own. `unpin_table` and a replacing re-pin
+  remove the old entry from the registry immediately, but do not revoke queries that already
+  acquired it: each handle identifies that exact entry weakly, and resolution promotes it to an
+  owning lease for the whole deferred gather. The old entry expires after its last serving query
+  releases it, while a new query sees only the replacement (or no pin). A true in-place column
+  merge still bumps the generation (`pin_entry_handle`, `column_origin.hpp`) because positional
+  metadata captured before that mutation may be stale. A consumer resolving an expired or
+  generation-mismatched origin gets `nullopt`, never a dangling pointer and never an entry later
+  installed under the same name. Fail-closed here means the PORT THROWS, not that the query quietly
+  re-reads: by that point the scan has emitted rowids in place of values, so no local fallback is
+  possible.
 - **Multi-GPU pins are refused.** `resolve_pinned_column`/`materialize()` pass a pin's raw column
   views and compressed-table pointers straight to a gather on the consumer's current GPU, with no
   per-device tag and no P2P check, clone, or host-staging fallback — a chunk pinned on a different
@@ -219,8 +221,8 @@ q10; no other query moves outside noise.
 
 | Piece | File |
 |---|---|
-| What a deferral is (the pair, the substituted schemas) | `src/include/late_mat/defer_directive.hpp` |
-| Whether a bundle is worth deferring, and the floors | `src/include/late_mat/defer_policy.hpp` |
+| What a deferral is (the pair, the substituted schemas) | `src/late_mat/defer_directive.hpp` |
+| Whether a bundle is worth deferring, and the floors | `src/late_mat/defer_policy.hpp` |
 | How long each scanned column's values are needed | `src/planner/late_mat_plan_pass.cpp` |
 | Admission (uniqueness proof, pipelines, riders) | `src/scan_manager/sirius_scan_manager.cpp` |
 | Pin-time distinctness proof | `src/late_mat/pin_uniqueness.cpp` |

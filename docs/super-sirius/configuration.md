@@ -26,9 +26,7 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-`SIRIUS_DISABLE` is a process-startup kill switch for the **Super Sirius runtime**, not a query-fallback setting. Set `SIRIUS_DISABLE=1` before starting DuckDB to prevent that runtime from initializing and transparently routing queries to the GPU. The extension binary still loads and registers its SQL surface; legacy functions therefore remain available in builds that include them. Sirius also skips creating its Quent telemetry context and does not publish an automatic NVTX injection path. A caller-supplied `NVTX_INJECTION64_PATH` remains untouched.
-
-This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks. An unset value or `SIRIUS_DISABLE=0` enables normal Super Sirius initialization; any other set value disables it.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
@@ -92,7 +90,11 @@ sirius:
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
+    scan_manager:
+      num_threads: 4
+      backend: sirius
+      uring_n_reactors: 1
+      cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -109,6 +111,7 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     pinned_zone_map_group_rows: 8192  # rows per sub-chunk zone-map group; 0 captures chunk stats only
+    enable_runtime_size_estimation: false  # project total port input from upstream ratios
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -310,7 +313,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -318,12 +321,165 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
-| `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
+| `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
-Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
+Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
+sub-config below.
+
+`max_readahead_scans` has three states:
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| `0` | The readahead does not run, whatever the cache mode. |
+| `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
+
+`readahead_strategy` works the same way, deferring to the backend rather than to the cache:
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring. |
+| `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
+| `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
+
+When the readahead ends up `opportunistic` (either way), an *unset* `max_readahead_scans` schedules
+against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
+deployment is only useful while a pipeline thread could still pick up another scan. An explicit
+`max_readahead_scans` wins over that substitution.
+
+Both are resolved against a single backend: the live one publishing the widest
+`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+
+Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
+
+### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
+
+There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
+operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
+
+### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
+
+TLS verification policy and the CA bundle are configured only under
+`scan_manager.object_store`. The REST reactor consumes those values so signing
+and transport use one trust policy; there are no separate REST YAML controls.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
+| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
+| `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
+| `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
+| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
+| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
+| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
+| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
+| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
+| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
+| `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
+| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
+| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
+| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+
+Two REST values are deliberately not YAML keys. **Connections per reactor** is
+fixed at 64 — the useful number is a property of one reactor thread, not of a
+deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
+each with its own thread to service them. **Physical GET size** is worker-owned:
+the reactor derives a target between 4 MiB and 16 MiB from its queued logical
+bytes and currently free connections. Large contiguous requests are balanced
+under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
+cache-chunk boundaries so a chunk is never published before all of its bytes
+arrive.
+
+`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
+as prepared slices without forcing a static physical layout. Device operations
+allocate as many pinned CuCascade blocks as their selected physical range needs;
+those blocks stay owned through curl retries, the asynchronous H2D copy, and its
+CUDA completion event. Staging is therefore proportional to active device work
+instead of being reserved as one fixed bounce slot per connection.
+
+### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
+
+Used when `backend: kvikio` routes reads (local files and `s3://` objects)
+to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
+alone"** — kvikIO seeds each setting from an environment variable at first use, so
+omitting a key preserves that value and setting one overrides it.
+
+**These are process-global.** Every key except `compat_mode` maps to a setter on
+kvikIO's `defaults` singleton, so the last context constructed wins and the
+setting is shared with every other kvikIO user in the process. Treat it as
+startup configuration. `compat_mode` is the exception: it rides the file-handle
+constructor, so it scopes to files this backend opens.
+
+This backend runs without the prefetching cache and therefore without the
+readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
+`readahead_strategy` have no effect on it.
+
+| Key | Type | Env default | Description |
+|-----|------|-------------|-------------|
+| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
+| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
+| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
+| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
+| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
+| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
+| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
+| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+
+### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
+
+Everything about read-path caching lives in this one block — rather than a mode on the
+scan manager and the cache's tunables in a sibling block.
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      cache:
+        mode: sirius
+        eviction: lru
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
+| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
+
+`mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
+through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Sirius's own
+pinned prefetching cache.
+
+`eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
+pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
+than for reuse.
+
+Those two knobs derive the settings below, which are therefore **not** individually settable from YAML:
+
+| Derived setting | Derived from |
+|-----------------|--------------|
+| `uring.use_odirect` | `mode` — true for everything but `os` |
+| whether the prefetching cache is armed | `mode` — only under `sirius` |
+| `dispose_on_idle` | `eviction` — true under `idle` |
+| the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
+
+### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL. |
+| `region` | string | "" | AWS region. |
+| `access_key` / `secret_key` | string | "" | Static credentials. |
+| `session_token` | string | "" | STS session token for temporary credentials. |
+| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
+| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
+| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
+| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
 
@@ -340,60 +496,6 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
 | `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
-
-### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `use_odirect` | bool | true | Use `O_DIRECT` for local-disk reads. |
-| `max_n_chunks` | int | 1 | Max contiguous file segments fused into one vectored read. |
-
-### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
-
-TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST reactor consumes those values so signing
-and transport use one trust policy; there are no separate REST YAML controls.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
-| `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
-| `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
-| `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
-| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
-| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
-| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
-| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
-| `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
-| `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
-| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
-| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
-| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
-
-### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `inflight_io_chunk_budget` | int (**> 0**) | 2048 | Max in-flight IO chunks (enforced by admission control). |
-| `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
-| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
-| `dispose_after_use` | bool | false | Discard chunks immediately after use. |
-
-### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `endpoint` | string | "" | S3 endpoint URL. |
-| `region` | string | "" | AWS region. |
-| `access_key` / `secret_key` | string | "" | Static credentials. |
-| `session_token` | string | "" | STS session token for temporary credentials. |
-| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
-| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
-| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ## Operator Parameters
 
@@ -428,13 +530,13 @@ individually.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
-| `dense_count_join_max_bytes` | 0 (auto) | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint. Auto = `dense_count_join_memory_fraction` of the smallest visible GPU's capacity (2 GiB if capacity cannot be read at planning time). At plan time, a preserved/counted cardinality estimate whose histogram would exceed the budget declines the fusion entirely, planning the ordinary join + aggregate instead; within a fused plan, a key domain that turns out too wide at runtime still takes the operator's exact sparse (eager-aggregation) strategy. |
-| `dense_count_join_memory_fraction` | 0.10 | Fraction of the smallest visible GPU's capacity used to resolve `dense_count_join_max_bytes` when it is 0 (auto). |
+| `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `pinned_zone_map_group_rows` | 8192 | Rows per zone-map group within a pinned chunk. Groups refine the per-chunk bounds, so a scan can skip part of a chunk instead of all-or-nothing. `0` captures chunk statistics only. Ignored when `enable_pinned_zone_map_pruning` is false; only pays off when the chunk's rows are ordered on the filtered column, which is what `pin_table`'s `cluster_by` arranges. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -451,6 +553,7 @@ after that dependency is fixed.
 sirius:
   telemetry:
     enable_quent: true
+    enable_nvtx: false
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
@@ -458,10 +561,11 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
-| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
@@ -574,6 +678,17 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
+The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
+If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
+the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
+the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
+backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
+does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
+logging. If the selected sink cannot be constructed, such as when the log directory is not
+writable, context construction throws and restores the previous `Config::LOG_*` values while
+leaving the previous sink active.
+
 ### Expression Evaluation
 
 **File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
@@ -621,8 +736,6 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
-| `dense_count_join_max_bytes` | 0 (auto) | Histogram budget for `DENSE_COUNT_JOIN`; auto = `dense_count_join_memory_fraction` of the smallest visible GPU's capacity |
-| `dense_count_join_memory_fraction` | 0.10 | Auto histogram-budget fraction when `dense_count_join_max_bytes` is 0 |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -637,11 +750,7 @@ Runtime distinct-build probing is also engine-owned and is temporarily disabled 
 Dense count-join is enabled by default and can be disabled with
 `sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers and are
 hash-partitioned on the join key, so one partition of each input plus its workspace must fit one
-GPU task. Its histogram budget applies per partition task and is auto-derived from GPU capacity
-by default (`dense_count_join_max_bytes: 0`); at plan time, a preserved/counted cardinality
-estimate whose histogram would exceed that budget declines the fusion and falls back to the
-ordinary join + aggregate, so query-plan shape alone no longer guarantees `DENSE_COUNT_JOIN` is
-chosen.
+GPU task. Its histogram budget is engine-owned and applies per partition task.
 
 ### GPU Admission
 
@@ -728,6 +837,19 @@ Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the coun
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
 
+### Runtime Data Size Estimation
+
+Runtime estimation projects the total bytes that will reach an input port from measured upstream
+ratios. Its current consumer is the grouped-aggregation `PARTITION`, which can overlap with its
+producer after an estimate is available. The disabled path retains the original `FULL` barrier.
+
+The partition logs its sizing basis (`projected`, `upstream-complete`, or `measured`) and final
+error. See [Data Size Estimation](data-size-estimation.md) for the design.
+
+```sql
+SET enable_runtime_size_estimation = true;   -- off by default
+```
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -738,45 +860,22 @@ gate table, the mechanism, and results.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Legacy Config Flags
-
-### Legacy-release DuckDB settings
-
-The following settings only control the legacy `gpu_processing` path. Sirius registers them
-when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
-`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
-`SET` them.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
-| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
-| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
-| `use_opt_table_scan` | true | Use the legacy optimized table scan |
-| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
-| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
-| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
-| `enable_fallback_check` | false | Enable legacy fallback validation |
-| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+## Compile-Time Config Flags
 
 ### Static flags
 
 **File:** `src/include/config.hpp`
 
-Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
+Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
-| `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
-| `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
+| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
@@ -787,11 +886,12 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
+| `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 
@@ -817,7 +917,14 @@ sirius:
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
 overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
 conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
-concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+concern.  Each uring reactor stages through whole host blocks under a fixed
+64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
+and even a small device miss occupies that whole block for the duration of
+its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
+so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /
+`stall_time_s`) rather than by a whole-transfer deadline: a large block does
+not time out on a slow link as long as bytes keep arriving.
+`pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
 include the cuCascade all-valid null-mask conversion fix; without it,

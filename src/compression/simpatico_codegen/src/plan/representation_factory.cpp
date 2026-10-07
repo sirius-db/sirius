@@ -161,11 +161,12 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   rmm::device_buffer chars_buffer =
     chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
 
-  auto keys_strings = cudf::make_strings_column(num_keys,
-                                                std::move(keys_offsets),
-                                                std::move(chars_buffer),
-                                                0,
-                                                rmm::device_buffer(0, stream, mr));
+  auto keys_strings =
+    cudf::make_strings_column(num_keys,
+                              std::move(keys_offsets),
+                              std::move(chars_buffer),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
   auto dict_col =
     cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);

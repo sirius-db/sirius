@@ -334,7 +334,11 @@ static bool is_trivial_key_side(const duckdb::Expression& expr, bool evaluated_a
 
 /// Materialize complex equality-key expressions into projected columns, then rewrite each
 /// condition to reference the appended column. This lets PARTITION and hash join consume a
-/// column index. Routed null-safe casts unsupported by cuDF AST use the same path.
+/// column index. Routed null-safe casts unsupported by cuDF AST use the same path, and so do the
+/// sides of inequality conditions: the mixed join evaluates those inline as a cuDF AST predicate,
+/// which can neither cast to nor compute with DECIMAL (e.g. TPC-H Q17's
+/// `l_quantity < 0.2 * avg(l_quantity)` when the planner hands the comparison over as a join
+/// condition), so anything beyond a reference or an AST-supported cast is computed as a column.
 static void materialize_expression_join_keys(
   duckdb::LogicalComparisonJoin& op,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& left,
@@ -347,19 +351,20 @@ static void materialize_expression_join_keys(
                               bool is_left) {
     const std::size_t old_width = child->types.size();
 
-    // Gather the complex, translatable sides on this child across all equality conditions.
+    // Gather the complex, translatable sides on this child across all conditions.
     std::vector<std::size_t> cond_indices;
     duckdb::vector<std::unique_ptr<sirius::ast::node>> key_exprs;
     duckdb::vector<sirius::logical_type> key_types;
     for (std::size_t i = 0; i < op.conditions.size(); i++) {
-      auto& cond = op.conditions[i];
-      if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-          cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-        continue;  // inequality sides are evaluated inline as the mixed-join predicate
-      }
+      auto& cond             = op.conditions[i];
+      const bool is_equality = cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+                               cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
       auto& side_expr = is_left ? cond.left : cond.right;
+      // Equality keys become hash-table columns; inequality sides (and routed null-safe keys)
+      // are evaluated inline by the cuDF AST predicate, which only takes what it can cast.
       const bool as_ast_predicate =
-        routes_null_safe && cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM;
+        !is_equality ||
+        (routes_null_safe && cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
       if (is_trivial_key_side(*side_expr, as_ast_predicate)) { continue; }
       auto node = sirius::ast::from_duckdb(*side_expr);
       if (!node) { continue; }  // untranslatable: leave for the existing downstream throw
@@ -609,7 +614,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               site.estimated_cardinality,
               channel,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
             site_channels.push_back(std::move(channel));
             return endpoint;
           });
@@ -631,15 +636,6 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
                                                            .channel_push_ordinal = placed.site_ordinals[site],
                                                            .probe_storage_type   = key.probe_storage_type}}});
         }
-      }
-      // Register after all keys bind so each declaration covers every planned push.
-      for (auto const& target : targets) {
-        std::vector<std::size_t> planned_columns;
-        planned_columns.reserve(target.key_bindings.size());
-        for (auto const& binding : target.key_bindings) {
-          planned_columns.push_back(binding.channel_push_ordinal);
-        }
-        target.filter_set->register_producer(std::move(planned_columns));
       }
     }
     if (!targets.empty()) {

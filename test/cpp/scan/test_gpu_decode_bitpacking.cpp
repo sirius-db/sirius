@@ -792,5 +792,5 @@ TEST_CASE("gpu_decode_table BITPACKING - unsupported type_size throws",
      {gpu_segment_desc{
        static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
   REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream, mr),
-                      Catch::Contains("viability invariant violated"));
+                      Catch::Matchers::ContainsSubstring("viability invariant violated"));
 }

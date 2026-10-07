@@ -30,7 +30,7 @@ DuckDB's optimizer calls one Sirius hook registered via `OptimizerExtension`:
 
 4. DuckDB's executor runs `PhysicalSiriusExecution::GetData()`, which delegates to the Sirius GPU engine (Step 3 below).
 
-## Step 1b: Explicit Table Function Path (Legacy)
+## Step 1b: Explicit Table Function Path
 
 **File:** `src/sirius_extension.cpp`
 
@@ -59,7 +59,7 @@ If GPU execution fails at runtime (and `enable_duckdb_fallback` is true), the op
 1. `sirius_pending_statement_or_prepared_statement()`:
    - Calls `begin_query_internal()` to set up the active query context
    - Calls `sirius_pending_statement_internal()` which:
-     - Creates a `sirius_engine(context, sirius_iface)`
+     - Creates a `sirius_engine(context, query_id, query_label, session_label)` (the labels are optional telemetry names)
      - Creates a `sirius_physical_materialized_collector` as the result sink
      - Calls `engine.initialize(collector)` to build pipelines (see Step 4)
      - Returns a `PendingQueryResult`
@@ -125,7 +125,7 @@ After meta-pipeline construction, `initialize_internal()` applies Sirius-specifi
 
 ## Step 6: Scan Execution
 
-**Files:** `src/include/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
+**Files:** `src/scan_manager/sirius_scan_manager.hpp`, `src/op/scan/sirius_gpu_scan_operator.cpp`, `src/io/io_context.cpp`
 
 Scans run as a normal pipeline source on the GPU executor — there is no separate scan executor. Two cooperating pieces drive them:
 

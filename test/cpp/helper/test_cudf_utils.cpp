@@ -25,6 +25,7 @@
 #include "catch.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/logical_type.hpp"
+#include "utils/test_validation_utility.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -265,7 +266,8 @@ TEST_CASE("make_empty_table - the cudf-type overload refuses nested carriers", "
   std::vector<cudf::data_type> const carriers{cudf::data_type{cudf::type_id::INT32},
                                               cudf::data_type{cudf::type_id::LIST}};
   REQUIRE_THROWS_AS(sirius::make_empty_table(carriers), duckdb::InvalidInputException);
-  REQUIRE_THROWS_WITH(sirius::make_empty_table(carriers), Catch::Contains("logical-type overload"));
+  REQUIRE_THROWS_WITH(sirius::make_empty_table(carriers),
+                      Catch::Matchers::ContainsSubstring("logical-type overload"));
 }
 
 TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")
@@ -285,4 +287,129 @@ TEST_CASE("make_empty_like reproduces nested LIST columns", "[cudf_utils]")
   REQUIRE(empty->get_column(1).type().id() == cudf::type_id::LIST);
   cudf::lists_column_view const lists(empty->get_column(1).view());
   REQUIRE(lists.child().type().id() == cudf::type_id::FLOAT64);
+}
+
+TEST_CASE("shared column comparison ignores unused storage and checks row validity",
+          "[cudf_utils][column_comparison]")
+{
+  using sirius::test::columns_logically_equal;
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
+  auto const make_column          = [stream](std::vector<int32_t> const& values) {
+    auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(values.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream);
+    REQUIRE(cudaMemcpyAsync(column->mutable_view().data<int32_t>(),
+                            values.data(),
+                            values.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice,
+                            stream.get()) == cudaSuccess);
+    stream.sync();
+    return column;
+  };
+  auto const null_at = [stream](cudf::column& column, cudf::size_type row) {
+    auto mask = cudf::create_null_mask(column.size(), cudf::mask_state::ALL_VALID, stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, stream);
+    column.set_null_mask(std::move(mask), 1);
+  };
+
+  SECTION("null payloads are ignored, but a moved null is detected")
+  {
+    auto lhs = make_column({10, 111, 30});
+    auto rhs = make_column({10, 999, 30});
+    null_at(*lhs, 1);
+    null_at(*rhs, 1);
+    REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+    REQUIRE(sirius::test::expect_tables_equivalent_impl(
+      cudf::table_view{{lhs->view()}}, cudf::table_view{{rhs->view()}}, stream));
+
+    null_at(*rhs, 2);
+    REQUIRE_FALSE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+  }
+
+  SECTION("all-valid masks are optional and mask padding is ignored")
+  {
+    auto lhs  = make_column({10, 20, 30});
+    auto rhs  = make_column({10, 20, 30});
+    auto mask = cudf::create_null_mask(3, cudf::mask_state::ALL_VALID, stream);
+    rhs->set_null_mask(std::move(mask), 0);
+    REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+
+    auto other_mask = cudf::create_null_mask(3, cudf::mask_state::ALL_NULL, stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(other_mask.data()), 0, 3, true, stream);
+    lhs->set_null_mask(std::move(other_mask), 0);
+    REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+  }
+
+  SECTION("sliced lists compare referenced elements rather than offsets or unused children")
+  {
+    auto lhs =
+      cudf::make_lists_column(3,
+                              make_column({0, 1, 3, 4}),
+                              make_column({999, 10, 20, 888}),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
+    auto rhs =
+      cudf::make_lists_column(1,
+                              make_column({0, 2}),
+                              make_column({10, 20}),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
+    auto const slice = cudf::slice(lhs->view(), {1, 2}, stream).front();
+    REQUIRE(columns_logically_equal(slice, rhs->view(), stream));
+
+    auto different =
+      cudf::make_lists_column(1,
+                              make_column({0, 2}),
+                              make_column({10, 21}),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
+    REQUIRE_FALSE(columns_logically_equal(slice, different->view(), stream));
+  }
+
+  SECTION("string values are checked and sliced views compare against compact storage")
+  {
+    auto const make_strings = [stream, &make_column](std::string const& text) {
+      rmm::device_buffer chars(text.size(), stream);
+      REQUIRE(cudaMemcpyAsync(
+                chars.data(), text.data(), text.size(), cudaMemcpyHostToDevice, stream.get()) ==
+              cudaSuccess);
+      stream.sync();
+      return cudf::make_strings_column(
+        3,
+        make_column({0, 1, 2, 3}),
+        std::move(chars),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
+    };
+    auto lhs = make_strings("abc");
+    auto rhs = make_strings("xbc");
+    REQUIRE_FALSE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+    REQUIRE(columns_logically_equal(cudf::slice(lhs->view(), {1, 3}, stream).front(),
+                                    cudf::slice(rhs->view(), {1, 3}, stream).front(),
+                                    stream));
+    null_at(*lhs, 0);
+    null_at(*rhs, 0);
+    REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
+  }
+
+  SECTION("empty columns still check exact types and reject unsupported payloads")
+  {
+    auto const empty =
+      cudf::column_view{cudf::data_type{cudf::type_id::INT32}, 0, nullptr, nullptr, 0};
+    REQUIRE(columns_logically_equal(empty, empty, stream));
+    auto const unsupported =
+      cudf::column_view{cudf::data_type{cudf::type_id::DICTIONARY32}, 0, nullptr, nullptr, 0};
+    REQUIRE_FALSE(columns_logically_equal(unsupported, unsupported, stream));
+    auto const nested_unsupported = cudf::column_view{
+      cudf::data_type{cudf::type_id::LIST}, 0, nullptr, nullptr, 0, 0, {empty, unsupported}};
+    REQUIRE_FALSE(columns_logically_equal(nested_unsupported, nested_unsupported, stream));
+    auto const decimal_lhs =
+      cudf::column_view{cudf::data_type{cudf::type_id::DECIMAL32, -2}, 0, nullptr, nullptr, 0};
+    auto const decimal_rhs =
+      cudf::column_view{cudf::data_type{cudf::type_id::DECIMAL32, -3}, 0, nullptr, nullptr, 0};
+    REQUIRE_FALSE(columns_logically_equal(decimal_lhs, decimal_rhs, stream));
+  }
 }
