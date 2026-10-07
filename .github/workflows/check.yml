@@ -225,7 +225,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_BUILD=ON -DCPM_LOCAL_PACKAGES_ONLY=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \
-            -DSIRIUS_BUILD_STATIC=ON -DSIRIUS_BUILD_TESTS=OFF -DSIRIUS_BUILD_S3_TESTS=OFF 2>&1 | tee /tmp/vcpkg.log
+            -DSIRIUS_BUILD_STATIC=ON -DSIRIUS_BUILD_TESTS=OFF 2>&1 | tee /tmp/vcpkg.log
           pixi run -e vcpkg cmake --build build/vcpkg-release --target sirius_library 2>&1 | tee -a /tmp/vcpkg.log
 
       - name: Check the installed static package

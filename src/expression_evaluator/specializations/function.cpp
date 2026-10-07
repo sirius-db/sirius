@@ -459,7 +459,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   if (resolved_id == function_id::constant_or_null) {
     D_ASSERT(args.size() >= 2);
     auto const num_rows = _input_table.num_rows();
-    rmm::device_buffer null_mask;
+    auto null_mask      = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, _stream, _mr);
     cudf::size_type null_count = 0;
     {
       bool any_null_scalar = false;

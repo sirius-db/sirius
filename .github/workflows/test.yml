@@ -86,6 +86,13 @@ jobs:
           set -o pipefail
           make -j$(nproc) 2>&1 | tee /tmp/build.log
 
+      - name: Build shared DuckDB scan host tests
+        run: |
+          cmake --build build/release --target libduckdb.so
+          cmake -S test/cmake/scan_host -B build/release/scan-host -G Ninja \
+            -DDUCKDB_LIBRARY="$PWD/build/release/src/libduckdb.so"
+          cmake --build build/release/scan-host
+
       - name: Check installed Sirius package
         run: |
           sirius_test_dir="$(mktemp -d)"
@@ -157,6 +164,14 @@ jobs:
       - name: Extract build artifacts
         run: tar -xf build.tar
 
+      - name: Check shared DuckDB scan host detection
+        # The legacy DuckDB library includes Sirius and needs the driver libraries.
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/release/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          ./build/release/scan-host/scan_host_pie
+          ./build/release/scan-host/scan_host_pic
+          ./build/release/scan-host/scan_host_nonpie
+
       - name: Provision DuckDB extensions the tests load
         # The iceberg cases LOAD without INSTALL on purpose: a test must not reach the network,
         # and an INSTALL inside the test would silently paper over an unprovisioned runner
@@ -226,6 +241,13 @@ jobs:
           chmod -R a+r test_datasets/
           mkdir -p test_datasets/tpch_parquet_sf1
           ./build/release/duckdb -f scripts/tpch_to_parquet.sql
+
+      - name: S3 integration tests
+        run: make s3-test
+
+      - name: S3 large integration tests
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: make s3-test-large
 
       - name: TPC-H performance snapshot
         id: tpch

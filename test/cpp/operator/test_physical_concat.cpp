@@ -1273,9 +1273,20 @@ TEST_CASE("an empty sizing side installs a single-partition placement", "[physic
   CHECK_FALSE(probe_partition.get_next_task_hint().has_value());
   auto const placement = fixture.hash_join->placement();
   REQUIRE(placement != nullptr);
-  CHECK(*placement == partition_placement::round_robin(1, {space->get_device_id()}));
+  CHECK(*placement == partition_placement::unpinned(1));
   CHECK(probe_concat.placement() == placement);
   CHECK_FALSE(fixture.hash_join->is_build_probe_mode());
+
+  // The surviving side's CONCAT retains its partition index without forcing a GPU.
+  cucascade::shared_data_repository concat_repo;
+  concat_repo.add_data_batch(make_int32_batch(*space, 4), 0);
+  probe_concat.set_concat_all(true);
+  attach_concat_port(probe_concat, concat_repo);
+  auto concat_input = probe_concat.get_next_task_input_data();
+  REQUIRE(concat_input != nullptr);
+  auto const& partitioned = dynamic_cast<const partitioned_operator_data&>(*concat_input);
+  CHECK(partitioned.get_partition_idx() == std::optional<std::size_t>{0});
+  CHECK_FALSE(partitioned.get_preferred_device_id().has_value());
 }
 
 //===----------------------------------------------------------------------===//

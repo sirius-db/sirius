@@ -19,17 +19,12 @@ if(NOT PROJECT_IS_TOP_LEVEL)
                            $<TARGET_OBJECTS:sirius_objects>)
 endif()
 
-# Scan reference resolution depends on the consuming target's DuckDB linkage.
-# Compile it per target so the loadable extension receives
-# DUCKDB_BUILD_LOADABLE_EXTENSION instead of reusing the static implementation.
+# Link the public configuration implementation into every Sirius artifact.
 foreach(_target sirius_core sirius_shared sirius_extension
                 sirius_loadable_extension)
-  if(NOT TARGET ${_target})
-    continue()
+  if(TARGET ${_target})
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>)
   endif()
-  target_sources(${_target} PRIVATE src/planner/connector_registry.cpp
-                                    $<TARGET_OBJECTS:sirius_context_config>)
-  set_target_properties(${_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
 # The standalone FFI constructs an embedded DuckDB, which needs the no-op static

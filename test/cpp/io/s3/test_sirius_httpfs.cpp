@@ -11,7 +11,7 @@
 #include "io/sirius_datasource.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 #include "utils/s3_test_env.hpp"
 
 #include <arpa/inet.h>
@@ -56,7 +56,7 @@ struct s3_test_env {
 
 std::optional<s3_test_env> read_s3_test_env()
 {
-  if (!sirius::test::ensure_s3_container_env()) { return std::nullopt; }
+  if (!sirius::test::ensure_s3_test_env()) { return std::nullopt; }
 
   auto endpoint   = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto access_key = env_or("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -489,7 +489,7 @@ TEST_CASE("sirius_httpfs positional reads fail on short reads and negative sizes
 TEST_CASE("sirius_httpfs exposes S3 ETags as DuckDB version tags",
           "[.][s3][integration][filesystem]")
 {
-  SECTION("plain and glob opens preserve the quoted MinIO ETag")
+  SECTION("plain and glob opens preserve the quoted SeaweedFS ETag")
   {
     auto env = read_s3_test_env();
     if (skip_if_no_s3_env(env)) { return; }
@@ -552,8 +552,8 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   }
 
   std::string const key = "efc/overwrite-invalidation.bin";
-  if (!sirius::test::put_s3_container_object(key, first)) {
-    SUCCEED("managed MinIO is required for the overwrite invalidation test");
+  if (!sirius::test::put_s3_test_object(key, first)) {
+    SUCCEED("managed SeaweedFS is required for the overwrite invalidation test");
     return;
   }
 
@@ -583,7 +583,7 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   REQUIRE(cache_rows->RowCount() == 1);
   CHECK(cache_rows->GetValue(0, 0).GetValue<std::int64_t>() >= 1);
 
-  REQUIRE(sirius::test::put_s3_container_object(key, second));
+  REQUIRE(sirius::test::put_s3_test_object(key, second));
   auto second_read = read_cached_range();
   CHECK(std::equal(second_read.begin(), second_read.end(), second.begin() + read_offset));
 }

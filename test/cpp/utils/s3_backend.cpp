@@ -14,16 +14,59 @@
  * limitations under the License.
  */
 
-#include "utils/s3_container.hpp"
+#include "utils/s3_backend.hpp"
 
+#include "io/rest/s3/sigv4.hpp"
+
+#include <arpa/inet.h>
+#include <curl/curl.h>
+#include <duckdb.hpp>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace sirius::test {
-
 namespace {
+
+namespace fs = std::filesystem;
+
+// Test-only static credentials, plus the fixed bucket/region the [s3] tests
+// expect. SeaweedFS enforces the credentials via the -s3.config identities file
+// below, and the harness publishes them through the SIRIUS_TEST_S3_* env vars.
+constexpr char const* kAccessKey  = "siriustest";
+constexpr char const* kSecretKey  = "siriustest-secret";
+constexpr char const* kRegion     = "us-east-1";
+constexpr char const* kBucket     = "sirius-test";
+constexpr char const* kDefaultKey = "hello.txt";
+
+// ---- small helpers ---------------------------------------------------------
 
 bool env_truthy(char const* name)
 {
@@ -39,55 +82,6 @@ bool env_set(char const* name)
   return v != nullptr && v[0] != '\0';
 }
 
-}  // namespace
-
-}  // namespace sirius::test
-
-#include "io/rest/s3/sigv4.hpp"
-
-#include <curl/curl.h>
-#include <duckdb.hpp>
-
-extern "C" {
-#include <testcontainers-c/container.h>
-}
-
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <array>
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
-#include <filesystem>
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <thread>
-#include <utility>
-#include <vector>
-
-namespace sirius::test {
-namespace {
-
-namespace fs = std::filesystem;
-
-// Pinned MinIO image — kept in sync with the (now-retired) docker-compose.yml so
-// the same Sirius commit produces reproducible S3 test behavior over time.
-constexpr char const* kMinioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1";
-constexpr int kMinioPort          = 9000;
-constexpr char const* kAccessKey  = "minioadmin";
-constexpr char const* kSecretKey  = "minioadmin";
-constexpr char const* kRegion     = "us-east-1";
-constexpr char const* kBucket     = "sirius-test";
-constexpr char const* kDefaultKey = "hello.txt";
-
-// ---- small helpers ---------------------------------------------------------
-
 std::string env_or(char const* name, std::string fallback = {})
 {
   auto const* v = std::getenv(name);
@@ -95,7 +89,8 @@ std::string env_or(char const* name, std::string fallback = {})
 }
 
 // Run argv synchronously (inheriting stdout/stderr) and return its exit code,
-// or -1 if it could not be spawned / exited abnormally.
+// or -1 if it could not be spawned / exited abnormally. Used for the one-shot
+// helper tools (openssl, python3, the DuckDB CLI) — not the long-lived server.
 int run_process(std::vector<std::string> const& argv)
 {
   std::vector<char*> c_argv;
@@ -111,75 +106,138 @@ int run_process(std::vector<std::string> const& argv)
     _exit(127);  // execvp only returns on failure
   }
   int status = 0;
-  if (waitpid(pid, &status, 0) < 0) return -1;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) return -1;
+  }
   return (WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
 
-// ---- testcontainers wrappers -----------------------------------------------
+class fixture_cache_lock {
+ public:
+  explicit fixture_cache_lock(fs::path const& path)
+  {
+    fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd_ < 0) throw std::runtime_error("cannot open fixture cache lock");
+    while (::flock(fd_, LOCK_EX) != 0) {
+      if (errno == EINTR) continue;
+      ::close(fd_);
+      throw std::runtime_error("cannot lock fixture cache");
+    }
+  }
+  ~fixture_cache_lock() { ::close(fd_); }
+  fixture_cache_lock(fixture_cache_lock const&)            = delete;
+  fixture_cache_lock& operator=(fixture_cache_lock const&) = delete;
 
-std::vector<int> g_running_containers;  // ids to terminate at shutdown
+ private:
+  int fd_;
+};
 
-struct minio_instance {
-  std::string host;       // e.g. "localhost"
-  int port{0};            // dynamically-mapped host port
+// ---- local process management ----------------------------------------------
+
+// Reserve `n` mutually-distinct free TCP ports on the loopback interface. We
+// hold every socket open until all are chosen so the OS hands out a different
+// ephemeral port each time, then close them and hand the numbers to `weed`.
+// There is a small TOCTOU window between close and the server's bind — the same
+// risk profile as any OS-assigned test port — and a clashing port surfaces as a
+// loud strict-mode bring-up failure rather than a silent skip.
+std::vector<int> reserve_free_ports(int n)
+{
+  std::vector<int> fds;
+  std::vector<int> ports;
+  fds.reserve(n);
+  ports.reserve(n);
+  for (int i = 0; i < n; ++i) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      for (int f : fds)
+        ::close(f);
+      throw std::runtime_error("failed to create socket for free-port reservation");
+    }
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;  // let the OS pick a free ephemeral port
+    socklen_t len        = sizeof(addr);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+      ::close(fd);
+      for (int f : fds)
+        ::close(f);
+      throw std::runtime_error("failed to reserve a free port");
+    }
+    fds.push_back(fd);
+    ports.push_back(ntohs(addr.sin_port));
+  }
+  for (int f : fds)
+    ::close(f);
+  return ports;
+}
+
+// Spawn argv as a detached child whose stdout/stderr go to log_path, returning
+// its pid. On Linux the child requests SIGKILL when its parent (the test
+// binary) dies, so a crashing test run never leaks the server.
+pid_t spawn_process(std::vector<std::string> const& argv, fs::path const& log_path)
+{
+  std::vector<char*> c_argv;
+  c_argv.reserve(argv.size() + 1);
+  for (auto const& a : argv)
+    c_argv.push_back(const_cast<char*>(a.c_str()));
+  c_argv.push_back(nullptr);
+
+  pid_t parent = ::getpid();
+  pid_t pid    = fork();
+  if (pid < 0) throw std::runtime_error("fork failed for weed server");
+  if (pid == 0) {
+#ifdef __linux__
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) _exit(127);
+    // Guard the fork→prctl race: if the parent already exited, bail out.
+    if (::getppid() != parent) _exit(127);
+#endif
+    int fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) _exit(127);
+    if (::dup2(fd, STDOUT_FILENO) < 0 || ::dup2(fd, STDERR_FILENO) < 0) _exit(127);
+    if (fd > STDERR_FILENO) ::close(fd);
+    execvp(c_argv[0], c_argv.data());
+    _exit(127);  // execvp only returns on failure
+  }
+  return pid;
+}
+
+// SIGTERM the child, give it a moment to exit cleanly, then SIGKILL; reap it so
+// no zombie is left behind. Safe if the process is already gone.
+void terminate_pid(pid_t pid)
+{
+  if (pid <= 0) return;
+  ::kill(pid, SIGTERM);
+  int status = 0;
+  for (int i = 0; i < 50; ++i) {  // up to ~5s
+    auto const result = waitpid(pid, &status, WNOHANG);
+    if (result == pid || (result < 0 && errno == ECHILD)) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ::kill(pid, SIGKILL);
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+// ---- S3 endpoint addressing -------------------------------------------------
+
+struct s3_endpoint {
   std::string endpoint;   // "<scheme>://<host>:<port>"
   std::string authority;  // "<host>:<port>" (Host header / signing)
 };
 
-// Configure the common MinIO request (image, creds, command, exposed port).
-int make_minio_request()
+s3_endpoint make_endpoint(std::string const& scheme, int port)
 {
-  int req = tc_container_create(kMinioImage);
-  if (req < 0) throw std::runtime_error("tc_container_create failed for MinIO image");
-
-  tc_container_with_env(req, "MINIO_ROOT_USER", kAccessKey);
-  tc_container_with_env(req, "MINIO_ROOT_PASSWORD", kSecretKey);
-  tc_container_with_env(req, "MINIO_REGION", kRegion);
-
-  // The MinIO image takes its mode from the command — no env-var equivalent —
-  // which is exactly the capability our testcontainers-native patch adds.
-  char const* cmd[] = {"server", "/data", "--console-address", ":9001"};
-  tc_container_with_cmd(req, cmd, sizeof(cmd) / sizeof(cmd[0]));
-
-  tc_container_with_exposed_tcp_port(req, kMinioPort);
-  return req;
+  s3_endpoint ep;
+  ep.authority = "127.0.0.1:" + std::to_string(port);
+  ep.endpoint  = scheme + "://" + ep.authority;
+  return ep;
 }
 
-minio_instance run_minio(int req, char const* scheme)
-{
-  char* run_err = nullptr;
-  int id        = tc_container_run(req, &run_err);
-  if (id < 0) {
-    std::string msg = run_err != nullptr ? std::string{run_err} : std::string{"unknown error"};
-    std::free(run_err);
-    throw std::runtime_error(
-      "failed to start MinIO container (is Docker running and reachable?): " + msg);
-  }
-  g_running_containers.push_back(id);
+// ---- TLS cert + fixtures + identities --------------------------------------
 
-  char* herr       = nullptr;
-  char* hp         = tc_container_get_hostname(id, &herr);
-  std::string host = (hp != nullptr) ? std::string{hp} : std::string{"localhost"};
-  std::free(hp);
-  std::free(herr);
-
-  char* perr = nullptr;
-  int port   = tc_container_get_mapped_port(id, kMinioPort, &perr);
-  std::free(perr);
-  if (port < 0) throw std::runtime_error("could not resolve MinIO mapped port");
-
-  minio_instance inst;
-  inst.host      = host;
-  inst.port      = port;
-  inst.authority = host + ":" + std::to_string(port);
-  inst.endpoint  = std::string{scheme} + "://" + inst.authority;
-  return inst;
-}
-
-// ---- TLS cert + fixtures ----------------------------------------------------
-
-// Generate a self-signed cert/key into dir (public.crt / private.key), matching
-// the SANs the old ensure_tls_certs.sh used. Returns the public cert path.
+// Generate a self-signed cert/key into dir (public.crt / private.key). Returns
+// the public cert path (used both to serve HTTPS and as the test CA bundle).
 fs::path generate_self_signed_cert(fs::path const& dir)
 {
   fs::create_directories(dir);
@@ -200,7 +258,7 @@ fs::path generate_self_signed_cert(fs::path const& dir)
                                "-subj",
                                "/CN=localhost",
                                "-addext",
-                               "subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:host.docker.internal"});
+                               "subjectAltName=IP:127.0.0.1,DNS:localhost"});
   if (rc != 0) throw std::runtime_error("openssl failed to generate self-signed cert");
   return cert;
 }
@@ -321,7 +379,28 @@ void create_edge_types_fixture(fs::path const& fixture_dir)
   }
 }
 
-// ---- host-side SigV4 + libcurl upload --------------------------------------
+// Write the SeaweedFS S3 identities file (the -s3.config payload) granting our
+// single test identity full access under the static access/secret keys, so the
+// SigV4-signed requests the [s3] tests issue are actually authenticated.
+void write_s3_identities_config(fs::path const& path)
+{
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) throw std::runtime_error("cannot write S3 identities config: " + path.string());
+  out << "{\n"
+         "  \"identities\": [\n"
+         "    {\n"
+         "      \"name\": \"sirius-test\",\n"
+         "      \"credentials\": [{\"accessKey\": \""
+      << kAccessKey << "\", \"secretKey\": \"" << kSecretKey
+      << "\"}],\n"
+         "      \"actions\": [\"Admin\", \"Read\", \"Write\", \"List\", \"Tagging\"]\n"
+         "    }\n"
+         "  ]\n"
+         "}\n";
+  if (!out) throw std::runtime_error("failed writing S3 identities config: " + path.string());
+}
+
+// ---- host-side SigV4 + libcurl request -------------------------------------
 
 size_t curl_read_file(char* buffer, size_t size, size_t nitems, void* userdata)
 {
@@ -330,14 +409,16 @@ size_t curl_read_file(char* buffer, size_t size, size_t nitems, void* userdata)
   return std::fread(buffer, 1, size * nitems, f);
 }
 
-// Signed PUT to <endpoint><canonical_uri>. body may be null (zero-length, used
-// for CreateBucket). Returns the HTTP status code, or -1 on transport error.
-long s3_put(minio_instance const& inst,
-            std::string const& scheme,
+size_t curl_discard(char*, size_t size, size_t nitems, void*) { return size * nitems; }
+
+// Stream a signed PUT; a null body creates an empty bucket. Returns the HTTP
+// status code, or -1 on transport error.
+long s3_put(s3_endpoint const& ep,
             std::string const& canonical_uri,
             std::FILE* body,
             std::int64_t body_len,
-            std::optional<fs::path> const& ca_bundle)
+            std::optional<fs::path> const& ca_bundle,
+            long timeout_seconds = 0)
 {
   sirius::io::rest::s3::sigv4_signer_config creds;
   creds.access_key = kAccessKey;
@@ -346,9 +427,9 @@ long s3_put(minio_instance const& inst,
   creds.service    = "s3";
 
   // UNSIGNED-PAYLOAD lets us stream arbitrarily large bodies (e.g. the SF10
-  // lineitem fixture) without hashing them; MinIO accepts it.
+  // lineitem fixture) without hashing them; SeaweedFS accepts it.
   auto signed_req = sirius::io::rest::s3::sign_request("PUT",
-                                                       inst.authority,
+                                                       ep.authority,
                                                        canonical_uri,
                                                        /*query=*/"",
                                                        "UNSIGNED-PAYLOAD",
@@ -359,22 +440,27 @@ long s3_put(minio_instance const& inst,
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return -1;
 
-  std::string url  = inst.endpoint + canonical_uri;
+  std::string url  = ep.endpoint + canonical_uri;
   curl_slist* hdrs = nullptr;
   for (auto const& [k, v] : signed_req.headers) {
     hdrs = curl_slist_append(hdrs, (k + ": " + v).c_str());
   }
   // Suppress libcurl's automatic "Expect: 100-continue" (unsigned, but avoids a
-  // round-trip stall against MinIO).
+  // round-trip stall on PUTs).
   hdrs = curl_slist_append(hdrs, "Expect:");
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
   curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(body_len));
   curl_easy_setopt(curl, CURLOPT_READFUNCTION, curl_read_file);
   curl_easy_setopt(curl, CURLOPT_READDATA, body);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-  if (scheme == "https" && ca_bundle.has_value()) {
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+  if (ca_bundle.has_value()) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle->c_str());
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
@@ -382,7 +468,11 @@ long s3_put(minio_instance const& inst,
 
   long code   = -1;
   CURLcode rc = curl_easy_perform(curl);
-  if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (rc == CURLE_OK) {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  } else if (timeout_seconds == 0) {
+    std::cerr << "[s3] PUT " << url << ": " << curl_easy_strerror(rc) << std::endl;
+  }
 
   curl_slist_free_all(hdrs);
   curl_easy_cleanup(curl);
@@ -396,74 +486,65 @@ std::string uri_path_for(std::string const& bucket, std::string const& key)
   return p;
 }
 
-// Poll <endpoint>/minio/health/ready until it returns 200 (or time out).
-bool wait_minio_ready(minio_instance const& inst,
-                      std::string const& scheme,
-                      std::optional<fs::path> const& ca_bundle)
+// A non-empty PUT checks that master, filer, and volume storage are writable.
+// ListBuckets alone can succeed before the volume server has registered.
+bool wait_s3_ready(pid_t pid,
+                   s3_endpoint const& ep,
+                   fs::path const& fixture,
+                   std::optional<fs::path> const& ca_bundle)
 {
-  std::string url = inst.endpoint + "/minio/health/ready";
-  for (int attempt = 0; attempt < 60; ++attempt) {
-    CURL* curl = curl_easy_init();
-    if (curl == nullptr) return false;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
-    if (scheme == "https" && ca_bundle.has_value()) {
-      curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle->c_str());
-      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> body(std::fopen(fixture.c_str(), "rb"),
+                                                          &std::fclose);
+  if (!body) throw std::runtime_error("cannot open readiness fixture");
+  auto const size     = static_cast<std::int64_t>(fs::file_size(fixture));
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (std::chrono::steady_clock::now() < deadline) {
+    siginfo_t info{};
+    if (::waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == pid) {
+      return false;
     }
-    long code   = -1;
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    curl_easy_cleanup(curl);
-    if (code == 200) return true;
+    auto const bucket = s3_put(ep, uri_path_for(kBucket, ""), nullptr, 0, ca_bundle, 2);
+    if (bucket == 200 || bucket == 204 || bucket == 409) {
+      std::rewind(body.get());
+      auto const code =
+        s3_put(ep, uri_path_for(kBucket, kDefaultKey), body.get(), size, ca_bundle, 2);
+      if (code == 200 || code == 204) return true;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
   }
   return false;
 }
 
-void upload_fixtures(minio_instance const& inst,
-                     std::string const& scheme,
-                     fs::path const& fixture_dir,
-                     std::optional<fs::path> const& ca_bundle)
+void upload_fixtures(s3_endpoint const& ep, fs::path const& fixture_dir)
 {
-  // Create the bucket (ignore 200/204 and 409 BucketAlreadyOwnedByYou).
-  long bc = s3_put(inst, scheme, uri_path_for(kBucket, ""), nullptr, 0, ca_bundle);
-  if (!(bc == 200 || bc == 204 || bc == 409)) {
-    throw std::runtime_error("create-bucket PUT failed (HTTP " + std::to_string(bc) + ") at " +
-                             inst.endpoint);
-  }
-
   for (auto const& entry : fs::recursive_directory_iterator(fixture_dir)) {
     if (!entry.is_regular_file()) continue;
     std::string key = fs::relative(entry.path(), fixture_dir).generic_string();
 
+    // Size first, so a throwing file_size() never leaks the FILE* below.
+    auto size    = static_cast<std::int64_t>(entry.file_size());
     std::FILE* f = std::fopen(entry.path().c_str(), "rb");
     if (f == nullptr) throw std::runtime_error("cannot open fixture: " + entry.path().string());
-    auto size = static_cast<std::int64_t>(entry.file_size());
-    long pc   = s3_put(inst, scheme, uri_path_for(kBucket, key), f, size, ca_bundle);
+    long pc = s3_put(ep, uri_path_for(kBucket, key), f, size, std::nullopt);
     std::fclose(f);
     if (!(pc == 200 || pc == 204)) {
       throw std::runtime_error("put-object PUT failed for '" + key + "' (HTTP " +
-                               std::to_string(pc) + ") at " + inst.endpoint);
+                               std::to_string(pc) + ") at " + ep.endpoint);
     }
   }
 }
 
 // Opt-in (SIRIUS_TEST_S3_LARGE=1): generate the SF10 lineitem parquet with the
-// DuckDB CLI and upload it for the [s3][sql][large] / benchmark tests. Replaces
-// the old `fixtures.sh --perf` path. Uploaded to both HTTP and TLS endpoints.
-void maybe_upload_large_fixture(minio_instance const& http,
-                                minio_instance const& tls,
-                                std::optional<fs::path> const& ca,
-                                fs::path const& work)
+// DuckDB CLI and upload it for the [s3][sql][large] tests. Both endpoints share
+// the uploaded object.
+void maybe_upload_large_fixture(s3_endpoint const& http, fs::path const& work)
 {
   if (!env_truthy("SIRIUS_TEST_S3_LARGE")) return;
 
   // The SF10 generation costs minutes, so cache the parquet at a stable path and
   // reuse it across the two processes that make s3-test-large runs. Only the
   // first generates.
+  fixture_cache_lock lock(work / "lineitem_sf10.lock");
   fs::path parquet = work / "lineitem_sf10.parquet";
   std::error_code ec;
   if (!(fs::exists(parquet, ec) && fs::file_size(parquet, ec) > 0)) {
@@ -498,7 +579,6 @@ void maybe_upload_large_fixture(minio_instance const& http,
   std::FILE* f    = std::fopen(parquet.c_str(), "rb");
   if (f == nullptr) throw std::runtime_error("cannot open generated SF10 parquet");
   long pc = s3_put(http,
-                   "http",
                    uri_path_for(kBucket, key),
                    f,
                    static_cast<std::int64_t>(fs::file_size(parquet)),
@@ -507,22 +587,6 @@ void maybe_upload_large_fixture(minio_instance const& http,
   if (!(pc == 200 || pc == 204)) {
     throw std::runtime_error("SF10 upload failed (HTTP " + std::to_string(pc) + ")");
   }
-  std::FILE* ft = std::fopen(parquet.c_str(), "rb");
-  if (ft == nullptr) throw std::runtime_error("cannot reopen SF10 parquet for TLS upload");
-  long tc = s3_put(tls,
-                   "https",
-                   uri_path_for(kBucket, key),
-                   ft,
-                   static_cast<std::int64_t>(fs::file_size(parquet)),
-                   ca);
-  std::fclose(ft);
-  if (!(tc == 200 || tc == 204)) {
-    throw std::runtime_error("SF10 TLS upload failed (HTTP " + std::to_string(tc) + ")");
-  }
-  std::cout << "[s3] uploaded SF10 lineitem fixture (" << fs::file_size(parquet) << " bytes) to "
-            << http.endpoint << "/" << kBucket << "/" << key << " and " << tls.endpoint << "/"
-            << kBucket << "/" << key << std::endl;
-
   // The large tests read the same SF10 file locally to build a CPU oracle to
   // compare the GPU-over-S3 result against. Point them at the file we just
   // uploaded so the local copy and the S3 object are byte-identical. (Respect an
@@ -532,15 +596,13 @@ void maybe_upload_large_fixture(minio_instance const& http,
   }
 }
 
-void maybe_upload_tpch_sf1_fixture(minio_instance const& http,
-                                   minio_instance const& tls,
-                                   std::optional<fs::path> const& ca,
-                                   fs::path const& work)
+void maybe_upload_tpch_sf1_fixture(s3_endpoint const& http, fs::path const& work)
 {
   if (!env_truthy("SIRIUS_TEST_S3_TPCH") && !env_truthy("SIRIUS_BENCH_S3_TPCH")) return;
 
   constexpr std::array<std::string_view, 8> tables = {
     "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+  fixture_cache_lock lock(work / "tpch_sf1.lock");
   fs::path fixture_dir = work / "tpch_sf1";
 
   auto fixture_complete = [&] {
@@ -595,32 +657,24 @@ void maybe_upload_tpch_sf1_fixture(minio_instance const& http,
     auto const bytes   = static_cast<std::int64_t>(fs::file_size(parquet));
     total_bytes += static_cast<std::uintmax_t>(bytes);
 
-    auto upload = [&](minio_instance const& instance,
-                      std::string const& scheme,
-                      std::optional<fs::path> const& ca_bundle) {
-      std::FILE* file = std::fopen(parquet.c_str(), "rb");
-      if (file == nullptr) {
-        throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
-      }
-      auto const code =
-        s3_put(instance, scheme, uri_path_for(kBucket, key), file, bytes, ca_bundle);
-      std::fclose(file);
-      if (!(code == 200 || code == 204)) {
-        throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
-                                 std::to_string(code) + ") at " + instance.endpoint);
-      }
-    };
-
-    upload(http, "http", std::nullopt);
-    upload(tls, "https", ca);
+    std::FILE* file = std::fopen(parquet.c_str(), "rb");
+    if (file == nullptr) {
+      throw std::runtime_error("cannot open SF1 TPC-H fixture: " + parquet.string());
+    }
+    auto const code = s3_put(http, uri_path_for(kBucket, key), file, bytes, std::nullopt);
+    std::fclose(file);
+    if (!(code == 200 || code == 204)) {
+      throw std::runtime_error("SF1 TPC-H upload failed for '" + key + "' (HTTP " +
+                               std::to_string(code) + ") at " + http.endpoint);
+    }
   }
 
   setenv("SIRIUS_TEST_S3_TPCH_LOCAL_DIR", fixture_dir.c_str(), /*overwrite=*/1);
   std::cout << "[s3] uploaded 8 SF1 TPC-H parquet fixtures (" << total_bytes << " bytes) to "
-            << http.endpoint << " and " << tls.endpoint << std::endl;
+            << http.endpoint << std::endl;
 }
 
-void maybe_upload_glob_scale_fixture(minio_instance const& http, fs::path const& fixture_dir)
+void maybe_upload_glob_scale_fixture(s3_endpoint const& http, fs::path const& fixture_dir)
 {
   if (!env_truthy("SIRIUS_TEST_S3_GLOB_SCALE")) return;
 
@@ -632,8 +686,7 @@ void maybe_upload_glob_scale_fixture(minio_instance const& http, fs::path const&
     auto const key = "glob-scale/part_" + std::to_string(index) + ".parquet";
     std::FILE* f   = std::fopen(parquet.c_str(), "rb");
     if (f == nullptr) throw std::runtime_error("cannot open glob-scale parquet fixture");
-    auto const code =
-      s3_put(http, "http", uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
+    auto const code = s3_put(http, uri_path_for(kBucket, key), f, parquet_size, std::nullopt);
     std::fclose(f);
     if (!(code == 200 || code == 204)) {
       throw std::runtime_error("glob-scale upload failed for '" + key + "' (HTTP " +
@@ -645,6 +698,69 @@ void maybe_upload_glob_scale_fixture(minio_instance const& http, fs::path const&
             << kBucket << "/glob-scale/" << std::endl;
 }
 
+// ---- weed server lifecycle -------------------------------------------------
+
+pid_t g_weed_pid{0};  // server to terminate at shutdown
+fs::path g_run_dir;   // this process's run dir, removed at shutdown
+
+struct weed_server {
+  pid_t pid{0};
+  s3_endpoint http;
+  s3_endpoint https;
+};
+
+// Spawn a single `weed server` exposing the S3 API over both HTTP and HTTPS on
+// dynamically-chosen free ports. All cluster services (master/volume/filer/s3 +
+// their grpc variants) get distinct free ports; the fixed-port Iceberg catalog
+// is disabled to avoid collisions across concurrent runs.
+weed_server start_weed(fs::path const& data_dir,
+                       fs::path const& s3_config,
+                       fs::path const& cert,
+                       fs::path const& key,
+                       fs::path const& log_path)
+{
+  auto p          = reserve_free_ports(9);
+  int master_port = p[0], master_grpc = p[1];
+  int volume_port = p[2], volume_grpc = p[3];
+  int filer_port = p[4], filer_grpc = p[5];
+  int s3_http = p[6], s3_grpc = p[7], s3_https = p[8];
+
+  auto flag = [](char const* name, int value) {
+    return std::string{name} + "=" + std::to_string(value);
+  };
+  std::string weed = env_or("SIRIUS_TEST_WEED", "weed");
+
+  std::vector<std::string> argv = {weed,
+                                   "server",
+                                   "-ip=127.0.0.1",
+                                   "-dir=" + data_dir.string(),
+                                   "-filer",
+                                   "-s3",
+                                   flag("-master.port", master_port),
+                                   flag("-master.port.grpc", master_grpc),
+                                   flag("-volume.port", volume_port),
+                                   flag("-volume.port.grpc", volume_grpc),
+                                   flag("-filer.port", filer_port),
+                                   flag("-filer.port.grpc", filer_grpc),
+                                   flag("-s3.port", s3_http),
+                                   flag("-s3.port.grpc", s3_grpc),
+                                   flag("-s3.port.https", s3_https),
+                                   "-s3.port.iceberg=0",
+                                   "-s3.port.lance=0",
+                                   "-s3.config=" + s3_config.string(),
+                                   "-s3.cert.file=" + cert.string(),
+                                   "-s3.key.file=" + key.string()};
+
+  pid_t pid  = spawn_process(argv, log_path);
+  g_weed_pid = pid;
+
+  weed_server srv;
+  srv.pid   = pid;
+  srv.http  = make_endpoint("http", s3_http);
+  srv.https = make_endpoint("https", s3_https);
+  return srv;
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 void setenv_kv(char const* k, std::string const& v) { ::setenv(k, v.c_str(), /*overwrite=*/1); }
@@ -654,49 +770,52 @@ bool bring_up()
 {
   curl_global_init(CURL_GLOBAL_DEFAULT);
 
-  fs::path work        = fs::temp_directory_path() / "sirius-s3-testcontainers";
-  fs::path certs_dir   = work / "certs";
-  fs::path fixture_dir = work / "fixtures" / "local";
+  // `base` holds the shared SF1 and SF10 fixture caches. Everything mutable for
+  // this run — certs, fixtures, the `weed` data dir, its config and log — lives
+  // under a per-process `run` dir so concurrent S3 test processes never stomp
+  // each other's filer state. The run dir is removed at shutdown.
+  fs::path base = fs::temp_directory_path() / ("sirius-s3-seaweedfs-" + std::to_string(::getuid()));
+  fs::create_directories(base);
+  std::string run_template = (base / "run-XXXXXX").string();
+  if (::mkdtemp(run_template.data()) == nullptr) {
+    throw std::runtime_error("cannot create SeaweedFS run directory");
+  }
+  fs::path run         = run_template;
+  g_run_dir            = run;
+  fs::path certs_dir   = run / "certs";
+  fs::path fixture_dir = run / "fixtures" / "local";
+  fs::path data_dir    = run / "data";
+  fs::path s3_config   = run / "s3_identities.json";
+  fs::path weed_log    = run / "weed.log";
+
+  fs::create_directories(data_dir);
 
   fs::path ca_bundle = generate_self_signed_cert(certs_dir);
   generate_fixtures(fixture_dir);
   create_special_key_fixtures(fixture_dir);
   create_edge_types_fixture(fixture_dir);
+  write_s3_identities_config(s3_config);
 
-  // HTTP instance: testcontainers' HTTP wait makes it ready before run returns.
-  int http_req = make_minio_request();
-  tc_container_with_wait_for_http(http_req, kMinioPort, "/minio/health/ready");
-  minio_instance http = run_minio(http_req, "http");
-
-  // TLS instance: mount the generated cert so MinIO serves HTTPS on 9000. We
-  // can't use the plain-HTTP wait strategy against it, so poll readiness below.
-  // NOTE: the bridge reads these host paths lazily (C.GoString runs inside the
-  // run-time customizer, not at registration), so the strings must outlive the
-  // run_minio() call below — keep them in locals, not temporaries.
-  int tls_req               = make_minio_request();
-  std::string tls_cert_path = (certs_dir / "public.crt").string();
-  std::string tls_key_path  = (certs_dir / "private.key").string();
-  tc_container_with_file(tls_req, tls_cert_path.c_str(), "/root/.minio/certs/public.crt");
-  tc_container_with_file(tls_req, tls_key_path.c_str(), "/root/.minio/certs/private.key");
-  minio_instance tls = run_minio(tls_req, "https");
+  weed_server srv =
+    start_weed(data_dir, s3_config, certs_dir / "public.crt", certs_dir / "private.key", weed_log);
 
   std::optional<fs::path> ca = ca_bundle;
-  if (!wait_minio_ready(http, "http", std::nullopt)) {
-    throw std::runtime_error("HTTP MinIO did not become ready at " + http.endpoint);
+  if (!wait_s3_ready(srv.pid, srv.http, fixture_dir / kDefaultKey, std::nullopt)) {
+    throw std::runtime_error("SeaweedFS S3 (HTTP) did not become ready at " + srv.http.endpoint);
   }
-  if (!wait_minio_ready(tls, "https", ca)) {
-    throw std::runtime_error("TLS MinIO did not become ready at " + tls.endpoint);
+  if (!wait_s3_ready(srv.pid, srv.https, fixture_dir / kDefaultKey, ca)) {
+    throw std::runtime_error("SeaweedFS S3 (HTTPS) did not become ready at " + srv.https.endpoint);
   }
 
-  upload_fixtures(http, "http", fixture_dir, std::nullopt);
-  upload_fixtures(tls, "https", fixture_dir, ca);
-  maybe_upload_large_fixture(http, tls, ca, work);
-  maybe_upload_tpch_sf1_fixture(http, tls, ca, work);
-  maybe_upload_glob_scale_fixture(http, fixture_dir);
+  // One backend serves both endpoints, so a single upload covers HTTP and HTTPS.
+  upload_fixtures(srv.http, fixture_dir);
+  maybe_upload_large_fixture(srv.http, base);
+  maybe_upload_tpch_sf1_fixture(srv.http, base);
+  maybe_upload_glob_scale_fixture(srv.http, fixture_dir);
 
-  // Publish the env contract the [s3] tests consume (mirrors the old env.sh).
-  setenv_kv("SIRIUS_TEST_S3_ENDPOINT", http.endpoint);
-  setenv_kv("SIRIUS_TEST_S3_HTTPS_ENDPOINT", tls.endpoint);
+  // Publish the env contract the [s3] tests consume.
+  setenv_kv("SIRIUS_TEST_S3_ENDPOINT", srv.http.endpoint);
+  setenv_kv("SIRIUS_TEST_S3_HTTPS_ENDPOINT", srv.https.endpoint);
   setenv_kv("SIRIUS_TEST_S3_REGION", kRegion);
   setenv_kv("SIRIUS_TEST_S3_ACCESS_KEY", kAccessKey);
   setenv_kv("SIRIUS_TEST_S3_SECRET_KEY", kSecretKey);
@@ -705,7 +824,7 @@ bool bring_up()
   setenv_kv("SIRIUS_TEST_S3_LOCAL_DIR", fixture_dir.string());
   setenv_kv("SIRIUS_TEST_S3_CA_BUNDLE", ca_bundle.string());
 
-  std::cout << "[s3] testcontainers MinIO ready: " << http.endpoint << " (http), " << tls.endpoint
+  std::cout << "[s3] SeaweedFS ready: " << srv.http.endpoint << " (http), " << srv.https.endpoint
             << " (https); fixtures in " << fixture_dir << std::endl;
   return true;
 }
@@ -717,7 +836,7 @@ int g_state = 0;
 
 }  // namespace
 
-bool ensure_s3_container_env()
+bool ensure_s3_test_env()
 {
   // Externally-provided endpoint (manual run / real AWS): use as-is.
   if (env_set("SIRIUS_TEST_S3_ENDPOINT")) return true;
@@ -726,8 +845,7 @@ bool ensure_s3_container_env()
   switch (g_state) {
     case 1: return true;
     case 2: return false;
-    case 3:
-      throw std::runtime_error("[s3] testcontainers bring-up previously failed (strict mode)");
+    case 3: throw std::runtime_error("[s3] SeaweedFS bring-up previously failed (strict mode)");
     default: break;  // untried
   }
 
@@ -741,7 +859,12 @@ bool ensure_s3_container_env()
     g_state = 1;
     return true;
   } catch (std::exception const& e) {
-    std::cerr << "[s3] testcontainers bring-up failed: " << e.what() << std::endl;
+    std::cerr << "[s3] SeaweedFS bring-up failed: " << e.what() << std::endl;
+    if (!g_run_dir.empty()) {
+      std::ifstream log(g_run_dir / "weed.log");
+      if (log) std::cerr << log.rdbuf();
+    }
+    shutdown_s3_test_env();
     if (env_truthy("SIRIUS_TEST_S3_STRICT")) {
       g_state = 3;
       throw;
@@ -751,19 +874,19 @@ bool ensure_s3_container_env()
   }
 }
 
-bool put_s3_container_object(std::string_view key, std::span<std::uint8_t const> bytes)
+bool put_s3_test_object(std::string_view key, std::span<std::uint8_t const> bytes)
 {
   if (g_state != 1) { return false; }
 
   auto endpoint         = env_or("SIRIUS_TEST_S3_ENDPOINT");
   auto const scheme_end = endpoint.find("://");
   if (scheme_end == std::string::npos) {
-    throw std::runtime_error("managed MinIO endpoint has no URI scheme");
+    throw std::runtime_error("managed SeaweedFS endpoint has no URI scheme");
   }
   auto const scheme = endpoint.substr(0, scheme_end);
   auto authority    = endpoint.substr(scheme_end + 3);
   if (scheme != "http" || authority.empty() || authority.find('/') != std::string::npos) {
-    throw std::runtime_error("managed MinIO object PUT requires the HTTP endpoint");
+    throw std::runtime_error("managed SeaweedFS object PUT requires the HTTP endpoint");
   }
 
   std::unique_ptr<std::FILE, decltype(&std::fclose)> body(std::tmpfile(), &std::fclose);
@@ -774,30 +897,34 @@ bool put_s3_container_object(std::string_view key, std::span<std::uint8_t const>
   }
   std::rewind(body.get());
 
-  minio_instance instance;
+  s3_endpoint instance;
   instance.endpoint  = std::move(endpoint);
   instance.authority = std::move(authority);
   auto const bucket  = env_or("SIRIUS_TEST_S3_BUCKET", kBucket);
   auto const code    = s3_put(instance,
-                           scheme,
                            uri_path_for(bucket, std::string{key}),
                            body.get(),
                            static_cast<std::int64_t>(bytes.size()),
                            std::nullopt);
   if (!(code == 200 || code == 204)) {
-    throw std::runtime_error("managed MinIO object PUT failed for '" + std::string{key} +
+    throw std::runtime_error("managed SeaweedFS object PUT failed for '" + std::string{key} +
                              "' (HTTP " + std::to_string(code) + ")");
   }
   return true;
 }
 
-void shutdown_s3_container_env()
+void shutdown_s3_test_env()
 {
-  for (int id : g_running_containers) {
-    char* err = tc_container_terminate(id);
-    std::free(err);
+  terminate_pid(g_weed_pid);
+  g_weed_pid = 0;
+
+  // Remove this run's mutable state (the shared fixture caches are left
+  // intact for reuse). Done after the servers are gone so nothing is in use.
+  if (!g_run_dir.empty()) {
+    std::error_code ec;
+    fs::remove_all(g_run_dir, ec);
+    g_run_dir.clear();
   }
-  g_running_containers.clear();
 }
 
 }  // namespace sirius::test
