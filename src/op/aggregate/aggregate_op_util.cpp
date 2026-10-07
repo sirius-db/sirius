@@ -281,8 +281,8 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
   }
 
   pinned_host_buffer host(slots.size(), stream);
-  CUDF_CUDA_TRY(cudaMemcpyAsync(
-    host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
   stream.sync();
 
   for (size_t i = 0; i < candidates.size(); ++i) {
