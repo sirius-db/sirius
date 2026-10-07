@@ -302,21 +302,28 @@ TEST_CASE("sirius_config still loads unrelated REST YAML fields", "[config][s3][
   std::filesystem::remove(path, ec);
 }
 
-TEST_CASE("sirius_config keeps REST connection count internal", "[scan_manager][config][rest]")
+TEST_CASE("sirius_config reads the REST connection count", "[scan_manager][config][rest]")
 {
+  // Connections per reactor is a tuning knob: the per-reactor in-flight ceiling
+  // sits at this value regardless of reactor count, so reaching ~100 Gbit/s from
+  // S3 needs it raised (128 per reactor on a 32-core box). Zero would leave a
+  // reactor with no connections, so it is rejected.
   auto const path = std::filesystem::temp_directory_path() / "sirius_rest_max_connections.yaml";
-  write_yaml(path,
-             "sirius:\n"
-             "  executor:\n"
-             "    scan_manager:\n"
-             "      rest:\n"
-             "        max_connections: 7\n");
+  auto const load = [&](char const* value) {
+    write_yaml(path,
+               std::string("sirius:\n"
+                           "  executor:\n"
+                           "    scan_manager:\n"
+                           "      rest:\n"
+                           "        max_connections: ") +
+                 value + "\n");
+    sirius::sirius_config cfg;
+    cfg.load_from_file(path);
+    return cfg.get_scan_manager_config().rest.max_connections;
+  };
 
-  sirius::sirius_config cfg;
-  REQUIRE_THROWS_WITH(
-    cfg.load_from_file(path),
-    Catch::Matchers::ContainsSubstring("unknown config key: 'max_connections' in rest"));
-  CHECK(cfg.get_scan_manager_config().rest.max_connections == 64);
+  CHECK(load("7") == 7);
+  CHECK_THROWS(load("0"));
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
