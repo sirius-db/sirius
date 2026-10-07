@@ -100,10 +100,10 @@ ContextConfigBuilder& ContextConfigBuilder::gpu_usage_limit_fraction(double frac
 std::expected<ContextConfig, Error> ContextConfigBuilder::build() const
 {
   try {
-    auto config = std::make_shared<ContextConfig::Impl>();
-    config->config =
+    auto config =
       impl_->gpu_limit ? impl_->config.with_gpu_usage_limit(*impl_->gpu_limit) : impl_->config;
-    return ContextConfig(std::move(config));
+    return ContextConfig(
+      std::make_shared<ContextConfig::Impl>(ContextConfig::Impl{std::move(config)}));
   } catch (const configuration_input_error& e) {
     return std::unexpected(
       Error{ErrorCode::invalid_configuration,

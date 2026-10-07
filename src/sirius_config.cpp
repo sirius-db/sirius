@@ -30,6 +30,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <variant>
@@ -747,18 +748,11 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       throw std::runtime_error("failed to parse YAML: " + std::string(e.what()));
     }
 
-    load_from_node(root);
+    *this = parsed_sirius_config::from_node(root).resolve(discover_configuration_topology());
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
   }
-}
-
-void sirius_config::load_from_node(const YAML::Node& root, std::optional<gpu_usage_limit> gpu_limit)
-{
-  auto parsed = parsed_sirius_config::from_node(root);
-  if (gpu_limit) { parsed = parsed.with_gpu_usage_limit(*gpu_limit); }
-  *this = parsed.resolve(discover_configuration_topology());
 }
 
 parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
@@ -790,7 +784,6 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
     settings._gpus_per_query = topo.gpus_per_query;
 
     // High-level memory config (mutually exclusive with space config)
-
     if (auto mem_node = r.optional_node("memory")) {
       yaml::reader mr(*mem_node, "sirius.memory");
       if (auto n = mr.optional_node("gpu")) {
@@ -823,8 +816,8 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
       er.reject_unknown();
     }
 
-    // Preserve the node until memory-space capacities are resolved below. Explicit
-    // values are applied after capacity-derived defaults so they always win.
+    // Parse operator settings below and record which batch sizes are explicit,
+    // so hardware resolution only fills in omitted values.
     operator_node = r.optional_node("operator_params");
 
     // Telemetry
@@ -838,7 +831,6 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
     }
 
     // Explicit space configs (low-level API)
-
     if (auto space_node = r.optional_node("space")) {
       yaml::reader sr(*space_node, "sirius.space");
       if (auto n = sr.optional_node("gpu")) read_yaml_vec(*n, gpu_space_configs);
@@ -855,7 +847,6 @@ parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root)
     }
 
     r.reject_unknown();
-
   } catch (const std::runtime_error& e) {
     throw configuration_input_error(e.what());
   }

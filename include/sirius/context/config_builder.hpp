@@ -19,7 +19,8 @@
  * @brief Build Sirius context configurations from defaults, YAML, and C++ overrides.
  *
  * Requires C++23 and standard-library support for std::expected. Include
- * `<sirius/context/config_builder.hpp>` and link the CMake target `sirius::sirius`.
+ * `<sirius/context/config_builder.hpp>` and link `sirius::sirius`, or
+ * `sirius::sirius_static` when the static library is enabled.
  */
 
 #pragma once

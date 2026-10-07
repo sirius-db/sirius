@@ -18,7 +18,7 @@
  * @file
  * @brief Immutable context configuration for Sirius.
  *
- * Include `<sirius/context/config.hpp>` and link the CMake target `sirius::sirius`.
+ * Include `<sirius/context/config.hpp>` to use this type.
  * Use `<sirius/context/config_builder.hpp>` to construct a configuration.
  */
 

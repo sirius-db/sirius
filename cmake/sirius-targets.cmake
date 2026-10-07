@@ -244,12 +244,7 @@ set_target_properties(
 target_compile_features(sirius_shared INTERFACE cxx_std_23)
 # Installed static consumers use the public headers too. Keep this requirement
 # out of DuckDB's in-tree build graph.
-foreach(_target sirius_core sirius_extension)
-  if(TARGET ${_target})
-    target_compile_features(${_target}
-                            INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
-  endif()
-endforeach()
+target_compile_features(sirius_core INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")

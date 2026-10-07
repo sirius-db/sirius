@@ -27,7 +27,6 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -299,13 +298,10 @@ struct sirius_config {
   sirius_config()  = default;
   ~sirius_config() = default;
 
-  void load_from_file(const std::filesystem::path& config_path);
-  void apply_defaults();
-
   // Explicit hardware-resolving helpers for internal configuration consumers.
   // Runtime startup takes parsed_sirius_config instead.
-  void load_from_node(const YAML::Node& root,
-                      std::optional<gpu_usage_limit> gpu_limit = std::nullopt);
+  void load_from_file(const std::filesystem::path& config_path);
+  void apply_defaults();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {

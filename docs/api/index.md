@@ -5,6 +5,8 @@ API.
 
 ## Getting started
 
+The public API requires C++23 and standard-library support for `std::expected`.
+
 - @ref sirius::ContextConfigBuilder "Configuration builder" assembles settings from defaults, YAML, and C++ overrides.
 - @ref sirius::ContextConfig "Context configuration" holds an immutable, validated configuration.
 - @ref sirius::Error "Errors" describe failures returned by the API.

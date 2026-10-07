@@ -227,17 +227,21 @@ TEST_CASE("public configuration defers GPU capacity checks", "[context_config][c
 
 TEST_CASE("configuration resolver applies programmatic GPU overrides", "[context_config][config]")
 {
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  const auto& topology = discovery.get_topology();
+
   SECTION("byte override replaces YAML fraction and preserves explicit settings")
   {
-    sirius::sirius_config config;
     constexpr std::uint64_t capacity = 256ULL << 20;
-    config.load_from_node(YAML::Load(R"(sirius:
+    auto parsed = sirius::parsed_sirius_config::from_node(YAML::Load(R"(sirius:
   topology: {num_gpus: 1}
   memory:
     gpu: {usage_limit_fraction: 0.5, reservation_limit_fraction: 0.7}
   operator_params: {hash_partition_bytes: 32Mi}
-)"),
-                          sirius::gpu_usage_limit{capacity});
+)"));
+    auto config = parsed.with_gpu_usage_limit(capacity).resolve(topology);
 
     const auto gpu = gpu_space(config);
     CHECK(gpu.memory_capacity == capacity);
@@ -247,18 +251,18 @@ TEST_CASE("configuration resolver applies programmatic GPU overrides", "[context
   }
   SECTION("fraction override replaces YAML bytes")
   {
-    sirius::sirius_config physical;
-    physical.load_from_node(
-      YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_fraction: 1.0}}}"));
+    auto physical =
+      sirius::parsed_sirius_config::from_node(
+        YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_fraction: 1.0}}}"))
+        .resolve(topology);
     const auto total = gpu_space(physical).memory_capacity;
     REQUIRE(total > 0);
 
+    auto parsed = sirius::parsed_sirius_config::from_node(
+      YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_bytes: 256Mi}}}"));
     for (const auto fraction : {0.0, 0.5, 1.0}) {
       CAPTURE(fraction);
-      sirius::sirius_config config;
-      config.load_from_node(
-        YAML::Load("sirius: {topology: {num_gpus: 1}, memory: {gpu: {usage_limit_bytes: 256Mi}}}"),
-        sirius::gpu_usage_limit{fraction});
+      auto config = parsed.with_gpu_usage_limit(fraction).resolve(topology);
       CHECK(gpu_space(config).memory_capacity == static_cast<std::size_t>(total * fraction));
     }
   }
