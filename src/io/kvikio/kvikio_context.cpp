@@ -223,11 +223,11 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
               }
               rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
               auto const copy_status = cudaMemcpyAsync(
-                slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.value());
+                slice.d_buffer.data, host, bytes, cudaMemcpyDefault, slice.d_buffer.stream.get());
               if (copy_status != cudaSuccess) {
                 throw std::runtime_error(cudaGetErrorString(copy_status));
               }
-              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.value());
+              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
               if (sync_status != cudaSuccess) {
                 throw std::runtime_error(cudaGetErrorString(sync_status));
               }
@@ -242,13 +242,20 @@ exec::semi_future<size_t> kvikio_context::mixed_readv_async_io(
 
             auto const* local = dynamic_cast<kvikio_io_object const*>(&object);
             if (local == nullptr) {
+              // kvikIO copies the HTTP body H2D on its own per-thread stream and only
+              // synchronizes that stream, so the destination — possibly a stream-ordered
+              // pool block still in use on the caller's stream — must be drained first.
+              auto const sync_status = cudaStreamSynchronize(slice.d_buffer.stream.get());
+              if (sync_status != cudaSuccess) {
+                throw std::runtime_error(cudaGetErrorString(sync_status));
+              }
               completed = object.read_at(slice.d_buffer.data, bytes, slice.offset());
             } else {
               auto future = local->handle().read_async(slice.d_buffer.data,
                                                        bytes,
                                                        static_cast<off_t>(slice.offset()),
                                                        0,
-                                                       slice.d_buffer.stream.value());
+                                                       slice.d_buffer.stream.get());
               completed   = future.check_bytes_done();
             }
           } else {

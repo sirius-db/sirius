@@ -24,6 +24,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -39,8 +40,6 @@
 #include <cudf/unary.hpp>
 
 #include <rmm/aligned.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -98,7 +97,7 @@ namespace {
 std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
                                                   cudf::column_view const& values,
                                                   cudf::null_policy value_policy,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   cudf::groupby::groupby gb(cudf::table_view({keys}), cudf::null_policy::EXCLUDE, cudf::sorted::NO);
@@ -116,7 +115,7 @@ std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
 
 std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
                                                std::unique_ptr<cudf::table> rhs,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   std::vector<cudf::table_view> views{lhs->view(), rhs->view()};
@@ -142,7 +141,7 @@ std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
 std::unique_ptr<cudf::table> sparse_merge_partials(
   std::vector<std::unique_ptr<cudf::table>> partials,
   cudf::data_type key_type,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (partials.empty()) {
@@ -202,8 +201,10 @@ dense_count_join_input::dense_count_join_input(
 dense_count_join_input::dense_count_join_input(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
-  std::size_t partition_idx)
-  : partitioned_operator_data(combine_sides(preserved_batches, counted_batches), partition_idx),
+  std::size_t partition_idx,
+  partition_placement const& placement)
+  : partitioned_operator_data(
+      combine_sides(preserved_batches, counted_batches), partition_idx, placement),
     _preserved_count(preserved_batches.size()),
     _counted_count(counted_batches.size())
 {
@@ -218,6 +219,7 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   uint64_t max_bins_bytes,
   uint64_t planned_histogram_bytes,
   uint64_t planned_output_rows,
+  uint64_t planned_counted_rows,
   uint64_t hash_partition_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
@@ -226,7 +228,8 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
     _counted_value_idx(counted_value_idx),
     _max_bins_bytes(max_bins_bytes),
     _planned_histogram_bytes(planned_histogram_bytes),
-    _planned_output_rows(planned_output_rows)
+    _planned_output_rows(planned_output_rows),
+    _planned_counted_rows(planned_counted_rows)
 {
   _hash_partition_bytes = hash_partition_bytes;
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
@@ -303,7 +306,7 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
   auto num_partitions =
     static_cast<int>(std::min(wanted, static_cast<uint64_t>(std::numeric_limits<int>::max())));
 
-  int const min_parts = partition_min_num_partitions(_num_gpus);
+  int const min_parts = partition_min_num_partitions(num_gpus());
   // For multi-gpu execution, there is a balance between doing any partitioning (added compute) vs
   // distributing the load across more GPUs. This is a rough heuristic threshold to determine if we
   // would rather share the load or avoid partitioning which adds compute.
@@ -327,7 +330,14 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
       }
     }
   }
-  return {num_partitions, /*broadcast=*/false, /*build_probe=*/false};
+  // The histogram/hash state is task-local; a lone partition needs no fixed GPU.
+  return partition_strategy{num_partitions,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            num_partitions == 1
+                              ? partition_placement::unpinned(1)
+                              : partition_placement::round_robin(
+                                  static_cast<std::size_t>(num_partitions), active_gpu_ids())};
 }
 
 std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()
@@ -394,13 +404,13 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_i
 
     // A single partition imposes no cross-task device agreement, so leave it untagged and let the
     // scheduler place it on whichever GPU already holds the data. With more than one, every task
-    // of a partition must share a device, which the partition index pins.
+    // of a partition must share a device, which the exchange's placement pins.
     if (num_partitions == 1) {
       return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
                                                       std::move(counted_batches));
     }
     return std::make_unique<dense_count_join_input>(
-      std::move(preserved_batches), std::move(counted_batches), this_partition);
+      std::move(preserved_batches), std::move(counted_batches), this_partition, *this->placement());
   }
   return nullptr;
 }
@@ -467,17 +477,24 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   constexpr std::size_t kSparseGroupFactor = 8;
   auto const avg_batch_bytes =
     stats.num_batches > 0 ? stats.bytes / stats.num_batches : stats.bytes;
-  auto sparse_peak = saturating_add(allocation_floor, avg_batch_bytes);
-  sparse_peak      = saturating_add(
+  // Groups every distinct counted-side key, including unmatched ones that never reach the
+  // output, so output_rows does not bound the hash state.
+  auto const planned_groups =
+    _planned_counted_rows > 0
+      ? saturating_add(static_cast<std::size_t>(_planned_counted_rows), output_rows)
+      : cudf_row_limit;
+  auto const sparse_groups = std::min({planned_groups, stats.bytes / key_width, cudf_row_limit});
+  auto sparse_peak         = saturating_add(allocation_floor, avg_batch_bytes);
+  sparse_peak              = saturating_add(
     sparse_peak,
-    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), output_rows));
+    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), sparse_groups));
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
-  operator_data const& input_data, rmm::cuda_stream_view stream)
+  operator_data const& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
   auto const& input          = dynamic_cast<dense_count_join_input const&>(input_data);
   auto const ro_batches      = input.get_read_only_batches();
   auto const preserved_count = input.preserved_count();

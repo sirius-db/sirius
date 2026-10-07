@@ -23,13 +23,10 @@
 // the final column values against a hand-computed expected column.
 //
 // The test deliberately includes NO duckdb/ header in its own body. A self-reading
-// grep-guard TEST_CASE below enforces that invariant. (catch.hpp and the AST
-// builder helpers pull in a duckdb std-alias header transitively — that is test
-// plumbing for the vendored Catch framework, not the expression frontend, and is
-// not a direct include of this file.)
+// grep-guard TEST_CASE below enforces that invariant.
 
 // test helpers — sirius::ast::node builders + GPU->host readback (no DuckDB
-// expression types); also establishes duckdb_base_std for the vendored catch.hpp.
+// expression types).
 #include "ast_test_support.hpp"
 
 #include <catch.hpp>

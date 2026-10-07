@@ -22,12 +22,11 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -154,7 +153,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
@@ -167,7 +166,12 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
       }
     }
   }
-  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+  return partition_strategy{natural,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            natural == 1 ? partition_placement::unpinned(1)
+                                         : partition_placement::round_robin(
+                                             static_cast<std::size_t>(natural), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
@@ -189,20 +193,20 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    // Tag with the source partition index so the scheduler pins this task to
-    // partition_idx % num_gpus. merge_group_by materializes a cuco hash table
-    // to combine its input batches, so — like hash_join — every task of a
-    // given partition must stay on a single GPU.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
+    // Each partition is drained into one task; its merge state is task-local. A lone partition
+    // follows input locality, while multiple partitions retain round-robin placement.
+    auto const placement = this->placement();
+    return std::make_unique<partitioned_operator_data>(
+      std::move(input_batch), this_partition_id, *placement);
   } else {
     return nullptr;
   }
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {
@@ -212,7 +216,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one

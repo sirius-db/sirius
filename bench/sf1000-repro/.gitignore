@@ -1,0 +1,5 @@
+# Runtime artifacts of the SANITIZER launcher and the verify-* gates.
+sanitizer_*.log
+VERIFY-LEDGER.txt
+gpu.lease
+coredumps/

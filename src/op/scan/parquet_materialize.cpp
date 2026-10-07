@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <future>
 #include "op/scan/parquet_materialize.hpp"
 
 #include "io/io_context.hpp"
@@ -26,10 +25,11 @@
 
 #include <rmm/device_buffer.hpp>
 
-#include <ctrack.hpp>
-
 #include <algorithm>
+#include <future>
 #include <iterator>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::op::scan {
@@ -51,11 +51,6 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 bool prefers_bulk_materialize(std::span<parquet_source const> sources,
                               cudf::io::parquet_reader_options const& options) noexcept
 {
-  // A filter is disqualifying, not merely unsupported: materialize_all_columns
-  // ignores one rather than rejecting it, so taking this route with filtered
-  // options would hand back every row and claim it was filtered.  Enforced here
-  // rather than left to each caller to remember.
-  if (options.get_filter().has_value()) { return false; }
   if (sources.empty()) { return false; }
   // Every source has to qualify: the decode consumes one flattened chunk-data
   // span covering all of them, so a single file that cannot be read this way
@@ -67,6 +62,31 @@ bool prefers_bulk_materialize(std::span<parquet_source const> sources,
 }
 
 namespace {
+
+char const* physical_type_name(cudf::io::parquet::Type type)
+{
+  switch (type) {
+    case cudf::io::parquet::Type::BOOLEAN: return "BOOLEAN";
+    case cudf::io::parquet::Type::INT32: return "INT32";
+    case cudf::io::parquet::Type::INT64: return "INT64";
+    case cudf::io::parquet::Type::INT96: return "INT96";
+    case cudf::io::parquet::Type::FLOAT: return "FLOAT";
+    case cudf::io::parquet::Type::DOUBLE: return "DOUBLE";
+    case cudf::io::parquet::Type::BYTE_ARRAY: return "BYTE_ARRAY";
+    case cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY: return "FIXED_LEN_BYTE_ARRAY";
+    default: return "group";
+  }
+}
+
+std::string describe(cudf::io::parquet::SchemaElement const& element)
+{
+  return "'" + element.name + "' " + physical_type_name(element.type);
+}
+
+std::string path_of(parquet_source const& src)
+{
+  return src.datasource ? src.datasource->get_io_object().object_path() : std::string{"<unknown>"};
+}
 
 /// One source's column chunks, resident on the device.
 struct fetched_chunks {
@@ -101,7 +121,7 @@ struct pending_chunks {
 pending_chunks issue_chunks(parquet_source const& src,
                             cudf::io::parquet_reader_options const& options,
                             std::span<cudf::io::text::byte_range_info const> ranges,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   // Derive the ranges when the caller did not already have them.  A caller that
@@ -141,11 +161,10 @@ pending_chunks issue_chunks(parquet_source const& src,
 fetched_chunks fetch_chunks(parquet_source const& src,
                             cudf::io::parquet_reader_options const& options,
                             std::span<cudf::io::text::byte_range_info const> ranges,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   auto pending = issue_chunks(src, options, ranges, stream, mr);
-  CTRACK_NAME("materialize_parquet::bulk::read");
   std::ignore = pending.done.get();
   return std::move(pending.chunks);
 }
@@ -164,17 +183,14 @@ std::unique_ptr<cudf::table> materialize_bulk(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options,
   std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
-  CTRACK_NAME("materialize_parquet::bulk");
-
   if (sources.size() == 1) {
     // Single file: the single-source reader, whose chunk data is flat.
     auto const& src   = sources.front();
     auto const chunks = fetch_chunks(src, options, ranges_for(ranges, 0), stream, mr);
 
-    CTRACK_NAME("materialize_parquet::bulk::decode");
     hybrid_scan_reader reader(*src.metadata, options);
     auto result =
       reader.materialize_all_columns(cudf::host_span<cudf::size_type const>(
@@ -186,6 +202,8 @@ std::unique_ptr<cudf::table> materialize_bulk(
                                      mr);
     return std::move(result.tbl);
   }
+
+  require_same_parquet_schema(sources);
 
   // Several files in one split: the multi-file reader takes the row groups per
   // source and wants its chunk data flattened in source order, with each
@@ -211,11 +229,8 @@ std::unique_ptr<cudf::table> materialize_bulk(
     pending.push_back(issue_chunks(sources[i], options, ranges_for(ranges, i), stream, mr));
   }
 
-  {
-    CTRACK_NAME("materialize_parquet::bulk::read");
-    for (auto& p : pending) {
-      std::ignore = p.done.get();
-    }
+  for (auto& p : pending) {
+    std::ignore = p.done.get();
   }
 
   for (std::size_t i = 0; i < sources.size(); ++i) {
@@ -228,7 +243,6 @@ std::unique_ptr<cudf::table> materialize_bulk(
     rg_per_src.push_back(sources[i].row_group_indices);
   }
 
-  CTRACK_NAME("materialize_parquet::bulk::decode");
   cudf::io::parquet::experimental::hybrid_scan_multifile reader(
     cudf::host_span<cudf::io::parquet::FileMetaData const>(metadatas.data(), metadatas.size()),
     options);
@@ -244,11 +258,9 @@ std::unique_ptr<cudf::table> materialize_bulk(
 /// General route: let cudf read as it decodes, over whatever sources there are.
 std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const> sources,
                                                  cudf::io::parquet_reader_options const& options,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
-  CTRACK_NAME("materialize_parquet::general");
-
   std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
   std::vector<cudf::io::parquet::FileMetaData> metadatas;
   std::vector<std::vector<cudf::size_type>> rg_per_src;
@@ -272,11 +284,35 @@ std::unique_ptr<cudf::table> materialize_general(std::span<parquet_source const>
 
 }  // namespace
 
+void require_same_parquet_schema(std::span<parquet_source const> sources)
+{
+  if (sources.size() < 2) { return; }
+  auto const& first = sources.front().metadata->schema;
+  for (auto const& src : sources.subspan(1)) {
+    auto const& schema = src.metadata->schema;
+    if (schema == first) { continue; }
+    std::string const prefix = "[parquet_materialize] All sources must have the same schema: '" +
+                               path_of(sources.front()) + "' and '" + path_of(src) + "' ";
+    if (schema.size() != first.size()) {
+      throw std::runtime_error(prefix + "have " + std::to_string(first.size()) + " and " +
+                               std::to_string(schema.size()) +
+                               " schema elements (including the root)");
+    }
+    auto const [lhs, rhs] = std::mismatch(first.begin(), first.end(), schema.begin(), schema.end());
+    std::string detail    = describe(*lhs) + " vs " + describe(*rhs);
+    if (lhs->name == rhs->name && lhs->type == rhs->type) {
+      detail += "; they differ in annotation, width or nesting";
+    }
+    throw std::runtime_error(prefix + "differ at schema element " +
+                             std::to_string(lhs - first.begin()) + " (" + detail + ")");
+  }
+}
+
 std::unique_ptr<cudf::table> materialize_parquet(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options,
   std::span<std::vector<cudf::io::text::byte_range_info> const> ranges,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (sources.empty()) { return nullptr; }

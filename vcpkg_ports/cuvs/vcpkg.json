@@ -11,7 +11,11 @@
     },
     "cccl",
     "cuco",
+    "curand",
+    "cusolver",
     "fmt",
+    "nvjitlink",
+    "nvrtc",
     "nvtx3",
     "raft",
     "rmm",
@@ -19,6 +23,7 @@
   ],
   "license": "Apache-2.0",
   "name": "cuvs",
+  "port-version": 1,
   "supports": "linux",
-  "version-string": "26.06.00"
+  "version-string": "26.08.01"
 }

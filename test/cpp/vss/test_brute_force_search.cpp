@@ -24,6 +24,7 @@
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -34,6 +35,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cuvs/distance/distance.hpp>
@@ -73,8 +75,11 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
 
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Copy a device column's raw elements back to the host after the search stream
@@ -91,7 +96,7 @@ std::vector<T> to_host(cudf::column_view const& col)
 
 TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   // Dataset row i is [i, i, i]; query is the origin, so distances grow with i and
@@ -110,13 +115,13 @@ TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
   std::vector<float> q_host(dim, 0.0f);
   rmm::device_uvector<float> q_dev(dim, stream);
   cudaMemcpyAsync(
-    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.get());
   auto query_view =
     raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
 
   constexpr int64_t k = 3;
   auto knn            = brute_force_knn(res, dataset_view, query_view, k, Metric::L2SqrtUnexpanded);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(knn.n_queries == 1);
   REQUIRE(knn.k == k);
@@ -135,7 +140,7 @@ TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
 
 TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   constexpr cudf::size_type dim = 2;
@@ -155,12 +160,12 @@ TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
   std::vector<float> q_host{1.0f, 0.0f};
   rmm::device_uvector<float> q_dev(dim, stream);
   cudaMemcpyAsync(
-    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.get());
   auto query_view =
     raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
 
   auto knn = brute_force_knn(res, dataset_view, query_view, /*k=*/3, Metric::CosineExpanded);
-  stream.synchronize();
+  stream.sync();
 
   auto neighbors = to_host<int64_t>(knn.neighbors->view());
   auto distances = to_host<float>(knn.distances->view());
@@ -174,7 +179,7 @@ TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
 
 TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   constexpr cudf::size_type n_rows = 4;
@@ -186,7 +191,7 @@ TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
   std::vector<float> q_host(dim, 0.0f);
   rmm::device_uvector<float> q_dev(dim, stream);
   cudaMemcpyAsync(
-    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.value());
+    q_dev.data(), q_host.data(), sizeof(float) * dim, cudaMemcpyHostToDevice, stream.get());
   auto query_view =
     raft::make_device_matrix_view<const float, int64_t, raft::row_major>(q_dev.data(), 1, dim);
 
@@ -205,7 +210,7 @@ TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
                     q2_host.data(),
                     sizeof(float) * (dim + 1),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
     auto bad_query = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
       q2_dev.data(), 1, dim + 1);
     REQUIRE_THROWS(brute_force_knn(res, dataset_view, bad_query, 1));

@@ -70,8 +70,12 @@ fn main() {
         .parse()
         .expect("valid engine uuid");
 
-    let events = Sirius::import_events(&dir).expect("importable session dir");
-    let analyzer = SiriusUiAnalyzer::try_new(engine_id, events).expect("analyzable events");
+    let events: Vec<_> = Sirius::import_events(&dir)
+        .expect("importable session dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("importable events");
+    let analyzer =
+        SiriusUiAnalyzer::try_new(engine_id, events.into_iter()).expect("analyzable events");
     let model = &analyzer.model;
 
     let root_id = model.root().expect("model has a root group").id();

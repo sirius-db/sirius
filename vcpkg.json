@@ -10,6 +10,7 @@
     ]
   },
   "dependencies": [
+    "catch2",
     "cudf",
     "cuvs",
     "raft",
@@ -20,7 +21,13 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    "roaring",
+    {
+      "features": [
+        "http2"
+      ],
+      "name": "curl"
+    }
   ],
   "overrides": [
     {

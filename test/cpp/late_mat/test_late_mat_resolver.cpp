@@ -33,10 +33,10 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/utilities/bit.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <api/simpatico_codegen.hpp>
@@ -68,11 +68,12 @@ namespace {
 /// A plain GPU pin of one column, chunked as asked, whose row i holds i.
 struct fake_entry {
   pinned_entry entry;
+  std::shared_ptr<pinned_entry const> entry_owner;
   std::shared_ptr<pin_entry_handle> handle;
 
   fake_entry(std::vector<std::int64_t> const& batch_rows,
              std::string const& name,
-             rmm::cuda_stream_view stream)
+             ::cuda::stream_ref stream)
   {
     entry.tier = cucascade::memory::Tier::GPU;
     entry.cache_info.names.push_back(name);
@@ -92,15 +93,16 @@ struct fake_entry {
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
       chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
       entry.num_rows += static_cast<std::size_t>(rows);
     }
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     entry.data_batches_by_column.emplace(name, std::move(chunks));
 
-    handle = std::make_shared<pin_entry_handle>(name, 5);
-    handle->set_entry(&entry);
+    entry_owner = std::shared_ptr<pinned_entry const>(&entry, [](pinned_entry const*) {});
+    handle      = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const
@@ -125,7 +127,7 @@ std::vector<std::int32_t> read_back(cudf::column_view const& col)
   return host;
 }
 
-rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_stream_view stream)
+rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, ::cuda::stream_ref stream)
 {
   rmm::device_buffer buf(
     host.size() * sizeof(std::uint64_t), stream, rmm::mr::get_current_device_resource_ref());
@@ -133,8 +135,8 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_
                   host.data(),
                   host.size() * sizeof(std::uint64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  cudaStreamSynchronize(stream.value());
+                  stream.get());
+  cudaStreamSynchronize(stream.get());
   return buf;
 }
 
@@ -142,7 +144,7 @@ rmm::device_buffer upload_ids(std::vector<std::uint64_t> const& host, rmm::cuda_
 
 TEST_CASE("a pinned entry resolves to the layout it actually holds", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({1000, 250, 700}, "l_extendedprice", stream);
 
   auto const layout = resolve_pinned_layout(pin.origin());
@@ -155,7 +157,7 @@ TEST_CASE("a pinned entry resolves to the layout it actually holds", "[late_mat]
 
 TEST_CASE("a column resolves to one source per batch, in pin order", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({64, 32}, "l_quantity", stream);
 
   auto const column = resolve_pinned_column(pin.origin());
@@ -169,7 +171,7 @@ TEST_CASE("a column resolves to one source per batch, in pin order", "[late_mat]
 
 TEST_CASE("a stale origin resolves to nothing at all", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({16}, "c_name", stream);
   auto const origin = pin.origin();
   REQUIRE(resolve_pinned_layout(origin).has_value());
@@ -183,14 +185,14 @@ TEST_CASE("a stale origin resolves to nothing at all", "[late_mat][resolver]")
 
 TEST_CASE("a column position the entry does not have resolves to nothing", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({16}, "c_name", stream);
   REQUIRE_FALSE(resolve_pinned_column(pin.origin(7)).has_value());
 }
 
 TEST_CASE("a host-tier entry is not served", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({16}, "c_name", stream);
   pin.entry.tier = cucascade::memory::Tier::HOST;
   // Not an error — a reason not to defer. A host chunk would have to be staged
@@ -201,7 +203,7 @@ TEST_CASE("a host-tier entry is not served", "[late_mat][resolver]")
 
 TEST_CASE("a compressed chunk with no readable table is not deferred", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto mgr          = sirius::test::operator_utils::initialize_memory_manager();
   auto* gpu_space   = mgr->get_memory_space(cucascade::memory::Tier::GPU, 0);
 
@@ -235,14 +237,14 @@ TEST_CASE("a column whose chunks disagree on their carrier is not deferred", "[l
   // resolved view carries a single dtype and the gather reads every batch at
   // that width, so a pin whose chunks disagree has no answer to give — refusing
   // is the only alternative to reading the later chunks at the wrong width.
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({64, 32}, "l_quantity", stream);
   REQUIRE(resolve_pinned_column(pin.origin()).has_value());
 
   auto& chunks  = pin.entry.data_batches_by_column.at("l_quantity");
   auto narrower = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT16}, 32, cudf::mask_state::UNALLOCATED, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   chunks[1] = std::shared_ptr<cudf::column>(std::move(narrower));
 
   REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
@@ -250,7 +252,7 @@ TEST_CASE("a column whose chunks disagree on their carrier is not deferred", "[l
 
 TEST_CASE("an origin materializes the rows a join asked for, end to end", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   fake_entry pin({3000, 1500, 2000}, "l_extendedprice", stream);
 
@@ -268,7 +270,7 @@ TEST_CASE("an origin materializes the rows a join asked for, end to end", "[late
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const out = materialize(*column, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   std::vector<std::int32_t> expect;
   for (auto const id : ids) {
@@ -279,7 +281,7 @@ TEST_CASE("an origin materializes the rows a join asked for, end to end", "[late
 
 TEST_CASE("a single batch materializes through the raw gather path", "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   fake_entry pin({64}, "l_quantity", stream);
 
@@ -296,7 +298,7 @@ TEST_CASE("a single batch materializes through the raw gather path", "[late_mat]
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const out = materialize(*column, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   std::vector<std::int32_t> expect;
   for (auto const id : ids) {
     expect.push_back(static_cast<std::int32_t>(id));
@@ -311,12 +313,13 @@ namespace {
 /// the "this batch has no nulls" shape a multi-batch gather must also treat as valid.
 struct fake_nullable_entry {
   pinned_entry entry;
+  std::shared_ptr<pinned_entry const> entry_owner;
   std::shared_ptr<pin_entry_handle> handle;
 
   fake_nullable_entry(std::vector<std::int64_t> const& batch_rows,
                       std::vector<std::int64_t> const& null_rows,
                       std::string const& name,
-                      rmm::cuda_stream_view stream,
+                      ::cuda::stream_ref stream,
                       std::vector<std::size_t> const& unmasked_batches = {})
   {
     entry.tier = cucascade::memory::Tier::GPU;
@@ -340,7 +343,7 @@ struct fake_nullable_entry {
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
+                      stream.get());
       if (masked) {
         cudf::size_type null_count = 0;
         for (auto const global_row : null_rows) {
@@ -356,11 +359,12 @@ struct fake_nullable_entry {
       chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
       entry.num_rows += static_cast<std::size_t>(rows);
     }
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     entry.data_batches_by_column.emplace(name, std::move(chunks));
 
-    handle = std::make_shared<pin_entry_handle>(name, 5);
-    handle->set_entry(&entry);
+    entry_owner = std::shared_ptr<pinned_entry const>(&entry, [](pinned_entry const*) {});
+    handle      = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const
@@ -389,7 +393,7 @@ std::vector<cudf::bitmask_type> read_back_mask(cudf::column_view const& col)
 TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives materialize",
           "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   fake_nullable_entry pin({64}, /*null_rows=*/{0, 17, 63}, "c_mktsegment", stream);
 
@@ -407,7 +411,7 @@ TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives ma
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const out = materialize(*column, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(out->view().size() == static_cast<cudf::size_type>(ids.size()));
   REQUIRE(out->view().nullable());
@@ -427,7 +431,7 @@ TEST_CASE("a single uncompressed batch may carry nulls, and the mask survives ma
 TEST_CASE("a multi-batch column carries nulls through the multi-source gather kernel",
           "[late_mat][resolver]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   // Batch 1 (rows 32-47) is left unmasked entirely -- no null mask allocated at all -- to
   // exercise the "this batch has no nulls" convention alongside batches that do have one.
@@ -451,7 +455,7 @@ TEST_CASE("a multi-batch column carries nulls through the multi-source gather ke
                                                 static_cast<std::int64_t>(ids.size()),
                                                 false});
   auto const out = materialize(*column, prepared, stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   REQUIRE(out->view().nullable());
   auto const host_mask = read_back_mask(out->view());
@@ -476,6 +480,7 @@ namespace {
 struct fake_compressed_entry {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   pinned_entry entry;
+  std::shared_ptr<pinned_entry const> entry_owner;
   std::shared_ptr<pin_entry_handle> handle;
 
   fake_compressed_entry(std::vector<std::int64_t> const& batch_rows,
@@ -533,8 +538,9 @@ struct fake_compressed_entry {
       entry.num_rows += static_cast<std::size_t>(rows);
     }
 
-    handle = std::make_shared<pin_entry_handle>(name, 5);
-    handle->set_entry(&entry);
+    entry_owner = std::shared_ptr<pinned_entry const>(&entry, [](pinned_entry const*) {});
+    handle      = std::make_shared<pin_entry_handle>(name, 5);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] column_origin origin(std::uint32_t pos = 0) const

@@ -20,13 +20,13 @@
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/plan/validity.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <memory>
 #include <string>
@@ -110,7 +110,7 @@ bool is_keys_chars_path(std::string const& path)
 
 std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
                                                  std::string const& path,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
   return is_keys_chars_path(path) ? copy_column_view_as_uint8(view, stream, mr)
@@ -153,7 +153,7 @@ struct CompressWalk {
   std::unordered_map<ValueId, std::unique_ptr<compressed_representation>, ValueIdHash>&
     reprs_by_input;
   std::vector<bool>& visited;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream{cudaStream_t{}};
   rmm::device_async_resource_ref mr;
   std::string* error_out;
   bool failed = false;
@@ -287,7 +287,7 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
     out_col->mutable_view().head<void>(),
     0,
     static_cast<size_t>(n_elements) * static_cast<size_t>(cudf::size_of(layout.output_type)),
-    stream.value());
+    stream.get());
 
   for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
     launch_bitjoin_field(out_col->mutable_view(),
@@ -295,9 +295,9 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
                          static_cast<int>(layout.src_los[fi]),
                          static_cast<int>(layout.dst_los[fi]),
                          layout.widths[fi],
-                         stream.value());
+                         stream.get());
   }
-  bitjoin_warn_on_truncation(columns, layout, node.input_sources, node.op, stream.value());
+  bitjoin_warn_on_truncation(columns, layout, node.input_sources, node.op, stream.get());
 
   // Route the output: terminal outputs are placed straight onto the tree;
   // outputs consumed by a downstream op stay in reprs_by_input (keeping their
@@ -575,11 +575,11 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
 std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
-                                          rmm::cuda_stream_view stream,
+                                          ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr,
                                           std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_column"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_column"};
   // Single-stream per column: all work runs on `stream`. Cross-column
   // parallelism is the caller's job (one column per worker thread, each on its
   // own stream). Intermediate device buffers are freed eagerly by the walk.
@@ -680,14 +680,14 @@ struct single_op_representation : compressed_representation {
   {
   }
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  std::vector<compressible_output> named_channels(::cuda::stream_ref) const override
   {
     return chans;
   }
 
   // Full stored size: every node rep + parked channel, so the op's aux buffers
   // (delta_first / for references / rle run offsets) are counted too.
-  size_t compressed_size_bytes(rmm::cuda_stream_view stream) const override
+  size_t compressed_size_bytes(::cuda::stream_ref stream) const override
   {
     size_t total = 0;
     if (!plan_tree) return total;
@@ -705,7 +705,7 @@ struct single_op_representation : compressed_representation {
 
 std::unique_ptr<compressed_representation> compress_single_op(std::string const& op_name,
                                                               cudf::column_view input,
-                                                              rmm::cuda_stream_view stream,
+                                                              ::cuda::stream_ref stream,
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out)
 {

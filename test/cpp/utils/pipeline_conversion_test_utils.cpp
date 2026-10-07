@@ -203,7 +203,7 @@ void with_conversion_result(
 
     pipeline::sirius_pipeline_build_state state;
     auto root_pipeline =
-      duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+      std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
     root_pipeline->build(*sirius_plan);
     root_pipeline->ready();
 
@@ -223,13 +223,19 @@ void with_conversion_result(
 
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
-                             const std::function<void(sirius_engine&)>& consume)
+                             const std::function<void(sirius_engine&)>& consume,
+                             std::optional<sirius::query_id_t> query_id)
 {
   auto& context = *con.context;
 
-  // Stands in for the execution window this helper never opens: registers this plan's
-  // repository manager and drops it (with its repositories) on the way out.
-  scoped_test_query test_query(context);
+  // Only mint a synthetic query id (and its stand-in repository-manager registration) when the
+  // caller did not already open a real execution window: reusing that window's id here, instead,
+  // is what lets execute() find the set_client_context registration begin_execution_window made.
+  std::optional<scoped_test_query> test_query;
+  if (!query_id) {
+    test_query.emplace(context);
+    query_id = test_query->query_id();
+  }
 
   con.BeginTransaction();
   try {
@@ -247,8 +253,7 @@ void with_initialized_engine(duckdb::Connection& con,
       duckdb::make_uniq_base<op::sirius_physical_result_collector,
                              op::sirius_physical_materialized_collector>(*prepared, context);
 
-    sirius_interface iface(context);
-    sirius_engine engine(context, iface, test_query.query_id());
+    sirius_engine engine(context, *query_id);
     engine.initialize(std::move(collector));
     consume(engine);
 
@@ -264,7 +269,7 @@ exec::logical_plan_source sql_plan_source(const std::string& query)
   return [query](duckdb::ClientContext& context) {
     optimizer_disable_guard guard(context);
     auto extracted = extract_logical_plan_sirius_order(context, query);
-    return std::move(extracted.logical_plan);
+    return exec::bound_plan{std::move(extracted.logical_plan), nullptr};
   };
 }
 
@@ -325,8 +330,7 @@ void with_initialized_streaming_fragment(
     }
     sink->children.push_back(std::move(sirius_plan));
 
-    sirius_interface iface(context);
-    sirius_engine engine(context, iface, window.query_id());
+    sirius_engine engine(context, window.query_id());
     // The fragment owns the plan; the engine borrows it. initialize() would take ownership and
     // destroy the sink with the engine, leaving nothing to pull from afterwards.
     engine.initialize_internal(*sink);

@@ -29,6 +29,7 @@
 #include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -62,56 +63,53 @@ sirius::decompression_pushdown_scan::compaction_forecast pushdown_compaction_for
 
 }  // namespace
 
-membership_snapshot snapshot_membership_probes(sirius::op::sirius_dynamic_filter_set const& set,
+membership_snapshot snapshot_membership_probes(sirius::op::dynamic_filter_snapshot const& snapshot,
                                                std::size_t n_slots)
 {
   membership_snapshot snap;
-  // generation FIRST: it must never claim probes the walk below did not
-  // capture (see the header doc).
-  snap.generation = set.filter_count();
+  snap.generation = snapshot.generation();
   snap.probes.resize(n_slots);
-  for (std::size_t i = 0; i < n_slots; ++i) {
-    auto filters = set.filters_for_column(i);
-    for (auto& filter : filters) {
-      // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
-      // at decode; zone-map filters have no per-row form.
-      auto const* applicable =
-        dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
-      if (applicable == nullptr) {
-        ++snap.skipped_non_mask;
-        continue;
-      }
-      // Ordering signal (sirius::membership_probe doc): rank by ascending
-      // expected keep-rate, num_keys where the concrete filter exposes it.
-      // Bloom has no size accessor — the rank alone places it last.
-      std::uint8_t kind_rank = 255;
-      std::uint64_t num_keys = 0;
-      if (auto const* small =
-            dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
-        kind_rank = 0;
-        num_keys  = small->size();
-      } else if (auto const* set =
-                   dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
-        kind_rank = 1;
-        num_keys  = set->size();
-      } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
-        kind_rank = 2;
-      }
-      // The closure co-owns the filter. It is snapshotted before the balancer
-      // assigns this split's chunk to a GPU, so the device isn't known yet
-      // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
-      // device at probe time, which the task scheduler has already set to
-      // the chunk's assigned GPU by then.
-      snap.probes[i].push_back(
-        {[f = std::move(filter), applicable](cudf::column_view const& keys,
-                                             rmm::cuda_stream_view s,
-                                             rmm::device_async_resource_ref mr) {
-           return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
-         },
-         kind_rank,
-         num_keys});
-      ++snap.attached_probes;
+  for (auto const& [i, filter] : snapshot.entries()) {
+    if (i >= n_slots) { continue; }
+    // Only mask-capable kinds (in-list / small-in-list / Bloom) can probe
+    // at decode; zone-map filters have no per-row form.
+    auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(filter.get());
+    if (applicable == nullptr) {
+      ++snap.skipped_non_mask;
+      continue;
     }
+    // Ordering signal (sirius::membership_probe doc): rank by ascending
+    // expected keep-rate, num_keys where the concrete filter exposes it.
+    // Bloom has no size accessor — the rank alone places it last.
+    std::uint8_t kind_rank = 255;
+    std::uint64_t num_keys = 0;
+    if (auto const* small =
+          dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get())) {
+      kind_rank = 0;
+      num_keys  = small->size();
+    } else if (auto const* set =
+                 dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get())) {
+      kind_rank = 1;
+      num_keys  = set->size();
+    } else if (filter->kind() == sirius::op::sirius_dynamic_filter_kind::BLOOM) {
+      kind_rank = 2;
+    }
+    // The closure co-owns the filter. It is snapshotted before the balancer
+    // assigns this split's chunk to a GPU, so the device isn't known yet
+    // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
+    // device at probe time, which the task scheduler has already set to
+    // the chunk's assigned GPU by then. The prior mask is the decoder's already-combined
+    // conjuncts.
+    snap.probes[i].push_back({[f = filter, applicable](cudf::column_view const& keys,
+                                                       std::uint32_t const* prior_mask_words,
+                                                       ::cuda::stream_ref s,
+                                                       rmm::device_async_resource_ref mr) {
+                                return applicable->compute_mask(
+                                  keys, prior_mask_words, /*device_id=*/-1, s, mr);
+                              },
+                              kind_rank,
+                              num_keys});
+    ++snap.attached_probes;
   }
   return snap;
 }
@@ -142,6 +140,13 @@ scan_operator_input::scan_operator_input(
       hint.datasource->fadvise(hint.ranges, preferred_device);
     }
   }
+
+  // fadvise only creates chunk entries; preparation attaches the buffers that
+  // demand reads can claim and fill even when there is no readahead worker.
+  // A readahead worker can prepare again later: already-prepared requests return
+  // immediately, and allocation failures remain queued for its eviction retry.
+  // Never wait for synchronous eviction while constructing a scan input.
+  static_cast<void>(stored->prepare_for_prefetching(false));
 
   // The publication barrier.  register_scan_task takes the readahead's mutex,
   // which the worker also takes to collect, so the hints above are ordered
@@ -182,21 +187,24 @@ void scan_operator_input::update(io::cache::scan_stage site) const
   scan_info const* task = has_scan_metadata()
                             ? std::get<std::shared_ptr<scan_info>>(materialization_info).get()
                             : nullptr;
-  if (_readahead) { _readahead->update_scan_state(_operator_id, task, site); }
-  if (task == nullptr) { return; }
-  // The split's own record of where its consumer is, which is what the readahead
-  // asks when deciding whether prefetching it is still worth anything.
-  std::get<std::shared_ptr<scan_info>>(materialization_info)->set_scan_stage(site);
-  // Datasources only, not the fadvise hints: this runs on every stage
-  // transition of every split, and the hints carry the split's entire
-  // byte-range list with them.
-  for (auto const& ds : get_datasources()) {
-    ds->update(site);
+  if (task != nullptr) {
+    // Publish the split and datasource state before notifying readahead. In
+    // particular, a disposed notification is the condition that wakes a memory
+    // retry, so the evictor must already be able to observe the cache handles as
+    // disposable when that worker wakes.
+    std::get<std::shared_ptr<scan_info>>(materialization_info)->set_scan_stage(site);
+    // Datasources only, not the fadvise hints: this runs on every stage
+    // transition of every split, and the hints carry the split's entire
+    // byte-range list with them.
+    for (auto const& ds : get_datasources()) {
+      ds->update(site);
+    }
   }
+  if (_readahead) { _readahead->update_scan_state(_operator_id, task, site); }
 }
 
 void scan_operator_input::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
@@ -247,18 +255,21 @@ void scan_operator_input::prepare_for_processing(
       // — by then upstream builds have published — so refresh the projected rep
       // with a fresh per-batch snapshot here, replacing the (typically empty)
       // drain-time one. The mapping invariant lives in
-      // snapshot_membership_probes; same mvcc guard as the row selection.
+      // snapshot_membership_probes. A masked split takes probes only if its rep carries
+      // the visibility mask too, so the two compose into one selection.
       if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
-          dynamic_filters->has_filters() && !mvcc_keep_mask.has_mask()) {
-        auto snapshot_onto = [&](auto* rep) {
+          dynamic_filters->has_filters()) {
+        auto const snapshot = dynamic_filters->snapshot();
+        auto snapshot_onto  = [&](auto* rep) {
+          if (mvcc_keep_mask.has_mask() && !rep->visibility_mask().has_mask()) { return; }
           std::size_t const n_slots = rep->selected_indices().has_value()
-                                        ? rep->selected_indices()->size()
-                                        : rep->column_names().size();
-          auto snap                 = snapshot_membership_probes(*dynamic_filters, n_slots);
+                                         ? rep->selected_indices()->size()
+                                         : rep->column_names().size();
+          auto snap                 = snapshot_membership_probes(snapshot, n_slots);
           SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
             "[decompression-pushdown] join filter attach (decode time) channel={}: slots={} "
-            "attached={} "
-            "generation={} skipped_non_maskable={}",
+             "attached={} "
+             "generation={} skipped_non_maskable={}",
             static_cast<void const*>(dynamic_filters.get()),
             n_slots,
             snap.attached_probes,
@@ -266,8 +277,8 @@ void scan_operator_input::prepare_for_processing(
             snap.skipped_non_mask);
           if (snap.attached_probes == 0) { return; }
           auto const base = rep->pushdown_scan()
-                              ? rep->pushdown_scan()
-                              : std::make_shared<const ::sirius::decompression_pushdown_scan>(
+                               ? rep->pushdown_scan()
+                               : std::make_shared<const ::sirius::decompression_pushdown_scan>(
                                   ::sirius::pushdown_request{});
           rep->set_pushdown_scan(
             base->with_membership_probes(std::move(snap.probes), snap.generation));
@@ -314,6 +325,7 @@ void scan_operator_input::prepare_for_processing(
       // flag. The transactional steal's filter bypass depends on this — if
       // that gate ever weakens, the steal must stop honoring
       // pushdown_row_filtered.
+      bool visibility_mask_applied = false;
       if (auto const* decoded =
             dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(
               mut.get_data())) {
@@ -323,6 +335,7 @@ void scan_operator_input::prepare_for_processing(
         pushdown_predicates_enforced = outcome.predicates_enforced;
         pushdown_compacted           = outcome.compacted;
         pushdown_survivors           = outcome.survivor_rows;
+        visibility_mask_applied      = outcome.visibility_mask_applied;
         if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
           pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
         }
@@ -333,14 +346,19 @@ void scan_operator_input::prepare_for_processing(
           "could not report which rows it kept, and a deferral needs those positions to build "
           "its pin-order rowid");
       }
+      // The decode consumed the mask: clear it, since re-applying selects wrong rows and
+      // clearing re-enables the zero-copy steal below.
+      if (visibility_mask_applied && mvcc_keep_mask.has_mask()) {
+        mvcc_keep_mask = scan_manager::mvcc_chunk_mask{};
+      }
       if (pushdown_row_filtered && mvcc_keep_mask.has_mask()) {
         // The keep-mask is positional over the chunk's full row range; a
-        // decode-compacted table no longer lines up with it. Row dropping must
-        // never be requested for mvcc-masked chunks — fail loudly rather than
-        // filter the wrong rows.
+        // decode-compacted table no longer aligns with it. A masked chunk may only drop
+        // rows when the decode consumed the mask (cleared above), so throw instead.
         throw std::runtime_error(
           "[scan_operator_input::prepare_for_processing] decode-time row filtering is "
-          "incompatible with an mvcc keep-mask; the attach must exclude masked chunks");
+          "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
+          "visibility mask on masked chunks");
       }
       // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
       // gpu_table_representation, so they never reach this branch), so a filter-free scan may
@@ -366,7 +384,7 @@ void scan_operator_input::prepare_for_processing(
             // The batch cannot hold null data and its size/view queries dereference the table, so
             // leave a valid empty placeholder.
             mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
-              std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+              std::make_unique<cudf::table>(), space, ::cuda::stream_ref{cudaStream_t{}}));
           }
         }
       }
@@ -380,9 +398,7 @@ void scan_operator_input::prepare_for_processing(
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
-  std::size_t output_width,
-  const converted_table_builder& builder,
-  rmm::cuda_stream_view stream) const
+  std::size_t output_width, const converted_table_builder& builder, ::cuda::stream_ref stream) const
 {
   // This gate is deliberately narrower than the generic resident path. Only prepare's own fresh
   // conversion may set pending; raw GPU pins and splits with filtering still ahead of them stay
@@ -416,7 +432,7 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
 
   auto& space    = gpu_rep->get_memory_space();
   auto empty_rep = std::make_unique<::cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{});
+    std::make_unique<cudf::table>(), space, ::cuda::stream_ref{cudaStream_t{}});
   auto replacements = builder(source_view);
   if (replacements.size() != output_width) {
     throw std::runtime_error(

@@ -19,10 +19,10 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/telemetry_utils.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <chrono>
@@ -98,7 +98,7 @@ class routing_test_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute(rmm::cuda_stream_view) override
+  void execute(::cuda::stream_ref) override
   {
     auto& global = _global_state->cast<routing_test_global_state>();
     auto& local  = _local_state->cast<routing_test_local_state>();
@@ -119,14 +119,9 @@ class routing_test_task : public sirius::pipeline::gpu_pipeline_task {
 
 }  // namespace
 
-TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgpu]")
+TEST_CASE("task_scheduler matches tasks to ready devices", "[task_scheduler][mgpu][multi_gpu]")
 {
-  int device_count = 0;
-  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
-  if (device_count < 2) {
-    INFO("Task scheduler routing test requires at least two GPUs; skipping");
-    return;
-  }
+  if (!sirius::test::has_gpus(2)) { return; }
 
   constexpr int tested_device_count = 2;
   auto manager                      = initialize_memory_manager(tested_device_count);

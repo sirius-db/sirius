@@ -39,7 +39,7 @@ graph TD
 
 ## Ownership Hierarchy
 
-`SiriusContext` (`src/include/sirius_context.hpp`) is a `ClientContextState` subclass that owns the lifetime of all Sirius subsystems within a DuckDB connection:
+`SiriusContext` (`src/sirius_context.hpp`) is a `ClientContextState` subclass that owns the lifetime of all Sirius subsystems within a DuckDB connection:
 
 ```
 SiriusContext
@@ -140,17 +140,17 @@ A query through Super Sirius follows these steps:
 
 | File | Role |
 |------|------|
-| `src/include/sirius_context.hpp` | Ownership hierarchy, subsystem lifecycle |
+| `src/sirius_context.hpp` | Ownership hierarchy, subsystem lifecycle |
 | `src/sirius_extension.cpp` | Extension registration, table functions, config |
 | `src/sirius_interface.cpp` | DuckDB-facing API, query lifecycle |
 | `src/sirius_engine.cpp` | Pipeline construction, execution orchestration |
 | `src/planner/sirius_physical_plan_generator.cpp` | Logical-to-physical plan translation |
-| `src/include/pipeline/task_scheduler.hpp` | Top-level executor (owns GPU executors) |
-| `src/include/pipeline/gpu_pipeline_executor.hpp` | Per-GPU task executor |
-| `src/include/creator/task_creator.hpp` | Task creation and scheduling |
-| `src/include/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
-| `src/include/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
-| `src/include/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
-| `src/include/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
-| `src/include/downgrade/downgrade_executor.hpp` | Memory spilling |
-| `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory management |
+| `src/pipeline/task_scheduler.hpp` | Top-level executor (owns GPU executors) |
+| `src/pipeline/gpu_pipeline_executor.hpp` | Per-GPU task executor |
+| `src/creator/task_creator.hpp` | Task creation and scheduling |
+| `src/op/scan/sirius_gpu_scan_operator.hpp` | Unified GPU scan source operator |
+| `src/op/scan/gpu_ingestible.hpp` | Per-format split materialization (parquet, duckdb-native) |
+| `src/scan_manager/sirius_scan_manager.hpp` | Per-scan preparation, split providers, I/O ownership |
+| `src/io/io_context.hpp` | I/O backends (uring / rest / kvikio) + prefetch cache |
+| `src/downgrade/downgrade_executor.hpp` | Memory spilling |
+| `src/memory/sirius_memory_reservation_manager.hpp` | Memory management |

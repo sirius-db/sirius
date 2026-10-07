@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 
@@ -32,9 +33,13 @@ sirius_physical_streaming_source::sirius_physical_streaming_source(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
   std::shared_ptr<cucascade::shared_data_repository> input_repository,
-  std::set<exec::sender_id_t> expected_senders)
+  std::set<exec::sender_id_t> expected_senders,
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views,
+  scan::scan_contract_id contract_id)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::STREAMING_SOURCE, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::STREAMING_SOURCE, std::move(types), estimated_cardinality),
+    _read_views(std::move(read_views)),
+    _contract_id(contract_id)
 {
   if (!input_repository) {
     throw sirius::invalid_input_exception(
@@ -44,13 +49,21 @@ sirius_physical_streaming_source::sirius_physical_streaming_source(
     std::make_shared<exec::batch_stream>(std::move(input_repository), std::move(expected_senders));
 }
 
+scan::bound_table_scan const& sirius_physical_streaming_source::scan_contract() const
+{
+  if (!_read_views || _contract_id == 0) {
+    throw sirius::internal_exception("streaming source has no bound scan contract");
+  }
+  return scan::contract_of(*_read_views, _contract_id);
+}
+
 void sirius_physical_streaming_source::set_pipeline(
-  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+  std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
   sirius_physical_operator::set_pipeline(pipeline);
 
   // Weak: callbacks run on producer threads.
-  duckdb::weak_ptr<pipeline::sirius_pipeline> weak_pipeline = pipeline;
+  std::weak_ptr<pipeline::sirius_pipeline> weak_pipeline = pipeline;
 
   // Empty/late-closed stream finishes with no task in flight; original_pipeline=false re-arms
   // downstream consumers.
@@ -106,7 +119,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_i
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::execute(
-  const operator_data& input, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input, ::cuda::stream_ref /*stream*/)
 {
   const auto& pod = dynamic_cast<const pipelineable_operator_data&>(input);
   return std::make_unique<pipelineable_operator_data>(pod.get_data_batches());

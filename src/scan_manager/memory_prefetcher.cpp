@@ -92,7 +92,7 @@ void memory_prefetcher::worker_loop(std::size_t worker_index)
   // 0, and the compression converters allocate from the CURRENT device's
   // resource rather than the target space's.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
-  const rmm::cuda_stream_view stream = _worker_streams[worker_index];
+  const ::cuda::stream_ref stream = _worker_streams[worker_index];
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
     try {
@@ -120,7 +120,7 @@ void memory_prefetcher::worker_loop(std::size_t worker_index)
   }
 }
 
-std::size_t memory_prefetcher::sweep(rmm::cuda_stream_view stream)
+std::size_t memory_prefetcher::sweep(::cuda::stream_ref stream)
 {
   std::size_t converted = 0;
   const auto min_free_bytes =

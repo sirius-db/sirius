@@ -4,7 +4,7 @@ This document covers the GPU expression-evaluation subsystem used by FILTER and 
 
 ## Overview
 
-**File:** `src/include/expression_evaluator/expression_evaluator.hpp`
+**File:** `src/expression_evaluator/expression_evaluator.hpp`
 
 `expression_evaluator` evaluates expressions on the GPU using the Sirius AST type hierarchy (see [Sirius AST Type Hierarchy](#sirius-ast-type-hierarchy)). It provides two public table operations:
 
@@ -21,7 +21,7 @@ The evaluator can be constructed from a `duckdb::vector<std::unique_ptr<sirius::
 
 ## Sirius AST Type Hierarchy
 
-**Files:** `src/include/expression/ast/node.hpp`, `src/include/expression/ast/*.hpp`
+**Files:** `src/expression/ast/node.hpp`, `src/expression/ast/*.hpp`
 
 `sirius::ast::node` is a `std::variant`-based sum type over all Sirius expression node kinds. It is the sole expression representation passed across operator, planner, and evaluator boundaries, and the type the evaluator dispatches on via `std::visit`.
 
@@ -66,17 +66,17 @@ The alternative order is part of the ABI: `std::variant` indexes by position and
 
 | File | Purpose |
 |------|---------|
-| `src/include/expression/ast/node.hpp` | `sirius::ast::node` variant definition |
-| `src/include/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translator |
-| `src/include/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
-| `src/include/expression/value.hpp` | `sirius::value` — typed constant payload (INT8–DECIMAL128, VARCHAR, TIMESTAMP, …) |
-| `src/include/expression/function_id.hpp` | `sirius::function_id` closed enum of supported functions |
-| `src/include/expression/aggregate_id.hpp` | `sirius::aggregate_id` closed enum of supported aggregates |
-| `src/include/expression/join_condition.hpp` | `sirius::join_condition` — `{left, right, comparison}` with AST-node sides |
+| `src/expression/ast/node.hpp` | `sirius::ast::node` variant definition |
+| `src/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translator |
+| `src/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
+| `src/expression/value.hpp` | `sirius::value` — typed constant payload (INT8–DECIMAL128, VARCHAR, TIMESTAMP, …) |
+| `src/expression/function_id.hpp` | `sirius::function_id` closed enum of supported functions |
+| `src/expression/aggregate_id.hpp` | `sirius::aggregate_id` closed enum of supported aggregates |
+| `src/expression/join_condition.hpp` | `sirius::join_condition` — `{left, right, comparison}` with AST-node sides |
 
 ## Execution Strategies
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 The evaluator supports three strategies, selected via the `strategy` constructor parameter (default from `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`):
 
@@ -157,7 +157,7 @@ Anything outside this set is an AST breaker and forces materialization at that n
 
 ## GPU Expression Translator
 
-**File:** `src/include/expression_evaluator/gpu_expression_translator_internal.hpp`
+**File:** `src/expression_evaluator/gpu_expression_translator_internal.hpp`
 
 `gpu_expression_translator` is a **separate** utility that converts Sirius AST expressions into standalone cuDF AST trees for operators that need compiled expression evaluation outside the evaluator — primarily mixed joins and parquet filter pushdown.
 
@@ -200,14 +200,14 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 
 | File | Purpose |
 |------|---------|
-| `src/include/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
+| `src/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
-| `src/include/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
-| `src/include/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
-| `src/include/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
+| `src/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
+| `src/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |
+| `src/expression_evaluator/gpu_expression_translator_internal.hpp` | Sirius AST → cuDF AST translator (mixed joins, parquet pushdown) |
 | `src/expression_evaluator/gpu_expression_translator.cpp` | Translator implementation |
-| `src/include/expression/ast/node.hpp` | `sirius::ast::node` variant; per-alternative headers included from here |
-| `src/include/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translation |
-| `src/include/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
-| `src/include/expression/join_condition.hpp` | `sirius::join_condition` — AST-node sides + comparison operator |
+| `src/expression/ast/node.hpp` | `sirius::ast::node` variant; per-alternative headers included from here |
+| `src/expression/ast/from_duckdb.hpp` | `sirius::ast::from_duckdb` — DuckDB → Sirius AST translation |
+| `src/expression/ast/utils.hpp` | AST tree utilities — `visit_references`, `clone`, `substitute_references` |
+| `src/expression/join_condition.hpp` | `sirius::join_condition` — AST-node sides + comparison operator |

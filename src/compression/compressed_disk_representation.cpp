@@ -102,7 +102,7 @@ compressed_disk_representation::~compressed_disk_representation()
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_disk_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   auto& ms = const_cast<cucascade::memory::memory_space&>(get_memory_space());
   // Private (projection/clone) constructor: wrap `new` directly since

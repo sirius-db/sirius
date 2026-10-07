@@ -15,29 +15,40 @@
  */
 
 #include <catch.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <io/cache/types.hpp>
 #include <io/io_request.hpp>
 #include <io/types.hpp>
+#include <io/uring/config.hpp>
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 #include <sys/uio.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
+using sirius::io::file_descriptor;
 using sirius::io::grouped_coordinator;
+using sirius::io::grouped_io_request;
+using sirius::io::host_buffer;
 using sirius::io::IO_BLOCK_SIZE;
 using sirius::io::prepared_io_completion;
+using sirius::io::prepared_io_slice;
 using sirius::io::range;
 using sirius::io::cache::cached_chunk;
+using sirius::io::uring::local_io_object;
 using sirius::io::uring::max_dynamic_io_size;
 using sirius::io::uring::min_dynamic_io_size;
 using sirius::io::uring::uring_io_op;
@@ -68,6 +79,19 @@ class aligned_bytes {
  private:
   std::uint8_t* _data;
 };
+
+/** Consume @p future and report whether it carries the reactor's cancellation error. */
+bool canceled(sirius::exec::semi_future<std::size_t>&& future) noexcept
+{
+  auto result = std::move(future).get_try();
+  try {
+    std::move(result).get();
+  } catch (std::system_error const& error) {
+    return error.code() == std::errc::operation_canceled;
+  } catch (...) {
+  }
+  return false;
+}
 
 }  // namespace
 
@@ -266,4 +290,95 @@ TEST_CASE("io_uring alignment widens and coalesces safely", "[uring_readv]")
   REQUIRE(merged.size() == 1);
   CHECK(merged[0].offset() == 0);
   CHECK(merged[0].size() == 12'288);
+}
+
+TEST_CASE("io_uring staging reservation follows the byte budget, not the slot cap", "[uring_readv]")
+{
+  // 4 MiB blocks: the pre-budget sizing asked for 64 x 4 MiB = 256 MiB, which does not
+  // fit in this resource; the 64 MiB budget asks for 16 blocks, which does.
+  constexpr std::size_t block_size = 4UL << 20;
+  constexpr std::size_t capacity   = 128UL << 20;
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, capacity, capacity, block_size, 4, 0};
+
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+  uring_reactor reactor{ctx, ""};
+
+  REQUIRE_NOTHROW(reactor.start());
+  CHECK(mr.get_total_allocated_bytes() == (64UL << 20));
+  reactor.shutdown();
+}
+
+TEST_CASE("io_uring staging failure names the reactor and the requested bytes", "[uring_readv]")
+{
+  // A block larger than the budget clamps the slot count to one; the resource cannot
+  // serve even that single block.
+  constexpr std::size_t block_size = 128UL << 20;
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, 1UL << 20, 1UL << 20, block_size, 1, 0};
+
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+  uring_reactor reactor{ctx, ""};
+
+  REQUIRE_THROWS_WITH(
+    reactor.start(),
+    Catch::Matchers::ContainsSubstring(
+      "uring_reactor: cannot reserve 134217728 bytes of pinned staging (1 x 134217728)"));
+}
+
+TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[uring_readv]")
+{
+  // cancel_remaining() runs the slice callback and settles the coordinator inline, and a
+  // continuation may submit another read on the same reactor: enqueue() must have released
+  // _enqueue_mutex before it cancels, otherwise the re-entry relocks it on this thread.
+  constexpr std::size_t block_size = 4UL << 20;
+  constexpr std::size_t capacity   = 128UL << 20;
+
+  auto destination    = std::make_shared<std::array<std::uint8_t, 1>>();
+  auto outer_canceled = std::make_shared<bool>(false);
+  auto inner_canceled = std::make_shared<bool>(false);
+  auto finished       = std::make_shared<std::promise<void>>();
+  auto watchdog       = finished->get_future();
+
+  // Detached so that a re-entrant self-deadlock fails the watchdog instead of hanging the
+  // whole test binary.
+  std::thread([destination, outer_canceled, inner_canceled, finished] {
+    cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+    cucascade::memory::fixed_size_host_memory_resource mr{
+      0, upstream, capacity, capacity, block_size, 4, 0};
+
+    auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+    uring_reactor reactor{ctx, ""};
+    reactor.start();
+    reactor.shutdown();
+
+    auto submit = [&](std::shared_ptr<prepared_io_completion> on_complete) {
+      auto object =
+        std::make_shared<local_io_object>("/dev/null", file_descriptor{}, file_descriptor{}, 1);
+      auto coordinator = std::make_shared<grouped_coordinator>(1, 1);
+      auto future      = coordinator->get_future();
+      std::vector<prepared_io_slice> slices;
+      slices.emplace_back(range{0, 1}, host_buffer{destination->data()});
+      slices.back().on_complete = std::move(on_complete);
+      reactor.enqueue(
+        grouped_io_request::create(std::move(object), std::move(slices), std::move(coordinator)));
+      return future;
+    };
+
+    auto reenter =
+      std::make_shared<prepared_io_completion>([&](std::span<cached_chunk* const>, bool) noexcept {
+        *inner_canceled = canceled(submit(nullptr));
+      });
+
+    *outer_canceled = canceled(submit(std::move(reenter)));
+    finished->set_value();
+  }).detach();
+
+  REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  CHECK(*outer_canceled);
+  CHECK(*inner_canceled);
 }

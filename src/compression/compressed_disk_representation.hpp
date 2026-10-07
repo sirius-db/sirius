@@ -101,7 +101,7 @@ class compressed_disk_representation : public cucascade::idata_representation {
 
   /// Clone shares the same backing file (increments shared ownership; unlink deferred).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 

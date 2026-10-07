@@ -45,6 +45,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/types.hpp>
 
@@ -355,10 +356,7 @@ struct plan_tree_shape_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(_db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(_db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     // big_left is larger so the optimizer keeps small_right as the build side.
@@ -385,8 +383,6 @@ struct plan_tree_shape_fixture {
     con->Query("CREATE TABLE items (fk INTEGER, qty INTEGER)");
     con->Query("INSERT INTO items SELECT range % 500, range * 7 % 23 FROM range(10000)");
   }
-
-  ~plan_tree_shape_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   // Declared before db/con so the backing file outlives the database.
   scoped_temp_db_path _db_path;
@@ -421,9 +417,10 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   REQUIRE(create);
   REQUIRE_FALSE(create->HasError());
 
-  REQUIRE_THROWS_WITH(generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
-                      Catch::Contains("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
-                                      "carrier"));
+  REQUIRE_THROWS_WITH(
+    generate_sirius_plan(*con, "SELECT wide, narrow FROM mixed_schema"),
+    Catch::Matchers::ContainsSubstring("GPU scan output column 1 (DECIMAL(4,2)) has no native cuDF "
+                                       "carrier"));
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -1010,7 +1007,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types() == expected_local_types);
   }
 
-  SECTION("AVG preserves its DECIMAL local sum carrier below MERGE_AGGREGATE")
+  SECTION("AVG widens its DECIMAL local sum carrier to DECIMAL(38, scale) below MERGE_AGGREGATE")
   {
     auto plan = generate_sirius_plan(*con, "SELECT avg(amount) FROM decimal_values");
     INFO(tree_to_string(plan.get()));
@@ -1023,7 +1020,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto* local = merge->children[0].get();
     REQUIRE(local->type == SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE);
     REQUIRE(local->get_types().size() == 2);
-    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
+    CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(38, 2));
     CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
   }
 }
@@ -1157,7 +1154,7 @@ TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
 {
   duckdb::vector<sirius::logical_type> types;
   sirius::op::scan::sirius_gpu_scan_operator scan(
-    std::move(types), /*estimated_cardinality=*/0, /*ingestible=*/nullptr);
+    std::move(types), /*estimated_cardinality=*/0, /*ingestible=*/nullptr, /*contract_id=*/1);
 
   CHECK_NOTHROW(
     sirius::planner::sirius_physical_plan_generator::set_parent_ops(scan, /*parent=*/nullptr));
@@ -1423,27 +1420,28 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan generation rejects an untranslatable pushed-down table filter",
                  "[plan_tree_shape][table_filter][isolated_context]")
 {
-  duckdb::TableFunction function;
-  function.name                = "seq_scan";
-  function.projection_pushdown = true;
-  function.filter_pushdown     = true;
-
-  auto get = duckdb::make_uniq<duckdb::LogicalGet>(
-    0,
-    std::move(function),
-    nullptr,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT},
-    duckdb::vector<duckdb::string>{"id"});
-  get->SetColumnIds({duckdb::ColumnIndex(0)});
-  get->projection_ids        = {0};
-  get->estimated_cardinality = 1;
-  get->table_filters.filters[0] =
+  auto begin = con->Query("BEGIN TRANSACTION");
+  REQUIRE(begin);
+  REQUIRE_FALSE(begin->HasError());
+  auto logical = con->ExtractPlan("SELECT id FROM big_left");
+  REQUIRE(logical);
+  auto* scan = logical.get();
+  while (scan->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+    REQUIRE(scan->children.size() == 1);
+    scan = scan->children.front().get();
+  }
+  auto& get = scan->Cast<duckdb::LogicalGet>();
+  REQUIRE(get.function.name == "seq_scan");
+  get.table_filters.filters[0] =
     duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
 
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
-  CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
-                    Catch::Contains("Unsupported filter predicate on column 'id'"));
+  CHECK_THROWS_WITH(
+    generator.create_plan(std::move(logical)),
+    Catch::Matchers::ContainsSubstring("Unsupported filter predicate on column 'id'"));
+  auto rollback = con->Query("ROLLBACK");
+  REQUIRE(rollback);
+  REQUIRE_FALSE(rollback->HasError());
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
@@ -1493,4 +1491,51 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   std::vector<const sirius_physical_operator*> found;
   sirius::planner::collect_gpu_scans(*plan, found);
   CHECK(found.size() == expected.size());
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
+                 "[plan_tree_shape][union_all][isolated_context]")
+{
+  // Each arm's sink must declare the union's schema. A materialized CTE declares its
+  // materialization side instead, so copying the arm's `types` misdeclares the sink's width --
+  // which `validate_operator_output_types` only warns about, so no end-to-end test can see it.
+  auto require_sinks_match_union = [&](const std::string& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+
+    auto* union_op = find_first(plan.get(), SiriusPhysicalOperatorType::UNION);
+    REQUIRE(union_op != nullptr);
+    REQUIRE(union_op->children.size() == 2);
+
+    // The premise, pinned: the arm is really a CTE node and its width really differs from the
+    // union's, or the sink would be right by accident. DuckDB's unused-column optimizer prunes the
+    // materialization down to what the body reads and can collapse these queries silently. If this
+    // fires, reshape so the definition is unprunable or the body widens; do not relax it.
+    auto* cte = find_first(plan.get(), SiriusPhysicalOperatorType::CTE);
+    REQUIRE(cte != nullptr);
+    INFO("cte width=" << cte->types.size() << " union width=" << union_op->types.size());
+    REQUIRE(cte->types.size() != union_op->types.size());
+
+    for (auto& child : union_op->children) {
+      REQUIRE(child->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+      CHECK(child->types == union_op->types);
+    }
+  };
+
+  // Definition wider than the arity: the self-join on `other` keeps it from being pruned to `rid`.
+  require_sinks_match_union(
+    "SELECT id FROM big_left UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT rid, other FROM small_right) "
+    " SELECT m1.rid FROM m m1 JOIN m m2 ON m1.other = m2.other)");
+
+  // Definition narrower: the body widens with a computed column the materialization never held.
+  require_sinks_match_union(
+    "SELECT id, id * 2 FROM big_left UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m)");
+
+  // The CTE as arm 0, so `op.types` is routed through the CTE's own body resolution.
+  require_sinks_match_union(
+    "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
+    "UNION ALL SELECT id, id * 2 FROM big_left");
 }

@@ -23,6 +23,7 @@
 #include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -73,7 +74,16 @@ struct temp_data_file {
   }
 };
 
-/// Pull `global[... evictions=N ...]` out of prefetching_cache::summary().
+/// Pull a counter out of `global[...]` in prefetching_cache::summary().
+std::uint64_t global_counter(std::string const& summary, std::string const& name)
+{
+  std::smatch m;
+  auto const re = std::regex("global\\[[^\\]]*" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) { return 0; }
+  return std::stoull(m[1].str());
+}
+
+/// Pull the eviction count out of prefetching_cache::summary().
 std::uint64_t evictions_from(std::string const& summary)
 {
   std::smatch m;
@@ -95,6 +105,21 @@ std::uint64_t evictions_within(sirius::io::cache::prefetching_cache& cache,
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   return seen;
+}
+
+/// Poll rather than sleep once: the evictor is a background thread, so a sweep
+/// that is merely slow must not read as one that never happened.
+std::size_t claimed_after_sweep(sirius::io::cache::prefetching_cache& cache,
+                                std::size_t before,
+                                std::chrono::milliseconds budget)
+{
+  auto const deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto const now = cache.claimed_bytes();
+    if (now < before) { return now; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return cache.claimed_bytes();
 }
 
 scan_manager_config dispose_on_idle_config()
@@ -134,7 +159,7 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
     // chunks it names -- so without this call there is no buffer to reclaim and
     // the evictor correctly evicts nothing.
     REQUIRE(ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
-  }  // ~sirius_datasource -> ~prefetching_handle -> the consumer is disposed
+  }  // ~sirius_datasource -> ~cache_handle -> the consumer is disposed
 
   // The evictor only sweeps when a request reaches it, so a second insert is
   // what gives the disposed request its sweep. Reclaiming
@@ -150,4 +175,105 @@ TEST_CASE("dispose_on_idle reclaims a disposed request's chunks on the next swee
 
   INFO("cache: " << cache->summary());
   CHECK(evictions_within(*cache, std::chrono::milliseconds(2000)) > 0);
+}
+
+TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][eviction][dispose]")
+{
+  constexpr std::size_t file_bytes = 32ull << 20;
+  temp_data_file file(file_bytes);
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_dispose();
+
+  sirius_scan_manager manager{dispose_on_idle_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+
+  // A single prepared byte measures the cache's chunk size, so the ranges below
+  // can be laid out in whole chunks whatever the host allocator's block size
+  // is.  The probe stays alive for the rest of the test: its chunk keeps a
+  // subscriber, so no sweep may touch it and it is a constant in every total.
+  auto probe = manager.create_datasource(file.path.string());
+  REQUIRE(probe != nullptr);
+  std::vector<cudf::io::text::byte_range_info> probe_range;
+  probe_range.emplace_back(0, 1);
+  probe->fadvise(probe_range, 0);
+  REQUIRE(probe->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  auto const chunk = cache->claimed_bytes();
+  REQUIRE(chunk > 0);
+  REQUIRE(6 * chunk <= file_bytes);
+
+  // Two requests on the same file, overlapping on exactly one chunk -- what
+  // adjacent parquet splits of one file do to their boundary chunk.
+  std::vector<cudf::io::text::byte_range_info> first;
+  first.emplace_back(static_cast<std::int64_t>(chunk), static_cast<std::int64_t>(2 * chunk));
+  auto ds1 = manager.create_datasource(file.path.string());
+  REQUIRE(ds1 != nullptr);
+  ds1->fadvise(first, 0);
+  REQUIRE(ds1->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+
+  std::vector<cudf::io::text::byte_range_info> second;
+  second.emplace_back(static_cast<std::int64_t>(2 * chunk), static_cast<std::int64_t>(2 * chunk));
+  auto ds2 = manager.create_datasource(file.path.string());
+  REQUIRE(ds2 != nullptr);
+  ds2->fadvise(second, 0);
+  REQUIRE(ds2->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+
+  // Probe plus chunks 1, 2 and 3 -- the shared chunk 2 is claimed once.
+  REQUIRE(cache->claimed_bytes() == 4 * chunk);
+
+  ds1.reset();  // ~sirius_datasource -> ~cache_handle -> the consumer is disposed
+
+  // The evictor only sweeps when a request reaches it, so a fresh insert is
+  // what gives the disposed request its sweep.  fadvise alone claims no
+  // buffers, so this one does not move the totals.
+  std::vector<cudf::io::text::byte_range_info> untouched;
+  untouched.emplace_back(static_cast<std::int64_t>(5 * chunk), static_cast<std::int64_t>(chunk));
+  auto ds3 = manager.create_datasource(file.path.string());
+  REQUIRE(ds3 != nullptr);
+  ds3->fadvise(untouched, 0);
+
+  // Only chunk 1 went idle: chunk 2 is still named by ds2, and `idle` reclaims
+  // a chunk when it is idle -- not when one of several subscribers lets go.
+  INFO("cache: " << cache->summary());
+  CHECK(claimed_after_sweep(*cache, 4 * chunk, std::chrono::milliseconds(2000)) == 3 * chunk);
+}
+
+TEST_CASE("scan inputs populate the cache without a readahead manager",
+          "[cache][scan][no_readahead]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory             = initialize_memory_manager(1);
+  auto topology           = single_gpu_index_for_dispose();
+  auto cfg                = dispose_on_idle_config();
+  cfg.cache.eviction      = sirius::io::cache::eviction_policy::lru;
+  cfg.max_readahead_scans = 0;
+  cfg.apply_cache_mode();
+  sirius_scan_manager manager{cfg, *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+
+  auto make_input = [&]() {
+    auto ds = manager.create_datasource(file.path.string());
+    std::vector<sirius::op::scan::scan_info::fadvise_entry> hints;
+    hints.push_back({ds, {cudf::io::text::byte_range_info{0, 4096}}});
+    auto info = std::make_shared<sirius::op::scan::scan_info>(std::move(hints));
+    return std::pair{ds, std::make_unique<sirius::op::scan::scan_operator_input>(info)};
+  };
+
+  auto [first_ds, first_input] = make_input();
+  // A later readahead preparation of the same handle is idempotent.
+  REQUIRE(first_ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  REQUIRE(first_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes.front() == static_cast<std::uint8_t>('z'));
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "h2d") > 0);
+
+  first_input.reset();
+  auto [second_ds, second_input] = make_input();
+  REQUIRE(second_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "hits") > 0);
 }

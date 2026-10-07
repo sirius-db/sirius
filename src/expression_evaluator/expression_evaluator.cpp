@@ -32,8 +32,9 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <memory>
@@ -138,7 +139,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_result::release_col
 expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -159,7 +160,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   sirius::ast::node const& expression,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -177,7 +178,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   sirius::ast::node const* expression,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -195,7 +196,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   std::vector<sirius::ast::node const*> expressions,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -368,7 +369,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select(
       "all-columns select() overload for count(*)-style filters with no output columns");
   }
   auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(
+  return ApplyRetentionMask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 }
 
@@ -384,7 +385,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
   // ONE mask, used twice: the survivors must be exactly the rows the output
   // holds, so computing the predicate a second time would risk two answers.
   auto mask     = compute_mask(input);
-  auto selected = cudf::apply_boolean_mask(
+  auto selected = ApplyRetentionMask(
     input.select(output_indices.begin(), output_indices.end()), mask->view(), _stream, _mr);
 
   auto const rows = input.num_rows();
@@ -394,7 +395,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
                                   _stream,
                                   _mr);
   auto surviving =
-    cudf::apply_boolean_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
+    ApplyRetentionMask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
   survivors = std::make_unique<cudf::column>(surviving->get_column(0), _stream, _mr);
   return selected;
 }
@@ -402,7 +403,7 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
 std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
 {
   auto mask = compute_mask(input);
-  return cudf::apply_boolean_mask(input, mask->view(), _stream, _mr);
+  return ApplyRetentionMask(input, mask->view(), _stream, _mr);
 }
 
 evaluate_result expression_evaluator::evaluate(sirius::ast::aggregate const& /*expr*/,

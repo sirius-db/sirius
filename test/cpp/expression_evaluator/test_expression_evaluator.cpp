@@ -118,7 +118,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   auto size   = static_cast<cudf::size_type>(values.size());
 
   auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
 
   cudf::size_type null_count = 0;
   for (cudf::size_type i = 0; i < size; ++i) {
@@ -157,7 +157,7 @@ std::shared_ptr<data_batch> make_two_int32_batch_with_nulls(memory_space& space,
 
   auto make_col = [&](const std::vector<int32_t>& values, const std::vector<bool>& valids) {
     auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-    auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+    auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
     cudf::size_type null_count = 0;
     for (cudf::size_type i = 0; i < size; ++i) {
       if (!valids[i]) {
@@ -1116,6 +1116,59 @@ TEMPLATE_TEST_CASE("evaluate projects references, constants, and comparisons",
       expected_cmp.push_back(v == "str_3" ? 1U : 0U);
     }
     REQUIRE(copy_bool_column_to_host(ov.column(2)) == expected_cmp);
+  }
+}
+
+TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
+                   "[expression_evaluator][scalar_cast]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const hugeint = logical_type::make(type_id::HUGEINT);
+  auto const bigint  = logical_type::make(type_id::BIGINT);
+  auto const integer = logical_type::make(type_id::INTEGER);
+
+  for (auto const row_count : {0, 1, 7}) {
+    CAPTURE(row_count);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                row_count,
+                                                cudf::mask_state::UNALLOCATED,
+                                                cudf::get_default_stream(),
+                                                get_resource_ref(*space)));
+    auto input = std::make_unique<cudf::table>(std::move(columns));
+
+    std::vector<std::unique_ptr<ast_node>> nodes;
+    nodes.push_back(make_cast(make_int_const(-42), hugeint, false));
+    // The outer AST cast consumes the materialized HUGEINT cast as a temporary column.
+    nodes.push_back(make_cast(make_cast(make_int_const(1), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_null_const(integer), hugeint, false));
+    nodes.push_back(make_cast(make_cast(make_null_const(integer), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_int_const(42), logical_type::make(type_id::DOUBLE), false));
+    std::vector<ast_node const*> expressions;
+    for (auto const& node : nodes) {
+      expressions.push_back(node.get());
+    }
+    exp_executor executor(
+      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
+    auto output     = executor.evaluate(input->view());
+    auto const view = output->view();
+    REQUIRE(view.num_rows() == row_count);
+    REQUIRE(view.num_columns() == 5);
+    for (int i = 0; i < 4; ++i) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
+    }
+    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
+    REQUIRE(view.column(0).null_count() == 0);
+    REQUIRE(view.column(1).null_count() == 0);
+    REQUIRE(view.column(2).null_count() == row_count);
+    REQUIRE(view.column(3).null_count() == row_count);
+    REQUIRE(view.column(4).type() == cudf::data_type{cudf::type_id::FLOAT64});
+    REQUIRE(copy_column_to_host<double>(view.column(4)) == std::vector<double>(row_count, 42.0));
   }
 }
 
@@ -2325,6 +2378,77 @@ TEMPLATE_TEST_CASE("select OR conjunction",
     if (v < 3 || v > 17) { expected.push_back(v); }
   }
   REQUIRE(copy_column_to_host<int32_t>(ov.column(0)) == expected);
+}
+
+TEMPLATE_TEST_CASE("evaluate conjunction with scalar children",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  auto input =
+    make_input_batch(*space, {cudf::data_type{cudf::type_id::INT32}}, {std::pair<int, int>{0, 20}});
+
+  auto const boolean = logical_type::make(type_id::BOOLEAN);
+  auto bool_const    = [&](bool v) {
+    return std::make_unique<ast_node>(sirius::ast::constant{sirius::value{v}, boolean});
+  };
+  auto null_const = [&] { return make_null_const(boolean); };
+  auto cmp  = [] { return make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(17)); };
+  auto conj = [](sirius::ast::conjunction::kind kind, auto... children) {
+    std::vector<std::unique_ptr<ast_node>> v;
+    (v.push_back(std::move(children)), ...);
+    return make_conj(kind, std::move(v));
+  };
+  auto constexpr op_or  = sirius::ast::conjunction::kind::op_or;
+  auto constexpr op_and = sirius::ast::conjunction::kind::op_and;
+
+  std::vector<std::unique_ptr<ast_node>> exprs;
+  exprs.push_back(conj(op_or, cmp(), null_const()));                     // col0 > 17 OR NULL
+  exprs.push_back(conj(op_or, null_const(), cmp()));                     // NULL OR col0 > 17
+  exprs.push_back(conj(op_and, cmp(), null_const()));                    // col0 > 17 AND NULL
+  exprs.push_back(conj(op_or, cmp(), bool_const(true)));                 // col0 > 17 OR TRUE
+  exprs.push_back(conj(op_and, bool_const(false), cmp()));               // FALSE AND col0 > 17
+  exprs.push_back(conj(op_or, null_const(), bool_const(false), cmp()));  // NULL OR FALSE OR ...
+
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, std::move(exprs), strategy);
+  REQUIRE(ov.num_columns() == 6);
+  auto const in0 = copy_column_to_host<int32_t>(iv.column(0));
+
+  // Kleene logic: TRUE OR NULL = TRUE, FALSE AND NULL = FALSE, otherwise NULL.
+  std::vector<bool> or_null_valid, and_null_valid;
+  std::vector<uint8_t> gt;
+  for (auto v : in0) {
+    gt.push_back(v > 17 ? 1U : 0U);
+    or_null_valid.push_back(v > 17);
+    and_null_valid.push_back(v <= 17);
+  }
+  auto values_where = [](std::vector<uint8_t> values, std::vector<bool> const& valid) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (!valid[i]) { values[i] = 0; }
+    }
+    return values;
+  };
+  auto check = [&](int col, std::vector<uint8_t> const& expected, std::vector<bool> const& valid) {
+    CAPTURE(col);
+    REQUIRE(ov.column(col).type() == cudf::data_type{cudf::type_id::BOOL8});
+    auto const valids = copy_valids_to_host(ov.column(col));
+    REQUIRE(valids == valid);
+    REQUIRE(values_where(copy_bool_column_to_host(ov.column(col)), valid) ==
+            values_where(expected, valid));
+  };
+
+  auto const all_valid = std::vector<bool>(in0.size(), true);
+  check(0, gt, or_null_valid);
+  check(1, gt, or_null_valid);
+  check(2, gt, and_null_valid);
+  check(3, std::vector<uint8_t>(in0.size(), 1U), all_valid);
+  check(4, std::vector<uint8_t>(in0.size(), 0U), all_valid);
+  check(5, gt, or_null_valid);
 }
 
 // ---------------------------------------------------------------------------

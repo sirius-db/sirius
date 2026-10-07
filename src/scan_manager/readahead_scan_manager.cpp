@@ -16,7 +16,6 @@
 
 #include "scan_manager/readahead_scan_manager.hpp"
 
-#include "io/prefetch_census.hpp"
 #include "io/sirius_datasource.hpp"
 #include "log/logging.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
@@ -27,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <format>
 #include <memory>
 #include <optional>
@@ -53,7 +53,9 @@ void readahead_scan_manager::prepare_for_query(const sirius::planner::query& que
   }
 }
 
-void readahead_scan_manager::on_task_deployed(query_id_t,
+void readahead_scan_manager::on_task_deployed(event::event_id_t,
+                                              event::timestamp_t,
+                                              query_id_t,
                                               std::size_t,
                                               op::SiriusPhysicalOperatorType operator_type,
                                               int) noexcept
@@ -66,27 +68,23 @@ void readahead_scan_manager::on_task_deployed(query_id_t,
   arm_prefetching();
 }
 
-void readahead_scan_manager::on_memory_downgrade_for_task(query_id_t,
-                                                          std::size_t,
-                                                          int,
-                                                          std::size_t) noexcept
+void readahead_scan_manager::on_memory_downgrade_for_task(
+  event::event_id_t, event::timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept
 {
   // The executor is spilling to make room, so the GPU does no work for the
   // duration and the device's IO path is unambiguously free.
   arm_prefetching();
 }
 
-void readahead_scan_manager::on_wait_for_memory_for_task(query_id_t,
-                                                         std::size_t,
-                                                         int,
-                                                         std::size_t) noexcept
+void readahead_scan_manager::on_wait_for_memory_for_task(
+  event::event_id_t, event::timestamp_t, query_id_t, std::size_t, int, std::size_t) noexcept
 {
   // Parked waiting on memory somebody else holds: same idle GPU as a downgrade,
   // arrived at differently.
   arm_prefetching();
 }
 
-void readahead_scan_manager::on_task_queue_empty() noexcept
+void readahead_scan_manager::on_task_queue_empty(event::event_id_t, event::timestamp_t) noexcept
 {
   // Nothing is waiting to be dispatched, so whatever the executor is doing it is
   // not about to read.  The strongest idle signal there is.
@@ -98,13 +96,18 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   // A backend that publishes a zero budget has opted out; running a worker that
   // can never issue anything would just be a thread parked on a condvar.
   if (_budget == 0) { return; }
-  _strategy    = strategy;
-  _stop_source = std::stop_source{};
+  // Start-once.  A second call while the worker runs would move a fresh jthread
+  // over the live one, and that move joins a worker whose stop token nothing
+  // ever requests -- the worker watches @c _stop_source, not the jthread's own
+  // source.  After @ref stop the gate is shut for good and the event subscriber
+  // is torn down, so a second worker could only spin without issuing anything.
+  if (is_running() || _stop_source.stop_requested()) { return; }
+  _strategy = strategy;
   _prefetch_worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
-  // Only now start draining the stage-manager mailbox: the hooks below arm
+  // Only now start draining the event-publisher mailbox: the hooks below arm
   // prefetching, and there must be a worker for them to arm.
-  exec::query_stage_listener::start();
+  event::query_event_subscriber::start();
 
   // Eager does not wait to be invited: it reads ahead as far as the budget
   // allows from the moment there is anything to read.  Opportunistic stays
@@ -116,8 +119,9 @@ void readahead_scan_manager::stop() noexcept
 {
   // First, so no hook can be dispatched into this object -- or re-arm the
   // prefetching we are about to tear down -- while the rest of teardown runs.
-  exec::query_stage_listener::stop();
+  event::query_event_subscriber::stop();
   _stop_source.request_stop();
+  _disposable_cv.notify_all();
   // Cuts short the worker's wait for a ticket, which is otherwise the one place
   // teardown can sit for a full timeout -- and a ticket handed out now would
   // only buy a prefetch that is about to be abandoned.
@@ -228,6 +232,11 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   if (stage == io::cache::scan_stage::disposed) {
     // The read is over, so give the ticket back -- paying down any debt first.
     if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
+    {
+      std::lock_guard lock(_disposable_mutex);
+      ++_disposable_generation;
+    }
+    _disposable_cv.notify_all();
   }
 }
 
@@ -304,28 +313,64 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_slot_wait = std::chrono::milliseconds{100};
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
-  // How long to let the evictor work before asking the pool again.
-  constexpr auto k_memory_retry = std::chrono::milliseconds{20};
+  // Bound the wait for a disposal notification. The timeout is also a recovery
+  // path for a coalesced or missed notification.
+  constexpr auto k_memory_retry = std::chrono::milliseconds{25};
 
   // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
   // the prefetch was issued -- which is also whether the completion has taken
   // ownership of the slot.
   auto try_issue = [&](prefetch_candidate const& candidate) {
+    bool evict_on_failure = false;
     while (!st.stop_requested()) {
-      auto const prep = candidate.task->prepare_for_prefetching(/*wait_for_eviction=*/true);
-      if (prep.ready()) {
-        candidate.task->prefetch([weak  = weak_from_this(),
-                                  op_id = candidate.operator_id,
-                                  split = std::weak_ptr{candidate.task}](
-                                   op::scan::scan_info::prefetch_outcome out) noexcept {
-          // weak, not shared: a completion firing after the query tore the
-          // manager down must not resurrect it.
-          if (auto self = weak.lock()) {
-            self->on_prefetch_complete(
-              op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
-          }
-        });
-        return true;
+      if (candidate.task->has_fallen_behind()) {
+        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+        return false;
+      }
+
+      std::uint64_t disposal_generation = 0;
+      {
+        std::lock_guard lock(_disposable_mutex);
+        disposal_generation = _disposable_generation;
+      }
+      bool const attempted_eviction = evict_on_failure;
+      op::scan::scan_info::prepare_outcome prep;
+      // This runs on a jthread, so an escaping exception is std::terminate for
+      // the whole process -- far too much for a best-effort prefetcher.  Both
+      // calls allocate (the fan-in completion here, the evictor's latch inside
+      // prepare), so bad_alloc is reachable exactly when the readahead is
+      // earning its keep.  A throw is treated as "not issued": prefetch can only
+      // throw before its prefetch_completion exists, because everything from
+      // there on is noexcept and the report is what hands the slot over, so the
+      // slot is still the worker's and returning false releases it exactly once.
+      try {
+        prep = candidate.task->prepare_for_prefetching(evict_on_failure);
+        if (prep.ready()) {
+          candidate.task->prefetch([weak  = weak_from_this(),
+                                    op_id = candidate.operator_id,
+                                    split = std::weak_ptr{candidate.task}](
+                                     op::scan::scan_info::prefetch_outcome out) noexcept {
+            // weak, not shared: a completion firing after the query tore the
+            // manager down must not resurrect it.
+            if (auto self = weak.lock()) {
+              self->on_prefetch_complete(
+                op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
+            }
+          });
+          return true;
+        }
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+        return false;
+      } catch (...) {
+        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+        return false;
+      }
+      if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
+        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+        return false;
       }
       // Nothing was refused for want of memory, so there is nothing to wait for:
       // this split has no request to prepare at all.
@@ -337,11 +382,17 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       // unless the consumer reached the split meanwhile, in which case a
       // prefetch would only duplicate the read it is already doing.
       _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
-      std::this_thread::sleep_for(k_memory_retry);
-      if (candidate.task->has_fallen_behind()) {
-        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
-        return false;
-      }
+      evict_on_failure = true;
+      // The first failure immediately advances to a synchronous-eviction
+      // attempt. Only a failed attempt that already processed eviction waits
+      // for another scan to become disposable (or the bounded timer).
+      if (!attempted_eviction) { continue; }
+
+      std::unique_lock lock(_disposable_mutex);
+      _disposable_cv.wait_for(lock, k_memory_retry, [&] {
+        return st.stop_requested() || candidate.task->has_fallen_behind() ||
+               _disposable_generation != disposal_generation;
+      });
     }
     // Stopped mid-preparation: the pool never satisfied it.
     _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
@@ -380,12 +431,13 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   }
 }
 
-void readahead_scan_manager::reset() { stop(); }
-
 void readahead_scan_manager::arm_prefetching()
 {
-  // Once: reloading a live gatekeeper would forget how much the executor is
-  // currently competing and hand the readahead a budget it has already spent.
+  // Once: reload() adds the budget to the count, so a second arming would
+  // double it.  Adding rather than assigning is what keeps the tickets the
+  // executor borrowed before this point on the books -- those reads are still
+  // in flight and will return them, so the readahead must not be handed a full
+  // allowance on top.
   //
   // This is also the only arming there is -- the gatekeeper starts with no
   // tickets, so the worker's acquire simply times out until this runs.

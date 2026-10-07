@@ -30,12 +30,15 @@
 
 // sirius
 #include <io/kvikio/kvikio_context.hpp>
+#include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
 // duckdb
 #include <duckdb.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/null_filter.hpp>
 
 // standard library
@@ -199,4 +202,50 @@ TEST_CASE_METHOD(NullCountFixture,
                  "[scan][parquet][pruning][null_count]")
 {
   REQUIRE(surviving_row_groups(/*filter_expects_null=*/false) == 2);
+}
+
+TEST_CASE_METHOD(NullCountFixture,
+                 "parquet virtual provenance keeps the original offset after stats pruning",
+                 "[scan][parquet][pruning][virtual_columns]")
+{
+  auto info        = make_info(std::nullopt);
+  info->column_ids = {
+    duckdb::ColumnIndex(0),
+    duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER)};
+  info->scan_output_arity = 2;
+  info->virtual_columns   = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                              "file_row_number",
+                              sirius::logical_type::make(sirius::type_id::BIGINT),
+                              scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER}};
+  auto filters            = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto lower_third_rg     = duckdb::make_uniq<duckdb::ConstantFilter>(
+    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::INTEGER(4097));
+  filters->PushFilter(duckdb::ColumnIndex(0), std::move(lower_third_rg));
+  info->table_filters = std::move(filters);
+
+  auto ingestible = scan::make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto task       = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(task);
+  auto file_info = task();
+  auto* file     = dynamic_cast<scan::parquet_file_scan_info*>(file_info.get());
+  REQUIRE(file);
+  REQUIRE(file->row_groups.size() == 1);
+  CHECK(file->row_groups.front().index == 2);
+
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(file_info));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail) {
+    splits.push_back(std::move(split));
+  }
+  REQUIRE(splits.size() == 1);
+  auto* split = dynamic_cast<scan::parquet_split_info*>(splits.front().get());
+  REQUIRE(split);
+  auto layout = scan::build_batch_layout(*split);
+  REQUIRE(layout.size() == 1);
+  CHECK(layout.front().file_row_offset == 4096);
+  CHECK(layout.front().num_rows == 2048);
+  CHECK(layout.front().file_index == 0);
 }

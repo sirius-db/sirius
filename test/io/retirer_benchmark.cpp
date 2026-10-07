@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// retirer_benchmark — stream_ordered_retirer vs. event + retirement thread pool.
+// retirer_benchmark — cuda_event_completion_poll vs. event + retirement thread pool.
 //
 // The question: the retirer has no thread of its own.  State only advances when
 // somebody calls drain(), which happens on the submitter as it comes back round
@@ -60,7 +60,7 @@
 // own right.  Both arms copy the same bytes on the same streams, so only the
 // DIFFERENCE between the arms is meaningful.
 
-#include "exec/stream_ordered_retirer.hpp"
+#include "exec/cuda_event_completion_poll.hpp"
 
 #include <cuda_runtime.h>
 
@@ -353,14 +353,14 @@ void retire_batch(chunk_table& chunks,
 }
 
 // ---------------------------------------------------------------------------
-// arm A — stream_ordered_retirer
+// arm A — cuda_event_completion_poll
 // ---------------------------------------------------------------------------
 
 run_stats run_retirer(fixture& fx, chunk_table& chunks, std::size_t staging_blocks)
 {
   chunks.reset();
   block_pool pool{fx.staging(staging_blocks)};
-  sirius::exec::stream_ordered_retirer retirer;
+  sirius::exec::cuda_event_completion_poll retirer;
 
   std::vector<double> lag_ms(N_BATCHES, 0.0);
   std::vector<clock_type::time_point> committed_at(N_BATCHES);

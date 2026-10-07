@@ -17,12 +17,14 @@
 #include "io/rest/rest_reactor.hpp"
 
 #include "cucascade/cuda/event.hpp"
+#include "exec/thread_util.hpp"
 #include "io/details/slot_pool.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -44,6 +46,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -282,7 +285,11 @@ std::chrono::seconds presign_ttl(const config& cfg) noexcept
 }
 
 /// Apply per-request TLS + timeout options on top of configure_easy_handle.
-void apply_request_opts(CURL* h, const config& cfg)
+/// @p data_transfer selects the time bound: a data GET can be as large as the
+/// cache block size, so it is bounded by the stall detector (a GET that keeps
+/// delivering bytes is never cut off, however long it takes); everything else is
+/// bounded by the whole-request timeout.
+void apply_request_opts(CURL* h, const config& cfg, bool data_transfer = false)
 {
   if (!cfg.ca_bundle_path.empty()) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, cfg.ca_bundle_path.c_str()));
@@ -291,7 +298,12 @@ void apply_request_opts(CURL* h, const config& cfg)
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L));
   }
-  if (cfg.request_timeout_s > 0) {
+  if (data_transfer) {
+    // Clears the whole-transfer default configure_easy_handle set.
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, cfg.stall_speed_limit_bytes));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, cfg.stall_time_s));
+  } else if (cfg.request_timeout_s > 0) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, cfg.request_timeout_s));
   }
 }
@@ -419,6 +431,12 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
     throw std::runtime_error("rest_reactor: fragmented read requires a cache block size");
   }
 
+  // A cache fill is completed atomically at chunk granularity: the completion
+  // callback publishes the whole chunk after its physical operation succeeds.
+  // Keep the normal 16 MiB REST target, but allow one indivisible fill to grow
+  // to the configured cache block size.
+  auto const max_segment_bytes = std::max(rest_max_segment_bytes, cache_block_size);
+
   std::vector<range> result;
   range current{};
   for (auto* chunk : slice.h_buffer.fragments()) {
@@ -429,17 +447,16 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
       cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
     auto const fill = range{fill_lo, fill_hi - fill_lo};
     if (fill.empty()) continue;
-    if (fill.size > rest_max_segment_bytes) {
+    if (fill.size > max_segment_bytes) {
       throw std::runtime_error("rest_reactor: one cache fill exceeds the REST segment maximum");
     }
 
     bool const contiguous = !current.empty() && current.end() == fill.offset;
-    bool const fits =
-      current.size <= rest_max_segment_bytes - std::min(fill.size, rest_max_segment_bytes);
+    bool const fits = current.size <= max_segment_bytes - std::min(fill.size, max_segment_bytes);
     if (current.empty()) {
       current = fill;
     } else if (contiguous && current.size < target && fits &&
-               current.size + fill.size <= rest_max_segment_bytes) {
+               current.size + fill.size <= max_segment_bytes) {
       current.size += fill.size;
     } else {
       result.push_back(current);
@@ -463,7 +480,7 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
     result.push_back(iovec{base + (io_rng.offset - slice.rng.offset), io_rng.size});
     return result;
   }
-  if (slice.is_staged()) return result;
+  if (slice.needs_staging()) return result;
 
   std::size_t covered = 0;
   for (auto* chunk : slice.h_buffer.fragments()) {
@@ -575,7 +592,7 @@ void rest_reactor::start()
   }
   if (!_tname.empty()) {
     auto const full_name = _tname + "_worker";
-    pthread_setname_np(_worker.native_handle(), full_name.c_str());
+    std::ignore          = sirius::exec::thread_util::set_thread_name(_worker, full_name);
   }
 }
 
@@ -1079,7 +1096,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                             worker_share.get(),
                             upkeep_ms,
                             static_cast<long>(_config.conn_max_age.count()));
-      apply_request_opts(handle.get(), _config);
+      apply_request_opts(handle.get(), _config, /*data_transfer=*/true);
       SIRIUS_CURL_CHECK(curl_easy_setopt(
         handle.get(), CURLOPT_PRIVATE, reinterpret_cast<void*>(static_cast<std::intptr_t>(i))));
       slots[i].easy = std::move(handle);
@@ -1276,7 +1293,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         // Only staged device reads are fused: their host side is reactor-owned, so
         // one staging allocation can back every constituent. A caller-owned host
         // destination would have to be scattered into, which this does not do.
-        if (!sl.is_staged() || !sl.has_device_request()) return false;
+        if (!sl.needs_staging() || !sl.has_device_request()) return false;
         lo = std::min(lo, sl.rng.offset);
         hi = std::max(hi, sl.rng.offset + sl.rng.size);
       }
@@ -1338,7 +1355,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       auto slice            = active_group->take_front();
       auto const slice_size = slice.size();
       try {
-        if (slice.is_staged() && !slice.has_device_request()) {
+        if (slice.needs_staging() && !slice.has_device_request()) {
           throw std::invalid_argument("rest_reactor: a staged read must have a device destination");
         }
         auto const* file = dynamic_cast<rest_io_object const*>(active_group->obj.get());
@@ -1402,7 +1419,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
           auto request           = std::make_unique<rest_io_op_request>();
           request->object        = file->get_object_ref();
-          request->needs_staging = slice.is_staged();
+          request->needs_staging = slice.needs_staging();
           request->logical_bytes = intersect(slice.rng, io_rng).size;
           logical_bytes += request->logical_bytes;
           request->op = std::move(op);
@@ -1460,9 +1477,8 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             return std::unique_ptr<rest_io_op_request>{};
           }
           if (active_group == nullptr) continue;
-          // An empty group would park this reactor: expand_active() returns early
-          // on one without clearing it, so active_group would never go null again
-          // and no further group would ever be dequeued.
+          // A group that arrives with no slices owes no completions; leaving it
+          // in place would spin here forever because expand_active is a no-op.
           if (active_group->empty()) {
             active_group.reset();
             continue;
@@ -1529,6 +1545,18 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                                      curl_multi_strerror(status));
           }
           ++inflight;
+        } catch (rmm::out_of_memory const& e) {
+          // Pinned staging is shared with the prefetching cache.  When it is
+          // exhausted the read fails rather than waits; say so loudly, since the
+          // allocator's own text names neither the reactor nor the object.  It
+          // stays an rmm::out_of_memory: the engine retries those, and treats a
+          // runtime_error as fatal.
+          auto const what = "rest_reactor: pinned staging exhausted for " +
+                            slot.req->object.bucket + "/" + slot.req->object.key + " (" +
+                            std::to_string(slot.req->op->io_rng.size) + " bytes): " + e.what();
+          SIRIUS_LOG_ERROR("{}", what);
+          slot.req->op->finish_error(std::make_exception_ptr(rmm::out_of_memory(what.c_str())));
+          slot.reset();
         } catch (...) {
           slot.req->op->finish_error(std::current_exception());
           slot.reset();

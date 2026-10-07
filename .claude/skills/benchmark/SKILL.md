@@ -104,7 +104,7 @@ Scripts are in `test/tpch_performance/`.
 
 ## TPC-H Query Files
 
-- **Sirius and DuckDB runners:** queries are defined in `test/tpch_performance/queries.py` (the `QUERIES` dict, keyed `q1`..`q22`) — imported by `performance_test.py`.
+- **Sirius and DuckDB runners:** queries are defined in `test/tpch_performance/queries.py`; `performance_test.py` renders the scale-dependent Q11 fraction from `--scale-factor`.
 - Plain SQL files at `test/tpch_performance/tpch_queries/orig/q*.sql` are kept for reference but are no longer wired into the recommended Python runner.
 
 ## Workflow H-A: Generate TPC-H Data
@@ -132,18 +132,19 @@ pixi run bash generate_tpch_data.sh <scale_factor> --format parquet|duckdb [--cl
 ```bash
 export SIRIUS_CONFIG_FILE=/path/to/config.yaml
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> [options]
+    --input <parquet_dir> --scale-factor <SF> [options]
 ```
 
 **Required:**
 - `--input <path>` — the dataset. A **parquet directory** (with `--data-source parquet`, default) or a single **`.duckdb` file** (with `--data-source duckdb`).
+- `--scale-factor <SF>` — the dataset scale used to render Q11 as `0.0001 / SF`. Always pass it explicitly; omission defaults to SF1 with a warning only for rollout compatibility.
 
 **Most-used flags** — the complete reference lives in `test/tpch_performance/CLAUDE.md` and `performance_test.py --help`; consult it rather than re-deriving flags here:
 - `--data-source {parquet,duckdb}` (default `parquet`) — input source/format. `parquet`: `--input` is a parquet directory (`read_parquet` scan). `duckdb`: `--input` is a single `.duckdb` file (GPU-native `seq_scan`). Works in all modes; `--pin` works for both.
 - `--engine {gpu,cpu,both}` (default `both`) — `gpu`/`both` load the Sirius extension; `cpu` does not.
 - `--iterations <N>` (default `1`) and `--queries 1,3,6-10` (default: all 22).
 - `--execution {cold,lukewarm,hot}` (optional; omit to change nothing) — the cache state to measure. Each value also sets `cache.mode` / `cache.eviction` in the Sirius config, overriding `--config`. `cold` drops the OS page cache and calls `reset_sirius_cache()` before every run (needs the sudo setup below); `lukewarm` drops the OS cache once then lets caches fill under LRU; `hot` runs iterations back-to-back per query.
-- `--nsys-profile` — GPU-only, owned by the `profile-analyzer` skill. Has its own execution model; passing it with an explicit `--execution` is an error.
+- `--precmd none|nsys|gdb` — `none` is the normal in-process benchmark; `nsys` is GPU-only and owned by the `profile-analyzer` skill; `gdb` runs each GPU query under batch-mode GDB. External runners have their own execution model and reject an explicit `--execution`.
 - `--pin {none,gpu,host}` (default `none`) — Sirius cache pre-load tier; rejected with `--engine cpu`.
 - `--pin-compression` (default off) — Simpatico-compressed pins; requires `--pin gpu|host`. Plan dir via `--compression-plan-dir` (defaults to the shipped `plans/tpch_sf1000`).
 - `--validation` — byte-compare GPU vs CPU results after timing (`abs_tol=1e-10` on floats); requires `--engine both`.
@@ -156,28 +157,32 @@ The CLAUDE.md is the source of truth for the rest of the surface (`--config`, `-
 # SF1, hot cache, both engines, 2 iterations (parquet directory)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --iterations 2 --engine both
 
 # Validate GPU vs CPU after timing (queries 1/3/6)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source (a .duckdb FILE) from disk, both engines, validate
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB source pinned into the GPU cache
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 ```
 
 ### Data Source: parquet vs duckdb (disk vs pinned)
 
 - **parquet** (`--data-source parquet`, default): `--input` is a **directory** of TPC-H `.parquet` files (`read_parquet` → `GPU_PARQUET_SCAN`).
-- **duckdb** (`--data-source duckdb`): `--input` is a single **`.duckdb` file** whose native TPC-H tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`).
+- **duckdb** (`--data-source duckdb`): `--input` is a single **`.duckdb` file** whose native TPC-H tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works with every runner.
 - **Disk vs pinned** is controlled by `--pin`, independently of the source:
   - *from disk*: omit `--pin` (or `--pin none`) — data is read from the parquet/`.duckdb` file each scan.
   - *pinned*: `--pin gpu` or `--pin host` pre-loads the referenced columns into the Sirius cache.
@@ -193,7 +198,7 @@ echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | su
 
 ### Output Layout
 
-A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+A timestamped benchmark dir `<output>/tpch_<ts>_<mode>_<engine>_iter<N>/` (or `<output>/<NAME>/`) containing `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ---
 
@@ -270,11 +275,12 @@ Ask in ~3 grouped rounds (`AskUserQuestion` allows up to 4 questions per call). 
 **Round 1 — data & engine**
 1. **Data source** (`--data-source`) — `parquet` or `duckdb`.
 2. **Dataset** (`--input`) — the parquet **directory** or `.duckdb` **file** path. ALWAYS ask the user where the dataset lives — never assume a path, and never treat a missing path as "needs generating": the dataset may already exist at a different location (see the generation gate in Workflow H-A). If the given path doesn't exist, report that and ask for the correct location; offer generation via `/dataset-manager` only after the user confirms no existing dataset is available (generation can take significant time and disk at large scale factors — **never auto-generate**). For duckdb, clarify plain vs `--cluster` (sorted) if generating.
-3. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
-4. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
+3. **Scale factor** (`--scale-factor`) — the dataset's scale factor; this must match the input because it controls Q11's threshold.
+4. **Config** (`--config` / `SIRIUS_CONFIG_FILE`) — which Sirius config YAML to use (required for any GPU engine). Do not guess the path; confirm it.
+5. **Engine** (`--engine`) — `gpu`, `cpu`, or `both` (default `both`).
 
 **Round 2 — execution shape**
-1. **Execution profile** (`--execution`, optional — omitted leaves the config untouched and runs iterations back-to-back) — `hot`, `lukewarm` (OS cache dropped once, LRU retention, round-robin), or `cold` (per-query OS cache drop + `reset_sirius_cache()`; needs the sudo setup below). `--nsys-profile` is a separate GPU-only flag owned by the `profile-analyzer` skill.
+1. **Execution profile** (`--execution`, optional — omitted leaves the config untouched and runs iterations back-to-back) — `hot`, `lukewarm` (OS cache dropped once, LRU retention, round-robin), or `cold` (per-query OS cache drop + `reset_sirius_cache()`; needs the sudo setup below). `--precmd nsys|gdb` selects a separate GPU-only external runner; Nsight is owned by the `profile-analyzer` skill.
 2. **Pin** (`--pin`) — `none` (from disk), `gpu`, or `host` (pinned cache tier; rejected with `--engine cpu`). This is how "from disk vs pinned" is chosen, for either source.
 3. **Pin compression** (`--pin-compression`) — only ask when Pin is `gpu` or `host`; skip it entirely for `none` (the runner rejects the combination). Off (Recommended) or Simpatico-compressed pins. When compression is chosen, always ask which plan directory to use — the shipped `src/compression/simpatico_codegen/plans/tpch_sf1000` (Recommended) or a user-supplied `--compression-plan-dir` path; never assume the default without confirming it.
 4. **Iterations** (`--iterations`) — per-query iteration count (default `1`).

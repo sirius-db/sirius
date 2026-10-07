@@ -66,11 +66,13 @@
 #include "codegen/plan/representation.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda/stream>
 
 namespace cc  = codegen;
 namespace cje = codegen::encode::jit;
@@ -185,11 +187,9 @@ int compute_bp_offsets(const void* cc_p,
 // Render-side kernel compile: optionally dump the source (``dump_env`` names an
 // env var holding a path), then compile-or-warm-cache the rendered source.
 // Returns the cached kernel, or nullptr on any failure (logged with ``ctx`` as
-// the message prefix). ``default_device`` is nvrtc's -default-device (decode
-// needs it for rle_block.cuh's unannotated constexpr accessors).
+// the message prefix).
 const jit::CompiledKernel* compile_rendered(const std::string& source,
                                             const std::string& entry_symbol,
-                                            bool default_device,
                                             const char* dump_env,
                                             const char* ctx)
 {
@@ -200,8 +200,7 @@ const jit::CompiledKernel* compile_rendered(const std::string& source,
     }
   }
   jit::CompileOptions opts;
-  opts.arch_cc        = jit::arch_cc_for_current_device();
-  opts.default_device = default_device;
+  opts.arch_cc = jit::arch_cc_for_current_device();
   try {
     const jit::CompiledKernel* kernel =
       jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
@@ -255,7 +254,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                                      cudf::column const& packed_overalloc,
                                                      std::int32_t stride_words,
                                                      std::int64_t live_packed_bytes,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr)
 {
   auto check_rc = [](int rc, const char* what) {
@@ -303,7 +302,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                  scratch_buf = rmm::device_buffer(bytes, stream, mr);
                  return scratch_buf.data();
                },
-               stream.value()),
+               stream.get()),
              "bp_offsets");
 
     // Strided gather: copy live_words[c] = bp_offsets[c+1] - bp_offsets[c]
@@ -316,23 +315,24 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                           static_cast<std::int32_t>(num_chunks),
                                           stride_words,
                                           static_cast<std::int32_t>(sizeof(std::uint32_t)),
-                                          stream.value()),
+                                          stream.get()),
              "compact gather");
   }
 
   // Zero the guard words so the decode over-read returns deterministic
   // (masked-out) zeros rather than uninitialised memory.
-  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.value());
+  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.get());
 
   // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer
   // under cudf's 2^31-element cap.  The column size includes the guard words
   // so they travel through serialisation/deserialisation without any special
   // extra allocation at the read site.  `live` is always a multiple of 4.
-  return std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                        static_cast<cudf::size_type>(live / 4 + kGuardWords),
-                                        std::move(dense),
-                                        rmm::device_buffer(0, stream, mr),
-                                        0);
+  return std::make_unique<cudf::column>(
+    cudf::data_type(cudf::type_id::UINT32),
+    static_cast<cudf::size_type>(live / 4 + kGuardWords),
+    std::move(dense),
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+    0);
 }
 
 }  // namespace
@@ -476,10 +476,9 @@ struct VariantLaunchArgs {
   CUdeviceptr chunk_ids     = 0;  // chunk_csr: the chunk each block serves
   CUdeviceptr block_offsets = 0;  // chunk_csr: per-block output bases
   CUdeviceptr in_chunk_rows = 0;  // chunk_csr: uint16 positions within the chunk
-  // Blocks to launch. 0 = one per chunk of the batch; chunk_csr sets it to the
-  // TOUCHED chunk count, which is the whole point of that enumerator. The
-  // per-chunk metadata bounds check still uses the batch's full chunk count,
-  // since a listed chunk may be any of them.
+  // Blocks to launch. 0 = the renderer's dense grid (see cdj::chunks_per_block); chunk_csr sets it
+  // to the TOUCHED chunk count, which is the whole point of that enumerator. The per-chunk metadata
+  // bounds check still uses the batch's full chunk count, since a listed chunk may be any of them.
   std::int32_t grid_blocks = 0;
   CUdeviceptr len_out      = 0;  // str_split_meta: per-survivor byte lengths (output)
 };
@@ -600,7 +599,7 @@ struct masked_launch {
   /// Null for a selection that arrives after the scan: a row set carries its
   /// own geometry, so there is no mask to check against.
   ::sirius::codegen::selection_mask const* mask;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream{cudaStream_t{}};
 };
 
 // Storage for the trailing kernel arguments, bound by TAG rather than by
@@ -748,11 +747,14 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
   if (!maybe_raise_smem(kernel.func_for_current_device(), static_cast<int>(spec.shared_bytes), ctx))
     return -1;
 
-  CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
-  CUfunction fn_dec = kernel.func_for_current_device();
+  // A dense grid follows the renderer's block-to-chunk mapping; a row set brings its own.
+  auto const cpb        = cdj::chunks_per_block(va.shape);
+  auto const dense_grid = cuda::ceil_div(num_chunks, cpb);
+  auto stream           = reinterpret_cast<CUstream>(stream_ptr);
+  auto fn_dec           = kernel.func_for_current_device();
   SIMPATICO_CU_CHECK(
     cuLaunchKernel(fn_dec,
-                   static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : num_chunks),
+                   static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : dense_grid),
                    1,
                    1,
                    static_cast<unsigned>(spec.block_x),
@@ -793,13 +795,8 @@ int run_rendered_decode(const jit::FusedTree& tree,
     return -1;
   }
   lap("render");
-  // The rendered decode source includes rle_block.cuh (→ tree.hpp), whose
-  // unannotated constexpr accessors require nvrtc's -default-device.
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/true,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "rendered decode");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "rendered decode");
   if (kernel == nullptr) { return -1; }
   lap("compile");
 
@@ -832,7 +829,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
                                    char const* dtype,
                                    std::int64_t num_rows,
                                    void* out,
-                                   rmm::cuda_stream_view stream,
+                                   ::cuda::stream_ref stream,
                                    VariantLaunchArgs const& va)
 {
   try {
@@ -871,7 +868,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
     };
 
     std::string err;
-    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.value(), labeled, &err)) {
+    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.get(), labeled, &err)) {
       std::fprintf(stderr,
                    "simpatico::codegen: launch_decode_fused_tree: transient synth failed: %s\n",
                    err.c_str());
@@ -888,7 +885,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
              labeled,
              num_rows,
              reinterpret_cast<std::uintptr_t>(out),
-             reinterpret_cast<std::uintptr_t>(stream.value()),
+             reinterpret_cast<std::uintptr_t>(stream.get()),
              [&](const char* what) { _lap(what); },
              va) == 1;
   } catch (const jit::CompileError& e) {
@@ -914,7 +911,7 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,
-                              rmm::cuda_stream_view stream)
+                              ::cuda::stream_ref stream)
 {
   return launch_decode_fused_tree_impl(
     tree, labeled, dtype, num_rows, out, stream, VariantLaunchArgs{});
@@ -975,7 +972,9 @@ void report_enumeration(char const* what,
   if (!::sirius::codegen::decompression_pushdown_diag_enabled()) { return; }
   auto const chunks = (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
   char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
-  auto const blocks = static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks);
+  auto const cpb    = cdj::chunks_per_block(va.shape);
+  auto const blocks =
+    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : cuda::ceil_div(chunks, cpb));
   if (survivors < 0) {
     // Before the CNT wave the count is not known yet; printing the -1 sentinel
     // as a survivor count (and dividing by it) is how a trace misleads.
@@ -988,7 +987,7 @@ void report_enumeration(char const* what,
                  static_cast<long long>(chunks));
     return;
   }
-  // On the mask and index walks every chunk gets a block, so `blocks` says
+  // On the mask and index walks every chunk gets a block (or a warp), so `blocks` says
   // nothing about how many did work — the touched count is what would have
   // been launched instead, and the difference is the empty-block tax.
   auto const touched = va.grid_blocks > 0
@@ -1011,19 +1010,16 @@ void report_enumeration(char const* what,
       touched > 0 ? static_cast<double>(survivors) / static_cast<double>(touched) : 0.0);
     return;
   }
-  std::fprintf(
-    stderr,
-    "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
-    "(%.4f of rows, %.1f per block)\n",
-    what,
-    how,
-    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks),
-    static_cast<long long>(chunks),
-    static_cast<long long>(survivors),
-    num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
-    va.grid_blocks > 0
-      ? static_cast<double>(survivors) / static_cast<double>(va.grid_blocks)
-      : (chunks > 0 ? static_cast<double>(survivors) / static_cast<double>(chunks) : 0.0));
+  std::fprintf(stderr,
+               "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
+               "(%.4f of rows, %.1f per block)\n",
+               what,
+               how,
+               blocks,
+               static_cast<long long>(chunks),
+               static_cast<long long>(survivors),
+               num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
+               blocks > 0 ? static_cast<double>(survivors) / static_cast<double>(blocks) : 0.0);
 }
 
 }  // namespace
@@ -1035,7 +1031,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        std::int64_t num_rows,
                                        ::sirius::codegen::range_predicate pred,
                                        ::sirius::codegen::selection_mask& mask,
-                                       rmm::cuda_stream_view stream)
+                                       ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   va.shape    = cdj::kShapeMaskOut;
@@ -1057,7 +1053,7 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        rmm::cuda_stream_view stream)
+                                        ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(
@@ -1084,7 +1080,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              row_enumeration rows,
                                              std::int64_t* src_offsets_out,
                                              std::int32_t* lengths_out,
-                                             rmm::cuda_stream_view stream)
+                                             ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(va,
@@ -1114,7 +1110,7 @@ bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           void const* keys_chars,
                                           std::int32_t key_width,
                                           void* out_chars,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(va,
@@ -1139,7 +1135,7 @@ bool launch_masked_char_copy(void const* chars,
                              std::int32_t const* out_offsets,
                              std::int64_t n_survivors,
                              void* out_chars,
-                             rmm::cuda_stream_view stream)
+                             ::cuda::stream_ref stream)
 {
   if (n_survivors <= 0) return true;  // empty selection: nothing to copy
   if (chars == nullptr || src_offsets == nullptr || out_offsets == nullptr ||
@@ -1148,11 +1144,8 @@ bool launch_masked_char_copy(void const* chars,
     return false;
   }
   const cdj::DecodeKernelSpec spec  = cdj::render_masked_char_copy();
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/false,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "masked char copy");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "masked char copy");
   if (kernel == nullptr) { return false; }
 
   CUdeviceptr d_chars  = reinterpret_cast<CUdeviceptr>(chars);
@@ -1172,13 +1165,13 @@ bool launch_masked_char_copy(void const* chars,
                                     1,
                                     1,
                                     0,
-                                    reinterpret_cast<CUstream>(stream.value()),
+                                    reinterpret_cast<CUstream>(stream.get()),
                                     args,
                                     nullptr),
                      false,
                      "masked char copy: cuLaunchKernel failed");
   SIMPATICO_CUDA_CHECK(
-    cudaStreamSynchronize(stream.value()), false, "masked char copy: stream sync failed");
+    cudaStreamSynchronize(stream.get()), false, "masked char copy: stream sync failed");
   return true;
 }
 
@@ -1299,7 +1292,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                          std::int64_t num_rows,
                                          std::uintptr_t data_ptr,
                                          simpatico::fused_leaf_builder* builder,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   if (builder == nullptr || cxx_dtype == nullptr) { return -1; }
@@ -1323,11 +1316,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     // same fused-tree shape and dtype hits the cached compile —
     // including different files / different num_rows.  Cache owns the
     // CompiledKernel; we hold a non-owning pointer for the launch.
-    const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                         spec.entry_symbol,
-                                                         /*default_device=*/false,
-                                                         "CODEGEN_JIT_DUMP_ENCODE_SOURCE",
-                                                         "cpp encode");
+    const jit::CompiledKernel* kernel = compile_rendered(
+      spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_ENCODE_SOURCE", "cpp encode");
     if (kernel == nullptr) { return -1; }
 
     // Allocate one rmm::device_buffer per EncodeBufferSpec.  Buffers are moved
@@ -1354,7 +1344,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       if (f == "lw_shards" || (f == "packed" && !spec.buffers[i].no_pre_zero)) {
         const std::size_t bytes = spec.buffers[i].length * spec.buffers[i].elem_size;
         if (bytes > 0)
-          cudaMemsetAsync(reinterpret_cast<void*>(dev_ptrs[i]), 0, bytes, stream.value());
+          cudaMemsetAsync(reinterpret_cast<void*>(dev_ptrs[i]), 0, bytes, stream.get());
       }
     }
 
@@ -1381,7 +1371,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                       1,
                                       1,
                                       static_cast<unsigned>(spec.shared_bytes),
-                                      stream.value(),
+                                      stream.get(),
                                       args.data(),
                                       nullptr),
                        -1,
@@ -1428,11 +1418,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                             reinterpret_cast<const void*>(dev_ptrs[i_lws]),
                             kMaxBitsShards * kShardStride * sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost,
-                            stream.value()),
+                            stream.get()),
             -1,
             "cpp encode: lw_shards DtoH failed (nid=%d)",
             node_id);
-          cudaStreamSynchronize(stream.value());
+          cudaStreamSynchronize(stream.get());
           std::int64_t live_packed_bytes = 0;
           for (std::size_t s = 0; s < kMaxBitsShards; ++s)
             live_packed_bytes += static_cast<std::int64_t>(lw_shards[s * kShardStride]);
@@ -1473,32 +1463,36 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
-          auto mins_col = std::make_unique<cudf::column>(bp_elem_type,
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_min]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto divs_col = std::make_unique<cudf::column>(bp_elem_type,
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_divs]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto cnt_col  = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                        static_cast<cudf::size_type>(num_chunks),
-                                                        std::move(bufs[i_cnt]),
-                                                        rmm::device_buffer(0, stream),
-                                                        0);
-          auto bits_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT8),
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_bits]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto pkd_overalloc =
-            std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::UINT32),
-                                           static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
-                                           std::move(bufs[i_pkd]),
-                                           rmm::device_buffer(0, stream),
-                                           0);
+          auto mins_col = std::make_unique<cudf::column>(
+            bp_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_min]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto divs_col = std::make_unique<cudf::column>(
+            bp_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_divs]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto cnt_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::INT32),
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_cnt]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto bits_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::UINT8),
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_bits]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto pkd_overalloc = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::UINT32),
+            static_cast<cudf::size_type>(spec.buffers[i_pkd].length),
+            std::move(bufs[i_pkd]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
 
           // EAGERLY compact the OverAllocate ``packed`` so every fused subtree's
           // bitpack output is born Compact (dense). The meta columns
@@ -1513,7 +1507,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             *cnt_col, *bits_col, *pkd_overalloc, stride_words, live_packed_bytes, stream, mr);
           // compact_bitpack_packed gathers on ``stream``; sync so the dense
           // bytes are safe to read from any stream before the pointer is exposed.
-          SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(stream.value()),
+          SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(stream.get()),
                                -1,
                                "cpp encode: bitpack eager-compact sync failed (nid=%d)",
                                node_id);
@@ -1543,12 +1537,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (first_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (first_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                      : cudf::data_type(cudf::type_id::INT32);
-          auto first_col = std::make_unique<cudf::column>(first_elem_type,
-                                                          static_cast<cudf::size_type>(num_chunks),
-                                                          std::move(bufs[i_first]),
-                                                          rmm::device_buffer(0, stream),
-                                                          0);
-          auto rep       = std::make_unique<simpatico::codegen_fused_representation>(
+          auto first_col = std::make_unique<cudf::column>(
+            first_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_first]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Delta, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("delta_first", std::move(first_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1573,7 +1568,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                 static_cast<std::int32_t>(off_count),
                 /*d_temp_storage=*/nullptr,
                 &tmp_bytes,
-                /*stream=*/stream.value());
+                /*stream=*/stream.get());
               rc != 0) {
             std::fprintf(stderr,
                          "simpatico::codegen: cpp encode: rle_runs_offsets scan probe "
@@ -1588,7 +1583,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                 static_cast<std::int32_t>(off_count),
                 tmp_bytes > 0 ? scratch.data() : nullptr,
                 &tmp_bytes,
-                /*stream=*/stream.value());
+                /*stream=*/stream.get());
               rc != 0) {
             std::fprintf(stderr,
                          "simpatico::codegen: cpp encode: rle_runs_offsets scan run "
@@ -1598,12 +1593,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             return -1;
           }
 
-          auto off_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                                        static_cast<cudf::size_type>(off_count),
-                                                        std::move(bufs[i_off]),
-                                                        rmm::device_buffer(0, stream),
-                                                        0);
-          auto rep     = std::make_unique<simpatico::codegen_fused_representation>(
+          auto off_col = std::make_unique<cudf::column>(
+            cudf::data_type(cudf::type_id::INT32),
+            static_cast<cudf::size_type>(off_count),
+            std::move(bufs[i_off]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Rle, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("rle_runs_offsets", std::move(off_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1627,12 +1623,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (refs_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (refs_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                     : cudf::data_type(cudf::type_id::INT32);
-          auto refs_col = std::make_unique<cudf::column>(refs_elem_type,
-                                                         static_cast<cudf::size_type>(num_chunks),
-                                                         std::move(bufs[i_refs]),
-                                                         rmm::device_buffer(0, stream),
-                                                         0);
-          auto rep      = std::make_unique<simpatico::codegen_fused_representation>(
+          auto refs_col = std::make_unique<cudf::column>(
+            refs_elem_type,
+            static_cast<cudf::size_type>(num_chunks),
+            std::move(bufs[i_refs]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::For, original_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("references", std::move(refs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1665,12 +1662,13 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             : (zz_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (zz_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                   : cudf::data_type(cudf::type_id::INT32);
-          auto zz_col = std::make_unique<cudf::column>(zz_type,
-                                                       static_cast<cudf::size_type>(zz_rows),
-                                                       std::move(bufs[i_zz]),
-                                                       rmm::device_buffer(0, stream),
-                                                       0);
-          auto rep    = std::make_unique<simpatico::codegen_fused_representation>(
+          auto zz_col = std::make_unique<cudf::column>(
+            zz_type,
+            static_cast<cudf::size_type>(zz_rows),
+            std::move(bufs[i_zz]),
+            cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+            0);
+          auto rep = std::make_unique<simpatico::codegen_fused_representation>(
             simpatico::OpId::Zigzag, zz_type, static_cast<cudf::size_type>(num_rows));
           rep->buffers.emplace_back("zigzag", std::move(zz_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
@@ -1722,18 +1720,18 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             // The kernel wrote data[c*CHUNK + t] and offsets[c] = c*CHUNK.
             const auto i_offs = find_buffer_idx(spec.buffers, node_id, "offsets");
 
-            auto data_col =
-              std::make_unique<cudf::column>(data_elem_type,
-                                             static_cast<cudf::size_type>(num_chunks * kChunkSize),
-                                             std::move(bufs[i_data]),
-                                             rmm::device_buffer(0, stream),
-                                             0);
-            auto offs_col =
-              std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                             static_cast<cudf::size_type>(num_chunks + 1),
-                                             std::move(bufs[i_offs]),
-                                             rmm::device_buffer(0, stream),
-                                             0);
+            auto data_col = std::make_unique<cudf::column>(
+              data_elem_type,
+              static_cast<cudf::size_type>(num_chunks * kChunkSize),
+              std::move(bufs[i_data]),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
+            auto offs_col = std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::INT32),
+              static_cast<cudf::size_type>(num_chunks + 1),
+              std::move(bufs[i_offs]),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             auto rep = std::make_unique<simpatico::codegen_fused_representation>(
               simpatico::OpId::Identity, original_type, static_cast<cudf::size_type>(num_rows));
@@ -1777,11 +1775,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                    reinterpret_cast<const void*>(d_tail),
                                                    sizeof(std::int32_t),
                                                    cudaMemcpyDeviceToHost,
-                                                   stream.value()),
+                                                   stream.get()),
                                    -1,
                                    "RLE Raw compact (%s): total_runs DtoH failed",
                                    origin.parent_channel.c_str());
-              cudaStreamSynchronize(stream.value());
+              cudaStreamSynchronize(stream.get());
             }
 
             rmm::device_buffer compact_buf(
@@ -1796,7 +1794,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                  num_chunks,
                                                  kChunkSize,
                                                  elem_size,
-                                                 stream.value());
+                                                 stream.get());
                   rc != 0) {
                 std::fprintf(
                   stderr,
@@ -1805,14 +1803,15 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                   rc);
                 return -1;
               }
-              cudaStreamSynchronize(stream.value());
+              cudaStreamSynchronize(stream.get());
             }
 
-            auto data_col = std::make_unique<cudf::column>(data_elem_type,
-                                                           static_cast<cudf::size_type>(total_runs),
-                                                           std::move(compact_buf),
-                                                           rmm::device_buffer(0, stream),
-                                                           0);
+            auto data_col = std::make_unique<cudf::column>(
+              data_elem_type,
+              static_cast<cudf::size_type>(total_runs),
+              std::move(compact_buf),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             const std::size_t offs_bytes =
               static_cast<std::size_t>(num_chunks + 1) * sizeof(std::int32_t);
@@ -1821,17 +1820,17 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                  reinterpret_cast<const void*>(dev_ptrs[i_rle_off]),
                                                  offs_bytes,
                                                  cudaMemcpyDeviceToDevice,
-                                                 stream.value()),
+                                                 stream.get()),
                                  -1,
                                  "RLE Raw compact (%s): offsets DtoD failed",
                                  origin.parent_channel.c_str());
-            cudaStreamSynchronize(stream.value());
-            auto offs_col =
-              std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
-                                             static_cast<cudf::size_type>(num_chunks + 1),
-                                             std::move(offs_buf),
-                                             rmm::device_buffer(0, stream),
-                                             0);
+            cudaStreamSynchronize(stream.get());
+            auto offs_col = std::make_unique<cudf::column>(
+              cudf::data_type(cudf::type_id::INT32),
+              static_cast<cudf::size_type>(num_chunks + 1),
+              std::move(offs_buf),
+              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream),
+              0);
 
             auto rep = std::make_unique<simpatico::codegen_fused_representation>(
               simpatico::OpId::Identity, original_type, static_cast<cudf::size_type>(num_rows));
@@ -1872,7 +1871,7 @@ namespace simpatico {
 
 bool launch_encode_fused_tree(CodegenHead const& head,
                               cudf::column_view const& input_col,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref const& mr,
                               fused_leaf_builder& builder,
                               std::string* error_out)
@@ -1958,7 +1957,7 @@ bool launch_encode_fused_tree(CodegenHead const& head,
 bool encode_fused_subtree(PlanTree const& tree,
                           NodeId start_node,
                           cudf::column_view input_col,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr,
                           fused_leaf_builder& builder,
                           std::string* error_out,

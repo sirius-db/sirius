@@ -1,0 +1,315 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    ps_partkey[#93]
+    value[#94]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  25:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: ps_partkey[#93]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: ps_partkey[#80]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    UNPARTITIONED
+IS_MERGE: true
+
+  24:VSORT(1710)
+  |  order by: value[#94] DESC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  23:VNESTED LOOP JOIN(1702)
+  |  join op: INNER JOIN()
+  |  join conjuncts: (cast(value as DECIMALV3(38, 6))[#89] > sum(ps_supplycost * ps_availqty) * 0.000002[#90])
+  |  cardinality=0
+  |  vIntermediate tuple ids: 26 
+  |  final projections: ps_partkey[#87], value[#88]
+  |  final project output tuple id: 27
+  |  distribute expr lists: ps_partkey[#84]
+  |  distribute expr lists: 
+  |  
+  |----11:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  22:VAGGREGATE (merge finalize)(1627)
+  |  output: sum(partial_sum((ps_supplycost * cast(ps_availqty as DECIMALV3(10, 0))))[#81])[#83]
+  |  group by: ps_partkey[#80]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  final projections: ps_partkey[#82], value[#83], CAST(value[#83] AS decimalv3(38,6))
+  |  final project output tuple id: 25
+  |  distribute expr lists: ps_partkey[#80]
+  |  
+  21:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: HASH_PARTITIONED: ps_suppkey[#59]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    HASH_PARTITIONED: ps_partkey[#80]
+
+  20:VAGGREGATE (update serialize)(1619)
+  |  STREAMING
+  |  output: partial_sum((ps_supplycost[#79] * CAST(ps_availqty[#78] AS decimalv3(10,0))))[#81]
+  |  group by: ps_partkey[#77]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  19:VHASH JOIN(1611)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (s_nationkey[#71] = n_nationkey[#43])
+  |  cardinality=1
+  |  vec output tuple id: 22
+  |  output tuple id: 22
+  |  vIntermediate tuple ids: 21 
+  |  hash output slot ids: 68 69 70 
+  |  final projections: ps_partkey[#72], ps_availqty[#73], ps_supplycost[#74]
+  |  final project output tuple id: 22
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----13:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  18:VHASH JOIN(1590)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (ps_suppkey[#59] = s_suppkey[#51])
+  |  cardinality=1
+  |  vec output tuple id: 20
+  |  output tuple id: 20
+  |  vIntermediate tuple ids: 19 
+  |  hash output slot ids: 52 58 60 61 
+  |  final projections: ps_partkey[#62], ps_availqty[#64], ps_supplycost[#65], s_nationkey[#67]
+  |  final project output tuple id: 20
+  |  distribute expr lists: ps_suppkey[#59]
+  |  distribute expr lists: s_suppkey[#51]
+  |  
+  |----15:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  17:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    HASH_PARTITIONED: ps_suppkey[#59]
+
+  16:VTVF_SCAN_NODE(1569)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=38032874, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.ps_partkey[#53], _tvf_local.ps_suppkey[#54], _tvf_local.ps_availqty[#55], _tvf_local.ps_supplycost[#56]
+     final project output tuple id: 18
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    HASH_PARTITIONED: s_suppkey[#51]
+
+  14:VTVF_SCAN_NODE(1578)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#44], _tvf_local.s_nationkey[#47]
+     final project output tuple id: 16
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    UNPARTITIONED
+
+  12:VTVF_SCAN_NODE(1595)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.n_name[#40] = 'GERMANY')
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#39]
+     final project output tuple id: 14
+
+PLAN FRAGMENT 6
+
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    UNPARTITIONED
+
+  10:VAGGREGATE (merge finalize)(1690)
+  |  output: sum(partial_sum((ps_supplycost * cast(ps_availqty as DECIMALV3(10, 0))))[#36])[#37]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  final projections: (sum((ps_supplycost * cast(ps_availqty as DECIMALV3(10, 0))))[#37] * 0.000002)
+  |  final project output tuple id: 12
+  |  distribute expr lists: 
+  |  
+  9:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 7
+
+  PARTITION: HASH_PARTITIONED: ps_suppkey[#19]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    UNPARTITIONED
+
+  8:VAGGREGATE (update serialize)(1682)
+  |  output: partial_sum((ps_supplycost[#35] * CAST(ps_availqty[#34] AS decimalv3(10,0))))[#36]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  7:VHASH JOIN(1674)
+  |  join op: INNER JOIN(BROADCAST)[]
+  |  equal join conjunct: (s_nationkey[#29] = n_nationkey[#4])
+  |  cardinality=1
+  |  vec output tuple id: 9
+  |  output tuple id: 9
+  |  vIntermediate tuple ids: 8 
+  |  hash output slot ids: 27 28 
+  |  final projections: ps_availqty[#30], ps_supplycost[#31]
+  |  final project output tuple id: 9
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  6:VHASH JOIN(1653)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (ps_suppkey[#19] = s_suppkey[#12])
+  |  cardinality=1
+  |  vec output tuple id: 7
+  |  output tuple id: 7
+  |  vIntermediate tuple ids: 6 
+  |  hash output slot ids: 20 21 13 
+  |  final projections: ps_availqty[#23], ps_supplycost[#24], s_nationkey[#26]
+  |  final project output tuple id: 7
+  |  distribute expr lists: ps_suppkey[#19]
+  |  distribute expr lists: s_suppkey[#12]
+  |  
+  |----3:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  5:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 8
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    HASH_PARTITIONED: ps_suppkey[#19]
+
+  4:VTVF_SCAN_NODE(1632)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=38032874, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.ps_suppkey[#15], _tvf_local.ps_availqty[#16], _tvf_local.ps_supplycost[#17]
+     final project output tuple id: 5
+
+PLAN FRAGMENT 9
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: s_suppkey[#12]
+
+  2:VTVF_SCAN_NODE(1641)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#5], _tvf_local.s_nationkey[#8]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 10
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    UNPARTITIONED
+
+  0:VTVF_SCAN_NODE(1658)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.n_name[#1] = 'GERMANY')
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_nationkey[#0]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

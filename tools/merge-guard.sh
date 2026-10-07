@@ -58,7 +58,7 @@ spill-encode-converters	src/compression/compression_converters.cpp	register_conv
 spill-encode-to-host	src/compression/compression_converters.cpp	register_converter<cucascade::gpu_table_representation, compressed_host_representation>
 spill-encode-to-disk	src/compression/compression_converters.cpp	register_converter<cucascade::gpu_table_representation, compressed_disk_representation>
 spill-encode-to-device	src/compression/compression_converters.cpp	register_converter<cucascade::gpu_table_representation, compressed_device_representation>
-spill-compression-gate	src/include/data/convertible_data_batch.hpp	try_convert_compressed
+spill-compression-gate	src/data/convertible_data_batch.hpp	try_convert_compressed
 spill-compression-arena	src/compression/compression_device_pool.hpp	init_compression_device_pool
 spill-arena-install	src/sirius_context.cpp	init_compression_device_pool
 spill-encode-plan-entrypoints	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	compressed_table compress_columns(

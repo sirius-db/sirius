@@ -55,10 +55,10 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 }
 
 /// Build a zero-task pipeline that can finish without an epilogue fallback.
-duckdb::shared_ptr<sirius_pipeline> make_finishable_pipeline(sirius_physical_operator& sink_op)
+std::shared_ptr<sirius_pipeline> make_finishable_pipeline(sirius_physical_operator& sink_op)
 {
   auto pipeline =
-    duckdb::make_shared_ptr<sirius_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
+    std::make_shared<sirius_pipeline>(sirius::pipeline::pipeline_build_context{nullptr});
   sirius_pipeline_build_state build_state;
   build_state.set_pipeline_sink(*pipeline, &sink_op, 0);
   return pipeline;

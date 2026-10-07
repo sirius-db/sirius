@@ -72,11 +72,13 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <spawn.h>
@@ -91,9 +93,11 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 extern char** environ;
@@ -110,16 +114,14 @@ using simpatico::try_operator;
 // ── RMM pool guard (mirrors bench/compress_with_plan_benchmark.cpp) ───────────
 struct pool_mr_guard {
   rmm::mr::cuda_async_memory_resource mr{};
-  cuda::mr::any_resource<cuda::mr::device_accessible> previous{};
-  bool installed = false;
+  std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>> previous;
   void install()
   {
-    previous  = rmm::mr::set_current_device_resource(mr);
-    installed = true;
+    previous.emplace(cudf::set_current_device_resource(rmm::device_async_resource_ref{mr}));
   }
   ~pool_mr_guard()
   {
-    if (installed) rmm::mr::set_current_device_resource(previous);
+    if (previous) { cudf::set_current_device_resource(std::move(*previous)); }
   }
 };
 
@@ -192,7 +194,7 @@ struct fixture {
   cudf::column_view view;
 };
 
-std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
+std::vector<fixture> build_fixtures(::cuda::stream_ref stream, int n)
 {
   std::vector<fixture> fixtures;
   auto add_numeric = [&](std::string nm, std::unique_ptr<cudf::table> t) {
@@ -234,7 +236,7 @@ struct sweep_stats {
 void verify_chain(cudf::column_view fixture_col,
                   std::string const& dsl,
                   std::string const& tag,
-                  rmm::cuda_stream_view stream,
+                  ::cuda::stream_ref stream,
                   rmm::device_async_resource_ref mr,
                   sweep_stats& st)
 {
@@ -243,7 +245,7 @@ void verify_chain(cudf::column_view fixture_col,
     cudf::table_view tv{{fixture_col}};
     auto ct  = compress_with_plan(tv, dsl, stream, mr);
     auto out = decompress(ct, stream, mr);
-    stream.synchronize();
+    stream.sync();
     bool ok = out && out->num_columns() == 1 &&
               columns_equal_any(fixture_col, out->view().column(0), stream);
     if (ok)
@@ -264,7 +266,7 @@ void dfs(cudf::column_view fixture_col,
          int max_depth,
          std::string const& dsl_prefix,
          std::string const& tag_prefix,
-         rmm::cuda_stream_view stream,
+         ::cuda::stream_ref stream,
          rmm::device_async_resource_ref mr,
          sweep_stats& st);
 
@@ -280,7 +282,7 @@ void try_op_and_recurse(std::string const& op,
                         int max_depth,
                         std::string const& dsl_prefix,
                         std::string const& tag_prefix,
-                        rmm::cuda_stream_view stream,
+                        ::cuda::stream_ref stream,
                         rmm::device_async_resource_ref mr,
                         sweep_stats& st)
 {
@@ -318,7 +320,7 @@ void dfs(cudf::column_view fixture_col,
          int max_depth,
          std::string const& dsl_prefix,
          std::string const& tag_prefix,
-         rmm::cuda_stream_view stream,
+         ::cuda::stream_ref stream,
          rmm::device_async_resource_ref mr,
          sweep_stats& st)
 {
@@ -393,7 +395,7 @@ void run_work_item(std::string const& op1,
                    std::string const& op2,
                    cudf::column_view fixture_col,
                    int max_depth,
-                   rmm::cuda_stream_view stream,
+                   ::cuda::stream_ref stream,
                    rmm::device_async_resource_ref mr,
                    sweep_stats& st)
 {

@@ -72,8 +72,7 @@ class fusion_flag_guard {
 };
 
 const sirius_pipeline* pipeline_containing(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  SiriusPhysicalOperatorType type)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines, SiriusPhysicalOperatorType type)
 {
   for (const auto& pipeline : pipelines) {
     for (const auto& op : pipeline->get_operators()) {
@@ -139,7 +138,7 @@ void require_unfused_terminal_shape(sirius::sirius_engine& engine,
 }
 
 //! True when some scheduled pipeline contains both operator types.
-bool pipeline_contains_both(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+bool pipeline_contains_both(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
                             SiriusPhysicalOperatorType a,
                             SiriusPhysicalOperatorType b)
 {
@@ -156,8 +155,7 @@ bool pipeline_contains_both(const duckdb::vector<duckdb::shared_ptr<sirius_pipel
 }
 
 //! Dump scheduled pipeline shapes for diagnostic failures.
-std::string dump_pipeline_shapes(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+std::string dump_pipeline_shapes(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   std::string out;
   for (std::size_t i = 0; i < pipelines.size(); i++) {

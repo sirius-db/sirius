@@ -71,9 +71,6 @@ Key version differences:
 | `src/cuda/cudf/cudf_groupby.cu` | aggregation, stream_compaction | `groupby`, aggregation factories |
 | `src/cuda/cudf/cudf_orderby.cu` | sorting, copying | `sorted_order`, `gather` |
 | `src/cuda/cudf/cudf_aggregate.cu` | aggregation | Reduction aggregation |
-| `src/expression_executor/specializations/gpu_execute_operator.cpp` | unary_binary, search | `binary_operation`, `cast` |
-| `src/expression_executor/specializations/gpu_execute_comparison.cpp` | unary_binary, scalar | `binary_operation`, scalar construction |
-| `src/expression_executor/specializations/gpu_execute_function.cpp` | strings, unary_binary, scalar, datetime | String functions, type casting |
 | `src/expression_executor/gpu_expression_translator.cpp` | ast, types | AST tree construction |
 | `src/op/sirius_physical_hash_join.cpp` | join, copying, unary_binary | `hash_join`, `gather`, `cast` |
 | `src/op/sirius_physical_nested_loop_join.cpp` | join, ast, copying | `conditional_join`, AST expressions |

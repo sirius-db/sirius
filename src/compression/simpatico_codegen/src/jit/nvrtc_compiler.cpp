@@ -203,14 +203,10 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  // Plain CUDA by default — no -default-device. Some rendered sources include
-  // shared headers that use c++20 and unannotated constexpr accessors; those
-  // opt into -default-device + c++20 via opts.default_device. The leaner path
-  // keeps the c++17/no-default-device setup.
   const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
 
   std::vector<const char*> nvrtc_opts = {
-    opts.default_device ? "-std=c++20" : "-std=c++17",
+    "-std=c++20",
     arch_opt.c_str(),
   };
   // No -I is required (headers are embedded); the env override, when set, adds
@@ -220,7 +216,7 @@ CompiledKernel compile_plain_kernel(const std::string& source,
     cccl_inc = std::string("-I") + ov;
     nvrtc_opts.push_back(cccl_inc.c_str());
   }
-  if (opts.default_device) { nvrtc_opts.push_back("-default-device"); }
+  nvrtc_opts.push_back("-default-device");
   // NVRTC rejects __int128 unless asked: "128-bit integer type is only supported
   // in Linux with the --device-int128 flag". DECIMAL128 columns are encoded as
   // their __int128 storage, so every rendered kernel needs it available. Passing

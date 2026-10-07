@@ -3,9 +3,12 @@
 `pin_table` can store pinned chunks Simpatico-compressed on either tier:
 
 ```sql
-SET pin_table_compression = true;
 SET pin_table_input_compression_plan_dir = '/path/to/plans';  -- <table>.txt per table
-CALL pin_table('/data/lineitem/*.parquet', tier => 'gpu', name => 'lineitem', cols => [...]);
+CALL pin_table('/data/lineitem/*.parquet',
+               tier => 'gpu',
+               name => 'lineitem',
+               cols => [...],
+               compression => true);
 ```
 
 Tables with no plan file pin uncompressed. Each plan file carries one `---`-separated DSL
@@ -27,16 +30,18 @@ directly. Interfaces: `src/compression/compressed_representation.hpp`
 (`decode_equality_pushdown`), `src/compression/compression_converters.cpp` (predicate
 translation), threaded through `sirius_scan_manager::prepare_for_query`.
 
-The compression settings can be staged in either order before a table is pinned. They become
-active only when `pin_table_compression` is true, the plan-directory setting is non-empty, and a
-matching table plan exists. `pin_table` warns and pins uncompressed when the enable flag is true
-but the plan directory is empty; a missing table plan likewise warns and falls back. The batch-size
-and compressed-fraction settings are inert until a matching plan activates compression.
+The compression settings can be staged before a table is pinned. Compression becomes active only
+when `CALL pin_table(..., compression => true)` requests it, the plan-directory setting is
+non-empty, and a matching table plan exists. `pin_table` warns and pins uncompressed when
+compression is requested but the plan directory is empty; a missing table plan likewise warns and
+falls back. The batch-size and compressed-fraction settings are inert until a matching plan
+activates compression. The existing `pin_table_compression` setting remains the default for calls
+that omit the `compression` argument; an explicit argument always wins.
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
 The tier decides whether compression helps at all. Measured against a 20.74 s all-host
-uncompressed baseline (dev `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
+uncompressed baseline (main `c4e8a10b`, pipeline 4, host-pinned, hot = min of iters 1–2 —
 note the shipped TPC-H plans were rewritten onto `bitpack` after this measurement, so
 per-column throughput/ratio figures below predate the current plans):
 

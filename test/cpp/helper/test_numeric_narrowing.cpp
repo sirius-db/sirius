@@ -27,6 +27,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
@@ -68,7 +69,7 @@ std::unique_ptr<cudf::column> make_test_column(cudf::data_type type,
     column = cudf::make_fixed_width_column(type, size, cudf::mask_state::UNALLOCATED, stream, mr);
   } else {
     auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-    auto* mask     = static_cast<cudf::bitmask_type*>(null_mask.data());
+    auto* mask     = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
     cudf::size_type null_count = 0;
     for (cudf::size_type row = 0; row < size; ++row) {
       if (!valid[static_cast<std::size_t>(row)]) {
@@ -94,7 +95,8 @@ template <typename T>
 std::vector<T> copy_values_to_host(cudf::column_view const& column)
 {
   std::vector<T> values(static_cast<std::size_t>(column.size()));
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  stream.sync();
   if (!values.empty() && cudaMemcpy(values.data(),
                                     column.data<T>(),
                                     values.size() * sizeof(T),
@@ -111,7 +113,8 @@ std::vector<bool> copy_valids_to_host(cudf::column_view const& column)
 
   auto const words = cudf::num_bitmask_words(column.offset() + column.size());
   std::vector<cudf::bitmask_type> mask(static_cast<std::size_t>(words));
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  stream.sync();
   if (cudaMemcpy(mask.data(),
                  column.null_mask(),
                  mask.size() * sizeof(cudf::bitmask_type),
@@ -876,4 +879,95 @@ TEST_CASE("pin-time native type records the declared mapping, not the decoded ca
   auto const declared_int = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
   auto const decoded_int  = cudf::data_type{cudf::type_id::INT32};
   REQUIRE(sirius::pin_native_type(decoded_int, &declared_int) == decoded_int);
+}
+
+TEST_CASE("the carrier rule is one definition for narrowing and the membership filters",
+          "[numeric_narrowing]")
+{
+  using id = cudf::type_id;
+  SECTION("physical carrier domains")
+  {
+    for (auto const t : {id::INT8, id::INT16, id::INT32, id::INT64}) {
+      CHECK(sirius::narrow_domain_of(cudf::data_type{t}) == sirius::narrow_domain::SIGNED_INTEGER);
+    }
+    for (auto const t : {id::UINT8, id::UINT16, id::UINT32, id::UINT64}) {
+      CHECK(sirius::narrow_domain_of(cudf::data_type{t}) ==
+            sirius::narrow_domain::UNSIGNED_INTEGER);
+    }
+    for (auto const t : {id::DECIMAL32, id::DECIMAL64, id::DECIMAL128}) {
+      CHECK(sirius::narrow_domain_of(cudf::data_type{t, -2}) == sirius::narrow_domain::DECIMAL);
+    }
+    CHECK(sirius::narrow_domain_of(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+          sirius::narrow_domain::DATE);
+    for (auto const t : {id::TIMESTAMP_SECONDS,
+                         id::TIMESTAMP_MICROSECONDS,
+                         id::FLOAT32,
+                         id::FLOAT64,
+                         id::BOOL8,
+                         id::STRING,
+                         id::DURATION_DAYS,
+                         id::EMPTY}) {
+      CHECK(sirius::narrow_domain_of(cudf::data_type{t}) == sirius::narrow_domain::NONE);
+    }
+  }
+  SECTION("integer storage: every timestamp is an integer, but only DATE has a narrowing rep")
+  {
+    CHECK(sirius::integer_storage_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+          cudf::data_type{id::INT32});
+    CHECK(sirius::narrowing_rep_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+          cudf::data_type{id::INT32});
+    for (auto const t : {id::TIMESTAMP_SECONDS,
+                         id::TIMESTAMP_MILLISECONDS,
+                         id::TIMESTAMP_MICROSECONDS,
+                         id::TIMESTAMP_NANOSECONDS}) {
+      CHECK(sirius::integer_storage_type(cudf::data_type{t}) == cudf::data_type{id::INT64});
+      CHECK(sirius::narrowing_rep_type(cudf::data_type{t}) == cudf::data_type{t});
+    }
+    CHECK(sirius::integer_storage_type(cudf::data_type{id::DECIMAL64, -2}) ==
+          cudf::data_type{id::DECIMAL64, -2});
+  }
+  SECTION("numeric_range_fits is value_fits over the bounds")
+  {
+    auto const int16 = cudf::data_type{id::INT16};
+    for (std::int64_t const v : {-32769LL, -32768LL, -1LL, 0LL, 32767LL, 32768LL}) {
+      CHECK(sirius::numeric_range_fits(int16, sirius::signed_integer_range(v, v)) ==
+            sirius::value_fits<std::int16_t>(v));
+    }
+    auto const uint8 = cudf::data_type{id::UINT8};
+    std::vector<std::uint64_t> const unsigned_values{
+      0, 255, 256, std::numeric_limits<std::uint64_t>::max()};
+    for (auto const v : unsigned_values) {
+      CHECK(sirius::numeric_range_fits(uint8, sirius::unsigned_integer_range(v, v)) ==
+            sirius::value_fits<std::uint8_t>(v));
+    }
+    // A negative bound never fits an unsigned carrier, on either layer.
+    CHECK_FALSE(sirius::numeric_range_fits(uint8, sirius::signed_integer_range(-1, -1)));
+    CHECK_FALSE(sirius::value_fits<std::uint8_t>(std::int64_t{-1}));
+  }
+  SECTION("column_values_fit reduces the column once and applies the same rule")
+  {
+    ::cuda::stream_ref const stream = cudf::get_default_stream();
+    auto const mr                   = cudf::get_current_device_resource_ref();
+    auto const int64                = cudf::data_type{id::INT64};
+    auto const int16                = cudf::data_type{id::INT16};
+    auto const fitting =
+      cudf::make_numeric_column(int64, 3, cudf::mask_state::UNALLOCATED, stream, mr);
+    std::vector<std::int64_t> const small_values{-32768, 0, 32767};
+    REQUIRE(cudaMemcpyAsync(fitting->mutable_view().data<std::int64_t>(),
+                            small_values.data(),
+                            small_values.size() * sizeof(std::int64_t),
+                            cudaMemcpyHostToDevice,
+                            stream.get()) == cudaSuccess);
+    stream.sync();
+    CHECK(sirius::column_values_fit(fitting->view(), int16, stream, mr));
+    CHECK_FALSE(sirius::column_values_fit(fitting->view(), cudf::data_type{id::INT8}, stream, mr));
+    // Wrong family never fits; an empty column always does.
+    CHECK_FALSE(
+      sirius::column_values_fit(fitting->view(), cudf::data_type{id::UINT16}, stream, mr));
+    auto const empty =
+      cudf::make_numeric_column(int64, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    CHECK(sirius::column_values_fit(empty->view(), cudf::data_type{id::INT8}, stream, mr));
+    CHECK_FALSE(sirius::column_values_fit(
+      empty->view(), cudf::data_type{id::STRING}, stream, mr));  // not a numeric carrier
+  }
 }

@@ -82,11 +82,12 @@ struct test_env {
   {
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 test_env& env()
 {
+  sirius::test::operator_utils::ensure_converter_registry();
   static test_env e;
   return e;
 }
@@ -112,7 +113,7 @@ std::shared_ptr<cucascade::data_batch> make_host_resident_batch(
                     values.data(),
                     sizeof(int32_t) * values.size(),
                     cudaMemcpyHostToDevice,
-                    e.stream().value());
+                    e.stream().get());
     columns.push_back(std::move(column));
   }
 
@@ -120,7 +121,7 @@ std::shared_ptr<cucascade::data_batch> make_host_resident_batch(
     std::make_unique<cudf::table>(std::move(columns)), *e.gpu_space, e.stream());
   auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, e.host_space, e.stream());
-  e.stream().synchronize();
+  e.stream().sync();
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
 
@@ -133,8 +134,12 @@ std::shared_ptr<cucascade::data_batch> make_resident_batch(test_env& e, std::siz
   std::vector<std::shared_ptr<cudf::column>> columns{col};
   std::vector<cudf::column_view> views{col->view()};
   auto const alloc_size = col->alloc_size();
-  auto repr             = std::make_unique<cucascade::gpu_table_representation>(
-    cudf::table_view(views), std::move(columns), alloc_size, *e.gpu_space, rmm::cuda_stream_view{});
+  auto repr =
+    std::make_unique<cucascade::gpu_table_representation>(cudf::table_view(views),
+                                                          std::move(columns),
+                                                          alloc_size,
+                                                          *e.gpu_space,
+                                                          ::cuda::stream_ref{cudaStream_t{}});
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
 }
 
@@ -142,6 +147,7 @@ class stub_table_info final : public sirius::op::scan::ingestible_table_info {
  public:
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 /// Hands execute() a caller-chosen table as the post-filter result, which is the seam where a
@@ -156,7 +162,7 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
   std::unique_ptr<cudf::table> post_filter_and_project(
     sirius::op::scan::filtered_table&&,
     const cucascade::memory::memory_space&,
-    rmm::cuda_stream_view,
+    ::cuda::stream_ref,
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
     std::unique_ptr<cudf::column>*,
@@ -177,7 +183,7 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     const sirius::op::scan::scan_info&,
     const cucascade::memory::memory_space&,
-    rmm::cuda_stream_view,
+    ::cuda::stream_ref,
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>) override
   {
@@ -204,7 +210,8 @@ sirius::op::scan::sirius_gpu_scan_operator make_bigint_scan(
   return sirius::op::scan::sirius_gpu_scan_operator{
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT}),
     /*estimated_cardinality=*/0,
-    std::move(ingestible)};
+    std::move(ingestible),
+    /*contract_id=*/1};
 }
 
 constexpr std::size_t kRows = 8;
@@ -232,8 +239,10 @@ TEST_CASE("scan construction rejects an incomplete native carrier schema",
   types.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
   types.push_back(sirius::logical_type::make_decimal(4, 2));
 
-  REQUIRE_THROWS_WITH(sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr),
-                      Catch::Contains("output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
+  REQUIRE_THROWS_WITH(
+    sirius::op::scan::sirius_gpu_scan_operator(std::move(types), 0, nullptr, /*contract_id=*/1),
+    Catch::Matchers::ContainsSubstring(
+      "output column 1 (DECIMAL(4,2)) has no native cuDF carrier"));
 }
 
 TEST_CASE("scan execute rejects a materialized column count its output types do not describe",
@@ -255,7 +264,7 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("output schema width mismatch"));
+                      Catch::Matchers::ContainsSubstring("output schema width mismatch"));
 }
 
 TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its output type",
@@ -278,7 +287,7 @@ TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its
   REQUIRE(input.is_resident());
 
   REQUIRE_THROWS_WITH(scan.execute(input, e.stream()),
-                      Catch::Contains("native schema carrier mismatch"));
+                      Catch::Matchers::ContainsSubstring("native schema carrier mismatch"));
 }
 
 TEST_CASE("scan execute restores a narrowed resident carrier to its native output type",
@@ -329,8 +338,10 @@ TEST_CASE("scan execute transactionally restores a fresh cached conversion",
   duckdb::vector<duckdb::LogicalType> logical_types;
   logical_types.push_back(duckdb::LogicalType::BIGINT);
   logical_types.push_back(duckdb::LogicalType::INTEGER);
-  sirius::op::scan::sirius_gpu_scan_operator scan{
-    sirius::from_duckdb_vec(logical_types), /*estimated_cardinality=*/0, ingestible};
+  sirius::op::scan::sirius_gpu_scan_operator scan{sirius::from_duckdb_vec(logical_types),
+                                                  /*estimated_cardinality=*/0,
+                                                  ingestible,
+                                                  /*contract_id=*/1};
 
   sirius::op::scan::scan_operator_input input(batch);
   input.needs_carrier_conversion = true;
@@ -369,7 +380,7 @@ TEST_CASE("scan execute transactionally restores a fresh cached conversion",
   REQUIRE(static_cast<const void*>(view.column(0).data<int64_t>()) != narrow_source_data);
   REQUIRE(static_cast<const void*>(view.column(1).data<int32_t>()) == unchanged_source_data);
 
-  e.stream().synchronize();
+  e.stream().sync();
   std::vector<int64_t> restored_values(narrow_values.size());
   std::vector<int32_t> moved_values(unchanged_values.size());
   cudaMemcpy(restored_values.data(),

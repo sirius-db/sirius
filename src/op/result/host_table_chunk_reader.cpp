@@ -423,8 +423,8 @@ host_table_chunk_reader::host_table_chunk_reader(
   }
 }
 
-/// Map a cudf data_type to the DuckDB LogicalType with the same physical storage size.
-/// Used to create temp vectors for type-widening casts.
+/// Map a cudf data_type to the DuckDB LogicalType with the same physical storage.
+/// Used to create temp vectors for type-widening / unit-converting casts.
 static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
 {
   switch (type.id()) {
@@ -438,6 +438,12 @@ static duckdb::LogicalType cudf_type_to_duckdb(cudf::data_type type)
     case cudf::type_id::UINT64: return duckdb::LogicalType::UBIGINT;
     case cudf::type_id::FLOAT32: return duckdb::LogicalType::FLOAT;
     case cudf::type_id::FLOAT64: return duckdb::LogicalType::DOUBLE;
+    case cudf::type_id::BOOL8: return duckdb::LogicalType::BOOLEAN;
+    case cudf::type_id::TIMESTAMP_DAYS: return duckdb::LogicalType::DATE;
+    case cudf::type_id::TIMESTAMP_SECONDS: return duckdb::LogicalType::TIMESTAMP_S;
+    case cudf::type_id::TIMESTAMP_MILLISECONDS: return duckdb::LogicalType::TIMESTAMP_MS;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: return duckdb::LogicalType::TIMESTAMP;
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return duckdb::LogicalType::TIMESTAMP_NS;
     case cudf::type_id::DECIMAL32:
       return duckdb::LogicalType::DECIMAL(duckdb::Decimal::MAX_WIDTH_INT32,
                                           static_cast<uint8_t>(-type.scale()));
@@ -510,8 +516,9 @@ void host_table_chunk_reader::column_reader::read_into(
     default: {
       // Fixed-width leaf, possibly type-widened — mirrors get_next_chunk().
       auto const src_type = cudf_type_to_duckdb(cudf_col_type);
-      if (src_type.id() == duckdb::LogicalTypeId::SQLNULL ||
-          src_type.InternalType() == vector.GetType().InternalType()) {
+      // Compare logical types, not physical width: TIMESTAMP_MS and TIMESTAMP are both INT64
+      // but differ by 1000x (Parquet TIMESTAMP_MILLIS vs DuckDB TIMESTAMP microseconds).
+      if (src_type.id() == duckdb::LogicalTypeId::SQLNULL || src_type == vector.GetType()) {
         copy_fixed_width(vector, row_offset, count, allocation);
       } else {
         duckdb::Vector temp_vec(src_type);
@@ -563,9 +570,11 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
       }
     } else {
       // Stored data is fixed-width: read with copy_fixed_width, then cast if needed.
+      // Compare logical types, not just physical width: TIMESTAMP_MS and TIMESTAMP are both
+      // INT64 but differ by 1000x (Parquet TIMESTAMP_MILLIS vs DuckDB TIMESTAMP microseconds).
       auto src_duckdb_type = cudf_type_to_duckdb(_column_readers[col_idx].cudf_col_type);
       if (src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
-          src_duckdb_type.InternalType() == vec.GetType().InternalType()) {
+          src_duckdb_type == vec.GetType()) {
         _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
       } else {
         duckdb::Vector temp_vec(src_duckdb_type);

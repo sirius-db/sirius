@@ -145,13 +145,13 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 // shim or ownership transfer is needed.  Stream is synchronised before
 // returning so the caller may safely discard the table immediately.
 std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::move(result.tbl);
 }
 
@@ -169,7 +169,7 @@ void run_baseline(std::vector<file_info>& files,
   for (std::size_t k = 0; k < files.size(); ++k) {
     disp.enqueue([k, &files, &streams, &total_rows, &done] {
       auto stream = streams.acquire_stream(acquire_pol::GROW);
-      auto tbl    = parse_parquet(*files[k].ds, stream);
+      auto tbl    = parse_parquet(*files[k].ds, stream.get());
       total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()), std::memory_order_relaxed);
       done.count_down();
     });
@@ -243,7 +243,7 @@ void run_hybrid_scan(std::vector<file_info>& files,
         mr_ref);
 
       // Buffers die when this lambda does, so drain the stream first.
-      cudaStreamSynchronize(stream.get().value());
+      stream.get().sync();
       total_rows.fetch_add(static_cast<std::size_t>(result.tbl->num_rows()),
                            std::memory_order_relaxed);
       done.count_down();

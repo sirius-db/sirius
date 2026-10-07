@@ -5,6 +5,10 @@ if [[ -z "${CONDA_PREFIX:-}" ]]; then
   exit 0
 fi
 
+if [[ -z "${LIBCLANG_PATH:-}" ]]; then
+  export LIBCLANG_PATH="$CONDA_PREFIX/lib"
+fi
+
 clang_cpp="$CONDA_PREFIX/bin/clang-cpp"
 clang_pp="$CONDA_PREFIX/bin/clang++"
 

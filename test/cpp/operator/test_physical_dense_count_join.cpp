@@ -19,6 +19,8 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cuda/stream>
+
 #include <catch.hpp>
 #include <op/aggregate/dense_count_join_impl.hpp>
 #include <op/sirius_physical_dense_count_join.hpp>
@@ -50,7 +52,7 @@ std::vector<group_row> run_dense_count_join(
   std::optional<std::size_t> counted_value_idx,
   uint64_t max_bins_bytes,
   sirius_physical_dense_count_join::strategy expected_strategy,
-  rmm::cuda_stream_view stream = cudf::get_default_stream())
+  ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType(key_logical_type));
@@ -66,7 +68,7 @@ std::vector<group_row> run_dense_count_join(
   dense_count_join_input input(preserved_batches, counted_batches);
 
   auto output = op.execute(input, stream);
-  stream.synchronize();
+  stream.sync();
   REQUIRE(op.last_strategy() == expected_strategy);
 
   auto const& out_batches =
@@ -626,7 +628,8 @@ TEST_CASE("dense_count_join: retained multi-batch extrema merge on a non-default
 
   // The direct operator-test path does not run task input preparation, so order batch creation
   // before deliberately executing the operator on another stream.
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const default_stream = cudf::get_default_stream();
+  default_stream.sync();
   rmm::cuda_stream stream;
   auto rows = run_dense_count_join<int32_t>(*space,
                                             duckdb::LogicalTypeId::INTEGER,
@@ -635,7 +638,7 @@ TEST_CASE("dense_count_join: retained multi-batch extrema merge on a non-default
                                             std::size_t{0},
                                             k_default_max_bytes,
                                             sirius_physical_dense_count_join::strategy::DENSE,
-                                            stream.view());
+                                            stream);
   REQUIRE((rows == std::vector<group_row>{{std::nullopt, 0}, {4, 4}, {5, 0}}));
 }
 
@@ -791,6 +794,51 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
   CHECK(absurd >= sparse.no_history_peak_memory_estimate({2, 100}));
 }
 
+TEST_CASE("dense_count_join sparse estimate covers unmatched counted-side keys",
+          "[dense_count_join][no_history_peak_memory_estimate]")
+{
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::INTEGER);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  // Few preserved keys, many counted keys that match none of them: the sparse path groups the
+  // counted side in full before any join, so the emitted row count does not bound its hash state.
+  constexpr uint64_t preserved_rows = 16;
+  constexpr uint64_t counted_rows   = 4ULL * 1000 * 1000;
+  // Large enough that the stats.bytes / key_width ceiling does not clamp the group term.
+  input_stats const stats{8, 512ULL * 1024 * 1024};
+  constexpr uint64_t tiny_bins = 8;  // forces the sparse peak to dominate
+
+  sirius_physical_dense_count_join few_counted(sirius::from_duckdb_vec(types),
+                                               /*estimated_cardinality=*/preserved_rows,
+                                               /*preserved_key_idx=*/0,
+                                               /*counted_key_idx=*/0,
+                                               /*counted_value_idx=*/std::nullopt,
+                                               tiny_bins,
+                                               /*planned_histogram_bytes=*/0,
+                                               /*planned_output_rows=*/preserved_rows,
+                                               /*planned_counted_rows=*/1);
+  sirius_physical_dense_count_join many_counted(sirius::from_duckdb_vec(types),
+                                                /*estimated_cardinality=*/preserved_rows,
+                                                /*preserved_key_idx=*/0,
+                                                /*counted_key_idx=*/0,
+                                                /*counted_value_idx=*/std::nullopt,
+                                                tiny_bins,
+                                                /*planned_histogram_bytes=*/0,
+                                                /*planned_output_rows=*/preserved_rows,
+                                                /*planned_counted_rows=*/counted_rows);
+
+  auto const few  = few_counted.no_history_peak_memory_estimate(stats);
+  auto const many = many_counted.no_history_peak_memory_estimate(stats);
+
+  // Sizing the groups off the emitted rows alone would leave both estimates at the `few` value,
+  // roughly 250,000x short of the counted-side hash state.
+  constexpr std::size_t group_factor = 8;
+  constexpr std::size_t group_bytes  = sizeof(int32_t) + sizeof(int64_t);
+  CHECK(many >= group_factor * group_bytes * (counted_rows + preserved_rows));
+  CHECK(many > few);
+}
+
 TEST_CASE("dense_count_join rejects an unrepresentable histogram layout",
           "[dense_count_join][validation]")
 {
@@ -897,7 +945,7 @@ TEST_CASE("dense_count_join exact rare-path BIGINT product validation",
 
   REQUIRE_NOTHROW(throw_if_count_product_overflows(lhs_view, safe_rhs_view, stream, mr));
   REQUIRE_THROWS_WITH(throw_if_count_product_overflows(lhs_view, overflow_rhs_view, stream, mr),
-                      Catch::Contains("COUNT result exceeds BIGINT max"));
+                      Catch::Matchers::ContainsSubstring("COUNT result exceeds BIGINT max"));
 }
 
 TEST_CASE("dense_count_join: a retried task re-executes on the same input",
@@ -931,12 +979,12 @@ TEST_CASE("dense_count_join: a retried task re-executes on the same input",
     dense_count_join_input input(preserved, counted);
 
     auto first = op.execute(input, stream);
-    stream.synchronize();
+    stream.sync();
     REQUIRE(op.last_strategy() == expected);
 
     std::unique_ptr<sirius::op::operator_data> second;
     REQUIRE_NOTHROW(second = op.execute(input, stream));
-    stream.synchronize();
+    stream.sync();
     REQUIRE(op.last_strategy() == expected);
 
     auto const rows_of = [](sirius::op::operator_data const& data) {

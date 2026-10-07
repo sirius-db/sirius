@@ -17,7 +17,9 @@
 #include "catch.hpp"
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
+#include "utils/sirius_test_env.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -359,9 +361,76 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
   cfg.readahead_strategy = prefetch_strategy::opportunistic;
   CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 2);
 
+  // A backend budget of zero is an opt-out and wins over the opportunistic
+  // pipeline-width substitution: the local (uring) backend defaults to 0.
+  cfg.readahead_strategy.reset();
+  CHECK(cfg.resolve_readahead(0, prefetch_strategy::opportunistic).budget == 0);
+  CHECK(cfg.resolve_readahead(0, prefetch_strategy::eager).budget == 0);
+
   // An explicit budget wins over the pipeline-width substitution.
   cfg.max_readahead_scans = 5;
   CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 5);
+}
+
+TEST_CASE("apply_defaults derives the readahead budgets like the file path does",
+          "[scan_manager][config][readahead]")
+{
+  constexpr auto pipeline_threads =
+    static_cast<std::size_t>(std::max(1, sirius::exec::default_gpu_pipeline_num_threads));
+
+  sirius::sirius_config cfg;
+  cfg.apply_defaults();
+  auto const& scan_manager = cfg.get_scan_manager_config();
+
+  // Having no sirius.yaml must size the readahead exactly like an empty one.
+  // The local (uring) backend defaults to 0 (readahead off); the rest backend
+  // defaults to max(8, 2x the pipeline width).
+  CHECK(scan_manager.pipeline_width == pipeline_threads);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == 0);
+  CHECK(scan_manager.rest.n_max_concurrent_scans == std::max<std::size_t>(8, 2 * pipeline_threads));
+}
+
+TEST_CASE("uring scan budget defaults off and honors an explicit value",
+          "[scan_manager][config][readahead]")
+{
+  constexpr std::size_t pipeline_width = 7;
+  constexpr std::size_t other_explicit = 5;
+
+  auto yaml = [=](std::optional<std::size_t> uring_budget) {
+    auto text =
+      std::string{
+        "sirius:\n"
+        "  executor:\n"
+        "    pipeline:\n"
+        "      num_threads: "} +
+      std::to_string(pipeline_width) +
+      "\n"
+      "    scan_manager:\n";
+    if (uring_budget.has_value()) {
+      text +=
+        "      uring:\n"
+        "        n_max_concurrent_scans: " +
+        std::to_string(*uring_budget) + "\n";
+    }
+    return text;
+  };
+
+  // Omitted: the local backend is off by default and is NOT scaled to the
+  // pipeline width any more.
+  auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
+  CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
+  CHECK(omitted.uring.n_max_concurrent_scans == 0);
+
+  // An explicit 0 is still recorded as explicit (== the struct default).
+  auto const explicit_zero = load_scan_manager("sirius_uring_budget_explicit_zero.yaml", yaml(0));
+  CHECK(explicit_zero.uring.n_max_concurrent_scans_explicit);
+  CHECK(explicit_zero.uring.n_max_concurrent_scans == 0);
+
+  // An explicit positive value opts the local path back in and wins.
+  auto const explicit_other =
+    load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
+  CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
+  CHECK(explicit_other.uring.n_max_concurrent_scans == other_explicit);
 }
 
 TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][readahead]")
@@ -504,8 +573,10 @@ TEST_CASE("sirius_config rejects the renamed local sub-config", "[scan_manager][
 }
 
 TEST_CASE("sirius_config forces the sirius backend for multi-GPU",
-          "[scan_manager][config][backend]")
+          "[scan_manager][config][backend][multi_gpu]")
 {
+  if (!sirius::test::has_gpus(2)) { return; }
+
   auto const cfg = load_scan_manager("sirius_backend_multi_gpu.yaml",
                                      "sirius:\n"
                                      "  topology:\n"

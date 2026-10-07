@@ -29,11 +29,13 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
@@ -46,8 +48,6 @@
 #include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
 #include <span>
@@ -231,8 +231,12 @@ partition_strategy sirius_physical_nested_loop_join::get_partition_strategy(
   const partition_sizing_input& /*in*/)
 {
   // A nested-loop join is never hash-partitioned: it runs on a single partition and streams both
-  // sides through the cross-product, so it never broadcasts or enters build-probe.
-  return {/*num_partitions=*/1, /*broadcast=*/false, /*build_probe=*/false};
+  // sides through the cross-product, so it never broadcasts or enters build-probe. No GPU state
+  // is shared across tasks; leave the CONCATs and join tasks free to follow input locality.
+  return partition_strategy{/*num_partitions=*/1,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            partition_placement::unpinned(1)};
 }
 
 duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_types() const
@@ -419,7 +423,7 @@ static std::unique_ptr<cudf::column> scatter_bool(
   std::unique_ptr<cudf::column> column,
   const rmm::device_uvector<cudf::size_type>& indices,
   bool value,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (indices.size() == 0) { return column; }
   cudf::numeric_scalar<bool> scalar(value, true, stream);
@@ -449,7 +453,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   const rmm::device_uvector<cudf::size_type>& maybe_indices,
   const cudf::table_view& left_view,
   cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
   std::vector<std::unique_ptr<cudf::column>> out_cols;
@@ -486,7 +490,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
   const cudf::table_view& right,
   bool left_side_empty,
   cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto mr                       = space.get_default_allocator();
   auto const num_surviving_rows = left_side_empty ? right.num_rows() : left.num_rows();
@@ -583,9 +587,9 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
 }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
@@ -628,6 +632,23 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   std::unique_ptr<cudf::table> result_table;
 
   if (conditions.empty()) {
+    // An output that exceeds the memory space can never be allocated, so fail instead of
+    // rescheduling the task on every out-of-memory error until the retry limit. The output holds
+    // every left column once per right row and every right column once per left row.
+    auto const output_bytes =
+      memory::saturating_add(memory::saturating_mul(left_batch.get_data()->get_size_in_bytes(),
+                                                    static_cast<std::size_t>(right.num_rows())),
+                             memory::saturating_mul(right_batch.get_data()->get_size_in_bytes(),
+                                                    static_cast<std::size_t>(left.num_rows())));
+    auto const max_bytes = space->get_max_memory();
+    if (max_bytes > 0 && output_bytes > max_bytes) {
+      throw sirius::not_implemented_exception(
+        "Cross join of {} x {} rows needs {} bytes, more than the {} bytes of GPU memory",
+        left.num_rows(),
+        right.num_rows(),
+        output_bytes,
+        max_bytes);
+    }
     auto cross         = cudf::cross_join(left, right, stream, mr);
     auto left_released = cross->release();
     const auto left_n  = static_cast<std::size_t>(left.num_columns());
@@ -744,8 +765,16 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
                                                                 right_col_views,
                                                                 "right");
 
-      left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
-      right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
+      // RIGHT is executed as a left join with the input tables swapped below. Keep
+      // each operand attached to its original table; swapping the result maps alone
+      // does not preserve an asymmetric predicate such as left.x < right.y.
+      const bool swap_sides = join_type == duckdb::JoinType::RIGHT;
+      left_refs.emplace_back(
+        left_join_input_index,
+        swap_sides ? cudf::ast::table_reference::RIGHT : cudf::ast::table_reference::LEFT);
+      right_refs.emplace_back(
+        right_join_input_index,
+        swap_sides ? cudf::ast::table_reference::LEFT : cudf::ast::table_reference::RIGHT);
       if (cond.comparison == sirius::comparison_type::distinct_from) {
         // IS DISTINCT FROM is null-safe (NULL vs 5 is TRUE, NULL vs NULL is FALSE) but cuDF's
         // NOT_EQUAL is null-propagating, so build NOT(NULL_EQUAL(l, r)) instead.

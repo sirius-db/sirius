@@ -305,19 +305,6 @@ TEST_CASE("presign_url keeps canonical query ordering deterministic", "[s3][sigv
   CHECK(signed_headers < signature);
 }
 
-TEST_CASE("presign_url signs only the host header", "[s3][sigv4]")
-{
-  auto url = presign_url("GET",
-                         "https",
-                         "examplebucket.s3.amazonaws.com",
-                         "/test.txt",
-                         aws_example_creds(),
-                         1369353600,
-                         std::chrono::seconds{300});
-
-  CHECK(query_value(url, "X-Amz-SignedHeaders") == "host");
-}
-
 TEST_CASE("presign_url propagates ttl into X-Amz-Expires", "[s3][sigv4]")
 {
   auto url_300   = presign_url("GET",
@@ -336,6 +323,7 @@ TEST_CASE("presign_url propagates ttl into X-Amz-Expires", "[s3][sigv4]")
                                std::chrono::seconds{86400});
 
   CHECK(query_value(url_300, "X-Amz-Expires") == "300");
+  CHECK(query_value(url_300, "X-Amz-SignedHeaders") == "host");
   CHECK(query_value(url_86400, "X-Amz-Expires") == "86400");
 }
 
@@ -398,12 +386,12 @@ TEST_CASE("presign_url preserves the caller-selected scheme", "[s3][sigv4]")
 {
   auto url = presign_url("GET",
                          "http",
-                         "minio.local:9000",
+                         "s3.example.test:9000",
                          "/bucket/test.txt",
                          aws_example_creds(),
                          1369353600,
                          std::chrono::seconds{300});
 
-  CHECK(url.find("http://minio.local:9000/bucket/test.txt?") == 0);
+  CHECK(url.find("http://s3.example.test:9000/bucket/test.txt?") == 0);
   CHECK(is_lower_hex_64(query_value(url, "X-Amz-Signature")));
 }

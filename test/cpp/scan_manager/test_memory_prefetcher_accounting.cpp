@@ -94,7 +94,7 @@ struct prefetcher_env {
     host_space = mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 /// Host-resident INT32 batch with pattern seed + 7*i. The GPU staging is fully
@@ -120,8 +120,8 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
                   values.data(),
                   sizeof(int32_t) * n_rows,
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  stream.synchronize();
+                  stream.get());
+  stream.sync();
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
@@ -129,7 +129,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(prefetcher_env& e,
     std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, stream);
   auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, e.host_space, stream);
-  stream.synchronize();
+  stream.sync();
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
 
@@ -399,7 +399,7 @@ TEST_CASE("prefetcher backs off cleanly when the peak reservation cannot be admi
   auto connector = make_loaded_connector(batches);
 
   rmm::device_buffer ballast(ballast_size, e.stream(), e.gpu_space->get_default_allocator());
-  e.stream().synchronize();
+  e.stream().sync();
   auto const avail_before = e.gpu_space->get_available_memory();
 
   memory_prefetcher_config cfg;

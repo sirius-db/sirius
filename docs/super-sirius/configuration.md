@@ -26,11 +26,21 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. Useful for CPU-only benchmarks, since Super Sirius claims most GPU and pinned host memory on startup.
 
 ```bash
 export SIRIUS_DISABLE=1
 ```
+
+These related modes have different behavior:
+
+| Mode | Query execution | NVTX/Quent behavior |
+|------|-----------------|---------------------|
+| `SIRIUS_DISABLE=1` | Ordinary SQL runs in DuckDB; Super Sirius is never attempted | Sirius does not create its Quent context or configure automatic NVTX injection |
+| `SET gpu_execution = false` | Ordinary SQL runs in DuckDB for that connection | The process-wide Sirius runtime remains initialized and, when Quent is enabled, NVTX injection remains armed because the setting is reversible and other connections may use Sirius; DuckDB emits no NVTX events unless DuckDB or another loaded component explicitly calls NVTX |
+| Automatic CPU fallback | Sirius first rejects the GPU plan or fails during GPU execution, then DuckDB executes the CPU plan | NVTX remains active so any Sirius/libcudf work before the fallback is retained; the DuckDB portion emits events only if the executing code calls NVTX |
+
+Use `SIRIUS_DISABLE=1` for a pure DuckDB CPU baseline in a process that contains the Sirius extension. Use `SET gpu_execution = false` when the initialized Sirius runtime must remain available to turn back on later.
 
 ### Byte Suffixes
 
@@ -100,6 +110,7 @@ sirius:
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    enable_runtime_size_estimation: false  # project total port input from upstream ratios
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -164,13 +175,15 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 ### Input-table compression (`sirius.compression`)
 
 These settings control optional Simpatico compression when
-`pin_table(tier=>'host')` caches input tables. Compression requires both
-`enable_pin_table_compression: true` and a matching plan in `input_plan_dir`;
-otherwise the table is pinned uncompressed.
+`pin_table` caches input tables. Prefer the per-call
+`CALL pin_table(..., compression => true)` argument to request compression for a specific pin.
+The settings below supply the default for calls that omit the argument and configure plan lookup
+and retention gates. Compression also requires a matching plan in `input_plan_dir`; otherwise the
+table is pinned uncompressed.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
-| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Attempt planned compression while pinning input tables to host memory. |
+| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
@@ -299,7 +312,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -307,11 +320,11 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` routes local files to the kvikIO fallback (single-GPU only; multi-GPU requires `sirius`). Values are lowercase. |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` serves both local files and `s3://` objects through kvikIO (local files through its file handle, objects through its remote handle); listing and glob expansion of `s3://` still go through the REST backend. Single-GPU only: a multi-GPU configuration is forced back to `sirius`. Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
-| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local ones (uring, kvikIO). Values are lowercase. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.
@@ -328,7 +341,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring and kvikIO. |
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring. |
 | `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
 | `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
 
@@ -355,7 +368,9 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and the presigned-URL TTL, which is this value plus 60 s. `0` does not remove the limit: control-plane requests then keep the transport's built-in 30 s limit, and presigned URLs get a 300 s TTL. Data GETs use the stall detector below instead. |
+| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
+| `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
 | `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
@@ -385,10 +400,10 @@ those blocks stay owned through curl retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work
 instead of being reserved as one fixed bounce slot per connection.
 
-### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
+### `scan_manager.kvikio` — kvikIO backend (`io/kvikio/config.hpp`)
 
-Used only when `backend: kvikio` routes local files to the kvikIO
-fallback. **Every key is optional and unset means "leave kvikIO's own default
+Used when `backend: kvikio` routes reads (local files and `s3://` objects)
+to kvikIO. **Every key is optional and unset means "leave kvikIO's own default
 alone"** — kvikIO seeds each setting from an environment variable at first use, so
 omitting a key preserves that value and setting one overrides it.
 
@@ -397,6 +412,10 @@ kvikIO's `defaults` singleton, so the last context constructed wins and the
 setting is shared with every other kvikIO user in the process. Treat it as
 startup configuration. `compat_mode` is the exception: it rides the file-handle
 constructor, so it scopes to files this backend opens.
+
+This backend runs without the prefetching cache and therefore without the
+readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
+`readahead_strategy` have no effect on it.
 
 | Key | Type | Env default | Description |
 |-----|------|-------------|-------------|
@@ -515,6 +534,7 @@ individually.
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -531,6 +551,7 @@ after that dependency is fixed.
 sirius:
   telemetry:
     enable_quent: true
+    enable_nvtx: false
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
@@ -538,9 +559,11 @@ sirius:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enable_quent` | bool | true | Emit Quent telemetry using the configured exporter. When false, telemetry uses the noop exporter. |
+| `enable_nvtx` | bool | false | Capture NVTX ranges from Sirius and dependency images such as libcudf into Quent. No-op when `enable_quent` is false. |
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. Used only when `enable_nvtx` is true. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
@@ -639,9 +662,9 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
-| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error (`spdlog` only) |
+| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
-| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds (`spdlog` only) |
+| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
 - **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
   `sirius_log_level` and `sirius_log_flush_seconds`.
@@ -652,6 +675,17 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
+
+The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
+If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
+the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
+the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
+backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
+does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
+logging. If the selected sink cannot be constructed, such as when the log directory is not
+writable, context construction throws and restores the previous `Config::LOG_*` values while
+leaving the previous sink active.
 
 ### Expression Evaluation
 
@@ -772,9 +806,13 @@ test options; it is not part of the normal user surface.
 
 ### Pinned-Table Compression (Simpatico)
 
+Prefer the per-call `pin_table(..., compression => true/false)` argument for a specific pin. The
+variables below supply the default for calls that omit the argument and configure plan lookup and
+retention gates.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `pin_table_compression` | false | Enable Simpatico compression for `pin_table(tier=>'host')` chunks. |
+| `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
@@ -796,6 +834,19 @@ Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the coun
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
 
+### Runtime Data Size Estimation
+
+Runtime estimation projects the total bytes that will reach an input port from measured upstream
+ratios. Its current consumer is the grouped-aggregation `PARTITION`, which can overlap with its
+producer after an estimate is available. The disabled path retains the original `FULL` barrier.
+
+The partition logs its sizing basis (`projected`, `upstream-complete`, or `measured`) and final
+error. See [Data Size Estimation](data-size-estimation.md) for the design.
+
+```sql
+SET enable_runtime_size_estimation = true;   -- off by default
+```
+
 ### Transparent Execution
 
 | Variable | Default | Description |
@@ -806,45 +857,22 @@ gate table, the mechanism, and results.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
+| `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
-## Legacy Config Flags
-
-### Legacy-release DuckDB settings
-
-The following settings only control the legacy `gpu_processing` path. Sirius registers them
-when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
-`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
-`SET` them.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `use_pin_memory` | true | Use pinned memory for legacy CPU↔GPU transfers |
-| `use_pin_memory_for_caching` | false | Use pinned memory for the legacy scan cache |
-| `use_cudf_expr` | true | Use cuDF in the legacy expression executor |
-| `use_custom_top_n` | true | Use the legacy custom top-N kernel |
-| `use_opt_table_scan` | true | Use the legacy optimized table scan |
-| `opt_table_scan_num_streams` | 8 | CUDA streams used by the legacy optimized scan |
-| `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
-| `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
-| `enable_fallback_check` | false | Enable legacy fallback validation |
-| `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
+## Compile-Time Config Flags
 
 ### Static flags
 
 **File:** `src/include/config.hpp`
 
-Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
+Static constants from `namespace duckdb::Config` and `namespace sirius::Config`:
 
 | Flag | Value | Namespace |
 |------|-------|-----------|
-| `USE_PIN_MEM_FOR_CPU_PROCESSING` | true | `duckdb::Config` |
-| `USE_PIN_MEM_FOR_CACHING` | false | `duckdb::Config` |
-| `USE_CUDF_EXPR` | true | `duckdb::Config` |
-| `ENABLE_DUCKDB_FALLBACK` | true | `duckdb::Config` |
+| `EXPRESSION_EVALUATOR_STRATEGY` | `ast_interpret` | `duckdb::Config` |
 | `NUM_GPU_EXECUTOR_THREADS` | 2 | `sirius::Config` |
 | `NUM_PIPELINE_EXECUTOR_THREADS` | 1 | `sirius::Config` |
 | `NUM_GPU` | 1 | `sirius::Config` |
@@ -855,12 +883,12 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Static config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
-| `src/include/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
+| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
+| `src/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 
@@ -886,7 +914,14 @@ sirius:
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
 overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
 conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
-concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+concern.  Each uring reactor stages through whole host blocks under a fixed
+64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
+and even a small device miss occupies that whole block for the duration of
+its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
+so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /
+`stall_time_s`) rather than by a whole-transfer deadline: a large block does
+not time out on a slow link as long as bytes keep arriving.
+`pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
 include the cuCascade all-valid null-mask conversion fix; without it,

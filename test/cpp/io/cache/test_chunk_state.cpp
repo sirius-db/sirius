@@ -78,6 +78,18 @@ TEST_CASE("an unset extent covers nothing and is distinct from a full one", "[ca
   CHECK(covers(whole, OFF, CHUNK, OFF, OFF + CHUNK));
 }
 
+TEST_CASE("the packed fill supports an exact 64 MiB cache chunk", "[cache][fill]")
+{
+  constexpr auto max_chunk = std::size_t{64} << 20;
+
+  static_assert(chunk_state::max_chunk_bytes() == max_chunk);
+  static_assert(chunk_state::max_fill_pages() * PAGE == max_chunk - PAGE);
+
+  CHECK(needed_fill(0, max_chunk, 0, max_chunk) == chunk_fill::whole());
+  CHECK(needed_fill(0, max_chunk, 0, max_chunk - PAGE) ==
+        chunk_fill::prefix_of(chunk_state::max_fill_pages()));
+}
+
 TEST_CASE("needed_fill anchors an extent to the nearer chunk edge", "[cache][fill]")
 {
   SECTION("a request spanning the whole chunk is full")

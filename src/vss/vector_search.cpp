@@ -16,17 +16,16 @@
 
 #include "vss/vector_search.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/vector_search_internal.hpp"
 
 #include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -43,21 +42,31 @@
 
 namespace sirius::vss {
 
-std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_entry& pin,
-                                                   const std::vector<std::string>& output_columns)
+std::unique_ptr<cudf::table> make_empty_vss_output(
+  const std::vector<sirius::logical_type>& output_column_types)
 {
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(output_columns.size() + 1);
-  for (auto const& name : output_columns) {
-    auto it = pin.data_batches_by_column.find(name);
-    if (it == pin.data_batches_by_column.end() || it->second.empty()) {
-      throw duckdb::InvalidInputException(
-        "sirius_knn_search: pinned table missing output column '" + name + "'");
+  duckdb::vector<sirius::logical_type> types(output_column_types.begin(),
+                                             output_column_types.end());
+  types.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
+  return sirius::make_empty_table(types);
+}
+
+void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
+                             const std::vector<sirius::logical_type>& native_types,
+                             ::cuda::stream_ref stream,
+                             rmm::device_async_resource_ref mr)
+{
+  auto const n = std::min(cols.size(), native_types.size());
+  for (std::size_t j = 0; j < n; ++j) {
+    if (cols[j] == nullptr) { continue; }
+    auto const native = sirius::get_cudf_type(native_types[j]);
+    // Only widen a genuinely-narrowed carrier; leave native columns and any type we can't
+    // safely widen back (e.g. non-numeric) untouched. cast_through_rep handles DATE, which a
+    // plain cudf::cast cannot restore from its narrowed integer carrier.
+    if (cols[j]->type() != native && sirius::can_restore_to(cols[j]->type(), native)) {
+      cols[j] = sirius::cast_through_rep(cols[j]->view(), native, stream, mr);
     }
-    cols.push_back(cudf::empty_like(it->second.front()->view()));
   }
-  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32}));
-  return std::make_unique<cudf::table>(std::move(cols));
 }
 
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
@@ -66,7 +75,7 @@ std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   cucascade::gpu_table_representation gpu_repr(std::move(table), c.space, c.stream);
   auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, &c.host_space, c.stream);
-  c.stream.synchronize();
+  c.stream.sync();
   return host_repr;
 }
 
@@ -85,15 +94,33 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // The GPU->host converter's cudaMemcpyBatchAsync rejects the default stream.
   // Synchronized before we return, so the owned stream is safe to destroy on exit.
   rmm::cuda_stream stream_owner;
-  auto stream = stream_owner.view();
+  ::cuda::stream_ref stream = stream_owner;
 
   // The table must be GPU-pinned: the search reads its vectors and gathers the
   // output columns straight from GPU-resident chunks (same order the index built in).
-  const auto* pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+  // OWNING: pin_owner is kept alive for the whole search below (vector_search_context::pin
+  // binds to it), so a concurrent unpin on another connection cannot invalidate it mid-search.
+  auto pin_owner = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    req.catalog, req.schema, req.table_name, req.table_identity);
+  const auto* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw duckdb::InvalidInputException("sirius_knn_search: table '" + req.table_name +
                                         "' must be pinned on the GPU tier");
+  }
+
+  // Pin and unpin don't rebind a prepared query, so the pin may have lost columns since bind.
+  // This checks if output and vector column are still pinned before we read them.
+  auto const& pinned_names = pin->cache_info.column_names();
+  auto require_pinned      = [&](const std::string& col) {
+    if (std::find(pinned_names.begin(), pinned_names.end(), col) == pinned_names.end()) {
+      throw duckdb::InvalidInputException(
+        "sirius_knn_search: column '" + col + "' is not pinned on table '" + req.table_name +
+        "' (the pin changed since the query was bound; re-pin it or re-run the query)");
+    }
+  };
+  require_pinned(req.column_name);
+  for (auto const& col : req.output_columns) {
+    require_pinned(col);
   }
 
   auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
@@ -107,14 +134,14 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   if (k <= 0 || num_rows == 0) {
     vector_search_context empty_ctx{
       ctx, req, *space, *host_space, *pin, mr, stream, nullptr, target_gpu, k};
-    return vss_result_to_host(empty_ctx, make_empty_vss_output(*pin, req.output_columns));
+    return vss_result_to_host(empty_ctx, make_empty_vss_output(req.output_column_types));
   }
 
   // Upload the (constant) query vector once; both search impls read it on the device.
   rmm::device_buffer query_buf(req.query.size() * sizeof(float), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.value()));
-  stream.synchronize();
+    query_buf.data(), req.query.data(), query_buf.size(), cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
 
   vector_search_context c{ctx,
                           req,
@@ -126,7 +153,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
                           static_cast<const float*>(query_buf.data()),
                           target_gpu,
                           k};
-  return run_vector_search_enn(c);
+  return req.use_index ? run_vector_search_ann(c) : run_vector_search_enn(c);
 }
 
 }  // namespace sirius::vss

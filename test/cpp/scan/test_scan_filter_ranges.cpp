@@ -29,7 +29,10 @@
 
 #include <catch.hpp>
 #include <duckdb/common/types/date.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/null_filter.hpp>
 #include <helper/type_conversions.hpp>
 
 #include <cstdint>
@@ -267,4 +270,60 @@ TEST_CASE("decompose_table_filters fails loudly on an unmaterialized column", "[
   // filter rejects.
   std::vector<std::optional<std::size_t>> absent{std::nullopt};
   REQUIRE_THROWS(decompose_table_filters(f.filters, f.column_ids, f.returned_types, absent, {}));
+}
+
+TEST_CASE("required IS NOT NULL survives scan conversion and range analysis",
+          "[scan][required_null]")
+{
+  filter_fixture f{duckdb::LogicalType::BIGINT};
+  f.filters.filters[0] = duckdb::make_uniq<duckdb::IsNotNullFilter>();
+
+  SECTION("standalone null rejection is not a numeric range")
+  {
+    auto const result = f.analyze();
+    REQUIRE(result.ranges.empty());
+    REQUIRE_FALSE(result.ranges_cover_whole_filter);
+    // A filter-only column can be at a different position in the materialized batch.
+    auto conjuncts = decompose_table_filters(f.filters, f.column_ids, f.returned_types, {2});
+    REQUIRE(conjuncts.size() == 1);
+    REQUIRE(conjuncts[0].batch_position == 2);
+    auto const& expr = conjuncts[0].expr->Cast<duckdb::BoundOperatorExpression>();
+    REQUIRE(expr.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NOT_NULL);
+    REQUIRE(expr.children[0]->Cast<duckdb::BoundReferenceExpression>().index == 2);
+  }
+
+  SECTION("a range on another column cannot discharge null rejection")
+  {
+    f.column_ids.emplace_back(1);
+    f.returned_types.push_back(sirius::from_duckdb(duckdb::LogicalType::INTEGER));
+    f.filters.filters[1] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::INTEGER(10));
+    auto const result = f.analyze();
+    REQUIRE(result.ranges.at(1).lo == 11);
+    REQUIRE_FALSE(result.ranges_cover_whole_filter);
+    std::vector<std::size_t> const slots{0, 1};
+    auto request = build_pushdown_request(result, slots);
+    REQUIRE_FALSE(request.ranges_cover_whole_filter);
+  }
+
+  SECTION("nested null rejection conservatively retains the residual")
+  {
+    f.push(duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(10));
+    REQUIRE(f.analyze().ranges.at(0).lo == 11);
+    REQUIRE_FALSE(f.analyze().ranges_cover_whole_filter);
+  }
+
+  SECTION("a missing required column must fail instead of dropping the predicate")
+  {
+    REQUIRE_THROWS(
+      decompose_table_filters(f.filters, f.column_ids, f.returned_types, {std::nullopt}));
+  }
+
+  SECTION("hive partition ownership still discharges the predicate")
+  {
+    REQUIRE(decompose_table_filters(f.filters, f.column_ids, f.returned_types, {std::nullopt}, {0})
+              .empty());
+    REQUIRE(analyze_scan_filters(f.filters, f.column_ids, f.returned_types, {0})
+              .ranges_cover_whole_filter);
+  }
 }

@@ -75,7 +75,7 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
   std::unique_ptr<cudf::table> compacted;
   if (auto const& vec = input.column(0); vec.offset() != 0 || vec.null_count() != 0) {
     auto valid_mask = cudf::is_valid(vec, stream, mr);
-    compacted       = cudf::apply_boolean_mask(input, valid_mask->view(), stream, mr);
+    compacted       = sirius::ApplyRetentionMask(input, valid_mask->view(), stream, mr);
     input           = compacted->view();
     if (input.num_rows() == 0) { return make_empty_enn_output(input); }
   }
@@ -103,6 +103,7 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
   for (std::size_t i = 1; i < gathered_cols.size(); ++i) {
     out_cols.push_back(std::move(gathered_cols[i]));
   }
+  restore_native_carriers(out_cols, c.req.output_column_types, c.stream, c.mr);
   out_cols.push_back(std::move(knn.distances));
   return std::make_unique<cudf::table>(std::move(out_cols));
 }

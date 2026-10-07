@@ -22,8 +22,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -116,11 +115,11 @@ void sirius_physical_column_data_scan::build_pipelines(
 }
 
 std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
   return std::make_unique<pipelineable_operator_data>(
-    dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
+    dynamic_cast<const pipelineable_operator_data&>(input_data).get_data_batches());
 }
 
 }  // namespace op

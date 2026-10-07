@@ -1,8 +1,8 @@
 # Super Sirius Documentation
 
-Super Sirius is the new task-based GPU execution engine in Sirius. It uses `namespace sirius` and replaces the legacy `gpu_processing` path with a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
+Super Sirius is the task-based GPU execution engine in Sirius. It uses `namespace sirius` and a pipelined, multi-threaded architecture that partitions work across GPU and CPU thread pools.
 
-With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required. Legacy `sirius.cfg` is still recognized for compatibility.
+With a Sirius config file (`~/.sirius/sirius.yaml`), GPU execution is **transparent** — users write plain SQL and supported queries automatically execute on the GPU. Unsupported queries silently fall back to CPU. The explicit `CALL gpu_execution('...')` function is still available but no longer required.
 
 ```sql
 -- Just load the extension. If ~/.sirius/sirius.yaml exists, GPU is automatic.
@@ -11,17 +11,6 @@ LOAD 'sirius.duckdb_extension';
 -- Plain SQL — transparently executed on GPU:
 SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 ```
-
-## How It Differs from Legacy Sirius
-
-| Aspect | Legacy (`gpu_processing`) | Super Sirius |
-|--------|---------------------------|-------------------------------|
-| Namespace | `duckdb` | `sirius` |
-| Entry point | `CALL gpu_processing(...)` | Plain SQL (transparent) or `CALL gpu_execution(...)` |
-| Plan generator | `GPUPhysicalPlanGenerator` | `sirius_physical_plan_generator` |
-| Operators | `GPUPhysicalOperator` in `src/operator/` | `sirius_physical_operator` in `src/op/` |
-| Execution model | Single-threaded GPU executor | Multi-pipeline task-based execution |
-| Memory management | `GPUBufferManager` | cuCascade tiered memory (GPU/Host/Disk) |
 
 ## Table of Contents
 
@@ -34,11 +23,12 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
-| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
+| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
+| [Scan Contracts](scan-contracts-design.md) | How scans verify their inputs, protect native reads during checkpoints, and decide whether CPU fallback is allowed |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
-| [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, the cross-language `sirius::ffi::Fragment`/`Context` lifecycle |
+| [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, and the embedder API (`sirius::ffi::Context` plus `Fragment`) |
 | [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
@@ -63,5 +53,3 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 10. **Data Management** — data batch lifecycle and port wiring
 11. **Configuration** — tuning knobs and runtime settings
 12. **Optimizations** — performance improvements and their mechanisms
-
-<!-- last-updated-commit: f03762faf2aba9966050102d632c92cb770ff14d -->

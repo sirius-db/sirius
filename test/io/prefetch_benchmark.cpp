@@ -109,13 +109,13 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 // shim or ownership transfer is needed.  Stream is synchronised before
 // returning so the caller may safely discard the table immediately.
 std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::move(result.tbl);
 }
 
@@ -133,7 +133,7 @@ void run_baseline(std::vector<file_info>& files,
   for (std::size_t k = 0; k < files.size(); ++k) {
     disp.enqueue([k, &files, &streams, &total_rows, &done] {
       auto stream = streams.acquire_stream(acquire_pol::GROW);
-      auto tbl    = parse_parquet(*files[k].ds, stream);
+      auto tbl    = parse_parquet(*files[k].ds, stream.get());
       total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()), std::memory_order_relaxed);
       done.count_down();
     });
@@ -185,7 +185,7 @@ void run_prefetch(std::vector<file_info>& files,
 
   auto t0 = clock_type::now();
   for (std::size_t k = 0; k < files.size(); ++k) {
-    bool const submitted = files[k].ds->prefetch_async(
+    auto const refusal = files[k].ds->prefetch_async(
       [k, &files, &streams, &total_rows, &done, &disp, &io_ok, &io_not_ok](bool ok) noexcept {
         if (ok) {
           io_ok.fetch_add(1, std::memory_order_relaxed);
@@ -194,16 +194,16 @@ void run_prefetch(std::vector<file_info>& files,
         }
         disp.enqueue([k, &files, &streams, &total_rows, &done] {
           auto stream = streams.acquire_stream(acquire_pol::GROW);
-          auto tbl    = parse_parquet(*files[k].ds, stream);
+          auto tbl    = parse_parquet(*files[k].ds, stream.get());
           total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()),
                                std::memory_order_relaxed);
           done.count_down();
         });
       });
-    if (submitted) {
+    if (refusal == sirius::io::prefetch_refusal::issued) {
       io_issued.fetch_add(1, std::memory_order_relaxed);
     } else {
-      SIRIUS_LOG_WARN("prefetch_async: file {} returned false — IO was not issued", k);
+      SIRIUS_LOG_WARN("prefetch_async: file {} was refused ({})", k, static_cast<int>(refusal));
     }
   }
   std::cout << "  prefetch submission: " << io_issued.load() << "/" << files.size()

@@ -18,10 +18,9 @@
 
 #include "data/data_batch_utils.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/copying.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
@@ -66,9 +65,9 @@ int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, in
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -119,6 +118,21 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
       std::move(output_data),
       telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
     output_batches.push_back(std::move(output_batch));
+  }
+
+  // Emit a 0-row batch when nothing passed, as scans and filters do for an empty input, so
+  // downstream operators still see the input. An ungrouped aggregate needs it to return its row.
+  if (output_batches.empty() && !input_batches.empty()) {
+    auto const& batch = input_batches.front();
+    auto view = batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+    std::unique_ptr<cucascade::idata_representation> output_data =
+      std::make_unique<cucascade::gpu_table_representation>(
+        cudf::empty_like(view), *batch.get_memory_space(), stream);
+    auto const batch_id = ::sirius::get_next_batch_id();
+    output_batches.push_back(cucascade::data_batch::make(
+      batch_id,
+      std::move(output_data),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id)));
   }
 
   if (_remaining_limit.load(std::memory_order_acquire) <= 0) {

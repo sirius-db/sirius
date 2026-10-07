@@ -17,7 +17,7 @@ You are identifying optimization targets in Sirius, a GPU-accelerated SQL query 
 
 **nsys profiling adds measurable overhead to query execution times.** When the user wants to validate that an optimization actually improved performance, always recommend running queries both WITH and WITHOUT profiling:
 
-1. **Profiled run** (`nsys_report.sh`, which delegates to `performance_test.py --nsys-profile`) → Provides GPU analysis data (kernels, operators, occupancy, memory) to understand *why* performance changed
+1. **Profiled run** (`nsys_report.sh`, which delegates to `performance_test.py --precmd nsys`) → Provides GPU analysis data (kernels, operators, occupancy, memory) to understand *why* performance changed
 2. **Non-profiled run** (`performance_test.py`) → Provides accurate cold/hot timings to confirm the optimization actually helped
 
 Never claim an optimization improved or regressed performance based solely on profiled timings. The profiled data tells you what changed internally; the non-profiled timings tell you whether it actually got faster.
@@ -80,11 +80,11 @@ export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing (accurate cold/hot without nsys overhead)
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine gpu --iterations <N> [--queries 1,3,6-10]
+    --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # Full DuckDB vs Sirius benchmark + result validation
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine both --iterations <N> --validation
+    --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 
 Compare the resulting `<bench>/csv/runtimes.csv` against a previous non-profiled baseline to confirm the optimization actually improved wall-clock performance. Then run a new profiled analysis (`nsys_report.sh`) to understand what changed internally.

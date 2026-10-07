@@ -29,7 +29,7 @@ Each tier has configurable thresholds:
 
 ## cuCascade Integration
 
-**File:** `src/include/memory/sirius_memory_reservation_manager.hpp`
+**File:** `src/memory/sirius_memory_reservation_manager.hpp`
 
 `sirius_memory_reservation_manager` inherits from `cucascade::memory::memory_reservation_manager`. It:
 
@@ -86,11 +86,11 @@ Wraps RMM device memory resource. On each allocation:
 
 ### Caller reservations for HOST conversions
 
-Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/include/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
 
 ## Downgrade Executor
 
-**File:** `src/include/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`
+**File:** `src/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`
 
 One `downgrade_executor` per memory space monitors pressure and moves data to lower tiers.
 
@@ -116,9 +116,19 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 3. For each request, the processing loop fetches candidates lazily in tiered order:
    - **Tier 1 (data repositories):** Creates a `convertible_data_batch_provider` per repository and fetches idle GPU-resident batches one at a time
    - **Tier 2 (task_scheduler queue):** Creates a `convertible_gpu_pipeline_task_provider` to extract tasks with convertible data batches from the pipeline-level task queue
-4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. After each conversion, the `predicate` is evaluated. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
+4. Each candidate is dispatched to the `bounded_thread_pool` and converted via `convertible_data::convert()`. The `predicate` is evaluated both **before dispatching each candidate** (a request that is already satisfied — e.g. the caller's reservation landed, or the running query freed memory — spills nothing) and after each conversion. If it returns `true`, no new candidates are dispatched (in-flight conversions finish naturally). The promise resolves with total bytes freed.
+
+**Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
+
+**Monitor spill sizing:** crossing the *trigger* threshold starts a monitor-issued request sized to reach the *stop* threshold. The request also observes live pressure and stops once usage reaches that threshold, preserving the trigger→stop hysteresis band.
 
 **Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
+
+### Spill Copy Granularity
+
+**Files:** `src/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/data/chunked_spill_copy.hpp`
+
+The builtin cucascade fast converter submits an entire batch's GPU→HOST copies as one monolithic batched call followed by one blocking synchronize (18–28 GB single submissions observed on q9-class partition spills). At context initialization Sirius replaces it with a chunked converter (`executor.downgrade.copy_chunk_bytes`, default 1 GiB; 0 keeps the builtin) that produces a byte-identical `host_data_representation` but flushes copies every ~chunk while the column tree is still being walked — overlapping each chunk's DMA with the next chunk's prep — and wraps each conversion in an NVTX range. The HOST→GPU restore direction deliberately stays on the builtin converter (it runs on instrumented pipeline threads and reconstructs from the self-describing `column_metadata`).
 
 ### Candidate Selection Strategy
 
@@ -131,7 +141,7 @@ Candidates are converted individually via `convertible_data::convert()`, which h
 
 ## Memory Consumption History
 
-**File:** `src/include/pipeline/pipeline_memory_history.hpp`
+**File:** `src/pipeline/pipeline_memory_history.hpp`
 
 Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring buffer of up to 64 `task_memory_record` entries, each recording:
 - `estimated_bytes` — pre-execution estimation basis (input data size)
@@ -155,7 +165,7 @@ A cached scan input (a resident `scan_operator_input`) is sized by a dedicated b
 
 ## Memory Pool Defragmentation
 
-**File:** `src/include/memory/defragmenter_oom_policy.hpp`, `src/memory/defragmenter_oom_policy.cpp`
+**File:** `src/memory/defragmenter_oom_policy.hpp`, `src/memory/defragmenter_oom_policy.cpp`
 
 `defragmenter_oom_policy` implements `cucascade::memory::oom_handling_policy`:
 
@@ -168,7 +178,7 @@ On allocation failure:
 
 ## Pinned Host Memory
 
-**File:** referenced in `src/include/sirius_context.hpp`
+**File:** referenced in `src/sirius_context.hpp`
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
@@ -177,13 +187,48 @@ On allocation failure:
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))
 
+## Stream-Ordering Discipline
+
+Device memory is freed stream-ordered (RMM async pool), and the pool may rebind the virtual
+address immediately after the free executes. Batches are handed off event-ordered, not
+host-synced, and read locks are host-scoped: a consumer can enqueue kernels and drop its lock
+with device work still in flight. The invariant that keeps this safe:
+
+> No owner of device memory may die (free, pool return, or dealloc-stream rebind) until every
+> stream that may still read or write that memory is ordered before the free.
+
+Three mechanisms carry it:
+
+1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
+   batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
+   exclusive lock does not imply the producer's writes have landed. Sirius's GPU batch helpers
+   record missing writer events before publication, including for default-stream producers, on
+   the producing thread/device. A GPU batch without a writer event is rejected before rebinding
+   or converting; there is no device-wide synchronization fallback.
+2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
+   a reader event for zero-copy views whose owner can be replaced before control returns to the
+   pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and
+   `to_mutable()` waits, until those reads complete, so no downgrade can rebind or free the batch
+   under an in-flight reader.
+3. **Quiesce before task-owned owner death.** The pipeline task synchronizes its stream after every
+   operator `execute()` and again after `publish_output`. Its exception handlers synchronize while
+   the corresponding inputs and outputs are still alive, before rethrowing lets them unwind. This
+   also ensures cross-task state freed by `finalize_operator` is not freed under a straggling sink
+   enqueue.
+
+Suspected violations show up as torn GPU→HOST conversions, scribbled string or selection
+geometry, or wild-pointer MMU faults, almost always under concurrency plus memory pressure.
+`bench/sf1000-repro/run.sh` accepts `SANITIZER=memcheck` to run the workload under
+compute-sanitizer; `verify-memcheck-sf1.sh` does so for the concurrent workload against an
+SF1-sized pressure config.
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
-| `src/include/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
+| `src/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
+| `src/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
 | `src/downgrade/downgrade_executor.cpp` | Processing loop, tiered candidate fetching |
-| `src/include/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
+| `src/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
-| `src/include/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |
+| `src/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |

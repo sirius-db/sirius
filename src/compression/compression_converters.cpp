@@ -24,9 +24,11 @@
 #include "plan_register.hpp"
 #include "simpatico_bridge.hpp"
 #include "spill_context.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -36,7 +38,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
 #include <api/compressed_table_io.hpp>
@@ -110,7 +111,7 @@ simpatico::stream_pool& column_pool()
 // re-pointing frees here ensures deallocation is not racing concurrent pipeline
 // operations on `s`.
 std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
-                                                   rmm::cuda_stream_view s)
+                                                   ::cuda::stream_ref s)
 {
   if (!col) { return col; }
   const auto type = col->type();
@@ -118,8 +119,8 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
   const auto nc   = col->null_count();
   auto contents   = col->release();
   if (contents.data) { contents.data->set_stream(s); }
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  auto null_mask = contents.null_mask ? std::move(*contents.null_mask)
+                                      : cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED);
   null_mask.set_stream(s);
   std::vector<std::unique_ptr<cudf::column>> children;
   children.reserve(contents.children.size());
@@ -138,9 +139,10 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
   decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   // Reconstruct only the requested columns. read_compressed_table_subset_from_memory
   // fetches just those columns' payload buffers, so serving a projection of a wide
@@ -166,13 +168,13 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // Decode across 4 pool streams, submitted from the calling thread — no worker
   // threads are spawned. The H2D fetch above ran on `stream`; sync it first so
   // pool-stream reads are ordered after all fetched bytes are resident.
-  stream.synchronize();
+  stream.sync();
   auto const mr = rmm::mr::get_current_device_resource_ref();
   // `subset` already holds only the projected columns, so the scan's request —
   // which is indexed by projected position — lines up with 0..num_columns.
   std::vector<std::size_t> selection(subset.num_columns());
   std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto decoded      = decompress_chunk(subset, selection, scan, stream, mr);
+  auto decoded      = decompress_chunk(subset, selection, scan, keep_mask, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
@@ -208,10 +210,10 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
 std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
+  nvtx_scoped_range nvtx_range{"sirius::compression::host_to_gpu"};
   auto& rep = source.cast<compressed_host_representation>();
 
   // Per-column form: each entry is a complete 1-column .hpln, decoded on its own
@@ -236,7 +238,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
         throw std::runtime_error("[compression_converters] per-column reconstruct failed: " +
                                  read_error);
       }
-      stream.synchronize();
+      stream.sync();
       auto& pool = column_pool();
       auto tbl   = simpatico::decompress(one, pool, rmm::mr::get_current_device_resource_ref());
       auto parts = tbl->release();
@@ -270,7 +272,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
   // device memory (block-aware, since the payload is a multi-block allocation).
   auto const& payload = rep.payload();
   simpatico::payload_fetch_fn fetch =
-    [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+    [&payload](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
       copy_pinned_blocks_to_device(payload, off, dst, sz, s);
     };
 
@@ -278,6 +280,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            fetch,
                                            rep.selected_indices(),
                                            rep.pushdown_scan().get(),
+                                           rep.visibility_mask(),
                                            source,
                                            target_memory_space,
                                            stream);
@@ -289,10 +292,10 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   [[maybe_unused]] cucascade::memory::reservation* reservation)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
+  nvtx_scoped_range nvtx_range{"sirius::compression::device_to_gpu"};
   auto& rep           = source.cast<compressed_device_representation>();
   auto const& indices = rep.selected_indices();
   auto const mr       = rmm::mr::get_current_device_resource_ref();
@@ -315,7 +318,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     selected = identity_selection;
   }
 
-  auto decoded      = decompress_chunk(ct, selected, rep.pushdown_scan().get(), stream, mr);
+  auto decoded =
+    decompress_chunk(ct, selected, rep.pushdown_scan().get(), rep.visibility_mask(), stream, mr);
   auto decompressed = std::move(decoded.table);
 
   auto cols = decompressed->release();
@@ -1492,7 +1496,7 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // safe; a column whose fallback also fails still declines the whole batch.
   if (ctx.release_columns_early && host_mr_early != nullptr) {
     column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
-    owned        = rep.try_release_table();
+    owned        = rep.try_release_table(stream);
     if (owned) {
       owned_columns = owned->release();
       owned_views.reserve(owned_columns.size());

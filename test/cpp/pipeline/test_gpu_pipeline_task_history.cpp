@@ -35,9 +35,10 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -71,8 +72,8 @@ constexpr std::size_t kGpuCapacity = 500ULL * 1024 * 1024;  // 500 MB
 class stub_operator : public sirius::op::sirius_physical_operator {
  public:
   using execute_fn = std::function<std::unique_ptr<sirius::op::operator_data>(
-    const sirius::op::operator_data&, rmm::cuda_stream_view)>;
-  using sink_fn    = std::function<void(const sirius::op::operator_data&, rmm::cuda_stream_view)>;
+    const sirius::op::operator_data&, ::cuda::stream_ref)>;
+  using sink_fn    = std::function<void(const sirius::op::operator_data&, ::cuda::stream_ref)>;
 
   stub_operator()
     : sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::FILTER,
@@ -84,13 +85,13 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   std::string get_name() const override { return "stub_operator"; }
 
   std::unique_ptr<sirius::op::operator_data> execute(const sirius::op::operator_data& input,
-                                                     rmm::cuda_stream_view stream) override
+                                                     ::cuda::stream_ref stream) override
   {
     if (on_execute) { return on_execute(input, stream); }
     throw std::runtime_error("execute not implemented");
   }
 
-  void sink(const sirius::op::operator_data& input, rmm::cuda_stream_view stream) override
+  void sink(const sirius::op::operator_data& input, ::cuda::stream_ref stream) override
   {
     if (on_sink) { return on_sink(input, stream); }
   }
@@ -124,6 +125,20 @@ class sized_input : public sirius::op::operator_data {
   std::size_t bytes_;
 };
 
+class prepare_oom_input : public sirius::op::operator_data {
+ public:
+  [[nodiscard]] sirius::op::operator_data_type get_type() const override
+  {
+    return sirius::op::operator_data_type::BASE;
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 64; }
+
+  void prepare_for_processing(const ::cucascade::memory::memory_space*, ::cuda::stream_ref) override
+  {
+    throw rmm::out_of_memory("injected prepare OOM");
+  }
+};
+
 // Minimal idata_representation stub that reports different compressed vs uncompressed
 // sizes without requiring the full compressed_host_representation infrastructure.
 // Used to test the peak_materialization_bytes logic in get_estimated_bytes_to_materialize_input.
@@ -142,8 +157,7 @@ class fake_compressed_representation : public sirius::simpatico_compressed_repre
   {
     return uncompressed_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view) override
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
   {
     return nullptr;
   }
@@ -166,8 +180,7 @@ class fake_noncompressed_representation : public cucascade::idata_representation
   {
     return logical_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view) override
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
   {
     return nullptr;
   }
@@ -224,7 +237,7 @@ struct pipeline_task_history_fixture {
 
   /// Create a data batch on GPU then convert to host representation.
   std::shared_ptr<cucascade::data_batch> create_host_data_batch(std::size_t num_rows,
-                                                                rmm::cuda_stream_view stream)
+                                                                ::cuda::stream_ref stream)
   {
     auto gpu_mr = gpu_space->get_default_allocator();
     auto gpu_table =
@@ -233,7 +246,7 @@ struct pipeline_task_history_fixture {
                                                  {std::make_pair(0, 1000000)},
                                                  stream,
                                                  gpu_mr);
-    stream.synchronize();
+    stream.sync();
 
     auto batch = sirius::make_data_batch(
       std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
@@ -243,7 +256,7 @@ struct pipeline_task_history_fixture {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
     }
-    stream.synchronize();
+    stream.sync();
 
     {
       auto ro = batch->to_read_only();
@@ -265,12 +278,12 @@ struct pipeline_task_history_fixture {
 
   /// Create a data batch that stays on GPU.
   std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(
-    std::size_t num_rows, rmm::cuda_stream_view stream, cudf::type_id type = cudf::type_id::INT64)
+    std::size_t num_rows, ::cuda::stream_ref stream, cudf::type_id type = cudf::type_id::INT64)
   {
     auto gpu_mr    = gpu_space->get_default_allocator();
     auto gpu_table = sirius::create_cudf_table_with_random_data(
       num_rows, {cudf::data_type{type}}, {std::make_pair(0, 1000000)}, stream, gpu_mr);
-    stream.synchronize();
+    stream.sync();
 
     auto batch = sirius::make_data_batch(
       std::move(gpu_table), *gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
@@ -282,16 +295,45 @@ struct pipeline_task_history_fixture {
 // Pipeline context: minimal pipeline shell and stub operator.
 //------------------------------------------------------------------------------
 struct pipeline_context {
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<stub_operator> stub_source;
   std::unique_ptr<stub_operator> stub_op;
 };
+
+struct two_operator_pipeline_context {
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<stub_operator> stub_source;
+  std::unique_ptr<stub_operator> first_op;
+  std::unique_ptr<stub_operator> second_op;
+};
+
+two_operator_pipeline_context create_two_operator_pipeline_context()
+{
+  two_operator_pipeline_context ctx;
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline->set_pipeline_id(44);
+  ctx.stub_source = std::make_unique<stub_operator>();
+  ctx.first_op    = std::make_unique<stub_operator>();
+  ctx.second_op   = std::make_unique<stub_operator>();
+
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.first_op);
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.second_op);
+  build_state.set_pipeline_sink(*ctx.pipeline, *ctx.second_op, 1);
+
+  // Number the stubs as the converter does in production; task execution reads operator ids.
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  sirius::pipeline::assign_operator_ids(pipelines);
+  return ctx;
+}
 
 pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();
   ctx.stub_op     = std::make_unique<stub_operator>();
@@ -302,13 +344,13 @@ pipeline_context create_pipeline_context()
   build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
 
   // Number the stubs as the converter does in production; task execution reads operator ids.
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
   sirius::pipeline::assign_operator_ids(pipelines);
   return ctx;
 }
 
 struct cached_scan_pipeline_context {
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<sirius::op::scan::sirius_gpu_scan_operator> scan_op;
 };
 
@@ -316,10 +358,10 @@ cached_scan_pipeline_context create_cached_scan_pipeline_context()
 {
   cached_scan_pipeline_context ctx;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
-    duckdb::vector<sirius::logical_type>{}, 0, nullptr);
+    duckdb::vector<sirius::logical_type>{}, 0, nullptr, /*contract_id=*/1);
 
   sirius::pipeline::sirius_pipeline_build_state build_state;
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.scan_op);
@@ -334,7 +376,7 @@ cached_scan_pipeline_context create_cached_scan_pipeline_context()
 stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_space* gpu_space,
                                                      std::size_t exec_size)
 {
-  return [gpu_space, exec_size](const sirius::op::operator_data& input, rmm::cuda_stream_view s) {
+  return [gpu_space, exec_size](const sirius::op::operator_data& input, ::cuda::stream_ref s) {
     auto* mr =
       gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     REQUIRE(mr != nullptr);
@@ -347,16 +389,16 @@ stub_operator::execute_fn make_allocating_execute_fn(cucascade::memory::memory_s
       if (batch) { pass_through.push_back(batch); }
     }
     auto out = std::make_unique<sirius::op::pipelineable_operator_data>(std::move(pass_through));
-    s.synchronize();
+    s.sync();
     mr->deallocate(s, scratch, exec_size, alignof(std::max_align_t));
-    s.synchronize();
+    s.sync();
     return out;
   };
 }
 
 stub_operator::execute_fn make_passthrough_execute_fn()
 {
-  return [](const sirius::op::operator_data& input, rmm::cuda_stream_view) {
+  return [](const sirius::op::operator_data& input, ::cuda::stream_ref) {
     auto& pipelineable_input = dynamic_cast<const sirius::op::pipelineable_operator_data&>(input);
     std::vector<std::shared_ptr<cucascade::data_batch>> pass_through;
     pass_through.reserve(pipelineable_input.get_data_batches().size());
@@ -376,12 +418,12 @@ stub_operator::execute_fn make_passthrough_execute_fn()
 stub_operator::sink_fn make_allocating_sink_fn(cucascade::memory::memory_space* gpu_space,
                                                std::size_t exec_size)
 {
-  return [gpu_space, exec_size](const sirius::op::operator_data&, rmm::cuda_stream_view s) {
+  return [gpu_space, exec_size](const sirius::op::operator_data&, ::cuda::stream_ref s) {
     auto* mr =
       gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     REQUIRE(mr != nullptr);
     void* scratch = mr->allocate(s, exec_size, alignof(std::max_align_t));
-    s.synchronize();
+    s.sync();
     mr->deallocate(s, scratch, exec_size, alignof(std::max_align_t));
   };
 }
@@ -450,9 +492,10 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
 /// A GPU-tier pin of one INT32 column, row i holding i, in a single chunk.
 struct deferral_test_pin {
   sirius::scan_manager::pinned_entry entry;
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> entry_owner;
   std::shared_ptr<sirius::late_mat::pin_entry_handle> handle;
 
-  deferral_test_pin(std::size_t rows, rmm::cuda_stream_view stream)
+  deferral_test_pin(std::size_t rows, ::cuda::stream_ref stream)
   {
     entry.tier = cucascade::memory::Tier::GPU;
     std::vector<std::int32_t> host(rows);
@@ -467,15 +510,17 @@ struct deferral_test_pin {
                       host.data(),
                       host.size() * sizeof(std::int32_t),
                       cudaMemcpyHostToDevice,
-                      stream.value());
-      cudaStreamSynchronize(stream.value());
+                      stream.get());
+      cudaStreamSynchronize(stream.get());
       std::vector<std::shared_ptr<cudf::column>> chunks;
       chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
       entry.data_batches_by_column.emplace(name, std::move(chunks));
     }
     entry.num_rows = rows;
-    handle         = std::make_shared<sirius::late_mat::pin_entry_handle>("deferral_pin", 1);
-    handle->set_entry(&entry);
+    entry_owner    = std::shared_ptr<sirius::scan_manager::pinned_entry const>(
+      &entry, [](sirius::scan_manager::pinned_entry const*) {});
+    handle = std::make_shared<sirius::late_mat::pin_entry_handle>("deferral_pin", 1);
+    handle->set_entry(entry_owner);
   }
 
   [[nodiscard]] sirius::late_mat::column_origin origin(std::uint32_t pos) const
@@ -499,7 +544,7 @@ std::vector<cudf::data_type> deferred_schema()
 std::shared_ptr<cucascade::data_batch> make_riding_batch(std::size_t num_rows,
                                                          std::size_t pin_rows,
                                                          cucascade::memory::memory_space* gpu_space,
-                                                         rmm::cuda_stream_view stream)
+                                                         ::cuda::stream_ref stream)
 {
   std::vector<std::uint64_t> rowids(num_rows);
   for (std::size_t i = 0; i < num_rows; ++i) {
@@ -514,14 +559,14 @@ std::shared_ptr<cucascade::data_batch> make_riding_batch(std::size_t num_rows,
                   rowids.data(),
                   rowids.size() * sizeof(std::uint64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   auto placeholder = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT8},
                                                static_cast<cudf::size_type>(num_rows),
                                                cudf::mask_state::UNALLOCATED,
                                                stream,
                                                gpu_space->get_default_allocator());
-  cudaMemsetAsync(placeholder->mutable_view().data<std::int8_t>(), 0, num_rows, stream.value());
-  stream.synchronize();
+  cudaMemsetAsync(placeholder->mutable_view().data<std::int8_t>(), 0, num_rows, stream.get());
+  stream.sync();
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(std::move(rowid_col));
@@ -909,6 +954,77 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// Test: a prepare OOM resumes at the attempt's current start index.
+//
+// prepare_for_processing runs before any operator in this attempt, so the input
+// is still the input for local_state._start_operator_index. A resumed task must
+// keep that index; a first attempt (index 0) still resumes at 0.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu_pipeline_task prepare OOM resumes at the current start index",
+          "[gpu_pipeline_task][prepare_oom_resume]")
+{
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  constexpr std::size_t kReservationSize = 1ULL * 1024 * 1024;
+
+  auto expect_resume_at = [&](std::size_t start_index) {
+    auto ctx = create_two_operator_pipeline_context();
+    REQUIRE(ctx.pipeline->get_operators().size() == 2);
+
+    int execute_count  = 0;
+    auto count_execute = [&execute_count](const sirius::op::operator_data&, ::cuda::stream_ref) {
+      ++execute_count;
+      return std::unique_ptr<sirius::op::operator_data>{};
+    };
+    ctx.stub_source->on_execute = count_execute;
+    ctx.first_op->on_execute    = count_execute;
+    ctx.second_op->on_execute   = count_execute;
+
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+    auto input            = std::make_unique<prepare_oom_input>();
+    auto* const installed = input.get();
+    auto task             = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      /*task_id=*/1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input),
+                                                                        start_index),
+      std::move(global_state));
+
+    auto info        = task->get_estimated_reservation_size_info(f.gpu_space);
+    auto reservation = f.manager->request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::GPU}, kReservationSize);
+    REQUIRE(reservation != nullptr);
+    auto* ls =
+      dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->set_reservation(std::move(reservation), info);
+
+    rmm::cuda_stream stream;
+    bool threw = false;
+    try {
+      task->execute(stream);
+    } catch (sirius::pipeline::oom_reschedule_exception& ex) {
+      threw = true;
+      REQUIRE(ex.get_resume_operator_index() == start_index);
+      auto released = ex.release_intermediate_data();
+      REQUIRE(released.get() == installed);
+    }
+    REQUIRE(threw);
+    REQUIRE(execute_count == 0);
+  };
+
+  SECTION("resumed task keeps start index 1") { expect_resume_at(1); }
+  SECTION("first attempt resumes at start index 0") { expect_resume_at(0); }
+}
+
+// ---------------------------------------------------------------------------
 // Test: OOM during operator execute records to pipeline memory history.
 //
 // Memory layout:
@@ -990,7 +1106,7 @@ TEST_CASE("gpu_pipeline_task resumed at the sink sentinel restores and publishes
   int sink_calls          = 0;
   std::vector<cudf::type_id> sink_schema;
   ctx.stub_op->on_sink = [&sink_calls, &sink_schema](const sirius::op::operator_data& in,
-                                                     rmm::cuda_stream_view) {
+                                                     ::cuda::stream_ref) {
     ++sink_calls;
     sink_schema.clear();
     auto const* pipelineable = dynamic_cast<const sirius::op::pipelineable_operator_data*>(&in);

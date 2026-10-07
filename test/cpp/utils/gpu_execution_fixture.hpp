@@ -29,6 +29,8 @@
  * native scan can see it on disk.
  */
 
+#include "util/env_guard.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <unistd.h>
@@ -67,13 +69,12 @@ inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQu
 }
 
 /// RAII guard that points Sirius at a config file for the lifetime of a fixture
-/// that spins up its own (non-shared) host database.
-struct sirius_config_env_guard {
+/// that spins up its own (non-shared) host database, then restores the previous value.
+struct sirius_config_env_guard : sirius::util::env_guard {
   explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 /**
@@ -103,10 +104,7 @@ class GpuExecutionFixture {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
-      // integration.yaml lives in test/cpp/integration/; this header is in
-      // test/cpp/utils/, so step up to test/cpp and back down.
-      auto cfg_path =
-        fs::path(__FILE__).parent_path().parent_path() / "integration" / "integration.yaml";
+      auto cfg_path = sirius::test::integration_config_path();
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
       db           = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB
@@ -285,6 +283,7 @@ class GpuExecutionFixture {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after_gpu_stats.read_view_mismatches == before_gpu_stats.read_view_mismatches);
     // Exactly one GPU execution, no fallback: proves the query ran on the GPU.
     sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 

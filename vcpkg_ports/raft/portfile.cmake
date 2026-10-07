@@ -11,9 +11,11 @@ vcpkg_from_github(
   REPO
   rapidsai/raft
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  b5c25d369f7e69941118b342ac581d0908a0f0c7763f4e42c6bc7af0afee4ab85306dfed057b28b115096bdf2799d8da5ce7eb3d2eb796468b210ea5f7724d41
+  cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
+  PATCHES
+  static-cuda-math.patch
   HEAD_REF
   main)
 
@@ -23,9 +25,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
+  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
   HEAD_REF
   main)
 
@@ -59,7 +61,9 @@ vcpkg_cmake_configure(
   -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
   -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
   -DRAFT_COMPILE_LIBRARY=OFF
+  -DCUDA_STATIC_MATH_LIBRARIES=ON
   -DBUILD_TESTS=OFF
+  -DDISABLE_OPENMP=ON
   -DRAFT_NVTX=OFF
   -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
@@ -69,6 +73,12 @@ vcpkg_cmake_configure(
 vcpkg_cmake_install()
 
 vcpkg_cmake_config_fixup(PACKAGE_NAME raft CONFIG_PATH lib/cmake/raft)
+
+file(READ "${CURRENT_PACKAGES_DIR}/share/raft/raft-config.cmake" RAFT_CONFIG)
+file(
+  WRITE "${CURRENT_PACKAGES_DIR}/share/raft/raft-config.cmake"
+  "include(CMakeFindDependencyMacro)\nfind_dependency(cusolver CONFIG)\nfind_dependency(curand CONFIG)\n${RAFT_CONFIG}"
+)
 
 # rmm is the port that owns rapids_logger in this vcpkg layout. raft's build
 # produces its own copy of the headers and static lib; drop them so they do not

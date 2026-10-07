@@ -17,6 +17,11 @@
 #include "catch.hpp"
 #include "io/io_request.hpp"
 
+// One logical read may expand into many physical operations across reactors.
+// grouped_coordinator exists to make that fan-out look like one future while
+// stopping new dispatch on the first error and still draining published work.
+// The tests below exercise those ordering and ownership requirements directly.
+
 #include <atomic>
 #include <cstddef>
 #include <exception>

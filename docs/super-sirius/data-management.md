@@ -63,7 +63,7 @@ Data repositories are thread-safe containers managed by a `shared_data_repositor
 
 ### Query-scoped repository managers
 
-**Files:** `src/include/data/data_repository_manager_registry.hpp`, `src/include/query_id.hpp`
+**Files:** `src/data/data_repository_manager_registry.hpp`, `src/query_id.hpp`
 
 Each in-flight query owns its own `shared_data_repository_manager`. The `sirius::data::data_repository_manager_registry` (held by `SiriusContext`) maps `query_id_t` → `shared_ptr<shared_data_repository_manager>`; managers are held by `shared_ptr` because a downgrade worker may still be sweeping a manager when its query ends. The registry exposes `get_all()` (a snapshot) for downgrade candidate selection, and the downgrade executor takes the registry — not a single manager — so it can sweep every active query.
 
@@ -71,7 +71,7 @@ Each in-flight query owns its own `shared_data_repository_manager`. The `sirius:
 
 ## Port System
 
-**File:** `src/include/op/sirius_physical_operator.hpp`
+**File:** `src/op/sirius_physical_operator.hpp`
 
 Ports connect pipelines by routing data from one operator's output to another's input:
 
@@ -89,8 +89,19 @@ struct port {
 | Barrier | Behavior | When Used |
 |---------|----------|-----------|
 | `FULL` | Downstream waits until upstream pipeline is **completely finished** before consuming any data | Hash join build side — entire hash table must be built before probing |
-| `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER) |
+| `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER); HASH_GROUP_BY into its fanout PARTITION, when that partition has runtime size estimation enabled |
 | `PIPELINE` | No synchronization — data flows **immediately** | Within a single pipeline |
+
+### Runtime data size estimation
+
+`estimate_port_total_input_bytes(op, port_id)` projects how many bytes will *ultimately* arrive at
+an input port by chaining measured upstream pipeline ratios.
+
+With estimation enabled, a grouped aggregation's `PARTITION` uses a `PARTIAL` ingress and fixes its
+partition count from the projected total. The disabled path and the
+`PARTITION → MERGE_GROUP_BY` edge remain `FULL`.
+
+See [Data Size Estimation](data-size-estimation.md) for the full design.
 
 ### `push_data_batch()`
 
@@ -135,7 +146,7 @@ Key methods:
 
 ### `partitioned_operator_data`
 
-Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, HASH_JOIN, MERGE_GROUP_BY, DENSE_COUNT_JOIN) to track which partition the data belongs to. Constructing it with an index takes the exchange's `partition_placement`, and a partition pinned to a GPU becomes the data's preferred device, so the task creator runs every task of a partition on one GPU. Data with no index carries no preference and is placed by locality.
 
 ### Class Hierarchy
 
@@ -149,7 +160,7 @@ operator_data                       (empty generic base)
 
 ### `sirius_converter_registry`
 
-**File:** `src/include/data/sirius_converter_registry.hpp`
+**File:** `src/data/sirius_converter_registry.hpp`
 
 Global singleton for converting between data representations:
 - Registers builtin cuCascade converters
@@ -169,7 +180,9 @@ Global singleton for converting between data representations:
 
 | File | Purpose |
 |------|---------|
-| `src/include/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch |
+| `src/op/sirius_physical_operator.hpp` | Port struct, barrier types, push_data_batch, source-total hooks |
 | `src/op/sirius_physical_operator.cpp` | Default sink/push implementation |
-| `src/include/data/sirius_converter_registry.hpp` | Format conversion registry |
-| `src/include/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |
+| `src/pipeline/data_size_estimator.hpp` | Runtime projection of total bytes arriving at a port |
+| `src/pipeline/pipeline_memory_history.hpp` | Per-pipeline task history; peak-memory estimate and output/input ratio |
+| `src/data/sirius_converter_registry.hpp` | Format conversion registry |
+| `src/memory/multiple_blocks_allocation_accessor.hpp` | Multi-block allocation cursor |

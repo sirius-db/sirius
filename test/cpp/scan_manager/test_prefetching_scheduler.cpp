@@ -19,6 +19,11 @@
 #include "planner/query_index.hpp"
 #include "scan_manager/prefetching_scheduler.hpp"
 
+// The scheduler is the executable form of the query prefetch order: it must
+// preserve branch order, revisit cyclic work, skip completed operators, and
+// splice dynamic additions without losing the current cursor. The cases below
+// show why a plain queue is insufficient.
+
 #include <memory>
 #include <vector>
 

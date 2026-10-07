@@ -201,6 +201,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   // from config to test the concurrency ceiling.
   r.optional("max_connections", opt.max_connections, yaml::greater_than<std::size_t>{0});
   r.optional("request_timeout_s", opt.request_timeout_s);
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
+  r.optional("stall_time_s", opt.stall_time_s);
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);
@@ -218,14 +220,22 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
-  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  {
+    // Preserve whether the value was named: an explicit value may equal the
+    // struct default and must not be replaced by the pipeline-derived default.
+    std::optional<std::size_t> n_max;
+    r.optional("n_max_concurrent_scans", n_max);
+    if (n_max.has_value()) {
+      opt.n_max_concurrent_scans          = *n_max;
+      opt.n_max_concurrent_scans_explicit = true;
+    }
+  }
   r.reject_unknown();
 }
 
 static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
-  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
   r.optional("nthreads", opt.nthreads);
   r.optional("task_size", yaml::bytes(opt.task_size));
   r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));
@@ -352,6 +362,8 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error(
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
+  r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("use_hw_decompression", opt.use_hw_decompression);
   r.reject_unknown();
 }
 
@@ -360,6 +372,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
   yaml::reader r(node, "telemetry");
   r.optional("enable_quent", opt.enable_quent);
   r.optional("enable_batch_events", opt.enable_batch_events);
+  r.optional("enable_nvtx", opt.enable_nvtx);
   r.optional("exporter", opt.exporter, [](std::string const& value) {
     if (value == "ndjson" || value == "msgpack" || value == "postcard") return true;
     throw std::runtime_error("must be one of ndjson, msgpack, postcard");
@@ -372,6 +385,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
     if (!value.empty()) return true;
     throw std::runtime_error("must not be empty");
   });
+  r.optional("nvtx_injection_lib", opt.nvtx_injection_lib);
   r.reject_unknown();
 }
 
@@ -414,6 +428,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
   r.optional("wait_timeout", opt.downgrade_wait_timeout);
+  r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
   r.reject_unknown();
 }
 
@@ -673,31 +688,32 @@ operator_params operator_defaults_for(
 
 // ================ sirius_config ================= //
 
-sirius_config::sirius_config()
-{
-  cucascade::memory::topology_discovery discovery;
-  if (discovery.discover()) { _hw_topology = discovery.get_topology(); }
-}
+struct sirius_config::hardware_config {
+  topology topo;
+  gpu_mem_config gpu;
+  host_mem_config host;
+  disk_mem_config disk;
+  bool using_configurator         = true;
+  bool use_effective_gpu_capacity = false;
+  std::optional<YAML::Node> operator_node;
+  std::filesystem::path source_path;
+};
+
+sirius_config::sirius_config() : _hardware_config(std::make_shared<hardware_config>()) {}
 
 void sirius_config::apply_defaults()
 {
-  // Run the configurator with default values to populate memory space configs
-  topology topo;
-  gpu_mem_config gpu_cfg;
-  host_mem_config host_cfg;
-  disk_mem_config disk_cfg;
-
-  cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(
-    resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
-  gpu_cfg.setup_configurator(builder);
-  host_cfg.setup_configurator(builder);
-  disk_cfg.setup_configurator(builder);
-  _memory_space_configs = builder.build(_hw_topology);
-  _operator_params      = operator_params{};
+  _hardware_config = std::make_shared<hardware_config>();
+  resolve_hardware();
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
+{
+  parse_from_file(config_path);
+  resolve_hardware();
+}
+
+void sirius_config::parse_from_file(const std::filesystem::path& config_path)
 {
   try {
     YAML::Node root;
@@ -802,21 +818,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
               disk_space_configs.end(),
               std::back_inserter(_memory_space_configs));
 
-    bool using_configurator = _memory_space_configs.empty();
-    if (using_configurator) {
-      cucascade::memory::reservation_manager_configurator builder;
-      if (std::holds_alternative<size_t>(topo.num_gpus_or_gpu_ids)) {
-        builder.set_number_of_gpus(
-          resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
-      } else {
-        const auto& gpu_ids = std::get<std::vector<int>>(topo.num_gpus_or_gpu_ids);
-        builder.set_gpu_ids(gpu_ids);
-      }
-      gpu_cfg.setup_configurator(builder);
-      host_cfg.setup_configurator(builder);
-      disk_cfg.setup_configurator(builder);
-      _memory_space_configs = builder.build(_hw_topology);
-    }
+    bool const using_configurator = _memory_space_configs.empty();
 
     bool const explicit_low_level_gpu_capacity =
       !gpu_space_configs.empty() && std::ranges::all_of(gpu_space_configs, [](auto const& gpu) {
@@ -824,18 +826,23 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       });
     bool const use_effective_gpu_capacity =
       using_configurator ? explicit_high_level_gpu_capacity : explicit_low_level_gpu_capacity;
-    auto resolved_operator_params =
-      operator_defaults_for(_memory_space_configs, use_effective_gpu_capacity);
-    if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
-    _operator_params = std::move(resolved_operator_params);
+    // Validate overrides before runtime startup installs the process-global hook. Keep
+    // the parsed node so explicit values can be applied after capacity-derived defaults.
+    auto parsed_operator_params = operator_params{};
+    if (operator_node) { sirius::from_yaml(*operator_node, parsed_operator_params); }
+    _operator_params = std::move(parsed_operator_params);
+    _hardware_config = std::make_shared<hardware_config>(hardware_config{
+      .topo                       = std::move(topo),
+      .gpu                        = std::move(gpu_cfg),
+      .host                       = std::move(host_cfg),
+      .disk                       = std::move(disk_cfg),
+      .using_configurator         = using_configurator,
+      .use_effective_gpu_capacity = use_effective_gpu_capacity,
+      .operator_node              = std::move(operator_node),
+      .source_path                = config_path,
+    });
 
-    derive_uring_scan_budget();
-    // The opportunistic strategy schedules against what the executor can run,
-    // not what the device can queue, so it needs the pipeline pool's width.
-    _scan_manager_config.pipeline_width =
-      static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
-    derive_rest_scan_budget();
-    enforce_sirius_backend_for_multi_gpu();
+    finalize_derived_config();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
@@ -843,28 +850,62 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   }
 }
 
-void sirius_config::derive_uring_scan_budget()
+void sirius_config::resolve_hardware()
 {
-  // The uring backend wants one concurrent scan per pipeline executor thread.
-  // io::uring::config can only spell that as the COMPILE-TIME thread count, so
-  // a config that resizes the pipeline pool would otherwise leave the readahead
-  // budget pinned to the old default and unable to keep the pool fed.
-  //
-  // Only the untouched default is replaced, so an explicit
-  // uring.n_max_concurrent_scans in the config still wins.
-  constexpr auto struct_default = static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads);
-  if (_scan_manager_config.uring.n_max_concurrent_scans != struct_default) { return; }
+  if (!_hardware_config) { return; }
+  auto const& pending = *_hardware_config;
+  try {
+    // Discovery now emits libcucascade NVTX, including its first domain declaration.
+    // Runtime callers must create Quent before reaching this point.
+    cucascade::memory::topology_discovery discovery;
+    if (discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                           /*with_runtime_attributes=*/true)) {
+      _hw_topology = discovery.get_topology();
+    }
 
-  auto const pipeline_threads =
+    if (pending.using_configurator) {
+      cucascade::memory::reservation_manager_configurator builder;
+      if (std::holds_alternative<size_t>(pending.topo.num_gpus_or_gpu_ids)) {
+        builder.set_number_of_gpus(
+          resolve_num_gpus(std::get<size_t>(pending.topo.num_gpus_or_gpu_ids), _hw_topology));
+      } else {
+        builder.set_gpu_ids(std::get<std::vector<int>>(pending.topo.num_gpus_or_gpu_ids));
+      }
+      pending.gpu.setup_configurator(builder);
+      pending.host.setup_configurator(builder);
+      pending.disk.setup_configurator(builder);
+      _memory_space_configs = builder.build(_hw_topology);
+    }
+
+    auto resolved_operator_params =
+      operator_defaults_for(_memory_space_configs, pending.use_effective_gpu_capacity);
+    if (pending.operator_node) {
+      sirius::from_yaml(*pending.operator_node, resolved_operator_params);
+    }
+    _operator_params = std::move(resolved_operator_params);
+    finalize_derived_config();
+  } catch (const std::exception& e) {
+    if (!pending.source_path.empty()) {
+      throw std::runtime_error("Failed to load config from " + pending.source_path.string() + ": " +
+                               e.what());
+    }
+    throw;
+  }
+  _hardware_config.reset();
+}
+
+void sirius_config::finalize_derived_config()
+{
+  // The uring (local-disk) readahead budget is NOT derived from the pipeline
+  // width: the local backend defaults to 0 (readahead off), because on local
+  // NVMe the prefetch competes with the executor's own reads for the same
+  // device.  An explicit uring.n_max_concurrent_scans in the config still wins.
+  // The opportunistic strategy schedules against what the executor can run,
+  // not what the device can queue, so it needs the pipeline pool's width.
+  _scan_manager_config.pipeline_width =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
-  if (pipeline_threads == struct_default) { return; }
-
-  SIRIUS_LOG_INFO(
-    "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
-    "({} threads), replacing the built-in default of {}",
-    pipeline_threads,
-    struct_default);
-  _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
+  derive_rest_scan_budget();
+  enforce_sirius_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_rest_scan_budget()
@@ -877,18 +918,23 @@ void sirius_config::derive_rest_scan_budget()
   // such round trip to hide, so uring stays at one per thread.
   //
   // Only the untouched default is replaced, so an explicit
-  // rest.n_max_concurrent_scans in the config still wins.
-  constexpr std::size_t scans_per_thread = 4;
+  // rest.n_max_concurrent_scans in the config still wins.  The derived budget is
+  // 2x the configured pipeline pool size, floored at 8 so a small pool still
+  // keeps enough ranged GETs in flight to cover the link's round-trip latency.
+  constexpr std::size_t scans_per_thread = 2;
+  constexpr std::size_t min_rest_scans   = 8;
   if (_scan_manager_config.rest.n_max_concurrent_scans_explicit) { return; }
 
   auto const derived =
-    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
-    scans_per_thread;
+    std::max(min_rest_scans,
+             static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads)) *
+               scans_per_thread);
   if (derived == _scan_manager_config.rest.n_max_concurrent_scans) { return; }
 
   SIRIUS_LOG_INFO(
-    "sirius_config: rest.n_max_concurrent_scans defaulted to {}x the configured pipeline pool size "
-    "({}), replacing the built-in default of {}",
+    "sirius_config: rest.n_max_concurrent_scans defaulted to max({}, {}x the configured pipeline "
+    "pool size) = {}, replacing the built-in default of {}",
+    min_rest_scans,
     scans_per_thread,
     derived,
     _scan_manager_config.rest.n_max_concurrent_scans);

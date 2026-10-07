@@ -46,6 +46,38 @@ struct scoped_yaml {
 
 }  // namespace
 
+TEST_CASE("parsed hardware configuration resolves independently after copying",
+          "[topology_config][config]")
+{
+  scoped_yaml yaml("sirius_deferred_topology.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: 1 }\n"
+                   "  memory:\n"
+                   "    gpu: { usage_limit_bytes: 1Gi }\n"
+                   "    host: { capacity_bytes: 2Gi }\n"
+                   "  operator_params: { concat_batch_bytes: 123456789 }\n"
+                   "  telemetry: { exporter: msgpack, output_directory: deferred_telemetry }\n");
+  sirius::sirius_config parsed;
+  parsed.parse_from_file(yaml.path);
+  CHECK(parsed.get_hw_topology().gpus.empty());
+  CHECK(parsed.get_memory_space_configs().empty());
+  CHECK(parsed.get_telemetry_config().exporter == "msgpack");
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
+
+  auto resolved = parsed;
+  resolved.resolve_hardware();
+  REQUIRE_FALSE(resolved.get_memory_space_configs().empty());
+  CHECK(resolved.get_operator_params().scan_task_batch_size == (1ULL << 30) / 40);
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 123456789);
+  CHECK(parsed.get_hw_topology().gpus.empty());
+  CHECK(parsed.get_memory_space_configs().empty());
+
+  // Resolving again must preserve runtime overrides instead of reapplying YAML.
+  resolved.get_operator_params().concat_batch_bytes = 987654321;
+  resolved.resolve_hardware();
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 987654321);
+}
+
 TEST_CASE("sirius_config parses topology.gpus_per_query", "[topology_config][config]")
 {
   scoped_yaml yaml("sirius_gpus_per_query.yaml",
