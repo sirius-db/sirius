@@ -2015,7 +2015,6 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     SIRIUS_LOG_INFO(
       "No sirius.yaml found (checked $SIRIUS_CONFIG_FILE, ./sirius.yaml, "
       "~/.sirius/sirius.yaml). Using defaults.");
-    config_ = sirius::parsed_sirius_config{};
   }
 }
 

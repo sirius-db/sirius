@@ -46,8 +46,8 @@ constexpr uint64_t DEFAULT_BATCH_SIZE = 800ULL * 1024 * 1024;  // 800 MiB
 
 /// Shared operator batch default: 2.5% of the smallest visible GPU's total memory,
 /// clamped to [512 MiB, 5 GiB]; DEFAULT_BATCH_SIZE when no GPU is visible. Queried
-/// once per process (memoized). operator_params derives its batch members from this,
-/// so every default-constructed instance agrees. When YAML explicitly configures an
+/// once per process (memoized). Hardware resolution derives operator batch sizes
+/// from this value. When YAML explicitly configures an
 /// effective GPU capacity, sirius_config narrows the shared defaults from the resolved
 /// memory-space configs before applying explicit operator_params overrides.
 uint64_t derived_default_batch_size();
@@ -125,13 +125,17 @@ constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 10
 /// Parameters controlling operator-level resource sizing.
 /// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
 /// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
+/// Hardware-independent defaults; resolution supplies capacity-derived batch sizes.
 struct operator_params {
+  /// Construct defaults with a shared batch size and twice that size for hash builds.
+  static operator_params with_batch_size(uint64_t batch_size);
+
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
   bool like_swar_fastpath = false;
 
   /// Target batch size (bytes) for DuckDB scan tasks.
-  uint64_t scan_task_batch_size = config::derived_default_batch_size();
+  uint64_t scan_task_batch_size = config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
@@ -140,18 +144,18 @@ struct operator_params {
   double max_sort_partition_memory_fraction = config::DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION;
 
   /// Target size (bytes) per hash partition for joins and group-bys.
-  uint64_t hash_partition_bytes = config::derived_default_batch_size();
+  uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
 
   /// Target size (bytes) for the concat operator output batch.
-  uint64_t concat_batch_bytes = config::derived_default_batch_size();
+  uint64_t concat_batch_bytes = config::DEFAULT_CONCAT_BATCH_BYTES;
 
   /// Target size (bytes) of data to sample before computing sort partition boundaries.
-  uint64_t sort_sample_bytes = config::derived_default_batch_size();
+  uint64_t sort_sample_bytes = config::DEFAULT_SORT_SAMPLE_BYTES;
 
   /// Maximum build-side bytes for switching to BUILD_PROBE join mode: 2x the shared
   /// batch default. May be larger than concat_batch_bytes; build-side batches will be
   /// concatenated if needed.
-  uint64_t max_build_hash_table_bytes = 2 * config::derived_default_batch_size();
+  uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
 
   /// Maximum build-side bytes for a broadcast join. A build below this size is eligible to be
   /// replicated to every GPU (instead of hash-partitioning across GPUs) when the probe side is
@@ -391,12 +395,7 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
-  // Parsing uses constant placeholders; resolution supplies hardware-derived defaults.
-  operator_params _operator_params{.scan_task_batch_size       = config::DEFAULT_BATCH_SIZE,
-                                   .hash_partition_bytes       = config::DEFAULT_BATCH_SIZE,
-                                   .concat_batch_bytes         = config::DEFAULT_BATCH_SIZE,
-                                   .sort_sample_bytes          = config::DEFAULT_BATCH_SIZE,
-                                   .max_build_hash_table_bytes = 2 * config::DEFAULT_BATCH_SIZE};
+  operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
 };

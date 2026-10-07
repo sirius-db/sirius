@@ -65,6 +65,16 @@ uint64_t derived_default_batch_size()
 
 }  // namespace config
 
+operator_params operator_params::with_batch_size(uint64_t batch_size)
+{
+  // Keep these fields in sync with batch_settings below.
+  return {.scan_task_batch_size       = batch_size,
+          .hash_partition_bytes       = batch_size,
+          .concat_batch_bytes         = batch_size,
+          .sort_sample_bytes          = batch_size,
+          .max_build_hash_table_bytes = 2 * batch_size};
+}
+
 static void reject_mutually_exclusive(yaml::reader& reader,
                                       const char* context,
                                       const char* first,
@@ -630,6 +640,7 @@ void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
   }
 }
 
+// Capacity-derived fields assigned by operator_params::with_batch_size.
 constexpr std::pair<const char*, uint64_t operator_params::*> batch_settings[] = {
   {"scan_task_batch_size", &operator_params::scan_task_batch_size},
   {"hash_partition_bytes", &operator_params::hash_partition_bytes},
@@ -661,16 +672,9 @@ operator_params operator_defaults_for(
   const std::vector<cucascade::memory::memory_space_config>& memory_space_configs,
   bool use_effective_capacity)
 {
-  operator_params params;
-  if (!use_effective_capacity) { return params; }
-
-  auto const batch                  = effective_default_batch_size(memory_space_configs);
-  params.scan_task_batch_size       = batch;
-  params.hash_partition_bytes       = batch;
-  params.concat_batch_bytes         = batch;
-  params.sort_sample_bytes          = batch;
-  params.max_build_hash_table_bytes = 2 * batch;
-  return params;
+  return operator_params::with_batch_size(use_effective_capacity
+                                            ? effective_default_batch_size(memory_space_configs)
+                                            : config::derived_default_batch_size());
 }
 
 }  // namespace
