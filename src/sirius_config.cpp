@@ -65,14 +65,30 @@ uint64_t derived_default_batch_size()
 
 }  // namespace config
 
+namespace {
+
+struct batch_setting {
+  const char* name;
+  uint64_t operator_params::* member;
+  uint64_t multiplier;
+};
+
+constexpr batch_setting batch_settings[] = {
+  {"scan_task_batch_size", &operator_params::scan_task_batch_size, 1},
+  {"hash_partition_bytes", &operator_params::hash_partition_bytes, 1},
+  {"concat_batch_bytes", &operator_params::concat_batch_bytes, 1},
+  {"sort_sample_bytes", &operator_params::sort_sample_bytes, 1},
+  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes, 2}};
+
+}  // namespace
+
 operator_params operator_params::with_batch_size(uint64_t batch_size)
 {
-  // Keep these fields in sync with batch_settings below.
-  return {.scan_task_batch_size       = batch_size,
-          .hash_partition_bytes       = batch_size,
-          .concat_batch_bytes         = batch_size,
-          .sort_sample_bytes          = batch_size,
-          .max_build_hash_table_bytes = 2 * batch_size};
+  operator_params result{};
+  for (const auto& setting : batch_settings) {
+    result.*setting.member = batch_size * setting.multiplier;
+  }
+  return result;
 }
 
 static void reject_mutually_exclusive(yaml::reader& reader,
@@ -640,14 +656,6 @@ void read_yaml_vec(const YAML::Node& node, std::vector<T>& out)
   }
 }
 
-// Capacity-derived fields assigned by operator_params::with_batch_size.
-constexpr std::pair<const char*, uint64_t operator_params::*> batch_settings[] = {
-  {"scan_task_batch_size", &operator_params::scan_task_batch_size},
-  {"hash_partition_bytes", &operator_params::hash_partition_bytes},
-  {"concat_batch_bytes", &operator_params::concat_batch_bytes},
-  {"sort_sample_bytes", &operator_params::sort_sample_bytes},
-  {"max_build_hash_table_bytes", &operator_params::max_build_hash_table_bytes}};
-
 uint64_t effective_default_batch_size(
   const std::vector<cucascade::memory::memory_space_config>& memory_space_configs)
 {
@@ -859,8 +867,8 @@ try {
   if (operator_node) {
     sirius::from_yaml(*operator_node, settings._operator_params);
     yaml::reader r(*operator_node, "operator_params");
-    for (auto [name, member] : batch_settings) {
-      if (r.has_value(name)) { impl->explicit_batch_settings.push_back(member); }
+    for (const auto& setting : batch_settings) {
+      if (r.has_value(setting.name)) { impl->explicit_batch_settings.push_back(setting.member); }
     }
   }
   return parsed_sirius_config(std::move(impl));
@@ -932,11 +940,11 @@ try {
 
   const auto defaults =
     operator_defaults_for(settings._memory_space_configs, impl_->use_effective_gpu_capacity);
-  for (auto [name, member] : batch_settings) {
+  for (const auto& setting : batch_settings) {
     if (std::find(impl_->explicit_batch_settings.begin(),
                   impl_->explicit_batch_settings.end(),
-                  member) == impl_->explicit_batch_settings.end()) {
-      settings._operator_params.*member = defaults.*member;
+                  setting.member) == impl_->explicit_batch_settings.end()) {
+      settings._operator_params.*setting.member = defaults.*setting.member;
     }
   }
   settings.finalize_derived_config();
