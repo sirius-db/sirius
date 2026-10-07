@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-// Unit tests for GpuExecutionFixture::cells_equal and canonical_float_key -- the cell
-// helpers behind compare_gpu_vs_cpu, compare_gpu_vs_cpu_approx and compare_gpu_vs_cpu_canonical.
-// They're pure functions on stringified cells, so they're tested directly here without a GPU or a
-// database.
+// Unit tests for GpuExecutionFixture::cells_equal -- the cell-equality helper
+// behind compare_gpu_vs_cpu / compare_gpu_vs_cpu_approx. It's a pure function on
+// stringified cells, so it's tested directly here without a GPU or a database.
 
 #include <catch.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -91,16 +90,4 @@ TEST_CASE("cells_equal: non-finite values only match exactly", "[gpu_execution][
   REQUIRE_FALSE(GpuExecutionFixture::cells_equal("nan", "0", kTol));
   // Identical spellings still match via the exact-string path.
   REQUIRE(GpuExecutionFixture::cells_equal("inf", "inf", kTol));
-}
-
-TEST_CASE("canonical_float_key folds NaN and signed-zero spellings", "[gpu_execution][comparator]")
-{
-  CHECK(GpuExecutionFixture::canonical_float_key("-nan") == "nan");
-  CHECK(GpuExecutionFixture::canonical_float_key("-0.0") == "0.0");
-  CHECK(GpuExecutionFixture::canonical_float_key("-0") == "0");
-  CHECK(GpuExecutionFixture::canonical_float_key("-0.5") == "-0.5");
-  CHECK(GpuExecutionFixture::canonical_float_key("-") == "-");
-  CHECK(GpuExecutionFixture::canonical_float_key("-inf") == "-inf");
-  CHECK(GpuExecutionFixture::canonical_float_key("nan") == "nan");
-  CHECK(GpuExecutionFixture::canonical_float_key("NULL") == "NULL");
 }

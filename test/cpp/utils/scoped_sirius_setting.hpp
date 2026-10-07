@@ -19,42 +19,30 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 
-#include <concepts>
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <utility>
 
 namespace sirius::test {
 
-/** Temporarily overrides a Sirius or DuckDB setting; destruction silently attempts restoration. */
+/** Temporarily overrides a shared Sirius setting; destruction silently attempts restoration. */
 class scoped_sirius_setting final {
  public:
-  template <std::same_as<bool> Bool>
-  scoped_sirius_setting(duckdb::Connection& connection, std::string name, Bool value)
+  scoped_sirius_setting(duckdb::Connection& connection, std::string name, bool value)
     : scoped_sirius_setting(
-        connection, std::move(name), setting_value{duckdb::Value::BOOLEAN(value)})
+        connection, std::move(name), value ? std::string{"true"} : std::string{"false"})
   {
   }
 
-  template <std::same_as<std::uint64_t> UInt64>
-  scoped_sirius_setting(duckdb::Connection& connection, std::string name, UInt64 value)
-    : scoped_sirius_setting(
-        connection, std::move(name), setting_value{duckdb::Value::UBIGINT(value)})
-  {
-  }
-
-  //! @p value is unquoted; the guard quotes it.
-  scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::string_view value)
-    : scoped_sirius_setting(
-        connection, std::move(name), setting_value{duckdb::Value(std::string{value})})
+  scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::uint64_t value)
+    : scoped_sirius_setting(connection, std::move(name), std::to_string(value))
   {
   }
 
   ~scoped_sirius_setting() noexcept
   {
     try {
-      con_.Query("SET " + name_ + " = " + original_.ToSQLString() + ";");
+      con_.Query("SET " + name_ + " = " + original_ + ";");
     } catch (...) {
       // Destructors must not mask the failure that caused scope unwinding.
     }
@@ -66,29 +54,22 @@ class scoped_sirius_setting final {
   scoped_sirius_setting& operator=(scoped_sirius_setting&&)      = delete;
 
  private:
-  //! Wraps a value so the delegating constructor never competes with the public overloads.
-  struct setting_value {
-    duckdb::Value value;
-  };
-
-  scoped_sirius_setting(duckdb::Connection& connection,
-                        std::string name,
-                        setting_value const& value)
+  scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::string value_literal)
     : con_(connection), name_(std::move(name))
   {
     auto current = con_.Query("SELECT current_setting('" + name_ + "');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
-    original_ = current->GetValue(0, 0);
+    original_ = current->GetValue(0, 0).ToString();
 
-    auto applied = con_.Query("SET " + name_ + " = " + value.value.ToSQLString() + ";");
+    auto applied = con_.Query("SET " + name_ + " = " + value_literal + ";");
     REQUIRE(applied);
     REQUIRE_FALSE(applied->HasError());
   }
 
   duckdb::Connection& con_;
   std::string name_;
-  duckdb::Value original_;
+  std::string original_;
 };
 
 }  // namespace sirius::test
