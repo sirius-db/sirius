@@ -1,9 +1,4 @@
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
-if(VCPKG_CUDA_ARCHITECTURES STREQUAL "RAPIDS")
-  message(
-    FATAL_ERROR
-      "Set VCPKG_CUDA_ARCHITECTURES to the CUDA architectures for Sirius")
-endif()
 
 set(sirius_url https://github.com/mbrobbel/sirius.git)
 set(sirius_ref 72c326f0e2c813fe5a10f014564fbc6d36b5fb7f)

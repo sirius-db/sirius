@@ -181,6 +181,7 @@
     },
     {
       "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "$env{VCPKG_CUDA_ARCHITECTURES}",
         "CMAKE_LINKER_TYPE": "BFD",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CPM_LOCAL_PACKAGES_ONLY": "ON",
@@ -193,6 +194,7 @@
       },
       "environment": {
         "VCPKG_BUILD_TYPE": "release",
+        "VCPKG_CUDA_ARCHITECTURES": "$env{CUDAARCHS}",
         "VCPKG_DISABLE_METRICS": "1",
         "VCPKG_LIBRARY_LINKAGE": "static"
       },

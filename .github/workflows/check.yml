@@ -230,10 +230,12 @@ jobs:
 
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
+        env:
+          VCPKG_CUDA_ARCHITECTURES: "100"
         run: |
           set -o pipefail
           pixi run -e vcpkg cmake -S . -B build/vcpkg-release -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100 \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$VCPKG_CUDA_ARCHITECTURES" \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_BUILD=ON -DCPM_LOCAL_PACKAGES_ONLY=ON \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_CUDA_COMPILER_LAUNCHER=sccache \

@@ -81,10 +81,16 @@ CMake's exported targets carry their link requirements. No archives are merged.
 
 ```bash
 pixi run -e vcpkg cmake --preset vcpkg-release -DSIRIUS_BUILD_TESTS=OFF
-pixi run -e vcpkg cmake --build build/vcpkg-release --target sirius_library
+pixi run -e vcpkg cmake --build --preset vcpkg-release --target sirius_library
 pixi run -e vcpkg cmake --install build/vcpkg-release \
   --component sirius_library --prefix "$PWD/build/static-install"
 ```
+
+The vcpkg presets use Pixi's `CUDAARCHS` list for both Sirius and its dependencies.
+To override it, run `pixi run -e vcpkg env CUDAARCHS=100 cmake --preset vcpkg-release`.
+Use the same `CUDAARCHS` value for configure and build commands.
+Direct toolchain builds must set `VCPKG_CUDA_ARCHITECTURES` to the same list passed
+as `CMAKE_CUDA_ARCHITECTURES`.
 
 Consumers use `find_package(sirius CONFIG REQUIRED COMPONENTS static)` and link
 `sirius::sirius_static`, with the dependency packages available through the vcpkg
