@@ -35,6 +35,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <transparent/read_view_registry.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -81,7 +82,6 @@
 #include <future>
 #include <iterator>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -102,9 +102,7 @@ namespace {
 /// null_count answers it — and handing one to filter_row_groups_with_stats
 /// faults rather than merely mis-pruning.
 ///
-/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST, and
-/// convert_table_filters_to_expression only drops it when it is a column's
-/// top-level filter, so one nested in a conjunction still reaches here.
+/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST.
 bool expression_has_null_predicate(duckdb::Expression const& expr)
 {
   auto const expr_type = expr.GetExpressionType();
@@ -173,11 +171,9 @@ duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression c
 
 /// Every `<col> IS [NOT] NULL` filter usable for null_count row-group pruning.
 ///
-/// Read from the TableFilterSet rather than from the converted expression,
-/// because convert_table_filters_to_expression DROPS a column's top-level
-/// IS_NOT_NULL before building the expression. Collecting downstream of that
-/// would leave the ordinary `WHERE v IS NOT NULL` with no pruning at all, which
-/// is the common form of the predicate.
+/// Read from the TableFilterSet independently of min/max pruning. Null-count
+/// pruning only eliminates whole row groups; mixed groups still require the
+/// row-level predicate after decoding.
 ///
 /// Both a top-level filter and one nested in a conjunction qualify. A
 /// conjunction is an AND of per-column filters, so each null test in it must
@@ -265,11 +261,13 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          scan_contract_id contract_id)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
-      _needs_assembly(needs_output_assembly(*_plan))
+      _needs_assembly(needs_output_assembly(*_plan)),
+      _contract_id(contract_id)
   {
   }
 
@@ -278,6 +276,14 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::vector<std::unique_ptr<scan_info>> emitted;
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
     if (file == nullptr) { return emitted; }
+
+    // Reject invalid ownership or coverage before recording a fallback or flushing pending work.
+    if (file->contract_id() != _contract_id) {
+      throw std::invalid_argument("parquet file contract does not match coalescer contract");
+    }
+    if (file->certificates().size() != 1 || file->dependencies().size() != 1) {
+      throw std::invalid_argument("parquet file requires one certificate and dependency");
+    }
 
     // Remember the first fully-pruned file. If the WHOLE source coalesces to
     // nothing, flush() emits one empty split built from it — zero splits mean
@@ -292,7 +298,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
-        file->file_index};
+        file->file_index,
+        std::vector<split_materializer_certificate>(file->certificates().begin(),
+                                                    file->certificates().end()),
+        std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
@@ -327,6 +336,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_comp,
                            std::move(slice_ds),
                            file->file_index);
+      auto certificate     = file->certificates().front();
+      certificate.split_id = _next_split_id++;
+      _certificates.push_back(std::move(certificate));
+      _dependencies.push_back(file->dependencies().front());
       _produced_any      = true;
       _acc_working_bytes = memory::saturating_add(_acc_working_bytes, cur_working);
       _acc_run_count     = memory::saturating_add(_acc_run_count, run_count);
@@ -389,7 +402,12 @@ class parquet_batch_coalescer : public batch_coalescer {
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
-      _produced_any       = true;
+      _certificates       = _empty_split_fallback->certificates;
+      _dependencies       = _empty_split_fallback->dependencies;
+      for (auto& certificate : _certificates) {
+        certificate.split_id = _next_split_id++;
+      }
+      _produced_any = true;
       out.push_back(emit_current());
     }
     return out;
@@ -409,7 +427,10 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
+    split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _slices.clear();
+    _certificates.clear();
+    _dependencies.clear();
     _acc_working_bytes = 0;
     _acc_run_count     = 0;
     _acc_rows          = 0;
@@ -420,8 +441,12 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
+  const scan_contract_id _contract_id;
 
   std::vector<row_group_slice> _slices;
+  std::vector<split_materializer_certificate> _certificates;
+  std::vector<split_dependencies> _dependencies;
+  uint64_t _next_split_id        = 1;
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
@@ -442,6 +467,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
     std::size_t file_index;
+    std::vector<split_materializer_certificate> certificates;
+    std::vector<split_dependencies> dependencies;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -600,8 +627,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       bind.returned_types,
                                                       _plan->batch_position_by_column_id,
                                                       _plan->partition_primary_indices,
-                                                      _virtual_types,
-                                                      _plan->has_user_virtual_columns());
+                                                      _virtual_types);
     if (duckdb_expression) {
       // Validate before scan tasks retranslate and dereference the predicate.
       if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
@@ -684,8 +710,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                             bind.returned_types,
                                             _plan->batch_position_by_column_id,
                                             _plan->partition_primary_indices,
-                                            _virtual_types,
-                                            _plan->has_user_virtual_columns()),
+                                            _virtual_types),
         answerable_positions);
     }
   }
@@ -727,7 +752,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->contract_id);
 }
 
 //===----------------------------------------------------------------------===//
@@ -791,10 +816,12 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::size_t footer_len = 0;
   if (sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();
+        footer_len    = pm->footer_byte_len();
       }
     }
   }
@@ -804,8 +831,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     // overlap each other rather than a pipeline's data traffic.  A prior bind
     // (or a pin) may have already stored the metadata, in which case the branch
     // above serves it and this costs nothing.
-    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
-    auto const footer_len = footer->size();
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    footer_len  = footer->size();
     // The carrier projection is only known to match this file after the footer
     // is parsed, so the parse itself runs without a column selection.
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
@@ -1185,6 +1212,39 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   out->partition_values = std::move(partition_values);
+  auto input_identity   = file_path + "|footer=" + std::to_string(footer_len);
+  if (_info->read_views && _info->contract_id != 0) {
+    auto const& entry = _info->read_views->entry(_info->contract_id);
+    if (auto const& evidence = entry.physical_evidence) {
+      std::call_once(_evidence_index_once, [this] {
+        _evidence_index_by_file = make_read_view_evidence_index(_file_paths);
+      });
+      auto const evidence_index =
+        _evidence_index_by_file.empty() ? file_index : _evidence_index_by_file[file_index];
+      if (evidence_index >= evidence->size.size() ||
+          evidence_index >= evidence->last_modified.size() ||
+          evidence_index >= evidence->size_present.size() ||
+          evidence_index >= evidence->last_modified_present.size() ||
+          evidence_index >= evidence->etag.size()) {
+        throw std::logic_error(
+          "physical read-view evidence does not match the bound file inventory");
+      }
+      if (evidence->size_present[evidence_index]) {
+        input_identity += "|size=" + std::to_string(evidence->size[evidence_index]);
+      }
+      if (evidence->last_modified_present[evidence_index]) {
+        input_identity +=
+          "|last_modified=" + std::to_string(evidence->last_modified[evidence_index]);
+      }
+      if (!evidence->etag[evidence_index].empty()) {
+        input_identity += "|etag=" + evidence->etag[evidence_index];
+      }
+    }
+  }
+  out->set_contract_payload(
+    _info->contract_id,
+    {{_info->contract_id, 0, std::move(input_identity), "parquet", "footer"}},
+    {{file_metadata, out->datasource, std::nullopt}});
 
   return out;
 }

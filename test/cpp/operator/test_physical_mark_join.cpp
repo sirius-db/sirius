@@ -29,6 +29,8 @@
 #include <op/sirius_physical_nested_loop_join.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 
+#include <algorithm>
+
 using namespace duckdb;
 using namespace sirius::op;
 using namespace cucascade;
@@ -157,6 +159,8 @@ nlj_projection_fixture create_projected_nlj(duckdb::JoinType join_type,
   f.logical_join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
   if (join_type == duckdb::JoinType::MARK) {
     f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+  } else if (join_type == duckdb::JoinType::RIGHT) {
+    f.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
   } else {
     f.logical_join->types = {duckdb::LogicalType::INTEGER};
   }
@@ -1166,4 +1170,42 @@ TEST_CASE("sirius_physical_nested_loop_join SEMI and ANTI honor the left project
     REQUIRE(out_view.num_rows() == 3);
     REQUIRE(copy_column_to_host<int32_t>(out_view.column(0)) == std::vector<int32_t>{10, 20, 30});
   }
+}
+
+TEST_CASE("sirius_physical_nested_loop_join RIGHT keeps asymmetric predicate sides",
+          "[physical_nested_loop_join][projection][right]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space);
+
+  auto left  = make_three_int32_batch(*space, {1, 1, 5}, {10, 11, 50}, {100, 101, 500});
+  auto right = make_numeric_batch_with_nulls<int32_t>(
+    *space, {0, 3, 0}, {true, true, false}, cudf::type_id::INT32);
+  auto f = create_projected_nlj(duckdb::JoinType::RIGHT, duckdb::ExpressionType::COMPARE_LESSTHAN);
+  auto result = execute_projected_nlj(*f.nlj, left, right);
+  REQUIRE(result.view.num_columns() == 2);
+  REQUIRE(result.view.num_rows() == 4);
+  auto payload       = copy_column_to_host<int32_t>(result.view.column(0));
+  auto keys          = copy_column_to_host<int32_t>(result.view.column(1));
+  auto payload_valid = copy_validity_to_host(result.view.column(0));
+  auto keys_valid    = copy_validity_to_host(result.view.column(1));
+  std::vector<int32_t> matched_payload;
+  size_t unmatched_zero = 0;
+  size_t unmatched_null = 0;
+  for (size_t i = 0; i < payload.size(); ++i) {
+    if (payload_valid[i]) {
+      REQUIRE(keys_valid[i]);
+      REQUIRE(keys[i] == 3);
+      matched_payload.push_back(payload[i]);
+    } else if (keys_valid[i]) {
+      REQUIRE(keys[i] == 0);
+      ++unmatched_zero;
+    } else {
+      ++unmatched_null;
+    }
+  }
+  std::sort(matched_payload.begin(), matched_payload.end());
+  REQUIRE(matched_payload == std::vector<int32_t>{10, 11});
+  REQUIRE(unmatched_zero == 1);
+  REQUIRE(unmatched_null == 1);
 }

@@ -212,6 +212,7 @@ Implements LIMIT/OFFSET using atomic counters for parallel execution.
 
 - **Key members:** `_remaining_offset` (atomic), `_remaining_limit` (atomic), `_limit_exhausted` (atomic)
 - **Mechanism:** Each task atomically claims a portion of the remaining limit via `claim()`. When the limit is exhausted, the pipeline terminates early.
+- **Empty output:** A task whose input batches yield no rows emits one 0-row batch, like a scan of an empty table, so a downstream ungrouped aggregate still returns its row. DuckDB plans an uncorrelated `EXISTS` as a count over `LIMIT 1`.
 
 ## Blocking Operators
 
@@ -233,6 +234,8 @@ Partition count, broadcast, and BUILD_PROBE are decided together by the free fun
 By execution time every equality-condition side is a plain column reference: a complex equality-key expression is materialized into a real column by a planner-inserted projection below the join (`materialize_expression_join_keys()`), because PARTITION — the first key consumer — hashes by column index and cannot evaluate expressions. Inequality sides stay inline as the mixed-join AST predicate.
 
 **NULL comparison for keys.** `compare_nulls()` picks the `null_equality` flag threaded through every cuDF join call (including the build helpers and `filtered_join`/`mark_join`): `EQUAL` only when *every* equi-key is `IS NOT DISTINCT FROM`, `UNEQUAL` otherwise (any plain `=`, delim joins, and MARK). A null-safe key *mixed* with plain `=` is instead routed through MIXED_JOIN (see below).
+
+**Nullable mixed SEMI/ANTI residuals.** These joins, including RIGHT_SEMI/RIGHT_ANTI, retain equality-key hashing when a build residual contains NULL. `prepare_mixed_filter_build()` appends a non-null validity column for each nullable residual input to the build conditional table. This prevents cuDF 26.08 build deduplication from confusing NULL with a valid value having identical stored bytes when its conditional comparator uses the equality table's nullability. The flags preserve duplicate elimination for valid rows, do not change predicate column indices, and are excluded from the join output. Only residual conditions enter the AST; hash-key casts continue through normal key preparation.
 
 **Broadcast small build tables.** On multi-GPU, a build side is a broadcast candidate when it is small (`< small_table_bytes`), or when it fits `max_broadcast_join_size` and the estimated probe-to-build ratio is at least `num_gpus * 1.25`; MARK joins are forced broadcast whenever `num_gpus > 1` (see [MARK joins](#mark-joins)). Instead of routing the whole build to one GPU, the join places one partition on each GPU (`partition_placement::one_per_device`, so `placement.num_partitions()` equals the GPU count) and PARTITION *replicates* the small build table to every slot (the `_broadcast` flag), so each GPU builds its own hash table and joins its local probe rows. The build sink deposits the build batch into every slot; the probe sink routes each batch to the slot placed on its current GPU (`partition_placement::first_partition_for_device`). Once the probe side finishes, any slot that received replicated build data but no probe rows is discarded (`discard_build_only_slots_if_probe_complete`). Right-family / mixed joins reject BUILD_PROBE and fall back to the normal partition count.
 
@@ -307,6 +310,8 @@ Supported join types: INNER, LEFT, RIGHT, OUTER, MARK via `cudf::inner_join()`, 
 
 Fallback for joins not supported by cuDF hash join (pure inequality conditions). Uses `PhysicalNestedLoopJoin::IsSupported()` to validate.
 
+Without conditions it runs a cross product: `cudf::cross_join` on each pair of left and right batches. Before allocating, `execute` computes the output size of the pair and throws when it exceeds the GPU memory space, so the query falls back to CPU instead. An output beyond the cuDF row limit fails in `cudf::cross_join`.
+
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
 ### `sirius_physical_union` — `UNION`
@@ -362,7 +367,8 @@ Combined ORDER + LIMIT: selects and sorts the top N rows.
 Aggregate without GROUP BY (e.g., `SELECT COUNT(*), SUM(x) FROM t`).
 
 - **GPU execution:** `gpu_aggregate_impl::local_ungrouped_aggregate()` using `cudf::reduce()`
-- **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST
+- **Supported:** SUM, MIN, MAX, COUNT (of valid values), COUNT(*), AVG, FIRST, and COUNT(DISTINCT) on a single non-nested column without a FILTER clause
+- **COUNT(DISTINCT) handling:** each batch reduces the column to a one-row LIST with `COLLECT_SET` (NULLs excluded), `MERGE_AGGREGATE` unions the lists with `MERGE_SETS` and counts the elements. Other DISTINCT aggregates fall back to the CPU at plan time.
 - **AVG handling:** Decomposed into SUM + COUNT and finalized on-device. `make_avg_column()` divides the single-row merged sum/count columns with `cudf::binary_operation` — DECIMAL output divides directly in fixed point to preserve precision, while non-DECIMAL output casts both operands to FLOAT64 and divides. This keeps AVG off the host `long double` path, avoiding both the device→host sync and the precision loss of decimal round-trips. The denominator is the count of *non-null* values (matching SUM, which skips NULLs), computed with a NULL-excluding COUNT reduction; when the column has no NULLs the row count is used directly.
 - **DECIMAL overflow handling:** DECIMAL SUM casts to a wider type before reduction — DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128 — to prevent overflow
 - **BIGINT SUM fallback:** BIGINT (INT64) SUM falls back to CPU execution because GPU lacks INT128 accumulator support. Without this, silent overflow produces incorrect results. BIGINT arithmetic operations (ADD, SUB, MUL) also fall back to CPU for the same reason.

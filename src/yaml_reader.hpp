@@ -18,7 +18,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -27,6 +30,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <vector>
 
@@ -81,7 +85,8 @@ struct path_exists {
 ///
 /// Binary (powers of 1024): Ki/KiB, Mi/MiB, Gi/GiB, Ti/TiB
 /// Decimal (powers of 1000): K/KB, M/MB, G/GB, T/TB
-/// Plain integers without suffix are returned as-is.
+/// Plain integers, including a trailing B or b, are returned exactly. A value that does not fit
+/// in uint64_t throws.
 ///
 /// Follows the Kubernetes/systemd convention where K=1000, Ki=1024.
 inline std::uint64_t parse_bytes(std::string_view sv)
@@ -90,30 +95,81 @@ inline std::uint64_t parse_bytes(std::string_view sv)
 
   // Find where the numeric part ends
   size_t pos = 0;
-  while (pos < sv.size() && (std::isdigit(sv[pos]) || sv[pos] == '.' || sv[pos] == '-')) {
+  while (pos < sv.size() &&
+         (std::isdigit(static_cast<unsigned char>(sv[pos])) || sv[pos] == '.' || sv[pos] == '-')) {
     ++pos;
   }
 
   if (pos == 0) { throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'"); }
 
-  double number = std::stod(std::string(sv.substr(0, pos)));
-  if (number < 0) { throw std::runtime_error("byte value must be non-negative"); }
-  auto suffix = sv.substr(pos);
+  const auto number_token = sv.substr(0, pos);
+  auto suffix             = sv.substr(pos);
 
   // Strip leading whitespace from suffix
   while (!suffix.empty() && suffix[0] == ' ') {
     suffix.remove_prefix(1);
   }
 
-  if (suffix.empty() || suffix == "B" || suffix == "b") {
-    return static_cast<std::uint64_t>(number);
+  // A trailing B/b is a plain byte count, same as no suffix.
+  const bool plain_count = suffix.empty() || suffix == "B" || suffix == "b";
+  if (plain_count && number_token.find('.') == std::string_view::npos) {
+    // Plain integer
+    auto digits         = number_token;
+    const bool negative = digits.front() == '-';
+    if (negative) { digits.remove_prefix(1); }
+    if (digits.empty()) {
+      throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
+    }
+
+    std::uint64_t value{};
+    const auto* const first = digits.data();
+    const auto* const last  = digits.data() + digits.size();
+    const auto parsed       = std::from_chars(first, last, value);
+    if (parsed.ptr != last || parsed.ec == std::errc::invalid_argument) {
+      throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
+    }
+    if (parsed.ec == std::errc::result_out_of_range) {
+      throw std::runtime_error(negative ? "byte value must be non-negative"
+                                        : "byte value out of range");
+    }
+    if (parsed.ec != std::errc{}) {
+      throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
+    }
+    if (negative && value != 0) { throw std::runtime_error("byte value must be non-negative"); }
+    return value;
+  }  // else double
+
+  double number        = 0;
+  std::size_t consumed = 0;
+  try {
+    number = std::stod(std::string(number_token), &consumed);
+  } catch (const std::out_of_range&) {
+    throw std::runtime_error("byte value out of range");
+  } catch (const std::invalid_argument&) {
+    throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
   }
+  // stod accepts a proper prefix, so "1.2.3G" would otherwise become 1.2G.
+  if (consumed != number_token.size()) {
+    throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
+  }
+  if (number < 0) { throw std::runtime_error("byte value must be non-negative"); }
+
+  // 2^64 is exactly representable as a double but does not fit in uint64_t.
+  const auto to_uint64 = [](double scaled) {
+    constexpr double limit = 18446744073709551616.0;
+    if (!std::isfinite(scaled) || scaled >= limit) {
+      throw std::runtime_error("byte value out of range");
+    }
+    return static_cast<std::uint64_t>(scaled);
+  };
+
+  if (plain_count) { return to_uint64(number); }
 
   // Determine if binary (Ki, Mi, Gi, Ti, KiB, MiB, GiB, TiB) or decimal (K, KB, M, MB, ...)
-  char unit   = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
-  bool binary = (suffix.size() >= 2 && suffix[1] == 'i');
+  const char unit   = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
+  const bool binary = suffix.size() >= 2 && suffix[1] == 'i';
 
-  std::uint64_t base = binary ? 1024ULL : 1000ULL;
+  const std::uint64_t base = binary ? 1024ULL : 1000ULL;
   std::uint64_t multiplier;
   switch (unit) {
     case 'K': multiplier = base; break;
@@ -123,7 +179,7 @@ inline std::uint64_t parse_bytes(std::string_view sv)
     default: throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
   }
 
-  return static_cast<std::uint64_t>(number * static_cast<double>(multiplier));
+  return to_uint64(number * static_cast<double>(multiplier));
 }
 
 // ================ Time-suffix parsing ================= //

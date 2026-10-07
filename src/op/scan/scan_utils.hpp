@@ -113,8 +113,7 @@ std::vector<table_filter_conjunct> decompose_table_filters(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices                     = {},
-  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {},
-  bool include_is_not_null                                                        = false);
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {});
 
 /**
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
@@ -129,7 +128,9 @@ std::vector<table_filter_conjunct> decompose_table_filters(
  * partition filters at the file-list level when hive_partitioning is enabled, so dropping them
  * here is safe.
  *
- * Returns nullptr if the filter set is empty or contains only unsupported/skipped filter types.
+ * Required predicates, including IS NOT NULL, are retained. Only advisory filters and
+ * predicates owned by another layer (the partition filters above) are omitted.
+ * Returns nullptr if no predicates remain.
  */
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
@@ -137,8 +138,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
   const std::unordered_set<std::size_t>& skip_primary_indices                     = {},
-  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {},
-  bool include_is_not_null                                                        = false);
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {});
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the

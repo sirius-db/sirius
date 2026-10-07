@@ -23,6 +23,7 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -43,6 +44,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -72,6 +74,9 @@ class sirius_engine;
 
 namespace duckdb {
 
+class Connection;
+class MaterializedQueryResult;
+
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
 ///
@@ -99,7 +104,11 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// A new query on this connection invalidates any leftover capture.
-  void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+  void QueryBegin(ClientContext& context) final
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void QueryEnd() final { pinned_update_guard_.reset(); }
 
@@ -123,8 +132,11 @@ class SiriusConnectionState : public ClientContextState {
   {
     ++planning_generation_;
     captured_plan_.reset();
+    captured_original_views_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
+
+  [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
 
   /// \brief Current classification; provider_internal remains latched.
   [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
@@ -173,6 +185,23 @@ class SiriusConnectionState : public ClientContextState {
     captured_generation_ = planning_generation_;
   }
 
+  void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
+  {
+    captured_original_views_ =
+      sirius::op::scan::logical_bound_read_view_capture{planning_generation_, std::move(views)};
+  }
+
+  std::optional<sirius::op::scan::logical_bound_read_view_capture>
+  take_captured_original_views_if_current()
+  {
+    if (!captured_original_views_ ||
+        captured_original_views_->planning_generation != planning_generation_) {
+      captured_original_views_.reset();
+      return std::nullopt;
+    }
+    return std::exchange(captured_original_views_, std::nullopt);
+  }
+
   /// \brief Consume the capture iff it belongs to the CURRENT planning attempt;
   /// a stale capture (generation mismatch) is dropped and nullptr is returned,
   /// which sends OnFinalizePrepare down its existing replan-from-SQL path.
@@ -187,7 +216,11 @@ class SiriusConnectionState : public ClientContextState {
 
   /// \brief Drop the capture without touching the generation (used by
   /// OnFinalizePrepare's not-taking-over early-outs).
-  void clear_captured_plan() noexcept { captured_plan_.reset(); }
+  void clear_captured_plan() noexcept
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
   [[nodiscard]] std::optional<std::string> take_pending_query_label()
@@ -245,6 +278,7 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t classified_generation_ = ~uint64_t{0};  ///< sentinel: no attempt classified yet
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -295,9 +329,14 @@ class SiriusContext : public ClientContextState {
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
-    uint64_t provider_internal_skips = 0;
-    uint64_t hidden_catalog_skips    = 0;
-    uint64_t classification_failures = 0;
+    uint64_t provider_internal_skips          = 0;
+    uint64_t hidden_catalog_skips             = 0;
+    uint64_t classification_failures          = 0;
+    uint64_t read_view_mismatches             = 0;
+    uint64_t certificate_mismatches           = 0;
+    uint64_t execution_rebuilds               = 0;
+    uint64_t checkpoint_revalidation_failures = 0;
+    uint64_t lease_held_at_replay             = 0;
   };
 
   SiriusContext();
@@ -375,6 +414,36 @@ class SiriusContext : public ClientContextState {
    private:
     shared_ptr<SiriusConnectionState> state_;
   };
+
+  /// Framework-owned Sirius-internal DuckDB connection. Its transaction is explicitly
+  /// read-only, and InternalQueryGuard remains active for the connection's entire lifetime.
+  struct internal_connection {
+    internal_connection(internal_connection&&) noexcept;
+    internal_connection& operator=(internal_connection&&) noexcept;
+    ~internal_connection() noexcept;
+    internal_connection(const internal_connection&)            = delete;
+    internal_connection& operator=(const internal_connection&) = delete;
+
+    unique_ptr<MaterializedQueryResult> Query(const string& sql);
+
+   private:
+    struct implementation;
+    explicit internal_connection(unique_ptr<implementation> impl) noexcept;
+    unique_ptr<implementation> impl_;
+    friend class SiriusContext;
+  };
+
+  [[nodiscard]] static internal_connection open_internal_connection(ClientContext& outer);
+
+  // Installed and cleared with no replay in flight; only invoked by the internal test option.
+  // Set before a test starts its workers; reset only after they have joined.
+  std::function<void(ClientContext&, std::string_view, uint64_t)>
+    native_checkpoint_hook_for_testing;
+  void observe_native_checkpoint_for_testing(ClientContext& context,
+                                             std::string_view phase,
+                                             uint64_t iteration = 0);
+  std::function<void()> cpu_replay_hook_for_testing;
+  void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -459,6 +528,17 @@ class SiriusContext : public ClientContextState {
    */
   class StandaloneQueryScope {
    public:
+    enum class lease_release_state : uint8_t {
+      not_entered,
+      released,
+      begin_failed,
+      cleanup_failed
+    };
+    struct lease_release_result {
+      lease_release_state state = lease_release_state::not_entered;
+      std::size_t keys_released = 0;
+    };
+
     StandaloneQueryScope(SiriusContext& ctx, ClientContext& context, std::string_view window_label);
     ~StandaloneQueryScope() noexcept;
     StandaloneQueryScope(const StandaloneQueryScope&)            = delete;
@@ -477,6 +557,7 @@ class SiriusContext : public ClientContextState {
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
     /// query's manager rather than a shared one.
     [[nodiscard]] sirius::query_id_t query_id() const noexcept { return window_id_; }
+    [[nodiscard]] lease_release_result lease_release() const noexcept { return lease_release_; }
 
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
@@ -495,10 +576,20 @@ class SiriusContext : public ClientContextState {
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
+    lease_release_result lease_release_;
+    bool inject_cleanup_failure_ = false;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
+
+  /// \brief Restore the cuDF global pinned memory resource and threshold that
+  ///        initialize() installed, before the slab allocator backing them is
+  ///        destroyed. Idempotent and no-op when nothing was installed, so it
+  ///        is safe to call from both terminate() (success path) and the
+  ///        failure/early-return paths. cuDF holds a non-owning reference to
+  ///        small_pinned_allocator_view_, so skipping this leaves it dangling.
+  void restore_cudf_pinned_memory_resource() noexcept;
 
   /// \brief Log host and GPU memory pool stats (allocated, peak, and
   ///        tier-specific capacity fields) at a labeled tag — used for
@@ -628,6 +719,17 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record a fresh split rejected because it belongs to another scan contract.
+  void record_transparent_certificate_mismatch() noexcept;
+
+  /// \brief Record a CPU/candidate bound read-view comparison failure.
+  void record_transparent_read_view_mismatch() noexcept;
+
+  /// \brief Record rebuilding a Sirius plan inside an execution window.
+  void record_transparent_execution_rebuild() noexcept;
+  void record_checkpoint_revalidation_failure() noexcept;
+  void record_lease_held_at_replay() noexcept;
+
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
@@ -662,7 +764,9 @@ class SiriusContext : public ClientContextState {
   /// telemetry and logging inside are best-effort and never abort the
   /// remaining steps. @p query_id selects which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
-  void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
+  [[nodiscard]] std::size_t run_mandatory_cleanup(sirius::query_id_t query_id,
+                                                  std::string_view end_tag,
+                                                  bool inject_failure = false);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
@@ -767,6 +871,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
+  std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
+  std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
+  std::atomic<uint64_t> lease_held_at_replay_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
@@ -777,20 +886,11 @@ class SiriusContext : public ClientContextState {
 /// null (best-effort) path never throws.
 void install_configured_log_sink(DatabaseInstance* db);
 
-/// Publish whether Quent captures NVTX, from the telemetry section of @p config_path.
-/// Call before constructing a sirius_config: its hardware discovery makes this image's
-/// first NVTX call, and NVTX picks an injector only once per image.
-void publish_nvtx_injection(const std::filesystem::path& config_path);
-
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
   SiriusContextExtensionCallback();
-
-  /// publish_nvtx_injection for the config file the constructor will load, unless Sirius is
-  /// disabled. Call before constructing the callback: its config_ member runs discovery.
-  static void publish_configured_nvtx_injection();
 
   /// Finish runtime initialization after process-wide setup that must precede
   /// the first NVTX/runtime-initialization call.

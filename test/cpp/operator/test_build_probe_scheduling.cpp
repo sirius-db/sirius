@@ -39,6 +39,7 @@
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -434,6 +435,40 @@ TEST_CASE("compute_hash_join_partition_strategy - mixed / full-outer / unfoldabl
   auto const unfoldable =
     strategy(k100MB, true, /*foldable=*/false, /*num_gpus=*/1, duckdb::JoinType::INNER);
   REQUIRE_FALSE(unfoldable.build_probe);
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - lone STANDARD partition follows locality",
+          "[hash_join][build_probe][partition_placement][unit]")
+{
+  for (int num_gpus : {1, 4}) {
+    for (auto join_type :
+         {duckdb::JoinType::INNER, duckdb::JoinType::OUTER, duckdb::JoinType::RIGHT}) {
+      // An unfoldable build stays STANDARD; right-family joins are probe-driven.
+      bool const build_driven = join_type != duckdb::JoinType::RIGHT;
+      auto const s            = strategy(1024 * 1024, build_driven, false, num_gpus, join_type);
+      REQUIRE(s.num_partitions == 1);
+      REQUIRE_FALSE(s.build_probe);
+      REQUIRE_FALSE(s.broadcast);
+      sirius::op::partitioned_operator_data input({}, 0, s.placement);
+      CHECK(input.get_partition_idx() == std::optional<std::size_t>{0});
+      CHECK_FALSE(input.get_preferred_device_id().has_value());
+    }
+    auto const mixed = strategy(
+      1024 * 1024, true, true, num_gpus, duckdb::JoinType::INNER, HASH_JOIN_MODE::MIXED_JOIN);
+    CHECK_FALSE(mixed.placement.any_pinned());
+  }
+}
+
+TEST_CASE("compute_hash_join_partition_strategy - multiple STANDARD partitions stay pinned",
+          "[hash_join][build_probe][partition_placement][unit]")
+{
+  for (bool build_driven : {false, true}) {
+    auto const s =
+      strategy(4 * kBigPartitionBytes, build_driven, false, 4, duckdb::JoinType::INNER);
+    REQUIRE_FALSE(s.build_probe);
+    REQUIRE(s.num_partitions == 4);
+    CHECK(s.placement == partition_placement::round_robin(4, {0, 1, 2, 3}));
+  }
 }
 
 TEST_CASE("compute_hash_join_partition_strategy - no GPU list plans one GPU, unpinned",

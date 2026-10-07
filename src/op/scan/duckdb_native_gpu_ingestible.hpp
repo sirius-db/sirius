@@ -73,10 +73,6 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
-  /// Skip the constructor's metadata walk: a pin-served scan takes its splits from the pinned
-  /// entry. ensure_metadata_prepared() runs the walk if the scan falls to disk after all.
-  bool defer_metadata_walk = false;
-
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
   std::vector<projected_column> projected_cols;
@@ -193,8 +189,16 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   [[nodiscard]] bool metadata_walk_pending() const noexcept
   {
-    return _walk_deferred && !_walk_ready.load(std::memory_order_acquire);
+    return !_walk_ready.load(std::memory_order_acquire);
   }
+
+  [[nodiscard]] duckdb::AttachedDatabase& attached_database() const noexcept
+  {
+    return _info->storage->GetAttached();
+  }
+
+  /// Valid only after ensure_metadata_prepared() completed under the caller's checkpoint key.
+  [[nodiscard]] std::uint64_t checkpoint_iteration() const;
 
   /// Call only when !metadata_walk_pending().
   [[nodiscard]] duckdb_native_walk_plan const& walk_plan_for_testing() const noexcept
@@ -247,9 +251,10 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 
   //===----------Deferred metadata walk----------===//
-  bool _walk_deferred = false;
   std::atomic<bool> _walk_ready{false};
   std::once_flag _walk_once;  ///< Serializes the deferred walk; re-arms after a throw.
+  std::uint64_t _checkpoint_iteration = 0;
+  bool _inject_decode_failure         = false;
 
   //===----------RG Range Slicing----------===//
   std::size_t _chunk_row_groups =

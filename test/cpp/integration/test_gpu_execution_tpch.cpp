@@ -804,6 +804,24 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
 }
 
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped aggregate over a limit that passes no rows",
+                 "[integration][gpu_execution][limit]")
+{
+  // The aggregate must still return its single row.
+  SECTION("empty input")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from "
+      "(select * from nation where n_regionkey > 10 limit 1);");
+  }
+  SECTION("offset past the end")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from (select * from nation limit 1 offset 100);");
+  }
+}
+
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - limit with offset on large table parquet",
                  "[.][integration_disabled][gpu_execution][parquet][limit][limit_multi_batch]")
@@ -4432,6 +4450,15 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 "[integration][gpu_execution][grouping_sets]",
                 "select l_returnflag, l_linestatus, count(distinct l_suppkey) s, count(*) n "
                 "from lineitem group by cube(l_returnflag, l_linestatus);")
+
+// Cross products of two tables and of single-row aggregates, the shape of TPC-DS Q88 and Q90.
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H tables cross product",
+                "[integration][gpu_execution][TPC-H][cross_product]",
+                "SELECT n_name, r_name, c, m FROM nation, region, "
+                "(SELECT count(*) c FROM lineitem WHERE l_quantity < 10), "
+                "(SELECT max(o_totalprice) m FROM orders);")
 
 //===----------------------------------------------------------------------===//
 // TPC-H SF10 smoke variants (TEST-04)

@@ -548,10 +548,8 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
                                " has no downstream partition-sizing consumer set");
     }
     std::lock_guard<std::mutex> sizing_guard(sizing_partition.lock);
-    apply_partition_strategy(
-      partition_strategy{
-        1, false, false, partition_placement::round_robin(1, consumer->active_gpu_ids())},
-      *consumer);
+    apply_partition_strategy(partition_strategy{1, false, false, partition_placement::unpinned(1)},
+                             *consumer);
   }
   if (_num_partitions.has_value() && !_is_build && _sibling_partition_op != nullptr) {
     // If this is part of a join and its on the probe side, and we have determined the number of
