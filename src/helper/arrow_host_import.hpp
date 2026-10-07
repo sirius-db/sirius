@@ -30,8 +30,8 @@
 
 // Arrow C Data Interface structs, forward-declared so this header needs no Arrow header. The .cpp
 // uses DuckDB's layout-identical definition, the one this library already links.
-struct ArrowSchema;
 struct ArrowArray;
+struct ArrowSchema;
 
 namespace sirius {
 
@@ -46,17 +46,21 @@ namespace sirius {
  * their copy. A `decimal128` is narrowed to the declared width before the next column is copied.
  * The struct's `offset`/`length` window is honoured, which `cudf::from_arrow_column` ignores.
  *
- * Copies run on `stream`; the caller syncs it before the producer releases the structs. A throw
- * after a copy started syncs `stream` first. The input is never released.
+ * The input is never released. A throw after a copy started syncs `stream` first.
  *
- * @param what Message prefix naming the batch.
- * @param names Declared column names, for messages; as many as `types`.
+ * @param array The batch, a struct array; read only during the call.
+ * @param schema Its schema.
+ * @param error_prefix Prefix of every error message, naming the batch.
+ * @param names Declared column names, used in messages.
+ * @param types Declared column types; as many as `names`.
+ * @param stream Runs the copies; sync it before the producer releases the structs.
  * @param mr Allocates the returned columns.
  * @throws sirius::invalid_input_exception on a refused batch, naming the column.
+ * @throws sirius::internal_exception when `names` and `types` differ in length.
  */
-std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
-                                                     const ArrowArray* array,
-                                                     std::string_view what,
+std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowArray* array,
+                                                     const ArrowSchema* schema,
+                                                     std::string_view error_prefix,
                                                      const std::vector<std::string>& names,
                                                      const std::vector<logical_type>& types,
                                                      rmm::cuda_stream_view stream,

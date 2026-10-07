@@ -437,8 +437,8 @@ void streaming_fragment::push_arrow(stream_id_t id,
   // A pool stream: syncing cudf's default (legacy) stream would be a device-wide barrier.
   auto stream = gpu.acquire_stream();
   auto table =
-    import_arrow_host_table(schema,
-                            array,
+    import_arrow_host_table(array,
+                            schema,
                             "streaming_fragment: Arrow batch for stream " + std::to_string(id),
                             declared.names,
                             declared.types,

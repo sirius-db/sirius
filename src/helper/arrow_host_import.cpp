@@ -28,16 +28,49 @@
 #include <cudf/utilities/traits.hpp>           // cudf::is_fixed_point
 #include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
 
+#include <algorithm>
+#include <array>
 #include <bit>       // std::popcount
 #include <charconv>  // std::from_chars
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace sirius {
 
 namespace {
+
+// Arrow C Data Interface format strings.
+constexpr std::string_view struct_format    = "+s";
+constexpr std::string_view decimal_prefix   = "d:";  // "d:<precision>,<scale>[,<bitwidth>]"
+constexpr std::string_view timestamp_prefix = "ts";  // "ts<unit>:<timezone>"
+constexpr std::array<std::string_view, 3> large_offset_formats{"+L", "U", "Z"};
+constexpr int decimal128_bits        = 128;
+constexpr int decimal256_bits        = 256;
+constexpr std::int64_t bits_per_byte = std::numeric_limits<std::uint8_t>::digits;
+
+// What `cudf::from_arrow_column` yields for each scalar format.
+constexpr std::array<std::pair<std::string_view, cudf::type_id>, 17> scalar_formats{{
+  {"b", cudf::type_id::BOOL8},
+  {"c", cudf::type_id::INT8},
+  {"C", cudf::type_id::UINT8},
+  {"s", cudf::type_id::INT16},
+  {"S", cudf::type_id::UINT16},
+  {"i", cudf::type_id::INT32},
+  {"I", cudf::type_id::UINT32},
+  {"l", cudf::type_id::INT64},
+  {"L", cudf::type_id::UINT64},
+  {"f", cudf::type_id::FLOAT32},
+  {"g", cudf::type_id::FLOAT64},
+  {"u", cudf::type_id::STRING},
+  {"tdD", cudf::type_id::TIMESTAMP_DAYS},
+  {"tss:", cudf::type_id::TIMESTAMP_SECONDS},
+  {"tsm:", cudf::type_id::TIMESTAMP_MILLISECONDS},
+  {"tsu:", cudf::type_id::TIMESTAMP_MICROSECONDS},
+  {"tsn:", cudf::type_id::TIMESTAMP_NANOSECONDS},
+}};
 
 std::string_view format_of(const ArrowSchema& schema)
 {
@@ -53,78 +86,66 @@ std::optional<int> parse_int(std::string_view digits)
   return value;
 }
 
-// "d:<precision>,<scale>[,<bitwidth>]" split into its fields; nullopt for any other format.
 struct decimal_format {
   int precision;
   int scale;
   int bitwidth;
 };
 
+// nullopt for a format that is not a decimal.
 std::optional<decimal_format> parse_decimal(std::string_view format)
 {
-  if (format.substr(0, 2) != "d:") { return std::nullopt; }
-  const auto fields = format.substr(2);
+  if (!format.starts_with(decimal_prefix)) { return std::nullopt; }
+  const auto fields = format.substr(decimal_prefix.size());
   const auto first  = fields.find(',');
   if (first == std::string_view::npos) { return std::nullopt; }
   const auto second    = fields.find(',', first + 1);
   const auto precision = parse_int(fields.substr(0, first));
   const auto scale     = parse_int(fields.substr(first + 1, second - first - 1));
-  const auto bitwidth  = second == std::string_view::npos ? std::optional<int>{128}
+  const auto bitwidth  = second == std::string_view::npos ? std::optional<int>{decimal128_bits}
                                                           : parse_int(fields.substr(second + 1));
   if (!precision || !scale || !bitwidth) { return std::nullopt; }
   return decimal_format{*precision, *scale, *bitwidth};
 }
 
 // Refused before any buffer is read, so a bad batch costs no device memory.
-void refuse_unsupported_shape(std::string_view what,
+void refuse_unsupported_shape(std::string_view error_prefix,
                               std::size_t index,
                               const std::string& name,
-                              const ArrowSchema& child)
+                              const ArrowSchema& child,
+                              const std::optional<decimal_format>& decimal)
 {
   const auto refuse = [&](std::string_view reason) {
-    throw invalid_input_exception("{}: column {} ({}) {}", what, index, name, reason);
+    throw invalid_input_exception("{}: column {} ({}) {}", error_prefix, index, name, reason);
   };
   const auto format = format_of(child);
 
   if (child.dictionary != nullptr) { refuse("is dictionary-encoded; decode it before pushing"); }
-  if (format == "+L" || format == "U" || format == "Z") {
+  if (std::ranges::find(large_offset_formats, format) != large_offset_formats.end()) {
     refuse("has 64-bit offsets (large_list/large_utf8/large_binary); send 32-bit offsets");
   }
-  // Timestamps are "ts<unit>:<timezone>"; an empty timezone is a naive timestamp.
-  if (format.size() > 4 && format.substr(0, 2) == "ts" && format[3] == ':') {
+  // An empty timezone is a naive timestamp.
+  constexpr auto timezone_colon = timestamp_prefix.size() + 1;
+  if (format.starts_with(timestamp_prefix) && format.size() > timezone_colon + 1 &&
+      format[timezone_colon] == ':') {
     refuse("is a timezone-aware timestamp; convert it to a naive timestamp first");
   }
-  if (const auto decimal = parse_decimal(format); decimal && decimal->bitwidth == 256) {
+  if (decimal && decimal->bitwidth == decimal256_bits) {
     refuse("is a decimal256; cudf has no 256-bit decimal");
   }
 }
 
-// The cudf type `cudf::from_arrow_column` yields for the scalar formats, or nullopt for a format
-// not listed here; the check on the imported column covers those.
-std::optional<cudf::data_type> cudf_type_of_format(std::string_view format)
+// nullopt for a format outside the scalar set; the check on the imported column covers those.
+std::optional<cudf::data_type> cudf_type_of_format(std::string_view format,
+                                                   const std::optional<decimal_format>& decimal)
 {
-  using cudf::type_id;
-  if (format == "b") { return cudf::data_type{type_id::BOOL8}; }
-  if (format == "c") { return cudf::data_type{type_id::INT8}; }
-  if (format == "C") { return cudf::data_type{type_id::UINT8}; }
-  if (format == "s") { return cudf::data_type{type_id::INT16}; }
-  if (format == "S") { return cudf::data_type{type_id::UINT16}; }
-  if (format == "i") { return cudf::data_type{type_id::INT32}; }
-  if (format == "I") { return cudf::data_type{type_id::UINT32}; }
-  if (format == "l") { return cudf::data_type{type_id::INT64}; }
-  if (format == "L") { return cudf::data_type{type_id::UINT64}; }
-  if (format == "f") { return cudf::data_type{type_id::FLOAT32}; }
-  if (format == "g") { return cudf::data_type{type_id::FLOAT64}; }
-  if (format == "u") { return cudf::data_type{type_id::STRING}; }
-  if (format == "tdD") { return cudf::data_type{type_id::TIMESTAMP_DAYS}; }
-  if (format == "tss:") { return cudf::data_type{type_id::TIMESTAMP_SECONDS}; }
-  if (format == "tsm:") { return cudf::data_type{type_id::TIMESTAMP_MILLISECONDS}; }
-  if (format == "tsu:") { return cudf::data_type{type_id::TIMESTAMP_MICROSECONDS}; }
-  if (format == "tsn:") { return cudf::data_type{type_id::TIMESTAMP_NANOSECONDS}; }
-  if (const auto decimal = parse_decimal(format); decimal && decimal->bitwidth == 128) {
-    return cudf::data_type{type_id::DECIMAL128, -decimal->scale};
+  if (decimal && decimal->bitwidth == decimal128_bits) {
+    return cudf::data_type{cudf::type_id::DECIMAL128, -decimal->scale};
   }
-  return std::nullopt;
+  const auto it =
+    std::ranges::find(scalar_formats, format, &decltype(scalar_formats)::value_type::first);
+  if (it == scalar_formats.end()) { return std::nullopt; }
+  return cudf::data_type{it->second};
 }
 
 // The one disagreement tolerated: fixed-point types with the same scale and different widths.
@@ -134,7 +155,7 @@ bool differs_in_width_only(cudf::data_type actual, cudf::data_type expected)
          actual.scale() == expected.scale();
 }
 
-[[noreturn]] void throw_type_mismatch(std::string_view what,
+[[noreturn]] void throw_type_mismatch(std::string_view error_prefix,
                                       std::size_t index,
                                       const std::string& name,
                                       const logical_type& declared,
@@ -142,7 +163,7 @@ bool differs_in_width_only(cudf::data_type actual, cudf::data_type expected)
                                       cudf::data_type actual)
 {
   throw invalid_input_exception("{}: column {} ({}) is declared {} ({}) but carries {} (scale {})",
-                                what,
+                                error_prefix,
                                 index,
                                 name,
                                 declared.to_string(),
@@ -156,14 +177,17 @@ std::int64_t count_nulls(const std::uint8_t* validity, std::int64_t begin, std::
 {
   std::int64_t valid = 0;
   auto bit           = begin;
-  for (; bit < end && (bit % 8) != 0; ++bit) {
-    valid += (validity[bit / 8] >> (bit % 8)) & 1;
+  const auto bit_at  = [&](std::int64_t i) {
+    return (validity[i / bits_per_byte] >> (i % bits_per_byte)) & 1;
+  };
+  for (; bit < end && bit % bits_per_byte != 0; ++bit) {
+    valid += bit_at(bit);
   }
-  for (; bit + 8 <= end; bit += 8) {
-    valid += std::popcount(validity[bit / 8]);
+  for (; bit + bits_per_byte <= end; bit += bits_per_byte) {
+    valid += static_cast<std::int64_t>(std::popcount(validity[bit / bits_per_byte]));
   }
   for (; bit < end; ++bit) {
-    valid += (validity[bit / 8] >> (bit % 8)) & 1;
+    valid += bit_at(bit);
   }
   return (end - begin) - valid;
 }
@@ -175,33 +199,34 @@ const std::uint8_t* validity_of(const ArrowArray& array)
            : nullptr;
 }
 
-void validate_batch(const ArrowSchema* schema,
-                    const ArrowArray* array,
-                    std::string_view what,
+void validate_batch(const ArrowArray* array,
+                    const ArrowSchema* schema,
+                    std::string_view error_prefix,
                     const std::vector<std::string>& names,
                     const std::vector<logical_type>& types)
 {
   if (schema == nullptr || array == nullptr) {
     throw invalid_input_exception("{}: requires non-null ArrowSchema and ArrowArray pointers",
-                                  what);
+                                  error_prefix);
   }
   // A released struct has dangling buffer pointers.
   if (schema->release == nullptr || array->release == nullptr) {
-    throw invalid_input_exception("{}: the ArrowSchema/ArrowArray were already released", what);
+    throw invalid_input_exception("{}: the ArrowSchema/ArrowArray were already released",
+                                  error_prefix);
   }
   if (names.size() != types.size()) {
     throw internal_exception(
-      "{}: {} declared names but {} declared types", what, names.size(), types.size());
+      "{}: {} declared names but {} declared types", error_prefix, names.size(), types.size());
   }
-  if (format_of(*schema) != "+s") {
+  if (format_of(*schema) != struct_format) {
     throw invalid_input_exception(
-      "{}: the top-level Arrow array must be a struct, not '{}'", what, format_of(*schema));
+      "{}: the top-level Arrow array must be a struct, not '{}'", error_prefix, format_of(*schema));
   }
   if (static_cast<std::size_t>(schema->n_children) != types.size() ||
       static_cast<std::size_t>(array->n_children) != types.size()) {
     throw invalid_input_exception(
       "{}: carries {} columns (schema) / {} columns (array) but the stream declares {}",
-      what,
+      error_prefix,
       schema->n_children,
       array->n_children,
       types.size());
@@ -211,7 +236,7 @@ void validate_batch(const ArrowSchema* schema,
       array->offset > std::numeric_limits<std::int64_t>::max() - array->length) {
     throw invalid_input_exception(
       "{}: the struct window (offset {}, length {}) is invalid or longer than cudf's {} rows",
-      what,
+      error_prefix,
       array->offset,
       array->length,
       max_rows);
@@ -221,19 +246,20 @@ void validate_batch(const ArrowSchema* schema,
       validity != nullptr && array->null_count != 0 &&
       count_nulls(validity, array->offset, array->offset + array->length) > 0) {
     throw invalid_input_exception("{}: the struct array has null rows; a record batch has none",
-                                  what);
+                                  error_prefix);
   }
   for (std::size_t i = 0; i < types.size(); ++i) {
     const auto* child_schema = schema->children == nullptr ? nullptr : schema->children[i];
     const auto* child_array  = array->children == nullptr ? nullptr : array->children[i];
     if (child_schema == nullptr || child_array == nullptr || child_schema->release == nullptr ||
         child_array->release == nullptr) {
-      throw invalid_input_exception("{}: column {} ({}) is missing or released", what, i, names[i]);
+      throw invalid_input_exception(
+        "{}: column {} ({}) is missing or released", error_prefix, i, names[i]);
     }
     if (child_array->length < array->offset + array->length) {
       throw invalid_input_exception(
         "{}: column {} ({}) has {} rows but the batch spans rows [{}, {})",
-        what,
+        error_prefix,
         i,
         names[i],
         child_array->length,
@@ -245,35 +271,35 @@ void validate_batch(const ArrowSchema* schema,
 
 // Per-column checks before any copy. Returns the declared cudf type of every column.
 std::vector<cudf::data_type> check_columns(const ArrowSchema& schema,
-                                           std::string_view what,
+                                           std::string_view error_prefix,
                                            const std::vector<std::string>& names,
                                            const std::vector<logical_type>& types)
 {
   std::vector<cudf::data_type> expected;
   expected.reserve(types.size());
   for (std::size_t i = 0; i < types.size(); ++i) {
-    const auto& child = *schema.children[i];
-    refuse_unsupported_shape(what, i, names[i], child);
+    const auto& child  = *schema.children[i];
+    const auto decimal = parse_decimal(format_of(child));
+    refuse_unsupported_shape(error_prefix, i, names[i], child, decimal);
     // No 128-bit integer on the GPU, and nested children are not type-checked.
     const auto declared = types[i].id();
     if (declared == type_id::HUGEINT || declared == type_id::UHUGEINT ||
         cudf::is_nested(expected.emplace_back(get_cudf_type(types[i])))) {
       throw invalid_input_exception("{}: column {} ({}) is declared {}, which cannot be imported",
-                                    what,
+                                    error_prefix,
                                     i,
                                     names[i],
                                     types[i].to_string());
     }
-    const auto carried = cudf_type_of_format(format_of(child));
+    const auto carried = cudf_type_of_format(format_of(child), decimal);
     if (carried && *carried != expected[i] && !differs_in_width_only(*carried, expected[i])) {
-      throw_type_mismatch(what, i, names[i], types[i], expected[i], *carried);
+      throw_type_mismatch(error_prefix, i, names[i], types[i], expected[i], *carried);
     }
     // Narrowing to the declared width truncates digits beyond the declared precision.
-    const auto decimal = parse_decimal(format_of(child));
     if (decimal && types[i].id() == type_id::DECIMAL &&
         decimal->precision > types[i].decimal_precision()) {
       throw invalid_input_exception("{}: column {} ({}) is declared {} but carries precision {}",
-                                    what,
+                                    error_prefix,
                                     i,
                                     names[i],
                                     types[i].to_string(),
@@ -297,27 +323,33 @@ ArrowArray windowed_child(const ArrowArray& array, std::size_t i)
 
 }  // namespace
 
-std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
-                                                     const ArrowArray* array,
-                                                     std::string_view what,
+std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowArray* array,
+                                                     const ArrowSchema* schema,
+                                                     std::string_view error_prefix,
                                                      const std::vector<std::string>& names,
                                                      const std::vector<logical_type>& types,
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr)
 {
-  validate_batch(schema, array, what, names, types);
-  const auto expected = check_columns(*schema, what, names, types);
+  validate_batch(array, schema, error_prefix, names, types);
+  const auto expected = check_columns(*schema, error_prefix, names, types);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   try {
     for (std::size_t i = 0; i < types.size(); ++i) {
       const ArrowArray window = windowed_child(*array, i);
-      auto column             = cudf::from_arrow_column(schema->children[i], &window, stream, mr);
-      const auto actual       = column->type();
+      std::unique_ptr<cudf::column> column;
+      try {
+        column = cudf::from_arrow_column(schema->children[i], &window, stream, mr);
+      } catch (const std::logic_error& e) {  // cudf::logic_error, cudf::data_type_error
+        throw invalid_input_exception(
+          "{}: column {} ({}) was refused by cudf: {}", error_prefix, i, names[i], e.what());
+      }
+      const auto actual = column->type();
       if (actual != expected[i]) {
         if (!differs_in_width_only(actual, expected[i])) {
-          throw_type_mismatch(what, i, names[i], types[i], expected[i], actual);
+          throw_type_mismatch(error_prefix, i, names[i], types[i], expected[i], actual);
         }
         column = cudf::cast(column->view(), expected[i], stream, mr);
       }

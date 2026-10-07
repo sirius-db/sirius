@@ -170,10 +170,9 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// Columns bind by position and must have the declared types; a decimal128 is narrowed to the
   /// declared precision's width.
   /// @throws before build(), once run() started, on an undeclared stream or sender, a closed
-  /// sender or ended stream, null or released structs, a column-count or type mismatch, a decimal
-  /// with another scale or a larger precision, dictionary encoding, 64-bit offsets, a
-  /// timezone-aware timestamp, a decimal256, struct-level nulls, or a column declared HUGEINT,
-  /// UHUGEINT or nested.
+  /// sender or ended stream, or a batch `sirius::import_arrow_host_table()` refuses
+  /// (src/helper/arrow_host_import.hpp lists the refused shapes, e.g. a column declared HUGEINT,
+  /// UHUGEINT or nested).
   void push_arrow(std::uint64_t stream_id,
                   std::uint32_t sender_id,
                   std::uintptr_t array_addr,

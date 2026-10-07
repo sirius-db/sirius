@@ -30,7 +30,6 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/downgrade/test_spill_policy.cpp
-    test/cpp/exec/test_arrow_host_import.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
@@ -59,6 +58,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
     test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
+    test/cpp/helper/test_arrow_host_import.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
     test/cpp/helper/test_numeric_narrowing.cpp

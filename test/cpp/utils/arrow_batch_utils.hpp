@@ -55,7 +55,9 @@ inline std::unique_ptr<arrow_batch> arrow_batch_from_sql(const std::string& sql)
   duckdb::Connection con(db);
   auto result = con.Query(sql);
   REQUIRE_FALSE(result->HasError());
-  duckdb::ResultArrowArrayStreamWrapper wrapper(std::move(result), 1 << 20);
+  // Above any test's row count, so the first batch holds the whole result.
+  constexpr duckdb::idx_t rows_per_batch = 1 << 20;
+  duckdb::ResultArrowArrayStreamWrapper wrapper(std::move(result), rows_per_batch);
   auto batch = std::make_unique<arrow_batch>();
   REQUIRE(wrapper.stream.get_schema(&wrapper.stream, &batch->schema) == 0);
   REQUIRE(wrapper.stream.get_next(&wrapper.stream, &batch->array) == 0);
