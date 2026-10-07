@@ -47,6 +47,7 @@ sirius:
             # sirius backend: REST reactors for s3:// URLs.
             backend: sirius
             rest_n_reactors: @REST_REACTORS@
+@READAHEAD_BYTES@
 @CACHE@
             rest:
                 max_connections: @REST_MAX_CONNECTIONS@

@@ -46,6 +46,9 @@ CACHE_EVICTION="${CACHE_EVICTION:-idle}"
 # spills and REST staging. The code default (0.8 = 80 GB of 100 GB) starved
 # both at SF3000; 0.2 = 20 GB.
 CACHE_MAX_FRACTION="${CACHE_MAX_FRACTION:-0.2}"
+# Bytes the readahead may hold prefetched but not yet consumed. Unset: derived
+# from the cache budget (CACHE_MAX_FRACTION of the host tier); 0: unlimited.
+READAHEAD_BYTES="${READAHEAD_BYTES:-}"
 SPILL_COMPRESSION="${SPILL_COMPRESSION:-0}"
 DEVICE_POOL_BYTES="${DEVICE_POOL_BYTES:-3GiB}"
 NAME="${NAME:-default}"
@@ -117,6 +120,7 @@ sub = {
     "@HASH_BUILD@": "$HASH_BUILD",
     "@REST_UPKEEP_MS@": "$REST_UPKEEP_MS",
     "@HOST_INITIAL_POOLS@": "$HOST_INITIAL_POOLS",
+    "@READAHEAD_BYTES@": ("            max_readahead_bytes: $READAHEAD_BYTES" if "$READAHEAD_BYTES" else "            # max_readahead_bytes: unset (derived from the cache budget)"),
     "@GPU_USAGE_FRACTION@": "$GPU_USAGE_FRACTION",
     "@HOST_CAPACITY_BYTES@": "$HOST_CAPACITY_BYTES",
     "@DISK_CAPACITY_BYTES@": "$DISK_CAPACITY_BYTES",
