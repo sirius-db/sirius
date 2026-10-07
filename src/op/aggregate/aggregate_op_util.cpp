@@ -203,7 +203,7 @@ scalar_rep scalar_rep_of(cudf::scalar& s)
 /// no Sirius context is installed). Allocation and release are ordered on @p stream.
 class pinned_host_buffer {
  public:
-  pinned_host_buffer(size_t bytes, rmm::cuda_stream_view stream)
+  pinned_host_buffer(size_t bytes, ::cuda::stream_ref stream)
     : mr_(cudf::get_pinned_memory_resource()),
       stream_(stream),
       bytes_(bytes),
@@ -218,7 +218,7 @@ class pinned_host_buffer {
 
  private:
   rmm::host_device_async_resource_ref mr_;
-  rmm::cuda_stream_view stream_;
+  ::cuda::stream_ref stream_;
   size_t bytes_;
   void* data_;
 };
@@ -240,7 +240,7 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type)
 
 std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
                                                       std::vector<int> const& candidates,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr)
 {
   for (int col_id : candidates) {
@@ -258,11 +258,11 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
   constexpr size_t slot_words = 3;
   size_t const slot_bytes     = slot_words * sizeof(int64_t);
   rmm::device_buffer slots(candidates.size() * slot_bytes, stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(slots.data(), 0, slots.size(), stream.get()));
 
   auto copy_to_slot = [&](size_t slot, size_t word, void const* src, size_t bytes) {
     auto* dst = static_cast<char*>(slots.data()) + slot * slot_bytes + word * sizeof(int64_t);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream.get()));
   };
   // The scalars own the device memory read by the copies, so they live until the host copy ends.
   std::vector<std::pair<std::unique_ptr<cudf::scalar>, std::unique_ptr<cudf::scalar>>> extremes;
@@ -282,8 +282,8 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
 
   pinned_host_buffer host(slots.size(), stream);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    host.data(), slots.data(), slots.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
 
   for (size_t i = 0; i < candidates.size(); ++i) {
     auto const type_id = rep_ids[i];
