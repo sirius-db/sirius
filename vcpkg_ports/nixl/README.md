@@ -6,6 +6,16 @@ environment-provided shared UCX, Abseil, and CUDA runtime libraries. CMake's
 external project downloads, patches, and builds the pinned source during the
 build step. This port uses the static UCX overlay port.
 
+Development builds use the transports and dynamically loaded modules provided
+by the environment's UCX package. The static build includes only the transports
+listed in the [UCX port](../ucx/README.md).
+
+Set `-DSIRIUS_NIXL_BUILD_JOBS=N` when configuring CMake to limit the development
+SDK build's parallel jobs. On first configuration, the cache value comes from
+`CMAKE_BUILD_PARALLEL_LEVEL` in the environment; an empty value uses Ninja's
+default. Reconfigure with `-DSIRIUS_NIXL_BUILD_JOBS=N` to change an existing build's
+limit.
+
 The static port builds Release only for Sirius distribution packages. Consumers
 use the Release archives in every build configuration.
 
@@ -21,7 +31,7 @@ The temporary patches address this pinned version:
   the UCX archive.
 
 Remove each backport when the pinned version provides the corresponding fix.
-Use a fresh CMake build directory after changing the pinned source or patches.
+CMake re-extracts the source when the pin or patches change.
 The system CUDA toolkit remains a build prerequisite, as for the other Sirius
 GPU ports; CUDA driver libraries are runtime dependencies.
 

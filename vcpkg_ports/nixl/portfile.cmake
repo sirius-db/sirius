@@ -1,5 +1,6 @@
 set(VCPKG_BUILD_TYPE release)
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
+include("${CMAKE_CURRENT_LIST_DIR}/nixl-source.cmake")
 
 vcpkg_from_github(
   OUT_SOURCE_PATH
@@ -7,9 +8,9 @@ vcpkg_from_github(
   REPO
   ai-dynamo/nixl
   REF
-  1683cf3b7f3d11674c03c5e861cea22339876c96
+  ${NIXL_SOURCE_REF}
   SHA512
-  bd27d3ab6e5a9e4bd14781731a738a3668befe15fad2b7aca848c237d9b808d30f5e5a8c067c52d6ebb6744ec096f1a12d6f539f0604962764c984d07f4acdfb
+  ${NIXL_SOURCE_SHA512}
   HEAD_REF
   main
   PATCHES

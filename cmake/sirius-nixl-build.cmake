@@ -10,6 +10,17 @@ pkg_check_modules(SIRIUS_UCX REQUIRED IMPORTED_TARGET "ucx>=1.20.1")
 pkg_get_variable(_nixl_ucx_pkgconfig_dir ucx pcfiledir)
 
 set(_nixl_port "${CMAKE_CURRENT_LIST_DIR}/../vcpkg_ports/nixl")
+include("${_nixl_port}/nixl-source.cmake")
+set(_nixl_patches
+    "${_nixl_port}/native-cpp-only.patch"
+    "${_nixl_port}/system-tomlplusplus.patch" "${_nixl_port}/static-sdk.patch")
+set(SIRIUS_NIXL_BUILD_JOBS
+    "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}"
+    CACHE STRING "Parallel NIXL jobs (empty uses Ninja's default)")
+set(_nixl_parallel)
+if(SIRIUS_NIXL_BUILD_JOBS)
+  set(_nixl_parallel -j "${SIRIUS_NIXL_BUILD_JOBS}")
+endif()
 set(_nixl_prefix "${CMAKE_BINARY_DIR}/_deps/nixl-install")
 file(MAKE_DIRECTORY "${_nixl_prefix}/include")
 list(GET CUDAToolkit_INCLUDE_DIRS 0 _nixl_cuda_include)
@@ -27,18 +38,13 @@ set(_nixl_archives)
 foreach(_library nixl plugin_UCX nixl_build stream serdes nixl_common)
   list(APPEND _nixl_archives "${_nixl_prefix}/lib/lib${_library}.a")
 endforeach()
-# Keep the source pin in sync with vcpkg_ports/nixl/portfile.cmake.
 ExternalProject_Add(
   sirius_nixl_build
   SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/nixl-src"
   BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/nixl-build"
-  URL https://github.com/ai-dynamo/nixl/archive/1683cf3b7f3d11674c03c5e861cea22339876c96.tar.gz
-  URL_HASH
-    SHA512=bd27d3ab6e5a9e4bd14781731a738a3668befe15fad2b7aca848c237d9b808d30f5e5a8c067c52d6ebb6744ec096f1a12d6f539f0604962764c984d07f4acdfb
-  PATCH_COMMAND
-    "${GIT_EXECUTABLE}" apply --whitespace=nowarn
-    "${_nixl_port}/native-cpp-only.patch"
-    "${_nixl_port}/system-tomlplusplus.patch" "${_nixl_port}/static-sdk.patch"
+  URL https://github.com/ai-dynamo/nixl/archive/${NIXL_SOURCE_REF}.tar.gz
+  URL_HASH SHA512=${NIXL_SOURCE_SHA512}
+  PATCH_COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn ${_nixl_patches}
   CONFIGURE_COMMAND
     "${SIRIUS_MESON_EXECUTABLE}" setup --reconfigure <BINARY_DIR> <SOURCE_DIR>
     --native-file "${CMAKE_BINARY_DIR}/_deps/nixl-native.ini" --prefix
@@ -49,9 +55,16 @@ ExternalProject_Add(
     "-Dpkg_config_path=${_nixl_ucx_pkgconfig_dir}"
     "-Dcudapath_inc=${_nixl_cuda_include}" "-Dcudapath_lib=${_nixl_cuda_libdir}"
     "-Dcudapath_stub=${_nixl_cuda_driver_libdir}"
-  BUILD_COMMAND "${SIRIUS_NINJA_EXECUTABLE}" -C <BINARY_DIR> -j4
+  BUILD_COMMAND "${SIRIUS_NINJA_EXECUTABLE}" -C <BINARY_DIR> ${_nixl_parallel}
   INSTALL_COMMAND "${SIRIUS_MESON_EXECUTABLE}" install -C <BINARY_DIR>
                   --no-rebuild INSTALL_BYPRODUCTS ${_nixl_archives})
+
+# Re-extract pristine sources before applying changed patches.
+ExternalProject_Add_Step(
+  sirius_nixl_build patch_inputs
+  DEPENDEES mkdir
+  DEPENDERS download
+  DEPENDS ${_nixl_patches} INDEPENDENT TRUE)
 
 include("${_nixl_port}/nixl-targets.cmake")
 nixl_import_targets("${_nixl_prefix}" PkgConfig::SIRIUS_UCX CUDA::cudart)
