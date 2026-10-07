@@ -51,6 +51,7 @@ task_creator::task_creator(task_creator_config config,
                            std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _running(false),
     _config(std::move(config)),
+    _mem_res_mgr(mem_res_mgr),
     _task_creation_queue([](const task_creation_request& request) -> exec::index_keys {
       // The request carries its own keys: they are resolved at schedule() time, where the
       // node's pipeline (and therefore its query and priority) is unambiguously alive. The
@@ -62,7 +63,6 @@ task_creator::task_creator(task_creator_config config,
         static_cast<exec::query_key>(sirius::value_of(request.query_id)),
         request.device_id};
     }),
-    _mem_res_mgr(mem_res_mgr),
     _topology_index(std::move(topology_index))
 {
   // NUMA-aware GPU routing (HOST-data locality via gpus_of(numa)) is served by

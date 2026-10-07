@@ -66,7 +66,7 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(column_types.size());
 
-  for (int c = 0; c < column_types.size(); ++c) {
+  for (std::size_t c = 0; c < column_types.size(); ++c) {
     const auto& dtype = column_types[c];
     switch (dtype.id()) {
       case cudf::type_id::INT32: {

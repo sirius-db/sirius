@@ -152,6 +152,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
   auto id = op_id_from_name(name);
   if (!id) return nullptr;
   switch (*id) {
+    case OpId::Unknown: return nullptr;
     case OpId::Identity: return std::make_unique<identity_compressor>();
     case OpId::Dictionary: return std::make_unique<dictionary_compressor>();
     case OpId::StrSplit: return std::make_unique<str_split_compressor>();

@@ -699,7 +699,7 @@ TEST_CASE("Scan reference resolution remembers unavailable definitions",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   unsigned calls = 0;
   auto resolve   = [&] {
     ++calls;
@@ -718,7 +718,7 @@ TEST_CASE("Extension bootstrap can publish after unavailable scan references",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   unsigned calls   = 0;
   auto unavailable = [&] {
     ++calls;
@@ -742,7 +742,7 @@ TEST_CASE("Scan reference resolution publishes only complete results",
           "[scan][contracts][reference_cache]")
 {
   sirius::planner::detail::connector_reference_cache cache;
-  int host;
+  int host{};
   CHECK_THROWS_AS(cache.get_or_resolve(&host,
                                        []() -> duckdb::vector<duckdb::TableFunction> {
                                          throw std::runtime_error("factory unavailable");

@@ -149,8 +149,8 @@ std::vector<std::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::schedul
   meta_pipeline_count_ = to_schedule.size();
 
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", to_schedule.size());
-  int schedule_count = 0;
-  int meta           = 0;
+  std::size_t schedule_count = 0;
+  std::size_t meta           = 0;
   while (schedule_count < to_schedule.size()) {
     std::vector<std::shared_ptr<sirius_meta_pipeline>> children;
     to_schedule[to_schedule.size() - 1 - meta]->get_meta_pipelines(children, false, true);

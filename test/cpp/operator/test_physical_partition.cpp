@@ -170,15 +170,15 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   std::vector<typename Traits::type> values(num_values);
   if constexpr (Traits::is_string) {
     std::vector<std::string> string_values = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
-    for (int i = 0; i < num_values; ++i) {
+    for (std::size_t i = 0; i < num_values; ++i) {
       values[i] = string_values[i % string_values.size()];
     }
   } else if constexpr (Traits::is_decimal) {
-    for (int i = 0; i < num_values; ++i) {
+    for (std::size_t i = 0; i < num_values; ++i) {
       values[i] = static_cast<typename Traits::type>(i * 100);
     }
   } else if constexpr (Traits::is_ts) {
-    for (int i = 0; i < num_values; ++i) {
+    for (std::size_t i = 0; i < num_values; ++i) {
       values[i] = static_cast<typename Traits::type>(i * 100'000);
     }
   } else if constexpr (std::is_same_v<typename Traits::type, int32_t> ||
@@ -187,11 +187,11 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
     std::iota(values.begin(), values.end(), static_cast<typename Traits::type>(0));
   } else if constexpr (std::is_same_v<typename Traits::type, float> ||
                        std::is_same_v<typename Traits::type, double>) {
-    for (int i = 0; i < num_values; ++i) {
+    for (std::size_t i = 0; i < num_values; ++i) {
       values[i] = static_cast<typename Traits::type>(i);
     }
   } else if constexpr (std::is_same_v<typename Traits::type, bool>) {
-    for (int i = 0; i < num_values; ++i) {
+    for (std::size_t i = 0; i < num_values; ++i) {
       values[i] = (i % 2 == 0);
     }
   }
@@ -288,12 +288,12 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   std::vector<int32_t> values1(total_num_values);
   std::size_t vidx0 = 0, vidx1 = 0;
 
-  for (int i_prime = 0; i_prime < prime_repeater; ++i_prime) {
+  for (std::size_t i_prime = 0; i_prime < prime_repeater; ++i_prime) {
     if constexpr (Traits::is_string) {
-      for (int i = 0; i < num_values0; ++i) {
-        for (int32_t j = 0; j < num_values1; ++j) {
+      for (std::size_t i = 0; i < num_values0; ++i) {
+        for (std::size_t j = 0; j < num_values1; ++j) {
           values0[vidx0++] = std::to_string(i);
-          values1[vidx1++] = j;
+          values1[vidx1++] = static_cast<int32_t>(j);
         }
       }
     } else if constexpr (std::is_same_v<typename Traits::type, int32_t> ||
@@ -301,17 +301,17 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
                          std::is_same_v<typename Traits::type, int16_t> ||
                          std::is_same_v<typename Traits::type, float> ||
                          std::is_same_v<typename Traits::type, double>) {
-      for (int i = 0; i < num_values0; ++i) {
-        for (int32_t j = 0; j < num_values1; ++j) {
+      for (std::size_t i = 0; i < num_values0; ++i) {
+        for (std::size_t j = 0; j < num_values1; ++j) {
           values0[vidx0++] = static_cast<typename Traits::type>(i);
-          values1[vidx1++] = j;
+          values1[vidx1++] = static_cast<int32_t>(j);
         }
       }
     } else if constexpr (std::is_same_v<typename Traits::type, bool>) {
-      for (int i = 0; i < num_values0; ++i) {
-        for (int32_t j = 0; j < num_values1; ++j) {
+      for (std::size_t i = 0; i < num_values0; ++i) {
+        for (std::size_t j = 0; j < num_values1; ++j) {
           values0[vidx0++] = (i % 2 == 0);
-          values1[vidx1++] = j;
+          values1[vidx1++] = static_cast<int32_t>(j);
         }
       }
     }
@@ -452,7 +452,7 @@ TEST_CASE(
   REQUIRE(dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches().size() == 1);
   REQUIRE(sirius::get_cudf_table_view(
             *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
-            .num_rows() == num_values);
+            .num_rows() == static_cast<cudf::size_type>(num_values));
 }
 
 namespace {

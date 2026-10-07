@@ -450,7 +450,6 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
-  std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
   /// Reader options of the current run. Projected and natural reads cannot share

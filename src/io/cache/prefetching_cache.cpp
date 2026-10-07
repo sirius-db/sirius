@@ -816,7 +816,7 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_ranges_async(
     _counters.h2d.fetch_add(n_loads, std::memory_order_relaxed);
     _counters.misses.fetch_add(n_misses, std::memory_order_relaxed);
 
-    if (has_backend) { return std::move(result_future); }
+    if (has_backend) { return result_future; }
     return exec::make_semi_future<std::size_t>(logical_bytes);
   } catch (...) {
     for (auto const& copy : hits) {
@@ -1001,7 +1001,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
 
   if (has_cached) { retire_pins_after_stream(stream, cached_copies, std::move(retirement)); }
 
-  if (has_backend || has_cached) { return std::move(result_future); }
+  if (has_backend || has_cached) { return result_future; }
   return exec::make_semi_future<std::size_t>(logical_bytes);
 }
 
