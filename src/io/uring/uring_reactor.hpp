@@ -69,6 +69,7 @@ class local_io_object : public io_object {
       _fd_direct(std::move(fd_direct)),
       _file_size(file_size)
   {
+    _has_identity = capture_local_identity(_fd.get(), _identity);
     if (hash.empty()) {
       _hash = _path;
     } else {
@@ -80,6 +81,11 @@ class local_io_object : public io_object {
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
 
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
+
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
   [[nodiscard]] int fd_direct() const noexcept { return _fd_direct.get(); }
 
@@ -90,6 +96,8 @@ class local_io_object : public io_object {
  private:
   std::string _path;
   std::string _hash;
+  object_identity _identity;
+  bool _has_identity = false;
   file_descriptor _fd;
   file_descriptor _fd_direct;
   size_t _file_size{0};

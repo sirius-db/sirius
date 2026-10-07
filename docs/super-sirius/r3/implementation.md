@@ -57,3 +57,16 @@ preserve both. Parser profile and access namespace remain separate dimensions.
 
 S0 code/API audit is recorded; baseline build and performance qualification are
 pending. No claim of passed regression or benchmark is made by this commit.
+
+## S1: backend identity
+
+Added the type-specific identity value and per-open generation. REST inherits
+ETag identity from its existing validation_tag; absent tags have open-local
+identity. Local uring/kvikio capture size and nanosecond mtime from the owned fd.
+No third-party source or network request is changed.
+
+Host-only Catch2 verification: 2 cases, 19 assertions passed using `pixi run
+--as-is` and the installed compiler. Coverage includes version/kind/size changes,
+local same-size mtime changes, identity after unlink while the fd is retained,
+and invalid-fd reporting. Full backend compilation is pending environment setup:
+the current include tree is missing cuda/std/iterator during synchronization.

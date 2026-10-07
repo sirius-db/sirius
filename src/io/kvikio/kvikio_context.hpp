@@ -74,11 +74,17 @@ class kvikio_io_object final : public kvikio_object {
   kvikio_io_object(std::string path, kvikio::FileHandle handle, size_t file_size)
     : _path(std::move(path)), _handle(std::move(handle)), _file_size(file_size)
   {
+    _has_identity = capture_local_identity(_handle.fd(), _identity);
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept final { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept final { return _path; }
   [[nodiscard]] size_t size() const noexcept final { return _file_size; }
+
+  [[nodiscard]] object_identity identity() const override
+  {
+    return _has_identity ? _identity : io_object::identity();
+  }
 
   /// Mutable: kvikIO's read entry points are non-const, and the reads issued
   /// through them do not mutate observable file state.
@@ -90,6 +96,8 @@ class kvikio_io_object final : public kvikio_object {
   std::string _path;
   mutable kvikio::FileHandle _handle;
   size_t _file_size{0};
+  object_identity _identity;
+  bool _has_identity = false;
 };
 
 // ---------------------------------------------------------------------------
