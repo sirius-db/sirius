@@ -274,94 +274,20 @@ std::string_view property_or_empty(duckdb_yyjson::yyjson_val* properties, char c
   return str == nullptr ? std::string_view{} : std::string_view{str};
 }
 
-/// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
-/// checking every property the spec fixes for `deletion-vector-v1`.
-///
-/// The manifest and the footer are written by the same commit but are separate structures, so
-/// agreement between them is what proves the entry points at *its own* vector. The blob's magic
-/// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
-/// vector passes both, and passes the cardinality check too whenever the two happen to be the
-/// same size.
-///
-/// Returns the offset of the footer's leading magic, i.e. the first byte past the blob region. The
-/// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
-/// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
+// Pure descriptor parser: the caller owns payload and optional parser arena.
+// No file handles or byte transport enter this function.
 template <typename Ref>
-std::streamoff validate_footer_descriptor(std::ifstream& f,
-                                          std::streamoff file_size,
-                                          Ref const& ref,
-                                          char const (&puffin_magic)[4],
-                                          sirius::scan_manager::charging_allocator* allocator)
+void parse_footer_descriptor(std::span<char> payload_bytes,
+                             Ref const& ref,
+                             duckdb_yyjson::yyjson_alc* pool)
 {
-  // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
-  static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
-  if (file_size < kFooterTail + 8) {
-    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
-  }
-
-  f.seekg(file_size - kFooterTail);
-  uint8_t tail[kFooterTail];
-  f.read(reinterpret_cast<char*>(tail), kFooterTail);
-  if (!f) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot read footer tail of " + ref.puffin_path);
-  }
-
-  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
-  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size) {
-    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
-                             " does not fit in " + ref.puffin_path);
-  }
-
-  // Bit 0 of the flags means the payload is LZ4-compressed. Nothing here can decompress it, and
-  // guessing would be worse than declining.
-  if ((tail[4] & 0x01u) != 0) {
-    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
-                             " is compressed, so its blob descriptors cannot be checked");
-  }
-
-  auto const footer_start = file_size - kFooterTail - payload_size - 4;
-  f.seekg(footer_start);
-  char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
-    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
-  }
-
-  std::string legacy_payload;
-  sirius::scan_manager::charged_block footer;
-  duckdb_yyjson::yyjson_alc pool;
-  auto const size = static_cast<size_t>(payload_size);
-  char* payload;
-  if (allocator) {
-    // One allocation includes the JSON text and yyjson's documented maximum parser usage.
-    auto const text_bytes   = (size + 15) / 16 * 16;
-    auto const parser_bytes = duckdb_yyjson::yyjson_read_max_memory_usage(size, 0);
-    if (!parser_bytes)
-      throw sirius::scan_manager::preparation_resource_error("Puffin JSON envelope overflow", true);
-    footer  = allocator->allocate(text_bytes + parser_bytes);
-    payload = reinterpret_cast<char*>(footer.data());
-    if (!duckdb_yyjson::yyjson_alc_pool_init(&pool, payload + text_bytes, parser_bytes))
-      throw sirius::scan_manager::preparation_resource_error(
-        "Puffin JSON pool initialization failed", false);
-  } else {
-    legacy_payload.resize(size);
-    payload = legacy_payload.data();
-  }
-  f.read(payload, payload_size);
-  if (!f) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot read footer payload of " + ref.puffin_path);
-  }
-
+  auto* payload   = payload_bytes.data();
+  auto const size = payload_bytes.size();
   duckdb_yyjson::yyjson_read_err parse_error{};
-  YyjsonDoc doc(
-    duckdb_yyjson::yyjson_read_opts(payload, size, 0, allocator ? &pool : nullptr, &parse_error),
-    &duckdb_yyjson::yyjson_doc_free);
+  YyjsonDoc doc(duckdb_yyjson::yyjson_read_opts(payload, size, 0, pool, &parse_error),
+                &duckdb_yyjson::yyjson_doc_free);
   if (!doc) {
-    if (allocator && parse_error.code == duckdb_yyjson::YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+    if (pool && parse_error.code == duckdb_yyjson::YYJSON_READ_ERROR_MEMORY_ALLOCATION)
       throw sirius::scan_manager::preparation_resource_error("Puffin JSON pool exhausted", true);
     throw std::runtime_error("[puffin] Footer of " + ref.puffin_path + " is not valid JSON");
   }
@@ -478,7 +404,92 @@ std::streamoff validate_footer_descriptor(std::ifstream& f,
                              std::string(cardinality) + ", but its manifest entry records " +
                              std::to_string(ref.record_count));
   }
+}
 
+/// Reads the footer and returns the blob descriptor whose `offset` equals @p content_offset,
+/// checking every property the spec fixes for `deletion-vector-v1`.
+///
+/// The manifest and the footer are written by the same commit but are separate structures, so
+/// agreement between them is what proves the entry points at *its own* vector. The blob's magic
+/// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
+/// vector passes both, and passes the cardinality check too whenever the two happen to be the
+/// same size.
+///
+/// Returns the offset of the footer's leading magic, i.e. the first byte past the blob region. The
+/// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
+/// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
+template <typename Ref>
+std::streamoff validate_footer_descriptor(
+  std::ifstream& f,
+  std::streamoff file_size,
+  Ref const& ref,
+  char const (&puffin_magic)[4],
+  sirius::scan_manager::charging_allocator* allocator = nullptr)
+{
+  // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
+  static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
+  if (file_size < kFooterTail + 8) {
+    throw std::runtime_error("[puffin] File too small to hold a footer: " + ref.puffin_path);
+  }
+
+  f.seekg(file_size - kFooterTail);
+  uint8_t tail[kFooterTail];
+  f.read(reinterpret_cast<char*>(tail), kFooterTail);
+  if (!f) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer tail of " + ref.puffin_path);
+  }
+
+  auto const payload_size = static_cast<int32_t>(read_u32_le(tail));
+  if (payload_size < 0 || static_cast<std::streamoff>(payload_size) + kFooterTail + 4 > file_size) {
+    throw std::runtime_error("[puffin] Footer payload size " + std::to_string(payload_size) +
+                             " does not fit in " + ref.puffin_path);
+  }
+
+  // Bit 0 of the flags means the payload is LZ4-compressed. Nothing here can decompress it, and
+  // guessing would be worse than declining.
+  if ((tail[4] & 0x01u) != 0) {
+    throw std::runtime_error("[puffin] Footer of " + ref.puffin_path +
+                             " is compressed, so its blob descriptors cannot be checked");
+  }
+
+  auto const footer_start = file_size - kFooterTail - payload_size - 4;
+  f.seekg(footer_start);
+  char magic[4];
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
+    throw std::runtime_error("[puffin] Missing footer magic in " + ref.puffin_path);
+  }
+
+  std::string legacy_payload;
+  sirius::scan_manager::charged_block footer;
+  duckdb_yyjson::yyjson_alc pool;
+  auto const size = static_cast<size_t>(payload_size);
+  char* payload;
+  if (allocator) {
+    // One allocation includes the JSON text and yyjson's documented maximum parser usage.
+    auto const text_bytes   = (size + 15) / 16 * 16;
+    auto const parser_bytes = duckdb_yyjson::yyjson_read_max_memory_usage(size, 0);
+    if (!parser_bytes)
+      throw sirius::scan_manager::preparation_resource_error("Puffin JSON envelope overflow", true);
+    footer  = allocator->allocate(text_bytes + parser_bytes);
+    payload = reinterpret_cast<char*>(footer.data());
+    if (!duckdb_yyjson::yyjson_alc_pool_init(&pool, payload + text_bytes, parser_bytes))
+      throw sirius::scan_manager::preparation_resource_error(
+        "Puffin JSON pool initialization failed", false);
+  } else {
+    legacy_payload.resize(size);
+    payload = legacy_payload.data();
+  }
+  f.read(payload, payload_size);
+  if (!f) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot read footer payload of " + ref.puffin_path);
+  }
+
+  parse_footer_descriptor(std::span<char>{payload, size}, ref, allocator ? &pool : nullptr);
   return footer_start;
 }
 
@@ -490,112 +501,15 @@ struct decoded_positions {
   sirius::scan_manager::charged_block backing;
   size_t count = 0;
 };
+// Pure DV blob parser. Framing/descriptor and resource-envelope checks have
+// already completed before the byte source allocates and fills this span.
 template <typename Ref>
-decoded_positions read_deletion_vector_impl(Ref const& ref,
-                                            sirius::scan_manager::charging_allocator* allocator)
+decoded_positions parse_deletion_vector_blob(std::span<uint8_t const> blob,
+                                             Ref const& ref,
+                                             sirius::scan_manager::charging_allocator* allocator)
 {
-  auto const& puffin_path          = ref.puffin_path;
-  auto const content_offset        = ref.content_offset;
-  auto const content_size_in_bytes = ref.content_size_in_bytes;
-  auto const record_count          = ref.record_count;
-
-  if (content_offset < 0 || content_size_in_bytes <= 0) {
-    throw std::runtime_error(
-      "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
-      " size=" + std::to_string(content_size_in_bytes));
-  }
-
-  // Bound the decode BEFORE opening the file, and on a constant rather than on anything the table
-  // wrote. `record_count` is a required manifest field; absent, both cardinality cross-checks
-  // below are vacuous and the expansion is unbounded.
-  if (record_count < 0) {
-    throw std::runtime_error(
-      "[puffin] Manifest entry for the deletion vector at offset " +
-      std::to_string(content_offset) + " in " + puffin_path +
-      " carries no record_count, so neither its footer cardinality nor its decoded position count "
-      "can be checked against anything, and nothing bounds how far the blob may expand");
-  }
-  if (record_count > kMaxDeletionVectorPositions) {
-    throw std::runtime_error(
-      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " in " +
-      puffin_path + " declares " + std::to_string(record_count) + " deleted positions, above the " +
-      std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
-  }
-
-  // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
-  std::string_view local_view(puffin_path);
-  if (local_view.starts_with("file://")) local_view.remove_prefix(7);
-  std::ifstream f(local_view.data(), std::ios::binary);
-  if (!f) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot open file: " + std::string(local_view) +
-        (local_view == puffin_path ? "" : " (from '" + puffin_path + "')"));
-  }
-
-  // The blob's own magic and CRC below cannot catch a bare blob written with no container, so a
-  // wrong offset would silently yield wrong deletes. Check the framing first.
-  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
-  char magic[4];
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
-  }
-  f.seekg(0, std::ios::end);
-  auto const file_size = static_cast<std::streamoff>(f.tellg());
-  f.seekg(file_size - 4);
-  f.read(magic, 4);
-  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
-    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
-  }
-
-  if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
-    throw sirius::scan_manager::preparation_resource_error(
-      "Puffin container exceeds the lowering-time envelope", true);
-  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator);
-
-  // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
-  // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
-  // sum of two manifest-supplied numbers and can wrap, and a descriptor that merely agrees with
-  // the manifest proves nothing about the file -- a few-KB Puffin whose manifest and footer both
-  // declare a 40 GiB blob would otherwise allocate 40 GiB here and fail on the read afterwards.
-  static constexpr std::streamoff kLeadingMagic = 4;
-  if (content_offset < kLeadingMagic || content_offset > footer_start ||
-      content_size_in_bytes > footer_start - content_offset) {
-    throw std::runtime_error("[puffin] Deletion vector at offset " +
-                             std::to_string(content_offset) + " size " +
-                             std::to_string(content_size_in_bytes) +
-                             " does not fit between the leading magic and the "
-                             "footer (which starts at " +
-                             std::to_string(footer_start) + ") of " + puffin_path);
-  }
-
-  f.seekg(content_offset);
-  if (!f) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Cannot seek to offset " + std::to_string(content_offset) + " in " + puffin_path);
-  }
-
-  std::vector<uint8_t> legacy_blob;
-  sirius::scan_manager::charged_block charged_blob;
-  std::span<uint8_t> blob;
-  if (allocator) {
-    charged_blob = allocator->allocate(content_size_in_bytes);
-    blob         = {reinterpret_cast<uint8_t*>(charged_blob.data()),
-                    static_cast<size_t>(content_size_in_bytes)};
-  } else {
-    legacy_blob.resize(content_size_in_bytes);
-    blob = legacy_blob;
-  }
-  f.read(reinterpret_cast<char*>(blob.data()), content_size_in_bytes);
-  if (!f) {
-    throw sirius::transparent::classified_execution_error(
-      sirius::transparent::late_failure_cause::reader_io,
-      "[puffin] Failed to read " + std::to_string(content_size_in_bytes) + " bytes from " +
-        puffin_path);
-  }
-
+  auto const& puffin_path = ref.puffin_path;
+  auto const record_count = ref.record_count;
   // deletion-vector-v1: [4B BE combined_length][4B magic][roaring_vector][4B BE CRC-32]
   auto const blob_size = blob.size();
   if (blob_size < 12) {
@@ -712,6 +626,114 @@ decoded_positions read_deletion_vector_impl(Ref const& ref,
     "[puffin] Read deletion vector from '{}': {} deleted position(s).", puffin_path, result.count);
 
   return result;
+}
+template <typename Ref>
+decoded_positions read_deletion_vector_impl(Ref const& ref,
+                                            sirius::scan_manager::charging_allocator* allocator)
+{
+  auto const& puffin_path          = ref.puffin_path;
+  auto const content_offset        = ref.content_offset;
+  auto const content_size_in_bytes = ref.content_size_in_bytes;
+  auto const record_count          = ref.record_count;
+
+  if (content_offset < 0 || content_size_in_bytes <= 0) {
+    throw std::runtime_error(
+      "[puffin] Invalid offset/size: offset=" + std::to_string(content_offset) +
+      " size=" + std::to_string(content_size_in_bytes));
+  }
+
+  // Bound the decode BEFORE opening the file, and on a constant rather than on anything the table
+  // wrote. `record_count` is a required manifest field; absent, both cardinality cross-checks
+  // below are vacuous and the expansion is unbounded.
+  if (record_count < 0) {
+    throw std::runtime_error(
+      "[puffin] Manifest entry for the deletion vector at offset " +
+      std::to_string(content_offset) + " in " + puffin_path +
+      " carries no record_count, so neither its footer cardinality nor its decoded position count "
+      "can be checked against anything, and nothing bounds how far the blob may expand");
+  }
+  if (record_count > kMaxDeletionVectorPositions) {
+    throw std::runtime_error(
+      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " in " +
+      puffin_path + " declares " + std::to_string(record_count) + " deleted positions, above the " +
+      std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
+  }
+
+  // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
+  std::string_view local_view(puffin_path);
+  if (local_view.starts_with("file://")) local_view.remove_prefix(7);
+  std::ifstream f(local_view.data(), std::ios::binary);
+  if (!f) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot open file: " + std::string(local_view) +
+        (local_view == puffin_path ? "" : " (from '" + puffin_path + "')"));
+  }
+
+  // The blob's own magic and CRC below cannot catch a bare blob written with no container, so a
+  // wrong offset would silently yield wrong deletes. Check the framing first.
+  static constexpr char kPuffinMagic[4] = {'P', 'F', 'A', '1'};
+  char magic[4];
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+    throw std::runtime_error("[puffin] Not a Puffin file (bad leading magic): " + puffin_path);
+  }
+  f.seekg(0, std::ios::end);
+  auto const file_size = static_cast<std::streamoff>(f.tellg());
+  f.seekg(file_size - 4);
+  f.read(magic, 4);
+  if (!f || std::memcmp(magic, kPuffinMagic, 4) != 0) {
+    throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
+  }
+
+  if (allocator && (ref.file_size_in_bytes < 0 || file_size > ref.file_size_in_bytes))
+    throw sirius::scan_manager::preparation_resource_error(
+      "Puffin container exceeds the lowering-time envelope", true);
+  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic, allocator);
+
+  // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
+  // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
+  // sum of two manifest-supplied numbers and can wrap, and a descriptor that merely agrees with
+  // the manifest proves nothing about the file -- a few-KB Puffin whose manifest and footer both
+  // declare a 40 GiB blob would otherwise allocate 40 GiB here and fail on the read afterwards.
+  static constexpr std::streamoff kLeadingMagic = 4;
+  if (content_offset < kLeadingMagic || content_offset > footer_start ||
+      content_size_in_bytes > footer_start - content_offset) {
+    throw std::runtime_error("[puffin] Deletion vector at offset " +
+                             std::to_string(content_offset) + " size " +
+                             std::to_string(content_size_in_bytes) +
+                             " does not fit between the leading magic and the "
+                             "footer (which starts at " +
+                             std::to_string(footer_start) + ") of " + puffin_path);
+  }
+
+  f.seekg(content_offset);
+  if (!f) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Cannot seek to offset " + std::to_string(content_offset) + " in " + puffin_path);
+  }
+
+  std::vector<uint8_t> legacy_blob;
+  sirius::scan_manager::charged_block charged_blob;
+  std::span<uint8_t> blob;
+  if (allocator) {
+    charged_blob = allocator->allocate(content_size_in_bytes);
+    blob         = {reinterpret_cast<uint8_t*>(charged_blob.data()),
+                    static_cast<size_t>(content_size_in_bytes)};
+  } else {
+    legacy_blob.resize(content_size_in_bytes);
+    blob = legacy_blob;
+  }
+  f.read(reinterpret_cast<char*>(blob.data()), content_size_in_bytes);
+  if (!f) {
+    throw sirius::transparent::classified_execution_error(
+      sirius::transparent::late_failure_cause::reader_io,
+      "[puffin] Failed to read " + std::to_string(content_size_in_bytes) + " bytes from " +
+        puffin_path);
+  }
+
+  return parse_deletion_vector_blob(std::span<uint8_t const>{blob}, ref, allocator);
 }
 }  // namespace
 
