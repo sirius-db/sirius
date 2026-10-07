@@ -442,11 +442,13 @@ When filter pushdown is enabled and the `gpu_expression_translator` successfully
 
 1. **Row group statistics pruning:** during the per-file metadata task, `filter_row_groups_with_stats()` runs against each fetched footer; row groups whose Parquet column min/max statistics cannot match the filter are dropped before any read is scheduled. Pure hive-partition filters are dropped during plan construction since hive columns aren't in the parquet file.
 
-   Only the stats-safe part of the predicate is handed to the stats filter. `is_unsafe_for_stats_filter()` rejects any expression containing a null test, and a bare column reference used directly as the predicate (`WHERE flag`) — both fault inside cuDF's statistics rewrite rather than merely mis-pruning. `stats_safe_conjuncts()` keeps only the safe top-level AND conjuncts (so `v IS NULL AND id > 3000` still prunes on `id`); a compound conjunct containing anything unsafe is dropped whole. Dropping conjuncts is sound: it can only retain extra row groups, and the full predicate is still applied at read/post-decode time.
+   Only the stats-safe part of the predicate is handed to the stats filter. `is_unsafe_for_stats_filter()` rejects any expression containing a null test, and a bare column reference used directly as the predicate (`WHERE flag`) — both fault inside cuDF's statistics rewrite rather than merely mis-pruning. `conjuncts_without()` keeps only the safe top-level AND conjuncts (so `v IS NULL AND id > 3000` still prunes on `id`); a compound conjunct containing anything unsafe is dropped whole. Dropping conjuncts is sound: it can only retain extra row groups, and the full predicate is still applied at read/post-decode time.
 
 2. **Null-count pruning:** a second statistics pass prunes on `null_count`: an `IS NULL` predicate drops row groups with `null_count == 0`, and `IS NOT NULL` drops row groups where every row is null (`null_count == rg.num_rows`); an absent `null_count` stat keeps the row group. The predicates come straight from the `TableFilterSet` (not the converted AST — see the translation-path note below), only from conjunctive positions, and only for scalar leaf columns (nested/legacy-repeated schemas are skipped).
 
 3. **Reader-level filter pushdown:** the cuDF AST is set on `parquet_reader_options` via `set_filter()`, so cuDF applies the filter inside `read_parquet`. When the reader applies the row filter, `materialize_table` reports `ROW_FILTERED` (or `ROW_FILTERED_AND_PROJECTED` once hive partitions are assembled), so the scan operator skips a redundant post-decode filter.
+
+   Before cuDF 26.12, the reader's bloom filter probe is wrong for some column types (rapidsai/cudf#24319). The reader filter (`_reader_pushdown_expression`) therefore leaves out equalities on the types listed by `has_unreliable_bloom_filter_probe()`, and they are applied post-decode. From cuDF 26.12 the list is empty.
 
 Reader-side pushdown is a per-split decision: an FLBA-decimal safety probe can disable it for a file, in which case the cached DuckDB filter expression is evaluated through `expression_evaluator` on the decoded batch in `post_filter_and_project`.
 
@@ -510,7 +512,7 @@ Three backends ship:
 | REST / object store | `rest::rest_ioctx = templated_ioctx<rest_reactor>` | `rest/rest_reactor.hpp` | `s3://` | libcurl-multi over an epoll loop; the worker chooses 4–16 MiB GETs and benefits from parallel operations. See [S3 / Object-Store Backend](#s3--object-store-backend). |
 | kvikio fallback | `kvikio_context` | (none) | any | Wraps kvikIO local/remote handles (GDS-capable for local files). It has no reactors or cache and consumes the shared prepared-slice hook eagerly and serially. |
 
-The scan manager builds one ioctx for the run: `uring_ioctx` when `backend` is `sirius`, otherwise the `kvikio_context` fallback (the registry can also resolve an `s3://` URL to the REST backend via `lookup`). A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.
+The scan manager builds a local ioctx (`uring_ioctx` for `backend: sirius`, otherwise `kvikio_context`). It also builds REST ioctxs on demand for S3 LIST and for S3 reads routed through Sirius. REST ioctxs are cached by the path-scoped credential snapshot, so a replaced secret affects subsequent operations. A new backend is a reactor + io_object that satisfy the concepts, a `templated_ioctx` specialization, and a registry entry.
 
 ### S3 / Object-Store Backend
 
@@ -534,6 +536,24 @@ Pages are processed as they arrive, so listing memory is bounded by one page plu
 
 **Authorization.** `request_authorizer` signs each request attempt and returns the request URL and headers. LIST uses the separate `authorize_list` entry point, which custom authorizers must implement if they support glob expansion.
 
+Sirius registers its own `CREATE SECRET (TYPE SIRIUS_S3, ...)` type, so this workflow does not require DuckDB's httpfs extension. It also accepts httpfs `TYPE S3` secrets when that extension is available. For each S3 bind, open, and glob, Sirius selects the best path-scoped `SIRIUS_S3` secret first, then an `S3` secret if no `SIRIUS_S3` secret matches, then the programmatically set `object_store_config` if neither matches. An invalid matching secret or failed S3 request is an error, not a reason to try another credential source. A selected secret must use `PROVIDER CONFIG` and contain non-empty `KEY_ID` and `SECRET`; partial, refresh-enabled, and non-static secrets fail without falling back to the programmatic config. `SESSION_TOKEN`, `REGION`, and `ENDPOINT` also come only from that selected secret: missing session token means no token, missing region defaults to `us-east-1`, and missing endpoint derives the regional AWS endpoint. `USE_SSL` and `VERIFY_SSL` map to endpoint transport and TLS certificate verification. Secret replacement therefore affects subsequent S3 operations on the same connection. Resolved config snapshots retain the credential fields needed by REST signing; Sirius does not retain the DuckDB secret object or its catalog name in bind data. Sirius currently supports only `URL_STYLE 'path'`; request-changing options such as requester-pays, proxies, extra headers, SSE/KMS, and URL compatibility mode are rejected when enabled. Other explicit URL styles fail clearly. Secret values are not included in Sirius diagnostics.
+
+For example, a scoped Sirius secret supplies credentials directly to a normal Parquet scan:
+
+```sql
+CREATE SECRET project_s3 (
+  TYPE SIRIUS_S3,
+  PROVIDER CONFIG,
+  SCOPE 's3://analytics-bucket/curated/',
+  KEY_ID 'ACCESS_KEY',
+  SECRET 'SECRET_KEY',
+  REGION 'us-west-2'
+);
+
+SELECT count(*)
+FROM read_parquet('s3://analytics-bucket/curated/events.parquet');
+```
+
 | Authorizer | Mechanism |
 |------------|-----------|
 | `sigv4_presigned_authorizer` | SigV4 credentials in the query string. This is the default. |
@@ -541,7 +561,7 @@ Pages are processed as they arrive, so listing memory is bounded by one page plu
 
 Both authorizers use path-style URLs and support temporary credentials. The session token is signed as a header in header mode and as a query parameter in presigned mode. Custom authorizers can use another credential source or return broker-issued URLs.
 
-**Configuration.** `object_store_config` supplies the endpoint, region, static credentials, optional session token, signing mode, and TLS settings. The built-in factory does not search environment variables, AWS profiles, or IMDS. A custom authorizer can implement those sources. If the endpoint, region, or static keys are missing, the factory returns no REST ioctx and the S3 read fails.
+**Configuration.** C++ callers can set `object_store_config` through `sirius_config::set_object_store_config()` before scan-manager initialization. It supplies an in-memory endpoint, region, static credentials, optional session token, signing mode, and TLS settings when no scoped secret matches. This configuration cannot be loaded from YAML. `TYPE SIRIUS_S3, PROVIDER CONFIG` secrets supply a static key pair and optional session token without httpfs; httpfs `TYPE S3, PROVIDER CONFIG` secrets work too when installed. Credential-chain providers, SSO, automatic refresh, environment variables, AWS profiles, and IMDS are not consumed by Sirius. A custom authorizer can implement those sources. If the selected secret is incomplete, Sirius reports an error; without a secret, missing fallback endpoint, region, or static keys leaves no REST ioctx and the S3 read fails.
 
 Connection limits, the logical merge-gap hint, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. Physical request sizing is worker-owned rather than configured. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
 

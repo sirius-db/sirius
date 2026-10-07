@@ -188,29 +188,13 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
-{
-  yaml::reader r(node, "object_store");
-  r.optional("endpoint", opt.endpoint);
-  r.optional("region", opt.region);
-  r.optional("access_key", opt.access_key);
-  r.optional("secret_key", opt.secret_key);
-  r.optional("session_token", opt.session_token);
-  r.optional("s3_transport", opt.s3_transport);
-  r.optional("signing_mode", opt.s3_signing_mode);
-  r.optional("ca_bundle_path", opt.ca_bundle_path);
-  r.optional("tls_verify", opt.tls_verify);
-  r.reject_unknown();
-}
-
 static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 {
   yaml::reader r(node, "rest");
   for (auto const* key : {"ca_bundle_path", "tls_verify"}) {
     if (r.has(key)) {
       throw std::runtime_error("'sirius.executor.scan_manager.rest." + std::string(key) +
-                               "': removed; configure 'sirius.executor.scan_manager.object_store." +
-                               key + "' instead");
+                               "': removed; use sirius_config::set_object_store_config() instead");
     }
   }
   {
@@ -311,6 +295,11 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
 static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
 {
   yaml::reader r(node, "scan_manager");
+  if (r.has("object_store")) {
+    throw std::runtime_error(
+      "'sirius.executor.scan_manager.object_store': no longer YAML-loadable; use "
+      "CREATE SECRET (TYPE SIRIUS_S3, ...) or sirius_config::set_object_store_config()");
+  }
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("backend", opt.backend);
@@ -322,7 +311,6 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("rest")) sirius::from_yaml(*n, opt.rest);
   if (auto n = r.optional_node("kvikio")) sirius::from_yaml(*n, opt.kvikio);
   if (auto n = r.optional_node("cache")) sirius::from_yaml(*n, opt.cache);
-  if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();
   // Stamped here rather than by the caller: `cache` and the `uring` sub-config
@@ -1047,6 +1035,11 @@ const scan_manager::scan_manager_config& sirius_config::get_scan_manager_config(
 void sirius_config::set_scan_manager_config(scan_manager::scan_manager_config config) noexcept
 {
   _scan_manager_config = std::move(config);
+}
+
+void sirius_config::set_object_store_config(io::object_store_config config) noexcept
+{
+  _scan_manager_config.object_store = std::move(config);
 }
 
 }  // namespace sirius

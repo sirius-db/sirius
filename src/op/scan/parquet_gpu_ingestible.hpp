@@ -447,6 +447,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // dropped conjuncts would never be applied.
   bool _static_pushdown_is_complete = true;
 
+  // The part of _static_pushdown_expression pushed into the per-task reader:
+  // minus any top-level AND conjunct with an equality on a column whose bloom
+  // filter probe cuDF before 26.12 gets wrong (has_unreliable_bloom_filter_probe).
+  // The reader probes bloom filters, the row-group stats filter does not.
+  std::shared_ptr<duckdb::Expression> _reader_pushdown_expression;
+  // False when the reader filter is a strict subset of _duckdb_filter_expression,
+  // like _static_pushdown_is_complete.
+  bool _reader_pushdown_is_complete = true;
+
   // Only the simple `IS [NOT] NULL` over a bare column reference shape is
   // recorded; anything compound is left to the post-decode filter. Empty when
   // the predicate has no such conjunct.
