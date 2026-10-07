@@ -21,7 +21,6 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 
 .PHONY: all release debug reldebug relwithdebinfo debug-release \
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
-	vcpkg-release \
 	test test_release test_debug test_reldebug clean list-presets \
 	s3-test s3-test-large s3-tpch \
 	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker \
@@ -69,9 +68,6 @@ clang-asan: build/clang-asan/build.ninja
 #     ./build/clang-tsan/test/cpp/sirius_unittest
 clang-tsan: build/clang-tsan/build.ninja
 	$(CMAKE) --build --preset clang-tsan --target $(BUILD_TARGETS)
-
-vcpkg-release: build/vcpkg-release/build.ninja
-	$(CMAKE) --build --preset vcpkg-release --target $(MAIN_BUILD_TARGETS)
 
 # The C++ unit tests run through scripts/run_unit_tests.py, as in CI. Pass options through
 # UNITTEST_ARGS, e.g. `make test UNITTEST_ARGS="--steps shards -- --order rand"`.

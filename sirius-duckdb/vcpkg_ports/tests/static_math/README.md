@@ -18,7 +18,7 @@ the selected toolkit and the existing nvjitlink port.
 Configure against an installed Sirius vcpkg prefix and CUDA toolkit:
 
 ```sh
-cmake -S vcpkg_ports/tests/static_math -B build/static-math-probe \
+cmake -S sirius-duckdb/vcpkg_ports/tests/static_math -B build/static-math-probe \
   -DCMAKE_PREFIX_PATH=/path/to/vcpkg_installed/x64-linux-release \
   -DCUDAToolkit_ROOT=/path/to/cuda
 cmake --build build/static-math-probe

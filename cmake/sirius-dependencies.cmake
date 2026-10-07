@@ -48,11 +48,11 @@ endif()
 # --- cuCollections (cuco) --- #
 
 # libcudf no longer ships its bundled copy. In the vcpkg build cuco comes from
-# the overlay port (vcpkg_ports/cuco); configure-time downloads are disabled
-# there. Otherwise (pixi build) fetch the same commit cudf is built against
-# (populate sources without add_subdirectory; CCCL comes from cudf). Either way
-# cuco is header-only and exposed as the cuco::cuco target, so both paths
-# consume it identically below.
+# the overlay port (sirius-duckdb/vcpkg_ports/cuco); configure-time downloads
+# are disabled there. Otherwise (pixi build) fetch the same commit cudf is built
+# against (populate sources without add_subdirectory; CCCL comes from cudf).
+# Either way cuco is header-only and exposed as the cuco::cuco target, so both
+# paths consume it identically below.
 if(VCPKG_BUILD)
   find_package(cuco CONFIG REQUIRED)
 else()

@@ -79,18 +79,16 @@ Consumers are responsible for DuckDB and C++ runtime ABI compatibility.
 source-built support libraries. Third-party dependencies remain separate packages;
 CMake's exported targets carry their link requirements. No archives are merged.
 
+The wrapper owns the vcpkg dependency setup. Install the static package through
+its Sirius port:
+
 ```bash
-pixi run -e vcpkg cmake --preset vcpkg-release -DSIRIUS_BUILD_TESTS=OFF
-pixi run -e vcpkg cmake --build --preset vcpkg-release --target sirius_library
-pixi run -e vcpkg cmake --install build/vcpkg-release \
-  --component sirius_library --prefix "$PWD/build/static-install"
+git submodule update --init sirius-duckdb/vcpkg
+pixi run -e vcpkg bash -c 'export VCPKG_CUDA_ARCHITECTURES="$CUDAARCHS"; sirius-duckdb/vcpkg/vcpkg install --x-manifest-root=sirius-duckdb --x-feature=static --x-install-root=build/vcpkg-installed'
 ```
 
-The vcpkg presets use Pixi's `CUDAARCHS` list for both Sirius and its dependencies.
-To override it, run `pixi run -e vcpkg env CUDAARCHS=100 cmake --preset vcpkg-release`.
-Use the same `CUDAARCHS` value for configure and build commands.
-Direct toolchain builds must set `VCPKG_CUDA_ARCHITECTURES` to the same list passed
-as `CMAKE_CUDA_ARCHITECTURES`.
+Set `VCPKG_CUDA_ARCHITECTURES` to select the GPU architecture list for Sirius
+and its dependencies.
 
 Consumers use `find_package(sirius CONFIG REQUIRED COMPONENTS static)` and link
 `sirius::sirius_static`, with the dependency packages available through the vcpkg

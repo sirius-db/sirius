@@ -40,10 +40,10 @@ post-link check rejects unexpected runtime dependencies. NVIDIA driver libraries
 and standard Linux libraries remain external.
 
 ```sh
-git submodule update --init vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+git submodule update --init sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run -e vcpkg make -C sirius-duckdb release \
   SIRIUS_DUCKDB_LINKAGE=static \
-  VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake"
+  VCPKG_TOOLCHAIN_PATH="$PWD/sirius-duckdb/vcpkg/scripts/buildsystems/vcpkg.cmake"
 ```
 
 Use `-e vcpkg-cuda12` for CUDA 12; `vcpkg` selects CUDA 13. The overlay triplets
@@ -54,16 +54,13 @@ The Makefile exports this from Pixi's `CUDAARCHS`. Direct vcpkg users must set
 Use separate build directories when switching toolchains or linkage modes.
 
 The Sirius port pins its source and vendored dependency revisions. Update these
-pins together with the engine's submodules. CI updates the port's source URL and
-revision to build the current commit. Only Sirius's binary cache key changes;
-dependency caches remain reusable. The overlay paths currently refer to the parent
-repository's RAPIDS ports and triplets; move those with the wrapper when splitting
-repositories.
+pins together with the engine's submodules. The `configure_ci` hook updates the
+Sirius source revision to the current commit when building in this repository
+on GitHub Actions. Only Sirius's binary cache key changes;
+dependency caches remain reusable. The wrapper owns the vcpkg manifest, ports, and triplets.
 
 Both builds produce
 `build/release/extension/sirius/sirius.duckdb_extension` under this directory.
-The local Pixi manifest supplies only the compiler runtimes for CI's downloaded
-test executable. Build and test locally with the root environment.
 Run the wrapper's SQL tests from the root with the same runtime search path:
 
 ```sh

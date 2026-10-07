@@ -19,8 +19,8 @@
 	path = .claude/claude-tools
 	url = https://github.com/sirius-db/claude-tools.git
 	branch = main
-[submodule "vcpkg"]
-	path = vcpkg
+[submodule "sirius-duckdb/vcpkg"]
+	path = sirius-duckdb/vcpkg
 	url = https://github.com/Microsoft/vcpkg.git
 [submodule "starrocks/starrocks"]
 	path = experimental/starrocks/starrocks
@@ -34,7 +34,7 @@
 	shallow = true
 [submodule "sirius-duckdb/duckdb"]
 	path = sirius-duckdb/duckdb
-	url = https://github.com/sirius-db/duckdb.git
+	url = https://github.com/duckdb/duckdb.git
 [submodule "sirius-duckdb/extension-ci-tools"]
 	path = sirius-duckdb/extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools.git

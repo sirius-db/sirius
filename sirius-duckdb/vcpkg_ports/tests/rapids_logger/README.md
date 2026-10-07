@@ -5,7 +5,7 @@ installation so its original paths no longer exist. Configure this probe against
 the moved triplet prefix without the vcpkg toolchain:
 
 ```sh
-cmake -S vcpkg_ports/tests/rapids_logger -B build/rapids-logger-probe \
+cmake -S sirius-duckdb/vcpkg_ports/tests/rapids_logger -B build/rapids-logger-probe \
   -DCMAKE_PREFIX_PATH=/path/to/relocated/x64-linux
 cmake --build build/rapids-logger-probe
 ctest --test-dir build/rapids-logger-probe --output-on-failure

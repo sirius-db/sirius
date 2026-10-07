@@ -3,11 +3,10 @@
   "builtin-baseline": "ffc071e0c08432c60c9b64f00334c0227667931b",
   "configuration": {
     "overlay-ports": [
-      "vcpkg_ports",
-      "../vcpkg_ports"
+      "vcpkg_ports"
     ],
     "overlay-triplets": [
-      "../vcpkg_triplets"
+      "vcpkg_triplets"
     ]
   },
   "dependencies": [],

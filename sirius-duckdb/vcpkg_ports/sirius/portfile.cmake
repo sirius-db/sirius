@@ -24,12 +24,12 @@ vcpkg_from_git(
 file(COPY "${CUCASCADE_SOURCE_PATH}/" DESTINATION "${SOURCE_PATH}/cucascade")
 file(COPY "${SUBSTRAIT_SOURCE_PATH}/" DESTINATION "${SOURCE_PATH}/substrait")
 
-find_program(SIRIUS_SCCACHE sccache)
+find_program(SIRIUS_COMPILER_CACHE NAMES sccache ccache)
 set(sirius_launchers)
-if(SIRIUS_SCCACHE)
+if(SIRIUS_COMPILER_CACHE)
   foreach(language C CXX CUDA)
     list(APPEND sirius_launchers
-         "-DCMAKE_${language}_COMPILER_LAUNCHER=${SIRIUS_SCCACHE}")
+         "-DCMAKE_${language}_COMPILER_LAUNCHER=${SIRIUS_COMPILER_CACHE}")
   endforeach()
 endif()
 

@@ -24,155 +24,65 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
-env:
-  duckdb_version: v1.5.6
-
 jobs:
-  build:
+  cuda-13:
     if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-        cuda-version: ["12", "13"]
-        include:
-          - arch: amd64
-            runner: cpu-xl
-          - arch: arm64
-            runner: arm-xl
-          - cuda-version: "12"
-            environment: vcpkg-cuda12
-          - cuda-version: "13"
-            environment: vcpkg
-    runs-on: [self-hosted, ubuntu-24.04, "${{ matrix.runner }}"]
-    timeout-minutes: 240
-    env:
-      CONDA_OVERRIDE_CUDA: ${{ matrix.cuda-version }}
-      CMAKE_BUILD_PARALLEL_LEVEL: "16"
-      CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@build/extension-subdirectory
+    with:
+      extension_name: sirius
+      duckdb_version: v1.5.6
+      ci_tools_version: build/extension-subdirectory
+      extension_directory: sirius-duckdb
+      exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      extra_toolchains: "cuda;rust;protobuf;libclang;lld"
+      vcpkg_url: "https://github.com/microsoft/vcpkg.git"
+      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
+      vcpkg_binary_cache_enabled: true
+      skip_tests: true
+      save_cache: ${{ github.ref == 'refs/heads/main' }}
+      reduced_ci_mode: "disabled"
+      override_ci_tools_repository: "sirius-db/extension-ci-tools"
+      build_duckdb_shell: false
+      vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
+      vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real;100f-real;120a-real;120"
+      cuda_version: "13"
+      artifact_postfix: "-cuda13"
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-24.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-24.04", "arm-xl"]}'
 
-      - name: Initialize build dependencies
-        run: |
-          git submodule update --init --depth=1 --jobs 2 sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-          git submodule update --init vcpkg
-          if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C vcpkg fetch --unshallow
-          fi
-
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
-        with:
-          pixi-version: v0.81.0
-          environments: ${{ matrix.environment }}
-          cache: false
-
-      - name: Configure cache backends
-        run: |
-          if [[ -n "${SCCACHE_BUCKET}" ]]; then
-            echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
-          else
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          fi
-          echo "SCCACHE_S3_KEY_PREFIX=sirius" >> "$GITHUB_ENV"
-          if [[ -n "${VCPKG_BUCKET}" ]]; then
-            echo "VCPKG_BINARY_SOURCES=clear;x-aws,s3://${VCPKG_BUCKET}/sirius/,readwrite" >> "$GITHUB_ENV"
-          fi
-
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.18.0
-
-      - name: Select the Sirius source revision
-        env:
-          SIRIUS_SOURCE_URL: https://github.com/${{ github.repository }}.git
-          SIRIUS_SOURCE_REF: ${{ github.sha }}
-        run: |
-          sed -i -E \
-            -e "s|^set\(sirius_url .*\)$|set(sirius_url $SIRIUS_SOURCE_URL)|" \
-            -e "s|^set\(sirius_ref .*\)$|set(sirius_ref $SIRIUS_SOURCE_REF)|" \
-            sirius-duckdb/vcpkg_ports/sirius/portfile.cmake
-
-      - name: Build the bundled extension
-        run: |
-          pixi run --locked -e "${{ matrix.environment }}" bash -euo pipefail -c '
-            make -C sirius-duckdb release \
-              SIRIUS_DUCKDB_LINKAGE=static \
-              VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-              DUCKDB_PLATFORM=linux_${{ matrix.arch }} \
-              EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
-          '
-
-      - name: Check release asset size
-        run: |
-          artifact=sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
-          bytes=$(stat -c %s "$artifact")
-          echo "Extension size: $bytes bytes"
-          [[ "$bytes" -lt 2147483648 ]]
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sirius-${{ env.duckdb_version }}-extension-linux_${{ matrix.arch }}-cuda${{ matrix.cuda-version }}
-          path: sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension
-          if-no-files-found: error
-
-      - name: Package the GPU test build
-        if: matrix.arch == 'amd64' && matrix.cuda-version == '13'
-        run: |
-          mkdir -p build
-          tar -C sirius-duckdb -cf build/extension-test.tar \
-            build/release/test/unittest \
-            build/release/extension/sirius/sirius.duckdb_extension
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.arch == 'amd64' && matrix.cuda-version == '13'
-        with:
-          name: sirius-extension-test-build
-          path: build/extension-test.tar
-          if-no-files-found: error
-          retention-days: 1
-
-  test:
-    needs: build
-    runs-on: [self-hosted, ubuntu-24.04, gpu-2xt4]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
-        with:
-          pixi-version: v0.81.0
-          manifest-path: sirius-duckdb/pixi.toml
-          cache: false
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: sirius-extension-test-build
-          path: build
-
-      - name: Test the bundled extension on GPU
-        env:
-          SIRIUS_CONFIG_FILE: ${{ github.workspace }}/sirius-duckdb/test/config.yaml
-        run: |
-          tar -C sirius-duckdb -xf build/extension-test.tar
-          pixi run --manifest-path sirius-duckdb/pixi.toml --locked bash -euo pipefail -c '
-            export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-            cd sirius-duckdb
-            ./build/release/test/unittest --test-dir "$PWD" "test/*"
-          '
+  cuda-12:
+    if: github.event_name != 'pull_request'
+    uses: sirius-db/extension-ci-tools/.github/workflows/_extension_distribution.yml@build/extension-subdirectory
+    with:
+      extension_name: sirius
+      duckdb_version: v1.5.6
+      ci_tools_version: build/extension-subdirectory
+      extension_directory: sirius-duckdb
+      exclude_archs: "linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      extra_toolchains: "cuda;rust;protobuf;libclang;lld"
+      vcpkg_url: "https://github.com/microsoft/vcpkg.git"
+      vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
+      vcpkg_binary_cache_enabled: true
+      skip_tests: true
+      save_cache: ${{ github.ref == 'refs/heads/main' }}
+      reduced_ci_mode: "disabled"
+      override_ci_tools_repository: "sirius-db/extension-ci-tools"
+      build_duckdb_shell: false
+      vcpkg_overlay_ports: "sirius-duckdb/vcpkg_ports"
+      vcpkg_overlay_triplets: "sirius-duckdb/vcpkg_triplets"
+      cuda_archs: "75-real;80-real;86-real;89-real;90a-real"
+      cuda_version: "12"
+      artifact_postfix: "-cuda12"
+      runners: '{"linux_x64": ["self-hosted", "ubuntu-22.04", "cpu-xl"], "linux_arm64": ["self-hosted", "ubuntu-22.04", "arm-xl"]}'
 
   distribution:
     runs-on: ubuntu-slim
-    needs: [build, test]
+    needs: [cuda-12, cuda-13]
     if: always()
     steps:
       - name: Check
-        env:
-          BUILD_RESULT: ${{ needs.build.result }}
-          TEST_RESULT: ${{ needs.test.result }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == pull_request && "$BUILD_RESULT" == skipped && "$TEST_RESULT" == skipped ]]; then
-            exit 0
-          fi
-          [[ "$BUILD_RESULT" == success && "$TEST_RESULT" == success ]]
+          for r in "${{ needs.cuda-12.result }}" "${{ needs.cuda-13.result }}"; do
+            case "$r" in failure|cancelled) echo "distribution build $r"; exit 1 ;; esac
+          done
+          echo "ok (cuda-12=${{ needs.cuda-12.result }}, cuda-13=${{ needs.cuda-13.result }})"
