@@ -4,28 +4,7 @@ name = "sirius-duckdb"
 platforms = ["linux-64", "linux-aarch64"]
 version = "0.0.0"
 
-[tasks]
-
+# Runtime libraries for the downloaded DuckDB test executable.
 [dependencies]
-black = "*"
-cmake-format = "*"
-make = "*"
-python = "3.*"
-
-[feature.tidy.dependencies]
-clang = "*"
-clang-tools = "*"
-cmake = "4.4.*"
-cxx-compiler = "*"
-cuda-nvcc = "*"
-cuda-driver-dev = "*"
-cuda-nvml-dev = "*"
-ninja = "*"
-sccache = "0.18.*"
-
-[feature.format.pypi-dependencies]
-clang-format = ">=11,<12"
-
-[environments]
-default = ["tidy"]
-format = ["format"]
+libgcc = ">=15"
+libstdcxx = ">=15"

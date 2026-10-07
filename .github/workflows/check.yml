@@ -4,7 +4,6 @@
 #     - Allow actions by Marketplace verified creators: NO
 #     - Explicitly allowed third-party actions:
 #       prefix-dev/setup-pixi@*
-#       prefix-dev/rattler-build-action@*
 #       mozilla-actions/sccache-action@*
 #     - Require actions to be pinned to a full-length commit SHA: NO
 #
@@ -29,8 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Initialize extension formatting configuration
-        run: git submodule update --init --depth=1 sirius-duckdb/duckdb
+      - name: Check source dependency pins
+        run: |
+          [[ "$(git rev-parse HEAD:duckdb)" == "$(git rev-parse HEAD:sirius-duckdb/duckdb)" ]]
+          for dependency in duckdb cucascade substrait; do
+            revision=$(git rev-parse "HEAD:$dependency")
+            grep -q "$revision" sirius-duckdb/vcpkg_ports/sirius/portfile.cmake
+          done
 
       - name: Test thread sweep harness
         run: |
@@ -182,14 +186,6 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check source dependency pins
-        run: |
-          [[ "$(git rev-parse HEAD:duckdb)" == "$(git rev-parse HEAD:sirius-duckdb/duckdb)" ]]
-          for dependency in duckdb cucascade substrait; do
-            revision=$(git rev-parse "HEAD:$dependency")
-            grep -q "$revision" sirius-duckdb/vcpkg_ports/sirius/portfile.cmake
-          done
 
       - name: Python DuckDB version check
         if: >-

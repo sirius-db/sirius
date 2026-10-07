@@ -15,7 +15,8 @@ name: Distribution
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   merge_group:
   pull_request:
   workflow_dispatch:
@@ -55,7 +56,7 @@ jobs:
 
       - name: Initialize build dependencies
         run: |
-          git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
+          git submodule update --init --depth=1 --jobs 2 sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
           git submodule update --init vcpkg
           if [[ "$(git -C vcpkg rev-parse --is-shallow-repository)" == "true" ]]; then
             git -C vcpkg fetch --unshallow
@@ -96,7 +97,6 @@ jobs:
       - name: Build the bundled extension
         run: |
           pixi run --locked -e "${{ matrix.environment }}" bash -euo pipefail -c '
-            export VCPKG_CUDA_ARCHITECTURES="$CUDAARCHS"
             make -C sirius-duckdb release \
               SIRIUS_DUCKDB_LINKAGE=static \
               VCPKG_TOOLCHAIN_PATH="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
@@ -122,7 +122,7 @@ jobs:
         run: |
           mkdir -p build
           tar -C sirius-duckdb -cf build/extension-test.tar \
-            build/release/duckdb build/release/test/unittest \
+            build/release/test/unittest \
             build/release/extension/sirius/sirius.duckdb_extension
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -139,9 +139,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Initialize extension test dependencies
-        run: git submodule update --init --depth=1 --jobs 2 sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 
       - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
@@ -161,7 +158,8 @@ jobs:
           tar -C sirius-duckdb -xf build/extension-test.tar
           pixi run --manifest-path sirius-duckdb/pixi.toml --locked bash -euo pipefail -c '
             export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-            make -C sirius-duckdb test_release
+            cd sirius-duckdb
+            ./build/release/test/unittest --test-dir "$PWD" "test/*"
           '
 
   distribution:

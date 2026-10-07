@@ -75,7 +75,7 @@ def run_case(case):
     )
     try:
         p = subprocess.run(
-            [args.duckdb, "-unsigned", "-bail", "-json", "-c", sql],
+            [args.duckdb, "-unsigned", "-json", "-c", sql],
             capture_output=True,
             text=True,
             timeout=args.timeout,

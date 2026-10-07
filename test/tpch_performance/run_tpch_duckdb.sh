@@ -123,7 +123,6 @@ if [ "$ENGINE" = "sirius" ]; then
 fi
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 
-
 if [ ! -f "$DUCKDB_FILE" ]; then
     echo "DuckDB database not found: $DUCKDB_FILE"
     echo "Create it with TPC-H tables (customer, lineitem, nation, orders, part, partsupp, region, supplier),"

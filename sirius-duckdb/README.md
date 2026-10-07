@@ -62,6 +62,8 @@ repositories.
 
 Both builds produce
 `build/release/extension/sirius/sirius.duckdb_extension` under this directory.
+The local Pixi manifest supplies only the compiler runtimes for CI's downloaded
+test executable. Build and test locally with the root environment.
 Run the wrapper's SQL tests from the root with the same runtime search path:
 
 ```sh

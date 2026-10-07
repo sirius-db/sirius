@@ -1,9 +1,2 @@
-# pixi environments
-.pixi/*
-!.pixi/config.toml
-
-# build
-.cache
-build/
+.pixi/
 log/
-telemetry_data/

@@ -172,24 +172,6 @@ endforeach()
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections"
                     "LINKER:--allow-multiple-definition")
 
-if(SIRIUS_BUILD_STATIC)
-  add_library(sirius::sirius_static ALIAS sirius_core)
-  set_target_properties(sirius_core PROPERTIES OUTPUT_NAME sirius EXPORT_NAME
-                                                                  sirius_static)
-  target_link_libraries(
-    sirius_core
-    PRIVATE
-      duckdb_static
-      core_functions_extension
-      parquet_extension
-      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
-  )
-  target_compile_features(sirius_core PUBLIC cxx_std_20)
-  target_link_options(
-    sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
-    "LINKER:--allow-multiple-definition")
-endif()
-
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
 # discovers the Sirius headers (repo + conda) and links the libsirius artifact
@@ -216,4 +198,22 @@ if(SIRIUS_BUILD_SHARED)
 endif()
 if(SIRIUS_BUILD_STATIC)
   add_dependencies(sirius_library sirius_core)
+endif()
+
+if(SIRIUS_BUILD_STATIC)
+  add_library(sirius::sirius_static ALIAS sirius_core)
+  set_target_properties(sirius_core PROPERTIES OUTPUT_NAME sirius EXPORT_NAME
+                                                                  sirius_static)
+  target_link_libraries(
+    sirius_core
+    PRIVATE
+      duckdb_static
+      core_functions_extension
+      parquet_extension
+      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
+  )
+  target_compile_features(sirius_core PUBLIC cxx_std_20)
+  target_link_options(
+    sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
+    "LINKER:--allow-multiple-definition")
 endif()

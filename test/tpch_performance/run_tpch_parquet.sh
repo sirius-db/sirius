@@ -146,7 +146,6 @@ fi
 # routes queries through GPU when SiriusContext is initialized.
 QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/orig"
 
-
 has_parquet_data() {
     local parquet_dir="$1"
     local parquet_file

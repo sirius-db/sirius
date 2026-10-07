@@ -23,6 +23,8 @@ set(EXTENSION_SOURCES src/sirius/sirius_extension.cpp)
 
 build_static_extension(sirius ${EXTENSION_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES})
+# Preserve RMM's shared device-resource registry across library boundaries.
+set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 if(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
   get_target_property(sirius_link_libraries sirius_loadable_extension
@@ -30,9 +32,7 @@ if(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
   list(REMOVE_ITEM sirius_link_libraries "-Wl,--exclude-libs,ALL" duckdb_static)
   set_target_properties(
     sirius_loadable_extension
-    PROPERTIES LINK_LIBRARIES "${sirius_link_libraries}"
-               LINKER_TYPE BFD
-               SKIP_BUILD_RPATH ON)
+    PROPERTIES LINK_LIBRARIES "${sirius_link_libraries}" SKIP_BUILD_RPATH ON)
   target_link_options(
     sirius_loadable_extension PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map"
@@ -49,9 +49,6 @@ if(SIRIUS_DUCKDB_LINKAGE STREQUAL "static")
       "-DEXTENSION=$<TARGET_FILE:sirius_loadable_extension>" -P
       "${CMAKE_CURRENT_SOURCE_DIR}/cmake/check-static-extension.cmake"
     VERBATIM)
-else()
-  # Preserve RMM's shared device-resource registry across library boundaries.
-  set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 endif()
 
 foreach(target IN ITEMS sirius_extension sirius_loadable_extension)
