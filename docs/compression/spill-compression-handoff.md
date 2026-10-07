@@ -106,6 +106,14 @@ default, i.e. 80 GB of 100. At SF1000 that pushed q9's spills to disk; at SF3000
 exhausted REST staging and failed q9/q10. The template caps it at 0.2
 (`CACHE_MAX_FRACTION`); `CACHE_MODE=none` turns it off.
 
+**Use `CACHE_MODE=none` at SF3000.** The cap does not bound the cache's real
+footprint: with it at 20 GB the host tier still peaked at 100 of 100 GB, spills
+went to disk (q5: 41 GB to disk capped vs 0 with the cache off), and five queries
+that complete with the cache off failed (q3, q13 on the GPU retry limit; q17, q21
+on exhausted REST staging) or slowed sharply (q14 23 → 44 s). The likely holder is
+readahead — prefetched chunks not yet consumed are not evictable, and 48 splits at
+SF3000 split sizes is tens of GB — but that is a hypothesis, untested.
+
 ### Box: RTX PRO 6000 (96 GB), 8 vCPU, 62 GB RAM, local NVMe at /mnt/datasets
 
 The earlier harness (`bench/compress-spills-v2`, removed) ran TPC-H SF1000 from a
@@ -170,20 +178,50 @@ Compression pays off when spills reach disk. When everything fits in the host
 tier (cache off, same suite) it was a wash to +5%: it saves PCIe bytes and host
 memory, neither of which was the bottleneck, and costs encode/decode time.
 
-**SF3000** — still running at the time of writing; compare the arms with
-`ab-report.py` on `each_sf3000_sf3k_nc_{base,comp}.tsv` (cache off) and
-`each_sf3000_sf3k_cap20_{base,comp}.tsv` (cache capped at 20 GB). Known so far:
-q3 spills 280–730 GB to disk depending on how much host tier the cache leaves
-(312 s cache off, 610 s uncapped); q9 fails on GPU memory (`HASH_JOIN`) even with
-the cache off; the uncapped cache failed q9/q10 on exhausted REST staging.
+**SF3000** — one process per query, 1 iteration, 20-minute timeout. Reproduce the
+tables with `ab-report.py` on `each_sf3000_sf3k_nc_{base,comp}.tsv` and
+`each_sf3000_sf3k_cap20_{base,comp}.tsv` under `test/tpch_performance/output/`.
+
+| Cache | Completed (off / on) | Total over queries both arms ran | Notable |
+|---|---|---|---|
+| off | 19 / 17 | 422.0 s → 412.7 s (−2%), 17 queries | q21 −11%, q2 −20%; most others ±8%. **q3 and q13 fail with compression** (GPU retry limit) where the baseline completes them (312 s, 31 s). |
+| capped at 20 GB | 14 / 14 | 417.2 s → 385.5 s (−8%), 15 queries | Spills reach disk here, and compression pays: q14 −27%, q5 −25%, q7 −10%. |
+
+Answers are identical between arms on every query that completed in both (q11
+differs only in ORDER BY tie order). Failing in every configuration: q9 (GPU OOM in
+`HASH_JOIN`), q10, q18 (thrashes on OOM retries past 20 minutes). Compression
+ratios on the heavy spillers: 2.3–4.7× (q3 471 → 121 GB, q9 325 → 114 GB).
+
+The pattern across both scale factors: **compression pays when spills would
+otherwise reach disk, is a wash when they fit in the host tier, and under extreme
+spill pressure can turn a completion into a GPU retry-limit failure** (next
+section).
 
 ## Open items
 
-- **SF3000 A/B** — finish and record (above). Expect the disk-bound queries (q3,
-  q9 if it can run) to be where compression matters.
-- **q18 at SF1000, q9 at SF3000** — GPU OOM at the retry limit on a 32 GB card,
-  with or without compression; engine limits rather than tuning, but the first
-  candidates if the aggregation/join memory estimates are revisited.
+- **The GPU retry limit under slow eviction — the most important open problem.**
+  Whenever freeing GPU memory gets slower, waiting tasks burn through their 100 OOM
+  retries and the query fails: SF3000 q3 and q13 complete with the cache off and
+  compression off, but fail with compression on (1,838 and 1,518 retries; a
+  compressed spill frees memory only after encoding) and fail with the capped cache
+  on (spills going to disk). Candidates: back off between retries instead of
+  retrying at the rate failures arrive, give the limit headroom while a downgrade
+  is in flight, or skip compression when spill pressure is extreme.
+- **Lazy per-thread stream pools in the compressed decode path.**
+  `simpatico::thread_device_stream_pool` (`src/util/stream_pool.cpp`) creates 4
+  CUDA streams the first time each thread decodes. Deep in a memory-starved query
+  `cudaStreamCreateWithFlags` fails, the pool throws `std::runtime_error` (not an
+  OOM, so the executor cannot retry) without the CUDA error code, and the query
+  fails: SF3000 q3, capped cache, compression on (`stream_pool: failed to create 4
+  streams on device 0`). Create the pools eagerly, or throw an OOM so it retries,
+  or fall back to the caller's stream.
+- **Prefetching cache footprint at SF3000** — test the readahead hypothesis above
+  (`REST_MAX_CONCURRENT_SCANS=16`; at SF1000 16 and 48 performed the same) before
+  using the cache at this scale.
+- **q18 at SF1000; q9, q10, q18 at SF3000** — fail in every configuration on a
+  32 GB card (GPU OOM at the retry limit, or thrashing past the timeout); engine
+  limits rather than tuning, but the first candidates if the aggregation/join
+  memory estimates are revisited.
 - **S3 throughput.** At ~3 MB column-chunk GETs the box measures ~8 GB/s raw from
   S3; 8 MB GETs reach ~10.8 GB/s. Fusion only joins exactly adjacent chunks, and
   `rest.merge_max_gap` applies only to the prefetching cache, so the demand path
