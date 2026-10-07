@@ -975,7 +975,8 @@ std::unique_ptr<cudf::column> make_nullable_list_payload(cudf::size_type rows,
   cudf::set_null_mask(values_column->mutable_view().null_mask(), 4, 5, false, stream);
   values_column->set_null_count(1);
   auto parent_mask = cudf::create_null_mask(rows, cudf::mask_state::ALL_VALID, stream);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(parent_mask.data()), 6, 7, false, stream);
+  cudf::set_null_mask(
+    reinterpret_cast<cudf::bitmask_type*>(parent_mask.data()), 6, 7, false, stream);
   return cudf::make_lists_column(
     rows, std::move(offsets_column), std::move(values_column), 1, std::move(parent_mask));
 }

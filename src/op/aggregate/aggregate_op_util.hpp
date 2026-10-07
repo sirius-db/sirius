@@ -24,8 +24,9 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <memory>
 #include <optional>
@@ -65,7 +66,7 @@ std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
 /// candidate is not DECIMAL32 or DECIMAL64.
 std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
                                                       std::vector<int> const& candidates,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr);
 
 /**
