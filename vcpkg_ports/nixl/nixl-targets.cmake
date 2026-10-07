@@ -14,14 +14,6 @@ function(nixl_import_targets prefix ucx_target cuda_runtime_target)
     set_target_properties(
       "${_target}" PROPERTIES IMPORTED_LOCATION
                               "${prefix}/lib/lib${_archive}.a")
-    if(EXISTS "${prefix}/debug/lib/lib${_archive}.a")
-      set_target_properties(
-        "${_target}"
-        PROPERTIES IMPORTED_CONFIGURATIONS "RELEASE;DEBUG"
-                   IMPORTED_LOCATION_RELEASE "${prefix}/lib/lib${_archive}.a"
-                   IMPORTED_LOCATION_DEBUG
-                   "${prefix}/debug/lib/lib${_archive}.a")
-    endif()
     list(APPEND _targets "${_target}")
   endforeach()
   list(JOIN _targets "," _archive_group)

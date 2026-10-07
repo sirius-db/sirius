@@ -4,6 +4,9 @@ This Linux port builds UCX 1.20.1 with TCP, self, POSIX/System V shared
 memory, CMA, CUDA copy and CUDA IPC transports. InfiniBand/RoCE, RDMA CM,
 GDRCopy and other optional transports are disabled explicitly.
 
+The port builds Release only for Sirius distribution packages. Consumers use
+the Release archives in every build configuration.
+
 `find_package(ucx CONFIG REQUIRED)` exposes `ucx::ucx`. Its link interface
 retains transport registration constructors and includes the complete static
 UCX dependency closure. CUDA's runtime is static; the NVIDIA CUDA driver and
@@ -36,7 +39,7 @@ stub directories when linking.
 For an isolated dependency installation:
 
 ```bash
-pixi run -e vcpkg cmake -S vcpkg_ports/ucx/test -B build/ucx-static-probe \
+pixi run -e vcpkg cmake -S test/cmake/ucx -B build/ucx-static-probe \
   -Ducx_DIR="$PWD/build/exchange-vcpkg-installed/x64-linux/share/ucx" \
   -DCMAKE_BUILD_TYPE=Release
 pixi run -e vcpkg cmake --build build/ucx-static-probe

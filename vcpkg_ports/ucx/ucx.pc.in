@@ -1,6 +1,6 @@
 prefix=${pcfiledir}/../..
 libdir=${prefix}/lib
-includedir=${prefix}/@UCX_PC_INCLUDE@
+includedir=${prefix}/include
 
 Name: ucx
 Description: Static UCX with TCP, shared-memory and CUDA transports

@@ -2,7 +2,12 @@
 
 This port pins NIXL 1.5.0 and links its UCX backend into the static SDK. Sirius's
 CMake development build shares its patches and `nixl-targets.cmake`, using
-environment-provided UCX. This port uses the static UCX overlay port.
+environment-provided shared UCX, Abseil, and CUDA runtime libraries. CMake's
+external project downloads, patches, and builds the pinned source during the
+build step. This port uses the static UCX overlay port.
+
+The static port builds Release only for Sirius distribution packages. Consumers
+use the Release archives in every build configuration.
 
 The temporary patches address this pinned version:
 
@@ -33,7 +38,7 @@ From the Sirius checkout:
 pixi run -e vcpkg vcpkg/vcpkg install nixl:x64-linux --classic \
   --overlay-ports=vcpkg_ports --overlay-triplets=vcpkg_triplets \
   --x-install-root=build/exchange-vcpkg-installed
-pixi run -e vcpkg cmake -S vcpkg_ports/nixl/test -B build/nixl-static-probe \
+pixi run -e vcpkg cmake -S test/cmake/nixl -B build/nixl-static-probe \
   -DCMAKE_PREFIX_PATH="$PWD/build/exchange-vcpkg-installed/x64-linux"
 pixi run -e vcpkg cmake --build build/nixl-static-probe
 pixi run -e vcpkg ctest --test-dir build/nixl-static-probe --output-on-failure

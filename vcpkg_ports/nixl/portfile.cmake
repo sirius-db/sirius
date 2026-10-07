@@ -1,3 +1,4 @@
+set(VCPKG_BUILD_TYPE release)
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
 vcpkg_from_github(
@@ -67,9 +68,8 @@ vcpkg_configure_meson(
   "-Dcudapath_inc=${NIXL_CUDA_ROOT}/include"
   "-Dcudapath_lib=${NIXL_CUDA_LIBDIR}"
   "-Dcudapath_stub=${NIXL_CUDA_STUBDIR}"
+  # Override vcpkg's wrap mode after its per-configuration defaults.
   OPTIONS_RELEASE
-  --wrap-mode=nofallback
-  OPTIONS_DEBUG
   --wrap-mode=nofallback)
 vcpkg_install_meson()
 
@@ -80,5 +80,4 @@ file(
   "${CMAKE_CURRENT_LIST_DIR}/nixl-targets.cmake"
   "${CMAKE_CURRENT_LIST_DIR}/usage"
   DESTINATION "${CURRENT_PACKAGES_DIR}/share/nixl")
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")

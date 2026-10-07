@@ -1,3 +1,4 @@
+set(VCPKG_BUILD_TYPE release)
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
 vcpkg_from_github(
@@ -64,30 +65,14 @@ vcpkg_configure_make(
 vcpkg_install_make()
 
 # Upstream's CUDA pkg-config entry is empty and omits static registration.
-foreach(UCX_CONFIG_DIR IN ITEMS "${CURRENT_PACKAGES_DIR}"
-                                "${CURRENT_PACKAGES_DIR}/debug")
-  if(EXISTS "${UCX_CONFIG_DIR}/lib/pkgconfig/ucx.pc")
-    set(UCX_PC_INCLUDE include)
-    if(UCX_CONFIG_DIR MATCHES "/debug$")
-      set(UCX_PC_INCLUDE ../include)
-    endif()
-    configure_file("${CMAKE_CURRENT_LIST_DIR}/ucx.pc.in"
-                   "${UCX_CONFIG_DIR}/lib/pkgconfig/ucx.pc" @ONLY)
-  endif()
-endforeach()
+configure_file("${CMAKE_CURRENT_LIST_DIR}/ucx.pc.in"
+               "${CURRENT_PACKAGES_DIR}/lib/pkgconfig/ucx.pc" @ONLY)
 vcpkg_fixup_pkgconfig()
 
 file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/ucx-config.cmake"
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/ucx")
 file(INSTALL "${CURRENT_PACKAGES_DIR}/lib/cmake/ucx/ucx-config-version.cmake"
      DESTINATION "${CURRENT_PACKAGES_DIR}/share/ucx")
-file(
-  REMOVE_RECURSE
-  "${CURRENT_PACKAGES_DIR}/lib/cmake"
-  "${CURRENT_PACKAGES_DIR}/debug/lib/cmake"
-  "${CURRENT_PACKAGES_DIR}/debug/include"
-  "${CURRENT_PACKAGES_DIR}/debug/share"
-  "${CURRENT_PACKAGES_DIR}/tools"
-  "${CURRENT_PACKAGES_DIR}/etc"
-  "${CURRENT_PACKAGES_DIR}/debug/etc")
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/cmake"
+     "${CURRENT_PACKAGES_DIR}/tools" "${CURRENT_PACKAGES_DIR}/etc")
 vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
