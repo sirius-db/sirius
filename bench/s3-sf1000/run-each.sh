@@ -66,10 +66,10 @@ for q in $QUERIES; do
     status=timeout
   elif grep -q 'pinned staging exhausted' "$log" "$dir"/log_dir/*.log 2>/dev/null; then
     status=staging_exhausted    # pinned host pool full: S3 reads could not stage
-  elif grep -q 'not enough capacity to allocate memory' "$log"; then
-    status=pin_oom              # pinned column set larger than its tier
   elif grep -q 'exceeded maximum retry limit' "$log"; then
     status=gpu_oom              # GPU ran out mid-query; no CPU fallback by design
+  elif [ "${PIN:-none}" != none ] && grep -q 'not enough capacity to allocate memory' "$log"; then
+    status=pin_oom              # pinned column set larger than its tier
   else
     status=failed
   fi
