@@ -118,9 +118,17 @@ mkdir -p "$(dirname "$NICLOG")"
 SAMPLER=$!
 trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 
+rc=0
 pixi run python test/tpch_performance/performance_test.py \
   --input "$DATA" --scale-factor "$SF" \
   --iterations "$ITERS" --engine gpu "${PIN_ARGS[@]}" \
-  --queries "$QUERIES" --name "sf${SF}_$NAME"
+  --queries "$QUERIES" --name "sf${SF}_$NAME" || rc=$?
+
+# The harness copies the rendered config into the run directory, S3 keys and
+# all; scrub them there (the rendered original stays 0600 under ~/.sirius).
+for f in "$REPO"/test/tpch_performance/output/tpch_*_"sf${SF}_$NAME"/{config,effective_config}.yml; do
+  [ -f "$f" ] && sed -i -E 's/^(\s*(access_key|secret_key|session_token):).*/\1 "<redacted>"/' "$f"
+done
 
 echo "NIC samples: $NICLOG"
+exit $rc
