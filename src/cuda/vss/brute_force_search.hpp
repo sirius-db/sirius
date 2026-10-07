@@ -212,6 +212,27 @@ knn_result gemm_int8_topk(
   bool take_sqrt,
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+/**
+ * @brief Expanded-L2 top-k over FP16 rows, on the half-precision tensor cores with FP32
+ *        accumulation.
+ *
+ * @p x [n x d] and @p q [m x d] are row-major IEEE half bit patterns; @p x_sq and @p q_sq are
+ * their squared norms. The products are exact and summed in FP32, so the ranking is that of the
+ * rounded vectors: an FP32 re-score is the caller's when the rounding matters.
+ */
+knn_result gemm_f16_topk(
+  raft::device_resources const& res,
+  std::uint16_t const* x,
+  float const* x_sq,
+  int64_t n,
+  std::uint16_t const* q,
+  float const* q_sq,
+  int64_t m,
+  int64_t d,
+  int64_t k,
+  bool take_sqrt,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 #ifdef SIRIUS_ENABLE_FAISS_KERNEL
 /**
  * @brief The same search, run by FAISS-GPU instead of cuVS.

@@ -1865,6 +1865,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                           _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
                           seed_enabled && small_clusters && small_batch;
     bool const seed = (bounded && seedable) || seed_f16;
+    // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
+    // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
+    // SIRIUS_VSS_F16_GEMM=0 widens the rows and ranks them with the FP32 GEMM instead.
+    bool const f16_sweep0 = f16_bounded && !seed && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_F16_GEMM");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
+    std::optional<rmm::device_uvector<float>> routed_sqf;
+    if (f16_sweep0) {
+      routed_f16.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
+      routed_sqf.emplace(static_cast<std::size_t>(max_routed), stream, mr);
+    }
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
@@ -2248,9 +2261,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                            : kept_first.empty()      ? needed_chunks
                                                      : kept_first;
       // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
-      // in compact for sweep 0 as well, and widened on the device, so that copy can be kept.
-      bool const direct        = int8_search || (f16_bounded && (sweep == 1 || seed));
-      bool const widen_compact = lists_on_host && f16_bounded && sweep == 0;
+      // in compact for sweep 0 as well (and widened on the device when it ranks in FP32), so that
+      // copy can be kept.
+      bool const direct = int8_search || (f16_bounded && (sweep == 1 || seed)) || f16_sweep0;
+      bool const widen_compact = lists_on_host && f16_bounded && sweep == 0 && !direct;
       bool const copy_compact  = (direct && lists_on_host) || widen_compact;
       auto stage_next          = [&](std::size_t j) {
         if (copy_compact) {
@@ -2454,6 +2468,27 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
           // per-call device synchronization, which is paid here once per slice.
           auto const knn = [&] {
+            if (f16_sweep0) {
+              vss::gather_bytes(probe_f16->data(),
+                                dim * static_cast<std::int64_t>(sizeof(std::uint16_t)),
+                                rows_c,
+                                m,
+                                routed_f16->data(),
+                                stream);
+              vss::gather_rows(probe_sqf->data(), 1, rows_c, m, routed_sqf->data(), stream);
+              return vss::gemm_f16_topk(
+                res,
+                reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
+                static_cast<float const*>(_lists->row_sq_f32->data()) + id_base,
+                slice_rows,
+                routed_f16->data(),
+                routed_sqf->data(),
+                m,
+                dim,
+                k_eff,
+                /*take_sqrt=*/false,
+                mr);
+            }
             if (int8_search) {
               vss::gather_bytes(probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
               vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);

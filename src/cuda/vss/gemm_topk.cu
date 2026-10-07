@@ -374,6 +374,27 @@ __global__ void finish_int8_topk_kernel(
   }
 }
 
+// The FP16 counterpart of int8_scores_kernel: the tile already holds FP32 dot products.
+__global__ void f16_scores_kernel(float* tile, int64_t n, int64_t ldc, float const* x_sq)
+{
+  auto* row = tile + static_cast<int64_t>(blockIdx.y) * ldc;
+  for (int64_t c = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; c < ldc;
+       c += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    row[c] = c < n ? x_sq[c] - 2.f * row[c] : INFINITY;
+  }
+}
+
+__global__ void finish_f16_topk_kernel(
+  float* vals, int64_t rows, int64_t k, float const* q_sq, bool take_sqrt)
+{
+  auto const total = rows * k;
+  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; p < total;
+       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const v = fmaxf(vals[p] + q_sq[p / k], 0.f);
+    vals[p]      = take_sqrt ? sqrtf(v) : v;
+  }
+}
+
 }  // namespace
 
 std::size_t gemm_search_tile_bytes()
@@ -636,6 +657,87 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
       /*sorted=*/true);
   }
   finish_int8_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.value()>>>(
+    out_d, m, k, q_sq, take_sqrt);
+  CUDF_CHECK_CUDA(stream.value());
+  return knn_result{std::move(neighbors), std::move(distances), m, k};
+}
+
+knn_result gemm_f16_topk(raft::device_resources const& res,
+                         std::uint16_t const* x,
+                         float const* x_sq,
+                         int64_t n,
+                         std::uint16_t const* q,
+                         float const* q_sq,
+                         int64_t m,
+                         int64_t d,
+                         int64_t k,
+                         bool take_sqrt,
+                         rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(k >= 1 && k <= n, "VSS k must satisfy 1 <= k <= n_rows");
+  CUDF_EXPECTS(n <= std::numeric_limits<int>::max(), "gemm_f16_topk: corpus slice too large");
+  auto const stream = raft::resource::get_cuda_stream(res);
+  // Rows padded to 4 floats so each score row starts 16-byte aligned for the selection.
+  auto const ldc = (n + 3) / 4 * 4;
+  auto const tile_rows =
+    std::clamp<int64_t>(static_cast<int64_t>(gemm_search_tile_bytes() /
+                                             (static_cast<std::size_t>(ldc) * sizeof(float))),
+                        1,
+                        std::min<int64_t>(std::max<int64_t>(m, 1), 65535));
+  rmm::device_uvector<float> scores(static_cast<std::size_t>(tile_rows * ldc), stream, mr);
+
+  auto const out_size = column_size(m * k, "vector join top-k");
+  auto neighbors      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto distances = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT32}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto* out_n = neighbors->mutable_view().data<int64_t>();
+  auto* out_d = distances->mutable_view().data<float>();
+
+  auto handle = raft::resource::get_cublas_handle(res);
+  CUDF_EXPECTS(cublasSetStream(handle, stream.value()) == CUBLAS_STATUS_SUCCESS,
+               "gemm_f16_topk: cublasSetStream failed");
+  float const alpha = 1.f;
+  float const beta  = 0.f;
+  for (int64_t q0 = 0; q0 < m; q0 += tile_rows) {
+    auto const t = std::min(tile_rows, m - q0);
+    // Same TN layout as the FP32 and INT8 searches: scores^T[n x t] = x^T * q_tile^T.
+    auto const status = cublasGemmEx(handle,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     static_cast<int>(n),
+                                     static_cast<int>(t),
+                                     static_cast<int>(d),
+                                     &alpha,
+                                     x,
+                                     CUDA_R_16F,
+                                     static_cast<int>(d),
+                                     q + q0 * d,
+                                     CUDA_R_16F,
+                                     static_cast<int>(d),
+                                     &beta,
+                                     scores.data(),
+                                     CUDA_R_32F,
+                                     static_cast<int>(ldc),
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    CUDF_EXPECTS(status == CUBLAS_STATUS_SUCCESS,
+                 "gemm_f16_topk: cublasGemmEx failed with status " + std::to_string(status));
+    dim3 const grid(
+      static_cast<unsigned>(std::clamp<int64_t>((ldc + kBlock - 1) / kBlock, 1, 65535)),
+      static_cast<unsigned>(t));
+    f16_scores_kernel<<<grid, kBlock, 0, stream.value()>>>(scores.data(), n, ldc, x_sq);
+    CUDF_CHECK_CUDA(stream.value());
+    cuvs::selection::select_k(
+      res,
+      raft::make_device_matrix_view<const float, int64_t, raft::row_major>(scores.data(), t, ldc),
+      std::nullopt,
+      raft::make_device_matrix_view<float, int64_t, raft::row_major>(out_d + q0 * k, t, k),
+      raft::make_device_matrix_view<int64_t, int64_t, raft::row_major>(out_n + q0 * k, t, k),
+      /*select_min=*/true,
+      /*sorted=*/true);
+  }
+  finish_f16_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.value()>>>(
     out_d, m, k, q_sq, take_sqrt);
   CUDF_CHECK_CUDA(stream.value());
   return knn_result{std::move(neighbors), std::move(distances), m, k};

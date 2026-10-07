@@ -1502,6 +1502,62 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "an FP16 nearest-cluster sweep on the tensor cores gives what the FP32 GEMM gives",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Unseeded, sweep 0 over FLOAT16 lists ranks each row's nearest cluster from the stored half
+  // rows; SIRIUS_VSS_F16_GEMM=0 widens them and ranks with the FP32 GEMM. Sweep 0 only sets the
+  // bound, re-scored in FP32, so the answers -- re-scored too -- must be the same pairs at the same
+  // distances on both tiers, for L2 and cosine lists.
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const metric = GENERATE(std::string("l2"), std::string("cosine"));
+  auto const prefix = "kmf16_" + tier + "_" + metric;
+  create_lists_tables(*this, prefix, tier);
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+         "_c', storage => 'float16', metric => '" + metric + "');");
+  auto const score = metric == "cosine" ? "similarity" : "distance";
+  auto const fetch = [&](const std::string& args) {
+    std::vector<std::tuple<std::string, std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 std::string("SELECT left_id, right_id, ") + score + " FROM sirius_knn_join('" +
+                   prefix + "_probe','vec','" + prefix + "_corpus','vec', metric => '" + metric +
+                   "', search_mode => 'approx', clustering => '" + prefix + "_c', " + args +
+                   ");")) {
+      out.emplace_back(r.at(0), r.at(1), std::stod(r.at(2)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  ::setenv("SIRIUS_VSS_SEED", "0", 1);
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SEED");
+      ::unsetenv("SIRIUS_VSS_F16_GEMM");
+    }
+  } unset_env;
+  for (auto const probes : {1, 4}) {
+    for (auto const k : {2, 10}) {
+      auto const args = "n_probes => " + std::to_string(probes) + ", k => " + std::to_string(k);
+      auto const half = fetch(args);
+      ::setenv("SIRIUS_VSS_F16_GEMM", "0", 1);
+      auto const widened = fetch(args);
+      ::unsetenv("SIRIUS_VSS_F16_GEMM");
+      REQUIRE(half.size() == static_cast<std::size_t>(50 * k));
+      REQUIRE(half.size() == widened.size());
+      for (std::size_t i = 0; i < half.size(); ++i) {
+        CHECK(std::get<0>(half[i]) == std::get<0>(widened[i]));
+        CHECK(std::get<1>(half[i]) == std::get<1>(widened[i]));
+        CHECK(std::get<2>(half[i]) == std::get<2>(widened[i]));
+      }
+    }
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "a seeded sweep over INT8 and float16 lists gives what the GEMM sweep gives",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {
