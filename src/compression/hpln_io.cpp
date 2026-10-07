@@ -302,6 +302,12 @@ class ioctx_hpln_source final : public hpln_source {
   [[nodiscard]] std::uint64_t size() const noexcept override { return _size; }
   [[nodiscard]] std::string_view transport() const noexcept override { return _stats.transport; }
 
+  [[nodiscard]] hpln_io_policy default_policy() const override
+  {
+    return _io_ctx->type() == io::io_context_type::restful ? hpln_io_policy{}
+                                                           : hpln_io_policy::local_file();
+  }
+
   /// Straight through to the datasource, which resolves the io_context's metadata store by the
   /// io_object's cache id -- the same path parquet's footer cache takes.
   [[nodiscard]] std::shared_ptr<io::io_object_metadata> metadata() const override
@@ -348,8 +354,8 @@ class ioctx_hpln_source final : public hpln_source {
       std::size_t batch_ranges  = 0;
       while (i < requests.size() &&
              (batch_ranges == 0 || batch_bytes + requests[i].bytes <= policy.max_bytes_in_flight)) {
-        auto const& r     = requests[i];
-        std::uint64_t at  = r.offset;
+        auto const& r    = requests[i];
+        std::uint64_t at = r.offset;
         for (auto const& d : r.dst) {
           if (d.bytes > 0) {
             slices.emplace_back(

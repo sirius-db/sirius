@@ -40,6 +40,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -59,9 +60,9 @@ namespace sirius {
 struct hpln_open_options {
   /// Backend serving this path. Null means the local filesystem.
   std::shared_ptr<io::ioctx> io_ctx;
-  /// How reads are coalesced into requests; see @ref hpln_io_policy for where its defaults
-  /// come from.
-  hpln_io_policy policy{};
+  /// How reads are coalesced into requests. Unset takes the opened source's
+  /// @ref hpln_source::default_policy, which differs between local files and object stores.
+  std::optional<hpln_io_policy> policy;
   /// Verify each staged chunk payload against the file's CRC32C.
   ///
   /// Off by default, and the default is a policy rather than a constant: a payload checksum costs

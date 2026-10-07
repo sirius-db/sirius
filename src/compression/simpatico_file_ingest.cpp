@@ -564,8 +564,9 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::span<const std::size_t> columns,
   std::span<const std::vector<std::uint32_t>> decode_chunks)
 {
-  auto src    = open_hpln(path, "hpln ingest", options);
-  auto layout = locate_hpln(*src, path);
+  auto src          = open_hpln(path, "hpln ingest", options);
+  auto const policy = options.policy.value_or(src->default_policy());
+  auto layout       = locate_hpln(*src, path);
   if (!layout.located) {
     throw std::runtime_error("[hpln ingest] '" + path +
                              "' predates the trailer and has no chunk directory; it can only be "
@@ -573,7 +574,7 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   }
   std::vector<std::vector<std::uint8_t>> headers;
   simpatico::hpln_schema schema;
-  describe_chunks(*src, path, layout, options.policy, headers, schema);
+  describe_chunks(*src, path, layout, policy, headers, schema);
 
   // Allocate every requested chunk first, then fill them all in one planned read: consecutive
   // chunks are adjacent in the payload region, so the batch collapses to a few large sequential
@@ -605,15 +606,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
                           ? std::span<const std::uint32_t>{decode_chunks[at]}
                           : std::span<const std::uint32_t>{};
       if (!rows.empty()) {
-        narrowed = allocate_chunk_narrowed(headers[id],
-                                           layout.chunks[id],
-                                           columns,
-                                           rows,
-                                           *src,
-                                           options.policy,
-                                           host_space,
-                                           extents,
-                                           blob);
+        narrowed = allocate_chunk_narrowed(
+          headers[id], layout.chunks[id], columns, rows, *src, policy, host_space, extents, blob);
       }
       if (!blob) {
         blob = columns.empty()
@@ -641,7 +635,7 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     out.push_back({it->second, rows_in_blob, narrowed_ids[id]});
     ++at;
   }
-  src->read_extents(std::move(extents), options.policy, "chunk payload");
+  src->read_extents(std::move(extents), policy, "chunk payload");
   // A narrowed read cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
   // and this read deliberately did not fetch all of it.
   auto const any_narrowed =
@@ -683,6 +677,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                                     hpln_open_options const& options)
 {
   auto src             = open_hpln(path, "hpln ingest", options);
+  auto const policy    = options.policy.value_or(src->default_policy());
   auto const file_size = src->size();
   auto layout          = locate_hpln(*src, path);
 
@@ -695,7 +690,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                                " chunks; read_hpln_into_pinned serves a single chunk only");
     }
     std::vector<std::vector<std::uint8_t>> headers;
-    describe_chunks(*src, path, layout, options.policy, headers, out.schema);
+    describe_chunks(*src, path, layout, policy, headers, out.schema);
     header = std::move(headers.front());
   } else {
     // Pre-trailer file: grow a speculative prefix until the header parses, which is the round trip
@@ -726,7 +721,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
 
   std::vector<hpln_extent> extents;
   out.blob = allocate_chunk(std::move(header), layout.chunks.front(), host_space, extents);
-  src->read_extents(std::move(extents), options.policy, "chunk payload");
+  src->read_extents(std::move(extents), policy, "chunk payload");
   if (options.verify_payload && !layout.checksums.empty()) {
     verify_crc(layout,
                path,
@@ -999,7 +994,8 @@ hpln_bind_schema parse_hpln_schema(std::string const& path,
 
   if (layout.located) {
     std::vector<std::vector<std::uint8_t>> headers;
-    describe_chunks(src, path, layout, options.policy, headers, header_schema);
+    describe_chunks(
+      src, path, layout, options.policy.value_or(src.default_policy()), headers, header_schema);
     for (auto const& c : layout.chunks) {
       chunk_rows.push_back(c.num_rows);
     }

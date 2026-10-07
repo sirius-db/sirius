@@ -64,6 +64,16 @@ struct hpln_io_policy {
   /// before the next is built, so this also bounds what one reading thread keeps queued.
   std::uint64_t max_bytes_in_flight = 1ull << 30;
 
+  /// Local NVMe wants far larger requests than S3: a batch goes to one uring reactor, where 16 MB
+  /// requests cap at ~17 GB/s and 64 MB reach the RAID's ~22 GB/s (SF1000 .hpln pin 13.2 -> 10.4 s;
+  /// 128 MB measured no better).
+  [[nodiscard]] static hpln_io_policy local_file()
+  {
+    hpln_io_policy p;
+    p.target_request_bytes = 64ull << 20;
+    return p;
+  }
+
   /// A policy that coalesces nothing and splits nothing -- one request per extent, as the
   /// pre-io_context reader behaved. Useful as a control.
   [[nodiscard]] static hpln_io_policy verbatim()
@@ -161,6 +171,12 @@ class hpln_source {
   /// Identifies the transport in errors, logs and tests: "ifstream", or "io_context:<backend>".
   [[nodiscard]] virtual std::string_view transport() const noexcept = 0;
 
+  /// The policy to read this source with when the caller does not pick one.
+  [[nodiscard]] virtual hpln_io_policy default_policy() const
+  {
+    return hpln_io_policy::local_file();
+  }
+
   /// Serve @p requests, throwing on a short read. Implementations may run them concurrently, so
   /// the destinations must be disjoint (which @ref plan_hpln_reads guarantees).
   virtual void submit(std::span<hpln_request const> requests,
@@ -198,10 +214,7 @@ class hpln_source {
   /// The default is "no cache", which is what a local ifstream source and a host test get: they
   /// re-parse, which is right rather than merely acceptable, since neither has an io_context whose
   /// lifetime could bound the entry.
-  [[nodiscard]] virtual std::shared_ptr<io::io_object_metadata> metadata() const
-  {
-    return nullptr;
-  }
+  [[nodiscard]] virtual std::shared_ptr<io::io_object_metadata> metadata() const { return nullptr; }
 
   /// Park @p metadata against this file. False when the transport has nowhere to put it.
   virtual bool store_metadata(std::shared_ptr<io::io_object_metadata> /*metadata*/)
@@ -224,7 +237,8 @@ class hpln_source {
 ///
 /// @p who names the caller in error messages. Throws std::runtime_error if the file cannot be
 /// opened or its size cannot be resolved.
-[[nodiscard]] std::unique_ptr<hpln_source> open_hpln_source(
-  std::string const& path, std::shared_ptr<io::ioctx> io_ctx, char const* who);
+[[nodiscard]] std::unique_ptr<hpln_source> open_hpln_source(std::string const& path,
+                                                            std::shared_ptr<io::ioctx> io_ctx,
+                                                            char const* who);
 
 }  // namespace sirius
