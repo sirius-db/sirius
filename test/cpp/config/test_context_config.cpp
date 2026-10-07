@@ -1,5 +1,5 @@
 /*
- * Copyright 2025, Sirius Contributors.
+ * Copyright 2026, Sirius Contributors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,13 +72,14 @@ cucascade::memory::gpu_memory_space_config gpu_space(const sirius::sirius_config
 
 }  // namespace
 
-TEST_CASE("public configuration preserves defaults", "[context_config][config]")
+TEST_CASE("public configuration builds from defaults", "[context_config][config]")
 {
   auto result = ContextConfigBuilder{}.build();
   REQUIRE(result.has_value());
 }
 
-TEST_CASE("public configuration preserves YAML and captures the file", "[context_config][config]")
+TEST_CASE("public configuration builds after its YAML file changes or is deleted",
+          "[context_config][config]")
 {
   const std::string text = R"(sirius:
   topology: {gpus_per_query: 1}
@@ -124,7 +125,8 @@ TEST_CASE("public GPU overrides replace each other and builder copies are indepe
   REQUIRE(copy.build().has_value());
 }
 
-TEST_CASE("public byte override replaces a YAML fraction", "[context_config][config]")
+TEST_CASE("public builder accepts a byte override for YAML with a GPU fraction",
+          "[context_config][config]")
 {
   scoped_yaml file("sirius:\n  memory:\n    gpu: {usage_limit_fraction: 0.5}\n");
   auto builder = ContextConfigBuilder::from_yaml(file.path);
@@ -164,6 +166,18 @@ TEST_CASE("public configuration returns errors for invalid inputs", "[context_co
     auto result = ContextConfigBuilder::from_yaml(file.path);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == ErrorCode::invalid_configuration);
+  }
+  SECTION("malformed time values")
+  {
+    for (const auto& value : {std::string("-ms"), std::string(400, '9') + "ms"}) {
+      scoped_yaml file("sirius: {executor: {scan_manager: {rest: {upkeep_interval_ms: '" + value +
+                       "'}}}}");
+      auto result = ContextConfigBuilder::from_yaml(file.path);
+      REQUIRE_FALSE(result.has_value());
+      CHECK(result.error().code == ErrorCode::invalid_configuration);
+      CHECK(result.error().message.find(file.path.string()) != std::string::npos);
+      CHECK(result.error().message.find("upkeep_interval_ms") != std::string::npos);
+    }
   }
   SECTION("fraction validation and recovery")
   {
@@ -248,6 +262,15 @@ TEST_CASE("configuration resolver applies programmatic GPU overrides", "[context
     CHECK(gpu.reservation_limit_fraction == 0.7);
     CHECK(config.get_operator_params().scan_task_batch_size == capacity / 40);
     CHECK(config.get_operator_params().hash_partition_bytes == (32ULL << 20));
+  }
+  SECTION("oversized byte limits fail resolution with source context")
+  {
+    auto parsed = sirius::parsed_sirius_config::from_node(
+      YAML::Load("sirius: {topology: {num_gpus: 1}}"), "capacity.yaml");
+    auto excessive = parsed.with_gpu_usage_limit(std::numeric_limits<std::uint64_t>::max());
+    REQUIRE_THROWS_WITH(excessive.resolve(topology),
+                        Catch::Matchers::ContainsSubstring("capacity.yaml") &&
+                          Catch::Matchers::ContainsSubstring("usage_limit_bytes exceeds"));
   }
   SECTION("fraction override replaces YAML bytes")
   {

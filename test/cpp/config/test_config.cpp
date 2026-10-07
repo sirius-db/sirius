@@ -26,11 +26,46 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <variant>
 
 using namespace sirius;
+
+namespace {
+struct allocation_failure {
+  static void from_yaml(const YAML::Node&, allocation_failure&) { throw std::bad_alloc(); }
+};
+}  // namespace
+
+TEST_CASE("yaml reader preserves allocation failures", "[config_opt][allocation]")
+{
+  yaml::reader reader(YAML::Load("value: {}"));
+  allocation_failure value;
+  SECTION("optional") { REQUIRE_THROWS_AS(reader.optional("value", value), std::bad_alloc); }
+  SECTION("optional value")
+  {
+    std::optional<allocation_failure> optional;
+    REQUIRE_THROWS_AS(reader.optional("value", optional), std::bad_alloc);
+  }
+  SECTION("validated")
+  {
+    REQUIRE_THROWS_AS(reader.optional("value", value, [](const auto&) { return true; }),
+                      std::bad_alloc);
+  }
+  SECTION("required") { REQUIRE_THROWS_AS(reader.required("value", value), std::bad_alloc); }
+}
+
+TEST_CASE("operator parameters start with hardware-independent defaults", "[config_opt][defaults]")
+{
+  const operator_params params;
+  CHECK(params.scan_task_batch_size == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.hash_partition_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.concat_batch_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.sort_sample_bytes == config::DEFAULT_BATCH_SIZE);
+  CHECK(params.max_build_hash_table_bytes == 2 * config::DEFAULT_BATCH_SIZE);
+}
 
 TEST_CASE("yaml reader basic types", "[config_opt][basic]")
 {
