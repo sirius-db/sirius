@@ -12,7 +12,8 @@
 # remaining QUERIES. Compare two arms with ab-report.py. Every other knob passes
 # through to run.sh / render-config.sh.
 #
-#   QUERY_TIMEOUT_S=3600     per-query wall-clock limit
+#   QUERY_TIMEOUT_S=1200     per-query wall-clock limit (SF3000 q3, the longest
+#                            query that completes, takes 5-10 min; q18 thrashes)
 #   WATCHDOG_FLOOR_MIB=6144  host MemAvailable floor for memory-watchdog.sh (0: off)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +21,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SF="${SF:-1000}"
 NAME="${NAME:-each}"
 QUERIES="${QUERIES:-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22}"
-QUERY_TIMEOUT_S="${QUERY_TIMEOUT_S:-3600}"
+QUERY_TIMEOUT_S="${QUERY_TIMEOUT_S:-1200}"
 OUTDIR="$REPO/test/tpch_performance/output"
 OUT="$OUTDIR/each_sf${SF}_${NAME}.tsv"
 LOGDIR="$OUTDIR/each_sf${SF}_${NAME}_logs"

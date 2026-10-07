@@ -79,7 +79,7 @@ python3 bench/s3-sf1000/ab-report.py test/tpch_performance/output/each_sf3000_{b
   filter (`FUSED_SCAN_FILTER=1`), and the JIT expression evaluator
   (`EXPR_EVAL=ast_jit`). Always sets `enable_duckdb_fallback = false`.
 - `run-each.sh` waits for the GPU to drain between queries, enforces
-  `QUERY_TIMEOUT_S`, runs `memory-watchdog.sh` (kills the harness, not the box,
+  `QUERY_TIMEOUT_S` (default 20 min), runs `memory-watchdog.sh` (kills the harness, not the box,
   below `WATCHDOG_FLOOR_MIB` of MemAvailable), and classifies failures: `gpu_oom`,
   `staging_exhausted`, `pin_oom`, `watchdog_killed`, `timeout`.
 - `ab-report.py` — per-query time, host/disk spill, compression in → out, and an
