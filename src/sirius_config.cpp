@@ -741,7 +741,11 @@ parsed_sirius_config parsed_sirius_config::from_file(const std::filesystem::path
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
 {
-  *this = parsed_sirius_config::from_file(config_path).resolve(discover_configuration_topology());
+  auto resolved =
+    parsed_sirius_config::from_file(config_path).resolve(discover_configuration_topology());
+  // Object-store settings are supplied programmatically, never through YAML.
+  resolved.set_object_store_config(_scan_manager_config.object_store);
+  *this = std::move(resolved);
 }
 
 parsed_sirius_config parsed_sirius_config::from_node(const YAML::Node& root,
