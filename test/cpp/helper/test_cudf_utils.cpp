@@ -309,7 +309,7 @@ TEST_CASE("shared column comparison ignores unused storage and checks row validi
   };
   auto const null_at = [stream](cudf::column& column, cudf::size_type row) {
     auto mask = cudf::create_null_mask(column.size(), cudf::mask_state::ALL_VALID, stream);
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, stream);
+    cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(mask.data()), row, row + 1, false, stream);
     column.set_null_mask(std::move(mask), 1);
   };
 
@@ -336,7 +336,7 @@ TEST_CASE("shared column comparison ignores unused storage and checks row validi
     REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
 
     auto other_mask = cudf::create_null_mask(3, cudf::mask_state::ALL_NULL, stream);
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(other_mask.data()), 0, 3, true, stream);
+    cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(other_mask.data()), 0, 3, true, stream);
     lhs->set_null_mask(std::move(other_mask), 0);
     REQUIRE(columns_logically_equal(lhs->view(), rhs->view(), stream));
   }
@@ -344,14 +344,26 @@ TEST_CASE("shared column comparison ignores unused storage and checks row validi
   SECTION("sliced lists compare referenced elements rather than offsets or unused children")
   {
     auto lhs = cudf::make_lists_column(
-      3, make_column({0, 1, 3, 4}), make_column({999, 10, 20, 888}), 0, rmm::device_buffer{});
+      3,
+      make_column({0, 1, 3, 4}),
+      make_column({999, 10, 20, 888}),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
     auto rhs = cudf::make_lists_column(
-      1, make_column({0, 2}), make_column({10, 20}), 0, rmm::device_buffer{});
+      1,
+      make_column({0, 2}),
+      make_column({10, 20}),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
     auto const slice = cudf::slice(lhs->view(), {1, 2}, stream).front();
     REQUIRE(columns_logically_equal(slice, rhs->view(), stream));
 
     auto different = cudf::make_lists_column(
-      1, make_column({0, 2}), make_column({10, 21}), 0, rmm::device_buffer{});
+      1,
+      make_column({0, 2}),
+      make_column({10, 21}),
+      0,
+      cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
     REQUIRE_FALSE(columns_logically_equal(slice, different->view(), stream));
   }
 
@@ -364,7 +376,11 @@ TEST_CASE("shared column comparison ignores unused storage and checks row validi
               cudaSuccess);
       stream.sync();
       return cudf::make_strings_column(
-        3, make_column({0, 1, 2, 3}), std::move(chars), 0, rmm::device_buffer{});
+        3,
+        make_column({0, 1, 2, 3}),
+        std::move(chars),
+        0,
+        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream));
     };
     auto lhs = make_strings("abc");
     auto rhs = make_strings("xbc");
