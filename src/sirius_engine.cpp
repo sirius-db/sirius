@@ -264,11 +264,7 @@ void sirius_engine::execute()
     sirius_ctx->retire_query_work(query_id_,
                                   duckdb::SiriusContext::query_retirement_mode::completed);
   } catch (const std::exception& e) {
-    registry->record_error(query_id_, std::current_exception());
-    if (fatal_device_exception(std::current_exception())) {
-      registry->mark_runtime_failed();
-      registry->quiesce_all();
-    }
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
     cancel_dynamic_filter_publications();
     // Retire asynchronous borrowers before the execution window can release repositories.
@@ -276,7 +272,7 @@ void sirius_engine::execute()
                                   duckdb::SiriusContext::query_retirement_mode::cancelled);
     throw;
   } catch (...) {
-    registry->record_error(query_id_, std::current_exception());
+    registry->report_failure(std::current_exception(), query_id_);
     SIRIUS_LOG_ERROR("Unknown error executing query");
     cancel_dynamic_filter_publications();
     sirius_ctx->retire_query_work(query_id_,
