@@ -128,6 +128,11 @@ class downgrade_executor {
    */
   std::future<size_t> request_free_memory(size_t bytes);
 
+  /// Reclaim only the current shortfall for a GPU reservation of `bytes`. Concurrent
+  /// releases may satisfy the request before any spill is needed; in-flight copies settle.
+  /// The caller coalesces requests per device. This request retains no query-owned state.
+  std::future<size_t> request_reservation_capacity(size_t bytes);
+
   /**
    * @brief Synchronously request GPU memory reclamation.
    *

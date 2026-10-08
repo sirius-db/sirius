@@ -88,8 +88,9 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    * @param[in] input_batch The input data batch
    * @throws InvalidInputException if input_batches is empty, if any data_batch has no data, or if
    * any data_batch currently resides in the DISK tier
-   * @throws InternalException if the memory manager is not initialized, if the reservation fails,
-   * or if the memory space for the reservation is invalid
+   * @throws InternalException if the memory manager or HOST memory space is unavailable
+   * @throws std::runtime_error if HOST reservation retries exhaust the configured budget
+   * @throws duckdb::InterruptException if the query is interrupted or retiring while waiting
    * @note For now, we assume that the input batch, if in the HOST tier, is always in the
    * host_data_representation. If it is in the GPU tier, we convert it to the
    * host_data_representation. In the future, we should register converters for other

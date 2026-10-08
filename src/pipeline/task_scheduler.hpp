@@ -77,7 +77,9 @@ class task_scheduler {
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-                            downgrade_executors = nullptr);
+                            downgrade_executors = nullptr,
+                          std::chrono::milliseconds memory_reservation_timeout =
+                            memory::reservation_wait::default_timeout);
 
   /**
    * @brief Destructor for the task_scheduler.

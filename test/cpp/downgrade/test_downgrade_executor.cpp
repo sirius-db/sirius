@@ -21,6 +21,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/multiple_blocks_allocation_accessor.hpp"
+#include "memory/reservation_headroom.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 // data utilities
 #include <data/data_batch_utils.hpp>
@@ -822,5 +823,57 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   REQUIRE(freed == batch_size);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
 
+  executor.stop();
+}
+
+TEST_CASE("reservation reclamation asks for the shortfall and observes releases",
+          "[downgrade_executor][memory_wait]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space);
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto small     = make_gpu_batch(*gpu_space, 1024);
+  auto large     = make_gpu_batch(*gpu_space, 8192);
+  repo->add_data_batch(small, 0);
+  repo->add_data_batch(large, 1);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  auto small_bytes = get_batch_size(*small);
+  // Leave some free capacity: reclaiming the full request would unnecessarily spill large.
+  auto available = sirius::memory::gpu_reservation_headroom(*gpu_space);
+  auto hold      = gpu_space->make_reservation_or_null(available - small_bytes * 4);
+  REQUIRE(hold);
+  auto needed   = sirius::memory::gpu_reservation_headroom(*gpu_space) + small_bytes;
+  auto executor = make_test_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  bool released = false;
+  SECTION("only the shortfall is spilled") {}
+  SECTION("capacity released after enqueue prevents any spill") { released = true; }
+
+  // Serialize the request behind a latch so release-before-processing is deterministic.
+  std::promise<void> entered, unblock;
+  auto go = unblock.get_future().share();
+  std::atomic<bool> notified{false};
+  auto gate = executor.request_downgrade([&] {
+    if (!notified.exchange(true)) entered.set_value();
+    go.wait();
+    return true;
+  });
+  entered.get_future().wait();
+  auto first  = executor.request_reservation_capacity(needed);
+  auto second = executor.request_reservation_capacity(needed);
+  if (released) { hold.reset(); }
+  unblock.set_value();
+  gate.get();
+  CHECK(first.get() == (released ? 0 : small_bytes));
+  CHECK(second.get() == 0);
+  CHECK(get_batch_tier(*small) ==
+        (released ? cucascade::memory::Tier::GPU : cucascade::memory::Tier::HOST));
+  CHECK(get_batch_tier(*large) == cucascade::memory::Tier::GPU);
   executor.stop();
 }

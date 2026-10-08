@@ -18,6 +18,7 @@
 
 #include "exec/query_lifecycle_registry.hpp"
 #include "helper/helper.hpp"
+#include "memory/reservation_wait.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -113,7 +114,7 @@ class itask {
   // Pending reservations remain in the scheduler queue, visible to spilling. A short retry
   // deadline prevents the oldest waiting task from monopolizing every dispatch opportunity.
   std::chrono::steady_clock::time_point retry_not_before{};
-  std::chrono::steady_clock::time_point memory_wait_started{};
+  memory::reservation_wait memory_wait;
   exec::query_lifecycle_registry::memory_wait_guard memory_wait_activity;
 
   // Execution function.
