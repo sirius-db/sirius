@@ -76,7 +76,9 @@ queries poll completion/interruption/health every 25 ms. Already-submitted kerne
 before their buffers can be released; cancellation does not preempt them.
 
 Reservations use nonblocking attempts. Waiting tasks remain visible to scheduling/spilling and
-retry after a short delay. A reservation that makes no progress for 30 seconds fails its query.
+retry with backoff from 5 to 50 ms. The configurable memory reservation retry budget defaults
+to 30 seconds of requested backoff without observed progress, excluding extra scheduler delay.
+See [Memory reservation retries](configuration.md#memory-reservation-retries).
 Operator OOM/batch-contention retries are separately bounded. HOST result transfer must obtain
 a real reservation.
 
