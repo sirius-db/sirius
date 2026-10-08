@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "expression/ast/utils.hpp"
 #include "late_mat/column_origin.hpp"
 #include "late_mat/defer_directive.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
+#include "op/sirius_physical_projection.hpp"
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
@@ -1072,4 +1075,108 @@ TEST_CASE("partition sizing preserves integer bytes above double precision",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{bytes});
   CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("native join preparation aligns evaluated and compressed keys across four partitions",
+          "[physical_partition][native_join_keys]")
+{
+  using namespace sirius::ast;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space  = manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space);
+  auto const shape        = GENERATE(0, 1, 2);
+  auto const null_safe    = GENERATE(false, true);
+  auto const key_type     = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto const payload_type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto operand            = [&]() {
+    auto ref = std::make_unique<node>(sirius::ast::reference{0, key_type});
+    if (shape == 0) { return ref; }
+    if (shape == 1) {
+      return std::make_unique<node>(cast{std::move(ref),
+                                         sirius::logical_type::make(sirius::type_id::DOUBLE),
+                                         false,
+                                         cast_kind::semantic});
+    }
+    std::vector<std::unique_ptr<node>> args;
+    args.push_back(std::move(ref));
+    args.push_back(std::make_unique<node>(constant{sirius::value{int64_t{1}}, key_type}));
+    return std::make_unique<node>(
+      function_call{sirius::function_id::add, std::move(args), key_type});
+  };
+  auto child = [&]() {
+    return make_uniq<sirius_physical_operator>(SiriusPhysicalOperatorType::TABLE_SCAN,
+                                               vector<sirius::logical_type>{key_type, payload_type},
+                                               6);
+  };
+  LogicalComparisonJoin logical(JoinType::INNER);
+  logical.types = {LogicalType::INTEGER, LogicalType::INTEGER};
+  vector<sirius::join_condition> conditions;
+  conditions.push_back(
+    {operand(),
+     operand(),
+     null_safe ? sirius::comparison_type::not_distinct_from : sirius::comparison_type::equal});
+  sirius_physical_hash_join join(
+    logical, child(), child(), std::move(conditions), JoinType::INNER, {1}, {1}, {}, 6);
+  join.operator_id = 0;
+  for (std::size_t i = 0; i < join.children.size(); ++i) {
+    join.children[i]->operator_id = i + 1;
+  }
+  REQUIRE(join.conditions[0].left->holds<sirius::ast::reference>());
+  REQUIRE(join.conditions[0].right->holds<sirius::ast::reference>());
+  REQUIRE(join.lhs_output_columns.col_idxs == std::vector<cudf::size_type>{1});
+  REQUIRE(join.rhs_output_columns.col_idxs == std::vector<cudf::size_type>{1});
+
+  auto left = concatenate_batches_horizontal(
+    {make_numeric_batch_with_nulls<int16_t>(
+       *space, {0, 1, 2, 3, 4, 5}, {true, true, true, true, true, false}, cudf::type_id::INT16),
+     make_numeric_batch<int32_t>(*space, {0, 1, 2, 3, 4, 5}, cudf::type_id::INT32)},
+    *space);
+  auto right = concatenate_batches_horizontal(
+    {make_numeric_batch_with_nulls<int64_t>(
+       *space, {0, 1, 2, 3, 4, 5}, {true, true, true, true, true, false}, cudf::type_id::INT64),
+     make_numeric_batch<int32_t>(*space, {0, 1, 2, 3, 4, 5}, cudf::type_id::INT32)},
+    *space);
+  auto materialize = [&](std::size_t side, auto batch) {
+    auto* projection = dynamic_cast<sirius_physical_projection*>(join.children[side].get());
+    if (!projection) { return batch; }
+    auto result = projection->execute(pipelineable_operator_data({batch}), default_stream());
+    return dynamic_cast<pipelineable_operator_data&>(*result).get_data_batches()[0];
+  };
+  left  = materialize(0, left);
+  right = materialize(1, right);
+  sirius_physical_partition probe(join.children[0]->types, 6, &join, false);
+  sirius_physical_partition build(join.children[1]->types, 6, &join, true);
+  probe.operator_id = 10;
+  build.operator_id = 11;
+  probe.set_num_partitions(4);
+  build.set_num_partitions(4);
+  auto left_result  = probe.execute(pipelineable_operator_data({left}), default_stream());
+  auto right_result = build.execute(pipelineable_operator_data({right}), default_stream());
+  auto const& left_parts =
+    dynamic_cast<pipelineable_operator_data&>(*left_result).get_data_batches();
+  auto const& right_parts =
+    dynamic_cast<pipelineable_operator_data&>(*right_result).get_data_batches();
+  REQUIRE(left_parts.size() == 4);
+  REQUIRE(right_parts.size() == 4);
+  std::vector<int32_t> joined;
+  for (std::size_t p = 0; p < 4; ++p) {
+    auto lhs = copy_column_to_host<int32_t>(sirius::get_cudf_table_view(*left_parts[p]).column(1));
+    auto rhs = copy_column_to_host<int32_t>(sirius::get_cudf_table_view(*right_parts[p]).column(1));
+    std::sort(lhs.begin(), lhs.end());
+    std::sort(rhs.begin(), rhs.end());
+    CHECK(lhs == rhs);
+    auto output =
+      join.execute(pipelineable_operator_data({left_parts[p], right_parts[p]}), default_stream());
+    auto const& batches = dynamic_cast<pipelineable_operator_data&>(*output).get_data_batches();
+    for (auto const& batch : batches) {
+      auto const view = sirius::get_cudf_table_view(*batch);
+      REQUIRE(view.num_columns() == 2);
+      auto ids = copy_column_to_host<int32_t>(view.column(0));
+      CHECK(ids == copy_column_to_host<int32_t>(view.column(1)));
+      joined.insert(joined.end(), ids.begin(), ids.end());
+    }
+  }
+  std::sort(joined.begin(), joined.end());
+  CHECK(joined ==
+        (null_safe ? std::vector<int32_t>{0, 1, 2, 3, 4, 5} : std::vector<int32_t>{0, 1, 2, 3, 4}));
 }

@@ -19,9 +19,6 @@
 #include "config.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/ast/to_duckdb.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
@@ -44,20 +41,6 @@ namespace sirius {
 namespace op {
 
 namespace {
-
-std::optional<std::size_t> extract_bound_ref_index(const duckdb::Expression& expr)
-{
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    return expr.Cast<duckdb::BoundReferenceExpression>().index;
-  }
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
-    if (cast_expr.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      return cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index;
-    }
-  }
-  return std::nullopt;
-}
 
 constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType type) noexcept
 {
@@ -127,35 +110,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _downstream_consumer_op = op;
     _partition_type         = PartitionType::HASH;
     auto& hash_join_op      = op->Cast<sirius_physical_hash_join>();
-    for (std::size_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
-      auto& condition = hash_join_op.conditions[cond_idx];
-      if (condition.comparison != sirius::comparison_type::equal &&
-          condition.comparison != sirius::comparison_type::not_distinct_from) {
-        continue;
-      }
-      auto left_owned  = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].left);
-      auto right_owned = sirius::ast::to_duckdb(*hash_join_op.conditions[cond_idx].right);
-      std::optional<std::size_t> left_index  = extract_bound_ref_index(*left_owned);
-      std::optional<std::size_t> right_index = extract_bound_ref_index(*right_owned);
-      if (left_index.has_value() && right_index.has_value()) {
-        // Determine if a type cast is needed for hash alignment.
-        // When the join condition has a BOUND_CAST on one side, the two sides have different
-        // physical column types (e.g. INT32 vs INT64). cuDF's murmur3 produces different hash
-        // values for the same integer in different representations, so without a cast, matching
-        // keys would land in different partitions. We apply the same cast used by the join
-        // condition so both sides hash identically.
-        const auto& key_expr = is_build ? *right_owned : *left_owned;
-        if (is_build) {
-          _partition_keys.push_back(right_index.value());
-        } else {
-          _partition_keys.push_back(left_index.value());
-        }
-        if (key_expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.return_type));
-        } else {
-          _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
-        }
-      }
+    for (auto const& key : hash_join_op.prepared_keys()) {
+      _partition_keys.push_back(is_build ? key.right_index : key.left_index);
+      _partition_key_cast_types.push_back(key.type);
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     // NLJ is the downstream sizing consumer too; it always reports a single partition.
