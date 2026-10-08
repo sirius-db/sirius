@@ -97,6 +97,13 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
+Only one Sirius engine context may be active per process. Connections sharing the
+same DuckDB database instance share its context, but loading Sirius into a second
+independent database instance fails while the first context is active. Close all
+connections and handles owning the first instance before creating another.
+Use separate processes for independent engine instances; do not fork a process
+with an active Sirius context.
+
 The default Pixi environment includes DuckDB's Python package. Its DuckDB version must match
 the version used to build the Sirius extension. Forked or nightly DuckDB builds may also require
 a Python package built from compatible source.

@@ -29,6 +29,10 @@ enum class ErrorCode {
   malformed_yaml,
   /// A setting is unknown, invalid, or conflicts with another.
   invalid_configuration,
+  /// Another engine context holds the process runtime.
+  context_in_use,
+  /// Hardware resolution or engine initialization failed.
+  context_initialization,
 };
 
 /// @brief A failure returned through std::expected by the public API.

@@ -86,6 +86,7 @@ class SIRIUS_EXPORT ContextConfig {
   std::shared_ptr<const Impl> impl_;
 
   friend class ContextConfigBuilder;
+  friend class Context;
 };
 
 }  // namespace sirius

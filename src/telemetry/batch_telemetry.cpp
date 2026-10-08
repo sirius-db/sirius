@@ -229,7 +229,8 @@ void batch_telemetry_registry::install(
 
 void batch_telemetry_registry::uninstall()
 {
-  if (!impl_->enabled.exchange(false, std::memory_order_acq_rel)) { return; }
+  // install() may have failed after creating some tier resources but before enabling events.
+  if (!impl_->enabled.exchange(false, std::memory_order_acq_rel) && !impl_->context) { return; }
 
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);

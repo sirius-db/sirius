@@ -1,5 +1,5 @@
-# Keep the public configuration implementation's C++23 requirement local.
-add_library(sirius_context_config OBJECT src/context_config.cpp)
+# Keep the public context API's C++23 requirement local.
+add_library(sirius_context_config OBJECT src/context_config.cpp src/context.cpp)
 target_compile_features(sirius_context_config PRIVATE cxx_std_23)
 set_target_properties(
   sirius_context_config PROPERTIES POSITION_INDEPENDENT_CODE ON
@@ -19,7 +19,7 @@ if(NOT PROJECT_IS_TOP_LEVEL)
                            $<TARGET_OBJECTS:sirius_objects>)
 endif()
 
-# Link the public configuration implementation into every Sirius artifact.
+# Link the public context API implementation into every Sirius artifact.
 foreach(_target sirius_core sirius_shared sirius_extension
                 sirius_loadable_extension)
   if(TARGET ${_target})

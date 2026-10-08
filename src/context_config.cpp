@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "sirius_config.hpp"
+#include "context_config_internal.hpp"
 
 #include <sirius/context/config_builder.hpp>
 #include <yaml-cpp/yaml.h>
@@ -23,10 +23,6 @@
 #include <utility>
 
 namespace sirius {
-
-struct ContextConfig::Impl {
-  parsed_sirius_config config;
-};
 
 struct ContextConfigBuilder::Impl {
   parsed_sirius_config config;

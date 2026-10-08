@@ -10,6 +10,7 @@ New fallible public C++ operations report errors through
 The public API therefore requires C++23 and standard-library support for
 `std::expected`.
 
+- @ref sirius::Context "Engine context" owns an initialized engine; one may be active per process.
 - @ref sirius::ContextConfigBuilder "Configuration builder" assembles settings from defaults or YAML.
 - @ref sirius::ContextConfig "Context configuration" holds an immutable, validated configuration.
 - @ref sirius::Error "Errors" describe failures returned by the API.
