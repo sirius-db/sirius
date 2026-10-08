@@ -132,12 +132,14 @@ namespace {
 // Reads a "null_mask" channel column (UINT8 bitmask bytes, as emitted by
 // dictionary/str_split named_channels) into a device_buffer + null count over
 // `num_rows` rows. Returns false and sets *error_out on a malformed channel.
-bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
-                            cudf::size_type num_rows,
-                            rmm::device_buffer* mask_out,
-                            cudf::size_type* null_count_out,
-                            ::cuda::stream_ref stream,
-                            std::string* error_out)
+bool take_null_mask_channel(
+  std::unique_ptr<cudf::column> mask_col,
+  cudf::size_type num_rows,
+  decltype(cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED))* mask_out,
+  cudf::size_type* null_count_out,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
 {
   if (mask_col->type().id() != cudf::type_id::UINT8) {
     if (error_out) *error_out = "dictionary null_mask must be UINT8";
@@ -151,7 +153,13 @@ bool take_null_mask_channel(std::unique_ptr<cudf::column> mask_col,
     reinterpret_cast<cudf::bitmask_type const*>(mask_col->view().data<std::uint8_t>());
   *null_count_out = num_rows > 0 ? cudf::null_count(bits, 0, num_rows, stream) : 0;
   auto contents   = mask_col->release();
-  *mask_out       = std::move(*contents.data);
+#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12)
+  // Keep the source alive until the asynchronous mask copy completes.
+  contents.data->set_stream(stream);
+  *mask_out = cudf::copy_bitmask(bits, 0, num_rows, stream, mr);
+#else
+  *mask_out = std::move(*contents.data);
+#endif
   return true;
 }
 
@@ -193,11 +201,11 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
     return nullptr;
   }
 
-  rmm::device_buffer mask(0, stream, mr);
+  auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type null_count = 0;
   if (has_mask &&
       !take_null_mask_channel(
-        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, error_out)) {
+        std::move(outputs[3]), indices->size(), &mask, &null_count, stream, mr, error_out)) {
     return nullptr;
   }
 
@@ -207,11 +215,12 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
   rmm::device_buffer chars_buffer =
     chars_contents.data ? std::move(*chars_contents.data) : rmm::device_buffer(0, stream, mr);
 
-  auto keys_strings = cudf::make_strings_column(num_keys,
-                                                std::move(keys_offsets),
-                                                std::move(chars_buffer),
-                                                0,
-                                                rmm::device_buffer(0, stream, mr));
+  auto keys_strings =
+    cudf::make_strings_column(num_keys,
+                              std::move(keys_offsets),
+                              std::move(chars_buffer),
+                              0,
+                              cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 
   auto dict_col =
     null_count > 0

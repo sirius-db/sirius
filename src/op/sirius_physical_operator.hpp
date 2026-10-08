@@ -22,6 +22,7 @@
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/partition_placement.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
@@ -33,12 +34,14 @@
 
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -258,6 +261,15 @@ class pipelineable_operator_data : public operator_data {
   {
   }
 
+  /**
+   * @brief IDs of the non-null input batches in input order, as constructed.
+   *
+   * The IDs survive preparation, which may replace a batch with a cross-GPU clone that has a new
+   * ID, and task retries, which reuse this object. `dynamic_filter_publication_session` uses them
+   * to deduplicate contributions.
+   */
+  [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PIPELINEABLE;
@@ -324,6 +336,8 @@ class pipelineable_operator_data : public operator_data {
 
  private:
   std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  /// (position, original ID) of each batch that preparation replaced with a clone; usually empty.
+  std::vector<std::pair<std::size_t, std::uint64_t>> _replaced_batch_ids;
   std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
@@ -336,17 +350,29 @@ class pipelineable_operator_data : public operator_data {
 class partitioned_operator_data : public pipelineable_operator_data {
  public:
   partitioned_operator_data() = default;
+
+  /// Partition `partition_idx` of an exchange placed by `placement`. When the placement pins the
+  /// partition to a GPU, that GPU becomes this data's preferred device, so the task creator puts
+  /// every task of the partition on it (cuco hash tables must stay on one device).
+  /// @throws std::invalid_argument if `partition_idx >= placement.num_partitions()`.
   partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
-                            std::size_t partition_idx)
+                            std::size_t partition_idx,
+                            partition_placement const& placement)
     : pipelineable_operator_data(std::move(data_batches)), _partition_idx(partition_idx)
   {
+    if (partition_idx >= placement.num_partitions()) {
+      throw std::invalid_argument("partitioned_operator_data: partition " +
+                                  std::to_string(partition_idx) + " is outside a placement of " +
+                                  std::to_string(placement.num_partitions()) + " partitions");
+    }
+    if (auto const device = placement.device_for(partition_idx)) {
+      set_preferred_device_id(*device);
+    }
   }
 
-  /// Partitioned data with no index. The scheduler pins a task to
-  /// `_active_gpu_ids[partition_idx % size]` only when an index is present; without one it falls
-  /// through to its byte-affinity heuristic and places the task on the GPU already holding the
-  /// data. Used when a consumer produced a single partition, where no cross-task device agreement
-  /// is required.
+  /// Partitioned data with no index and no preferred device: the task creator places the task on
+  /// the GPU already holding the data. Used when a consumer produced a single partition, where no
+  /// cross-task device agreement is required.
   explicit partitioned_operator_data(
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
     : pipelineable_operator_data(std::move(data_batches))
@@ -728,7 +754,9 @@ class sirius_physical_operator {
     uuid::UUID pseudo_sink_port_uuid;
   };
 
-  // source pipeline pushed to repo of the ports
+  /**
+   * @brief Pushes @p batch into port @p port_id after `on_input_batch_pushed` observes it.
+   */
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
@@ -785,6 +813,16 @@ class sirius_physical_operator {
   virtual void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
+  /**
+   * @brief Observes a batch pushed into port @p port_id, inside the pushing task, before the batch
+   * becomes poppable.
+   *
+   * An override must not wait for a batch lock or access device data. `sirius_physical_partition`
+   * uses the hook to certify dynamic-filter input. An engine-invariant failure may throw before the
+   * batch is added. The default does nothing.
+   */
+  virtual void on_input_batch_pushed(std::string_view port_id, ::cucascade::data_batch& batch);
+
   std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;

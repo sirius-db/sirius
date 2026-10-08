@@ -279,7 +279,10 @@ void apply_null_mask(cudf::column& column,
     cudf::clear_bit_unsafe(host_mask.data(), idx);
   }
 
-  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
+  auto mask_buffer =
+    cudf::create_null_mask(column.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
+  cudaMemcpyAsync(
+    mask_buffer.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get());
   column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
 }
 

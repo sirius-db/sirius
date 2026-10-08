@@ -1,0 +1,52 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    revenue[#19]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  3:VAGGREGATE (merge finalize)(218)
+  |  output: sum(partial_sum((l_extendedprice * l_discount))[#18])[#19]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  2:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    UNPARTITIONED
+
+  1:VAGGREGATE (update serialize)(210)
+  |  output: partial_sum((l_extendedprice[#16] * l_discount[#17]))[#18]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(198)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#10] >= '1994-01-01'), (_tvf_local.l_shipdate[#10] < '1995-01-01'), (_tvf_local.l_discount[#6] >= 0.05), (_tvf_local.l_discount[#6] <= 0.07), (_tvf_local.l_quantity[#4] < 24.00)
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_extendedprice[#5], _tvf_local.l_discount[#6]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

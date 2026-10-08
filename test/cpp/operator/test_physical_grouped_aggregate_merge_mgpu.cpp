@@ -18,8 +18,8 @@
 //
 // grouped_aggregate_merge is partition-based (like hash_join) — it builds a
 // cuco GPU hash table per partition. cuco tables cannot span GPUs, so every
-// task for a given partition must pin to the same GPU via
-// `partition_idx % num_gpus` in task_creator.cpp. These TEST_CASEs exercise
+// task for a given partition must pin to the same GPU, which the merge's
+// round-robin partition placement stamps on each task's input. These TEST_CASEs exercise
 // the cross-GPU routing path in isolation:
 //
 //   1. High-cardinality GROUP BY with hash_partition_bytes small enough to

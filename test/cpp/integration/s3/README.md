@@ -6,14 +6,13 @@ tests run in the default unit suite.
 
 ## Running the gates
 
-`SIRIUS_BUILD_S3_TESTS` defaults to `ON`, including the MinIO harness. CMake
-fetches and patches testcontainers-native at configure time and builds its
-Go c-archive (`cmake/testcontainers_native.cmake`). The vcpkg presets turn
-S3 tests off.
+The S3 harness is included whenever the C++ tests are built. The Pixi
+environment provides the prebuilt `weed` executable; no Docker daemon or Go
+toolchain is required. Server startup is opt-in through `SIRIUS_TEST_S3_AUTO`.
 
 | Command | Selection and environment |
 |---|---|
-| `make test` | Default unit suite; does not start Docker unless opted in |
+| `make test` | Default unit suite; does not start a server unless opted in |
 | `make s3-test` | Non-large, non-AWS S3 integration cases; AUTO and STRICT enabled |
 | `make s3-test-large` | Two processes: cache-enabled SF10 cases plus SF1 TPC-H and glob-scale, then cache-disabled SF10 cases |
 | `make s3-test-aws` | Manual AWS cases; STRICT enabled; supply the endpoint, bucket and temporary credentials |
@@ -67,7 +66,7 @@ with `[large-nocache]`. The tiny `[tpch]` suite runs in `s3-test`;
 1001-object `[glob-scale]` case. `[aws]` cases belong to the manual
 real-AWS gate.
 
-Without an external endpoint, MinIO-backed cases skip when
+Without an external endpoint, SeaweedFS-backed cases skip when
 `SIRIUS_TEST_S3_AUTO` is unset. The gates set
 `SIRIUS_TEST_S3_STRICT=1` so missing prerequisites fail instead.
 SF10, SF1 TPC-H and glob-scale also require their LARGE, TPCH and
@@ -111,52 +110,46 @@ spec='[s3][integration]~[large]~[aws]'
 "$bin" --list-tests --verbosity quiet "$spec"
 ```
 
-The gate lists contain 98, 5, 3 and 3 cases respectively; the deprecated
+The gate lists contain 105, 5, 3 and 3 cases respectively; the deprecated
 TPC-H target selects two. `--list-tags "[s3]"` lists the 26 tags above
 plus `[.]`.
 
-## MinIO lifecycle
+## SeaweedFS lifecycle
 
-The binary starts two MinIO containers on dynamically mapped ports, one
-HTTP and one HTTPS. It generates a self-signed certificate with `openssl`,
-uploads fixtures from the host with SigV4 and libcurl, and publishes the
-environment used by the tests. No separate setup script is needed.
+The binary starts one SeaweedFS process with HTTP and HTTPS listeners sharing
+one backend, using dynamically selected loopback ports. It generates a
+self-signed certificate with `openssl`, uploads fixtures with SigV4 and libcurl,
+and publishes the environment used by the tests.
 
 An existing `SIRIUS_TEST_S3_ENDPOINT` is used as-is. Otherwise,
-`SIRIUS_TEST_S3_AUTO=1` opts into container startup. SQL, httpfs and TPC-H
+`SIRIUS_TEST_S3_AUTO=1` opts into server startup. SQL, httpfs and TPC-H
 tests pass missing required `SIRIUS_TEST_S3_*` settings to
 `skip_or_fail_unless`: a skip, or a failure with `SIRIUS_TEST_S3_STRICT=1`.
 REST, describe_parquet and kvikio tests use that helper only for
-`ensure_s3_container_env`. Once an endpoint is set, missing BUCKET,
+`ensure_s3_test_env`. Once an endpoint is set, missing BUCKET,
 ACCESS_KEY or SECRET_KEY fails those tests regardless of STRICT.
 
 The LARGE, TPCH and GLOB_SCALE switches use the same skip-or-fail rule.
 Live HEAD/GET and query errors fail regardless of STRICT, except that
 SF10 tests report a failed describe of the SF10 object as a skip unless
-STRICT is set. The three tests that PUT objects into managed MinIO skip when
+STRICT is set. The three tests that PUT objects into managed SeaweedFS skip when
 the endpoint is externally managed; device tests also report unavailable CUDA.
 The PUT cases cover ETag invalidation, kvikio stream ordering, and
 `transparent S3 glob rejects parquet files whose schemas differ instead of decoding them together`.
 
-`unittest.cpp` calls explicit container shutdown before exiting. The
-library's default Ryuk reaper is best effort; a killed process can leave
-containers running.
+`unittest.cpp` terminates and reaps the server before exiting. On Linux the
+server also receives SIGKILL if the test process dies. Each process has its own
+working directory under `<tmp>/sirius-s3-seaweedfs-<uid>`, removed at shutdown.
 
-The working directory, `<tmp>/sirius-s3-testcontainers`, is reused across
-runs and shared by users on the host. Do not run conflicting fixture
-generators there concurrently.
+Requirements: `weed` (provided and locked by Pixi), Python 3.9+, and `openssl`.
+Set `SIRIUS_TEST_WEED` to use another executable. SF1 and SF10 generation need the built
+DuckDB CLI or `SIRIUS_TEST_DUCKDB`, which loads the TPC-H extension to generate
+the data. The SF1 and SF10 fixtures are cached across processes; file locks serialize
+concurrent generation. Set `TMPDIR` to a disk with several GB free for large
+fixtures and the server data. SeaweedFS also requires the disk to remain above
+its default 1% free-space reserve.
 
-Requirements: a reachable Docker daemon, the Pixi Go toolchain for the
-bridge build, Python 3.9+ and `openssl`. Both SF10 and SF1 generation need
-the built DuckDB CLI or `SIRIUS_TEST_DUCKDB`.
-
-The image is pinned in `s3_container.cpp`:
-
-| Image | Tag |
-|---|---|
-| `minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
-
-After changing `kMinioImage`, run `make s3-test`.
+After changing the SeaweedFS version, run `make s3-test`.
 
 ## Fixtures
 
@@ -166,20 +159,22 @@ files. `SIRIUS_TEST_S3_LOCAL_DIR` points to the uploaded local copy used by
 CPU oracles. `MANIFEST.sha256` is written next to that directory and is
 not uploaded.
 
-| Object group | Contents | Upload |
-|---|---|---|
-| `hello.txt` | 16 bytes; HEAD and tiny reads | HTTP + HTTPS |
-| `small.bin` | 20 KiB; exact-byte reads | HTTP + HTTPS |
-| `medium.bin` | 8 MiB; ranges at odd offsets | HTTP + HTTPS |
-| `parquet/*` | Committed parquet files plus runtime-generated `edge_types.parquet` | HTTP + HTTPS |
-| `glob/multi/*` | Two nation copies and `region.parquet` | HTTP + HTTPS |
-| `glob/hive/*` | Hive partition directories | HTTP + HTTPS |
-| `root_a.parquet`, `root_b.parquet` | Bucket-root glob inputs | HTTP + HTTPS |
-| `glob-enc/*` | 12 keys covering percent bytes, spaces, slashes, query/fragment delimiters and partition directories | HTTP + HTTPS |
-| `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE | HTTP + HTTPS |
-| `tpch/sf1/*` | Eight SF1 tables; requires TPCH | HTTP + HTTPS |
-| `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE | HTTP only |
-| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair | HTTP only |
+Fixtures are uploaded once and are available through both HTTP and HTTPS.
+
+| Object group | Contents |
+|---|---|
+| `hello.txt` | 16 bytes; HEAD and tiny reads |
+| `small.bin` | 20 KiB; exact-byte reads |
+| `medium.bin` | 8 MiB; ranges at odd offsets |
+| `parquet/*` | Committed parquet files plus runtime-generated `edge_types.parquet` |
+| `glob/multi/*` | Two nation copies and `region.parquet` |
+| `glob/hive/*` | Hive partition directories |
+| `root_a.parquet`, `root_b.parquet` | Bucket-root glob inputs |
+| `glob-enc/*` | 12 keys covering percent bytes, spaces, slashes, query/fragment delimiters and partition directories |
+| `tpch/lineitem_sf10.parquet` | SF10 lineitem; requires LARGE |
+| `tpch/sf1/*` | Eight SF1 tables; requires TPCH |
+| `glob-scale/part_*.parquet` | 1001 nation copies; requires GLOB_SCALE |
+| Objects written during tests | ETag overwrite, kvikio stream-ordering inputs and schema-drift parquet pair |
 
 The SF10 cache was 2,223,320,375 bytes (about 2.07 GiB), measured on
 2026-05-21, before the DuckDB v1.5.6 pin.
@@ -190,7 +185,7 @@ on every run.
 
 `nation.parquet` has 25 rows, keys 0-24, and five nations per region.
 The HTTPS tests use the generated CA bundle so `rest_ioctx` checks the
-certificate. MinIO uses region `us-east-1`.
+certificate. SeaweedFS uses region `us-east-1`.
 
 ## Environment
 
@@ -198,9 +193,10 @@ User inputs:
 
 | Variable | Purpose |
 |---|---|
-| `SIRIUS_TEST_S3_AUTO` | Start managed MinIO when no endpoint is supplied |
+| `SIRIUS_TEST_S3_AUTO` | Start managed SeaweedFS when no endpoint is supplied |
+| `SIRIUS_TEST_WEED` | Override the `weed` executable |
 | `SIRIUS_TEST_S3_STRICT` | Fail on missing prerequisites or failed startup |
-| `SIRIUS_TEST_S3_ENDPOINT` | Use an existing endpoint instead of starting containers |
+| `SIRIUS_TEST_S3_ENDPOINT` | Use an existing endpoint instead of starting a server |
 | `SIRIUS_TEST_S3_SESSION_TOKEN` | Session token for temporary credentials |
 | `SIRIUS_TEST_S3_LARGE` | Generate/upload SF10 lineitem |
 | `SIRIUS_TEST_S3_TPCH` | Generate/upload all eight SF1 tables |

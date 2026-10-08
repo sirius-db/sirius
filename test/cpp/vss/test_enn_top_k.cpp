@@ -78,8 +78,11 @@ std::unique_ptr<cudf::column> make_vec_column(std::vector<float> const& values,
              offsets.data(),
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 std::unique_ptr<cudf::column> make_int32_column(std::vector<int32_t> const& values)
@@ -233,7 +236,7 @@ TEST_CASE("compute_enn_top_k compacts null and sliced vector rows before search"
     auto vec_col  = make_vec_column(vecs, n_rows, dim);
     auto contents = vec_col->release();
     auto mask     = cudf::create_null_mask(n_rows, cudf::mask_state::ALL_VALID);
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 2, 3, false);
+    cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(mask.data()), 2, 3, false);
     auto null_vec = cudf::make_lists_column(
       n_rows, std::move(contents.children[0]), std::move(contents.children[1]), 1, std::move(mask));
     auto id_col = make_int32_column(ids);

@@ -29,6 +29,8 @@
  * native scan can see it on disk.
  */
 
+#include "util/env_guard.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <unistd.h>
@@ -68,13 +70,12 @@ inline std::vector<std::vector<std::string>> collect_rows(duckdb::MaterializedQu
 }
 
 /// RAII guard that points Sirius at a config file for the lifetime of a fixture
-/// that spins up its own (non-shared) host database.
-struct sirius_config_env_guard {
+/// that spins up its own (non-shared) host database, then restores the previous value.
+struct sirius_config_env_guard : sirius::util::env_guard {
   explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 /**
@@ -307,6 +308,7 @@ class GpuExecutionFixture {
     }
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    CHECK(after_gpu_stats.read_view_mismatches == before_gpu_stats.read_view_mismatches);
     // Exactly one GPU execution, no fallback: proves the query ran on the GPU.
     sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
 

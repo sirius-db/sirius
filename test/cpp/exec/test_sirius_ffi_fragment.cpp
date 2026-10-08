@@ -15,16 +15,13 @@
  */
 
 // Regression coverage for the public FFI Context and Fragment lifecycle (src/sirius_ffi.cpp).
-// Fragment::Impl::end_lifecycle() must roll back a build() failure while the transaction is
-// still open, not commit it (a7bb47e2).
+// A build() failure must roll back its open transaction, not commit it.
 //
-// The public FFI surface links only DuckDB's substrait consumer (no substrait-plan-from-SQL
-// helper, no raw-SQL passthrough), so no test here can construct a valid Fragment or inspect
-// catalog state after a failed build(). Instead these tests use a declared column type name
-// that TransformStringToLogicalType() can never resolve, which fails build() inside
-// resolve_inputs() before `substrait_plan` is ever parsed — and check the one thing observable
-// through the public API: that end_lifecycle() leaves the connection able to start and fail a
-// second, independent Fragment cleanly.
+// These tests declare a column type name that TransformStringToLogicalType() can never resolve,
+// which fails build() inside resolve_inputs() before `substrait_plan` is parsed, and check what
+// the public API can observe: the rollback leaves the connection able to start and fail a
+// second, independent Fragment cleanly. Valid fragments are covered in
+// test_sirius_ffi_embedder.cpp.
 
 #include "config.hpp"
 #include "log/sink.hpp"
@@ -103,8 +100,8 @@ void declare_unresolvable_column(sirius::ffi::Fragment& fragment, const std::str
 
 // Both TransactionContext::Commit() and ::Rollback() clear current_transaction before doing any
 // work that can throw, so "does BeginTransaction() work afterward" cannot tell the old
-// commit-on-failure bug apart from the fix. What both bugs share is that a broken/skipped
-// end_lifecycle() would leave the transaction open, and the next BeginTransaction() would then
+// commit-on-failure bug apart from the fix. What both bugs share is that a broken or skipped
+// rollback would leave the transaction open, and the next BeginTransaction() would then
 // throw TransactionException("cannot start a transaction within a transaction") — that's the
 // one thing worth asserting against here.
 void require_build_fails_without_transaction_exception(sirius::ffi::Fragment& fragment)
@@ -138,13 +135,12 @@ TEST_CASE("Fragment::build() failure during resolve_inputs() rolls back cleanly"
   require_build_fails_without_transaction_exception(*second);
 }
 
-TEST_CASE("Fragment destroyed between a failed build() and reuse also closes the lifecycle cleanly",
+TEST_CASE("Fragment destroyed after a failed build() leaves the Context usable",
           "[isolated_context][sirius_ffi]")
 {
   auto context = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
 
-  // Exercises ~Fragment::Impl() -> end_lifecycle() (rather than the catch-block call in
-  // build()): the failed fragment goes out of scope with no further use.
+  // The failed fragment goes out of scope with no further use.
   {
     auto first = sirius::ffi::make_fragment(*context);
     declare_unresolvable_column(*first, "not_a_real_type_xyz");

@@ -99,10 +99,10 @@ struct scan_filter_analysis {
  * depends on the session time zone; both keep the residual filter.
  *
  * Filters that do not restrict the emitted rows are skipped WITHOUT clearing
- * coverage — OPTIONAL_FILTER and IS_NOT_NULL, which
+ * coverage — OPTIONAL_FILTER, which
  * @ref convert_table_filters_to_expression also drops, and @p
  * skip_primary_indices (hive partitions, enforced at file-list level). Any other
- * unconvertible conjunct clears only @c ranges_cover_whole_filter.
+ * unconvertible conjunct (including IS_NOT_NULL) clears only @c ranges_cover_whole_filter.
  *
  * Equality sets are collected only for @p filter_only_primary_indices.
  */

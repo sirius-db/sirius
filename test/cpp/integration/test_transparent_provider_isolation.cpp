@@ -15,6 +15,7 @@
  */
 
 #include "transparent/connection_provenance.hpp"
+#include "utils/dynamic_filter_test_utils.hpp"
 #include "utils/scoped_temp_directory.hpp"
 #include "utils/sirius_test_env.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -391,11 +392,7 @@ TEST_CASE_METHOD(isolation_fixture,
 {
   auto const gpu_enabled = GENERATE(true, false);
   gpu(gpu_enabled);
-  struct reset_optimizers {
-    duckdb::Connection& con;
-    ~reset_optimizers() { con.Query("RESET disabled_optimizers"); }
-  } guard{a};
-  query(a, "SET disabled_optimizers = 'extension'");
+  sirius::test::disabled_optimizers_guard const guard(a, "extension");
   hidden_query("SELECT i FROM " + hidden + ".main.t");
   hidden_query("SELECT count(*) FROM " + hidden + ".main.t");
 
@@ -420,11 +417,7 @@ TEST_CASE_METHOD(
   "[integration][transparent][provenance]")
 {
   gpu(GENERATE(true, false));
-  struct reset_optimizers {
-    duckdb::Connection& con;
-    ~reset_optimizers() { con.Query("RESET disabled_optimizers"); }
-  } optimizer_guard{a};
-  query(a, "SET disabled_optimizers = 'extension'");
+  sirius::test::disabled_optimizers_guard const optimizer_guard(a, "extension");
   query(a, "BEGIN");
   struct rollback_transaction {
     duckdb::Connection& con;

@@ -15,6 +15,7 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "util/env_guard.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -69,13 +70,11 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
-struct sirius_config_env_guard {
-  sirius_config_env_guard(const std::string& config_path)
+struct sirius_config_env_guard : sirius::util::env_guard {
+  explicit sirius_config_env_guard(const std::string& config_path)
+    : env_guard("SIRIUS_CONFIG_FILE", config_path)
   {
-    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
   }
-
-  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
 };
 
 class GPUExecutionFixtureBase {
@@ -803,6 +802,24 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "[integration][gpu_execution][limit][limit_multi_batch]")
 {
   compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
+                 "gpu_execution - ungrouped aggregate over a limit that passes no rows",
+                 "[integration][gpu_execution][limit]")
+{
+  // The aggregate must still return its single row.
+  SECTION("empty input")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from "
+      "(select * from nation where n_regionkey > 10 limit 1);");
+  }
+  SECTION("offset past the end")
+  {
+    compare_gpu_vs_cpu(
+      "select count(*), sum(n_nationkey) from (select * from nation limit 1 offset 100);");
+  }
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
@@ -4416,6 +4433,15 @@ TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
                 "gpu_execution - TPC-H Query 22 parquet",
                 "[integration][gpu_execution][parquet][TPC-H][Q22]",
                 sirius::test::kTpchQ22)
+
+// Cross products of two tables and of single-row aggregates, the shape of TPC-DS Q88 and Q90.
+TPCH_TEST_CASES(compare_gpu_vs_cpu_for,
+                GPUExecutionDuckDBFixture,
+                "gpu_execution - TPC-H tables cross product",
+                "[integration][gpu_execution][TPC-H][cross_product]",
+                "SELECT n_name, r_name, c, m FROM nation, region, "
+                "(SELECT count(*) c FROM lineitem WHERE l_quantity < 10), "
+                "(SELECT max(o_totalprice) m FROM orders);")
 
 //===----------------------------------------------------------------------===//
 // TPC-H SF10 smoke variants (TEST-04)

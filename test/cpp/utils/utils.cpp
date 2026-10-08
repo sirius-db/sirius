@@ -17,6 +17,9 @@
 #include "utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
+
+#include <rmm/error.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -49,7 +52,9 @@ std::unique_ptr<cudf::column> create_numeric_column_with_random_data(
   for (size_t r = 0; r < num_rows; ++r)
     h_data[r] = dist(gen);
 
-  cudaMemcpy(view.data<T>(), h_data.data(), sizeof(T) * num_rows, cudaMemcpyHostToDevice);
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    view.data<T>(), h_data.data(), sizeof(T) * num_rows, cudaMemcpyHostToDevice, stream.get()));
+  stream.sync();
   return col;
 }
 
@@ -119,8 +124,12 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
 
         rmm::device_buffer d_chars(h_chars.data(), h_chars.size(), stream, mr);
 
-        auto col = cudf::make_strings_column(
-          num_rows, std::move(offsets_col), std::move(d_chars), 0, rmm::device_buffer{});
+        auto col =
+          cudf::make_strings_column(num_rows,
+                                    std::move(offsets_col),
+                                    std::move(d_chars),
+                                    0,
+                                    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
         cols.push_back(std::move(col));
         break;
       }

@@ -703,6 +703,29 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       "ROLLUP, CUBE, GROUPING SETS and GROUPING() are not supported in GPU aggregates");
   }
 
+  // The GPU aggregates support DISTINCT only in COUNT, but not with FILTER.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (!aggregate.IsDistinct()) { continue; }
+    if (aggregate.filter) {
+      throw duckdb::NotImplementedException(
+        "DISTINCT aggregates with a FILTER clause not supported in GPU");
+    }
+    if (sirius::from_duckdb_aggregate_name(aggregate.function.name) !=
+        sirius::aggregate_id::count) {
+      throw duckdb::NotImplementedException(op.groups.empty()
+                                              ? "DISTINCT in ungrouped aggregates other than "
+                                                "COUNT not supported in GPU"
+                                              : "DISTINCT in grouped aggregates other than "
+                                                "COUNT not supported in GPU");
+    }
+    if (op.groups.empty() &&
+        (aggregate.children.size() != 1 || aggregate.children[0]->return_type.IsNested())) {
+      throw duckdb::NotImplementedException(
+        "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);

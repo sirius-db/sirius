@@ -20,21 +20,23 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal
+from urllib.parse import urlsplit
 
 import duckdb
-from queries import QUERIES
+from queries import (
+    queries_for_scale_factor,
+    scale_factor_metadata_value,
+)
 from tpch_pin_columns import (
     emit_pin,
     emit_pin_all,
     emit_unpin,
     emit_unpin_all,
 )
-
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -219,6 +221,8 @@ def setup_benchmark_dir(
     queries,
     config_path,
     pin,
+    scale_factor,
+    query_texts,
     name=None,
     precmd="none",
     data_source="parquet",
@@ -231,6 +235,7 @@ def setup_benchmark_dir(
         <benchmark_name>/
           config.yml         (copy of Sirius config, if provided)
           metadata.json
+          queries/q<N>.sql           (effective query text)
           csv/runtimes.csv
           log_dir/                  (SIRIUS_LOG_DIR target)
           <engine>/q<N>/result.txt  (one repr(row) per line)
@@ -250,6 +255,12 @@ def setup_benchmark_dir(
     os.makedirs(csv_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
+    query_sql_dir = os.path.join(benchmark_dir, "queries")
+    os.makedirs(query_sql_dir, exist_ok=True)
+    for qnum in queries:
+        with open(os.path.join(query_sql_dir, f"q{qnum}.sql"), "w") as f:
+            f.write(query_texts[f"q{qnum}"].rstrip().rstrip(";") + ";\n")
+
     runtime_csv = os.path.join(csv_dir, "runtimes.csv")
 
     if config_path and os.path.isfile(config_path):
@@ -263,6 +274,7 @@ def setup_benchmark_dir(
         "profile": profile_label,
         "iterations": iterations,
         "engine": engine,
+        "scale_factor": scale_factor,
         "data_source": data_source,
         "queries": [f"q{q}" for q in queries],
         "pin": pin,
@@ -344,6 +356,152 @@ def resolve_engine_modes(engine):
     return [("duckdb", False), ("sirius", True)]
 
 
+def is_s3_input(source):
+    return urlsplit(source).scheme.lower() == "s3"
+
+
+def _sql_literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+class S3Input:
+    """Resolve an S3 TPC-H dataset and refresh its temporary DuckDB secrets.
+
+    Boto3 uses the normal AWS credential chain, including an EC2 instance role.
+    Frozen credentials are fetched again before each query so long benchmarks
+    pick up role-credential rotation. No credential is written to benchmark files.
+    """
+
+    def __init__(self, source, session=None):
+        uri = urlsplit(source)
+        if uri.scheme.lower() != "s3" or not uri.netloc or uri.query or uri.fragment:
+            raise ValueError("S3 --input must be s3://bucket/directory")
+        self.bucket = uri.netloc
+        self.prefix = uri.path.strip("/")
+        self.scope = f"s3://{self.bucket}/{self.prefix + '/' if self.prefix else ''}"
+        if session is None:
+            try:
+                import boto3
+            except ImportError as exc:
+                raise RuntimeError(
+                    "S3 input requires boto3 in the Python environment"
+                ) from exc
+            session = boto3.session.Session()
+        self.session = session
+        if self.session.get_credentials() is None:
+            raise RuntimeError(
+                "No AWS credentials found for S3 input; attach an EC2 IAM role "
+                "or configure the standard AWS credential chain"
+            )
+
+        # HeadBucket reports the bucket's region even when the EC2 instance is
+        # in a different region. The us-east-1 client is only a bootstrap.
+        bootstrap_region = self.session.region_name or "us-east-1"
+        s3 = self.session.client("s3", region_name=bootstrap_region)
+        try:
+            response = s3.head_bucket(Bucket=self.bucket)
+        except Exception as exc:
+            response = getattr(exc, "response", {})
+            headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+            if not headers.get("x-amz-bucket-region"):
+                raise RuntimeError(
+                    f"Could not determine region for S3 bucket {self.bucket!r}"
+                ) from exc
+        headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        self.region = headers.get("x-amz-bucket-region") or bootstrap_region
+
+        s3 = self.session.client("s3", region_name=self.region)
+        prefix = self.prefix + "/" if self.prefix else ""
+        self.keys = [
+            item["Key"]
+            for page in s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=prefix
+            )
+            for item in page.get("Contents", [])
+            if item["Key"].endswith(".parquet")
+        ]
+        self.files = {table: self._table_files(table) for table in TPCH_TABLES}
+        for table, files in self.files.items():
+            if not files:
+                raise FileNotFoundError(
+                    f"No parquet files found for table {table!r} under {self.scope}"
+                )
+
+    def _table_files(self, table):
+        prefix = self.prefix + "/" if self.prefix else ""
+        single = prefix + table + ".parquet"
+        numbered = prefix + table + "_"
+        subdir = prefix + table + "/"
+        keys = [
+            key
+            for key in self.keys
+            if key == single
+            or (key.startswith(numbered) and "/" not in key[len(numbered) :])
+            or (key.startswith(subdir) and "/" not in key[len(subdir) :])
+        ]
+        return [f"s3://{self.bucket}/{key}" for key in sorted(keys)]
+
+    def refresh_secret(self, con, use_gpu):
+        credentials = self.session.get_credentials()
+        if credentials is None:
+            raise RuntimeError("AWS credentials are no longer available")
+        frozen = credentials.get_frozen_credentials()
+        if not frozen.access_key or not frozen.secret_key:
+            raise RuntimeError("AWS credential chain returned incomplete credentials")
+        secret_type = "SIRIUS_S3" if use_gpu else "S3"
+        secret_name = "sirius_benchmark_s3" if use_gpu else "duckdb_benchmark_s3"
+        sql = (
+            f"CREATE OR REPLACE SECRET {secret_name} "
+            f"(TYPE {secret_type}, PROVIDER CONFIG, SCOPE ?, "
+            "KEY_ID ?, SECRET ?, REGION ?, URL_STYLE 'path'"
+        )
+        values = [self.scope, frozen.access_key, frozen.secret_key, self.region]
+        if frozen.token:
+            sql += ", SESSION_TOKEN ?"
+            values.append(frozen.token)
+        con.execute(sql + ")", values)
+
+    def pin_globs(self):
+        """Derive one precise remote pin glob per table from the discovered keys."""
+        if hasattr(self, "_pin_globs"):
+            return self._pin_globs
+        key_prefix = self.prefix + "/" if self.prefix else ""
+        result = {}
+        for table, files in self.files.items():
+            keys = {uri[len(f"s3://{self.bucket}/") :] for uri in files}
+            single = key_prefix + table + ".parquet"
+            numbered_prefix = key_prefix + table + "_"
+            subdir_prefix = key_prefix + table + "/"
+            subdir = {key for key in keys if key.startswith(subdir_prefix)}
+            same_dir = keys - subdir
+            if subdir and same_dir:
+                raise RuntimeError(
+                    f"Cannot pin mixed S3 layouts for table {table!r} under {self.scope}"
+                )
+            if subdir:
+                pattern = subdir_prefix + "*.parquet"
+            elif keys == {single}:
+                pattern = single
+            elif single not in keys:
+                pattern = numbered_prefix + "*.parquet"
+            else:
+                pattern = key_prefix + table + "*.parquet"
+                broad = {
+                    key
+                    for key in self.keys
+                    if key.startswith(key_prefix + table)
+                    and "/" not in key[len(key_prefix) :]
+                }
+                if broad != keys:
+                    raise RuntimeError(
+                        f"Cannot form one precise S3 pin glob for table {table!r} "
+                        f"under {self.scope}"
+                    )
+            result[table] = f"s3://{self.bucket}/{pattern}"
+        self._pin_globs = result
+        return result
+
+
 DEFAULT_OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 # Set from --pin-compression/--compression-plan-dir in main(); when set, every
@@ -397,7 +555,9 @@ def _plant(doc, keys, values):
     return node
 
 
-def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
+def check_profile_sanity(
+    profile_name, overrides, config_path, engine, pin, source=None
+):
     """Validate the run's inputs before anything runs.
 
     Every check here catches a mistake that would otherwise yield a plausible
@@ -439,22 +599,6 @@ def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
             f"settings for {label} will be written into a generated config over "
             "Sirius defaults"
         )
-
-    # Fail now rather than after the first query was measured against a warm cache.
-    if not can_drop_os_cache():
-        detail = (
-            "passwordless sudo for /usr/bin/tee /proc/sys/vm/drop_caches is not "
-            "available, so the OS page cache cannot be dropped"
-        )
-        if profile["drop_os_cache_between"]:
-            problems.append(
-                f"--profile {profile_name} requires a cold page cache: {detail}"
-            )
-        else:
-            warnings.append(
-                f"{detail}; {label} wanted one drop at startup, so the first "
-                "query may read warm"
-            )
 
     if profile["reset_cache_between"] and engine == "cpu":
         warnings.append(
@@ -522,40 +666,20 @@ def derive_profile_config(overrides, config_path, benchmark_dir):
     return effective_path
 
 
-def can_drop_os_cache():
-    """Whether drop_os_cache() would work, without dropping anything.
-
-    Must name the exact command drop_os_cache runs: the sudoers rule is scoped
-    to `/usr/bin/tee /proc/sys/vm/drop_caches`, so probing anything else reports
-    "no sudo" on a correctly configured machine.
-    """
-    proc = subprocess.run(
-        ["sudo", "-n", "-l", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        capture_output=True,
-        text=True,
-    )
-    return proc.returncode == 0
-
-
 def drop_os_cache(source, data_source="parquet"):
-    """Drop OS filesystem cache. Requires passwordless sudo per CLAUDE.md."""
-    proc = subprocess.run(
-        ["sudo", "-n", "/usr/bin/tee", "/proc/sys/vm/drop_caches"],
-        input="3\n",
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "Failed to drop OS cache. Set up passwordless sudo as described "
-            f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
-        )
+    """Evict the benchmark data files from the OS page cache.
+
+    Uses posix_fadvise(DONTNEED) per data file instead of writing to
+    /proc/sys/vm/drop_caches, so no sudo is needed. Unlike drop_caches this
+    only covers the benchmark's own files (not dentries/inodes or unrelated
+    cached files), and filesystems that ignore the hint will stay warm.
+    """
+    if is_s3_input(source):
+        log("Skipping OS cache drop for S3 input (remote objects are not local files)")
+        return
 
     if data_source == "duckdb":
         files = [source]
-    elif is_s3_source(source):
-        # Nothing local to fadvise -- the page cache drop above is all that applies.
-        files = []
     else:
         files = []
         for table in TPCH_TABLES:
@@ -574,7 +698,9 @@ def drop_os_cache(source, data_source="parquet"):
     log(f"posix_fadvise(DONTNEED) applied to {evicted} file(s)")
 
 
-def _resolve_parquet_files(parquet_dir, table):
+def _resolve_parquet_files(parquet_dir, table, s3_input=None):
+    if s3_input is not None:
+        return s3_input.files[table]
     candidates = []
     for pattern in (
         os.path.join(parquet_dir, f"{table}.parquet"),
@@ -585,18 +711,16 @@ def _resolve_parquet_files(parquet_dir, table):
     return candidates
 
 
-def _build_views_sql(parquet_dir):
+def _build_views_sql(parquet_dir, s3_input=None):
     """Return CREATE OR REPLACE VIEW SQL for the 8 TPC-H tables.
 
     Each statement is terminated with `;\n`. Raises FileNotFoundError if any
     table has no parquet files in `parquet_dir`.
 
-    For an `s3://` prefix the files are not enumerated here: the view body keeps
-    the glob and Sirius's `sirius_httpfs` expands it with ListObjectsV2 at bind
-    time. Only the GPU path can serve `s3://` (no CPU fallback exists), which
-    main() enforces.
+    With S3Input, Boto3 discovers exact object keys and the view body lists
+    those keys. This works for both Sirius and DuckDB's CPU httpfs baseline.
     """
-    if is_s3_source(parquet_dir):
+    if is_s3_source(parquet_dir) and s3_input is None:
         root = str(parquet_dir).rstrip("/")
         return (
             "\n".join(
@@ -609,19 +733,19 @@ def _build_views_sql(parquet_dir):
 
     parts = []
     for table in TPCH_TABLES:
-        files = _resolve_parquet_files(parquet_dir, table)
+        files = _resolve_parquet_files(parquet_dir, table, s3_input)
         if not files:
             raise FileNotFoundError(
                 f"No parquet files found for table '{table}' in {parquet_dir}"
             )
-        file_list = ",".join(f"'{f}'" for f in files)
+        file_list = ",".join(_sql_literal(f) for f in files)
         parts.append(
             f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM read_parquet([{file_list}]);"
         )
     return "\n".join(parts) + "\n"
 
 
-def open_connection(source, gpu_execution=False, data_source="parquet"):
+def open_connection(source, gpu_execution=False, data_source="parquet", s3_input=None):
     """Open a DuckDB connection over the benchmark source, optionally LOAD Sirius.
 
     parquet: in-memory DB with CREATE VIEW ... read_parquet over the directory.
@@ -632,7 +756,7 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
     """
     config = {"allow_unsigned_extensions": "true"}
     s3_source = data_source != "duckdb" and is_s3_source(source)
-    if s3_source:
+    if s3_source and gpu_execution:
         # s3:// must resolve through Sirius's own sirius_httpfs, not DuckDB's
         # httpfs (which would autoload on the first s3:// bind and then serve the
         # scan on the CPU with its own credential chain, bypassing Sirius).
@@ -646,23 +770,40 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Opening DuckDB connection over parquet dir {source}")
         con = duckdb.connect(":memory:", config=config)
 
-    # Sirius must be loaded before the views are registered for an s3:// source:
-    # registering sirius_httpfs is what makes the s3:// glob in the view body
-    # bind at all. Load it first unconditionally -- for local sources the order
-    # is immaterial.
+    # Load Sirius before registering S3 views. GPU execution stays on while the
+    # views bind: sirius_httpfs serves S3 only under gpu_execution=true.
     if gpu_execution:
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
-        con.execute(f"LOAD '{EXTENSION_PATH}'")
+        con.execute(f"LOAD {_sql_literal(EXTENSION_PATH)}")
         log("Sirius extension loaded")
+    elif s3_input is not None:
+        con.execute("LOAD httpfs")
+
+    if s3_input is not None:
+        s3_input.refresh_secret(con, gpu_execution)
 
     if data_source != "duckdb":
         log("Registering TPC-H parquet views")
-        for stmt in _build_views_sql(source).split(";"):
+        for stmt in _build_views_sql(source, s3_input).split(";\n"):
             stmt = stmt.strip()
             if not stmt:
                 continue
             con.execute(stmt)
         log("All TPC-H views registered")
+    if gpu_execution:
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(
+                f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
+            )
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
     return con
 
 
@@ -675,7 +816,7 @@ def _execute_multi(con, sql):
         con.execute(stmt).fetchall()
 
 
-def time_query(con, qnum, use_gpu, profile_path=None):
+def time_query(con, qnum, query_sql, use_gpu, profile_path=None):
     engine_label = "GPU/sirius" if use_gpu else "CPU/duckdb"
     if use_gpu:
         log("  SET gpu_execution = true (GPU/sirius)")
@@ -692,7 +833,7 @@ def time_query(con, qnum, use_gpu, profile_path=None):
         con.execute(f"PRAGMA profiling_output='{profile_path}';")
     log(f"  Executing q{qnum} on {engine_label}…")
     start = time.perf_counter()
-    rows = con.execute(QUERIES[f"q{qnum}"]).fetchall()
+    rows = con.execute(query_sql).fetchall()
     elapsed = time.perf_counter() - start
     log(f"  q{qnum} fetched {len(rows)} rows in {elapsed:.4f}s")
     return elapsed, rows
@@ -744,8 +885,19 @@ class RuntimeCsv:
 
 
 def _run_one(
-    writer, con, name, qnum, it, use_gpu, benchmark_dir, duckdb_profiling=False
+    writer,
+    con,
+    name,
+    qnum,
+    it,
+    use_gpu,
+    benchmark_dir,
+    query_texts,
+    duckdb_profiling=False,
+    s3_input=None,
 ):
+    if s3_input is not None:
+        s3_input.refresh_secret(con, use_gpu)
     profile_path = None
     if duckdb_profiling and not use_gpu:
         # Write one JSON profile per (query, iteration) so no iteration overwrites
@@ -753,7 +905,9 @@ def _run_one(
         profile_path = os.path.join(
             _query_dir(benchmark_dir, name, qnum), f"profile_iter{it}.json"
         )
-    elapsed, rows = time_query(con, qnum, use_gpu, profile_path=profile_path)
+    elapsed, rows = time_query(
+        con, qnum, query_texts[f"q{qnum}"], use_gpu, profile_path=profile_path
+    )
     writer.record(name, qnum, it, elapsed)
     _write_result(benchmark_dir, name, qnum, rows)
 
@@ -782,9 +936,11 @@ def run_grouped(
     benchmark_dir,
     pin,
     profile,
+    query_texts,
     data_source="parquet",
     duckdb_profiling=False,
     pin_after_iteration=0,
+    s3_input=None,
 ):
     """Per-query iterations back-to-back; one connection per engine. Pin per query.
 
@@ -802,7 +958,9 @@ def run_grouped(
     )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
-        con = open_connection(source, gpu_execution=use_gpu, data_source=data_source)
+        con = open_connection(
+            source, gpu_execution=use_gpu, data_source=data_source, s3_input=s3_input
+        )
         try:
             for qnum in queries:
                 pinned = False
@@ -818,7 +976,15 @@ def run_grouped(
                             and it >= pin_after_iteration
                         ):
                             log(f"  Pinning tables for q{qnum} (from iter{it})")
-                            _execute_multi(con, emit_pin(qnum, source, data_source))
+                            _execute_multi(
+                                con,
+                                emit_pin(
+                                    qnum,
+                                    source,
+                                    data_source,
+                                    s3_input.pin_globs() if s3_input else None,
+                                ),
+                            )
                             pinned = True
                         log(f"--- q{qnum} iter{it} engine={name} ---")
                         if drop_scope == "run":
@@ -833,7 +999,9 @@ def run_grouped(
                             it,
                             use_gpu,
                             benchmark_dir,
+                            query_texts,
                             duckdb_profiling,
+                            s3_input,
                         )
                 finally:
                     if pinned:
@@ -854,9 +1022,11 @@ def run_sequential(
     benchmark_dir,
     pin,
     profile,
+    query_texts,
     data_source="parquet",
     duckdb_profiling=False,
     pin_after_iteration=0,
+    s3_input=None,
 ):
     """Round-robin iterations; one connection per engine. Single union-pin at session start.
 
@@ -871,7 +1041,9 @@ def run_sequential(
     )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
-        con = open_connection(source, gpu_execution=use_gpu, data_source=data_source)
+        con = open_connection(
+            source, gpu_execution=use_gpu, data_source=data_source, s3_input=s3_input
+        )
         try:
             pinned = False
             try:
@@ -885,7 +1057,14 @@ def run_sequential(
                         log(
                             f"  Union-pinning all referenced TPC-H tables (from iter{it})"
                         )
-                        _execute_multi(con, emit_pin_all(source, data_source))
+                        _execute_multi(
+                            con,
+                            emit_pin_all(
+                                source,
+                                data_source,
+                                s3_input.pin_globs() if s3_input else None,
+                            ),
+                        )
                         pinned = True
                     if drop_scope == "iteration":
                         log(f"--- iter{it} flush engine={name} ---")
@@ -904,7 +1083,9 @@ def run_sequential(
                             it,
                             use_gpu,
                             benchmark_dir,
+                            query_texts,
                             duckdb_profiling,
+                            s3_input,
                         )
             finally:
                 if pinned:
@@ -924,7 +1105,7 @@ RUNNERS = {
 
 
 def _build_precmd_temp_sql(
-    qnum, source, iterations, pin, qdir, precmd, data_source="parquet"
+    qnum, query_sql, source, iterations, pin, qdir, precmd, data_source="parquet"
 ):
     """Write the DuckDB SQL script for one external pre-command invocation.
 
@@ -975,7 +1156,7 @@ def _build_precmd_temp_sql(
     # iteration) is captured.
     if precmd == "nsys":
         parts.append("CALL profiler_start();")
-    query_sql = QUERIES[f"q{qnum}"].rstrip().rstrip(";") + ";"
+    query_sql = query_sql.rstrip().rstrip(";") + ";"
     for i in range(1, iterations + 1):
         parts.append(query_sql)
         parts.append(
@@ -1009,6 +1190,36 @@ def _build_precmd_temp_sql(
     return sql_path
 
 
+def _run_nsys_s3_child(source, qnum, iterations, pin, qdir, query_sql):
+    """Profile S3 in Python so credentials can be bound, never written to SQL files."""
+    s3_input = S3Input(source)
+    con = open_connection(source, gpu_execution=True, s3_input=s3_input)
+    try:
+        if pin != "none":
+            _execute_multi(con, emit_pin(qnum, source, pin_globs=s3_input.pin_globs()))
+        con.execute("SET gpu_execution = true;")
+        s3_input.refresh_secret(con, True)
+        runtimes = []
+        con.execute("CALL profiler_start();")
+        try:
+            for _ in range(iterations):
+                start = time.perf_counter()
+                con.execute(query_sql).fetchall()
+                runtimes.append(time.perf_counter() - start)
+        finally:
+            con.execute("CALL profiler_stop();")
+        with open(os.path.join(qdir, "timings.csv"), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "runtime_s"])
+            writer.writerow(["views", 0])
+            for i, runtime in enumerate(runtimes, 1):
+                writer.writerow([f"iter_{i}", runtime])
+        if pin != "none":
+            _execute_multi(con, emit_unpin(qnum))
+    finally:
+        con.close()
+
+
 def run_nsys_profile(
     queries,
     source,
@@ -1017,9 +1228,11 @@ def run_nsys_profile(
     *,
     benchmark_dir,
     pin,
+    query_texts,
     config_path,
     query_timeout,
     data_source="parquet",
+    s3_input=None,
 ):
     """Profile each query with NVIDIA Nsight Systems: one DuckDB subprocess per query.
 
@@ -1033,7 +1246,7 @@ def run_nsys_profile(
     Iteration runtimes from timings.csv are written into csv/runtimes.csv with
     engine="sirius" and iteration=0..N-1.
     """
-    if not os.path.isfile(DUCKDB_BIN):
+    if s3_input is None and not os.path.isfile(DUCKDB_BIN):
         raise SystemExit(
             f"DuckDB binary not found at {DUCKDB_BIN}. "
             "Build with `pixi run -e clang make release` first."
@@ -1052,9 +1265,17 @@ def run_nsys_profile(
         sub_log_dir = os.path.join(qdir, "log_dir")
         os.makedirs(sub_log_dir, exist_ok=True)
 
-        sql_path = _build_precmd_temp_sql(
-            qnum, source, iterations, pin, qdir, "nsys", data_source
-        )
+        if s3_input is None:
+            sql_path = _build_precmd_temp_sql(
+                qnum,
+                query_texts[f"q{qnum}"],
+                source,
+                iterations,
+                pin,
+                qdir,
+                "nsys",
+                data_source,
+            )
         nsys_output = os.path.join(qdir, "nsys")
         stdout_path = os.path.join(qdir, "nsys_stdout.txt")
 
@@ -1074,17 +1295,31 @@ def run_nsys_profile(
         # (its native TPC-H tables become queryable by name) — mirroring
         # open_connection / run_tpch_duckdb.sh. For parquet, the in-script
         # CREATE VIEW read_parquet statements supply the tables, so no DB arg.
-        duckdb_invocation = [DUCKDB_BIN]
-        if data_source == "duckdb":
-            duckdb_invocation.append(source)
-        duckdb_invocation += [
-            # -unsigned mirrors the Python runner's allow_unsigned_extensions
-            # config (open_connection): without it, the DuckDB CLI rejects
-            # locally-built (unsigned) Sirius extensions.
-            "-unsigned",
-            "-f",
-            sql_path,
-        ]
+        if s3_input is not None:
+            duckdb_invocation = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--_nsys-s3-child",
+                source,
+                str(qnum),
+                str(iterations),
+                pin,
+                qdir,
+                PIN_COMPRESSION_PLAN_DIR or "",
+                query_texts[f"q{qnum}"],
+            ]
+        else:
+            duckdb_invocation = [DUCKDB_BIN]
+            if data_source == "duckdb":
+                duckdb_invocation.append(source)
+            duckdb_invocation += [
+                # -unsigned mirrors the Python runner's allow_unsigned_extensions
+                # config (open_connection): without it, the DuckDB CLI rejects
+                # locally-built (unsigned) Sirius extensions.
+                "-unsigned",
+                "-f",
+                sql_path,
+            ]
         nsys_cmd.extend(
             [
                 "--output",
@@ -1175,6 +1410,7 @@ def run_gdb(
     *,
     benchmark_dir,
     pin,
+    query_texts,
     config_path,
     query_timeout,
     data_source="parquet",
@@ -1206,7 +1442,14 @@ def run_gdb(
         os.makedirs(sub_log_dir, exist_ok=True)
 
         sql_path = _build_precmd_temp_sql(
-            qnum, source, iterations, pin, qdir, "gdb", data_source
+            qnum,
+            query_texts[f"q{qnum}"],
+            source,
+            iterations,
+            pin,
+            qdir,
+            "gdb",
+            data_source,
         )
         stdout_path = os.path.join(qdir, "gdb_stdout.txt")
 
@@ -1351,12 +1594,12 @@ def print_runtime_summary(runtime_csv):
     print()
 
 
-def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
+def split_sirius_log(log_dir, benchmark_dir, queries, iterations, query_texts):
     """Split the combined Sirius spdlog into one log file per query.
 
     A query's segment runs from its `QueryBegin: SQL: <sql>` marker to the next such
     marker. Benchmarked-query begins are identified by matching the logged
-    (whitespace-normalized) SQL against the known QUERIES text, so interleaved control
+    (whitespace-normalized) SQL against the rendered query text, so interleaved control
     statements (`SET gpu_execution`, `CALL pin_table`/`unpin_table`, `CREATE VIEW`,
     `LOAD`) are ignored and segments are grouped by query content. This is robust
     across data sources (parquet/duckdb), pinning on/off, and every profile --
@@ -1376,7 +1619,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
         # and lowercase so the match is exact but tolerant of formatting differences.
         return " ".join(sql.split()).rstrip(";").strip().lower()
 
-    known = {_norm(QUERIES[f"q{q}"]): q for q in queries}
+    known = {_norm(query_texts[f"q{q}"]): q for q in queries}
 
     begin_marker = "QueryBegin: "
     sql_marker = " SQL: "
@@ -1508,9 +1751,18 @@ def parse_args():
         type=str,
         required=True,
         help="TPC-H input: a parquet directory (--data-source parquet; one .parquet "
-        "file or subdir per table), an s3:// prefix holding one <table>/ subdir "
-        "per table (--engine gpu only), or a single .duckdb file "
-        "(--data-source duckdb)",
+        "file or subdir per table), an s3://bucket/prefix parquet directory, "
+        "or a single .duckdb file (--data-source duckdb)",
+    )
+    p.add_argument(
+        "--scale-factor",
+        type=str,
+        default=None,
+        help=(
+            "TPC-H scale factor used to render scale-dependent query parameters, "
+            "notably Q11's FRACTION. Defaults to 1 with a warning for backward "
+            "compatibility."
+        ),
     )
     p.add_argument(
         "--data-source",
@@ -1739,28 +1991,41 @@ def _resolve_duckdb_results_dir(path):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--_nsys-s3-child":
+        if len(sys.argv) != 9:
+            raise SystemExit("Invalid internal nsys S3 invocation")
+        _, _, source, qnum, iterations, pin, qdir, compression_plan_dir, query_sql = (
+            sys.argv
+        )
+        global PIN_COMPRESSION_PLAN_DIR
+        PIN_COMPRESSION_PLAN_DIR = compression_plan_dir or None
+        _run_nsys_s3_child(source, int(qnum), int(iterations), pin, qdir, query_sql)
+        return
+
     args = parse_args()
+    if args.scale_factor is None:
+        log(
+            "WARNING: --scale-factor was not provided; defaulting to SF1. "
+            "Pass the dataset's scale factor so Q11 uses 0.0001 / SF."
+        )
+        args.scale_factor = "1"
+    try:
+        query_texts = queries_for_scale_factor(args.scale_factor)
+        scale_factor = scale_factor_metadata_value(args.scale_factor)
+    except ValueError as exc:
+        raise SystemExit(f"--scale-factor: {exc}") from exc
     source = args.input
+    s3_input = None
     if args.data_source == "duckdb":
+        if is_s3_input(source):
+            raise SystemExit("S3 --input currently supports --data-source parquet only")
         if not os.path.isfile(source):
             raise SystemExit(
                 f"--data-source duckdb requires --input to be a .duckdb file; "
                 f"got {source!r}"
             )
-    elif is_s3_source(source):
-        # S3 is GPU-only: DuckDB's CPU read_parquet has no S3 filesystem, and
-        # Sirius deliberately refuses to serve s3:// to a CPU plan
-        # (src/sirius_context.cpp, throw_if_s3_no_cpu_fallback). So there is no
-        # CPU baseline to time against or validate with.
-        if args.engine != "gpu":
-            raise SystemExit(
-                "an s3:// --input requires --engine gpu; S3 has no CPU fallback"
-            )
-        if args.pin != "none":
-            raise SystemExit(
-                "--pin is not supported for an s3:// --input; pin_table globs "
-                "local files"
-            )
+    elif is_s3_input(source):
+        s3_input = S3Input(source)
     elif not os.path.isdir(source):
         raise SystemExit(
             f"--data-source parquet requires --input to be a parquet directory "
@@ -1799,8 +2064,10 @@ def main():
                 f"No plan file in {plan_dir} names a TPC-H table; plan files "
                 "are <table>.<ext>"
             )
-        global PIN_COMPRESSION_PLAN_DIR
         PIN_COMPRESSION_PLAN_DIR = plan_dir
+
+    if s3_input is not None and args.pin != "none":
+        s3_input.pin_globs()  # fail before launching a benchmark if pinning is ambiguous
 
     if args.validation and args.engine != "both" and not duckdb_results_dir:
         raise SystemExit(
@@ -1839,6 +2106,8 @@ def main():
                 f"--precmd {precmd} has its own execution model; --mode "
                 "does not apply to it"
             )
+        if s3_input is not None and precmd == "gdb":
+            raise SystemExit("--precmd gdb does not yet support S3 input")
 
     config_path = (args.config or "").strip()
 
@@ -1850,12 +2119,6 @@ def main():
     # profile asked for is kept.
     if args.mode is not None:
         mode_props = MODE_PROFILES[args.mode]
-        if not can_drop_os_cache():
-            raise SystemExit(
-                f"--mode {args.mode} drops the OS page cache: passwordless sudo "
-                "for /usr/bin/tee /proc/sys/vm/drop_caches is not available "
-                "(see test/tpch_performance/CLAUDE.md)"
-            )
         profile = {
             **profile,
             "ordering": mode_props["ordering"],
@@ -1871,7 +2134,12 @@ def main():
         if cache_overrides:
             log("Checking profile sanity")
             check_profile_sanity(
-                args.profile, cache_overrides, config_path, args.engine, args.pin
+                args.profile,
+                cache_overrides,
+                config_path,
+                args.engine,
+                args.pin,
+                source,
             )
 
     if args.pin != "none":
@@ -1892,6 +2160,8 @@ def main():
         queries,
         config_path,
         args.pin,
+        scale_factor,
+        query_texts,
         name=args.name,
         precmd=precmd,
         data_source=args.data_source,
@@ -1919,6 +2189,7 @@ def main():
     log(f"Mode:          {args.mode or '(unset)'}")
     log(f"Iterations:    {args.iterations}")
     log(f"Engine:        {args.engine}")
+    log(f"Scale factor:  {scale_factor}")
     log(f"Queries:       {queries}")
     log(f"Config:        {config_path or '(default)'}")
     log(f"Pin:           {args.pin}")
@@ -1930,12 +2201,8 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    # Best-effort: a profile that REQUIRES a cold cache already failed the
-    # sanity check above when sudo is unavailable, so reaching here without it
-    # means the run only wanted the one drop at startup and can proceed warm.
-    if can_drop_os_cache():
-        log("Dropping OS page cache")
-        drop_os_cache(source, args.data_source)
+    log("Dropping OS page cache")
+    drop_os_cache(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = RuntimeCsv(csv.writer(f), len(queries))
         writer.writerow(["engine", "query", "iteration", "runtime_s"])
@@ -1948,9 +2215,11 @@ def main():
                 writer,
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
+                query_texts=query_texts,
                 config_path=config_path,
                 query_timeout=args.query_timeout,
                 data_source=args.data_source,
+                s3_input=s3_input,
             )
         elif precmd == "gdb":
             run_gdb(
@@ -1960,6 +2229,7 @@ def main():
                 writer,
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
+                query_texts=query_texts,
                 config_path=config_path,
                 query_timeout=args.query_timeout,
                 data_source=args.data_source,
@@ -1974,9 +2244,11 @@ def main():
                 benchmark_dir=benchmark_dir,
                 pin=args.pin,
                 profile=profile,
+                query_texts=query_texts,
                 data_source=args.data_source,
                 duckdb_profiling=args.duckdb_profiling,
                 pin_after_iteration=args.pin_after_iteration,
+                s3_input=s3_input,
             )
         writer.write_totals()
 
@@ -1986,7 +2258,7 @@ def main():
     # the long-running Python connection. External runners already isolate each
     # query under <bench>/sirius/q<N>/log_dir/.
     if not uses_precmd and any(use_gpu for _, use_gpu in engine_modes):
-        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations)
+        split_sirius_log(log_dir, benchmark_dir, queries, args.iterations, query_texts)
 
     if do_validate:
         log("Starting validation")

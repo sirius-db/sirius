@@ -150,7 +150,7 @@ void attach_validity(cudf::column& col, std::vector<bool> const& valid, ::cuda::
   auto const null_count =
     static_cast<cudf::size_type>(std::count(valid.begin(), valid.end(), false));
   auto const words = upload_prior_mask(valid, stream);
-  rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(col.size()), stream};
+  auto mask        = cudf::create_null_mask(col.size(), cudf::mask_state::UNINITIALIZED, stream);
   REQUIRE(mask.size() >= words.size());
   REQUIRE(cudaMemcpyAsync(
             mask.data(), words.data(), words.size(), cudaMemcpyDeviceToDevice, stream.get()) ==
@@ -1350,7 +1350,7 @@ TEST_CASE("DATE probes write null rows as false and keep the sentinel conservati
   // for integer probes.
   auto probe     = make_days({10957, 10958, 5, 10958}, stream);
   auto null_mask = cudf::create_null_mask(4, cudf::mask_state::ALL_VALID, stream, mr);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
+  cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
   probe->set_null_mask(std::move(null_mask), 1);
   auto mask = filter.compute_mask(probe->view(), kDevice, stream, mr);
   REQUIRE(mask != nullptr);
@@ -1776,7 +1776,8 @@ TEST_CASE("DECIMAL128 keys build an int64 set when their values fit and are refu
   {
     auto keys      = make_decimal<__int128_t>({5, 0, 7}, stream);
     auto null_mask = cudf::create_null_mask(3, cudf::mask_state::ALL_VALID, stream, mr);
-    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
+    cudf::set_null_mask(
+      reinterpret_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
     keys->set_null_mask(std::move(null_mask), 1);
     REQUIRE(membership_build_fits_rep(keys->view(), stream, mr));
     // Every filter drops the null slot before inserting; the IN-lists store the two valid keys.
@@ -1909,12 +1910,12 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::optional<std::string
   }
   auto offsets_col = make_values(offsets, cudf::data_type{cudf::type_id::INT32}, stream);
   rmm::device_buffer chars_buf{chars.data(), chars.size(), stream, mr};
-  rmm::device_buffer null_mask{};
+  auto null_mask = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   if (null_count > 0) {
     null_mask = cudf::create_null_mask(n, cudf::mask_state::ALL_VALID, stream, mr);
     for (std::size_t i = 0; i < values.size(); ++i) {
       if (!values[i].has_value()) {
-        cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()),
+        cudf::set_null_mask(reinterpret_cast<cudf::bitmask_type*>(null_mask.data()),
                             static_cast<cudf::size_type>(i),
                             static_cast<cudf::size_type>(i) + 1,
                             false,

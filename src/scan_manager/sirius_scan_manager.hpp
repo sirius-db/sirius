@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
@@ -25,6 +26,7 @@
 #include "io/sirius_datasource.hpp"
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "pin_snapshot_identity.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
@@ -121,10 +123,13 @@ namespace sirius::scan_manager {
 /// owns the match logic that @ref sirius_scan_manager::try_match_cached_entry consults.
 class cache_entry_info {
  public:
-  std::vector<std::string> resolved_file_paths;    ///< parquet identity (file set)
-  std::string catalog_name;                        ///< duckdb identity: catalog (attach alias)
-  std::string schema_name;                         ///< duckdb identity: schema
-  std::string table_name;                          ///< duckdb identity: table
+  std::vector<std::string> resolved_file_paths;  ///< parquet identity (file set)
+  std::string catalog_name;                      ///< duckdb identity: catalog (attach alias)
+  std::string schema_name;                       ///< duckdb identity: schema
+  std::string table_name;                        ///< duckdb identity: table
+  /// Catalog object id plus storage identity: DROP/CREATE changes the former;
+  /// ALTER that rewrites values or column layout changes the latter.
+  sirius::duckdb_table_identity table_identity;
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
 
@@ -143,10 +148,21 @@ class cache_entry_info {
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
   /// MVCC guards — one matcher, so the probe and prepare can never disagree.
-  /// False for parquet entries (empty table_name).
+  /// Qualified name AND catalog/storage identity. False for parquet
+  /// entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
-                                          std::string_view table) const;
+                                          std::string_view table,
+                                          sirius::duckdb_table_identity const& identity) const;
+
+  /// Match only the qualified name. Used to find superseded pins, not cache hits.
+  [[nodiscard]] bool matches_duckdb_table_name(std::string_view catalog,
+                                               std::string_view schema,
+                                               std::string_view table) const;
+
+  /// Whether both entries cache the same DuckDB table incarnation or parquet
+  /// file set. Identity-less entries never match.
+  [[nodiscard]] bool same_source_as(const cache_entry_info& other) const;
 
   /// Parquet-identity check shared by can_serve_with_columns and the plan-time
   /// residency gate — one matcher, so the probe and prepare can never disagree.
@@ -174,6 +190,11 @@ class cache_entry_info {
  * pinned table. The vector may be empty until splits are populated.
  */
 struct pinned_entry {
+  /// Identity of this materialization, independent of the source table's identity.
+  /// ANN indexes must match it before using row positions from their build snapshot.
+  std::shared_ptr<const pin_snapshot_identity> snapshot_identity{
+    std::make_shared<const pin_snapshot_identity>()};
+
   /// Cache identity + column layout for this pinned table. Drives the cache-hit
   /// match (@ref cache_entry_info::can_serve_with_columns) and the per-column
   /// gather; replaces the heavyweight read-side ingestible_table_info.
@@ -223,9 +244,8 @@ struct pinned_entry {
   /// Representative memory space of a HOST-tier entry; the MVCC path expands
   /// it into a per-chunk vector. GPU-tier entries leave it null.
   cucascade::memory::memory_space* memory_space{nullptr};
-  /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
-  /// to decide whether a re-insert merges into the existing entry (same row
-  /// count → add unique columns) or replaces it (different row count).
+  /// Total rows across pinned chunks. Re-insertion merges only when this and the
+  /// cache identity match.
   std::size_t num_rows{0};
   /// Zone-map sidecar: pin-time DuckDB types + per-chunk min/max statistics,
   /// positional with cache_info.column_ids. Absent (never prunes) when the
@@ -491,6 +511,11 @@ class sirius_scan_manager {
 
   using ingestible_table_info = op::scan::ingestible_table_info;
 
+  /// Install the immutable S3 configuration resolved for @p path on the
+  /// client thread while binding a query. Matching scans and LIST/glob calls
+  /// reuse this snapshot; subsequent replacement affects only future lookups.
+  void install_s3_config(std::string_view path, sirius::io::object_store_config config);
+
   /// \brief Prepare per-scan state for the given query.
   ///
   /// Walks @p query 's pipelines in scan-operator order. For each GPU parquet
@@ -528,6 +553,10 @@ class sirius_scan_manager {
   /// mutex, so another connection's prepare_for_query is never parked behind it.
   void reset(sirius::query_id_t query_id);
 
+  /// Drain and drop this query's scan work while retaining checkpoint protection.
+  /// Used after mandatory cleanup fails, when releasing storage leases is unsafe.
+  void drain_query(sirius::query_id_t query_id);
+
   /// \brief Drop every query's state. Teardown only (stop(), the destructor, and the
   ///        failed-query backstop).
   void reset_all();
@@ -559,6 +588,14 @@ class sirius_scan_manager {
   /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
 
+  /// Retain a checkpoint key until this execution window is reset. Pinning may hold
+  /// keys without registering scan providers, so their lifetime is tracked separately.
+  void acquire_checkpoint_key(sirius::query_id_t query_id, duckdb::AttachedDatabase& database);
+  [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
+  [[nodiscard]] std::size_t checkpoint_key_count() const noexcept;
+  [[nodiscard]] std::size_t checkpoint_key_count(sirius::query_id_t query_id) const noexcept;
+
   /// \brief Start the worker thread pool. Idempotent.
   void start();
 
@@ -574,13 +611,10 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count, the
-  ///     incoming columns whose names are not already present are merged in
-  ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
-  ///     to the union of pinned columns so later cache-hit matching can serve them.
-  ///     The existing cache identity is preserved; the merge requires the incoming
-  ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
-  ///     any mismatch.
+  ///   - If an entry has the same source and row count, new columns are merged and
+  ///     duplicate columns are dropped. Chunk placement must also match.
+  ///   - If the source differs, including a recreated table with the same name, the
+  ///     existing entry is replaced.
   ///   - If row counts differ, the existing entry is dropped and replaced. (An
   ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
   ///     same table, since their row counts differ.)
@@ -762,7 +796,8 @@ class sirius_scan_manager {
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
-  /// The pinned entry whose duckdb identity matches catalog.schema.table, or nullptr.
+  /// The pinned entry whose duckdb identity matches catalog.schema.table at
+  /// catalog/storage identity @p table_identity, or nullptr.
   /// OWNING: the returned shared_ptr keeps the entry alive for as long as the caller holds
   /// it, so a concurrent unpin on another connection cannot pull it out from under the
   /// plan-time MVCC guards that read it. When one table is pinned under two names with
@@ -774,8 +809,18 @@ class sirius_scan_manager {
     std::string_view catalog_name,
     std::string_view schema_name,
     std::string_view table_name,
+    sirius::duckdb_table_identity const& table_identity,
     duckdb::vector<duckdb::ColumnIndex> const* requested_ids  = nullptr,
     duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
+
+  /// Find a same-name pin for an older table incarnation: same qualified name,
+  /// different catalog object id or rewritten storage. Used to report a superseded
+  /// pin, never to serve.
+  [[nodiscard]] std::optional<std::string> pinned_entry_name_for_superseded_duckdb_table(
+    std::string_view catalog_name,
+    std::string_view schema_name,
+    std::string_view table_name,
+    sirius::duckdb_table_identity const& table_identity) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. OWNING: the returned
@@ -925,10 +970,6 @@ class sirius_scan_manager {
     //! scan. Its slot map is keyed by operator id, which restarts at 0 per query.
     std::unique_ptr<load_balancing_scan_batch_coalescer> metadata_processor;
 
-    //! Prevents DuckDB checkpoints from replacing row groups between this query's pinned
-    //! validation and completion. Released when the state dies at reset(query_id).
-    std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> checkpoint_locks;
-
     //! This query's background host->GPU upgrader for queued pinned-cache splits (built in
     //! start_metadata_processing when the memory_prefetcher config block enables it, torn
     //! down first in drain(): it holds shared_ptrs to the operators' connectors and must
@@ -992,13 +1033,15 @@ class sirius_scan_manager {
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
   /// nullptr when the registry cannot build that backend.
-  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type);
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_type(sirius::io::io_context_type type,
+                                                    std::string_view path = {});
 
   /// The REST ioctx, which owns LIST / glob regardless of which backend serves
   /// object READS (with @c backend=kvikio, `s3://` reads route to kvikIO).
   /// Returns nullptr when the object store is not configured, i.e. the REST
-  /// backend cannot be built.  The returned ioctx stays owned by this manager.
-  sirius::io::rest::rest_ioctx* rest_ioctx_for_list();
+  /// backend cannot be built. The caller shares ownership for the full LIST so
+  /// credential rotation cannot retire the context while a request is in flight.
+  std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -1008,14 +1051,29 @@ class sirius_scan_manager {
   exec::static_thread_pool _thread_pool;
   std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
-  /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
-  /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
-  /// threads + cache allocation happen outside the map mutex), while
+  /// REST or kvikIO context alongside the local `_io_ctx`). Contexts are keyed
+  /// by the immutable resolved-config snapshot, not merely by backend type, so
+  /// credentials/endpoints can differ by path. `_routed_io_ctxs_build_mtx` serializes construction
+  /// (reactor threads + cache allocation happen outside the map mutex), while
   /// `_routed_io_ctxs_mtx` guards only map lookup/insert; drained + torn down
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::ioctx>>
+  sirius::io::scoped_object_store_configs _s3_configs;
+  struct routed_ioctx_key {
+    sirius::io::io_context_type type;
+    std::uint64_t config_id;
+    bool operator==(routed_ioctx_key const&) const = default;
+  };
+  struct routed_ioctx_key_hash {
+    std::size_t operator()(routed_ioctx_key const& key) const noexcept
+    {
+      auto const type_hash = std::hash<sirius::io::io_context_type>{}(key.type);
+      auto const id_hash   = std::hash<std::uint64_t>{}(key.config_id);
+      return type_hash ^ (id_hash + 0x9e3779b9 + (type_hash << 6) + (type_hash >> 2));
+    }
+  };
+  std::unordered_map<routed_ioctx_key, std::shared_ptr<sirius::io::ioctx>, routed_ioctx_key_hash>
     _routed_io_ctxs;
   /// The pin table. Shared across every query and outliving all of them, so entries are
   /// held by shared_ptr rather than by value: a matched scan takes a reference for its
@@ -1076,6 +1134,14 @@ class sirius_scan_manager {
   /// hands over its own.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  struct checkpoint_lock_entry {
+    duckdb::AttachedDatabase* database;
+    duckdb::unique_ptr<duckdb::StorageLockKey> key;
+  };
+  void release_checkpoint_keys(sirius::query_id_t query_id);
+  std::map<sirius::query_id_t, std::vector<checkpoint_lock_entry>> _checkpoint_locks;
+  mutable std::mutex _checkpoint_locks_mutex;
+
   io::io_context_registry _ioctx_registry;
 };
 

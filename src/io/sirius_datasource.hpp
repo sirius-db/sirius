@@ -25,11 +25,14 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/version_config.hpp>
 
+#if CUDF_VERSION_MAJOR < 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR < 10)
 #include <rmm/cuda_stream_view.hpp>
+#endif
 
 #include <cuda/stream>
 
 #include <cstdint>
+#include <exception>
 #include <span>
 
 namespace sirius::io {
@@ -198,6 +201,11 @@ class sirius_datasource : public cudf::io::datasource {
   /// completion.  Returns @c prefetch_refusal::issued when IO went out, and
   /// otherwise why it did not.
   prefetch_refusal prefetch_async(exec::invocable<void(bool) noexcept> on_done);
+
+  /// Why this datasource's prefetch failed, if it did: null otherwise, and
+  /// null when no prefetch was ever issued.  Set before the prefetch's
+  /// completion callback fires and before @c wait_until_ready would return.
+  [[nodiscard]] std::exception_ptr prefetch_failure() const noexcept;
 
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 

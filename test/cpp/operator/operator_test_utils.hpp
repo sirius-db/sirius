@@ -35,49 +35,93 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace sirius::test::operator_utils {
 
 using data_repository_mgr = cucascade::data_repository_manager;
+
+/**
+ * @brief Shape of the memory manager `initialize_memory_manager` builds.
+ */
+struct memory_manager_options {
+  /** @brief GPU memory the manager may use, per GPU or in total (see `divide_among_gpus`). */
+  std::size_t gpu_bytes = std::size_t{512} << 20;
+  /** @brief Fraction of each GPU's memory that reservations may take. */
+  double gpu_reservation_fraction = 0.75;
+  /**
+   * @brief Split `gpu_bytes` and the 1 GiB host capacity evenly among the GPUs; false gives every
+   * GPU and its host region the full amounts.
+   */
+  bool divide_among_gpus = true;
+  /**
+   * @brief Track reservations per stream; false tracks them per thread, as the engine does
+   * (`per_stream_reservation = false` in `sirius_config.cpp`).
+   */
+  bool per_stream_tracking = true;
+  /** @brief Builds each GPU's upstream memory resource; empty uses cuCascade's default. */
+  cucascade::memory::DeviceMemoryResourceFactoryFn gpu_resource_factory = {};
+};
+
+/**
+ * @brief A memory manager with one GPU space and one host space per GPU, with a freshly initialized
+ * converter registry.
+ */
 inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initialize_memory_manager(
-  std::size_t n_gpus = 1)
+  std::size_t n_gpus = 1, memory_manager_options options = {})
 {
   // Reset converter registry to avoid cross-test leakage
   sirius::converter_registry::reset_for_testing();
 
+  constexpr double host_reservation_fraction = 0.75;
+  constexpr std::size_t host_capacity        = std::size_t{1} << 30;
+  auto const share                           = options.divide_among_gpus ? n_gpus : std::size_t{1};
+
   cucascade::memory::reservation_manager_configurator builder;
-
-  // Configure a modest GPU space
-  const size_t gpu_capacity  = 512ull << 20;  // 512MB
-  const double limit_ratio   = 0.75;
-  const size_t host_capacity = 1ull << 30;  // 1GB
-
   builder.set_number_of_gpus(n_gpus)
-    .set_gpu_usage_limit(gpu_capacity / n_gpus)
-    .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_numa_region_capacity(host_capacity / n_gpus)
+    .set_gpu_usage_limit(options.gpu_bytes / share)
+    .set_reservation_fraction_per_gpu(options.gpu_reservation_fraction)
+    .set_per_numa_region_capacity(host_capacity / share)
     .use_gpu_id_as_host_id()
-    .set_reservation_fraction_per_numa_region(limit_ratio);
-
-  auto space_configs = builder.build();
+    .set_reservation_fraction_per_numa_region(host_reservation_fraction)
+    .track_reservation_per_stream(options.per_stream_tracking);
+  if (options.gpu_resource_factory) {
+    builder.set_gpu_memory_resource_factory(std::move(options.gpu_resource_factory));
+  }
   auto manager =
-    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
 
   // Initialize converters used by data representations
   sirius::converter_registry::initialize();
   return manager;
 }
 
+/// Initializes the process-global converter registry unless it is already initialized. Tests that
+/// cache a memory manager across test cases call this on every access, since other tests may shut
+/// the registry down in between.
+inline void ensure_converter_registry()
+{
+  if (!sirius::converter_registry::is_initialized()) { sirius::converter_registry::initialize(); }
+}
+
 inline cucascade::memory::memory_space* get_default_gpu_space()
 {
+  ensure_converter_registry();
   static auto manager = initialize_memory_manager();
   return const_cast<cucascade::memory::memory_space*>(
     manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
@@ -173,6 +217,34 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
   }
 }
 
+/**
+ * @brief Copies a fixed-width column's values to the host in @p stream's order and synchronizes
+ * @p stream; a BOOL8 column copies as `bool`.
+ *
+ * @throw std::runtime_error if the copy cannot be enqueued
+ */
+template <typename T>
+  requires(!std::is_same_v<T, std::string>)
+std::vector<T> copy_column_to_host(cudf::column_view const& col, ::cuda::stream_ref stream)
+{
+  using stored = std::conditional_t<std::is_same_v<T, bool>, std::int8_t, T>;
+  std::vector<stored> host(static_cast<std::size_t>(col.size()));
+  if (!host.empty() && cudaMemcpyAsync(host.data(),
+                                       col.data<stored>(),
+                                       host.size() * sizeof(stored),
+                                       cudaMemcpyDeviceToHost,
+                                       stream.get()) != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::runtime_error{"copy_column_to_host: cudaMemcpyAsync failed"};
+  }
+  stream.sync();
+  if constexpr (std::is_same_v<T, bool>) {
+    return std::vector<bool>(host.begin(), host.end());
+  } else {
+    return host;
+  }
+}
+
 /// @brief Copy a column's per-row validity to host (true == valid). All-true if no null mask.
 inline std::vector<bool> copy_validity_to_host(const cudf::column_view& col)
 {
@@ -237,7 +309,7 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
   auto size   = static_cast<cudf::size_type>(values.size());
 
   auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-  auto* mask_ptr = static_cast<cudf::bitmask_type*>(null_mask.data());
+  auto* mask_ptr = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
   cudf::size_type null_count = 0;
   for (cudf::size_type i = 0; i < size; ++i) {
     if (!valids[i]) {
@@ -306,11 +378,12 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                     stream.get());
   }
 
-  return cudf::make_strings_column(strings_count,
-                                   std::move(offsets_col),
-                                   std::move(chars_buf),
-                                   0,
-                                   rmm::device_buffer{0, stream, mr});
+  return cudf::make_strings_column(
+    strings_count,
+    std::move(offsets_col),
+    std::move(chars_buf),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_string_batch(

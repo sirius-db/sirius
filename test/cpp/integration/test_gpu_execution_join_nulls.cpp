@@ -103,3 +103,80 @@ TEST_CASE_METHOD(JoinNullFixture,
   // l.k=NULL is still NULL and matches are TRUE) -- this exercises FALSE.
   compare_gpu_vs_cpu("SELECT l.id, l.k IN (SELECT k FROM r WHERE k IS NOT NULL) AS m FROM l");
 }
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution mixed SEMI and ANTI joins keep matches after NULL build rows",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  run_ok("CREATE TABLE mixed_left (k BIGINT, v UINTEGER);");
+  run_ok("INSERT INTO mixed_left VALUES (1, 134), (2, 7), (NULL, 3);");
+  run_ok("CREATE TABLE mixed_right (k BIGINT, v UINTEGER);");
+  run_ok("INSERT INTO mixed_right VALUES (1, NULL), (1, 0), (2, NULL);");
+  run_ok("CHECKPOINT;");
+
+  compare_gpu_vs_cpu(
+    "SELECT l.* FROM mixed_left l SEMI JOIN mixed_right r "
+    "ON l.k = r.k AND l.v <> r.v");
+  compare_gpu_vs_cpu(
+    "SELECT l.* FROM mixed_left l ANTI JOIN mixed_right r "
+    "ON l.k = r.k AND l.v <> r.v");
+}
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution mixed SEMI and ANTI nullable residuals with cast hash keys",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  const std::string join_type = GENERATE("SEMI", "ANTI");
+  const bool right_family     = GENERATE(false, true);
+  const std::string residual  = GENERATE("<>", "IS NOT DISTINCT FROM");
+  run_ok("CREATE TABLE cast_big (id INTEGER, k BIGINT, v INTEGER);");
+  run_ok(
+    "INSERT INTO cast_big VALUES "
+    "(1, 1, NULL), (2, 1, 0), (3, 2, NULL), (4, NULL, 3), (5, 3, 8);");
+  run_ok("INSERT INTO cast_big SELECT 10 + i, 1, 0 FROM range(20) t(i);");
+  run_ok("CREATE TABLE cast_small (id INTEGER, k SMALLINT, v INTEGER);");
+  run_ok(
+    "INSERT INTO cast_small VALUES "
+    "(1, 1, NULL), (2, 1, 134), (3, 2, 7), (4, NULL, 3), (5, 4, 9);");
+  run_ok("CHECKPOINT;");
+
+  // The larger table stays on the physical left. Selecting the small table produces
+  // RIGHT_SEMI/RIGHT_ANTI; both orientations have NULLs in the residual's build column.
+  // INTEGER is unsupported by cuDF AST casts. The keys must stay on the hash path,
+  // and SELECT l.* checks that build validity columns do not leak into the output.
+  const std::string lhs = right_family ? "cast_small" : "cast_big";
+  const std::string rhs = right_family ? "cast_big" : "cast_small";
+  const auto query      = "SELECT l.* FROM " + lhs + " l " + join_type + " JOIN " + rhs +
+                     " r ON CAST(l.k AS INTEGER) = CAST(r.k AS INTEGER) AND l.v " + residual +
+                     " r.v";
+  INFO(query);
+  run_ok("SET gpu_execution = false;");
+  auto plan = con->Query("EXPLAIN " + query);
+  REQUIRE(plan);
+  REQUIRE_FALSE(plan->HasError());
+  const auto expected_type = (right_family ? "RIGHT_" : "") + join_type;
+  REQUIRE(plan->ToString().find("Join Type: " + expected_type) != std::string::npos);
+  compare_gpu_vs_cpu(query);
+}
+
+TEST_CASE_METHOD(JoinNullFixture,
+                 "gpu_execution selective mixed SEMI and ANTI joins with one NULL residual",
+                 "[integration][gpu_execution][join][nulls][mixed_join]")
+{
+  const std::string join_type = GENERATE("SEMI", "ANTI");
+  const bool right_family     = GENERATE(false, true);
+  // Only one build residual is NULL in either orientation. The equality keys narrow five
+  // billion possible row pairs to 50,000 candidates; a conditional full-predicate join loses
+  // that selectivity. Keep this a result regression rather than a hardware-dependent timer.
+  run_ok(
+    "CREATE TABLE selective_big AS SELECT i::INTEGER AS k, "
+    "CASE WHEN i = 0 THEN NULL ELSE 1 END AS v FROM range(100000) t(i);");
+  run_ok(
+    "CREATE TABLE selective_small AS SELECT i::INTEGER AS k, "
+    "CASE WHEN i = 0 THEN NULL ELSE 0 END AS v FROM range(50000) t(i);");
+  run_ok("CHECKPOINT;");
+  const std::string lhs = right_family ? "selective_small" : "selective_big";
+  const std::string rhs = right_family ? "selective_big" : "selective_small";
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + lhs + " l " + join_type + " JOIN " + rhs +
+                     " r ON l.k = r.k AND l.v <> r.v");
+}

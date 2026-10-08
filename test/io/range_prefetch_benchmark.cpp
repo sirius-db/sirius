@@ -126,7 +126,7 @@ struct read_result {
 read_result read_ranges_to_device(sirius::io::sirius_datasource& ds,
                                   std::span<const cudf::io::text::byte_range_info> ranges,
                                   rmm::device_async_resource_ref mr,
-                                  rmm::cuda_stream_view stream,
+                                  ::cuda::stream_ref stream,
                                   std::chrono::milliseconds decode_wait)
 {
   read_result r;
@@ -153,7 +153,7 @@ read_result read_ranges_to_device(sirius::io::sirius_datasource& ds,
   r.read_ms = now_ms(t_read);
 
   auto const t_sync = clock_type::now();
-  stream.synchronize();
+  stream.sync();
   r.sync_ms = now_ms(t_sync);
 
   buffers.clear();
@@ -491,7 +491,7 @@ int main(int argc, char** argv)
     std::cout << "\n";
 
     auto t0 = clock_type::now();
-    auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream.view(), decode_wait);
+    auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream, decode_wait);
     results.push_back({"A baseline 1 file", now_ms(t0), prep.range_bytes, rr, 0.0, false, {}});
   }
 
@@ -513,7 +513,7 @@ int main(int argc, char** argv)
                sirius::io::prefetch_refusal::issued;
     b_ok                     = fut.get();
     double const prefetch_ms = now_ms(t0);
-    auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream.view(), decode_wait);
+    auto rr = read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream, decode_wait);
     results.push_back({"B prefetch 1 file",
                        now_ms(t0),
                        prep.range_bytes,
@@ -535,8 +535,7 @@ int main(int argc, char** argv)
     auto t0           = clock_type::now();
     for (auto& prep : preps) {
       auto f0 = clock_type::now();
-      agg.accumulate(
-        read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream.view(), decode_wait));
+      agg.accumulate(read_ranges_to_device(*prep.ds, prep.ranges, device_mr, stream, decode_wait));
       per_file_c.push_back(now_ms(f0));
     }
     double const ms = now_ms(t0);
@@ -602,8 +601,8 @@ int main(int argc, char** argv)
       futures[i].get();
       d_parse_start[i] = now_ms(t0);
       auto f0          = clock_type::now();
-      agg.accumulate(read_ranges_to_device(
-        *preps[i].ds, preps[i].ranges, device_mr, stream.view(), decode_wait));
+      agg.accumulate(
+        read_ranges_to_device(*preps[i].ds, preps[i].ranges, device_mr, stream, decode_wait));
       per_file_d.push_back(now_ms(f0));
       d_parse_end[i] = now_ms(t0);
       parse_pos.store(i + 1, std::memory_order_release);

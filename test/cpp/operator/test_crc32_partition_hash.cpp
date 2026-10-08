@@ -88,7 +88,7 @@ uint32_t cpu_fold_decimal_split(uint32_t seed, __int128 v)
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
 // Build a null mask from a per-row validity vector (empty vector => no mask / all valid).
-rmm::device_buffer make_mask(std::vector<bool> const& valid, cudf::size_type& null_count)
+auto make_mask(std::vector<bool> const& valid, cudf::size_type& null_count)
 {
   auto const n         = static_cast<cudf::size_type>(valid.size());
   auto const num_words = cudf::num_bitmask_words(n);
@@ -103,7 +103,7 @@ rmm::device_buffer make_mask(std::vector<bool> const& valid, cudf::size_type& nu
   }
   // cudf requires the mask buffer to be padded to its allocation size (multiple of 64 bytes).
   auto const buf_size = cudf::bitmask_allocation_size_bytes(n);
-  rmm::device_buffer buf(buf_size, test_stream(), test_mr());
+  auto buf = cudf::create_null_mask(n, cudf::mask_state::UNINITIALIZED, test_stream(), test_mr());
   cudaMemset(buf.data(), 0, buf_size);
   cudaMemcpy(
     buf.data(), words.data(), words.size() * sizeof(cudf::bitmask_type), cudaMemcpyHostToDevice);
@@ -159,7 +159,8 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& value
     cudaMemcpy(chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice);
   }
 
-  rmm::device_buffer null_mask{0, test_stream(), test_mr()};
+  auto null_mask =
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, test_stream(), test_mr());
   cudf::size_type null_count = 0;
   if (!valid.empty()) { null_mask = make_mask(valid, null_count); }
 

@@ -18,11 +18,13 @@
 #include "log/level.hpp"
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
+#include "util/env_guard.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
@@ -48,10 +50,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <source_location>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -129,37 +133,9 @@ struct finally {
   }
 };
 
-namespace {
-class scoped_env_assignment {
- public:
-  scoped_env_assignment(const char* name, const char* value) : _name(name)
-  {
-    if (auto const* previous = std::getenv(name)) { _previous = previous; }
-    setenv(_name.c_str(), value, 1);
-  }
-
-  ~scoped_env_assignment()
-  {
-    if (_previous) {
-      setenv(_name.c_str(), _previous->c_str(), 1);
-    } else {
-      unsetenv(_name.c_str());
-    }
-  }
-
-  scoped_env_assignment(scoped_env_assignment const&)            = delete;
-  scoped_env_assignment& operator=(scoped_env_assignment const&) = delete;
-
- private:
-  std::string _name;
-  std::optional<std::string> _previous;
-};
-
-}  // namespace
-
 TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]")
 {
-  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -181,7 +157,7 @@ TEST_CASE("Sirius settings are registered", "[sirius][config][isolated_context]"
 TEST_CASE("like_swar_fastpath is isolated between connections",
           "[sirius][config][like-swar][isolated_context]")
 {
-  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
+  sirius::util::env_guard const disable_sirius{"SIRIUS_DISABLE", "1"};
 
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con_a(db);
@@ -231,8 +207,11 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -241,6 +220,11 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
+    REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
+    auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
+    REQUIRE(native_option);
+    REQUIRE(native_option->HasError());
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -281,8 +265,13 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
+    REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
+    REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -298,8 +287,11 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
@@ -308,6 +300,11 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    duckdb::Value native_enabled;
+    auto native_setting =
+      con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
+    REQUIRE(static_cast<bool>(native_setting));
+    REQUIRE_FALSE(native_enabled.GetValue<bool>());
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
@@ -625,6 +622,38 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(telemetry.engine_name == "sirius_config_test");
 }
 
+TEST_CASE("SiriusContext init failure restores the cuDF pinned resource",
+          "[sirius][context][config][isolated_context]")
+{
+  // The [isolated_context] tag makes the Catch2 listener pause (destroy) any
+  // shared env, so no live SiriusContext owns cuDF's pinned resource here and
+  // the baseline below is cuDF's own default.
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+
+  std::source_location loc = std::source_location::current();
+  fs::path cfg =
+    fs::path(loc.file_name()).parent_path() / "data" / "init_failure_pinned_rollback.yaml";
+
+  // Baseline cuDF pinned state before the failed init.
+  auto const prev_threshold = cudf::get_allocate_host_as_pinned_threshold();
+
+  // initialize() installs the cuDF pinned resource, then throws starting the
+  // four uring reactors (256 MiB staging) against the config's 160 MB host
+  // pool -- the exact path the 1->4 reactor default change exposes.
+  REQUIRE_THROWS(sirius::test::open_sirius_db(nullptr, cfg));
+
+  // The rollback must have restored cuDF's threshold. Without the fix it would
+  // still be the sirius-installed MAX_SLAB_SIZE, not the pre-init default.
+  CHECK(cudf::get_allocate_host_as_pinned_threshold() == prev_threshold);
+
+  // And the pinned resource must not dangle at the freed slab allocator: an
+  // allocate/deallocate through whatever cuDF now points at must succeed.
+  auto pinned = cudf::get_pinned_memory_resource();
+  void* p     = pinned.allocate_sync(256);
+  CHECK(p != nullptr);
+  pinned.deallocate_sync(p, 256);
+}
+
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")
 {
   std::source_location loc = std::source_location::current();
@@ -671,6 +700,22 @@ TEST_CASE("Sirius configuration validates telemetry exporters before initializat
     REQUIRE_NOTHROW(accepted.load_from_file(data_dir / fixture));
     REQUIRE(accepted.get_telemetry_config().exporter == exporter);
   }
+}
+
+TEST_CASE("Sirius configuration keeps NVTX capture off unless telemetry.enable_nvtx is set",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config config;
+  REQUIRE_FALSE(config.get_telemetry_config().enable_nvtx);
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_telemetry_exporter_ndjson.yaml"));
+  REQUIRE_FALSE(config.get_telemetry_config().enable_nvtx);
+
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_telemetry_enable_nvtx.yaml"));
+  REQUIRE(enabled.get_telemetry_config().enable_nvtx);
 }
 
 TEST_CASE("Sirius configuration rejects empty telemetry destination and identity",
@@ -979,11 +1024,11 @@ TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GP
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const before = config.get_operator_params();
+  auto const physical_default = sirius::config::derived_default_batch_size();
   config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
   config.apply_defaults();
 
-  require_shared_operator_defaults(config.get_operator_params(), before.scan_task_batch_size);
+  require_shared_operator_defaults(config.get_operator_params(), physical_default);
 }
 
 TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
@@ -995,7 +1040,7 @@ TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
   for (auto const* fixture : fixtures) {
     INFO("fixture=" << fixture);
     sirius::sirius_config config;
-    auto const physical_default = config.get_operator_params().scan_task_batch_size;
+    auto const physical_default = sirius::config::derived_default_batch_size();
 
     config.load_from_file(config_fixture(fixture));
     require_shared_operator_defaults(config.get_operator_params(), physical_default);
@@ -1006,7 +1051,7 @@ TEST_CASE("repeated loads clear explicit and cap-derived operator values",
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const physical_default = config.get_operator_params().scan_task_batch_size;
+  auto const physical_default = sirius::config::derived_default_batch_size();
 
   config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
   REQUIRE(config.get_operator_params().scan_task_batch_size == 1ULL * 1024 * 1024);
@@ -1355,7 +1400,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
-      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE
+      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
+      current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
+      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1381,6 +1428,21 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
+  REQUIRE(settings->GetValue(20, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+
+  for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
+    auto rejected =
+      con.Query(std::string{"SET max_dynamic_filter_bloom_bytes_per_gpu = "} + invalid_budget);
+    REQUIRE(rejected != nullptr);
+    REQUIRE(rejected->HasError());
+    if (std::string_view{invalid_budget} == "0") {
+      REQUIRE_THAT(rejected->GetError(),
+                   Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
+    }
+    REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+            17 * mib);
+  }
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -1478,6 +1540,24 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter = true");
   require_ok("RESET enable_dynamic_filter");
+  require_ok("SET enable_dynamic_filter_multi_partition = false");
+  REQUIRE_FALSE(
+    sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("RESET enable_dynamic_filter_multi_partition");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          std::numeric_limits<uint64_t>::max());
+  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          17 * mib);
+  auto multi_reset = con.Query(
+    "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
+    "current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
+  REQUIRE(multi_reset != nullptr);
+  REQUIRE_FALSE(multi_reset->HasError());
+  REQUIRE(multi_reset->GetValue(0, 0).GetValue<bool>());
+  REQUIRE(multi_reset->GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");
@@ -2237,20 +2317,42 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   // WRONGLY consumes the stale capture records a successful rebind (+1) and
   // also nulls the slot, so "capture is null" alone is ambiguous — the
   // zero-rebind delta across the Prepare is the discriminating assertion.
-  auto plan = con.ExtractPlan("SELECT 42;");
+  REQUIRE(run_ok(con, "CREATE TABLE hook_original(original_name INTEGER);"));
+  auto const capture_sql =
+    "SELECT * FROM hook_original left_side JOIN hook_original right_side USING (original_name);";
+  auto plan = con.ExtractPlan(capture_sql);
   REQUIRE(plan != nullptr);
+
+  // The optimizer hook itself (rather than Sirius candidate lowering) captured
+  // the registered LogicalGet and read its bound schema from bind data.
+  auto original_views = conn_state->take_captured_original_views_if_current();
+  REQUIRE(original_views.has_value());
+  REQUIRE(original_views->views.size() == 2);
+  CHECK(original_views->views[0].table_index != original_views->views[1].table_index);
+  for (auto const& original : original_views->views) {
+    REQUIRE(original.view.identity != nullptr);
+    CHECK(original.view.identity->bound_names == duckdb::vector<std::string>{"original_name"});
+  }
+
+  // Taking is consumption, not merely moving from the stored optional. A second
+  // take in the same planning generation must not expose an engaged, moved-from
+  // capture.
+  REQUIRE_FALSE(conn_state->take_captured_original_views_if_current().has_value());
+
   conn_state->set_captured_plan(std::move(plan));
+  conn_state->set_captured_original_views(original_views->views);
 
   auto const before_prepare      = sirius_ctx->get_transparent_execution_stats();
   auto& client_config            = duckdb::ClientConfig::GetConfig(client_ctx);
   client_config.enable_optimizer = false;
-  auto prepared                  = con.Prepare("SELECT 42;");  // SAME SQL as the capture
+  auto prepared                  = con.Prepare(capture_sql);  // SAME SQL as the capture
   client_config.enable_optimizer = true;
   REQUIRE_FALSE(prepared->HasError());
   auto const after_prepare = sirius_ctx->get_transparent_execution_stats();
 
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
+  REQUIRE_FALSE(conn_state->take_captured_original_views_if_current().has_value());
 }
 
 TEST_CASE("Sirius configuration enables dense count join by default and accepts a YAML override",

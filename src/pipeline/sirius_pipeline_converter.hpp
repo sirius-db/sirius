@@ -100,12 +100,12 @@ class sirius_pipeline_converter {
   void finalize_pipeline_structure();
   void link_join_partition_siblings();
 
-  // Configure every sirius_physical_partition operator with the multi-GPU
-  // partition floor so partition-consumer tasks (hash_join, merge_group_by)
-  // have at least num_gpus partitions to spread across devices for big
-  // inputs. Small tables stay at their natural partition count. Reads
-  // num_gpus from build_ctx_; no-op when num_gpus <= 1.
-  void configure_partition_min_partitions();
+  //! Hand the admitted GPU list to every PARTITION's sizing consumer (hash join, NLJ, merge,
+  //! dense count join), which derives the partition count and placement from it, and to every
+  //! operator that receives a PARTITION's batches (the joins' CONCATs), which then treats a
+  //! missing placement as a bug. Runs for a single GPU too, so every query gets explicit
+  //! placements.
+  void configure_partition_consumers();
 
   /// Drop dynamic-filter replica targets on GPUs outside the admitted subset. Replica spaces
   /// are resolved during plan generation, which runs before admission, so they cover every

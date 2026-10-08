@@ -14,24 +14,34 @@
  * limitations under the License.
  */
 
+#include "late_mat/column_origin.hpp"
+#include "late_mat/defer_directive.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
-#include "pipeline/pipeline_build_context.hpp"
+#include "partitioned_join_test_utils.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/late_mat_plan_pass.hpp"
 #include "utils/data_utils.hpp"
 
+#include <rmm/error.hpp>
+
 #include <catch.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include <duckdb/planner/operator/logical_comparison_join.hpp>
-#include <op/sirius_physical_concat.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
+#include <op/dynamic_filter/dynamic_filter_stats.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 
 #include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <future>
 #include <numeric>
+#include <stdexcept>
+#include <vector>
 
 using namespace duckdb;
 using namespace sirius::op;
@@ -44,72 +54,14 @@ namespace {
 
 using namespace sirius::test::operator_utils;
 
-struct partition_barrier_fixture {
-  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
-  duckdb::unique_ptr<sirius_physical_hash_join> join;
-  sirius_physical_partition* probe_partition = nullptr;
-  sirius_physical_partition* build_partition = nullptr;
-};
+constexpr std::size_t mib = std::size_t{1} << 20;
 
-partition_barrier_fixture make_partition_barrier_fixture(duckdb::JoinType join_type)
-{
-  partition_barrier_fixture fixture;
-  fixture.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
-  fixture.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
-
-  auto make_child = [] {
-    return duckdb::make_uniq<sirius_physical_operator>(
-      SiriusPhysicalOperatorType::PROJECTION,
-      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
-      1);
-  };
-
-  duckdb::JoinCondition condition;
-  condition.left =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  condition.right =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
-  duckdb::vector<duckdb::JoinCondition> conditions;
-  conditions.push_back(std::move(condition));
-
-  fixture.join = duckdb::make_uniq<sirius_physical_hash_join>(
-    *fixture.logical_join,
-    make_child(),
-    make_child(),
-    sirius::wrap_join_conditions(std::move(conditions)),
-    join_type,
-    duckdb::vector<std::size_t>{},
-    duckdb::vector<std::size_t>{},
-    duckdb::vector<sirius::logical_type>{},
-    1);
-
-  auto wrap_side = [&](std::size_t child_idx, bool is_build) {
-    auto child       = std::move(fixture.join->children[child_idx]);
-    auto child_types = child->types;
-    auto partition =
-      duckdb::make_uniq<sirius_physical_partition>(child_types, 1, fixture.join.get(), is_build);
-    auto* partition_ptr = partition.get();
-    partition->children.push_back(std::move(child));
-
-    auto concat =
-      duckdb::make_uniq<sirius_physical_concat>(child_types, 1, fixture.join.get(), is_build);
-    concat->children.push_back(std::move(partition));
-    fixture.join->children[child_idx] = std::move(concat);
-    return partition_ptr;
-  };
-
-  fixture.probe_partition = wrap_side(0, false);
-  fixture.build_partition = wrap_side(1, true);
-  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*fixture.join, nullptr);
-  return fixture;
-}
 }  // namespace
 
 TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence",
           "[physical_partition][partition_barrier]")
 {
-  auto fixture = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  auto fixture = make_partitioned_join();
   REQUIRE(fixture.probe_partition->get_parent_op()->type == SiriusPhysicalOperatorType::CONCAT);
   REQUIRE(fixture.probe_partition->get_parent_op()->get_parent_op() == fixture.join.get());
 
@@ -137,10 +89,10 @@ TEST_CASE("sirius_physical_partition barrier hook preserves build and right-fami
   sirius_physical_operator projection{
     SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
 
-  auto inner = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  auto inner = make_partitioned_join();
   CHECK(inner.build_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
 
-  auto right = make_partition_barrier_fixture(duckdb::JoinType::RIGHT);
+  auto right = make_partitioned_join({.join_type = duckdb::JoinType::RIGHT});
   CHECK(right.probe_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
 }
 
@@ -457,20 +409,108 @@ TEST_CASE(
 
 namespace {
 
+/// Counts batch lookups and records whether any batch left before accumulation was decided.
+class observed_build_repository final : public cucascade::shared_data_repository {
+ public:
+  explicit observed_build_repository(dynamic_filter_stats const& counters) : stats{counters} {}
+
+  std::shared_ptr<data_batch> get_data_batch_by_id(std::uint64_t id,
+                                                   std::size_t partition = 0) const override
+  {
+    ++lookups;
+    return data_repository::get_data_batch_by_id(id, partition);
+  }
+
+  std::shared_ptr<data_batch> pop_next_data_batch(std::size_t partition = 0) override
+  {
+    auto const counters = stats.snapshot();
+    if (counters.accumulations_started == 0 && counters.accumulations_skipped_inventory == 0) {
+      popped_before_decision.store(true);
+    }
+    return data_repository::pop_next_data_batch(partition);
+  }
+
+  dynamic_filter_stats const& stats;
+  mutable std::atomic<std::size_t> lookups{0};
+  std::atomic<bool> popped_before_decision{false};
+};
+
+/// Inputs to `partition_accumulation_fixture`.
+struct partition_accumulation_options {
+  MemoryBarrierType barrier   = MemoryBarrierType::FULL;  ///< The build input port's barrier
+  std::uint64_t cap           = 64 * mib;  ///< `max_dynamic_filter_bloom_bytes_per_gpu`
+  bool per_thread_tracking    = false;     ///< Track reservations per thread, as the engine does
+  bool preset_partition_count = true;      ///< Give both PARTITIONs two partitions up front
+  bool multi_partition        = true;      ///< `enable_dynamic_filter_multi_partition`
+};
+
+/// A build PARTITION with two partitions, fed through a `default` port, whose join accumulates an
+/// INT32 key.
+struct partition_accumulation_fixture {
+  rmm::cuda_set_device_raii device{rmm::cuda_device_id{0}};
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+  memory_space* gpu;
+  memory_space const* host;
+  dynamic_filter_stats stats;
+  observed_build_repository repository{stats};
+  std::shared_ptr<sirius_dynamic_filter_set> channel =
+    std::make_shared<sirius_dynamic_filter_set>();
+  std::shared_ptr<controllable_pipeline> producer = std::make_shared<controllable_pipeline>();
+  partitioned_join tree;
+
+  explicit partition_accumulation_fixture(partition_accumulation_options options = {})
+    : manager{initialize_memory_manager(1, {.per_stream_tracking = !options.per_thread_tracking})},
+      gpu{manager->get_memory_space(Tier::GPU, 0)},
+      host{manager->get_memory_spaces_for_tier(Tier::HOST).front()}
+  {
+    auto const type = cudf::data_type{cudf::type_id::INT32};
+    tree            = make_partitioned_join(
+      {.filter_plan = {{{.build_key_ordinal = 0, .storage_type = type}},
+                                  {{channel, dynamic_filter_route_class::scan, false, {{0, 0, type}}}},
+                                  {{*gpu, *host}},
+                                  {.enable_multi_partition  = options.multi_partition,
+                                   .max_bloom_bytes_per_gpu = options.cap}},
+                  .stats       = &stats});
+    tree.join->operator_id            = 1;
+    tree.build_partition->operator_id = 2;
+    tree.probe_partition->operator_id = 3;
+    if (options.preset_partition_count) {
+      tree.build_partition->set_num_partitions(2);
+      tree.probe_partition->set_num_partitions(2);
+    }
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = options.barrier;
+    port->repo         = &repository;
+    port->src_pipeline = producer;
+    tree.build_partition->add_port("default", std::move(port));
+  }
+
+  std::shared_ptr<data_batch> push(std::vector<std::int32_t> const& values)
+  {
+    auto batch = make_numeric_batch<std::int32_t>(*gpu, values, cudf::type_id::INT32);
+    // The batch is allocated on the default stream but read on task streams; wait for it here.
+    default_stream().sync();
+    tree.build_partition->push_data_batch("default", batch);
+    return batch;
+  }
+
+  /// Runs @p partition on @p input as a task would: the build side contributes its batch and, as
+  /// the final contributor, publishes before returning.
+  void execute(sirius_physical_partition& partition, operator_data const& input)
+  {
+    auto const stream = gpu->acquire_stream();
+    (void)partition.execute(input, stream);
+    stream.sync();
+  }
+
+  void contribute(operator_data const& input) { execute(*tree.build_partition, input); }
+};
+
 struct sizing_source : sirius_physical_operator {
   sizing_source() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
 
   std::optional<std::size_t> total_source_output_bytes() const override { return projected_bytes; }
   std::optional<std::size_t> projected_bytes;
-};
-
-struct sizing_pipeline : sirius::pipeline::sirius_pipeline {
-  explicit sizing_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
-    : sirius_pipeline(ctx)
-  {
-  }
-  bool is_pipeline_finished() const override { return finished; }
-  bool finished = false;
 };
 
 // Observe the sizing input at the consumer boundary, without context-level test counters.
@@ -486,7 +526,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   {
     inputs.push_back(in.total_bytes);
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
-    return {count, false, false};
+    return partition_strategy{
+      count, false, false, partition_placement::unpinned(static_cast<std::size_t>(count))};
   }
 
   uint64_t target_bytes = 1;
@@ -538,8 +579,7 @@ struct partition_sizing_fixture {
 
   decltype(sirius::test::operator_utils::initialize_memory_manager()) memory_manager =
     sirius::test::operator_utils::initialize_memory_manager();
-  sirius::pipeline::pipeline_build_context context{nullptr, true};
-  std::shared_ptr<sizing_pipeline> producer = std::make_shared<sizing_pipeline>(context);
+  std::shared_ptr<controllable_pipeline> producer = std::make_shared<controllable_pipeline>(false);
   sizing_source source;
   shared_data_repository repo;
   sizing_consumer consumer;
@@ -548,6 +588,394 @@ struct partition_sizing_fixture {
 };
 
 }  // namespace
+
+TEST_CASE("build PARTITION certifies its pushed input once before any batch leaves",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture;
+  auto const first  = fixture.push({1, 3});
+  auto const second = fixture.push({7001, 9001, 11003});
+  // Two creator threads race for the first pull.
+  auto pull_a = std::async(
+    std::launch::async, [&] { return fixture.tree.build_partition->get_next_task_input_data(); });
+  auto pull_b = std::async(
+    std::launch::async, [&] { return fixture.tree.build_partition->get_next_task_input_data(); });
+  auto input_a = pull_a.get();
+  auto input_b = pull_b.get();
+  REQUIRE(input_a);
+  REQUIRE(input_b);
+  REQUIRE_FALSE(fixture.repository.popped_before_decision.load());
+  REQUIRE(fixture.repository.lookups.load() == 0);
+  auto counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_started == 1);
+  REQUIRE(counters.accumulation_expected_contributions == 2);
+
+  // The probe side never accumulates.
+  fixture.execute(*fixture.tree.probe_partition, *input_a);
+  REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);
+
+  fixture.contribute(*input_a);
+  fixture.contribute(*input_b);
+  fixture.tree.build_partition->finalize_operator();
+  counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulation_completed_contributions == 2);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.accumulations_skipped_error == 0);
+  REQUIRE(fixture.channel->filter_count() == 1);
+}
+
+TEST_CASE("a push after certification fails, and is harmless once the ledger is abandoned",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  SECTION("certified: the late batch is rejected before it becomes poppable")
+  {
+    partition_accumulation_fixture fixture;
+    fixture.push({1, 3});
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+    auto late = make_numeric_batch<std::int32_t>(*fixture.gpu, {5}, cudf::type_id::INT32);
+    REQUIRE_THROWS_AS(fixture.tree.build_partition->push_data_batch("default", late),
+                      std::logic_error);
+    REQUIRE(fixture.repository.total_size() == 0);
+    fixture.tree.join->cancel_dynamic_filter_publication();
+  }
+  SECTION("disabled by the multi-partition switch: the late batch is queued normally")
+  {
+    partition_accumulation_fixture fixture{{.multi_partition = false}};
+    fixture.push({1, 3});
+    auto input = fixture.tree.build_partition->get_next_task_input_data();
+    REQUIRE(input);
+    REQUIRE_FALSE(fixture.tree.join->dynamic_filter_plan().multi_partition_enabled());
+    fixture.contribute(*input);
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.accumulations_started == 0);
+    REQUIRE(counters.publication_attempts == 0);
+    REQUIRE(counters.accumulations_skipped_inventory == 0);
+    REQUIRE(counters.accumulations_skipped_admission == 0);
+    REQUIRE(counters.keys_considered == 0);
+    REQUIRE(counters.keys_skipped_bloom_unsupported == 0);
+    REQUIRE(counters.keys_skipped_bloom_size_gate == 0);
+    auto late = make_numeric_batch<std::int32_t>(*fixture.gpu, {5}, cudf::type_id::INT32);
+    REQUIRE_NOTHROW(fixture.tree.build_partition->push_data_batch("default", late));
+    REQUIRE(fixture.repository.total_size() == 1);
+  }
+}
+
+TEST_CASE("build PARTITION declines inputs it cannot account for",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture;
+  auto const first  = fixture.push({1, 3});
+  auto const second = fixture.push({7, 9});
+  SECTION("a multi-batch task input fails the task before it can contribute")
+  {
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE_THROWS(fixture.contribute(pipelineable_operator_data({first, second})));
+    REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);
+    fixture.tree.join->cancel_dynamic_filter_publication();
+  }
+  SECTION("a null-bearing task input")
+  {
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    fixture.contribute(pipelineable_operator_data({first, nullptr}));
+    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+  }
+  SECTION("a task input whose deferred columns are not yet materialized")
+  {
+    // A late-materialization directive on the PARTITION's port: the task input still carries
+    // placeholders for deferred columns, so its keys cannot be accounted for.
+    sirius_physical_operator scan{
+      SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
+    auto const pin    = std::make_shared<sirius::late_mat::pin_entry_handle>("accumulation_pin", 1);
+    auto const origin = [&pin](std::uint32_t position) {
+      return sirius::late_mat::column_origin{
+        .handle = pin, .column_pos = position, .generation = pin->generation()};
+    };
+    std::vector<cudf::data_type> const schema{cudf::data_type{cudf::type_id::INT32},
+                                              cudf::data_type{cudf::type_id::INT32}};
+    auto pair =
+      sirius::late_mat::make_defer_pair(schema, {0, 1}, schema, {0, 1}, {origin(0), origin(1)});
+    REQUIRE(pair.valid());
+    REQUIRE(
+      sirius::planner::install_deferral(scan, *fixture.tree.build_partition, std::move(pair)));
+    REQUIRE_FALSE(fixture.tree.build_partition->port_directive().empty());
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+    fixture.contribute(pipelineable_operator_data({first}));
+    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+    REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);
+  }
+  SECTION("an extra repository partition")
+  {
+    fixture.repository.set_num_partitions(2);
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
+  }
+  SECTION("a second data-bearing port")
+  {
+    cucascade::shared_data_repository other_repository;
+    other_repository.add_data_batch(
+      make_numeric_batch<std::int32_t>(*fixture.gpu, {11}, cudf::type_id::INT32));
+    auto other          = std::make_unique<sirius_physical_operator::port>();
+    other->type         = MemoryBarrierType::FULL;
+    other->repo         = &other_repository;
+    other->src_pipeline = fixture.producer;
+    fixture.tree.build_partition->add_port("other", std::move(other));
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
+  }
+  SECTION("a dependency-only port does not enlarge the input")
+  {
+    auto dependency          = std::make_unique<sirius_physical_operator::port>();
+    dependency->type         = MemoryBarrierType::FULL;
+    dependency->src_pipeline = fixture.producer;
+    fixture.tree.build_partition->add_port("dependency", std::move(dependency));
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+    REQUIRE(fixture.stats.snapshot().accumulation_expected_contributions == 2);
+    fixture.tree.join->cancel_dynamic_filter_publication();
+  }
+  REQUIRE(fixture.channel->snapshot().empty());
+}
+
+TEST_CASE("a build input that cannot be read fails the task and leaves the accumulation to cancel",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture;
+  auto const first  = fixture.push({1, 3});
+  auto const second = fixture.push({7, 9});
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+  {
+    // A thread holding a batch's exclusive lock cannot also read it: the read lock throws, from the
+    // PARTITION's own read of its input, before any contribution.
+    auto const held = first->try_to_mutable();
+    REQUIRE(held);
+    REQUIRE_THROWS(fixture.contribute(pipelineable_operator_data({first})));
+  }
+  auto counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_skipped_error == 0);
+  REQUIRE(counters.accumulations_skipped_inventory == 0);
+  REQUIRE(counters.accumulation_completed_contributions == 0);
+  REQUIRE_FALSE(fixture.channel->snapshot().terminal());
+  // The failed query cancels the join's publication, which ends the attempt.
+  fixture.tree.join->cancel_dynamic_filter_publication();
+  counters = fixture.stats.snapshot();
+  REQUIRE(counters.publications_failed == 1);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.channel->snapshot().empty());
+}
+
+TEST_CASE("a final contributor rescheduled before its scatter publishes once on its retry",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture;
+  std::vector<std::int32_t> many(300'000);
+  std::iota(many.begin(), many.end(), 100);
+  auto const first  = fixture.push({1, 3});
+  auto const second = fixture.push(many);
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+  fixture.contribute(pipelineable_operator_data({first}));
+
+  // The final task's reservation cannot hold its scatter: its contribution commits, then the
+  // scatter throws the out-of-memory that reschedules the task.
+  pipelineable_operator_data const input({second});
+  auto const stream = fixture.gpu->acquire_stream();
+  {
+    auto task_lease =
+      sirius::op::detail::scoped_replica_reservation::try_acquire(*fixture.gpu, mib, stream);
+    REQUIRE(task_lease);
+    REQUIRE_THROWS_AS(fixture.tree.build_partition->execute(input, stream), rmm::out_of_memory);
+    // The task path retires its stream before it releases the input.
+    stream.sync();
+  }
+  // The attempt is still open: its counters reach the stats only when it settles.
+  REQUIRE(fixture.stats.snapshot().accumulation_publications_finished == 0);
+  REQUIRE_FALSE(fixture.channel->snapshot().terminal());
+
+  // The retry re-enters with the same input: it scatters, then publishes.
+  auto const output = fixture.tree.build_partition->execute(input, stream);
+  stream.sync();
+  REQUIRE(output);
+  REQUIRE(dynamic_cast<pipelineable_operator_data const&>(*output).get_data_batches().size() == 2);
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulation_completed_contributions == 2);
+  REQUIRE(counters.accumulation_duplicate_contributions == 1);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.accumulations_skipped_error == 0);
+  REQUIRE(fixture.channel->filter_count() == 1);
+  REQUIRE(fixture.channel->snapshot().terminal());
+}
+
+TEST_CASE("the build PARTITION's finalize releases storage a task thread retired",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  partition_accumulation_fixture fixture{{.per_thread_tracking = true}};
+  auto const* allocator = fixture.gpu->get_memory_resource_of<Tier::GPU>();
+  REQUIRE(allocator != nullptr);
+  auto const first    = fixture.push({1, 3});
+  auto const second   = fixture.push({7, 9});
+  auto const baseline = allocator->get_total_allocated_bytes();
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+  auto const partials = allocator->get_total_allocated_bytes();
+  REQUIRE(partials > baseline);
+
+  // A task thread declines the attempt (its input carries a null batch) and may not free the
+  // partial arrays itself.
+  auto const stream = fixture.gpu->acquire_stream();
+  {
+    auto task_lease =
+      sirius::op::detail::scoped_replica_reservation::try_acquire(*fixture.gpu, mib, stream);
+    REQUIRE(task_lease);
+    (void)fixture.tree.build_partition->execute(pipelineable_operator_data({first, nullptr}),
+                                                stream);
+    stream.sync();
+  }
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(allocator->get_total_allocated_bytes() == partials);
+  // The build pipeline's end, before the join's.
+  fixture.tree.build_partition->finalize_operator();
+  REQUIRE(allocator->get_total_allocated_bytes() == baseline);
+}
+
+TEST_CASE("drained finalization closes and releases unfinished accumulated input",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  auto const per_thread = GENERATE(false, true);
+  auto const pending    = GENERATE(false, true);
+  auto const join_end   = GENERATE(false, true);
+  CAPTURE(per_thread, pending, join_end);
+  partition_accumulation_fixture fixture{{.per_thread_tracking = per_thread}};
+  auto const first      = fixture.push({1, 3});
+  auto const second     = fixture.push({7, 9});
+  auto const* allocator = fixture.gpu->get_memory_resource_of<Tier::GPU>();
+  auto const baseline   = allocator->get_total_allocated_bytes();
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  REQUIRE(fixture.repository.total_size() == 0);
+  auto const stream = fixture.gpu->acquire_stream();
+  fixture.tree.join->dynamic_filter_session().contribute(
+    first->get_batch_id(), first->to_read_only(), stream);
+  if (pending) {
+    fixture.tree.join->dynamic_filter_session().contribute(
+      second->get_batch_id(), second->to_read_only(), stream);
+  }
+  stream.sync();
+  REQUIRE_FALSE(fixture.channel->snapshot().terminal());
+  REQUIRE(allocator->get_total_allocated_bytes() > baseline);
+
+  auto* finalizer = join_end ? static_cast<sirius_physical_operator*>(fixture.tree.join.get())
+                             : fixture.tree.build_partition;
+  finalizer->finalize_operator();
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(fixture.channel->snapshot().empty());
+  REQUIRE(allocator->get_total_allocated_bytes() == baseline);
+  auto const counters = fixture.stats.snapshot();
+  REQUIRE(counters.accumulations_incomplete == (pending ? 0 : 1));
+  REQUIRE(counters.accumulations_abandoned == (pending ? 1 : 0));
+  REQUIRE(counters.publications_finished == 1);
+  finalizer->finalize_operator();
+  REQUIRE(fixture.stats.snapshot().publications_finished == 1);
+  REQUIRE(allocator->get_total_allocated_bytes() == baseline);
+}
+
+TEST_CASE("whole-build publication survives single-partition and broadcast build finalization",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  auto const multi_partition = GENERATE(false, true);
+  auto const broadcast       = GENERATE(false, true);
+  CAPTURE(multi_partition, broadcast);
+  partition_accumulation_fixture fixture{
+    {.preset_partition_count = !broadcast, .multi_partition = multi_partition}};
+  cucascade::shared_data_repository probe_input;
+  std::array<cucascade::shared_data_repository, 2> join_input;
+  if (broadcast) {
+    fixture.tree.join->set_active_gpu_ids({0, 1});
+    fixture.tree.build_partition->set_sibling_partition_op(fixture.tree.probe_partition);
+    fixture.tree.probe_partition->set_sibling_partition_op(fixture.tree.build_partition);
+    fixture.tree.build_partition->add_next_port_after_sink(
+      {fixture.tree.join->children[1].get(), "default", {}});
+    auto probe_port          = std::make_unique<sirius_physical_operator::port>();
+    probe_port->type         = MemoryBarrierType::FULL;
+    probe_port->repo         = &probe_input;
+    probe_port->src_pipeline = fixture.producer;
+    fixture.tree.probe_partition->add_port("default", std::move(probe_port));
+  } else {
+    fixture.tree.build_partition->set_num_partitions(1);
+    fixture.tree.join->set_build_arrives_whole(true);
+  }
+  std::size_t index = 0;
+  for (auto const name : {"build", "default"}) {
+    auto port  = std::make_unique<sirius_physical_operator::port>();
+    port->type = MemoryBarrierType::FULL;
+    port->repo = &join_input[index++];
+    fixture.tree.join->add_port(name, std::move(port));
+  }
+  auto const batch = fixture.push({1, 3, 7, 9});
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  if (broadcast) { REQUIRE(fixture.tree.join->is_build_probe_mode()); }
+  fixture.tree.build_partition->finalize_operator();
+  REQUIRE_FALSE(fixture.channel->snapshot().terminal());
+  fixture.tree.join->push_data_batch_partitioned("build", batch, 0);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE_FALSE(fixture.channel->snapshot().empty());
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
+  REQUIRE(fixture.stats.snapshot().publications_finished == 1);
+}
+
+TEST_CASE("a non-FULL build input never accumulates and never blocks",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  sirius_physical_operator order_by{
+    SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
+  partition_accumulation_fixture fixture{{.barrier = MemoryBarrierType::PIPELINE}};
+  REQUIRE(fixture.tree.build_partition->input_barrier_for(order_by) == MemoryBarrierType::PIPELINE);
+  fixture.producer->finished.store(false);
+  fixture.push({1, 3});
+  auto input = fixture.tree.build_partition->get_next_task_input_data();
+  REQUIRE(input);
+  REQUIRE(fixture.stats.snapshot().accumulations_skipped_inventory == 1);
+  REQUIRE(fixture.stats.snapshot().accumulations_started == 0);
+  fixture.contribute(*input);
+  REQUIRE(fixture.stats.snapshot().accumulation_completed_contributions == 0);
+  // Later batches are queued and pulled as usual.
+  REQUIRE_NOTHROW(fixture.push({5, 7}));
+  REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+  fixture.tree.join->cancel_dynamic_filter_publication();
+}
+
+TEST_CASE("a FULL build input is certified only after its source pipeline finished",
+          "[physical_partition][dynamic_filter][multi_partition]")
+{
+  SECTION("an unfinished source keeps every batch queued")
+  {
+    partition_accumulation_fixture fixture;
+    fixture.push({1, 3});
+    fixture.producer->finished.store(false);
+    REQUIRE_FALSE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.repository.total_size() == 1);
+    REQUIRE(fixture.stats.snapshot().publication_attempts == 0);
+    fixture.producer->finished.store(true);
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    REQUIRE(fixture.stats.snapshot().accumulations_started == 1);
+    fixture.tree.join->cancel_dynamic_filter_publication();
+  }
+  SECTION("one partition attempts nothing")
+  {
+    partition_accumulation_fixture fixture;
+    fixture.tree.build_partition->set_num_partitions(1);
+    fixture.push({1, 3});
+    REQUIRE(fixture.tree.build_partition->get_next_task_input_data());
+    auto const counters = fixture.stats.snapshot();
+    REQUIRE(counters.publication_attempts == 0);
+    REQUIRE(counters.accumulations_skipped_inventory == 0);
+  }
+}
 
 TEST_CASE("partition sizing uses a projection and keeps its first decision",
           "[physical_partition][size_estimation]")
@@ -562,6 +990,9 @@ TEST_CASE("partition sizing uses a projection and keeps its first decision",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
   CHECK(f.consumer.count == 4);
+  // The consumer's placement is latched with the count.
+  REQUIRE(f.consumer.placement() != nullptr);
+  CHECK(f.consumer.placement()->num_partitions() == 4);
 
   // A later sizing attempt must keep the count, even when the final total differs.
   f.finish(8 * f.received_bytes);

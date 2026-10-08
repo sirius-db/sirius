@@ -48,7 +48,7 @@ TEST_CASE("device_copy_batch filters empty descriptors and resets for reuse",
   CHECK(batch.empty());
   CHECK(batch.count() == 0);
   CHECK(batch.bytes() == 0);
-  CHECK(batch.enqueue(rmm::cuda_stream_default) == cudaSuccess);
+  CHECK(batch.enqueue(::cuda::stream_ref{cudaStream_t{cudaStreamDefault}}) == cudaSuccess);
 
   batch.add(&byte, &byte, 1);
   REQUIRE(batch.count() == 1);
@@ -73,7 +73,7 @@ TEST_CASE("device_copy_batch copies separate source allocations in one submissio
   std::fill_n(second, piece_size, std::uint8_t{0x72});
 
   rmm::cuda_stream stream;
-  rmm::device_buffer destination{2 * piece_size, stream.view()};
+  rmm::device_buffer destination{2 * piece_size, stream};
 
   sirius::cuda::device_copy_batch batch;
   batch.reserve(2);
@@ -85,7 +85,7 @@ TEST_CASE("device_copy_batch copies separate source allocations in one submissio
   // an allocation boundary.
   REQUIRE(batch.count() == 2);
   REQUIRE(batch.bytes() == 2 * piece_size);
-  REQUIRE(batch.enqueue(stream.view()) == cudaSuccess);
+  REQUIRE(batch.enqueue(stream) == cudaSuccess);
   stream.synchronize();
 
   std::array<std::uint8_t, 2 * piece_size> result{};

@@ -34,9 +34,9 @@ namespace sirius::op {
  * every position: batch `i` belongs to the preserved input exactly when `i < preserved_count()`.
  *
  * The batches are one partition of each side. A partition index is carried only when the operator
- * produced more than one partition: an indexed task is pinned to `_active_gpu_ids[idx % size]` so
- * every task of a partition shares a device, while a single-partition task has no such constraint
- * and is better placed by data affinity.
+ * produced more than one partition: an indexed task is pinned to the partition's device in the
+ * exchange's placement so every task of a partition shares a device, while a single-partition task
+ * has no such constraint and is better placed by data affinity.
  */
 class dense_count_join_input : public partitioned_operator_data {
  public:
@@ -56,11 +56,13 @@ class dense_count_join_input : public partitioned_operator_data {
    *
    * @param preserved_batches Batches from the outer-join-preserved input
    * @param counted_batches Batches from the input whose matches contribute to COUNT
-   * @param partition_idx Partition these batches came from; pins the task to one GPU
+   * @param partition_idx Partition these batches came from
+   * @param placement Placement of the exchange; pins the task to the partition's GPU
    */
   dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
                          std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
-                         std::size_t partition_idx);
+                         std::size_t partition_idx,
+                         partition_placement const& placement);
 
   /** @brief Number of leading batches that belong to the preserved input. */
   [[nodiscard]] std::size_t preserved_count() const noexcept { return _preserved_count; }
