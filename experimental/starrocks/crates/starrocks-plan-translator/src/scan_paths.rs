@@ -22,7 +22,8 @@ use crate::error::{Result, TranslateError};
 /// Collection fails closed: only the slice that maps faithfully onto a `parquet_scan` over
 /// local files is accepted — a `FILES()` query (not a load), reading local parquet files whose
 /// columns are direct passthroughs to the scan tuple. Byte ranges assigned to this instance are
-/// normalized per file: overlaps are refused (they would read rows twice), adjacent ranges
+/// normalized per file: overlaps are refused (StarRocks reads shared rows once per range, the
+/// engine once per file), adjacent ranges
 /// coalesce, an exact tiling of the whole file collapses to a whole-file read, and anything
 /// else is emitted as explicit `[start, start+length)` splits — the engine reads exactly the
 /// row groups whose start offset falls inside each split, so the instances of a distributed
@@ -150,8 +151,9 @@ impl ScanFilePaths {
 
     /// Normalizes each file's byte ranges into the [`ScanFile`]s this instance reads.
     ///
-    /// Overlaps are refused — under start-offset row-group ownership two overlapping ranges
-    /// would read the same row groups twice, silently. Adjacent ranges coalesce; an exact
+    /// Overlaps are refused: StarRocks would read the shared rows once per range, while the
+    /// engine takes the union of a file's ranges and reads them once, so results would differ
+    /// silently. Adjacent ranges coalesce; an exact
     /// tiling of the whole file collapses to a whole-file read (so single-instance plans stay
     /// byte-identical to before splits existed); everything else becomes explicit ranges. The
     /// rest of the file belongs to other instances of the same distributed scan.
@@ -241,7 +243,8 @@ impl ScanFilePaths {
                         if start < last.1 {
                             return Err(Self::unsupported(
                                 node_id,
-                                "overlapping byte ranges would read the same rows twice",
+                                "overlapping byte ranges have no single meaning: StarRocks \
+                                 reads shared rows once per range, the engine once",
                             ));
                         }
                         if start == last.1 {

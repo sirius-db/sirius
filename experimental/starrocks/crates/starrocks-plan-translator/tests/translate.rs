@@ -740,8 +740,8 @@ fn open_ended_split_reads_to_the_end_of_the_file() {
     assert_eq!((items[0].start, items[0].length), (1024, 3072));
 }
 
-/// Verifies overlapping ranges are refused: under start-offset row-group ownership they would
-/// read the same rows twice, silently.
+/// Verifies overlapping ranges are refused: StarRocks reads the shared rows once per range, the
+/// engine once, so the results would disagree silently.
 #[test]
 fn overlapping_split_ranges_are_refused() {
     let path = "file:///data/users.parquet";
@@ -1127,7 +1127,8 @@ fn all_empty_splits_of_one_file_are_refused_beside_a_real_file() {
 fn overlapping_split_broker_ranges_are_unsupported() {
     assert_eq!(
         splits_rejected_because(1024, &[(0, 1024), (0, 512)]),
-        "overlapping byte ranges would read the same rows twice"
+        "overlapping byte ranges have no single meaning: StarRocks reads shared rows once per \
+         range, the engine once"
     );
 }
 
