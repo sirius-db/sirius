@@ -48,6 +48,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
+          locked: true
           pixi-version: v0.81.0
           manifest-path: experimental/starrocks/pixi.toml
           environments: cn
@@ -55,17 +56,17 @@ jobs:
       # Scope by package: `--all` would also reach the sibling rust/ workspace via the
       # `sirius` path dep. Mirrors check.yml's scoped rust/ fmt check.
       - name: fmt
-        run: pixi run -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
+        run: pixi run --locked -e cn cargo fmt --package sirius-starrocks-cn --package starrocks-plan-translator --package starrocks-thrift -- --check
 
       # The CN's `sirius-engine` feature is on by default but links a Sirius build
       # tree (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build
       # the pure-Rust path here. The engine path is exercised on a GPU box via
       # `pixi run cn-build` / `cn-test`.
       - name: clippy
-        run: pixi run -e cn cargo clippy --all-targets --no-default-features -- -D warnings
+        run: pixi run --locked -e cn cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: test
-        run: pixi run -e cn cargo test --workspace --no-default-features
+        run: pixi run --locked -e cn cargo test --workspace --no-default-features
 
   doris:
     name: doris
@@ -92,6 +93,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
+          locked: true
           pixi-version: v0.81.0
           manifest-path: experimental/doris/pixi.toml
           environments: be
@@ -99,18 +101,18 @@ jobs:
       # Scope by package: `--all` would also reach the sibling rust/ workspace via the
       # `sirius` path dep.
       - name: fmt
-        run: pixi run -e be cargo fmt --package sirius-doris-be --package doris-plan-translator --package doris-thrift --package doris-proto -- --check
+        run: pixi run --locked -e be cargo fmt --package sirius-doris-be --package doris-plan-translator --package doris-thrift --package doris-proto -- --check
 
       # The BE's `sirius-engine` feature is on by default but links a Sirius build tree
       # (C++ toolchain + RAPIDS/CUDA) that this CI env does not have, so build the
       # pure-Rust path here. The engine path is exercised on a GPU box via
       # `pixi run be-build` / `be-test`.
       - name: clippy
-        run: pixi run -e be cargo clippy --all-targets --no-default-features -- -D warnings
+        run: pixi run --locked -e be cargo clippy --all-targets --no-default-features -- -D warnings
 
       # Includes tests/corpus.rs, which replays the captured TPC-H dispatch fixtures.
       - name: test
-        run: pixi run -e be cargo test --workspace --no-default-features
+        run: pixi run --locked -e be cargo test --workspace --no-default-features
 
   experimental:
     name: experimental
