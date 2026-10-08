@@ -20,6 +20,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
+#include <helper/timestamp_semantics.hpp>
 #include <sirius/exception.hpp>
 
 // cudf
@@ -87,12 +88,20 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
     child = evaluate_result(
       cudf::make_column_from_scalar(child.get_scalar(), _input_table.num_rows(), _stream, _mr));
   }
-  // Only planner-certified carrier restoration may tunnel through the narrowed representation.
-  // A semantic cast delegates to cuDF and is never reinterpreted as a physical DATE restore.
-  auto result_column =
-    alt.kind == sirius::ast::cast_kind::carrier_restore
-      ? sirius::cast_through_rep(child.get_column_view(), return_type, _stream, _mr)
-      : cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+  std::unique_ptr<cudf::column> result_column;
+  auto const source_type = child.get_column_view().type().id();
+  if (alt.kind == sirius::ast::cast_kind::semantic &&
+      (source_type == cudf::type_id::TIMESTAMP_NANOSECONDS ||
+       source_type == cudf::type_id::TIMESTAMP_MILLISECONDS ||
+       source_type == cudf::type_id::TIMESTAMP_SECONDS) &&
+      return_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
+    result_column = temporal::cast_to_microseconds_checked(child.get_column_view(), _stream, _mr);
+  } else {
+    // Only planner-certified carrier restoration may tunnel through a narrowed representation.
+    result_column = alt.kind == sirius::ast::cast_kind::carrier_restore
+                      ? sirius::cast_through_rep(child.get_column_view(), return_type, _stream, _mr)
+                      : cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+  }
   if (mode == evaluation_mode::AST) {
     // The parent is executing in AST mode, so add the materialized result to the AST tree.
     return materialize_as_ast_column(std::move(result_column));
