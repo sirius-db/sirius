@@ -39,7 +39,11 @@ namespace sirius::transparent {
 /// enabled. It acts as a source operator: DuckDB's executor calls GetData() to retrieve
 /// results, which are produced by executing the Sirius physical plan on the GPU.
 ///
-/// Created by SiriusContext::OnFinalizePrepare when the query is GPU-acceleratable.
+/// Created by SiriusContext::OnFinalizePrepare when the query is GPU-acceleratable, and —
+/// through make_cpu_only — when GPU planning declined a plan that reads Sirius-owned S3 and
+/// the retained CPU plan may run under the S3 CPU-fallback admission.
+struct SiriusGlobalSourceState;
+
 class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
  public:
   static constexpr const duckdb::PhysicalOperatorType TYPE =
@@ -60,6 +64,19 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr,
     std::uint64_t validated_plan_pin_epoch                                         = 0,
     std::optional<uint64_t> captured_transaction_id                                = std::nullopt);
+
+  /// A root for a plan whose GPU planning was declined but whose retained CPU
+  /// plan reads Sirius-owned S3: every execution re-decides the S3 admission
+  /// (setting, runtime health, cancellation) and then runs the CPU plan under
+  /// a CpuFallbackGuard.  @p decline_reason is the GPU planner's refusal.
+  static PhysicalSiriusExecution& make_cpu_only(
+    duckdb::PhysicalPlan& physical_plan,
+    std::string decline_reason,
+    std::string query_sql,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<std::string> names,
+    duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
+    plan_source_policy source_policy);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -124,6 +141,11 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// pin-derived decisions, and pin/unpin can land between that window and this operator's
   /// execution window, so the plan is reused only while the epoch still matches.
   std::uint64_t validated_plan_pin_epoch_ = 0;
+
+  /// Set by make_cpu_only: the GPU planner's refusal; empty for a GPU root.
+  std::optional<std::string> cpu_only_decline_reason_;
+
+  void execute_cpu_only(duckdb::ExecutionContext& context, SiriusGlobalSourceState& state) const;
 };
 
 }  // namespace sirius::transparent

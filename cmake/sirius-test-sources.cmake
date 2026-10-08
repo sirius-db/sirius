@@ -311,6 +311,7 @@ set(TEST_SOURCES
     test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
+    test/cpp/integration/test_s3_cpu_fallback.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 # cmake-format: on
 

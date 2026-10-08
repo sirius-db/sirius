@@ -203,8 +203,14 @@ struct cpu_replay_policy_validator final : ClientContextState {
     auto policy = prepared.physical_plan ? sirius::transparent::derive_plan_source_policy(
                                              prepared.physical_plan->Root(), context)
                                          : sirius::transparent::plan_source_policy{{}, false};
+    // The replay connection runs under the outer statement's admission; its
+    // decision, not this connection's settings, governs the S3 veto.
+    sirius::transparent::cpu_replay_decision decision;
+    if (auto state = duckdb::get_sirius_connection_state(context); state) {
+      if (auto admitted = state->active_cpu_replay(); admitted) { decision = *admitted; }
+    }
     try {
-      sirius::transparent::require_cpu_replay(policy, "", gpu_error);
+      sirius::transparent::require_cpu_replay(policy, decision, "", gpu_error);
     } catch (...) {
       *policy_refused = true;
       throw;
@@ -227,34 +233,35 @@ struct cpu_replay_result {
     return std::move(result);
   }
 };
-cpu_replay_result run_internal_cpu_fallback_query(ClientContext& context,
-                                                  Connection& connection,
-                                                  const string& query,
-                                                  const string& gpu_error             = "",
-                                                  duckdb::SiriusContext* test_context = nullptr)
+cpu_replay_result run_internal_cpu_fallback_query(
+  ClientContext& context,
+  Connection& connection,
+  const string& query,
+  const string& gpu_error                           = "",
+  duckdb::SiriusContext* test_context               = nullptr,
+  sirius::transparent::cpu_replay_decision decision = {})
 {
-  // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
-  // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
-  // read_parquet has no S3 filesystem, so a query that reads s3:// cannot fall
-  // back to CPU. Surface a clear error (with the underlying GPU cause) instead
-  // of replaying a query that would fail anyway. Local / non-s3 queries are
-  // unaffected and fall through to the normal DuckDB CPU replay below.
-  if (sirius::references_sirius_owned_s3_parquet(query)) {
+  // Without the sirius_s3_cpu_fallback admission, Sirius reads s3:// only on
+  // the GPU path and a query that reads s3:// cannot fall back to CPU: surface
+  // a clear error (with the underlying GPU cause) instead of replaying a query
+  // that would fail anyway. Local / non-s3 queries are unaffected and fall
+  // through to the normal DuckDB CPU replay below.
+  if (!decision.s3_allowed && sirius::references_sirius_owned_s3_parquet(query)) {
     throw std::runtime_error(
       "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
       "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
       gpu_error);
   }
 
-  // CpuFallbackGuard marks this replay so sirius_httpfs refuses to serve s3://
-  // data reached indirectly (e.g. through a view) to the CPU plan — the
-  // string-level references_sirius_owned_s3_parquet check above only catches a
-  // literal read_parquet('s3://') in the query text. Both guards bind to the
-  // TARGET executing connection (the replay runs on `connection`, not on the
-  // context that issued the original query) and are no-ops when Sirius has no
-  // per-connection state there.
+  // CpuFallbackGuard marks this replay and carries the outer decision, so the
+  // sirius_httpfs gates serve s3:// reached indirectly (e.g. through a view)
+  // only when it allows — the string-level references_sirius_owned_s3_parquet
+  // check above only catches a literal read_parquet('s3://') in the query
+  // text. Both guards bind to the TARGET executing connection (the replay runs
+  // on `connection`, not on the context that issued the original query) and
+  // are no-ops when Sirius has no per-connection state there.
   duckdb::SiriusContext::InternalQueryGuard guard(*connection.context);
-  duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*connection.context);
+  duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*connection.context, decision);
   auto& states                 = *connection.context->registered_state;
   constexpr auto validator_key = "sirius_cpu_replay_policy";
   auto policy_refused          = std::make_shared<bool>(false);
@@ -633,21 +640,26 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
             duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered &&
           sirius_ctx)
         sirius_ctx->record_late_failure(failure.cause);
-      // Cancellation is never a fallback candidate; a pre-existing-unavailable
-      // error on an S3 query keeps its stable typed message (no CPU fallback
-      // exists for S3, so the S3 rewrite inside the fallback helper must not
-      // replace it).
+      // Cancellation is never a fallback candidate. A pre-existing-unavailable
+      // error keeps its stable typed message for a literal s3:// query, and —
+      // once the decision admits S3 — for S3 bound behind a view; with the
+      // switch off the view case keeps the bound-source veto text below.
       if (gpu_error.Type() == ExceptionType::INTERRUPT) { gpu_error.Throw(); }
+      // One decision for this execution: it governs the bound-source checks
+      // here, the SQL-text check in the helper, and the replay connection's
+      // gates. S3 hidden behind a view is only consulted when the decision
+      // admits it; otherwise the bound-source veto below keeps refusing it.
+      sirius::transparent::cpu_replay_decision const decision{s3_cpu_fallback_enabled(context)};
       if (runtime_unavailable_error &&
-          sirius::references_sirius_owned_s3_parquet(data.cpu_fallback_query)) {
+          (sirius::references_sirius_owned_s3_parquet(data.cpu_fallback_query) ||
+           (decision.s3_allowed && data.source_policy.reads_sirius_owned_s3()))) {
         gpu_error.Throw();
       }
       if (!duckdb_fallback_enabled(context)) {
         throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
       }
-      // Check the bound sources before entering CPU replay. The helper below
-      // retains its existing SQL-text check as an additional S3 signal.
-      sirius::transparent::require_cpu_replay(data.source_policy, "", gpu_error.RawMessage());
+      sirius::transparent::require_cpu_replay(
+        data.source_policy, decision, "", gpu_error.RawMessage());
       if (sirius_ctx) { sirius_ctx->before_cpu_replay_for_testing(context); }
       if (lease_release.state !=
             duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
@@ -658,10 +670,11 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
           "SiriusExecuteQuery error: checkpoint-lease cleanup did not complete before CPU replay");
       }
       // The retained helper also vetoes S3 mentioned only in SQL text (for example
-      // an unused CTE omitted from the bound plan). Count replay only after this
-      // final source guard; keep its existing position after the lease check.
+      // an unused CTE omitted from the bound plan) unless the decision admits
+      // S3. Count replay only after this final source guard; keep its existing
+      // position after the lease check.
       sirius::transparent::require_s3_cpu_replay(
-        data.source_policy, data.cpu_fallback_query, gpu_error.RawMessage());
+        data.source_policy, decision, data.cpu_fallback_query, gpu_error.RawMessage());
       D_ASSERT(!gstate.res && !gstate.finished);
       if (injections && injections->interrupt_before_replay) context.interrupted = true;
       auto const read_only = injections && injections->override_read_only
@@ -677,8 +690,12 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
-      auto cpu_replay = run_internal_cpu_fallback_query(
-        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), sirius_ctx.get());
+      auto cpu_replay = run_internal_cpu_fallback_query(context,
+                                                        *gstate.conn,
+                                                        data.cpu_fallback_query,
+                                                        gpu_error.RawMessage(),
+                                                        sirius_ctx.get(),
+                                                        decision);
       if (cpu_replay.policy_refused) {
         failure_trace.refused_by =
           sirius::transparent::late_failure_condition::policy_refused_in_replay;
@@ -3015,6 +3032,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     SetEnableDuckdbFallback);
 
   add_sirius_option(config,
+                    option_visibility::user,
+                    "sirius_s3_cpu_fallback",
+                    "Allow queries over Sirius-owned s3:// data to run on DuckDB CPU execution: "
+                    "replay after a GPU failure or planning decline, and plain reads with "
+                    "gpu_execution off. REST backend only. Default false: S3 stays GPU-only.",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
                     option_visibility::internal,
                     "sirius_test_inject_gpu_task_oom",
                     "latched execution test injection",
@@ -3148,6 +3173,12 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     option_visibility::internal,
                     "sirius_test_inject_pin_registry_change",
                     "simulate a pin or unpin landing between the finalize and execution windows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_finalize_publish_error",
+                    "fail the transparent GPU plan publication after the CPU plan was moved",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(false));
   add_sirius_option(config,
@@ -3588,9 +3619,8 @@ static void LoadInternal(ExtensionLoader& loader)
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes
   // the transparent form work — SET gpu_execution=true; SELECT ... FROM
   // read_parquet('s3://...') — with the captured scan run on GPU. sirius_httpfs
-  // is read-only and GPU-only: it serves the bind-time footer read, never a CPU
-  // data path (a query that reads s3:// and fails on GPU still surfaces a clear
-  // "S3 CPU fallback is not supported" error; local reads fall back to CPU).
+  // is read-only and GPU-only by default: it serves the bind-time footer read,
+  // and a CPU data path only under the sirius_s3_cpu_fallback admission.
   db.GetFileSystem().RegisterSubSystem(make_uniq<sirius::io::s3::sirius_httpfs>());
 
   // Register optimizer extension for transparent GPU execution. The post-hook

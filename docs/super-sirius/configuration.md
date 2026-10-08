@@ -868,6 +868,7 @@ SET enable_runtime_size_estimation = true;   -- off by default
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus explicit `CALL gpu_execution(...)`. Set to `false` to surface Sirius errors instead of falling back. |
+| `sirius_s3_cpu_fallback` | false | Allow queries over Sirius-owned `s3://` data to run on DuckDB CPU execution: replay after a GPU failure or planning decline, the explicit `gpu_execution(...)` replay, and plain reads with `gpu_execution` off. REST backend only. Off: S3 stays GPU-only and CPU-path S3 opens are refused where they reach Sirius (see [scan.md](scan.md)). |
 | `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 

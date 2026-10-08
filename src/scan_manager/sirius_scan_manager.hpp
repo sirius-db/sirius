@@ -894,6 +894,21 @@ class sirius_scan_manager {
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
+  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
+  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
+  /// building it once per backend on first use.  Routes by path through the registry
+  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
+  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
+
+  /// The second half of create_datasource: open @p path on an ioctx the caller
+  /// already resolved with ioctx_for_path (and may have refused on its type
+  /// before any object I/O).  Returns nullptr for a null @p io_ctx.
+  [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> open_datasource_on(
+    std::shared_ptr<sirius::io::ioctx> const& io_ctx,
+    std::string_view path,
+    sirius::io::open_hint hint = sirius::io::open_hint::generic);
+
   /// \brief Stream ListObjectsV2 pages for @p s3_prefix_uri ("s3://bucket/prefix")
   ///        to @p sink, one call per page; @p sink returns false to stop early.
   ///        Uses @ref rest_ioctx_for_list (throws a clear error when the REST
@@ -1047,13 +1062,6 @@ class sirius_scan_manager {
   /// via the sirius.executor.scan_manager.memory_prefetcher config block (see
   /// memory_prefetcher.hpp). No-op otherwise.
   void maybe_start_memory_prefetcher(query_scan_manager_state& state);
-
-  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
-  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
-  /// building it once per backend on first use.  Routes by path through the registry
-  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
 
   /// Resolve the ioctx of @p type, building and caching it on first use (the
   /// by-path routing above resolves to a type and then lands here).  Returns
