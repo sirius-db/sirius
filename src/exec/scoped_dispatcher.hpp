@@ -37,10 +37,13 @@ concept scoped_dispatcher_task = std::invocable<F> || std::invocable<F, std::sto
 
 class scoped_dispatcher {
  public:
-  scoped_dispatcher(static_thread_pool& pool, std::size_t max_concurrent_task = 0)
+  scoped_dispatcher(static_thread_pool& pool,
+                    std::size_t max_concurrent_task = 0,
+                    queue_priority priority         = 0)
     : pool_(pool),
       max_inflight_(max_concurrent_task == 0 ? pool.num_threads()
-                                             : std::min(max_concurrent_task, pool.num_threads()))
+                                             : std::min(max_concurrent_task, pool.num_threads())),
+      priority_(priority)
   {
   }
 
@@ -166,29 +169,48 @@ class scoped_dispatcher {
     }
   }
 
-  // A slot is transferred through a worker-local chain. There is no allocating
-  // pool enqueue between completion and the next pending task.
+  // Retain the slot across handoffs so wait_for_all() includes queued continuations.
+  // A null task means this continuation must claim pending work on the worker.
   void run(task_t task) noexcept
   {
+    bool can_yield = true;
     for (;;) {
-      if (task) {
-        try {
-          task();
-        } catch (...) {
-          try {
-            log_exception_ptr(std::current_exception());
-          } catch (...) {
-          }
+      if (!task) {
+        std::lock_guard lk(mu_);
+        if (stop_.stop_requested() || pending_.empty()) {
+          release_slot_locked();
+          return;
         }
-        task = nullptr;
-      }
-      std::lock_guard lk(mu_);
-      if (!stop_.stop_requested() && !pending_.empty()) {
         task = std::move(pending_.front());
         pending_.pop_front();
-      } else {
-        release_slot_locked();
-        return;
+      }
+      try {
+        task();
+      } catch (...) {
+        try {
+          log_exception_ptr(std::current_exception());
+        } catch (...) {
+        }
+      }
+      task = nullptr;  // Captures may reenter the dispatcher; destroy outside mu_.
+      {
+        std::lock_guard lk(mu_);
+        if (stop_.stop_requested() || pending_.empty()) {
+          release_slot_locked();
+          return;
+        }
+      }
+      if (can_yield) {
+        try {
+          // Pending tasks stay in the dispatcher until the continuation runs, so
+          // a failed submission cannot destroy or lose the next task.
+          pool_.schedule([this] { run(nullptr); }, priority_);
+          return;
+        } catch (...) {
+          // Already on a worker: drain locally if the pool cannot accept a handoff.
+          // Avoid repeated failing allocations and preserve the outstanding slot.
+          can_yield = false;
+        }
       }
     }
   }
@@ -204,7 +226,7 @@ class scoped_dispatcher {
   void submit(task_t task)
   {
     try {
-      pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); });
+      pool_.schedule([this, task = std::move(task)]() mutable { run(std::move(task)); }, priority_);
     } catch (...) {
       // No worker owns this slot. Cancel pending work without executing user tasks on the
       // producer thread, then release the failed slot and propagate the original exception.
@@ -217,6 +239,7 @@ class scoped_dispatcher {
 
   static_thread_pool& pool_;
   std::size_t max_inflight_;
+  const queue_priority priority_;
 
   std::mutex mu_;
   std::condition_variable cv_done_;      // drained signal; not stop-aware

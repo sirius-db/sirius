@@ -1485,10 +1485,10 @@ void sirius_scan_manager::prepare_for_query(
   state->pruning_enabled   = enable_pinned_zone_map_pruning;
   state->completion        = completion;
   // Deliberately NOT divided by the query count: a lone query must still be able to use the
-  // whole pool. Oversubscription across concurrent queries is absorbed by the dispatcher's
-  // pending queue and the pool, not by a per-query cap.
-  state->dispatcher =
-    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
+  // whole pool. Dispatchers yield between tasks; the shared pool selects older queries
+  // first and preserves FIFO order within each query's priority.
+  state->dispatcher = std::make_unique<exec::scoped_dispatcher>(
+    _thread_pool, _thread_pool.num_threads(), sirius::query_priority_bits(query_id));
   state->metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
   // ioctxs are process/query-manager resources and remain alive across query
