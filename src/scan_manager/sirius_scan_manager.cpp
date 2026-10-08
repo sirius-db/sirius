@@ -2685,6 +2685,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
       // Build privately: validation/allocation failure leaves the published generation intact.
       auto const& previous = *existing_it->second;
       pinned_entry entry;
+      // The source is unchanged. Preserve its evidence; revalidate the merged layout below.
+      entry.identity_evidence      = previous.identity_evidence;
       entry.cache_info             = previous.cache_info;
       entry.data_batches_by_column = previous.data_batches_by_column;
       entry.chunk_memory_spaces    = previous.chunk_memory_spaces;
