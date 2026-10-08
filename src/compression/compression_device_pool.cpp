@@ -34,13 +34,14 @@ namespace sirius::compression {
 
 namespace {
 
-/// Bytes currently allocated from the arena. One relaxed atomic per allocation,
-/// always on: the spill path reads it to skip compressing when the arena is
-/// nearly full (see compression_device_pool_used_bytes), rather than letting the
-/// encode fail into it.
-std::atomic<std::size_t> g_arena_used{0};
+/// Bytes currently allocated from the arena, and their high-water mark. A couple
+/// of relaxed atomics per allocation, always on: the spill path reads the usage
+/// to skip compressing when the arena is nearly full (see
+/// compression_device_pool_used_bytes), and the per-query pool log reports the
+/// peak (compression_device_pool_peak_bytes).
+usage_high_water_mark g_arena_usage;
 
-/// Forwards to the arena and keeps g_arena_used. Same shape as the optional
+/// Forwards to the arena and keeps g_arena_usage. Same shape as the optional
 /// counting adaptor in compression_alloc_stats.cpp, which may wrap this one.
 class arena_usage_resource {
  public:
@@ -49,7 +50,7 @@ class arena_usage_resource {
   void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
   {
     void* ptr = _upstream.allocate(stream, bytes, alignment);
-    g_arena_used.fetch_add(bytes, std::memory_order_relaxed);
+    g_arena_usage.on_allocate(bytes);
     return ptr;
   }
 
@@ -59,20 +60,20 @@ class arena_usage_resource {
                   std::size_t alignment) noexcept
   {
     _upstream.deallocate(stream, ptr, bytes, alignment);
-    g_arena_used.fetch_sub(bytes, std::memory_order_relaxed);
+    g_arena_usage.on_deallocate(bytes);
   }
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment)
   {
     void* ptr = _upstream.allocate_sync(bytes, alignment);
-    g_arena_used.fetch_add(bytes, std::memory_order_relaxed);
+    g_arena_usage.on_allocate(bytes);
     return ptr;
   }
 
   void deallocate_sync(void* ptr, std::size_t bytes, std::size_t alignment) noexcept
   {
     _upstream.deallocate_sync(ptr, bytes, alignment);
-    g_arena_used.fetch_sub(bytes, std::memory_order_relaxed);
+    g_arena_usage.on_deallocate(bytes);
   }
 
   bool operator==(arena_usage_resource const& other) const noexcept { return this == &other; }
@@ -152,14 +153,70 @@ rmm::device_async_resource_ref compression_device_mr()
 
 bool compression_device_pool_enabled() noexcept { return g_pool_usage != nullptr; }
 
-std::size_t compression_device_pool_used_bytes() noexcept
-{
-  return g_arena_used.load(std::memory_order_relaxed);
-}
+std::size_t compression_device_pool_used_bytes() noexcept { return g_arena_usage.used(); }
+
+std::size_t compression_device_pool_peak_bytes() noexcept { return g_arena_usage.peak(); }
+
+void compression_device_pool_reset_peak() noexcept { (void)g_arena_usage.reset_peak(); }
 
 std::size_t compression_device_pool_bytes() noexcept
 {
   return g_pool_bytes.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+std::atomic<std::uint64_t> g_enc_granted{0};
+std::atomic<std::uint64_t> g_enc_declined{0};
+usage_high_water_mark g_enc_reserved;
+std::atomic<std::size_t> g_enc_largest_reserved{0};
+std::atomic<std::size_t> g_enc_largest_used{0};
+
+void raise_to(std::atomic<std::size_t>& mark, std::size_t value) noexcept
+{
+  auto cur = mark.load(std::memory_order_relaxed);
+  while (value > cur && !mark.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
+}
+
+}  // namespace
+
+void note_encode_reservation_granted(std::size_t reserved_bytes) noexcept
+{
+  g_enc_granted.fetch_add(1, std::memory_order_relaxed);
+  g_enc_reserved.on_allocate(reserved_bytes);
+  raise_to(g_enc_largest_reserved, reserved_bytes);
+}
+
+void note_encode_reservation_released(std::size_t reserved_bytes, std::size_t peak_used) noexcept
+{
+  g_enc_reserved.on_deallocate(reserved_bytes);
+  raise_to(g_enc_largest_used, peak_used);
+}
+
+void note_encode_reservation_declined() noexcept
+{
+  g_enc_declined.fetch_add(1, std::memory_order_relaxed);
+}
+
+encode_reservation_stats read_encode_reservation_stats() noexcept
+{
+  encode_reservation_stats s;
+  s.granted                   = g_enc_granted.load(std::memory_order_relaxed);
+  s.declined                  = g_enc_declined.load(std::memory_order_relaxed);
+  s.outstanding_reserved      = g_enc_reserved.used();
+  s.peak_outstanding_reserved = g_enc_reserved.peak();
+  s.largest_reserved          = g_enc_largest_reserved.load(std::memory_order_relaxed);
+  s.largest_used              = g_enc_largest_used.load(std::memory_order_relaxed);
+  return s;
+}
+
+void reset_encode_reservation_window() noexcept
+{
+  g_enc_granted.store(0, std::memory_order_relaxed);
+  g_enc_declined.store(0, std::memory_order_relaxed);
+  (void)g_enc_reserved.reset_peak();
+  g_enc_largest_reserved.store(0, std::memory_order_relaxed);
+  g_enc_largest_used.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace sirius::compression

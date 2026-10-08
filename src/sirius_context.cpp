@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/compression_alloc_stats.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/compression_device_pool.hpp"
 #include "compression/plan_register.hpp"
@@ -317,6 +318,35 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
                     ra_mr->get_peak_total_allocated_bytes(),
                     ra_mr->get_total_reserved_bytes());
   }
+
+  // Spill-compression encoder memory. Peaks are per window: begin_execution_window
+  // restarts them after logging, so the QueryEnd line covers that query (with
+  // concurrent queries, every query that ran in the window).
+  auto const& comp = config_.get_compression_config();
+  if (sirius::compression::compression_device_pool_enabled()) {
+    SIRIUS_LOG_INFO("[compression_arena] {} capacity={} bytes used={} bytes peak={} bytes",
+                    tag,
+                    sirius::compression::compression_device_pool_bytes(),
+                    sirius::compression::compression_device_pool_used_bytes(),
+                    sirius::compression::compression_device_pool_peak_bytes());
+  } else if (comp.enable_spill_compression) {
+    auto const enc = sirius::compression::read_encode_reservation_stats();
+    SIRIUS_LOG_INFO(
+      "[compression_encode_reservation] {} mode={} granted={} declined={} outstanding={} bytes "
+      "peak_outstanding={} bytes largest_reserved={} bytes largest_used={} bytes",
+      tag,
+      comp.spill_encode_strict_reservation ? "strict" : "soft",
+      enc.granted,
+      enc.declined,
+      enc.outstanding_reserved,
+      enc.peak_outstanding_reserved,
+      enc.largest_reserved,
+      enc.largest_used);
+  }
+  if (sirius::compression::alloc_stats_enabled()) {
+    SIRIUS_LOG_INFO(
+      "[compression_alloc] {} {}", tag, sirius::compression::alloc_stats_format_window());
+  }
 }
 
 void SiriusContext::QueryBegin(ClientContext& context)
@@ -535,6 +565,10 @@ void SiriusContext::begin_execution_window(ClientContext& context,
     SIRIUS_LOG_INFO("QueryBegin: {}", window_label);
   } catch (...) {  // best-effort observability
   }
+  // Start this query's window for the compression-memory peaks logged at its end.
+  sirius::compression::compression_device_pool_reset_peak();
+  sirius::compression::reset_encode_reservation_window();
+  sirius::compression::alloc_stats_begin_window();
   // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
   // Registers this query's task_creator state. No reset of a previous query here: each query
@@ -919,6 +953,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                         comp.spill_release_columns_early,
                                                         comp.spill_encode_reserve_fraction,
                                                         comp.spill_encode_min_headroom_fraction);
+    sirius::compression::set_spill_encode_strict_reservation(comp.spill_encode_strict_reservation);
     // Before any query runs, so the arena comes off the top of a device that is
     // still empty rather than being asked for once the query pool has grown.
     if (comp.enable_spill_compression && comp.device_pool_bytes > 0) {

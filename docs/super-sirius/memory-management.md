@@ -193,6 +193,54 @@ accounting and the physical pool agree and `usage_limit_fraction` keeps meaning 
 footprint on the device. An arena that does not fit inside the capacity is a configuration
 error.
 
+### Encoder memory modes
+
+| Mode | Config | Where the encode allocates |
+|---|---|---|
+| arena | `device_pool_bytes > 0` | Explicit allocations (`compression_device_mr()`) from the arena; no reservation. cuDF temporaries and Simpatico scratch made without an `mr` (dictionary encode, the dictionary representation's key-chars copy) still use the current device resource, i.e. the query pool, unreserved. |
+| soft (default) | `device_pool_bytes: 0` | Everything from the GPU memory space, under a per-encode reservation of `spill_encode_reserve_fraction` × the batch attached to the calling thread (`scoped_encode_reservation`, `compression_converters.cpp`). cuCascade's default limit policy lets the thread allocate past it, so an overrun is unreserved query-pool memory, and a compression OOM latches compression off for the pressure episode. |
+| strict ("no-arena") | `device_pool_bytes: 0`, `spill_encode_strict_reservation: true` | As soft, but the reservation is attached with `fail_reservation_limit_policy`: a hard budget for every allocation the encoding thread makes through the GPU space, explicit `mr` and implicit current-resource allocations alike (both resolve to the same reservation-aware adaptor and its per-thread tracker). |
+
+In strict mode the encode never waits for memory and never competes for it unreserved:
+
+- The reservation is taken up front with `make_reservation_or_null` (non-blocking). If it is
+  not grantable, if free memory is under `spill_encode_min_headroom_fraction`, or if the thread
+  already holds a reservation (an encode reached from inside a reserved task), the spill goes
+  out uncompressed and is counted as `spill_skipped_reservation`.
+- An allocation that would exceed the reservation throws `rmm::out_of_memory` immediately
+  (no OOM-policy retry); the existing fallback stores the column raw or spills the batch
+  uncompressed (`spill_fell_back`). It does not latch compression off: the overrun is the
+  encode's estimate, not the query's memory. A physical failure (`ALLOCATION_FAILED`) is
+  recorded as a physical OOM, which skips compression for the next second.
+- The reservation is released when the converter returns; what the encode did not use goes
+  back to the space at once.
+- `spill_release_columns_early` is ignored (the whole-table path is used), because after the
+  release a column that does not fit the budget could no longer decline.
+- The asynchronous plan explorer takes its own strict reservation (8 × its widest sample
+  column) from the same space; when that is not grantable the search is dropped and may be
+  requested again by a later spill.
+
+Decompression does not depend on the arena in any mode: decode converters allocate from the
+current device resource under whatever reservation the consuming task holds.
+
+Not covered by any mode: driver-side device memory -- JIT-compiled Simpatico kernels
+(`cuLibraryLoadData`, cached per plan shape for the life of the process), the per-thread
+compression stream pools, and CUDA events. These are outside both the arena and cuCascade's
+accounting.
+
+### Observing encoder memory
+
+At each query end `SiriusContext::log_pool_stats` logs, next to `[gpu_pool]` / `[host_pool]`:
+
+- `[compression_arena] ... capacity= used= peak=` with an arena (peak since the query began);
+- `[compression_encode_reservation] ... mode= granted= declined= peak_outstanding=
+  largest_reserved= largest_used=` without one (`largest_used` is the largest per-encode
+  tracker peak, i.e. how much of its reservation an encode really used);
+- `[compression_alloc] ...` when `SIRIUS_COMPRESSION_ALLOC_STATS=1`: the encoder's explicit
+  allocations for the query (count, peak, largest, failures, size histogram).
+
+`bench/s3-sf1000/arena-report.py` tabulates these per query from a run-each.sh TSV.
+
 ### Compression is optional; decompression is not
 
 A compressed spill is an optimization of the spill, never a condition for it. Every compress-side
@@ -210,8 +258,8 @@ conversion:
 - Under extreme pressure spills skip compression up front, before touching the plan register
   (`spill_compression_pressure_skip_reason`): when the compression arena is ≥ 90% allocated, or
   within 1 s of a physical device OOM reported by the defragmenter. Neither latches. This is in
-  addition to the suppression latch set by a compression OOM without an arena and cleared by the
-  downgrade monitor.
+  addition to the suppression latch set by a compression OOM in the soft no-arena mode and
+  cleared by the downgrade monitor (neither the arena nor the strict mode latches).
 - Skips and fallbacks are counted (`read_compression_fallback_counters`) and logged by the
   downgrade monitor as `[compression_fallback]` at its occupancy cadence.
 

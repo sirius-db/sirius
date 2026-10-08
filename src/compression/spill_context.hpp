@@ -116,6 +116,23 @@ struct spill_context {
   /// that is already out of memory, and a failed encode costs the spill it was
   /// meant to make cheaper. Spilling uncompressed is the cheaper answer.
   double encode_min_headroom_fraction{0.10};
+
+  /// No-arena mode only: make the encode's reservation a hard budget.
+  ///
+  /// The reservation above is otherwise *soft*: cuCascade's default limit policy
+  /// lets the thread allocate past it, the excess coming straight out of the
+  /// query's pool unreserved -- so an encode whose working set outgrows its
+  /// estimate competes with the query exactly as it did before reservations
+  /// existed. Strict attaches the reservation with
+  /// `fail_reservation_limit_policy`: an allocation that would exceed it throws
+  /// `rmm::out_of_memory` at once (no OOM-policy retry or wait), which the
+  /// encode's existing fallback turns into a raw column or an uncompressed spill.
+  /// It also declines (rather than encoding unreserved) when the reservation
+  /// cannot be attached because the thread already holds one, requires a positive
+  /// `encode_reserve_fraction`, gives the asynchronous explorer a reservation of
+  /// its own, and stops a compression OOM from latching compression off for the
+  /// episode: the OOM is the encode's own budget running out, not the query's.
+  bool encode_strict_reservation{false};
 };
 
 /// The calling thread's active spill context, or nullptr when none is installed.
@@ -210,6 +227,14 @@ void set_spill_compression_settings(bool enabled,
                                     double encode_reserve_fraction,
                                     double encode_min_headroom_fraction) noexcept;
 
+/// Set compression.spill_encode_strict_reservation; see
+/// spill_context::encode_strict_reservation. Separate from
+/// set_spill_compression_settings so that call's many callers keep their shape.
+void set_spill_encode_strict_reservation(bool strict) noexcept;
+
+/// Whether the encode reservation is strict (process-global setting).
+[[nodiscard]] bool spill_encode_strict_reservation() noexcept;
+
 /// Whether spill compression is enabled process-wide *and* not currently
 /// suppressed. This is the predicate the spill path consults.
 [[nodiscard]] bool spill_compression_enabled() noexcept;
@@ -269,6 +294,9 @@ void clear_physical_device_oom_for_testing() noexcept;
 struct compression_fallback_counters {
   /// Spills that skipped compression up front: extreme memory pressure.
   std::uint64_t spill_skipped_pressure = 0;
+  /// Spills that skipped compression because the encode's device reservation
+  /// (no-arena mode) could not be had; see encode_reservation_declined.
+  std::uint64_t spill_skipped_reservation = 0;
   /// Compressed spills that were attempted and fell back to uncompressed
   /// because the encode (or its plan resolution) threw.
   std::uint64_t spill_fell_back = 0;
@@ -278,7 +306,13 @@ struct compression_fallback_counters {
   std::uint64_t output_fell_back = 0;
 };
 
-enum class compression_fallback_kind { spill_skipped_pressure, spill_fell_back, in_place, output };
+enum class compression_fallback_kind {
+  spill_skipped_pressure,
+  spill_skipped_reservation,
+  spill_fell_back,
+  in_place,
+  output
+};
 
 void note_compression_fallback(compression_fallback_kind kind) noexcept;
 [[nodiscard]] compression_fallback_counters read_compression_fallback_counters() noexcept;

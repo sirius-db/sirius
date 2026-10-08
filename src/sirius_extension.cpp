@@ -2695,6 +2695,7 @@ static void PushSpillCompressionSettings(const sirius::compression_config& cfg)
                                                       cfg.spill_release_columns_early,
                                                       cfg.spill_encode_reserve_fraction,
                                                       cfg.spill_encode_min_headroom_fraction);
+  sirius::compression::set_spill_encode_strict_reservation(cfg.spill_encode_strict_reservation);
 }
 
 static void SetCompressionMaxCompressedFraction(ClientContext& context,

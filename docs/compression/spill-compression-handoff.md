@@ -12,9 +12,11 @@ hierarchy (GPU → host, GPU → disk, and in place on the device), and decompre
 transparently when a consumer locks them again. Per-column plans are keyed by the
 spill edge (the producing repository), seeded from the offline per-table plans via
 column lineage, explored on first contact when no seed exists, and re-explored
-adaptively. The encoder allocates from a dedicated device arena
-(`compression.device_pool_bytes`), never from the query pool whose exhaustion
-triggered the spill.
+adaptively. The encoder allocates either from a dedicated device arena
+(`compression.device_pool_bytes`), or -- with `device_pool_bytes: 0` and
+`spill_encode_strict_reservation: true` -- from the GPU memory space under a
+hard per-encode cuCascade reservation (see "Encoder memory modes" in
+[memory-management.md](../super-sirius/memory-management.md)).
 
 Key configuration (`sirius.compression.*`):
 
@@ -22,6 +24,7 @@ Key configuration (`sirius.compression.*`):
 |---|---|
 | `enable_spill_compression` | Master switch. |
 | `device_pool_bytes` | The encoder's arena. Carved out of the GPU memory space's capacity (the query pool shrinks by the same amount; logged at startup), so it no longer over-commits the device. **Installed only from the config file at startup**: `SET spill_compression = true` at session start flips the flag but leaves the encoder allocating from the query pool — the documented pathology (compression latching on/off, a downgrade-request storm, the query killed). Sizing is a cliff, not a gradient: 1 GiB was too small for concurrent encodes on a 96 GB card and the query failed outright; 4 GiB worked there. 3 GiB is used on the 32 GB card and fills on SF3000 q18. |
+| `spill_encode_strict_reservation` | No-arena mode (`device_pool_bytes: 0`): the encode's reservation (`spill_encode_reserve_fraction` × batch, default 0.5) becomes a hard budget. No reservation → uncompressed spill (`spill_skipped_reservation`); an overrun → the existing fallback, without latching. Default off (soft reservation, which the encode may overrun into the query pool). `bench/s3-sf1000`: `DEVICE_POOL_BYTES=0` renders this mode, `ENCODE_RESERVE_FRACTION` sizes it. |
 | `input_plan_dir` | Offline table plans. Loaded whenever set, because the spill path seeds per-column plans from them through lineage, independent of pin compression. Only `lineitem` and `orders` plans are enabled under `plans/tpch_sf1000`; the rest were renamed `*_disabled.txt` in cbd95163 pending validation. |
 
 ## Branch state (2026-10-07)
@@ -268,6 +271,33 @@ retry policy and the compression arena's device over-commit, not slower eviction
   not wrapped (its stream creation is an OOM; other CUDA errors there propagate
   as before). The arena-nearly-full gate has no unit test: installing an arena is
   process-wide and permanent.
+- **How much of the arena is used, and can the arena go?** Measured at SF3000
+  (32 GB, 0.86, 3 GiB arena): compression cut spill bytes 2.3-7.6x but cost 3 GiB
+  of query memory, and q3 then failed at the retry limit (18,727 retries,
+  PARTITION) where the baseline completed. Nobody knew how much of the 3 GiB the
+  encoder used. Now logged per query (`[compression_arena] peak=`,
+  `[compression_alloc]`; run.sh turns on `SIRIUS_COMPRESSION_ALLOC_STATS` for
+  compression arms; `bench/s3-sf1000/arena-report.py`). Next: run the SF3000
+  compression arm for the arena peaks, and an arm with `DEVICE_POOL_BYTES=0`
+  (strict no-arena mode), which gives the query its 3 GiB back and charges each
+  encode to a reservation instead (`[compression_encode_reservation]` reports
+  grants, declines and how much of each reservation an encode used -- the data
+  for sizing `spill_encode_reserve_fraction`). Not yet built or measured.
+  Remaining risk in that mode: the reservation is taken from the same budget the
+  query is short of, so under heavy pressure most spills decline (that is the
+  intent -- they go out raw), and reservations held by in-flight encodes
+  (downgrade threads × fraction × batch) briefly reduce what tasks can reserve.
+  Physical OOMs in the compression arms (q3/q13 at 0.86 and 0.95, none in the
+  0.86 baseline) are not explained by the encode's RMM allocations: an audit of
+  the encode/decode paths found Simpatico forwards the caller's `mr` for outputs
+  and scratch (nvcomp temp space included), and the exceptions -- cuDF
+  temporaries in dictionary encode, the dictionary representation's key-chars
+  copy, the fused-JIT decode transients (`codegen_runtime.cpp` drops `mr`) --
+  use the current device resource, i.e. cuCascade-accounted query pool. What
+  bypasses all accounting is driver-side: JIT kernel libraries
+  (`cuLibraryLoadData`, cached per plan shape, never evicted), per-thread stream
+  pools (4 streams per worker thread), events. Unmeasured; candidates for the
+  over-commit along with async-pool fragmentation.
 - **Prefetching cache footprint at SF3000** — test the readahead hypothesis above
   (`REST_MAX_CONCURRENT_SCANS=16`; at SF1000 16 and 48 performed the same) before
   using the cache at this scale.

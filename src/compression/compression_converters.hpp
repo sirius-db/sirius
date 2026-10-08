@@ -41,6 +41,18 @@ class spill_source_consumed : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+/// Thrown, before anything has been touched, when a compressed spill declines
+/// because the encode's device reservation could not be had (not grantable, too
+/// little headroom, or the calling thread already holds a reservation). A clean
+/// decline like any other -- the caller spills uncompressed -- but counted
+/// separately (compression_fallback_counters::spill_skipped_reservation), and
+/// never a reason to latch compression off: nothing was allocated, so nothing
+/// failed.
+class encode_reservation_declined : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 /**
  * @brief Register Simpatico compression/decompression converters into @p registry.
  *

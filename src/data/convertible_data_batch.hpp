@@ -40,6 +40,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
+#include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -290,6 +291,16 @@ class convertible_data_batch : public convertible_data {
       // convert an empty representation and hand downstream a zero-column batch.
       // Fail the downgrade instead; the executor logs it and moves on.
       throw;
+    } catch (const sirius::encode_reservation_declined& e) {
+      // No-arena mode: the encode's device reservation could not be had. Nothing
+      // was allocated, so there is nothing to latch on; the next spill asks again.
+      compression::note_compression_fallback(
+        compression::compression_fallback_kind::spill_skipped_reservation);
+      SIRIUS_LOG_DEBUG(
+        "[convertible_data_batch] compressed spill skipped ({}); spilling "
+        "uncompressed",
+        e.what());
+      return false;
     } catch (const std::exception& e) {
       // An OOM here is compression's own doing: the encode wanted device memory
       // during a spill, which is exactly when there is none. Suppress further
@@ -308,9 +319,24 @@ class convertible_data_batch : public convertible_data {
       // encodes have it full right now, which says nothing about query memory
       // and clears as they finish. Latching on it would disable compression for
       // the whole episode on the first burst of concurrent spills.
+      //
+      // Nor with a strict encode reservation (no-arena mode): there the OOM is
+      // the encode outgrowing its own reservation, which says the estimate was
+      // short for this batch, not that the query's memory is exhausted -- the
+      // next spill reserves afresh, and declines cleanly if it cannot.
       if (dynamic_cast<const rmm::out_of_memory*>(&e) != nullptr &&
-          !compression::compression_device_pool_enabled()) {
+          !compression::compression_device_pool_enabled() &&
+          !compression::spill_encode_strict_reservation()) {
         compression::set_spill_compression_suppressed(true);
+      }
+      // A physical device failure inside the encode (cudaMallocAsync refused
+      // with cuCascade's accounting satisfied) never reaches the defragmenter
+      // policy that normally records it -- an attached encode reservation
+      // carries its own rethrowing OOM policy -- so record it here, which keeps
+      // the next second's spills from trying to compress.
+      if (const auto* oom = dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&e);
+          oom != nullptr && oom->error_kind == cucascade::memory::MemoryError::ALLOCATION_FAILED) {
+        compression::note_physical_device_oom();
       }
       compression::note_compression_fallback(
         compression::compression_fallback_kind::spill_fell_back);

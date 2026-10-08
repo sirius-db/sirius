@@ -20,7 +20,11 @@
 #   REST_MAX_CONCURRENT_SCANS=        (empty: derived from pipeline threads)
 #   SCAN_BATCH=2GB  HASH_PARTITION=4GB  HASH_BUILD=4GB
 #   SPILL_COMPRESSION=0                (1: enable it, with a DEVICE_POOL_BYTES arena)
-#   DEVICE_POOL_BYTES=3GiB
+#   DEVICE_POOL_BYTES=3GiB             (0: no arena -- the encoder allocates from the
+#                                       GPU memory space under a strict per-encode
+#                                       reservation; see memory-management.md)
+#   ENCODE_RESERVE_FRACTION=           (no-arena mode: the reservation as a fraction
+#                                       of the batch; empty = code default 0.5)
 #   NAME=default                       (output file stem)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -87,9 +91,22 @@ fi
 
 if [ "$SPILL_COMPRESSION" = 1 ]; then
   PLAN_DIR="${PLAN_DIR:-$(cd "$HERE/../.." && pwd)/src/compression/simpatico_codegen/plans/tpch_sf1000}"
+  case "$DEVICE_POOL_BYTES" in
+    0|0B|0b|0Gi|0GiB|0MiB)
+      ENCODER_MEMORY="        # No arena: the encoder allocates from the GPU memory space, each encode
+        # under a strict cuCascade reservation; no reservation -> uncompressed spill.
+        device_pool_bytes: 0
+        spill_encode_strict_reservation: true"
+      if [ -n "${ENCODE_RESERVE_FRACTION:-}" ]; then
+        ENCODER_MEMORY="$ENCODER_MEMORY
+        spill_encode_reserve_fraction: $ENCODE_RESERVE_FRACTION"
+      fi ;;
+    *)
+      ENCODER_MEMORY="        # Arena the spill encoder allocates from; installed only at startup.
+        device_pool_bytes: $DEVICE_POOL_BYTES" ;;
+  esac
   COMPRESSION="        enable_spill_compression: true
-        # Arena the spill encoder allocates from; installed only at startup.
-        device_pool_bytes: $DEVICE_POOL_BYTES
+$ENCODER_MEMORY
         # Offline table plans: spill edges seed their per-column plans from these
         # through column lineage (scans are named after their S3 directory).
         input_plan_dir: $PLAN_DIR"

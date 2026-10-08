@@ -47,6 +47,7 @@
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <explore/compression_explorer.hpp>
@@ -139,6 +140,178 @@ std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column>
   return std::make_unique<cudf::column>(
     type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
+
+/// The encoder's device-memory mode for a spill with context @p ctx.
+///
+///  - arena:   an arena is installed; the encode's explicit allocations go to it
+///             (compression_device_mr) and no reservation is taken.
+///  - soft:    no arena; the encode allocates from the GPU memory space under a
+///             reservation the thread may overrun (cuCascade's default "ignore"
+///             limit policy) -- the overrun is unreserved query-pool memory.
+///  - strict:  no arena; same reservation, attached with
+///             fail_reservation_limit_policy, so the reservation is a hard budget
+///             for *every* allocation the calling thread makes through the
+///             GPU space's resource -- the explicit mr and the implicit
+///             current-device-resource allocations (cuDF temporaries, Simpatico
+///             scratch without an mr) alike, because both resolve to the same
+///             reservation-aware adaptor and its PER_THREAD tracker.
+enum class encode_memory_mode { arena, soft, strict };
+
+encode_memory_mode encode_memory_mode_for(const compression::spill_context& ctx) noexcept
+{
+  if (compression::compression_device_pool_enabled()) { return encode_memory_mode::arena; }
+  return ctx.encode_strict_reservation ? encode_memory_mode::strict : encode_memory_mode::soft;
+}
+
+/// The GPU space the calling thread's strict encode reservation was taken from,
+/// while one is attached; nullptr otherwise. Lets the asynchronous explore,
+/// submitted from inside the encode, reserve its own budget from the same space.
+thread_local cucascade::memory::memory_space* t_strict_encode_space = nullptr;
+
+/// Holds a device reservation covering an encode's working memory, attached to
+/// the calling thread for as long as it lives.
+///
+/// Only used when there is no compression arena. With an arena the encode
+/// allocates from a pool carved off the device at startup, which is outside
+/// cuCascade's accounting entirely — reserving as well would double-count.
+/// Without one, the encode allocates from the query's own pool, during a
+/// downgrade, and does so unreserved: it can push the pool past what
+/// reservations promised, which then surfaces as an OOM in some unrelated
+/// operator that did everything right. Reserving makes the demand visible and
+/// gives it somewhere to fail cleanly.
+///
+/// Sirius runs the reservation adaptor in PER_THREAD tracking scope
+/// (`per_stream_reservation` defaults false), so attaching binds to the calling
+/// thread — which is why every encode must be submitted from this thread, the
+/// same constraint the column pool already operates under.
+///
+/// With @p strict the reservation is a hard budget (see encode_memory_mode), and
+/// every way of not getting it -- not grantable, too little headroom, a zero
+/// size, or the thread already holding a reservation -- is a decline. Without
+/// it, the last two proceed unreserved as they always have.
+///
+/// Destruction detaches the tracker and releases what the encode did not use;
+/// buffers still alive (none, on the spill paths: they are scoped inside the
+/// guard) keep their accounting and return it to the space when freed.
+class scoped_encode_reservation {
+ public:
+  /// @return an inactive guard when no reservation was needed or one could not
+  ///         be granted; check `ok()` before proceeding.
+  scoped_encode_reservation(cucascade::memory::memory_space* gpu_space,
+                            std::size_t bytes,
+                            std::size_t min_headroom_bytes,
+                            rmm::cuda_stream_view stream,
+                            bool strict = false)
+    : _stream(stream)
+  {
+    if (gpu_space == nullptr || bytes == 0) {
+      // Nothing to reserve. Not a failure -- unless the reservation is the
+      // encode's only budget, in which case there is nothing to encode in.
+      if (strict) {
+        compression::note_encode_reservation_declined();
+        return;
+      }
+      _ok = true;
+      return;
+    }
+    // Headroom first. A reservation for a fraction of one batch is grantable
+    // long after the device has run out of room to actually encode in, so
+    // asking only "does this reservation fit" lets compression keep starting
+    // work that the allocator then refuses.
+    if (min_headroom_bytes > 0 && gpu_space->get_available_memory() < min_headroom_bytes) {
+      _declined_for_headroom = true;
+      compression::note_encode_reservation_declined();
+      return;  // _ok stays false: caller declines to an uncompressed spill
+    }
+    // Non-blocking: make_reservation_or_null returns at once, never waits for
+    // memory to be released.
+    auto reservation = gpu_space->make_reservation_or_null(bytes);
+    if (!reservation) {
+      compression::note_encode_reservation_declined();
+      return;  // _ok stays false: caller declines
+    }
+    _allocator = gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    if (_allocator == nullptr) {
+      // No adaptor to attach to. The reservation is released on return, so a
+      // strict encode would run on no budget at all.
+      if (strict) {
+        compression::note_encode_reservation_declined();
+        return;
+      }
+      _ok = true;  // behave as before
+      return;
+    }
+    // attach_reservation_to_tracker consumes the reservation either way; when it
+    // returns false (the thread already holds one -- an encode reached from
+    // inside a reserved task) the reservation is released immediately.
+    _attached = strict ? _allocator->attach_reservation_to_tracker(
+                           stream,
+                           std::move(reservation),
+                           std::make_unique<cucascade::memory::fail_reservation_limit_policy>())
+                       : _allocator->attach_reservation_to_tracker(stream, std::move(reservation));
+    if (!_attached && strict) {
+      _thread_busy = true;
+      compression::note_encode_reservation_declined();
+      return;
+    }
+    if (_attached) {
+      _reserved_bytes = bytes;
+      compression::note_encode_reservation_granted(bytes);
+      if (strict) {
+        _previous_space       = t_strict_encode_space;
+        t_strict_encode_space = gpu_space;
+        _set_space            = true;
+      }
+    }
+    _ok = true;
+  }
+
+  ~scoped_encode_reservation()
+  {
+    if (_attached && _allocator != nullptr) {
+      // The tracker's peak: everything this thread allocated through the GPU
+      // space while the reservation was attached -- what the encode really used.
+      const auto peak_used = _allocator->get_peak_allocated_bytes(_stream);
+      _allocator->reset_stream_reservation(_stream);
+      compression::note_encode_reservation_released(_reserved_bytes, peak_used);
+    }
+    if (_set_space) { t_strict_encode_space = _previous_space; }
+  }
+
+  scoped_encode_reservation(const scoped_encode_reservation&)            = delete;
+  scoped_encode_reservation& operator=(const scoped_encode_reservation&) = delete;
+  scoped_encode_reservation(scoped_encode_reservation&&)                 = delete;
+  scoped_encode_reservation& operator=(scoped_encode_reservation&&)      = delete;
+
+  [[nodiscard]] bool ok() const noexcept { return _ok; }
+
+  /// True when the decline was for lack of device headroom rather than an
+  /// ungrantable reservation; distinguishes "too tight to compress at all" from
+  /// "this particular reservation did not fit".
+  [[nodiscard]] bool declined_for_headroom() const noexcept { return _declined_for_headroom; }
+
+  /// True when a strict reservation was declined because the calling thread
+  /// already held one.
+  [[nodiscard]] bool declined_thread_busy() const noexcept { return _thread_busy; }
+
+  [[nodiscard]] const char* decline_reason() const noexcept
+  {
+    if (_declined_for_headroom) { return "device too tight to encode"; }
+    if (_thread_busy) { return "thread already holds a reservation"; }
+    return "reservation not grantable";
+  }
+
+ private:
+  rmm::cuda_stream_view _stream;
+  cucascade::memory::reservation_aware_resource_adaptor* _allocator{nullptr};
+  std::size_t _reserved_bytes{0};
+  cucascade::memory::memory_space* _previous_space{nullptr};
+  bool _set_space{false};
+  bool _attached{false};
+  bool _ok{false};
+  bool _declined_for_headroom{false};
+  bool _thread_busy{false};
+};
 
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
@@ -562,11 +735,18 @@ using column_state = compression::plan_register::column_plan_state;
 /// the meantime carry the lineage seed or the dtype default and are upgraded to
 /// the explored plan as soon as it lands.
 ///
-/// Safe to run on a worker only because the explorer allocates from
+/// With an arena, safe to run on a worker because the explorer allocates from
 /// compression_device_mr(), a plain rmm pool. cuCascade's reservation state is
 /// thread_local, so a spawned thread carries no reservation and anything it takes
-/// from the *query* pool fails LIMIT_EXCEEDED however much memory is free (see the
-/// stream-pool note at the top of this file).
+/// from the *query* pool is checked against the raw pool capacity, unreserved
+/// (see the stream-pool note at the top of this file).
+///
+/// Without an arena and with a strict encode reservation, the worker takes a
+/// strict reservation of its own for each search (task::gpu_space,
+/// kExploreReserveFactor), so the search is bounded and visible to cuCascade
+/// like the encode it was spawned from; when that reservation is not grantable
+/// the search is dropped and the edge may ask again later. In the soft no-arena
+/// mode the search still runs unreserved, as before.
 class explore_worker {
  public:
   struct task {
@@ -576,6 +756,10 @@ class explore_worker {
     std::size_t max_explore_bytes{0};
     std::size_t sample_rows{0};
     double change_threshold{0.0};
+    /// Strict no-arena mode: the GPU space to reserve the search's budget from,
+    /// and that budget. Null in the other modes (no reservation).
+    cucascade::memory::memory_space* gpu_space{nullptr};
+    std::size_t reserve_bytes{0};
   };
 
   /// Constructed on first use, which is always after plan_register::global() has
@@ -659,6 +843,24 @@ class explore_worker {
     const auto t0 = std::chrono::steady_clock::now();
     try {
       rmm::cuda_stream stream;
+      // Declared after the stream so it detaches before the stream is destroyed;
+      // declared inside the try so it detaches before `t`'s samples are freed
+      // (they were allocated under the encode's reservation, not this one).
+      std::optional<scoped_encode_reservation> budget;
+      if (t.gpu_space != nullptr) {
+        budget.emplace(
+          t.gpu_space, t.reserve_bytes, /*min_headroom_bytes=*/0, stream.view(), /*strict=*/true);
+        if (!budget->ok()) {
+          SIRIUS_LOG_DEBUG(
+            "[compression_converters] repo={} async explore skipped ({}, {}B); will retry on a "
+            "later spill",
+            static_cast<const void*>(t.repo),
+            budget->decline_reason(),
+            t.reserve_bytes);
+          reg.end_async_explore(t.repo);
+          return;
+        }
+      }
       simpatico::exploration_config ecfg;
       ecfg.beam_width        = t.beam_width;
       ecfg.max_explore_bytes = t.max_explore_bytes;
@@ -713,6 +915,12 @@ class explore_worker {
 
 std::atomic<explore_worker*> explore_worker::s_instance{nullptr};
 
+/// Strict no-arena mode: the asynchronous explorer's reservation, as a multiple
+/// of its widest sample column. The beam search holds the sample plus a few
+/// candidate encodings of it at a time; an overrun fails the search (which
+/// costs nothing but the search), never the query.
+constexpr std::size_t kExploreReserveFactor = 8;
+
 /// Spills an edge must serve before an asynchronous explore is worth starting.
 /// Exploring on the very first spill fired a beam search for every port the query
 /// touched -- 14 on q18/SF3000, including one-off edges that never spilled again.
@@ -764,6 +972,22 @@ void submit_async_explore(cudf::table_view view,
         std::make_unique<cudf::column>(slice, sample_stream, compression::compression_device_mr()));
     }
     sample_stream.synchronize();  // the worker reads these on its own stream
+    // Strict no-arena mode: bound the search by a reservation from the space the
+    // encode reserved from. The submitting thread is inside that encode, so
+    // t_strict_encode_space is set exactly when the encode is strictly reserved.
+    if (ctx.encode_strict_reservation && !compression::compression_device_pool_enabled()) {
+      if (t_strict_encode_space == nullptr) {
+        reg.end_async_explore(ctx.repo);
+        return;
+      }
+      std::size_t widest = 0;
+      for (auto const& col : t.columns) {
+        widest = std::max(widest, simpatico::column_size_bytes_ex(col->view(), sample_stream));
+      }
+      if (t.max_explore_bytes > 0) { widest = std::min(widest, t.max_explore_bytes); }
+      t.gpu_space     = t_strict_encode_space;
+      t.reserve_bytes = std::max<std::size_t>(widest * kExploreReserveFactor, 1ULL << 20);
+    }
     explore_worker::instance().submit(std::move(t));
   } catch (const std::exception& e) {
     SIRIUS_LOG_DEBUG("[compression_converters] repo={} could not sample for async explore: {}",
@@ -1137,80 +1361,6 @@ staged_compression compress_for_spill(
   return out;
 }
 
-/// Holds a device reservation covering an encode's working memory, attached to
-/// the calling thread for as long as it lives.
-///
-/// Only used when there is no compression arena. With an arena the encode
-/// allocates from a pool carved off the device at startup, which is outside
-/// cuCascade's accounting entirely — reserving as well would double-count.
-/// Without one, the encode allocates from the query's own pool, during a
-/// downgrade, and does so unreserved: it can push the pool past what
-/// reservations promised, which then surfaces as an OOM in some unrelated
-/// operator that did everything right. Reserving makes the demand visible and
-/// gives it somewhere to fail cleanly.
-///
-/// Sirius runs the reservation adaptor in PER_THREAD tracking scope
-/// (`per_stream_reservation` defaults false), so attaching binds to the calling
-/// thread — which is why every encode must be submitted from this thread, the
-/// same constraint the column pool already operates under.
-class scoped_encode_reservation {
- public:
-  /// @return an inactive guard when no reservation was needed or one could not
-  ///         be granted; check `ok()` before proceeding.
-  scoped_encode_reservation(cucascade::memory::memory_space* gpu_space,
-                            std::size_t bytes,
-                            std::size_t min_headroom_bytes,
-                            rmm::cuda_stream_view stream)
-    : _stream(stream)
-  {
-    if (gpu_space == nullptr || bytes == 0) {
-      _ok = true;  // nothing to reserve; not a failure
-      return;
-    }
-    // Headroom first. A reservation for a fraction of one batch is grantable
-    // long after the device has run out of room to actually encode in, so
-    // asking only "does this reservation fit" lets compression keep starting
-    // work that the allocator then refuses.
-    if (min_headroom_bytes > 0 && gpu_space->get_available_memory() < min_headroom_bytes) {
-      _declined_for_headroom = true;
-      return;  // _ok stays false: caller declines to an uncompressed spill
-    }
-    auto reservation = gpu_space->make_reservation_or_null(bytes);
-    if (!reservation) { return; }  // _ok stays false: caller declines
-    _allocator = gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
-    if (_allocator == nullptr) {
-      _ok = true;  // no adaptor to attach to; behave as before
-      return;
-    }
-    _attached = _allocator->attach_reservation_to_tracker(stream, std::move(reservation));
-    _ok       = true;
-  }
-
-  ~scoped_encode_reservation()
-  {
-    if (_attached && _allocator != nullptr) { _allocator->reset_stream_reservation(_stream); }
-  }
-
-  scoped_encode_reservation(const scoped_encode_reservation&)            = delete;
-  scoped_encode_reservation& operator=(const scoped_encode_reservation&) = delete;
-  scoped_encode_reservation(scoped_encode_reservation&&)                 = delete;
-  scoped_encode_reservation& operator=(scoped_encode_reservation&&)      = delete;
-
-  [[nodiscard]] bool ok() const noexcept { return _ok; }
-
-  /// True when the decline was for lack of device headroom rather than an
-  /// ungrantable reservation; distinguishes "too tight to compress at all" from
-  /// "this particular reservation did not fit".
-  [[nodiscard]] bool declined_for_headroom() const noexcept { return _declined_for_headroom; }
-
- private:
-  rmm::cuda_stream_view _stream;
-  cucascade::memory::reservation_aware_resource_adaptor* _allocator{nullptr};
-  bool _attached{false};
-  bool _ok{false};
-  bool _declined_for_headroom{false};
-};
-
 /// Free device bytes below which a spill declines to compress, or 0 when the
 /// check does not apply (an arena is installed, or the fraction is disabled).
 std::size_t encode_min_headroom_bytes(const compression::spill_context& ctx,
@@ -1462,21 +1612,23 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // must still be a clean decline at this point and because a reservation is
   // cheap to fail and expensive to discover late.
   auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
-  scoped_encode_reservation encode_reservation(gpu_space,
-                                               encode_reservation_bytes(ctx, uncompressed_bytes),
-                                               encode_min_headroom_bytes(ctx, gpu_space),
-                                               stream);
+  scoped_encode_reservation encode_reservation(
+    gpu_space,
+    encode_reservation_bytes(ctx, uncompressed_bytes),
+    encode_min_headroom_bytes(ctx, gpu_space),
+    stream,
+    /*strict=*/encode_memory_mode_for(ctx) == encode_memory_mode::strict);
   if (!encode_reservation.ok()) {
     SIRIUS_LOG_DEBUG(
       "[compression_converters] repo={} declining ({}): free={}B, needed headroom {}B, "
       "reserve {}B; spilling uncompressed",
       static_cast<const void*>(ctx.repo),
-      encode_reservation.declined_for_headroom() ? "device too tight to encode"
-                                                 : "reservation not grantable",
+      encode_reservation.decline_reason(),
       gpu_space != nullptr ? gpu_space->get_available_memory() : 0,
       encode_min_headroom_bytes(ctx, gpu_space),
       encode_reservation_bytes(ctx, uncompressed_bytes));
-    throw std::runtime_error("[compression_converters] insufficient device memory for the encode");
+    throw encode_reservation_declined(
+      "[compression_converters] insufficient device memory for the encode");
   }
 
   const auto* space   = resolve_target_space(source, target_memory_space, reservation);
@@ -1507,7 +1659,13 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // fall back to, so a column whose planned encode fails must have somewhere to
   // land. default_plan_for provides one for every dtype, so the release is always
   // safe; a column whose fallback also fails still declines the whole batch.
-  if (ctx.release_columns_early && host_mr_early != nullptr) {
+  //
+  // Not with a strict encode reservation: there a column whose raw carrier does
+  // not fit the remaining budget fails every retry below the same way, and after
+  // the release that failure destroys the batch. The whole-table path declines
+  // cleanly instead.
+  if (ctx.release_columns_early && host_mr_early != nullptr &&
+      encode_memory_mode_for(ctx) != encode_memory_mode::strict) {
     column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
     // Likewise the encode's streams: created now, a failure is a clean decline;
     // created inside the first column's encode, it would destroy the batch.
@@ -1924,16 +2082,18 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_disk(
   // See compress_gpu_to_host: without an arena the encode is otherwise
   // unreserved pressure on the query's own pool.
   auto* gpu_space = const_cast<cucascade::memory::memory_space*>(&source.get_memory_space());
-  scoped_encode_reservation encode_reservation(gpu_space,
-                                               encode_reservation_bytes(ctx, uncompressed_bytes),
-                                               encode_min_headroom_bytes(ctx, gpu_space),
-                                               stream);
+  scoped_encode_reservation encode_reservation(
+    gpu_space,
+    encode_reservation_bytes(ctx, uncompressed_bytes),
+    encode_min_headroom_bytes(ctx, gpu_space),
+    stream,
+    /*strict=*/encode_memory_mode_for(ctx) == encode_memory_mode::strict);
   if (!encode_reservation.ok()) {
     SIRIUS_LOG_DEBUG("[compression_converters] repo={} declining ({}); spilling uncompressed",
                      static_cast<const void*>(ctx.repo),
-                     encode_reservation.declined_for_headroom() ? "device too tight to encode"
-                                                                : "reservation not grantable");
-    throw std::runtime_error("[compression_converters] insufficient device memory for the encode");
+                     encode_reservation.decline_reason());
+    throw encode_reservation_declined(
+      "[compression_converters] insufficient device memory for the encode");
   }
 
   auto staged = compress_for_spill(view, ctx, uncompressed_bytes, stream);

@@ -408,7 +408,10 @@ struct compression_config {
   /// worse than spilling raw, however good the ratio.
   std::size_t spill_min_batch_bytes{64ULL * 1024 * 1024};
   /// Device memory reserved exclusively for spill-compression transients.
-  /// 0 (the default) keeps the encoder allocating from the query's pool.
+  /// 0 (the default) installs no arena: the encoder allocates from the GPU memory
+  /// space (the query's pool) under a per-encode cuCascade reservation of
+  /// `spill_encode_reserve_fraction` of the batch -- soft by default, a hard
+  /// budget with `spill_encode_strict_reservation` (the "no-arena mode").
   ///
   /// Sharing that pool is circular: a downgrade happens *because* the pool is
   /// full, so the encode that would relieve the pressure is the one allocation
@@ -446,6 +449,14 @@ struct compression_config {
   /// capacity and no arena is configured. See
   /// spill_context.hpp::encode_min_headroom_fraction.
   double spill_encode_min_headroom_fraction{0.10};
+
+  /// No-arena mode (`device_pool_bytes: 0`) only: make the encode's reservation
+  /// (`spill_encode_reserve_fraction` of the batch) a hard budget rather than a
+  /// soft one the encode may overrun into the query pool. An encode that cannot
+  /// get its reservation, or outgrows it, spills uncompressed. Requires a
+  /// positive `spill_encode_reserve_fraction`. Ignored when an arena is
+  /// installed. See spill_context.hpp::encode_strict_reservation.
+  bool spill_encode_strict_reservation{false};
 
   /// When true, the downgrade executor may satisfy a request by compressing
   /// batches in place on the device, instead of spilling them to host/disk.

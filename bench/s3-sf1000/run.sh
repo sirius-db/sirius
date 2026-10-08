@@ -60,6 +60,14 @@ export SIRIUS_LOG_LEVEL="${SIRIUS_LOG_LEVEL:-debug}"
 # Per-query REST reactor counters (bytes, requests, fused reads) to stderr at
 # query end -- the scan-throughput evidence for NIC saturation.
 export SIRIUS_IO_PROFILE=1
+# Spill-compression arms: count the encoder's device allocations (sizes, peak,
+# failures), logged per query as [compression_alloc] next to the [gpu_pool] and
+# [compression_arena] / [compression_encode_reservation] lines
+# (bench/s3-sf1000/arena-report.py). Set SIRIUS_COMPRESSION_ALLOC_STATS=0 to
+# skip the counting adaptor.
+if [ "${SPILL_COMPRESSION:-0}" = 1 ]; then
+  export SIRIUS_COMPRESSION_ALLOC_STATS="${SIRIUS_COMPRESSION_ALLOC_STATS:-1}"
+fi
 # No CPU replay on a GPU OOM: it would not be a Sirius measurement, it is not
 # supported for S3 inputs anyway, and DuckDB has only the host memory the pinned
 # tier leaves (a CPU q18 at SF1000 once OOM-killed a 62 GB box this way).

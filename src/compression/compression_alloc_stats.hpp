@@ -57,6 +57,10 @@ struct alloc_stats_snapshot {
   /// asks for many small scratch buffers and one that asks for one buffer the
   /// size of the batch fail for different reasons and are fixed differently.
   std::uint64_t histogram[6] = {0, 0, 0, 0, 0, 0};
+  /// Allocations the upstream refused (it threw). Each is a compress attempt
+  /// that then fell back -- per column to the raw carrier, or the whole batch to
+  /// an uncompressed spill.
+  std::uint64_t failures = 0;
 };
 
 /// True when `SIRIUS_COMPRESSION_ALLOC_STATS=1` was set at process start.
@@ -73,5 +77,19 @@ struct alloc_stats_snapshot {
 
 /// One log line's worth of the counters, formatted for the debug log.
 [[nodiscard]] std::string alloc_stats_format();
+
+/// Start a measurement window (SiriusContext calls this at each query begin):
+/// the peak restarts from what is outstanding now, the largest-allocation mark
+/// restarts from zero, and the cumulative counters are remembered as the
+/// window's baseline. Process-wide, so concurrent queries share one window.
+void alloc_stats_begin_window() noexcept;
+
+/// The counters for the current window: allocations, frees, total bytes,
+/// histogram and failures as deltas from the baseline; outstanding as of now;
+/// peak and largest since alloc_stats_begin_window().
+[[nodiscard]] alloc_stats_snapshot alloc_stats_read_window() noexcept;
+
+/// alloc_stats_read_window(), formatted like alloc_stats_format().
+[[nodiscard]] std::string alloc_stats_format_window();
 
 }  // namespace sirius::compression

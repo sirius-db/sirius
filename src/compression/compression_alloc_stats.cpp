@@ -35,6 +35,24 @@ std::atomic<std::uint64_t> g_outstanding{0};
 std::atomic<std::uint64_t> g_peak{0};
 std::atomic<std::uint64_t> g_largest{0};
 std::atomic<std::uint64_t> g_histogram[6]{};
+std::atomic<std::uint64_t> g_failures{0};
+
+/// Cumulative counters at the start of the current window (alloc_stats_begin_window).
+std::atomic<std::uint64_t> g_base_allocations{0};
+std::atomic<std::uint64_t> g_base_deallocations{0};
+std::atomic<std::uint64_t> g_base_total_bytes{0};
+std::atomic<std::uint64_t> g_base_failures{0};
+std::atomic<std::uint64_t> g_base_histogram[6]{};
+/// Peak and largest allocation since the window began (the g_peak/g_largest
+/// pair above stays process-lifetime for the downgrade monitor's line).
+std::atomic<std::uint64_t> g_window_peak{0};
+std::atomic<std::uint64_t> g_window_largest{0};
+
+void raise_to(std::atomic<std::uint64_t>& mark, std::uint64_t value) noexcept
+{
+  auto cur = mark.load(std::memory_order_relaxed);
+  while (value > cur && !mark.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
+}
 
 /// Bucket index for @p bytes; see alloc_stats_snapshot::histogram.
 std::size_t bucket_of(std::size_t bytes) noexcept
@@ -56,12 +74,13 @@ void record_allocation(std::size_t bytes) noexcept
   // Not a strict maximum under concurrency — a racing thread can publish a lower
   // value between the load and the store — but the encode paths are few and this
   // is a diagnostic, so the cheap CAS-free version is the right trade.
-  auto peak = g_peak.load(std::memory_order_relaxed);
-  while (now > peak && !g_peak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {}
-  auto largest = g_largest.load(std::memory_order_relaxed);
-  while (bytes > largest &&
-         !g_largest.compare_exchange_weak(largest, bytes, std::memory_order_relaxed)) {}
+  raise_to(g_peak, now);
+  raise_to(g_window_peak, now);
+  raise_to(g_largest, bytes);
+  raise_to(g_window_largest, bytes);
 }
+
+void record_failure() noexcept { g_failures.fetch_add(1, std::memory_order_relaxed); }
 
 void record_deallocation(std::size_t bytes) noexcept
 {
@@ -79,7 +98,13 @@ class counting_resource {
 
   void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
   {
-    void* ptr = _upstream.allocate(stream, bytes, alignment);
+    void* ptr = nullptr;
+    try {
+      ptr = _upstream.allocate(stream, bytes, alignment);
+    } catch (...) {
+      record_failure();
+      throw;
+    }
     record_allocation(bytes);
     return ptr;
   }
@@ -95,7 +120,13 @@ class counting_resource {
 
   void* allocate_sync(std::size_t bytes, std::size_t alignment)
   {
-    void* ptr = _upstream.allocate_sync(bytes, alignment);
+    void* ptr = nullptr;
+    try {
+      ptr = _upstream.allocate_sync(bytes, alignment);
+    } catch (...) {
+      record_failure();
+      throw;
+    }
     record_allocation(bytes);
     return ptr;
   }
@@ -146,23 +177,25 @@ rmm::device_async_resource_ref alloc_stats_wrap(rmm::device_async_resource_ref u
 alloc_stats_snapshot alloc_stats_read() noexcept
 {
   alloc_stats_snapshot s;
-  s.allocations      = g_allocations.load(std::memory_order_relaxed);
-  s.deallocations    = g_deallocations.load(std::memory_order_relaxed);
-  s.total_bytes      = g_total_bytes.load(std::memory_order_relaxed);
+  s.allocations       = g_allocations.load(std::memory_order_relaxed);
+  s.deallocations     = g_deallocations.load(std::memory_order_relaxed);
+  s.total_bytes       = g_total_bytes.load(std::memory_order_relaxed);
   s.outstanding_bytes = g_outstanding.load(std::memory_order_relaxed);
-  s.peak_bytes       = g_peak.load(std::memory_order_relaxed);
-  s.largest_bytes    = g_largest.load(std::memory_order_relaxed);
+  s.peak_bytes        = g_peak.load(std::memory_order_relaxed);
+  s.largest_bytes     = g_largest.load(std::memory_order_relaxed);
   for (std::size_t i = 0; i < 6; ++i) {
     s.histogram[i] = g_histogram[i].load(std::memory_order_relaxed);
   }
+  s.failures = g_failures.load(std::memory_order_relaxed);
   return s;
 }
 
-std::string alloc_stats_format()
+namespace {
+
+std::string format_snapshot(alloc_stats_snapshot const& s)
 {
-  const auto s = alloc_stats_read();
   return std::format(
-    "allocs={} frees={} total={}MiB outstanding={}MiB peak={}MiB largest={}MiB "
+    "allocs={} frees={} total={}MiB outstanding={}MiB peak={}MiB largest={}MiB failures={} "
     "hist[<64K,<1M,<8M,<64M,<256M,>=256M]={},{},{},{},{},{}",
     s.allocations,
     s.deallocations,
@@ -170,6 +203,7 @@ std::string alloc_stats_format()
     s.outstanding_bytes >> 20,
     s.peak_bytes >> 20,
     s.largest_bytes >> 20,
+    s.failures,
     s.histogram[0],
     s.histogram[1],
     s.histogram[2],
@@ -177,5 +211,51 @@ std::string alloc_stats_format()
     s.histogram[4],
     s.histogram[5]);
 }
+
+}  // namespace
+
+std::string alloc_stats_format() { return format_snapshot(alloc_stats_read()); }
+
+void alloc_stats_begin_window() noexcept
+{
+  g_base_allocations.store(g_allocations.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+  g_base_deallocations.store(g_deallocations.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+  g_base_total_bytes.store(g_total_bytes.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+  g_base_failures.store(g_failures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  for (std::size_t i = 0; i < 6; ++i) {
+    g_base_histogram[i].store(g_histogram[i].load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+  }
+  g_window_peak.store(g_outstanding.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  g_window_largest.store(0, std::memory_order_relaxed);
+}
+
+alloc_stats_snapshot alloc_stats_read_window() noexcept
+{
+  const auto all = alloc_stats_read();
+  // Saturating: a counter read before its baseline was stored (a window begun
+  // concurrently) reports 0 rather than wrapping.
+  auto delta = [](std::uint64_t now, std::atomic<std::uint64_t> const& base) {
+    const auto b = base.load(std::memory_order_relaxed);
+    return now > b ? now - b : 0;
+  };
+  alloc_stats_snapshot s;
+  s.allocations       = delta(all.allocations, g_base_allocations);
+  s.deallocations     = delta(all.deallocations, g_base_deallocations);
+  s.total_bytes       = delta(all.total_bytes, g_base_total_bytes);
+  s.outstanding_bytes = all.outstanding_bytes;
+  s.peak_bytes        = g_window_peak.load(std::memory_order_relaxed);
+  s.largest_bytes     = g_window_largest.load(std::memory_order_relaxed);
+  s.failures          = delta(all.failures, g_base_failures);
+  for (std::size_t i = 0; i < 6; ++i) {
+    s.histogram[i] = delta(all.histogram[i], g_base_histogram[i]);
+  }
+  return s;
+}
+
+std::string alloc_stats_format_window() { return format_snapshot(alloc_stats_read_window()); }
 
 }  // namespace sirius::compression

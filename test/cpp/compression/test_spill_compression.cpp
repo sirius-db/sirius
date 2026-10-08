@@ -41,6 +41,7 @@
 #include <compression/compressed_disk_representation.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/compression_converters.hpp>
+#include <compression/compression_device_pool.hpp>
 #include <compression/plan_register.hpp>
 #include <compression/spill_context.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -114,7 +115,12 @@ struct spill_test_env {
       .set_per_numa_region_capacity(512ull << 20)
       .use_gpu_id_as_host_id()
       .set_reservation_fraction_per_numa_region(0.75)
-      .set_disk_mounting_point(0, 2ull << 30, tmp_dir.string());
+      .set_disk_mounting_point(0, 2ull << 30, tmp_dir.string())
+      // Per-thread reservation tracking, as Sirius configures it
+      // (gpu_memory_space.per_stream_reservation defaults false). The encoder
+      // allocates on its column-pool streams, not the caller's, so a per-stream
+      // tracker would never see an encode reservation's allocations.
+      .track_reservation_per_stream(false);
 
     auto space_configs = builder.build();
     mgr =
@@ -1957,4 +1963,269 @@ TEST_CASE("optional compression: a transient decode failure is retryable, a real
   clear_faults();
   require_restores_to(batch, &repo_a(), expected_sum_of(n));
   reset_spill_state(false);
+}
+
+// ── No-arena mode: the encode under a strict reservation ─────────────────────
+//
+// The test process installs no compression arena, so the encoder allocates from
+// the GPU memory space; these cases make its reservation strict and size it
+// through encode_reserve_fraction. The batches are a few KB, so "sufficient"
+// is a large multiple of the batch and "ungrantable" a multiple beyond the
+// space's whole capacity.
+
+namespace {
+
+/// reset_spill_state with a given reservation fraction and strictness.
+void set_encode_reservation(double encode_reserve_fraction, bool strict)
+{
+  sirius::compression::plan_register::global().clear_all();
+  sirius::compression::set_spill_compression_settings(/*enabled=*/true,
+                                                      /*explore_beam_width=*/4,
+                                                      /*explore_max_bytes=*/8ull << 20,
+                                                      /*max_compressed_fraction=*/0.95,
+                                                      /*replan_after_uses=*/0,
+                                                      /*error_tolerance=*/1,
+                                                      /*replan_change_threshold=*/0.20,
+                                                      /*explore_sample_rows=*/0,
+                                                      /*min_batch_bytes=*/0,
+                                                      /*release_columns_early=*/false,
+                                                      encode_reserve_fraction,
+                                                      /*encode_min_headroom_fraction=*/0.0);
+  sirius::compression::set_spill_encode_strict_reservation(strict);
+}
+
+void reset_encode_reservation()
+{
+  sirius::compression::set_spill_encode_strict_reservation(false);
+  reset_spill_state(false);
+}
+
+std::size_t gpu_reserved_bytes()
+{
+  auto* mr = env().gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  REQUIRE(mr != nullptr);
+  return mr->get_total_reserved_bytes();
+}
+
+}  // namespace
+
+TEST_CASE("no-arena compression: a strict encode round-trips under a sufficient reservation",
+          "[compression][spill][no_arena][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+  if (sirius::compression::compression_device_pool_enabled()) {
+    SKIP("a compression arena is installed in this process");
+  }
+
+  auto& e = env();
+  clear_faults();
+  // ~20 KB batch -> a ~20 MB reservation: generous for the encode's scratch.
+  set_encode_reservation(/*encode_reserve_fraction=*/1000.0, /*strict=*/true);
+  set_plan_1col(&repo_a(), kOneColDsl);
+  sirius::compression::reset_encode_reservation_window();
+
+  const std::size_t n      = 5000;
+  auto batch               = make_int32_gpu_batch(n);
+  const auto reserved_then = gpu_reserved_bytes();
+  const auto before        = sirius::compression::read_compression_fallback_counters();
+
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch));
+
+  const auto enc = sirius::compression::read_encode_reservation_stats();
+  REQUIRE(enc.granted == 1);
+  REQUIRE(enc.declined == 0);
+  REQUIRE(enc.outstanding_reserved == 0);  // released when the encode finished
+  REQUIRE(enc.largest_reserved > 0);
+  REQUIRE(enc.largest_used > 0);  // the encode's allocations went through it
+  REQUIRE(enc.largest_used <= enc.largest_reserved);
+  REQUIRE(gpu_reserved_bytes() == reserved_then);
+  const auto after = sirius::compression::read_compression_fallback_counters();
+  REQUIRE(after.spill_fell_back == before.spill_fell_back);
+  REQUIRE(after.spill_skipped_reservation == before.spill_skipped_reservation);
+
+  // The thread's tracker was detached: a second encode on the same thread
+  // attaches afresh rather than being refused as "thread already holds one".
+  auto second = make_int32_gpu_batch(n);
+  spill_to(second, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*second));
+  REQUIRE(sirius::compression::read_encode_reservation_stats().granted == 2);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  require_restores_to(second, &repo_a(), expected_sum_of(n));
+  reset_encode_reservation();
+}
+
+TEST_CASE("no-arena compression: an ungrantable reservation skips compression and still spills",
+          "[compression][spill][no_arena][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+  if (sirius::compression::compression_device_pool_enabled()) {
+    SKIP("a compression arena is installed in this process");
+  }
+
+  auto& e           = env();
+  const bool strict = GENERATE(true, false);
+  CAPTURE(strict);
+  clear_faults();
+  // ~20 KB x 1e6 = ~20 GB: far beyond the 512 MiB test space.
+  set_encode_reservation(/*encode_reserve_fraction=*/1.0e6, strict);
+  set_plan_1col(&repo_a(), kOneColDsl);
+  sirius::compression::reset_encode_reservation_window();
+
+  const std::size_t n      = 5000;
+  auto batch               = make_int32_gpu_batch(n);
+  const auto reserved_then = gpu_reserved_bytes();
+  const auto before        = sirius::compression::read_compression_fallback_counters();
+
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(is_compressed_host(*batch));
+
+  const auto after = sirius::compression::read_compression_fallback_counters();
+  REQUIRE(after.spill_skipped_reservation == before.spill_skipped_reservation + 1);
+  REQUIRE(after.spill_fell_back == before.spill_fell_back);
+  REQUIRE(sirius::compression::read_encode_reservation_stats().declined == 1);
+  // Declining allocated nothing, so nothing latches and nothing stays reserved.
+  REQUIRE_FALSE(sirius::compression::spill_compression_suppressed());
+  REQUIRE(gpu_reserved_bytes() == reserved_then);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  reset_encode_reservation();
+}
+
+TEST_CASE("no-arena compression: a strict encode that outgrows its reservation falls back",
+          "[compression][spill][no_arena][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+  if (sirius::compression::compression_device_pool_enabled()) {
+    SKIP("a compression arena is installed in this process");
+  }
+
+  auto& e = env();
+  clear_faults();
+  // ~20 KB x 1e-4 = a couple of bytes: grantable, but the encode's first
+  // allocation overruns it and fail_reservation_limit_policy throws at once.
+  set_encode_reservation(/*encode_reserve_fraction=*/1.0e-4, /*strict=*/true);
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n      = 5000;
+  auto batch               = make_int32_gpu_batch(n);
+  const auto reserved_then = gpu_reserved_bytes();
+  const auto before        = sirius::compression::read_compression_fallback_counters();
+
+  sirius::convertible_data_batch w(batch, &repo_a());
+  std::optional<std::vector<std::size_t>> moved;
+  REQUIRE_NOTHROW(moved = w.convert({e.host_space}, e.stream(), *e.mgr, true));
+  REQUIRE(moved.has_value());
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(is_compressed_host(*batch));
+
+  const auto after = sirius::compression::read_compression_fallback_counters();
+  REQUIRE(after.spill_fell_back == before.spill_fell_back + 1);
+  // The overrun is the encode's own budget, not the query's memory: no latch.
+  REQUIRE_FALSE(sirius::compression::spill_compression_suppressed());
+  REQUIRE(gpu_reserved_bytes() == reserved_then);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  reset_encode_reservation();
+}
+
+TEST_CASE("no-arena compression: a thread already holding a reservation declines a strict encode",
+          "[compression][spill][no_arena][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+  if (sirius::compression::compression_device_pool_enabled()) {
+    SKIP("a compression arena is installed in this process");
+  }
+
+  auto& e = env();
+  clear_faults();
+  set_encode_reservation(/*encode_reserve_fraction=*/1000.0, /*strict=*/true);
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+  const auto before   = sirius::compression::read_compression_fallback_counters();
+
+  outcome result = outcome::other_exception;
+  on_fresh_thread([&] {
+    // Stand in for a pipeline task's reservation on this thread.
+    auto* mr         = e.gpu_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+    auto reservation = e.gpu_space->make_reservation_or_null(1ull << 20);
+    REQUIRE(reservation);
+    REQUIRE(mr->attach_reservation_to_tracker(e.stream(), std::move(reservation)));
+    sirius::convertible_data_batch w(batch, &repo_a());
+    result = outcome_of([&] { (void)w.convert({e.host_space}, e.stream(), *e.mgr, true); });
+    mr->reset_stream_reservation(e.stream());
+  });
+
+  REQUIRE(result == outcome::ok);
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(is_compressed_host(*batch));
+  REQUIRE(sirius::compression::read_compression_fallback_counters().spill_skipped_reservation ==
+          before.spill_skipped_reservation + 1);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  reset_encode_reservation();
+}
+
+// ── Per-query peaks ──────────────────────────────────────────────────────────
+
+TEST_CASE("compression memory: the arena's high-water mark restarts per query",
+          "[compression][no_arena]")
+{
+  // The counter behind compression_device_pool_peak_bytes(); installing a real
+  // arena is process-wide and permanent, so the logic is tested on its own.
+  sirius::compression::usage_high_water_mark mark;
+  mark.on_allocate(100);
+  mark.on_allocate(50);
+  mark.on_deallocate(120);
+  REQUIRE(mark.used() == 30);
+  REQUIRE(mark.peak() == 150);
+
+  // A new window starts from what is still outstanding, not from zero and not
+  // from the previous window's peak.
+  REQUIRE(mark.reset_peak() == 150);
+  REQUIRE(mark.peak() == 30);
+  mark.on_allocate(10);
+  REQUIRE(mark.peak() == 40);
+  mark.on_deallocate(40);
+  REQUIRE(mark.used() == 0);
+  REQUIRE(mark.peak() == 40);
+  REQUIRE(mark.reset_peak() == 40);
+  REQUIRE(mark.peak() == 0);
+
+  // The process-wide arena accessors and the encode-reservation window reset
+  // the same way (no arena here, so the arena reads zero throughout).
+  sirius::compression::compression_device_pool_reset_peak();
+  REQUIRE(sirius::compression::compression_device_pool_peak_bytes() ==
+          sirius::compression::compression_device_pool_used_bytes());
+
+  sirius::compression::note_encode_reservation_granted(1000);
+  sirius::compression::note_encode_reservation_released(1000, 400);
+  sirius::compression::note_encode_reservation_declined();
+  auto enc = sirius::compression::read_encode_reservation_stats();
+  REQUIRE(enc.granted >= 1);
+  REQUIRE(enc.peak_outstanding_reserved >= 1000);
+  REQUIRE(enc.largest_used >= 400);
+  sirius::compression::reset_encode_reservation_window();
+  enc = sirius::compression::read_encode_reservation_stats();
+  REQUIRE(enc.granted == 0);
+  REQUIRE(enc.declined == 0);
+  REQUIRE(enc.peak_outstanding_reserved == enc.outstanding_reserved);
+  REQUIRE(enc.largest_reserved == 0);
+  REQUIRE(enc.largest_used == 0);
 }

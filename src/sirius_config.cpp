@@ -419,7 +419,15 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.optional("spill_release_columns_early", opt.spill_release_columns_early);
   r.optional("spill_encode_reserve_fraction", opt.spill_encode_reserve_fraction);
   r.optional("spill_encode_min_headroom_fraction", opt.spill_encode_min_headroom_fraction);
+  r.optional("spill_encode_strict_reservation", opt.spill_encode_strict_reservation);
   r.reject_unknown();
+  if (opt.spill_encode_strict_reservation && opt.device_pool_bytes == 0 &&
+      !(opt.spill_encode_reserve_fraction > 0.0)) {
+    throw std::runtime_error(
+      "compression.spill_encode_strict_reservation needs a positive "
+      "spill_encode_reserve_fraction: without an arena the reservation is the encode's only "
+      "device budget");
+  }
 }
 
 static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& opt)

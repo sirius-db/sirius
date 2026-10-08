@@ -50,7 +50,18 @@ std::atomic<std::size_t> g_spill_min_batch_bytes{64ULL * 1024 * 1024};
 std::atomic<bool> g_spill_release_columns_early{false};
 std::atomic<double> g_encode_reserve_fraction{0.5};
 std::atomic<double> g_encode_min_headroom_fraction{0.10};
+std::atomic<bool> g_encode_strict_reservation{false};
 }  // namespace
+
+void set_spill_encode_strict_reservation(bool strict) noexcept
+{
+  g_encode_strict_reservation.store(strict, std::memory_order_relaxed);
+}
+
+bool spill_encode_strict_reservation() noexcept
+{
+  return g_encode_strict_reservation.load(std::memory_order_relaxed);
+}
 
 const spill_context* current_spill_context() noexcept { return t_current_spill_context; }
 
@@ -87,6 +98,7 @@ namespace {
 std::atomic<std::int64_t> g_last_physical_oom_ms{0};
 
 std::atomic<std::uint64_t> g_spill_skipped_pressure{0};
+std::atomic<std::uint64_t> g_spill_skipped_reservation{0};
 std::atomic<std::uint64_t> g_spill_fell_back{0};
 std::atomic<std::uint64_t> g_in_place_fell_back{0};
 std::atomic<std::uint64_t> g_output_fell_back{0};
@@ -133,6 +145,9 @@ void note_compression_fallback(compression_fallback_kind kind) noexcept
     case compression_fallback_kind::spill_skipped_pressure:
       g_spill_skipped_pressure.fetch_add(1, std::memory_order_relaxed);
       break;
+    case compression_fallback_kind::spill_skipped_reservation:
+      g_spill_skipped_reservation.fetch_add(1, std::memory_order_relaxed);
+      break;
     case compression_fallback_kind::spill_fell_back:
       g_spill_fell_back.fetch_add(1, std::memory_order_relaxed);
       break;
@@ -148,6 +163,7 @@ void note_compression_fallback(compression_fallback_kind kind) noexcept
 compression_fallback_counters read_compression_fallback_counters() noexcept
 {
   return {g_spill_skipped_pressure.load(std::memory_order_relaxed),
+          g_spill_skipped_reservation.load(std::memory_order_relaxed),
           g_spill_fell_back.load(std::memory_order_relaxed),
           g_in_place_fell_back.load(std::memory_order_relaxed),
           g_output_fell_back.load(std::memory_order_relaxed)};
@@ -241,6 +257,7 @@ spill_context make_spill_context(const cucascade::shared_data_repository* repo) 
     .release_columns_early        = g_spill_release_columns_early.load(std::memory_order_relaxed),
     .encode_reserve_fraction      = g_encode_reserve_fraction.load(std::memory_order_relaxed),
     .encode_min_headroom_fraction = g_encode_min_headroom_fraction.load(std::memory_order_relaxed),
+    .encode_strict_reservation    = g_encode_strict_reservation.load(std::memory_order_relaxed),
   };
 }
 

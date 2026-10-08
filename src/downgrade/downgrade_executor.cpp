@@ -787,14 +787,15 @@ void downgrade_executor::monitor_loop()
         // encode is asking the allocator for, against how much room there was.
         // Compress-side skips and fallbacks: each is a batch that still moved, raw.
         if (const auto fb = compression::read_compression_fallback_counters();
-            fb.spill_skipped_pressure + fb.spill_fell_back + fb.in_place_fell_back +
-              fb.output_fell_back >
+            fb.spill_skipped_pressure + fb.spill_skipped_reservation + fb.spill_fell_back +
+              fb.in_place_fell_back + fb.output_fell_back >
             0) {
           SIRIUS_LOG_DEBUG(
-            "[compression_fallback] [{}] spill_skipped_pressure={} spill_fell_back={} "
-            "in_place_fell_back={} output_fell_back={}",
+            "[compression_fallback] [{}] spill_skipped_pressure={} spill_skipped_reservation={} "
+            "spill_fell_back={} in_place_fell_back={} output_fell_back={}",
             _source_label,
             fb.spill_skipped_pressure,
+            fb.spill_skipped_reservation,
             fb.spill_fell_back,
             fb.in_place_fell_back,
             fb.output_fell_back);
