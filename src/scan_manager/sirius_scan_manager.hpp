@@ -19,6 +19,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb_table_identity.hpp"
 #include "event/query_event_publisher.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
@@ -466,24 +467,6 @@ struct parquet_bind_result {
   std::size_t total_num_rows{0};
 };
 
-/// Number of concurrent queries the scan manager sizes its thread pool for.
-///
-/// Each query's coalescer runs exactly ONE sequencer task that BLOCKS in
-/// queue.wait_dequeue, and is unblocked only by that query's own split_provider tasks
-/// running on the same pool. So every concurrent query needs a parked thread on top of the
-/// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
-/// deadlock: every thread parked in a sequencer, none left to feed them.
-///
-/// Left at 1 so the pool stays exactly the size it was before per-query state landed
-/// (num_threads + 1, the old single-sequencer allowance) — this makes the concurrency
-/// refactor behaviorally neutral for existing single-query runs.
-///
-/// TODO: promote to a real option on @ref scan_manager_config (scan_manager/config.hpp),
-/// parsed alongside thread_pool.num_threads in sirius_config.cpp's from_yaml, and RAISE IT
-/// before enabling more than a couple of concurrent queries. Nothing else should read this
-/// constant once it moves.
-inline constexpr int k_max_concurrent_queries = 1;
-
 /**
  * @brief Manages scan-side preparation for a query.
  *
@@ -504,7 +487,8 @@ class sirius_scan_manager {
    * @param topology_index Hardware GPU/NUMA topology index.  Drives round-robin
    *        GPU assignment for scans and is forwarded to the prefetching cache.
    */
-  sirius_scan_manager(const scan_manager_config& config,
+  sirius_scan_manager(sirius::exec::query_lifecycle_registry& lifecycle,
+                      const scan_manager_config& config,
                       cucascade::memory::memory_reservation_manager& reservation_manager,
                       std::shared_ptr<const sirius::memory::topology_index> topology_index,
                       std::shared_ptr<op::scan::physical_check_counters> physical_counters = {});
@@ -570,6 +554,8 @@ class sirius_scan_manager {
   ///
   /// Blocking — waits out this query's in-flight reads. The wait happens OUTSIDE the state
   /// mutex, so another connection's prepare_for_query is never parked behind it.
+  // Stop producers while retaining providers/buffers until downstream retirement.
+  void quiesce(sirius::query_id_t query_id);
   void reset(sirius::query_id_t query_id);
 
   /// Drain and drop this query's scan work while retaining checkpoint protection.
@@ -1068,6 +1054,7 @@ class sirius_scan_manager {
   /// credential rotation cannot retire the context while a request is in flight.
   std::shared_ptr<sirius::io::rest::rest_ioctx> rest_ioctx_for_list(std::string_view path);
 
+  exec::query_lifecycle_registry& _query_lifecycle;
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   /// Hardware GPU/NUMA topology, shared with the prefetching cache.  Source of

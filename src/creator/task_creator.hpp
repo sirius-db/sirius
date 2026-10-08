@@ -23,6 +23,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -58,6 +59,10 @@ namespace sirius::memory {
 class topology_index;
 }  // namespace sirius::memory
 
+namespace sirius::parallel {
+class itask;
+}
+
 namespace sirius::creator {
 
 /**
@@ -76,6 +81,8 @@ namespace sirius::creator {
  */
 
 struct task_creation_request {
+  // Lives from publication through the final creator callback, including the pop/attach gap.
+  exec::query_lifecycle_registry::work_lease work;
   op::sirius_physical_operator* node;
   request_type type = request_type::active;
   //! The query `node` belongs to. Indexes the request in the creation queue so a finished or
@@ -84,6 +91,13 @@ struct task_creation_request {
   //! Scheduling priority of `node`'s pipeline; orders the creation queue the same way the
   //! execution queue is ordered (query first, then within-query pipeline rank).
   exec::queue_priority priority = 0;
+  //! `node`'s operator type, captured at schedule() time.
+  //!
+  //! Stored rather than read back off `node` so the queue's key extractor — which runs inside the
+  //! queue mutex on every push — dereferences no operator. A schedule() racing its query's
+  //! teardown would otherwise read a freed operator while holding that mutex, and unlike the
+  //! other keys this one had no reason to be resolved late.
+  op::SiriusPhysicalOperatorType operator_type = op::SiriusPhysicalOperatorType::INVALID;
   //! Preferred GPU, when the caller had a hint. Only a secondary index; does not bind the task.
   int device_id = exec::no_preferred_device;
 };
@@ -106,7 +120,8 @@ class task_creator {
    * @param mem_res_mgr Reference to the memory reservation manager.
    * @param topology_index Optional shared GPU<->NUMA index for NUMA-aware GPU routing.
    */
-  task_creator(task_creator_config config,
+  task_creator(sirius::exec::query_lifecycle_registry& lifecycle,
+               task_creator_config config,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
                std::shared_ptr<const sirius::memory::topology_index> topology_index = nullptr);
 
@@ -144,6 +159,7 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+  void reschedule(std::unique_ptr<parallel::itask> task);
 
   /// Attach the query-event observer. Until called, events go to an unsubscribed publisher.
   void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
@@ -229,20 +245,21 @@ class task_creator {
   /// No-op when no query is registered.
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail @p query_id with @p error.
+  /// \brief Fail @p query_id with @p error, touching no shared subsystem.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
   /// surfaces the error rather than the process terminating. The error goes to that query's own
-  /// completion handler, so no other in-flight query is failed by it.
+  /// completion handler and nothing else; other in-flight queries keep running, and the failing
+  /// query is unwound by sirius_engine::execute's drain_after_error(query_id).
   ///
   /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
   /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
   /// ~gpu_pipeline_task), and synchronously stopping/draining a pool from its own worker is a
   /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
-  /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
-  /// called by the query thread once it observes the error, does the actual draining.
+  /// occupying). Only fulfills the completion future; drain_after_error(query_id), called by the
+  /// query thread once it observes the error, does the actual draining.
   void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
 
   /**
@@ -268,6 +285,18 @@ class task_creator {
   compute_pipeline_priorities(const sirius::planner::query& query) const;
 
  protected:
+  /**
+   * @brief Register a publisher and diagnose an unknown query. Retain the guard through push.
+   *
+   * Unknown and retiring queries return a refused guard; no work may be published.
+   */
+  [[nodiscard]] sirius::exec::query_lifecycle_registry::submission_guard begin_submission(
+    sirius::query_id_t query_id) const;
+
+  /// \brief Log loudly when a push was refused for a query that is still accepting work.
+  /// A refused push destroys the request, so a live query silently loses a task it is waiting on.
+  void report_if_dropped(bool pushed, sirius::query_id_t query_id) const;
+
   /**
    * @brief Stop the worker thread pool.
    *
@@ -326,6 +355,8 @@ class task_creator {
   /// the context's own in set_query_event_publisher.
   std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
     std::make_shared<sirius::event::query_event_publisher>()};
+  /// Non-owning; the runtime or test fixture must outlive this creator.
+  sirius::exec::query_lifecycle_registry& _query_lifecycle;
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
@@ -361,16 +392,9 @@ class task_creator {
     std::size_t index_of_next_lookahead{0};
     std::vector<op::sirius_physical_operator*> lookahead_queue;
 
-    //! Per-query stand-in for `bounded_thread_pool::wait_all()`, which can only wait on every
-    //! query's creation work at once. Incremented before dispatch, decremented when the lambda
-    //! leaves (including by exception); `wait_for_in_flight()` blocks until it reaches zero.
-    std::mutex in_flight_mutex;
-    std::condition_variable in_flight_cv;
-    std::size_t in_flight{0};
-
-    void enter_in_flight();
-    void leave_in_flight();
-    void wait_for_in_flight();
+    // (In-flight creation work is tracked by the pool itself, keyed by the query the slot is
+    // attached to; see bounded_thread_pool::drain_and_wait. The bespoke counter that used to live
+    // here duplicated that accounting and had to be kept in sync by hand across every exit path.)
   };
 
   //! Resolve a query's state, or nullptr when it has already been reset.
@@ -390,15 +414,17 @@ class task_creator {
   //! One entry per in-flight query. Guarded by _global_state_mutex.
   std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
   mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
-
-  //! Serializes start_thread_pool()/stop_thread_pool() against each other and guards
-  //! _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
+  //! Serializes pool/manager-thread lifecycle (start_thread_pool / stop_thread_pool / stop) and
+  //! guards _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
   //! do_stop_thread_pool() joins _manager_thread while holding this lock, and manager_loop()
   //! (running on that thread) takes _global_state_mutex on every request via
   //! get_query_task_global_state(). Sharing one mutex between the two let a worker thread's
-  //! error-triggered stop_thread_pool() call block on the join while holding the very lock
-  //! manager_loop() needed to reach its own exit check -- a real deadlock, not a theoretical one,
-  //! since manager_loop() passes through that lock on every iteration.
+  //! error-triggered stop_thread_pool() call (fired whenever a query takes the error path --
+  //! drain_after_error() -> stop_thread_pool() -- while the creator is still running) block on
+  //! the join while holding the very lock manager_loop() needed to reach its own exit check -- a
+  //! real deadlock, not a theoretical one, since manager_loop() passes through that lock on every
+  //! iteration. The two mutexes guard disjoint state -- this one covers _bounded_pool /
+  //! _manager_thread / _running, the other covers _query_task_global_states and _task_scheduler.
   std::mutex _thread_pool_mutex;
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).

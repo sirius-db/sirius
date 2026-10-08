@@ -136,14 +136,28 @@ scoped_test_query::scoped_test_query(duckdb::ClientContext& context)
   : ctx_(context.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     query_id_(next_test_query_id())
 {
-  if (usable()) { ctx_->get_data_repository_registry().create_for_query(query_id_); }
+  if (usable()) {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.open_query(query_id_);
+    try {
+      ctx_->get_data_repository_registry().create_for_query(query_id_);
+    } catch (...) {
+      lifecycle.close(query_id_);
+      throw;
+    }
+  }
 }
 
 scoped_test_query::~scoped_test_query()
 {
   if (!usable()) { return; }
   try {
+    auto& lifecycle = ctx_->get_query_lifecycle_registry();
+    lifecycle.quiesce_and_wait_for_submissions(query_id_);
+    lifecycle.wait_for_work(query_id_);
+    lifecycle.release_resources(query_id_);
     ctx_->get_data_repository_registry().erase(query_id_);
+    lifecycle.close(query_id_);
   } catch (...) {  // best-effort: never throw out of a test-scaffolding destructor
   }
 }

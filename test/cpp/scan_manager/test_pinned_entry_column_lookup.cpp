@@ -105,7 +105,8 @@ void pin_metadata_entry(sirius_scan_manager& manager,
 struct split_pin_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
 
   split_pin_fixture()
   {
@@ -161,7 +162,8 @@ void pin_typed_entry(sirius_scan_manager& manager,
 struct type_match_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory =
     initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   duckdb::vector<duckdb::LogicalType> returned_types{duckdb::LogicalType::BIGINT,
                                                      duckdb::LogicalType::BIGINT};
   std::string matching_name;
@@ -286,7 +288,8 @@ TEST_CASE("type match: when no covering entry still matches, one is returned any
           "[pinned_lookup][scan_manager]")
 {
   auto memory = initialize_memory_manager(1);
-  sirius_scan_manager manager{scan_manager_config{}, *memory, single_gpu_index()};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, scan_manager_config{}, *memory, single_gpu_index()};
   pin_typed_entry(manager, *memory, "orders", {0, 1}, kInt32);
   duckdb::vector<duckdb::LogicalType> const returned_types{duckdb::LogicalType::BIGINT,
                                                            duckdb::LogicalType::BIGINT};

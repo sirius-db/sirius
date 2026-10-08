@@ -45,7 +45,7 @@ using sirius::creator::task_creator_config;
 struct schedule_fixture {
   schedule_fixture()
     : memory_manager(sirius::test::operator_utils::initialize_memory_manager(1)),
-      creator(task_creator_config{}, *memory_manager)
+      creator(lifecycle, task_creator_config{}, *memory_manager)
   {
   }
 
@@ -76,6 +76,7 @@ struct schedule_fixture {
 
   sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
+  sirius::exec::query_lifecycle_registry lifecycle;
   task_creator creator;
 };
 
@@ -104,6 +105,7 @@ TEST_CASE("task_creator::schedule accepts a placed operator", "[task_creator][sc
   const auto query_id = sirius::make_query_id(11);
   auto op             = f.make_operator();
   auto pipeline       = f.place(*op, query_id);
+  f.lifecycle.open_query(query_id);
 
   REQUIRE_NOTHROW(f.creator.schedule(op.get()));
 
@@ -117,6 +119,7 @@ TEST_CASE("task_creator::schedule with an explicit query id still requires a pip
   schedule_fixture f;
   auto op = f.make_operator();
 
+  f.lifecycle.open_query(sirius::make_query_id(11));
   // The query id is supplied here, but the priority still comes from the pipeline, so the
   // overload is no laxer than the one-argument form.
   REQUIRE_THROWS_AS(f.creator.schedule(op.get(), sirius::make_query_id(11)),

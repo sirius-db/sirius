@@ -1305,21 +1305,19 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
 }  // namespace
 
 sirius_scan_manager::sirius_scan_manager(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   const scan_manager_config& config,
   cucascade::memory::memory_reservation_manager& reservation_manager,
   std::shared_ptr<const sirius::memory::topology_index> topology_index,
   std::shared_ptr<op::scan::physical_check_counters> physical_counters)
-  : _config(config),
+  : _query_lifecycle(lifecycle),
+    _config(config),
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
-    // num_threads + k_max_concurrent_queries, not num_threads + 1: each query's coalescer
-    // sequencer task BLOCKS (worker_loop -> process_provider_inputs -> queue.wait_dequeue)
-    // and is unblocked only by that query's own split_provider tasks, which run on this same
-    // pool. With Q concurrent queries, Q threads are parked in sequencers at all times, so
-    // sizing for a single sequencer would let Q queries consume the entire working budget
-    // and deadlock by starvation. See k_max_concurrent_queries for the bound and its TODO.
-    _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
+    // Query execution is serialized by SiriusContext's lifecycle slot. Reserve one extra
+    // worker for the query's blocking coalescer so its producers retain their working budget.
+    _thread_pool(_config.thread_pool.num_threads + 1,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _ioctx_registry(config, reservation_manager)
@@ -1954,20 +1952,6 @@ void sirius_scan_manager::prepare_for_query(
   // locally and never leaves a half-built entry visible to reset() or a concurrent prepare.
   {
     std::lock_guard lk{_query_states_mutex};
-    if (_query_states.size() >= static_cast<std::size_t>(k_max_concurrent_queries)) {
-      // The pool is sized for k_max_concurrent_queries parked sequencers; past that, each
-      // extra query eats into the working budget and at pool size it deadlocks outright.
-      // Loud rather than silent, so the missing config option reports itself the first time
-      // real concurrency is exercised. See k_max_concurrent_queries.
-      SIRIUS_LOG_WARN(
-        "[sirius_scan_manager::prepare_for_query] registering query {} brings the live query "
-        "count to {}, above the {} the scan thread pool is sized for; scan throughput will "
-        "degrade and {} concurrent queries would deadlock. Raise k_max_concurrent_queries.",
-        query_id,
-        _query_states.size() + 1,
-        k_max_concurrent_queries,
-        _thread_pool.num_threads() + k_max_concurrent_queries);
-    }
     _query_states.emplace(query_id, state);
   }
 
@@ -2015,7 +1999,8 @@ void sirius_scan_manager::maybe_start_memory_prefetcher(query_scan_manager_state
     connectors.push_back(scan.op->get_shared_split_connector());
   }
 
-  state.prefetcher = std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space);
+  state.prefetcher =
+    std::make_unique<memory_prefetcher>(cfg, std::move(connectors), gpu_space, _query_lifecycle);
 }
 
 std::shared_ptr<sirius::io::sirius_datasource> sirius_scan_manager::create_datasource(
@@ -2201,6 +2186,11 @@ std::shared_ptr<sirius_scan_manager::query_scan_manager_state> sirius_scan_manag
   std::lock_guard lk{_query_states_mutex};
   auto it = _query_states.find(query_id);
   return it == _query_states.end() ? nullptr : it->second;
+}
+
+void sirius_scan_manager::quiesce(sirius::query_id_t query_id)
+{
+  if (auto state = get_query_state(query_id)) { state->drain(); }
 }
 
 void sirius_scan_manager::reset(sirius::query_id_t query_id)

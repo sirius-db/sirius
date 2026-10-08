@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
+#include "pipeline/task_submission.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <memory>
@@ -30,10 +31,12 @@ namespace sirius {
 namespace parallel {
 
 itask_executor::itask_executor(
+  sirius::exec::query_lifecycle_registry& lifecycle,
   exec::thread_pool_config config,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::optional<int> device_id)
-  : _config(std::move(config)),
+  : _query_lifecycle(lifecycle),
+    _config(std::move(config)),
     // Shared with the task_scheduler's queue so both derive a task's query the same way; see
     // pipeline::index_keys_for.
     _task_queue(&pipeline::index_keys_for),
@@ -48,9 +51,19 @@ itask_executor::itask_executor(
 
 itask_executor::~itask_executor() { stop(); }
 
-void itask_executor::schedule(std::unique_ptr<itask> task)
+bool itask_executor::schedule(std::unique_ptr<itask> input)
 {
+  // Declared before task so an exception destroys unsubmitted work before settling its publisher.
+  exec::query_lifecycle_registry::submission_guard submission;
+  auto task = std::move(input);
   if (task) {
+    // The OOM reschedule path re-enters here from a pool worker after a 50 ms backoff, so a
+    // drain for this query may already have passed. Refuse rather than re-arm work behind it.
+
+    submission = pipeline::begin_submission(
+      _query_lifecycle, *task, "task_executor: query lifecycle registration is missing");
+    if (!submission) { return false; }
+
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
       pipeline_task->telemetry_handle().queued({
         .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -58,9 +71,16 @@ void itask_executor::schedule(std::unique_ptr<itask> task)
       });
     }
   }
-  if (!_task_queue.push(std::move(task))) {
+  if (!_task_queue.try_push(task)) {
+    if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
+      if (auto handler = gpu_task->get_completion_handler()) {
+        handler->report_error("task executor queue closed before dispatch");
+      }
+    }
     SIRIUS_LOG_WARN("Task queue interrupted, dropping task");
+    return false;
   }
+  return true;
 }
 
 void itask_executor::start()
@@ -97,11 +117,6 @@ void itask_executor::wait_all()
 
 void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
 
-void itask_executor::drain_query_tasks(sirius::query_id_t query_id)
-{
-  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-}
-
 void itask_executor::drain_and_wait()
 {
   // Guard: if the executor has never been started (or has been stopped),
@@ -116,56 +131,75 @@ void itask_executor::drain_and_wait()
     return;
   }
 
-  // Interrupt the pool so the manager's reserve() unblocks with an invalid slot.
-  _bounded_pool->interrupt();
-
-  // Interrupt pop() so the manager loop sees a nullptr and breaks out.
-  _task_queue.interrupt();
-
-  // Join the manager thread so we know it has exited.
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-
-  // Wait for all in-flight thread-pool tasks to finish.
-  _bounded_pool->wait_all();
-
-  // Clear any remaining tasks from the queue.
+  quiesce_manager();
   _task_queue.drain();
+  resume_manager();
+}
 
-  // Re-enable the pool and queue so the executor is ready for the next query.
+void itask_executor::quiesce_manager()
+{
+  // Releasing the manager thread's pool slot is a PRECONDITION for wait_all(), not an
+  // optimization. manager_loop() calls reserve() and then blocks in _task_queue.pop(), so an idle
+  // manager permanently holds an active slot; wait_all() waits for active_ == 0 and would never
+  // return. interrupt() makes reserve() hand back an invalid slot and pop() return nullptr, which
+  // is what lets the loop exit and the join succeed.
+  _bounded_pool->interrupt();
+  _task_queue.interrupt();
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+  _bounded_pool->wait_all();
+}
+
+void itask_executor::resume_manager()
+{
   _bounded_pool->resume();
   _task_queue.reactivate();
   _manager_thread = std::thread([this] { manager_loop(); });
 }
 
-void itask_executor::wait_and_validate_empty()
+void itask_executor::wait_and_validate_empty(sirius::query_id_t query_id)
 {
-  // Same quiescing as drain_and_wait(): interrupt the pool + queue so the manager
-  // exits, join it, and wait for all in-flight thread-pool tasks to finish.
-  _bounded_pool->interrupt();
-  _task_queue.interrupt();
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
+  // Never started (or already stopped): nothing dispatched, nothing to validate. drain_and_wait()
+  // has always had this guard; the whole-executor variant this replaced did not, and
+  // null-dereferenced when a query failed before any work reached this executor.
+  if (!_bounded_pool) { return; }
 
-  // Instead of draining, VALIDATE the queue is empty. A non-empty queue here means
-  // tasks were still scheduled on this executor when the query was declared complete.
-  const std::size_t remaining = _task_queue.size();
+  // Per-query wait, no quiesce bracket. This is the success path: the query's completion handler
+  // has already fired, so nothing of this query remains to be popped and the pop-to-attach window
+  // that the error path must worry about cannot occur here. Untagged slots (a manager parked in
+  // pop()) are ignored by drain_and_wait, which is exactly what lets this return without stopping
+  // the executor -- and therefore without interrupting the shared queue and dropping a co-tenant's
+  // in-transit task, which the previous bracket did on EVERY successful completion.
+  // wait_for_query, NOT drain_and_wait: this is the success path, so the query's remaining work
+  // must be allowed to RUN. Dropping it here would silently discard tasks the query legitimately
+  // scheduled and then report success.
+  _bounded_pool->wait_for_query(query_id);
 
-  // Re-enable the pool/queue and restart the manager so the executor is left in a
-  // usable state for the next query, whether or not validation passes.
-  _bounded_pool->resume();
-  _task_queue.reactivate();
-  _manager_thread = std::thread([this] { manager_loop(); });
+  // Only THIS query's tasks must be gone. The original validated the WHOLE queue, so a query
+  // completing normally threw because a co-tenant had work legitimately queued.
+  const std::size_t remaining =
+    _task_queue.size(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
 
   if (remaining != 0) {
     SIRIUS_LOG_ERROR(
-      "itask_executor::wait_and_validate_empty: task queue NOT empty at query completion — "
+      "itask_executor::wait_and_validate_empty: task queue NOT empty for query {} at completion — "
       "{} task(s) still queued; tasks were still being scheduled when the query was marked "
       "complete",
+      query_id,
       remaining);
     throw std::runtime_error(
       "task_executor: task queue not empty at query completion (" + std::to_string(remaining) +
       " task(s) remaining) — premature completion while work was still scheduled");
   }
+}
+
+void itask_executor::wait_and_drain_query(sirius::query_id_t query_id)
+{
+  // Leave accepted staging tasks for the manager: each consumed a device_ready signal.
+  // Removing one here could strand the manager in pop() with no scheduler readiness left.
+  // The GPU manager discards cancelled tasks before preparation and advertises readiness again.
+  // The caller must close publication first, then wait_for_work() after draining workers to
+  // cover staged and manager-local tasks that have not yet been attributed to a pool slot.
+  if (_bounded_pool) { _bounded_pool->drain_and_wait(query_id); }
 }
 
 }  // namespace parallel

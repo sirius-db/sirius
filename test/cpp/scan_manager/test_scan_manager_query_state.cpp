@@ -63,8 +63,8 @@ std::filesystem::path project_root()
 #endif
 }
 
-/// Local-file scan config: no S3 backend, no prefetch cache, one worker. The pool the manager
-/// builds is num_threads + k_max_concurrent_queries, which is what the two-query gates lean on.
+/// Local-file scan config: no S3 backend, no prefetch cache, two workers. The pool the manager
+/// builds is num_threads + 1, which is what the two-query gates lean on.
 sirius::scan_manager::scan_manager_config make_local_config()
 {
   sirius::scan_manager::scan_manager_config cfg;
@@ -156,7 +156,8 @@ TEST_CASE("two queries register independently and reset drops only one",
           "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto a = make_query(sirius::make_query_id(1), "nation.parquet");
   auto b = make_query(sirius::make_query_id(2), "supplier.parquet");
@@ -186,7 +187,8 @@ TEST_CASE("two queries register independently and reset drops only one",
 TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   // Both scan operators are id 0 — ids restart per query. A shared coalescer keys its slot map
   // by that id, so one query's splits would land in the other's slot.
@@ -234,7 +236,8 @@ TEST_CASE("concurrent queries do not collide on operator id", "[scan_manager][qu
 TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   // Never prepared: sirius_context's failure backstop calls reset(query_id) unconditionally,
   // so an unknown id has to be harmless.
@@ -255,7 +258,8 @@ TEST_CASE("reset is a no-op for unknown and already-reset queries", "[scan_manag
 TEST_CASE("reset_all drops every query and stop() still returns", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto a = make_query(sirius::make_query_id(1), "nation.parquet");
   auto b = make_query(sirius::make_query_id(2), "supplier.parquet");
@@ -274,7 +278,8 @@ TEST_CASE("reset_all drops every query and stop() still returns", "[scan_manager
 TEST_CASE("a query with no GPU scan operators registers nothing", "[scan_manager][query_state]")
 {
   fixture f;
-  sirius_scan_manager manager{make_local_config(), *f.memory, f.topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+  sirius_scan_manager manager{scan_lifecycle, make_local_config(), *f.memory, f.topology};
 
   auto tctx           = sirius::test::make_test_telemetry_context();
   auto const query_id = sirius::make_query_id(7);

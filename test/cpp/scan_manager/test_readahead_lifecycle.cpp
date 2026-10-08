@@ -658,8 +658,9 @@ TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_mana
   // Control: a usable budget does build one, so the check below is about the
   // budget rather than about the query having nothing to scan.
   {
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_readahead_budget(4), *memory, topology};
+      scan_lifecycle, config_with_readahead_budget(4), *memory, topology};
     manager.prepare_for_query(query.get(), false, std::vector<int>{0});
     CHECK(manager.has_readahead_for_testing());
   }
@@ -668,8 +669,9 @@ TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_mana
   // its worker still subscribes it to the publisher, which then buffers one
   // event per deployed task in a mailbox nothing drains -- for the whole query.
   {
+    sirius::exec::query_lifecycle_registry scan_lifecycle;
     sirius::scan_manager::sirius_scan_manager manager{
-      config_with_readahead_budget(0), *memory, topology};
+      scan_lifecycle, config_with_readahead_budget(0), *memory, topology};
     manager.prepare_for_query(query.get(), false, std::vector<int>{0});
     CHECK_FALSE(manager.has_readahead_for_testing());
   }
@@ -702,7 +704,9 @@ TEST_CASE("the kvikIO backend builds no readahead however the cache is configure
   REQUIRE_FALSE(cfg.max_readahead_scans.has_value());
   REQUIRE_FALSE(cfg.readahead_strategy.has_value());
 
-  sirius::scan_manager::sirius_scan_manager manager{cfg, *memory, topology};
+  sirius::exec::query_lifecycle_registry scan_lifecycle;
+
+  sirius::scan_manager::sirius_scan_manager manager{scan_lifecycle, cfg, *memory, topology};
   REQUIRE(manager.io_ctx() != nullptr);
   REQUIRE_FALSE(manager.io_ctx()->can_use_prefetching_cache());
 

@@ -20,6 +20,7 @@
 #include "exec/config.hpp"
 #include "exec/invocable.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "parallel/task.hpp"
 #include "query_id.hpp"
 
@@ -55,7 +56,8 @@ class itask_executor {
    * @param device_id GPU this executor is bound to, if any. Used to parent the
    * task-queue telemetry under that GPU's device group instead of the engine.
    */
-  explicit itask_executor(exec::thread_pool_config config,
+  explicit itask_executor(sirius::exec::query_lifecycle_registry& lifecycle,
+                          exec::thread_pool_config config,
                           std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
                           std::optional<int> device_id = std::nullopt);
 
@@ -69,8 +71,11 @@ class itask_executor {
 
   /**
    * @brief Schedule a task for execution.
+   *
+   * A no-op when the lifecycle gate reports that the task's query is tearing down: the OOM
+   * reschedule path re-enters here from a worker thread long after a drain may have passed.
    */
-  void schedule(std::unique_ptr<itask> task);
+  bool schedule(std::unique_ptr<itask> task);
 
   /**
    * @brief Start the executor: creates the thread pool and manager thread.
@@ -102,15 +107,6 @@ class itask_executor {
   void drain_leftover_tasks();
 
   /**
-   * @brief Drop the queued tasks belonging to one query.
-   *
-   * Tasks of other queries are left in place and the queue stays open, so unlike interrupt()
-   * this does not stall any other query's producers or consumers. Only queued work is affected;
-   * a task already dispatched to the thread pool runs to completion.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
    *
    * Stops the kiosk and interrupts the queue so the manager exits, waits for
@@ -120,19 +116,47 @@ class itask_executor {
   void drain_and_wait();
 
   /**
-   * @brief Like drain_and_wait(), but VALIDATES the queue is empty instead of
-   * draining it.
+   * @brief Wait for in-flight work, then assert @p query_id has nothing queued here.
    *
-   * Stops the kiosk and interrupts the queue so the manager exits, waits for all
-   * in-flight thread-pool tasks, then — instead of draining — checks that the
-   * task queue is empty. If it is not, logs an error and throws: a non-empty queue
-   * at query completion means tasks were still scheduled when we declared the query
-   * done. Re-enables the queue/pool and restarts the manager thread either way
-   * (the throw happens after the executor is left in a restartable state).
+   * The success-path counterpart of wait_and_drain_query(). A non-empty queue for @p query_id at
+   * completion means tasks were still being scheduled when the query was declared done, so this
+   * throws rather than draining, which would hide the bug.
+   *
+   * Unlike the whole-executor version it replaced, this neither interrupts the shared queue nor
+   * stops and restarts the manager thread — both of which dropped co-tenant queries' queued work
+   * and stalled their producers on every completion. It also no longer validates the *whole*
+   * queue, which made one query fail because another had work legitimately queued.
+   *
+   * The pool wait is scoped to this query; idle manager slots and other queries are ignored.
    */
-  void wait_and_validate_empty();
+  void wait_and_validate_empty(sirius::query_id_t query_id);
+
+  /**
+   * @brief Discard queued pool work and wait for this query's attributed worker slots.
+   *
+   * The caller must close publication first. Accepted staging tasks stay queued for the manager
+   * to consume and discard, preserving its readiness handoff. This pool wait does not cover
+   * staged or manager-local tasks before slot attribution: the caller must also wait_for_work()
+   * before releasing query resources.
+   */
+  void wait_and_drain_query(sirius::query_id_t query_id);
 
  protected:
+  /**
+   * @brief Stop the manager thread and wait for all in-flight pool work.
+   *
+   * Releasing the manager's pool slot is a PRECONDITION for wait_all(), not an optimization:
+   * manager_loop() reserves a slot and then blocks in pop(), so an idle manager holds an active
+   * slot forever and wait_all() (which waits for active_ == 0) would never return.
+   *
+   * Used by the whole-executor drain.
+   * Production per-query retirement leaves the manager running.
+   */
+  void quiesce_manager();
+
+  /// \brief Re-arm the pool and queue and restart the manager thread after quiesce_manager().
+  void resume_manager();
+
   /**
    * @brief Main dispatch loop — must be implemented by each subclass.
    *
@@ -184,6 +208,8 @@ class itask_executor {
   /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
   /// same extractor the task_scheduler's queue uses.
   exec::multi_index_priority_queue<itask> _task_queue;
+  /// Non-owning; the runtime or test fixture must outlive this executor.
+  exec::query_lifecycle_registry& _query_lifecycle;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

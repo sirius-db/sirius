@@ -70,7 +70,7 @@ class sirius_engine {
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
-  duckdb::unique_ptr<op::sirius_physical_operator> sirius_owned_plan;
+  std::shared_ptr<op::sirius_physical_operator> sirius_owned_plan;
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 
   //! All pipelines of the query plan
