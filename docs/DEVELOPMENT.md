@@ -1,10 +1,9 @@
 # Developing Sirius
 
-Since SiriusDB is an extension to DuckDB, the CMake project source is actually the `duckdb` directory (a submodule of
-this project), which then pulls in SiriusDB as an extension. We use
-
-- symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
-- [pixi](https://pixi.prefix.dev/) to manage build dependencies.
+The root CMake project builds the Sirius library and its C++ tests.
+The separate `sirius-duckdb/` project builds the DuckDB extension against the
+installed library. We use `CMakePresets.json` for the engine build configuration
+and [Pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
 ## Public API documentation
 
@@ -76,8 +75,10 @@ CMAKE_BUILD_PARALLEL_LEVEL=8 pixi run make
 
 The extension can also be built separately using [its Makefile](../sirius-duckdb/README.md).
 
+Start the built DuckDB shell with Sirius loaded:
+
 ```bash
-pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:

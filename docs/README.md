@@ -58,7 +58,7 @@ git clone --no-recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 pixi run make TEST_BUILD_TARGET=
-pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
+pixi run duckdb
 ```
 
 Alternatively, load the extension into an existing DuckDB shell:

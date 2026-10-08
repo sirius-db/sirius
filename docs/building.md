@@ -5,7 +5,8 @@
 [`sirius-duckdb/`](../sirius-duckdb/README.md) contains the independent extension
 setup, with its own DuckDB checkout and Makefile. It consumes
 an installed shared or static Sirius CMake package and runs GPU SQL tests
-through the normal DuckDB extension test target. The root CMake project builds the Sirius libraries and C++ tests.
+through the normal DuckDB extension test target. The root CMake project builds
+the Sirius libraries and C++ tests.
 
 For local development, `pixi run make` builds Sirius and its C++ tests, installs
 Sirius under `build/release/install`, and builds the shared DuckDB extension in
@@ -21,8 +22,8 @@ pixi run cmake --build --preset release --target sirius_library sirius_unittest
 
 The internal `sirius_objects` CMake target compiles the common C++ and CUDA
 implementation once per build configuration. Its objects form `sirius_core`, an
-internal archive, and feed the shared and static Sirius libraries. CUDA device linking takes place on concrete library targets, not on the
-object target.
+internal archive, and feed the shared and static Sirius libraries. CUDA device
+linking takes place on concrete library targets, not on the object target.
 
 Compile options, dependency headers, PIC, and visibility belong to the object
 target. Final library targets also declare their link dependencies: consuming
@@ -39,7 +40,9 @@ output-specific compilation is required.
 ## NVTX linkage tests
 
 These tests need a C++ compiler but no GPU, CUDA toolkit, or DuckDB build. They
-check environment precedence, explicit injector configuration, discovery in PIE and non-PIE executables and shared libraries, and forwarding to the embedded initializer.
+check environment precedence, explicit injector configuration, discovery in PIE
+and non-PIE executables and shared libraries, and forwarding to the embedded
+initializer.
 
 ```bash
 pixi run cmake -S test/cmake/nvtx_injection -B build/nvtx-test -G Ninja

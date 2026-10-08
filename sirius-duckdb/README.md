@@ -18,7 +18,14 @@ git submodule update --init duckdb substrait cucascade sirius-duckdb/duckdb siri
 pixi run make
 ```
 
-Run DuckDB with the environment's shared libraries on its runtime search path:
+Start DuckDB with Sirius loaded:
+
+```sh
+pixi run duckdb
+```
+
+This task sets the runtime search path for the environment's shared libraries
+and loads the unsigned local extension. Its equivalent direct invocation is:
 
 ```sh
 pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- \
@@ -57,8 +64,9 @@ Use separate build directories when switching toolchains or linkage modes.
 
 Both linkage modes use the local engine sources, including uncommitted changes.
 The static port hashes source contents and filenames, including the engine's
-submodules, so source edits invalidate Sirius's package without invalidating
-third-party dependency caches. Distribution CI uses the same port, with
+submodules and untracked, nonignored source files, so source edits invalidate
+Sirius's package without invalidating third-party dependency caches.
+Distribution CI uses the same port, with
 `configure_ci` initializing the engine's submodules.
 
 For shared builds, first build/install Sirius with the root Makefile or CMake,

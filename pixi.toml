@@ -71,6 +71,10 @@ seaweedfs = ">=4.48"
 
 [tasks]
 
+[tasks.duckdb]
+description = "Start the local DuckDB shell with Sirius loaded."
+cmd = '''LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}" sirius-duckdb/build/release/duckdb -unsigned -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"'''
+
 [tasks.clion-env]
 description = "Generate the Pixi environment file used by CLion."
 cmd = "mkdir -p build && pixi shell-hook -s bash > build/sirius_pixi_env_for_clion.sh"
