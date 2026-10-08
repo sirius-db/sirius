@@ -1029,11 +1029,11 @@ TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GP
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const before = config.get_operator_params();
+  auto const physical_default = sirius::config::derived_default_batch_size();
   config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
   config.apply_defaults();
 
-  require_shared_operator_defaults(config.get_operator_params(), before.scan_task_batch_size);
+  require_shared_operator_defaults(config.get_operator_params(), physical_default);
 }
 
 TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
@@ -1045,7 +1045,7 @@ TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
   for (auto const* fixture : fixtures) {
     INFO("fixture=" << fixture);
     sirius::sirius_config config;
-    auto const physical_default = config.get_operator_params().scan_task_batch_size;
+    auto const physical_default = sirius::config::derived_default_batch_size();
 
     config.load_from_file(config_fixture(fixture));
     require_shared_operator_defaults(config.get_operator_params(), physical_default);
@@ -1056,7 +1056,7 @@ TEST_CASE("repeated loads clear explicit and cap-derived operator values",
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const physical_default = config.get_operator_params().scan_task_batch_size;
+  auto const physical_default = sirius::config::derived_default_batch_size();
 
   config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
   REQUIRE(config.get_operator_params().scan_task_batch_size == 1ULL * 1024 * 1024);

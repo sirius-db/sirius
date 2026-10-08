@@ -2912,11 +2912,10 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
-void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
+void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
+                                           const sirius::operator_params& operator_defaults,
+                                           const sirius::compression_config& compression_defaults)
 {
-  auto const& operator_defaults    = defaults.get_operator_params();
-  auto const& compression_defaults = defaults.get_compression_config();
-
   config.AddExtensionOption(
     "expression_evaluator_strategy",
     "Strategy for the expression_evaluator: 'materialize', 'ast_interpret', or "
@@ -3386,7 +3385,8 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
-  SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
+  SiriusRegistration::InitialGPUConfigs(
+    config, callback_ptr->get_operator_defaults(), callback_ptr->get_compression_defaults());
   SiriusRegistration::RegisterGPUFunctions(db);
   if (!sirius_disabled) { sirius::planner::register_scan_source_callbacks(db); }
 
