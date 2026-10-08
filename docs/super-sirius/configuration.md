@@ -394,15 +394,16 @@ and transport use one trust policy; there are no separate REST YAML controls.
 Two REST values are deliberately not YAML keys. **Connections per reactor** is
 fixed at 64 — the useful number is a property of one reactor thread, not of a
 deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
-each with its own thread to service them. **Physical GET size** is worker-owned:
-the reactor derives a target between 4 MiB and 16 MiB from its queued logical
-bytes and currently free connections. Large contiguous requests are balanced
-under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
-cache-chunk boundaries so a chunk is never published before all of its bytes
-arrive.
+each with its own thread to service them. **Physical GET size** is worker-owned
+and capped at 16 MiB. A slice served on its own is split against a 4–16 MiB
+target derived from the reactor's queued logical bytes and free connections
+(fragmented cache fills only at whole cache-chunk boundaries, so a chunk is never
+published before all of its bytes arrive). Runs of nearby slices -- cache fills,
+populate-on-read fills and staged device reads alike -- are coalesced into one
+GET, bridging gaps of up to `merge_max_gap`; the bridged bytes are discarded.
 
-`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
-as prepared slices without forcing a static physical layout. Device operations
+`merge_max_gap` therefore sets both the prefetching cache's range merging and the
+gap the worker will bridge with one GET. Device operations
 allocate as many pinned CuCascade blocks as their selected physical range needs;
 those blocks stay owned through curl retries, the asynchronous H2D copy, and its
 CUDA completion event. Staging is therefore proportional to active device work

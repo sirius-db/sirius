@@ -79,13 +79,27 @@ struct rest_io_op_request {
   std::size_t auth_attempt{0};
   bool needs_staging{false};
   std::size_t logical_bytes{0};
+  /// Indices into @c op->iovecs that still need reactor-owned staging. They are
+  /// placeholders (null base, final length) until the worker allocates staging
+  /// just before the GET is armed, which replaces each one with the pinned
+  /// blocks backing it. Empty with @c needs_staging set means the whole
+  /// physical range is staged (the unfused shape). A null iovec that is NOT
+  /// listed here is a hole: bytes a fused GET bridges and discards.
+  std::vector<std::size_t> staging_slots;
 
-  [[nodiscard]] bool is_device() const noexcept
+  [[nodiscard]] bool is_device() const noexcept { return first_device_copy() != nullptr; }
+
+  /// The first constituent with a device destination; its device owns the
+  /// completion event. A fused operation only mixes copies on one device and
+  /// stream, so any constituent would do.
+  [[nodiscard]] device_cpy_request const* first_device_copy() const noexcept
   {
-    if (op == nullptr) return false;
-    if (op->device_copy != nullptr) return true;
-    return std::ranges::any_of(op->fused_extra,
-                               [](auto const& part) { return part.device_copy != nullptr; });
+    if (op == nullptr) return nullptr;
+    if (op->device_copy != nullptr) return op->device_copy.get();
+    for (auto const& part : op->fused_extra) {
+      if (part.device_copy != nullptr) return part.device_copy.get();
+    }
+    return nullptr;
   }
 
   /// Copy every constituent's window out of the shared read buffers. The event is

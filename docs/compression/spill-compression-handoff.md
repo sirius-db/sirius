@@ -276,10 +276,10 @@ retry policy and the compression arena's device over-commit, not slower eviction
   limits rather than tuning, but the first candidates if the aggregation/join
   memory estimates are revisited.
 - **S3 throughput.** At ~3 MB column-chunk GETs the box measures ~8 GB/s raw from
-  S3; 8 MB GETs reach ~10.8 GB/s. Fusion only joins exactly adjacent chunks, and
-  `rest.merge_max_gap` applies only to the prefetching cache, so the demand path
-  cannot make bigger GETs today. With the cache on, fetches are host-block sized
-  (1 MiB) and bound by request latency × concurrency.
+  S3; 8 MB GETs reach ~10.8 GB/s. The REST worker now coalesces runs of cache
+  fills, populate-on-read fills and staged reads into one GET (up to 16 MiB) and
+  bridges gaps up to `rest.merge_max_gap`, which targets exactly this; it has not
+  been re-measured here yet.
 - **Cache accounting.** The per-query cache summary reports `reads=0 hits=0` on the
   REST path, and nothing reports the cache's resident bytes, so the cache/spill
   split of the host tier cannot be observed directly.

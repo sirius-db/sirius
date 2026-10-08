@@ -511,6 +511,168 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
   return result;
 }
 
+// ---- GET coalescing --------------------------------------------------------
+//
+// A fused GET serves a run of logical slices from one ranged request. Each
+// constituent contributes its *physical extent* -- the bytes the wire must
+// deliver for it -- and the gets iovecs are those extents' destinations
+// concatenated in file order:
+//
+//   - a staged device slice (no host buffer): its logical range, landing in
+//     reactor-owned staging allocated only for those bytes;
+//   - a cache fill (fragmented host buffer, with or without a device
+//     destination): the union of its chunks' fill spans, landing directly in
+//     the chunk buffers, exactly as the unfused path would fill them.
+//
+// Between extents the GET may bridge a gap of up to merge_max_gap bytes; those
+// bytes land in a hole iovec (null base) that write_to_sink steps over, so they
+// are neither stored, copied to device, nor published. A staged slice may
+// overlap the bytes already covered (its device copy reads them from whichever
+// iovec received them); a cache fill may not, since its chunk must receive
+// every byte of its extent from the wire.
+
+/// The bytes the wire must deliver for @p slice when it rides a fused GET, or
+/// nullopt when it cannot (caller-owned host memory, an unbuffered or
+/// non-contiguous cache fill, a device window outside the fill).
+[[nodiscard]] std::optional<range> fusable_extent(prepared_io_slice const& slice,
+                                                  std::size_t cache_block_size,
+                                                  std::size_t file_size)
+{
+  auto const object = range{0, file_size};
+  if (slice.rng.empty()) return std::nullopt;
+  if (slice.needs_staging()) {
+    if (!slice.has_device_request()) return std::nullopt;
+    auto const extent = intersect(slice.rng, object);
+    if (extent.size != slice.rng.size) return std::nullopt;
+    return extent;
+  }
+  // Caller-owned contiguous host memory stays on the per-slice path, which also
+  // serves it from a footer-probe stash when it can.
+  if (!slice.is_fragmented() || cache_block_size == 0) return std::nullopt;
+
+  range extent{};
+  for (auto* chunk : slice.h_buffer.fragments()) {
+    if (chunk == nullptr || chunk->data == nullptr) return std::nullopt;
+    auto const [fill_lo, fill_hi] =
+      cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
+    auto const fill = intersect(range{fill_lo, fill_hi - fill_lo}, object);
+    if (fill.empty()) continue;
+    if (extent.empty()) {
+      extent = fill;
+    } else if (extent.end() == fill.offset) {
+      extent.size += fill.size;
+    } else {
+      return std::nullopt;
+    }
+  }
+  if (extent.empty()) return std::nullopt;
+  if (slice.has_device_request() && intersect(slice.rng, extent).size != slice.rng.size) {
+    return std::nullopt;
+  }
+  return extent;
+}
+
+struct fused_run_plan {
+  /// Leading slices that ride the GET (fused only when >= 2).
+  std::size_t count{0};
+  /// Physical extent of each of them, in order.
+  std::vector<range> extents;
+  /// The gets range: first extent's start to the furthest extent end.
+  range io_rng{};
+};
+
+/// Plan the longest fusable prefix of @p group's remaining slices: it stops at
+/// the first slice that cannot be fused, a gap wider than @p max_gap, a cache
+/// fill overlapping bytes already covered, a device copy on another device or
+/// stream, or a GET that would exceed @p max_bytes.
+[[nodiscard]] fused_run_plan plan_fused_run(grouped_io_request const& group,
+                                            std::size_t cache_block_size,
+                                            std::size_t file_size,
+                                            std::size_t max_bytes,
+                                            std::size_t max_gap)
+{
+  fused_run_plan plan;
+  std::size_t cursor          = 0;
+  device_buffer const* device = nullptr;
+  for (std::size_t i = 0; i < group.remaining_slices(); ++i) {
+    auto const& slice = group.slice_at(i);
+    auto const extent = fusable_extent(slice, cache_block_size, file_size);
+    if (!extent) break;
+    if (slice.has_device_request()) {
+      // The completion event is recorded on one stream after every copy; copies
+      // on another stream or device would not be ordered before it.
+      if (device == nullptr) {
+        device = &slice.d_buffer;
+      } else if (device->device_id != slice.d_buffer.device_id ||
+                 device->stream.get() != slice.d_buffer.stream.get()) {
+        break;
+      }
+    }
+    if (plan.count == 0) {
+      plan.io_rng = *extent;
+      cursor      = extent->end();
+    } else {
+      // Only [previous extent start, cursor) is known to hold no hole, so an
+      // extent starting before it could put a device window over a gap.
+      if (extent->offset < plan.extents.back().offset) break;
+      if (extent->offset > cursor) {
+        if (extent->offset - cursor > max_gap) break;
+      } else if (extent->offset < cursor && !slice.needs_staging()) {
+        break;
+      }
+      auto const end = std::max(cursor, extent->end());
+      if (end - plan.io_rng.offset > max_bytes) break;
+      cursor = end;
+    }
+    plan.extents.push_back(*extent);
+    ++plan.count;
+  }
+  plan.io_rng.size = cursor - plan.io_rng.offset;
+  return plan;
+}
+
+/// Carve one staging allocation into the placeholder iovecs @p slots of
+/// @p iovecs (or, with no slots, a single placeholder covering the whole
+/// operation). Holes and caller/cache destinations are left as they are.
+template <typename Allocation>
+[[nodiscard]] std::vector<iovec> carve_staging(std::vector<iovec> const& iovecs,
+                                               std::vector<std::size_t> const& slots,
+                                               Allocation& allocation)
+{
+  auto blocks            = allocation.get_blocks();
+  auto const block_bytes = allocation.block_size();
+  std::vector<iovec> result;
+  result.reserve(iovecs.size() + blocks.size());
+  std::size_t block  = 0;
+  std::size_t offset = 0;
+  std::size_t next   = 0;  // next entry of @p slots
+  for (std::size_t i = 0; i < iovecs.size(); ++i) {
+    if (next == slots.size() || slots[next] != i) {
+      result.push_back(iovecs[i]);
+      continue;
+    }
+    ++next;
+    auto remaining = iovecs[i].iov_len;
+    while (remaining != 0) {
+      if (block == blocks.size()) {
+        throw std::runtime_error("rest_reactor: staging blocks do not cover physical operation");
+      }
+      auto const bytes = std::min(block_bytes - offset, remaining);
+      result.push_back(iovec{reinterpret_cast<std::uint8_t*>(blocks[block]) + offset, bytes});
+      offset += bytes;
+      remaining -= bytes;
+      if (offset == block_bytes) {
+        ++block;
+        offset = 0;
+      }
+    }
+  }
+  if (next != slots.size()) {
+    throw std::runtime_error("rest_reactor: staging slot outside the operation's iovecs");
+  }
+  return result;
+}
+
 }  // namespace
 
 shared_byte_span make_shared_byte_span(std::vector<std::uint8_t> bytes)
@@ -1261,70 +1423,112 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       if (resource == nullptr) {
         throw std::runtime_error("rest_reactor: staged device read requires host memory resource");
       }
-      auto allocation = resource->allocate_multiple_blocks(request.op->io_rng.size);
-      if (allocation == nullptr || allocation->size_bytes() < request.op->io_rng.size) {
+      // An unfused staged read stages its whole physical range; a fused one
+      // stages only its placeholder slots -- the bytes no cache chunk receives.
+      auto& op = *request.op;
+      if (request.staging_slots.empty()) {
+        op.iovecs.assign(1, iovec{nullptr, op.io_rng.size});
+        request.staging_slots.assign(1, 0);
+      }
+      std::size_t staged = 0;
+      for (auto const index : request.staging_slots) {
+        staged += op.iovecs.at(index).iov_len;
+      }
+      auto allocation = resource->allocate_multiple_blocks(staged);
+      if (allocation == nullptr || allocation->size_bytes() < staged) {
         throw std::runtime_error("rest_reactor: failed to allocate complete staging range");
       }
-      request.op->iovecs.clear();
-      auto remaining = request.op->io_rng.size;
-      for (auto* block : allocation->get_blocks()) {
-        if (remaining == 0) break;
-        auto const bytes = std::min(allocation->block_size(), remaining);
-        request.op->iovecs.push_back(iovec{block, bytes});
-        remaining -= bytes;
-      }
-      if (remaining != 0) {
-        throw std::runtime_error("rest_reactor: staging blocks do not cover physical operation");
-      }
+      op.iovecs = carve_staging(op.iovecs, request.staging_slots, *allocation);
+      request.staging_slots.clear();
       using allocation_type =
         cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-      request.op->staging_owner = std::shared_ptr<allocation_type>(std::move(allocation));
+      op.staging_owner = std::shared_ptr<allocation_type>(std::move(allocation));
     };
 
-    // Build one physical read covering `run` leading contiguous slices of @p group.
-    // Returns false if the run is not fusable, leaving the caller's per-slice path
-    // to handle it unchanged.
-    auto make_fused_operation =
-      [&](grouped_io_request& group, std::size_t run, std::size_t /*free_connections*/) -> bool {
-      auto const head = group.front().rng;
-      std::size_t lo = head.offset, hi = head.offset + head.size;
-      for (std::size_t i = 0; i < run; ++i) {
-        auto const& sl = group.slice_at(i);
-        // Only staged device reads are fused: their host side is reactor-owned, so
-        // one staging allocation can back every constituent. A caller-owned host
-        // destination would have to be scattered into, which this does not do.
-        if (!sl.needs_staging() || !sl.has_device_request()) return false;
-        lo = std::min(lo, sl.rng.offset);
-        hi = std::max(hi, sl.rng.offset + sl.rng.size);
-      }
+    // Serve the longest fusable prefix of the active group with one GET (see
+    // "GET coalescing" above). Returns false, consuming nothing, when fewer than
+    // two leading slices can be fused; the per-slice path then takes the head.
+    auto make_fused_operation = [&](grouped_io_request& group) -> bool {
       auto const* file = dynamic_cast<io_object_type const*>(group.obj.get());
       if (file == nullptr) return false;
-      if (hi > file->size()) hi = file->size();
-      if (hi <= lo) return false;
+      auto const block_size = _ctx->host_memory_resource() == nullptr
+                                ? std::size_t{0}
+                                : _ctx->host_memory_resource()->get_block_size();
+      auto const plan       = plan_fused_run(
+        group, block_size, file->size(), rest_max_segment_bytes, _config.merge_max_gap);
+      if (plan.count < 2 || plan.io_rng.empty()) return false;
 
       auto op         = std::make_unique<io_op_request>();
       op->obj         = group.obj;
-      op->io_rng      = range{lo, hi - lo};
+      op->io_rng      = plan.io_rng;
       op->coordinator = group.coordinator;
 
+      auto request    = std::make_unique<rest_io_op_request>();
+      request->object = file->get_object_ref();
+
+      // Build every destination before consuming a slice, so a failure here
+      // leaves the group untouched for the per-slice path.
+      auto covered = plan.io_rng.offset;
+      for (std::size_t i = 0; i < plan.count; ++i) {
+        auto const& slice  = group.slice_at(i);
+        auto const& extent = plan.extents[i];
+        if (extent.offset > covered) {
+          op->iovecs.push_back(iovec{nullptr, extent.offset - covered});  // bridged, discarded
+          covered = extent.offset;
+        }
+        if (extent.end() <= covered) continue;  // a staged slice already covered
+        auto const fresh = range{covered, extent.end() - covered};
+        if (slice.needs_staging()) {
+          auto const last = op->iovecs.size();
+          if (!request->staging_slots.empty() && request->staging_slots.back() + 1 == last) {
+            op->iovecs.back().iov_len += fresh.size;  // extend the adjacent staged span
+          } else {
+            request->staging_slots.push_back(last);
+            op->iovecs.push_back(iovec{nullptr, fresh.size});
+          }
+          request->needs_staging = true;
+        } else {
+          // No overlap is planned for a cache fill, so it receives its whole extent.
+          auto const fill_iovecs = operation_iovecs(slice, fresh, block_size);
+          op->iovecs.insert(op->iovecs.end(), fill_iovecs.begin(), fill_iovecs.end());
+        }
+        covered = extent.end();
+      }
+      if (covered != plan.io_rng.end()) {
+        throw std::runtime_error("rest_reactor: fused destinations do not cover the GET");
+      }
+
+      // Each constituent's device window and the chunks it publishes -- exactly
+      // the chunks the unfused path would -- are built while the slices are
+      // still in the group too.
+      std::vector<std::unique_ptr<device_cpy_request>> copies(plan.count);
+      std::vector<std::vector<cache::cached_chunk*>> chunks(plan.count);
+      for (std::size_t i = 0; i < plan.count; ++i) {
+        auto const& slice = group.slice_at(i);
+        if (slice.has_device_request()) {
+          copies[i] = std::make_unique<device_cpy_request>(
+            device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
+        }
+        chunks[i] = operation_chunks(slice, plan.extents[i], block_size);
+      }
+      op->fused_extra.reserve(plan.count - 1);
+
+      // Nothing below allocates: the slices are consumed only once the
+      // operation can no longer fail to be built.
       std::size_t logical = 0;
-      for (std::size_t i = 0; i < run; ++i) {
+      for (std::size_t i = 0; i < plan.count; ++i) {
         auto slice = group.take_front();
         logical += slice.size();
-        auto copy = std::make_unique<device_cpy_request>(
-          device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
         if (i == 0) {
-          op->device_copy = std::move(copy);
-          op->on_complete = std::move(slice.on_complete);
+          op->device_copy       = std::move(copies[i]);
+          op->on_complete       = std::move(slice.on_complete);
+          op->completion_chunks = std::move(chunks[i]);
         } else {
-          op->fused_extra.push_back(
-            fused_constituent{std::move(copy), std::move(slice.on_complete), {}});
+          op->fused_extra.push_back(fused_constituent{
+            std::move(copies[i]), std::move(slice.on_complete), std::move(chunks[i])});
         }
       }
 
-      auto request           = std::make_unique<rest_io_op_request>();
-      request->object        = file->get_object_ref();
-      request->needs_staging = true;
       request->logical_bytes = logical;
       request->op            = std::move(op);
       _queued_bytes.fetch_sub(logical, std::memory_order_relaxed);
@@ -1345,11 +1549,23 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       //
       // Bounded by the segment maximum so the fused range is still one physical
       // read; a longer run simply fuses its prefix and the rest follows next pass.
-      if (auto const run = active_group->leading_run(rest_max_segment_bytes); run > 1) {
-        if (make_fused_operation(*active_group, run, free_connections)) {
-          if (active_group->empty()) { active_group.reset(); }
-          return;
+      //
+      // The run may mix cache fills, populate-on-read fills and staged device
+      // reads, may bridge gaps up to merge_max_gap, and is truncated at the
+      // first slice that cannot join it.
+      bool fused = false;
+      if (active_group->remaining_slices() > 1) {
+        try {
+          fused = make_fused_operation(*active_group);
+        } catch (...) {
+          // Nothing was consumed; the per-slice path below takes the head and
+          // reports any error that is really the slice's own.
+          fused = false;
         }
+      }
+      if (fused) {
+        if (active_group->empty()) { active_group.reset(); }
+        return;
       }
 
       auto slice            = active_group->take_front();
@@ -1615,7 +1831,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         }
 
         try {
-          auto* event            = event_for(op.device_copy->device_id, index);
+          auto* event            = event_for(request.first_device_copy()->device_id, index);
           auto const copy_status = request.copy_h2d_async(event->get());
           if (copy_status != cudaSuccess) {
             op.finish_error(copy_status, true);

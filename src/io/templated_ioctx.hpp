@@ -255,7 +255,7 @@ class templated_ioctx : public ioctx {
     // request count, size, duration and in-flight were unchanged; the requests were
     // simply queued behind an unlucky reactor pick. SIRIUS_DISPATCH_FANOUT overrides
     // it (0 or unset keeps the historical 2; "all" uses every reactor).
-    static std::size_t const fanout_override = [] () -> std::size_t {
+    static std::size_t const fanout_override = []() -> std::size_t {
       char const* v = std::getenv("SIRIUS_DISPATCH_FANOUT");
       if (v == nullptr) return 0;
       if (std::string_view{v} == "all") return std::numeric_limits<std::size_t>::max();
@@ -389,13 +389,21 @@ class templated_ioctx : public ioctx {
         // Keep the originals until every queue entry has been allocated. If an
         // allocation fails, their callbacks can still release all claimed cache
         // chunks and every coordinator credit can be settled.
+        //
+        // A reactor may also bridge a gap of up to merge_gap_size() between two
+        // slices with one request (the REST worker does, discarding the gap), so
+        // slices that close together count as one run too.
+        auto const max_gap = _config.merge_gap_size();
         for (std::size_t begin = 0; begin < slices.size();) {
           std::size_t end       = begin + 1;
           std::size_t run_bytes = slices[begin].size();
-          // Contiguous or overlapping: exactly what a later merge could fuse.
-          while (end < slices.size() &&
-                 slices[end].rng.offset <= slices[end - 1].rng.offset + slices[end - 1].rng.size) {
+          auto run_end          = slices[begin].rng.end();
+          // Contiguous, overlapping, or within the bridgeable gap: exactly what a
+          // later merge could fuse.
+          while (end < slices.size() && (slices[end].rng.offset <= run_end ||
+                                         slices[end].rng.offset - run_end <= max_gap)) {
             run_bytes += slices[end].size();
+            run_end = std::max(run_end, slices[end].rng.end());
             ++end;
           }
           auto const smallest = static_cast<std::size_t>(
