@@ -173,6 +173,16 @@ so sentinel handling has one implementation. The evaluator boundary regressions
 are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
 tagged `[timestamp_extraction]`.
 
+### Rounding
+
+`round(x)` and `round(x, n)` on FLOAT and DOUBLE map to `function_id::round` and run in
+`round_floating_point` (`src/cuda/sirius_round_floating_point.cu`), one elementwise kernel that
+reproduces DuckDB's `RoundOperatorPrecision`: the value is rounded in double precision as
+`round(x * 10^n) / 10^n`, or `round(x / 10^-n) * 10^-n` for negative `n`, with ties away from
+zero. A non-finite result yields the input for `n >= 0` and 0 for `n < 0`. The output is bit
+identical to DuckDB. The precision must be a constant INTEGER.
+DECIMAL and integer inputs and a column precision fall back to the CPU at plan time.
+
 ### Logical AND/OR NULL semantics
 
 SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.

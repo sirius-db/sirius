@@ -232,6 +232,21 @@ bool gpu_supports_substring(duckdb::BoundFunctionExpression const& expr)
   return offset && length && gpu_substring_slice(*offset, *length);
 }
 
+// The GPU evaluator rounds FLOAT and DOUBLE inputs to a constant number of decimal places.
+bool gpu_supports_round(duckdb::BoundFunctionExpression const& expr)
+{
+  if (expr.children.size() != 1 && expr.children.size() != 2) { return false; }
+  auto const input_type = expr.children[0]->return_type.id();
+  if (input_type != duckdb::LogicalTypeId::FLOAT && input_type != duckdb::LogicalTypeId::DOUBLE) {
+    return false;
+  }
+  if (expr.children.size() == 1) { return true; }
+  auto const& precision = *expr.children[1];
+  if (precision.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
+  auto const& value = precision.Cast<duckdb::BoundConstantExpression>().value;
+  return !value.IsNull() && value.type().id() == duckdb::LogicalTypeId::INTEGER;
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
@@ -258,6 +273,7 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
     }
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
+  if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
