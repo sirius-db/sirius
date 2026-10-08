@@ -22,9 +22,11 @@
 #include "op/aggregate/group_key_labels.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -37,6 +39,7 @@
 
 #include <algorithm>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <unordered_set>
 
@@ -125,15 +128,19 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 
-std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
-  const cucascade::read_only_data_batch& input,
+namespace {
+
+/// Aggregate @p input_table grouped by the `group_idx` columns. Returns the table
+/// `[keys..., aggregates...]`. See `gpu_aggregate_impl::local_grouped_aggregate()` for the
+/// parameters.
+std::unique_ptr<cudf::table> grouped_aggregate_table(
+  cudf::table_view input_table,
   const std::vector<int>& group_idx,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   ::cuda::stream_ref stream,
-  cucascade::memory::memory_space& memory_space,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  cucascade::memory::memory_space& memory_space)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -144,8 +151,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
   const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
 
-  auto input_table = get_cudf_table_view(input);
-  auto mr          = memory_space.get_default_allocator();
+  auto mr = memory_space.get_default_allocator();
 
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
   // single-column radix path while preserving the original keys' lexicographic order. A
@@ -451,8 +457,226 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     }
   }
 
-  // Create the output data batch
-  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
+  return std::make_unique<cudf::table>(std::move(output_cols));
+}
+
+/// The aggregation that combines partial results of a local aggregation of kind @p kind.
+std::unique_ptr<cudf::groupby_aggregation> make_reaggregation(cudf::aggregation::Kind kind)
+{
+  switch (kind) {
+    case cudf::aggregation::Kind::MIN:
+      return cudf::make_min_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::MAX:
+      return cudf::make_max_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::SUM:
+    case cudf::aggregation::Kind::COUNT_ALL:
+    case cudf::aggregation::Kind::COUNT_VALID:
+      return cudf::make_sum_aggregation<cudf::groupby_aggregation>();
+    case cudf::aggregation::Kind::COLLECT_SET:
+      return cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>();
+    default:
+      throw std::runtime_error("Unsupported cudf aggregate kind for grouping sets: " +
+                               std::to_string(static_cast<int>(kind)));
+  }
+}
+
+/// The empty grouping set over an empty input: one row with zero counts and NULL for every
+/// other aggregate.
+std::vector<std::unique_ptr<cudf::column>> make_empty_input_row(
+  cudf::table_view aggregate_cols,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> row;
+  row.reserve(aggregates.size());
+  for (std::size_t i = 0; i < aggregates.size(); ++i) {
+    auto const kind = aggregates[i];
+    if (kind == cudf::aggregation::Kind::COUNT_ALL ||
+        kind == cudf::aggregation::Kind::COUNT_VALID) {
+      row.push_back(cast_if_needed(make_constant_column<int64_t>(0, 1, stream, mr),
+                                   aggregate_cols.column(i).type(),
+                                   stream,
+                                   mr));
+    } else if (kind == cudf::aggregation::Kind::COLLECT_SET) {
+      // An empty set, so that COUNT(DISTINCT) of the empty input is 0.
+      auto offsets = make_constant_column<cudf::size_type>(0, 2, stream, mr);
+      auto child   = cudf::empty_like(cudf::lists_column_view(aggregate_cols.column(i)).child());
+      row.push_back(
+        cudf::make_lists_column(1, std::move(offsets), std::move(child), 0, rmm::device_buffer{}));
+    } else {
+      row.push_back(make_null_column(aggregate_cols.column(i), 1, stream, mr));
+    }
+  }
+  return row;
+}
+
+/// Expand the partial aggregate @p partial, grouped by all @p num_keys keys, into one block of
+/// rows per grouping set. See `gpu_aggregate_impl::local_grouping_sets_aggregate()`.
+std::unique_ptr<cudf::table> expand_grouping_sets(
+  cudf::table_view partial,
+  std::size_t num_keys,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<std::set<std::size_t>>& grouping_sets,
+  const std::vector<std::vector<std::size_t>>& grouping_functions,
+  ::cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::size_type> aggregate_col_ids(aggregates.size());
+  std::iota(aggregate_col_ids.begin(), aggregate_col_ids.end(), static_cast<int>(num_keys));
+  auto const partial_aggregates = partial.select(aggregate_col_ids);
+
+  // Owners of the columns that the per-set views below reference.
+  std::vector<std::vector<std::unique_ptr<cudf::column>>> owned(grouping_sets.size());
+  std::vector<cudf::table_view> set_views;
+  set_views.reserve(grouping_sets.size());
+
+  for (std::size_t set_idx = 0; set_idx < grouping_sets.size(); ++set_idx) {
+    auto const& set = grouping_sets[set_idx];
+    auto& owner     = owned[set_idx];
+    owner.reserve(num_keys + aggregates.size() + 1 + grouping_functions.size());
+    std::vector<cudf::column_view> keys(num_keys);
+    std::vector<cudf::column_view> values;
+    values.reserve(aggregates.size());
+    cudf::size_type num_rows = 0;
+
+    if (set.size() == num_keys) {
+      // The partial aggregate is already grouped by this set.
+      for (std::size_t k = 0; k < num_keys; ++k) {
+        keys[k] = partial.column(static_cast<cudf::size_type>(k));
+      }
+      for (auto const& col : partial_aggregates) {
+        values.push_back(col);
+      }
+      num_rows = partial.num_rows();
+    } else {
+      std::vector<cudf::column_view> set_keys;
+      set_keys.reserve(set.empty() ? 1 : set.size());
+      std::unique_ptr<cudf::column> constant_key;
+      if (set.empty()) {
+        constant_key = make_constant_column<int8_t>(0, partial.num_rows(), stream, mr);
+        set_keys.push_back(constant_key->view());
+      }
+      for (auto const k : set) {
+        set_keys.push_back(partial.column(static_cast<cudf::size_type>(k)));
+      }
+      cudf::groupby::groupby grouper(cudf::table_view(set_keys), cudf::null_policy::INCLUDE);
+      std::vector<cudf::groupby::aggregation_request> requests(aggregates.size());
+      for (std::size_t i = 0; i < aggregates.size(); ++i) {
+        requests[i].values = partial_aggregates.column(static_cast<cudf::size_type>(i));
+        requests[i].aggregations.push_back(make_reaggregation(aggregates[i]));
+      }
+      auto [grouped_keys, results] = grouper.aggregate(requests, stream, mr);
+      constant_key.reset();
+      num_rows = grouped_keys->num_rows();
+
+      if (set.empty() && num_rows == 0) {
+        for (auto& col : make_empty_input_row(partial_aggregates, aggregates, stream, mr)) {
+          values.push_back(col->view());
+          owner.push_back(std::move(col));
+        }
+        num_rows = 1;
+      } else {
+        // Re-aggregating a COUNT with SUM widens it, so match the partial column types.
+        for (std::size_t i = 0; i < results.size(); ++i) {
+          auto col =
+            cast_if_needed(std::move(results[i].results[0]),
+                           partial_aggregates.column(static_cast<cudf::size_type>(i)).type(),
+                           stream,
+                           mr);
+          values.push_back(col->view());
+          owner.push_back(std::move(col));
+        }
+      }
+
+      auto key_cols       = grouped_keys->release();
+      std::size_t key_pos = set.empty() ? 1 : 0;
+      for (std::size_t k = 0; k < num_keys; ++k) {
+        if (set.contains(k)) {
+          keys[k] = key_cols[key_pos]->view();
+          owner.push_back(std::move(key_cols[key_pos++]));
+        } else {
+          auto nulls =
+            make_null_column(partial.column(static_cast<cudf::size_type>(k)), num_rows, stream, mr);
+          keys[k] = nulls->view();
+          owner.push_back(std::move(nulls));
+        }
+      }
+    }
+
+    std::vector<cudf::column_view> cols;
+    cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
+    cols.assign(keys.begin(), keys.end());
+    auto set_id =
+      make_constant_column<int32_t>(static_cast<int32_t>(set_idx), num_rows, stream, mr);
+    cols.push_back(set_id->view());
+    owner.push_back(std::move(set_id));
+    for (auto const& function : grouping_functions) {
+      // GROUPING(a, b, ...) has one bit per argument, the first argument most significant, set
+      // when the argument is not in the grouping set.
+      int64_t value = 0;
+      for (auto const k : function) {
+        value = (value << 1) | (set.contains(k) ? 0 : 1);
+      }
+      auto col = make_constant_column<int64_t>(value, num_rows, stream, mr);
+      cols.push_back(col->view());
+      owner.push_back(std::move(col));
+    }
+    cols.insert(cols.end(), values.begin(), values.end());
+    set_views.emplace_back(cols);
+  }
+
+  return cudf::concatenate(set_views, stream, mr);
+}
+
+}  // namespace
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
+  const cucascade::read_only_data_batch& input,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  auto output_table = grouped_aggregate_table(get_cudf_table_view(input),
+                                              group_idx,
+                                              aggregates,
+                                              aggregate_idx,
+                                              aggregate_struct_col_indices,
+                                              stream,
+                                              memory_space);
+  return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
+}
+
+std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouping_sets_aggregate(
+  const cucascade::read_only_data_batch& input,
+  const std::vector<int>& group_idx,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+  const std::vector<std::set<std::size_t>>& grouping_sets,
+  const std::vector<std::vector<std::size_t>>& grouping_functions,
+  ::cuda::stream_ref stream,
+  cucascade::memory::memory_space& memory_space,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  auto partial      = grouped_aggregate_table(get_cudf_table_view(input),
+                                         group_idx,
+                                         aggregates,
+                                         aggregate_idx,
+                                         aggregate_struct_col_indices,
+                                         stream,
+                                         memory_space);
+  auto output_table = expand_grouping_sets(partial->view(),
+                                           group_idx.size(),
+                                           aggregates,
+                                           grouping_sets,
+                                           grouping_functions,
+                                           stream,
+                                           memory_space.get_default_allocator());
   return make_data_batch(std::move(output_table), memory_space, stream, telemetry_info);
 }
 

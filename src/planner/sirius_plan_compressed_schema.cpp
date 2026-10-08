@@ -416,7 +416,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       // accumulation/result width. Each ineligible shape breaks to the native boundary below.
       if (slot->children.size() != 1) { break; }
       auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
-      if (aggregate.grouping_sets.size() > 1) { break; }
+      if (aggregate.has_grouping_sets()) { break; }
       // AVG decomposes into SUM + COUNT_VALID partial columns and COUNT(DISTINCT) keeps a LIST
       // partial column, so the partial batch layout deviates from the declared `types` shape a
       // sidecar describes; those shapes keep the native boundary.
