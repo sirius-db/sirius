@@ -695,7 +695,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       std::move(filter_replica_spaces),
       {.emit_zone_map_filters     = op_params.enable_dynamic_zone_map_filter,
        .domain_coverage_threshold = op_params.dynamic_filter_domain_coverage_threshold,
-       .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction}};
+       .inlist_max_l2_fraction    = op_params.dynamic_filter_inlist_max_l2_fraction,
+       .enable_multi_partition    = op_params.enable_dynamic_filter_multi_partition,
+       .max_bloom_bytes_per_gpu   = op_params.max_dynamic_filter_bloom_bytes_per_gpu}};
 
     auto join = duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
       op,

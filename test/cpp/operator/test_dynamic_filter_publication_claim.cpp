@@ -88,10 +88,12 @@ struct claim_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 
   /// The plan's replica space stays GPU 0 only regardless of @p num_gpus; extra GPUs exist so
-  /// tests can build batches resident outside the replica set.
+  /// tests can build batches resident outside the replica set. @p probe_type is the channel
+  /// binding's recorded probe storage type.
   explicit claim_fixture(duckdb::JoinType join_type        = duckdb::JoinType::INNER,
                          std::size_t num_gpus              = 1,
-                         cudf::size_type build_key_ordinal = 0)
+                         cudf::size_type build_key_ordinal = 0,
+                         cudf::data_type probe_type        = kInt64)
     : memory_manager(sirius::test::operator_utils::initialize_memory_manager(num_gpus))
   {
     gpu_space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, kDeviceId);
@@ -111,7 +113,7 @@ struct claim_fixture {
                        .accepts_zone_map_filters = false,
                        .key_bindings             = {{.admitted_key_index   = 0,
                                                      .channel_push_ordinal = kProbeColumnIndex,
-                                                     .probe_storage_type   = kInt64}}});
+                                                     .probe_storage_type   = probe_type}}});
     dynamic_filter_publish_plan::admitted_key key{.planner_condition_index      = 0,
                                                   .build_key_ordinal            = build_key_ordinal,
                                                   .storage_type                 = kInt64,
@@ -210,7 +212,11 @@ struct claim_fixture {
     // The converter's batched copy path (cudaMemcpyBatchAsync) rejects the default stream.
     auto const stream = gpu_space->acquire_stream();
     {
-      auto mut = batch->to_mutable();
+      auto mut                = batch->to_mutable();
+      auto const writer_event = mut.get_data()->get_writer_event();
+      REQUIRE(writer_event != nullptr);
+      RMM_CUDA_TRY(cudaStreamWaitEvent(stream.get(), writer_event, 0));
+      mut.rebind_stream(stream);
       mut.convert_to<cucascade::host_data_representation>(registry, host_space, stream);
     }
     return batch;
@@ -241,6 +247,23 @@ TEST_CASE("hash join claims a whole build for publication in any join mode",
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
   CHECK_FALSE(fixture.channel->snapshot().empty());
+  CHECK(fixture.channel->snapshot().terminal());
+}
+
+TEST_CASE("a whole-build publication counts incompatible probe bindings in the session stats",
+          "[dynamic_filter][publication_claim][gpu_execution]")
+{
+  // No integer key domain reads a FLOAT64 probe, so the only binding gets no filter.
+  claim_fixture fixture{duckdb::JoinType::INNER, 1, 0, cudf::data_type{cudf::type_id::FLOAT64}};
+  fixture.hash_join->set_build_arrives_whole(true);
+  fixture.push_build_batch();
+
+  auto const counters = fixture.stats.snapshot();
+  CHECK(counters.publication_attempts == 1);
+  CHECK(counters.membership_filters_built == 1);
+  CHECK(counters.bindings_skipped_incompatible_probe == 1);
+  CHECK(counters.filters_pushed == 0);
+  CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
 }
 

@@ -15,6 +15,7 @@
  */
 
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "utils/host_allocation_fault.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -24,6 +25,7 @@
 #include <catch.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <memory>
@@ -43,6 +45,7 @@ using sirius::op::sirius_dynamic_filter_kind;
 using sirius::op::sirius_dynamic_filter_set;
 using sirius::op::sirius_dynamic_zone_map_filter;
 using sirius::op::zone_map_entry;
+using sirius::test::scoped_host_allocation_fault;
 
 namespace {
 
@@ -294,7 +297,7 @@ TEST_CASE("snapshot and producer owners outlive the channel wrapper independentl
   std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
   {
     sirius_dynamic_filter_set set;
-    producer.emplace(set.register_producer({2}));
+    producer.emplace(set.register_producer({2}, 3));
     set.freeze_registration();
     auto filter     = std::make_shared<stub_runtime_only_filter>();
     filter_lifetime = filter;
@@ -378,12 +381,12 @@ TEST_CASE("the same filter can be co-owned by multiple channels (fan-out)", "[dy
 
 TEST_CASE("sirius_dynamic_filter_set::push_filter is thread-safe", "[dynamic_filter]")
 {
-  sirius_dynamic_filter_set set;
-  auto producer = set.register_producer({0, 1, 2, 3});
-
   constexpr int kThreads             = 8;
   constexpr int kPushesPerThread     = 32;
   constexpr std::size_t kColumnCount = 4;
+
+  sirius_dynamic_filter_set set;
+  auto producer = set.register_producer({0, 1, 2, 3}, kThreads * kPushesPerThread / kColumnCount);
 
   std::atomic<int> rejected{0};
   std::vector<std::thread> threads;
@@ -466,6 +469,79 @@ TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]"
     REQUIRE(set.has_producers());
     REQUIRE(set.has_unscoped_producer());
   }
+}
+
+TEST_CASE("a push beyond a producer's reserved room is refused without disturbing other producers",
+          "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  auto bounded = set.register_producer({0}, 1);
+  auto other   = set.register_producer({0, 1}, 1);
+  set.freeze_registration();
+  auto const kept = std::make_shared<stub_runtime_only_filter>();
+  REQUIRE(bounded.push_filter(0, kept));
+  auto const refused = std::make_shared<stub_runtime_only_filter>();
+  REQUIRE_FALSE(bounded.push_filter(0, refused));
+  // The other producer's room on column 1 is not the bounded producer's to use.
+  REQUIRE_FALSE(bounded.push_filter(1, refused));
+  REQUIRE(refused.use_count() == 1);
+  REQUIRE(set.filter_count() == 1);
+
+  REQUIRE(other.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
+  REQUIRE(other.push_filter(1, std::make_shared<stub_runtime_only_filter>()));
+  REQUIRE_FALSE(other.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
+  bounded.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
+  other.finish(sirius_dynamic_filter_set::completion::PUBLISHED);
+  auto const snapshot = set.snapshot();
+  REQUIRE(snapshot.terminal());
+  REQUIRE(snapshot.entries().size() == 3);
+  auto const column_0 = filters_on_column(snapshot, 0);
+  REQUIRE(column_0.size() == 2);
+  REQUIRE(column_0.front() == kept);
+  REQUIRE(filters_on_column(snapshot, 1).size() == 1);
+}
+
+TEST_CASE("push_filter never allocates, within or beyond a producer's room",
+          "[.][host_allocation_fault]")
+{
+  REQUIRE(scoped_host_allocation_fault::available());
+  sirius_dynamic_filter_set set;
+  auto bounded = set.register_producer({0}, 1);
+  auto other   = set.register_producer({0}, 1);
+  std::array<std::shared_ptr<sirius_dynamic_filter const>, 3> const filters{
+    std::make_shared<stub_runtime_only_filter>(),
+    std::make_shared<stub_runtime_only_filter>(),
+    std::make_shared<stub_runtime_only_filter>()};
+  std::array<bool, 3> accepted{};
+  std::size_t allocations = 0;
+  {
+    // Catch2 assertions allocate.
+    scoped_host_allocation_fault counting{scoped_host_allocation_fault::every_allocation_scope, 0};
+    accepted[0] = bounded.push_filter(0, filters[0]);
+    accepted[1] = bounded.push_filter(0, filters[1]);
+    accepted[2] = other.push_filter(0, filters[2]);
+    allocations = counting.stop();
+  }
+  REQUIRE(accepted == std::array{true, false, true});
+  REQUIRE(allocations == 0);
+}
+
+TEST_CASE("a producer registered without a push budget cannot push", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+  SECTION("zero pushes per planned column")
+  {
+    auto producer = set.register_producer({0}, 0);
+    REQUIRE_FALSE(producer.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
+  }
+  SECTION("an unscoped producer")
+  {
+    auto producer = set.register_producer({});
+    REQUIRE(set.has_unscoped_producer());
+    REQUIRE_FALSE(producer.push_filter(0, std::make_shared<stub_runtime_only_filter>()));
+  }
+  REQUIRE_FALSE(set.has_filters());
+  REQUIRE(set.filter_count() == 0);
 }
 
 TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic_filter]")
