@@ -15,14 +15,15 @@
  */
 
 /**
- * @file test_build_key_domain.cpp
- * @brief Tests positional lineage resolution for build-key domains.
+ * @file test_scan_column_origin.cpp
+ * @brief Tests shared column tracing and its dynamic-filter domain consumer.
  *
  * The CPU-only fixtures use disjoint ordinal and cardinality ranges so resolving the wrong scan or
  * coordinate produces an unmistakable result.
  */
 
 #include "planner/dynamic_filter/build_key_domain.hpp"
+#include "planner/scan_column_origin.hpp"
 
 #include <catch.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>
@@ -51,10 +52,18 @@
 #include <vector>
 
 using sirius::planner::build_key_domain_cardinalities;
+using sirius::planner::resolve_scan_column_origin;
 using sirius::planner::detail::resolve_build_key_scans;
-using sirius::planner::detail::resolve_pass_through_scan;
 
 namespace {
+
+// Structural tests exercise the shared tracer; the domain tests below exercise its consumer.
+duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
+                                                    std::size_t ordinal)
+{
+  auto const origin = resolve_scan_column_origin(subtree, ordinal);
+  return origin ? origin->get : nullptr;
+}
 
 // Assign each table a distinct cardinality so resolving the wrong scan is visible.
 constexpr std::size_t stub_cardinality_of(duckdb::idx_t table_index)
@@ -163,7 +172,7 @@ void require_all_ordinals_resolve_to(duckdb::LogicalOperator const& subtree,
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("walk resolves a plain base scan and refuses ordinals past its width",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get = make_get(/*table_index=*/0, /*width=*/3);
   get->ResolveOperatorTypes();
@@ -175,7 +184,7 @@ TEST_CASE("walk resolves a plain base scan and refuses ordinals past its width",
 }
 
 TEST_CASE("walk uses the projected scan width when projection_ids narrow the scan",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get            = make_get(/*table_index=*/0, /*width=*/4);
   get->projection_ids = {2};  // scan output is one column
@@ -186,7 +195,7 @@ TEST_CASE("walk uses the projected scan width when projection_ids narrow the sca
   REQUIRE(resolve_pass_through_scan(*get, 3) == nullptr);
 }
 
-TEST_CASE("walk refuses a table-in-out scan wholesale", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk refuses a table-in-out scan wholesale", "[planner][scan_column_origin]")
 {
   // A GET with projected input appends its child's columns after the scan columns, so "the base
   // table's row count" is not meaningful for any ordinal of this node.
@@ -205,7 +214,7 @@ TEST_CASE("walk refuses a table-in-out scan wholesale", "[dynamic_filter][build_
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("walk resolves a projection pass-through at a non-identity position",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto get        = make_get(/*table_index=*/0, /*width=*/3);
   auto const* raw = get.get();
@@ -220,7 +229,7 @@ TEST_CASE("walk resolves a projection pass-through at a non-identity position",
   REQUIRE(resolve_pass_through_scan(*projection, 2) == nullptr);  // past the projection width
 }
 
-TEST_CASE("walk applies the FILTER projection map", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk applies the FILTER projection map", "[planner][scan_column_origin]")
 {
   // The child projection makes the map observable: mapped resolution lands on a pass-through
   // reference, identity resolution lands on a computed expression and refuses.
@@ -248,7 +257,7 @@ TEST_CASE("walk applies the FILTER projection map", "[dynamic_filter][build_key_
   }
 }
 
-TEST_CASE("walk applies the ORDER_BY projection map", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk applies the ORDER_BY projection map", "[planner][scan_column_origin]")
 {
   auto get = make_get(/*table_index=*/0, /*width=*/2);
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
@@ -275,7 +284,7 @@ TEST_CASE("walk applies the ORDER_BY projection map", "[dynamic_filter][build_ke
 }
 
 TEST_CASE("walk passes through LIMIT, TOP_N, and DISTINCT by identity",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto make_traced_child = [] {
     auto get        = make_get(/*table_index=*/0, /*width=*/2);
@@ -311,7 +320,7 @@ TEST_CASE("walk passes through LIMIT, TOP_N, and DISTINCT by identity",
   }
 }
 
-TEST_CASE("walk resolves aggregate group ordinals only", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk resolves aggregate group ordinals only", "[planner][scan_column_origin]")
 {
   auto make_aggregate = [](duckdb::unique_ptr<duckdb::LogicalOperator> child) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
@@ -350,7 +359,7 @@ TEST_CASE("walk resolves aggregate group ordinals only", "[dynamic_filter][build
   }
 }
 
-TEST_CASE("walk composes a three-level stack", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk composes a three-level stack", "[planner][scan_column_origin]")
 {
   // GET(width 3) -> FILTER(map {2, 0}) -> PROJECTION([ref 1]): projection output 0 reads filter
   // output 1, the map sends 1 to child ordinal 0, which is within the scan. Every level's remap
@@ -375,7 +384,7 @@ TEST_CASE("walk composes a three-level stack", "[dynamic_filter][build_key_domai
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("walk continues through row-subset joins to the emitted side",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto const semi_like_left = {duckdb::JoinType::SEMI, duckdb::JoinType::ANTI};
   for (auto const join_type : semi_like_left) {
@@ -408,7 +417,7 @@ TEST_CASE("walk continues through row-subset joins to the emitted side",
 }
 
 TEST_CASE("walk continues through MARK's left block and refuses the mark column",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto left            = make_get(/*table_index=*/0, /*width=*/2);
   auto const* left_raw = left.get();
@@ -423,7 +432,7 @@ TEST_CASE("walk continues through MARK's left block and refuses the mark column"
 }
 
 TEST_CASE("walk continues through SINGLE's left block and refuses its right block",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   auto left            = make_get(/*table_index=*/0, /*width=*/2);
   auto const* left_raw = left.get();
@@ -441,7 +450,7 @@ TEST_CASE("walk continues through SINGLE's left block and refuses its right bloc
 }
 
 TEST_CASE("walk refuses row-multiplying and DELIM joins on every ordinal",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   SECTION("INNER refuses both sides")
   {
@@ -474,7 +483,7 @@ TEST_CASE("walk refuses row-multiplying and DELIM joins on every ordinal",
 }
 
 TEST_CASE("walk locates join ordinals through non-empty projection maps",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   SECTION("SEMI with a left projection map")
   {
@@ -569,7 +578,7 @@ TEST_CASE("walk locates join ordinals through non-empty projection maps",
 }
 
 TEST_CASE("walk never resolves an ordinal to the opposite join side",
-          "[dynamic_filter][build_key_domain]")
+          "[planner][scan_column_origin]")
 {
   // Two GETs with different table indexes under one modelled join: a recurse-into-every-child
   // default would resolve the wrong GET for refused ordinals.
@@ -592,7 +601,7 @@ TEST_CASE("walk never resolves an ordinal to the opposite join side",
 // Unmodelled operators
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("walk refuses unmodelled operators", "[dynamic_filter][build_key_domain]")
+TEST_CASE("walk refuses unmodelled operators", "[planner][scan_column_origin]")
 {
   SECTION("WINDOW")
   {

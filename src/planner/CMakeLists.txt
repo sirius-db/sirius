@@ -9,6 +9,7 @@ target_sources(
           gpu_admission.cpp
           query.cpp
           query_index.cpp
+          scan_column_origin.cpp
           sirius_physical_plan_generator.cpp
           sirius_plan_aggregate.cpp
           sirius_plan_column_data_get.cpp
