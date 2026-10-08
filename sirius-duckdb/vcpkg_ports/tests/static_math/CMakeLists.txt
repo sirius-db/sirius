@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.30)
+cmake_minimum_required(VERSION 3.30.4)
 project(static_cuda_math_probe LANGUAGES CXX)
 
 find_package(cusolver CONFIG REQUIRED)

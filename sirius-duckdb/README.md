@@ -24,12 +24,11 @@ Start DuckDB with Sirius loaded:
 pixi run duckdb
 ```
 
-This task sets the runtime search path for the environment's shared libraries
-and loads the unsigned local extension. Its equivalent direct invocation is:
+This task loads the unsigned local extension. CMake and the Pixi toolchain record
+the local library search paths in the binaries. The equivalent direct invocation is:
 
 ```sh
-pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; exec "$@"' -- \
-  sirius-duckdb/build/release/duckdb -unsigned \
+pixi run sirius-duckdb/build/release/duckdb -unsigned \
   -cmd "LOAD 'sirius-duckdb/build/release/extension/sirius/sirius.duckdb_extension';"
 ```
 
@@ -76,8 +75,8 @@ uses `find_package(sirius)` and never builds the engine itself.
 
 Both builds produce
 `build/release/extension/sirius/sirius.duckdb_extension` under this directory.
-Run the wrapper's SQL tests from the root with the same runtime search path:
+Run the wrapper's SQL tests from the root:
 
 ```sh
-pixi run bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"; make -C sirius-duckdb test_release'
+pixi run make -C sirius-duckdb test_release
 ```

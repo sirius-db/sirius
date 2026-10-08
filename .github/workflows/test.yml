@@ -173,6 +173,7 @@ jobs:
         run: tar -xf build.tar
 
       - name: Configure shared library lookup
+        # Downloaded binaries may contain paths from a different build runner.
         run: echo "LD_LIBRARY_PATH=$PWD/build/release/install/lib:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Check shared DuckDB scan host detection
