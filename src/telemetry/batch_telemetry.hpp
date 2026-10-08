@@ -85,11 +85,12 @@ class batch_telemetry_registry {
 
   /// Enable batch telemetry: create the per-tier MemoryTier resources and
   /// retain the telemetry context.
-  void install(std::shared_ptr<const telemetry_context> context,
+  // Returns whether this call installed the registry.
+  bool install(std::shared_ptr<const telemetry_context> context,
                sirius::memory::sirius_memory_reservation_manager& memory_manager);
 
   /// Drain leftover placements, drop the MemoryTier resources, and disable.
-  void uninstall();
+  void uninstall() noexcept;
 
   /// Associate a consumer port's data repository with its pipeline and port.
   void register_consumer_port(const cucascade::shared_data_repository* repo,

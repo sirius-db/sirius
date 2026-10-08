@@ -13,8 +13,9 @@ else()
 endif()
 
 # Compile the public API test separately so engine tests remain C++20.
-add_library(sirius_context_config_test OBJECT
-            test/cpp/config/test_context_config.cpp)
+add_library(
+  sirius_context_config_test OBJECT test/cpp/config/test_context_config.cpp
+                                    test/cpp/config/test_public_context.cpp)
 target_compile_features(sirius_context_config_test PRIVATE cxx_std_23)
 target_compile_definitions(sirius_context_config_test
                            PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)

@@ -105,23 +105,30 @@ class bounded_thread_pool {
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
     auto* latch_ptr   = init_latch.get();
 
-    for (int i = 0; i < capacity; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-        if (init_fn_ptr) {
-          (*init_fn_ptr)();
-          latch_ptr->count_down();
+    try {
+      for (int i = 0; i < capacity; ++i) {
+        auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+          if (init_fn_ptr) {
+            (*init_fn_ptr)();
+            latch_ptr->count_down();
+          }
+          work_loop();
+        });
+        if (!name.empty()) {
+          std::ignore =
+            sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
         }
-        work_loop();
-      });
-      if (!name.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
+        if (!cpu_ids.empty()) {
+          std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
+        }
       }
-      if (!cpu_ids.empty()) {
-        std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
-      }
-    }
 
-    if (init_latch) { init_latch->wait(); }
+      if (init_latch) { init_latch->wait(); }
+    } catch (...) {
+      // Join workers before the callback and initialization latch leave scope.
+      stop();
+      throw;
+    }
   }
 
   ~bounded_thread_pool() { stop(); }

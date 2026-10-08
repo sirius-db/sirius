@@ -1373,7 +1373,11 @@ sirius_scan_manager::sirius_scan_manager(
 sirius_scan_manager::~sirius_scan_manager()
 {
   if (_io_ctx && _io_ctx->cache()) {
-    SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+    try {
+      SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
+    } catch (...) {
+      // Diagnostics must not prevent shutdown during exception unwinding.
+    }
   }
   // Drain the dispatcher (and the worker pool) first so no in-flight
   // metadata-scan / sequencer task can still be reaching into the
