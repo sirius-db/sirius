@@ -166,9 +166,7 @@ class TestOpenConnection(unittest.TestCase):
                 "unused.duckdb", gpu_execution=True, data_source="duckdb"
             )
 
-        load = next(
-            i for i, s in enumerate(con.statements) if s.startswith("LOAD ")
-        )
+        load = next(i for i, s in enumerate(con.statements) if s.startswith("LOAD "))
         self.assertEqual(
             con.statements[load + 1 :],
             [
