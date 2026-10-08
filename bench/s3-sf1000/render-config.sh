@@ -97,25 +97,6 @@ else
   COMPRESSION="        enable_spill_compression: false"
 fi
 
-# Fair A/B: with spill compression on, Sirius carves the DEVICE_POOL_BYTES arena
-# out of the GPU budget (ba52ca12). Give the baseline arm the same query pool by
-# lowering its fraction by the arena's share of the device. MATCH_ARENA=0 opts out.
-if [ "$SPILL_COMPRESSION" != 1 ] && [ "${MATCH_ARENA:-1}" = 1 ]; then
-  dev_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
-  if [ -n "$dev_mib" ]; then
-    GPU_USAGE_FRACTION=$(python3 - "$GPU_USAGE_FRACTION" "$DEVICE_POOL_BYTES" "$dev_mib" <<'PY'
-import re, sys
-frac, arena, dev_mib = float(sys.argv[1]), sys.argv[2], float(sys.argv[3])
-m = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)(i?)B?\s*", arena, re.I)
-n, unit, binary = float(m.group(1)), m.group(2).upper(), m.group(3)
-scale = (1024 if binary else 1000) ** " KMGT".index(unit or " ")
-print(f"{frac - n * scale / (dev_mib * 1024 * 1024):.4f}")
-PY
-)
-    echo "baseline GPU fraction lowered to $GPU_USAGE_FRACTION to match the $DEVICE_POOL_BYTES compression arena" >&2
-  fi
-fi
-
 # Credentials straight from the CLI into the file, via python so nothing lands in
 # argv or the terminal.
 umask 077
