@@ -50,10 +50,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <source_location>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -204,10 +206,14 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -216,6 +222,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
+    REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
     REQUIRE(native_option);
     REQUIRE(native_option->HasError());
@@ -258,10 +266,16 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 0);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 0);
+    REQUIRE(con.Query("SET enable_dynamic_filter_multi_partition = true")->HasError());
+    REQUIRE(con.Query("SET max_dynamic_filter_bloom_bytes_per_gpu = 1024")->HasError());
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
@@ -280,6 +294,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
+    REQUIRE(setting_count(con, "enable_dynamic_filter_multi_partition") == 1);
+    REQUIRE(setting_count(con, "max_dynamic_filter_bloom_bytes_per_gpu") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
@@ -1012,11 +1028,11 @@ TEST_CASE("ordinary defaults stay physical-memory-derived without an explicit GP
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const before = config.get_operator_params();
+  auto const physical_default = sirius::config::derived_default_batch_size();
   config.load_from_file(config_fixture("effective_operator_defaults_high_level.yaml"));
   config.apply_defaults();
 
-  require_shared_operator_defaults(config.get_operator_params(), before.scan_task_batch_size);
+  require_shared_operator_defaults(config.get_operator_params(), physical_default);
 }
 
 TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
@@ -1028,7 +1044,7 @@ TEST_CASE("null GPU usage limits do not enable effective-capacity defaults",
   for (auto const* fixture : fixtures) {
     INFO("fixture=" << fixture);
     sirius::sirius_config config;
-    auto const physical_default = config.get_operator_params().scan_task_batch_size;
+    auto const physical_default = sirius::config::derived_default_batch_size();
 
     config.load_from_file(config_fixture(fixture));
     require_shared_operator_defaults(config.get_operator_params(), physical_default);
@@ -1039,7 +1055,7 @@ TEST_CASE("repeated loads clear explicit and cap-derived operator values",
           "[sirius][config][operator_defaults]")
 {
   sirius::sirius_config config;
-  auto const physical_default = config.get_operator_params().scan_task_batch_size;
+  auto const physical_default = sirius::config::derived_default_batch_size();
 
   config.load_from_file(config_fixture("effective_operator_defaults_explicit.yaml"));
   REQUIRE(config.get_operator_params().scan_task_batch_size == 1ULL * 1024 * 1024);
@@ -1388,7 +1404,9 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       current_setting('pin_table_input_compression_plan_dir')::VARCHAR,
       current_setting('pin_table_compression_min_batch_size_bytes')::UBIGINT,
       current_setting('pin_table_compression_max_compressed_fraction')::DOUBLE,
-      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE
+      current_setting('dynamic_filter_inlist_max_l2_fraction')::DOUBLE,
+      current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN,
+      current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT
   )");
   REQUIRE(settings != nullptr);
   REQUIRE_FALSE(settings->HasError());
@@ -1414,6 +1432,21 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   REQUIRE(settings->GetValue(17, 0).GetValue<uint64_t>() == 8 * mib);
   REQUIRE(settings->GetValue(18, 0).GetValue<double>() == Approx(0.6));
   REQUIRE(settings->GetValue(19, 0).GetValue<double>() == Approx(0.4));
+  REQUIRE(settings->GetValue(20, 0).GetValue<bool>());
+  REQUIRE(settings->GetValue(21, 0).GetValue<uint64_t>() == 17 * mib);
+
+  for (auto const* invalid_budget : {"-1", "0", "18446744073709551616"}) {
+    auto rejected =
+      con.Query(std::string{"SET max_dynamic_filter_bloom_bytes_per_gpu = "} + invalid_budget);
+    REQUIRE(rejected != nullptr);
+    REQUIRE(rejected->HasError());
+    if (std::string_view{invalid_budget} == "0") {
+      REQUIRE_THAT(rejected->GetError(),
+                   Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
+    }
+    REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+            17 * mib);
+  }
 
   auto zero_partition = con.Query("SET hash_partition_bytes = 0");
   REQUIRE(zero_partition != nullptr);
@@ -1511,6 +1544,24 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET max_sort_partition_memory_fraction");
   require_ok("SET enable_dynamic_filter = true");
   require_ok("RESET enable_dynamic_filter");
+  require_ok("SET enable_dynamic_filter_multi_partition = false");
+  REQUIRE_FALSE(
+    sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("RESET enable_dynamic_filter_multi_partition");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          std::numeric_limits<uint64_t>::max());
+  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
+  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          17 * mib);
+  auto multi_reset = con.Query(
+    "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
+    "current_setting('max_dynamic_filter_bloom_bytes_per_gpu')::UBIGINT");
+  REQUIRE(multi_reset != nullptr);
+  REQUIRE_FALSE(multi_reset->HasError());
+  REQUIRE(multi_reset->GetValue(0, 0).GetValue<bool>());
+  REQUIRE(multi_reset->GetValue(1, 0).GetValue<uint64_t>() == 17 * mib);
   require_ok("SET dynamic_filter_domain_coverage_threshold = 1.5");
   require_ok("RESET dynamic_filter_domain_coverage_threshold");
   require_ok("SET dynamic_filter_keep_threshold = 0.0");

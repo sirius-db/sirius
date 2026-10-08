@@ -318,3 +318,42 @@ TEST_CASE_METHOD(join_expression_key_fixture,
   CHECK_FALSE(is_bound_ref(*hj->conditions[0].left));
   CHECK_FALSE(is_bound_ref(*hj->conditions[0].right));
 }
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "join expression key - string case inequality operand is materialized",
+                 "[join_expression_key][string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO countries VALUES (0, 'Germany'), (1, 'France')")->HasError());
+  REQUIRE(!con->Query("CREATE TABLE birth_countries (id INTEGER, country VARCHAR)")->HasError());
+  REQUIRE(
+    !con->Query("INSERT INTO birth_countries VALUES (0, 'GERMANY'), (1, 'FRANCE'), (2, 'USA')")
+       ->HasError());
+  auto const name = GENERATE("upper", "lower");
+  auto plan       = generate_sirius_plan(
+    *con,
+    "SELECT l.id FROM birth_countries l JOIN countries r ON l.id = r.id AND l.country <> " +
+      std::string(name) + "(r.country)");
+  REQUIRE(plan);
+  auto* hj = find_hash_join(plan.get());
+  REQUIRE(hj);
+  bool saw_inequality = false;
+  for (auto const& condition : hj->conditions) {
+    if (condition.comparison != sirius::comparison_type::not_equal) { continue; }
+    saw_inequality = true;
+    CHECK(is_bound_ref(*condition.left));
+    CHECK(is_bound_ref(*condition.right));
+  }
+  REQUIRE(saw_inequality);
+  CHECK(has_projection_child(*hj));
+}
+
+TEST_CASE_METHOD(join_expression_key_fixture,
+                 "projection - string case functions plan successfully",
+                 "[string_case][isolated_context]")
+{
+  REQUIRE(!con->Query("CREATE TABLE names (name VARCHAR)")->HasError());
+  REQUIRE(!con->Query("INSERT INTO names VALUES ('Call Center'), (NULL)")->HasError());
+  auto plan = generate_sirius_plan(*con, "SELECT lower(name), upper(name) FROM names");
+  REQUIRE(plan);
+}

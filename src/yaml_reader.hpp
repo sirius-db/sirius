@@ -25,6 +25,7 @@
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -406,6 +407,8 @@ class reader {
     if (!child.IsDefined() || child.IsNull()) return;
     try {
       read_yaml(child, out);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       throw std::runtime_error(format_error(key, e.what()));
     }
@@ -423,6 +426,8 @@ class reader {
       T val{};
       read_yaml(child, val);
       out = std::move(val);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       throw std::runtime_error(format_error(key, e.what()));
     }
@@ -440,6 +445,8 @@ class reader {
       read_yaml(child, temp);
       if (!validator(temp)) { throw std::runtime_error("value out of range"); }
       out = std::move(temp);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       throw std::runtime_error(format_error(key, e.what()));
     }
@@ -456,6 +463,8 @@ class reader {
     }
     try {
       read_yaml(child, out);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (const std::exception& e) {
       throw std::runtime_error(format_error(key, e.what()));
     }

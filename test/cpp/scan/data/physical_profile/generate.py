@@ -1,0 +1,275 @@
+"""Regenerate T5's pinned PyArrow corpus and read back the actual encodings.
+
+Run through pixi. The test KMS deliberately wraps test keys in base64; it is not
+an example for production key management. Regenerate on a cuDF/PyArrow bump.
+"""
+
+import argparse
+import base64
+from decimal import Decimal
+from pathlib import Path
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.parquet.encryption as pe
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--output", type=Path, required=True)
+ROOT = parser.parse_args().output.resolve()
+ROOT.mkdir(parents=True, exist_ok=True)
+assert pa.__version__ in {"25.0.0", "25.0.1"}
+expected_encodings = {
+    "PLAIN": ("RLE", "PLAIN"),
+    "DELTA_BINARY_PACKED": ("RLE", "DELTA_BINARY_PACKED"),
+    "BYTE_STREAM_SPLIT": ("RLE", "BYTE_STREAM_SPLIT"),
+    "DELTA_LENGTH_BYTE_ARRAY": ("RLE", "DELTA_LENGTH_BYTE_ARRAY"),
+    "DELTA_BYTE_ARRAY": ("RLE", "DELTA_BYTE_ARRAY"),
+    "DICTIONARY": ("PLAIN", "RLE", "RLE_DICTIONARY"),
+}
+physical_types = {"int": "INT32", "double": "DOUBLE", "string": "BYTE_ARRAY"}
+values = {
+    "int": (
+        pa.array([None if i % 7 == 0 else i for i in range(128)], pa.int32()),
+        ["PLAIN", "DELTA_BINARY_PACKED", "DICTIONARY"],
+    ),
+    "double": (
+        pa.array([None if i % 7 == 0 else i / 4 for i in range(128)], pa.float64()),
+        ["PLAIN", "BYTE_STREAM_SPLIT", "DICTIONARY"],
+    ),
+    "string": (
+        pa.array([None if i % 7 == 0 else f"value-{i % 31:04}" for i in range(128)]),
+        ["PLAIN", "DELTA_LENGTH_BYTE_ARRAY", "DELTA_BYTE_ARRAY", "DICTIONARY"],
+    ),
+}
+for codec in ["NONE", "SNAPPY", "GZIP", "ZSTD", "LZ4", "BROTLI"]:
+    for kind, (array, encodings) in values.items():
+        for encoding in encodings:
+            name = f"{kind}-{codec}-{encoding}.parquet"
+            options = {"use_dictionary": encoding == "DICTIONARY"}
+            if encoding != "DICTIONARY":
+                options["column_encoding"] = encoding
+            pq.write_table(
+                pa.table({"x": array}),
+                ROOT / name,
+                compression=codec,
+                row_group_size=64,
+                **options,
+            )
+            metadata = pq.read_metadata(ROOT / name)
+            chunks = [
+                metadata.row_group(i).column(0) for i in range(metadata.num_row_groups)
+            ]
+            assert len(chunks) == 2
+            for chunk in chunks:
+                assert chunk.compression == (
+                    "UNCOMPRESSED" if codec == "NONE" else codec
+                )
+                assert chunk.encodings == expected_encodings[encoding]
+                assert chunk.physical_type == physical_types[kind]
+
+
+test_keys = {}
+
+
+class TestKms(pe.KmsClient):
+    def wrap_key(self, key_bytes, master_key_identifier):
+        test_keys[master_key_identifier] = base64.b64encode(key_bytes).decode()
+        return base64.b64encode(key_bytes)
+
+    def unwrap_key(self, wrapped_key, master_key_identifier):
+        return base64.b64decode(wrapped_key)
+
+
+factory = pe.CryptoFactory(lambda config: TestKms())
+kms = pe.KmsConnectionConfig(
+    custom_kms_conf={"footer": "0123456789012345", "column": "0123456789012345"}
+)
+for plaintext in [False, True]:
+    name = "encrypted-columns.parquet" if plaintext else "encrypted-footer.parquet"
+    config = pe.EncryptionConfiguration(
+        footer_key="footer",
+        column_keys={"column": ["x"]} if plaintext else None,
+        uniform_encryption=not plaintext,
+        plaintext_footer=plaintext,
+        double_wrapping=False,
+    )
+    props = factory.file_encryption_properties(kms, config)
+    if not plaintext:
+        (ROOT / "encrypted-footer.key").write_text(test_keys["footer"] + "\n")
+    pq.write_table(
+        pa.table({"x": pa.array([1, 2, 3], pa.int32())}),
+        ROOT / name,
+        encryption_properties=props,
+    )
+    actual = pq.read_table(
+        ROOT / name, decryption_properties=factory.file_decryption_properties(kms)
+    )
+    assert actual.column(0).to_pylist() == [1, 2, 3]
+    assert (ROOT / name).read_bytes()[-4:] == (b"PAR1" if plaintext else b"PARE")
+# Change only the footer encoding union; the data pages stay byte-identical.
+from footer_encoding import rewrite_encoding_lists, remove_raw_logical_annotation
+import struct
+
+raw = (ROOT / "int-SNAPPY-PLAIN.parquet").read_bytes()
+size = struct.unpack("<I", raw[-8:-4])[0]
+for name, replacement in [("levels", bytes([0x25, 0, 8])), ("empty", bytes([0x05]))]:
+    footer = rewrite_encoding_lists(raw[-8 - size : -8], replacement)
+    path = ROOT / f"int-SNAPPY-{name}.parquet"
+    path.write_bytes(
+        raw[: -8 - size] + footer + struct.pack("<I", len(footer)) + b"PAR1"
+    )
+    metadata = pq.read_metadata(path)
+    assert pq.read_table(path).equals(pq.read_table(ROOT / "int-SNAPPY-PLAIN.parquet"))
+    assert metadata.num_row_groups == 2
+    for i in range(metadata.num_row_groups):
+        chunk = metadata.row_group(i).column(0)
+        assert chunk.compression == "SNAPPY"
+        assert chunk.encodings == (("PLAIN", "BIT_PACKED") if name == "levels" else ())
+
+
+# Converted-type-only timestamps are legal legacy Parquet. cuDF's hybrid
+# reader synthesizes a UTC logical annotation for them; the raw footer must
+# remain the source of truth for DuckDB's plain TIMESTAMP binding.
+def without_raw_logical(source, target):
+    raw = source.read_bytes()
+    size = struct.unpack("<I", raw[-8:-4])[0]
+    footer = remove_raw_logical_annotation(raw[-8 - size : -8])
+    target.write_bytes(
+        raw[: -8 - size] + footer + struct.pack("<I", len(footer)) + b"PAR1"
+    )
+
+
+VARIANTS = ROOT / "schema_variants"
+VARIANTS.mkdir(exist_ok=True)
+# PyArrow emits three-level LISTs, so the tiny one-level REPEATED fixture is
+# checked in. Verify its physical shape and payload whenever the corpus is built.
+one_level = Path(__file__).parent / "repeated-leaf.parquet"
+assert "repeated int32 field_id=-1 x;" in str(pq.read_metadata(one_level).schema)
+assert pq.read_table(one_level).to_pydict() == {
+    "x": [[1, 2], [], [3]],
+    "next": [10, 20, 30],
+}
+wide = VARIANTS / "wide-many-groups.parquet"
+pq.write_table(
+    pa.table({f"c{i:03}": pa.array(range(16), type=pa.int32()) for i in range(128)}),
+    wide,
+    row_group_size=1,
+    use_dictionary=False,
+)
+wide_metadata = pq.read_metadata(wide)
+assert wide_metadata.num_columns == 128 and wide_metadata.num_row_groups == 16
+modern = VARIANTS / "timestamp-modern.parquet"
+pq.write_table(
+    pa.table({"x": pa.array([1, 2, 3], type=pa.timestamp("us"))}),
+    modern,
+    version="2.4",
+)
+legacy = VARIANTS / "timestamp-legacy.parquet"
+without_raw_logical(modern, legacy)
+assert pq.read_table(legacy).column(0).cast(pa.int64()).to_pylist() == [1, 2, 3]
+assert "is_from_converted_type=true" in str(pq.read_metadata(legacy).schema)
+pq.write_table(
+    pa.table({"x": pa.array([1, 2, 3], type=pa.timestamp("us", tz="UTC"))}),
+    VARIANTS / "timestamp-utc.parquet",
+    version="2.4",
+)
+assert "isAdjustedToUTC=true" in str(
+    pq.read_metadata(VARIANTS / "timestamp-utc.parquet").schema
+)
+
+pq.write_table(
+    pa.table(
+        {
+            "x": pa.array([[1, 2], [], [3]], type=pa.list_(pa.int32())),
+            "next": pa.array([10, 20, 30], type=pa.int32()),
+        }
+    ),
+    VARIANTS / "list-three-level.parquet",
+)
+pq.write_table(
+    pa.table(
+        {
+            "x": pa.array(
+                [[[1, 2]], [], [[3], [4]]], type=pa.list_(pa.list_(pa.int32()))
+            ),
+            "next": pa.array([10, 20, 30], type=pa.int32()),
+        }
+    ),
+    VARIANTS / "list-nested.parquet",
+)
+
+
+def schema_pair(name, first, second, **options):
+    folder = VARIANTS / name
+    folder.mkdir(exist_ok=True)
+    pq.write_table(first, folder / "a.parquet", **options)
+    pq.write_table(second, folder / "b.parquet", **options)
+    assert pq.read_metadata(folder / "a.parquet").num_row_groups == 1
+    assert pq.read_metadata(folder / "b.parquet").num_row_groups == 1
+
+
+schema_pair(
+    "pair-repetition",
+    pa.table({"x": pa.array([1, 2], type=pa.int32())}),
+    pa.Table.from_arrays(
+        [pa.array([3, 4], type=pa.int32())],
+        schema=pa.schema([pa.field("x", pa.int32(), nullable=False)]),
+    ),
+)
+schema_pair(
+    "pair-decimal-scale",
+    pa.table({"x": pa.array([Decimal("1.20")], type=pa.decimal128(8, 2))}),
+    pa.table({"x": pa.array([Decimal("2.300")], type=pa.decimal128(8, 3))}),
+)
+legacy_decimal = VARIANTS / "pair-legacy-decimal-scale"
+legacy_decimal.mkdir(exist_ok=True)
+for file in ("a.parquet", "b.parquet"):
+    without_raw_logical(VARIANTS / "pair-decimal-scale" / file, legacy_decimal / file)
+    assert "Decimal(precision=8, scale=" in str(
+        pq.read_metadata(legacy_decimal / file).schema
+    )
+assert pq.read_table(legacy_decimal / "a.parquet").column(0).to_pylist() == [
+    Decimal("1.20")
+]
+assert pq.read_table(legacy_decimal / "b.parquet").column(0).to_pylist() == [
+    Decimal("2.300")
+]
+# Keep physical width and scale equal so precision is an independent legacy field.
+schema_pair(
+    "pair-decimal-precision",
+    pa.table({"x": pa.array([Decimal("1.20")], type=pa.decimal128(8, 2))}),
+    pa.table({"x": pa.array([Decimal("2.30")], type=pa.decimal128(9, 2))}),
+    store_schema=False,
+)
+legacy_precision = VARIANTS / "pair-legacy-decimal-precision"
+legacy_precision.mkdir(exist_ok=True)
+for file in ("a.parquet", "b.parquet"):
+    without_raw_logical(
+        VARIANTS / "pair-decimal-precision" / file, legacy_precision / file
+    )
+    assert "fixed_len_byte_array(4)" in str(
+        pq.read_metadata(legacy_precision / file).schema
+    )
+    assert pq.read_table(legacy_precision / file).column(0).to_pylist() == [
+        Decimal("1.20") if file == "a.parquet" else Decimal("2.30")
+    ]
+schema_pair(
+    "pair-type-length",
+    pa.table({"x": pa.array([Decimal("1.20")], type=pa.decimal128(8, 2))}),
+    pa.table({"x": pa.array([Decimal("2.30")], type=pa.decimal128(12, 2))}),
+)
+schema_pair(
+    "pair-logical-unit",
+    pa.table({"x": pa.array([1], type=pa.timestamp("us"))}),
+    pa.table({"x": pa.array([2], type=pa.timestamp("ms"))}),
+)
+schema_pair(
+    "pair-logical-utc",
+    pa.table({"x": pa.array([1], type=pa.timestamp("us"))}),
+    pa.table({"x": pa.array([2], type=pa.timestamp("us", tz="UTC"))}),
+)
+assert "isAdjustedToUTC=false" in str(
+    pq.read_metadata(VARIANTS / "pair-logical-utc/a.parquet").schema
+)
+assert "isAdjustedToUTC=true" in str(
+    pq.read_metadata(VARIANTS / "pair-logical-utc/b.parquet").schema
+)

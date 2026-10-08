@@ -42,6 +42,9 @@
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 
+#include <cstdint>
+#include <numeric>
+
 namespace {
 using namespace sirius::transparent;
 
@@ -402,6 +405,7 @@ TEST_CASE("Explicit replay permits local Parquet after refused window entry",
 namespace {
 unsigned replay_source_executions = 0;
 unsigned replay_source_binds      = 0;
+std::string replay_source_behavior;
 
 struct replay_source_state : duckdb::GlobalTableFunctionState {
   bool emitted = false;
@@ -419,6 +423,10 @@ duckdb::TableFunction rebound_policy_source(std::string name)
       if (state.emitted) return;
       state.emitted = true;
       ++replay_source_executions;
+      if (replay_source_behavior == "empty") return;
+      if (replay_source_behavior == "error") {
+        throw duckdb::InvalidInputException("CPU replay source failed");
+      }
       output.SetCardinality(1);
       output.SetValue(0, 0, duckdb::Value::INTEGER(42));
     },
@@ -458,7 +466,7 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
           "[integration][policy][explicit_replay][rebound_replay]")
 {
   if (sirius::test::run_isolated()) return;
-  auto const source    = GENERATE("s3", "incomplete", "local");
+  auto const source    = GENERATE("s3", "incomplete", "local", "empty", "error", "throw");
   auto const optimizer = GENERATE(true, false);
   auto const fallback  = GENERATE(true, false);
   CAPTURE(source, optimizer, fallback);
@@ -479,6 +487,12 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
   unsigned replays                     = 0;
   context->cpu_replay_hook_for_testing = [&] {
     ++replays;
+    replay_source_behavior = source;
+    if (std::string_view(source) == "throw") {
+      context->cpu_replay_query_hook_for_testing = [] {
+        throw std::runtime_error("direct CPU replay exception");
+      };
+    }
     auto changed =
       replace.Query("CREATE OR REPLACE VIEW " + view + " AS SELECT * FROM " + function + "('" +
                     source + "', " + (optimizer ? "true" : "false") + ")");
@@ -487,7 +501,12 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
   };
   struct reset_hook {
     duckdb::SiriusContext& context;
-    ~reset_hook() { context.cpu_replay_hook_for_testing = {}; }
+    ~reset_hook()
+    {
+      context.cpu_replay_hook_for_testing       = {};
+      context.cpu_replay_query_hook_for_testing = {};
+      replay_source_behavior.clear();
+    }
   } reset{*context};
   fixture.run_ok("SET sirius_test_sync_cpu_replay=true");
   fixture.run_ok("SET sirius_test_mark_runtime_unavailable_before_window=true");
@@ -497,11 +516,13 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
   REQUIRE_FALSE(prepared->HasError());
   replay_source_executions = 0;
   replay_source_binds      = 0;
+  replay_source_behavior   = "local";
+  auto before              = context->get_transparent_execution_stats();
   auto result              = prepared->Execute();
   REQUIRE(result);
   INFO((result->HasError() ? result->GetError() : "CPU source executed"));
   CHECK(replays == (fallback ? 1 : 0));
-  CHECK(replay_source_binds == (fallback ? 1 : 0));
+  CHECK(replay_source_binds == (fallback && std::string_view(source) != "throw" ? 1 : 0));
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   if (fallback && std::string_view(source) == "local") {
     REQUIRE_FALSE(result->HasError());
@@ -510,18 +531,53 @@ TEST_CASE("Explicit replay validates sources after a view is replaced",
     REQUIRE(chunk->size() == 1);
     CHECK(chunk->GetValue(0, 0).GetValue<int32_t>() == 42);
     CHECK(replay_source_executions == 1);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      try {
+        auto next = result->Fetch();
+        CHECK((!next || next->size() == 0));
+      } catch (std::exception const&) {
+        // DuckDB may surface the exhausted result as an exception.
+      }
+      CHECK(replay_source_executions == 1);
+      CHECK(replays == 1);
+    }
+  } else if (fallback && std::string_view(source) == "empty") {
+    REQUIRE_FALSE(result->HasError());
+    auto chunk = result->Fetch();
+    CHECK((!chunk || chunk->size() == 0));
+    CHECK(replay_source_executions == 1);
   } else {
-    CHECK(replay_source_executions == 0);
+    CHECK(replay_source_executions == (fallback && std::string_view(source) == "error"));
     REQUIRE(result->HasError());
-    CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
-    if (fallback) {
+    if (fallback && std::string_view(source) == "throw") {
+      CHECK(result->GetError().find("direct CPU replay exception") != std::string::npos);
+    } else if (fallback && std::string_view(source) == "error") {
+      CHECK(result->GetError().find("CPU replay source failed") != std::string::npos);
+    } else {
+      CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+    }
+    if (fallback && std::string_view(source) != "error" && std::string_view(source) != "throw") {
       CHECK(result->GetError().find(std::string_view(source) == "s3"
                                       ? "S3 CPU fallback is not supported"
                                       : "source discovery incomplete") != std::string::npos);
-    } else {
+    } else if (!fallback) {
       CHECK(result->GetError().find("SiriusExecuteQuery error:") != std::string::npos);
     }
   }
+  auto after = context->get_transparent_execution_stats();
+  auto const admitted =
+    fallback && std::string_view(source) != "s3" && std::string_view(source) != "incomplete";
+  auto const policy_refused = fallback && !admitted;
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks + admitted);
+  CHECK(after.late_failure_no_replay[static_cast<size_t>(
+          sirius::transparent::late_failure_condition::policy_refused_in_replay)] ==
+        before.late_failure_no_replay[static_cast<size_t>(
+          sirius::transparent::late_failure_condition::policy_refused_in_replay)] +
+          policy_refused);
+  auto replay_count = [](auto const& stats) {
+    return std::accumulate(stats.late_replays.begin(), stats.late_replays.end(), uint64_t{0});
+  };
+  CHECK(replay_count(after) == replay_count(before) + admitted);
 }
 
 namespace {

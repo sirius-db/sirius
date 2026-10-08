@@ -319,6 +319,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
+  /**
+   * @brief The session that publishes this join's dynamic filters, through which the build-side
+   * `sirius_physical_partition` accumulates a multi-partition filter.
+   */
+  [[nodiscard]] dynamic_filter_publication_session& dynamic_filter_session() noexcept
+  {
+    return _dynamic_filter_session;
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
