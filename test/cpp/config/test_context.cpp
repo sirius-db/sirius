@@ -1444,7 +1444,7 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
       REQUIRE_THAT(rejected->GetError(),
                    Catch::Matchers::ContainsSubstring("enable_dynamic_filter_multi_partition"));
     }
-    REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+    REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
             17 * mib);
   }
 
@@ -1546,14 +1546,18 @@ TEST_CASE("YAML-backed operator and compression settings are DuckDB defaults",
   require_ok("RESET enable_dynamic_filter");
   require_ok("SET enable_dynamic_filter_multi_partition = false");
   REQUIRE_FALSE(
-    sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
-  require_ok("RESET enable_dynamic_filter_multi_partition");
+    duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
+  // Session overrides must leave the shared YAML defaults unchanged.
   REQUIRE(sirius_ctx->get_config().get_operator_params().enable_dynamic_filter_multi_partition);
+  require_ok("RESET enable_dynamic_filter_multi_partition");
+  REQUIRE(duckdb::session_operator_params(*con.context).enable_dynamic_filter_multi_partition);
   require_ok("SET max_dynamic_filter_bloom_bytes_per_gpu = 18446744073709551615");
-  REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           std::numeric_limits<uint64_t>::max());
-  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
   REQUIRE(sirius_ctx->get_config().get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu ==
+          17 * mib);
+  require_ok("RESET max_dynamic_filter_bloom_bytes_per_gpu");
+  REQUIRE(duckdb::session_operator_params(*con.context).max_dynamic_filter_bloom_bytes_per_gpu ==
           17 * mib);
   auto multi_reset = con.Query(
     "SELECT current_setting('enable_dynamic_filter_multi_partition')::BOOLEAN, "
