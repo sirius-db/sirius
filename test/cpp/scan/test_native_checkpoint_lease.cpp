@@ -18,10 +18,12 @@
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/metadata_walk_parallel.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 #include <signal.h>
 #include <sirius_context.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <transparent/read_view_registry.hpp>
 #include <unistd.h>
 #include <utils/child_process_environment.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -1215,4 +1217,51 @@ TEST_CASE("checkpoint leases are released only for their owning query",
   REQUIRE(checkpoint.wait_for(5s) == std::future_status::ready);
   CHECK(checkpoint.get().empty());
   query_ok(*fixture.con, "ROLLBACK");
+}
+
+TEST_CASE("native and Iceberg planning completes under a waiting forced checkpoint",
+          "[scan][native][checkpoint][iceberg][verdict][integration]")
+{
+  if (sirius::test::run_isolated()) return;
+  NativeLeaseFixture fixture;
+  prepare_native_table(fixture);
+  auto& con = fixture.con;
+  query_ok(*con, "LOAD iceberg");
+  auto sibling = sibling_connection(fixture);
+  auto context = sirius::test::get_registered_sirius_context(*con);
+  query_ok(*con, "SET gpu_execution=false");
+  query_ok(*con, "BEGIN TRANSACTION READ ONLY");
+  auto& catalog = duckdb::Catalog::GetCatalog(*con->context, fixture.attach_alias);
+  auto& table = catalog.GetEntry<duckdb::TableCatalogEntry>(*con->context, "main", "native_lease_t")
+                  .Cast<duckdb::DuckTableEntry>();
+  std::future<std::string> checkpoint;
+  {
+    duckdb::SiriusContext::StandaloneQueryScope window(
+      *context, *con->context, "iceberg_checkpoint");
+    context->get_scan_manager().acquire_checkpoint_key(window.query_id(),
+                                                       table.GetStorage().GetAttached());
+    checkpoint = std::async(std::launch::async, [&] {
+      auto result = sibling->Query("FORCE CHECKPOINT");
+      return result->HasError() ? result->GetError() : std::string{};
+    });
+    CHECK(checkpoint.wait_for(150ms) == std::future_status::timeout);
+    duckdb::SiriusContext::InternalQueryGuard guard(*con->context);
+    auto before  = context->get_transparent_execution_stats();
+    auto logical = con->ExtractPlan(
+      "SELECT i FROM native_lease_t UNION ALL SELECT count::BIGINT FROM iceberg_scan("
+      "'test/cpp/integration/data/iceberg_v2_delete', snapshot_from_id=2000000000000000001)");
+    sirius::planner::sirius_physical_plan_generator generator(*con->context);
+    auto plan = generator.create_plan(std::move(logical));
+    REQUIRE(plan);
+    REQUIRE(generator.read_views->entries().size() == 2);
+    auto after = context->get_transparent_execution_stats();
+    CHECK(after.iceberg_manifest_walks == before.iceberg_manifest_walks + 1);
+    CHECK(after.iceberg_delete_payload_loads == before.iceberg_delete_payload_loads + 1);
+    CHECK(checkpoint.wait_for(0ms) == std::future_status::timeout);
+    plan.reset();
+    window.finish();
+  }
+  REQUIRE(checkpoint.wait_for(5s) == std::future_status::ready);
+  CHECK(checkpoint.get().empty());
+  query_ok(*con, "ROLLBACK");
 }

@@ -588,6 +588,13 @@ void task_creator::manager_loop()
     }
     node = next.op;
 
+    // The discard-count fixture leaves a real published batch in its repository until
+    // the held footer fails. Scan tasks remain runnable so the failure can be delivered.
+    if (auto completion = query_state->completion_handler;
+        completion && completion->injections && completion->injections->hold_published_batch &&
+        dynamic_cast<op::scan::sirius_gpu_scan_operator*>(node) == nullptr) {
+      continue;
+    }
     // Counted before dispatch so drain_pending_tasks(query_id) cannot observe zero in-flight
     // while this task creation is still queued to run.
     query_state->enter_in_flight();

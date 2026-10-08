@@ -206,6 +206,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
@@ -264,6 +266,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
   {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
+    REQUIRE(setting_count(con, "sirius_test_inject_scan_verdict") == 0);
+    REQUIRE(setting_count(con, "sirius_test_budget_declines") == 0);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
     REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);

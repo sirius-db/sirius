@@ -274,8 +274,10 @@ void streaming_fragment::build()
       // opens the window and compares this epoch to detect a stale plan.
       duckdb::SiriusContext::SlotGuard plan_slot(sirius_ctx, _context);
       _planned_pin_epoch = sirius_ctx.get_scan_manager().pin_registry_epoch();
-      subtree            = sirius::planner::sirius_physical_plan_generator(_context).create_plan(
-        std::move(bound.plan));
+      sirius::planner::sirius_physical_plan_generator generator(_context);
+      // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
+      generator.contract_provenance.host_export_available = false;
+      subtree = generator.create_plan(std::move(bound.plan));
     }
 
     _plan_root = is_result() ? make_result_collector(std::move(subtree), std::move(bound.prepared))
