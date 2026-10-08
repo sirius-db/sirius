@@ -123,6 +123,10 @@ inline std::unique_ptr<cudf::column> make_null_column(cudf::column_view const& l
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr)
 {
+  if (cudf::is_fixed_width(like.type())) {
+    return cudf::make_fixed_width_column(
+      like.type(), num_rows, cudf::mask_state::ALL_NULL, stream, mr);
+  }
   // Every index of the gather map is out of bounds, so NULLIFY makes every row NULL.
   auto const out_of_bounds = cudf::numeric_scalar<cudf::size_type>(like.size(), true, stream, mr);
   auto gather_map          = cudf::make_column_from_scalar(out_of_bounds, num_rows, stream, mr);

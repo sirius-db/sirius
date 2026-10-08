@@ -140,3 +140,24 @@ TEST_CASE_METHOD(GroupingSetsFixture,
   create_grouping_table(*this);
   expect_plan_fallback_matches_cpu("SELECT count(*) n FROM gs_t GROUP BY GROUPING SETS ((), ());");
 }
+
+TEST_CASE_METHOD(GroupingSetsFixture,
+                 "grouping sets - aggregates with a FILTER clause fall back",
+                 "[integration][gpu_execution][grouping_sets][aggregate]")
+{
+  create_grouping_table(*this);
+  SECTION("ROLLUP")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT a, b, sum(v) FILTER (WHERE v > 10) s FROM gs_t GROUP BY ROLLUP(a, b);");
+  }
+  SECTION("GROUP BY")
+  {
+    expect_plan_fallback_matches_cpu(
+      "SELECT a, sum(v) FILTER (WHERE v > 10) s, count(*) n FROM gs_t GROUP BY a;");
+  }
+  SECTION("ungrouped")
+  {
+    expect_plan_fallback_matches_cpu("SELECT count(*) FILTER (WHERE v > 10) n FROM gs_t;");
+  }
+}
