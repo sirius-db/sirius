@@ -250,6 +250,32 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
   return aggregate;
 }
 
+// A HASH_GROUP_BY over @p child grouping on column 0 with `first(#1)` beside `sum(#2)`.
+duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_first_beside_sum(
+  duckdb::unique_ptr<sirius_physical_operator> child)
+{
+  duckdb::vector<sirius::logical_type> output_types{
+    integer_type(),
+    sirius::logical_type::make(sirius::type_id::BIGINT),
+    sirius::logical_type::make(sirius::type_id::BIGINT)};
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> groups;
+  groups.push_back(make_reference(0));
+  duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions;
+  expressions.push_back(make_aggregate(1, sirius::aggregate_id::first));
+  expressions.push_back(make_aggregate(2, sirius::aggregate_id::sum));
+  auto aggregate = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    std::move(output_types),
+    std::move(expressions),
+    std::move(groups),
+    duckdb::vector<duckdb::GroupingSet>{},
+    duckdb::vector<duckdb::unsafe_vector<std::size_t>>{},
+    /*estimated_cardinality=*/1,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+    duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+  aggregate->children.push_back(std::move(child));
+  return aggregate;
+}
+
 void require_restore_projection_at(sirius_physical_operator const& op,
                                    std::size_t restored_idx,
                                    std::vector<cudf::data_type> const& expected)
@@ -442,6 +468,67 @@ TEST_CASE("compressed_schema_propagation - grouped aggregation keeps narrow grou
     REQUIRE(restored.get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int32});
     // The aggregate output keeps the narrow key carrier; the SUM output is native.
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int64});
+  }
+
+  SECTION("a zero-aggregate DISTINCT keeps every key narrow and restores nothing below")
+  {
+    // The shape `SELECT DISTINCT` lowers to. With no aggregates there is no value-sensitive input,
+    // so restore_native_columns is handed an empty set and short-circuits: the child keeps its
+    // narrow carriers through the PARTITION/MERGE_GROUP_BY exchange and widens once at the first
+    // native boundary above the merge.
+    //
+    // The keys are reversed and the two child carriers differ, so mirroring them onto the output
+    // has to read group_idx rather than assume the identity `GROUP BY a, b` produces. The distinct
+    // builder ships non-identity group_idx for `SELECT DISTINCT ON (b, a) a, b`.
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_grouped_aggregate({1, 0}, {}, make_scan(2, {k_int8, k_int16}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(plan->children[0]->type == SiriusPhysicalOperatorType::TABLE_SCAN);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int8, k_int16});
+    // Every output column is a key, so the output schema is the child's carriers in key order.
+    REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int16, k_int8});
+  }
+
+  SECTION("a FIRST keeps the native boundary even where SUM would narrow")
+  {
+    // Same shape as the first section with FIRST in place of SUM. cudf_aggregates is empty for a
+    // FIRST, so without the has_first break the pass would see no value-sensitive input and leave
+    // the carried column narrow while cudf::distinct copies it out at whatever carrier it has.
+    duckdb::unique_ptr<sirius_physical_operator> plan = make_grouped_aggregate(
+      {0}, {1}, make_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("a FIRST beside SUM keeps the native boundary")
+  {
+    // The has_first break fires before the SUM input is considered, so every column below the
+    // aggregate is restored, the key included.
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      make_first_beside_sum(make_scan(3, {k_int8, k_int8, k_int8}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list.size() == 3);
+    for (auto const& entry : projection.select_list) {
+      REQUIRE(entry->holds<sirius::ast::cast>());
+    }
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
   }
 
   SECTION("unused payload columns remain narrow")

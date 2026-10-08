@@ -28,9 +28,11 @@
 
 #include <cuda/stream>
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace sirius {
@@ -44,8 +46,9 @@ namespace op {
  * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
  * count_distinct case to add here.
  *
- * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
- * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg` (decomposes
+ * into SUM + COUNT_VALID) and `first` (a carried column in the grouped aggregate, NTH_ELEMENT in
+ * the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
@@ -69,19 +72,35 @@ std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& ta
                                                       ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr);
 
+/** @brief An aggregate answered by one cuDF request whose partial is also its output. */
+struct plain_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief AVG: SUM at `sum_idx` and COUNT_VALID at `sum_idx + 1`, divided at the merge. */
+struct avg_slot {
+  std::size_t sum_idx{};                              ///< Index of the SUM in cudf_aggregates
+  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< Quotient type: FLOAT64 or DECIMAL
+};
+
+/** @brief COUNT(DISTINCT): COLLECT_SET locally and MERGE_SETS at the merge, then counted. */
+struct count_distinct_slot {
+  std::size_t partial_idx{};  ///< Index in cudf_aggregates
+};
+
+/** @brief FIRST: no cuDF request; child column `input_idx` is carried at `carried_idx`. */
+struct first_slot {
+  int input_idx{-1};          ///< Child column whose value this slot carries
+  std::size_t carried_idx{};  ///< Position in the carried block that follows the partials
+};
+
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
- * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
- * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
+ * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), FIRST uses none,
+ * all others use one. COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then
+ * counts list elements.
  */
-struct AggregateSlot {
-  bool is_avg            = false;
-  bool is_count_distinct = false;  ///< True if this is a COUNT(DISTINCT col) aggregate
-  size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
-                    ///< COUNT_VALID.
-  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
-                                                      ///< (FLOAT64 or DECIMAL).
-};
+using AggregateSlot = std::variant<plain_slot, avg_slot, count_distinct_slot, first_slot>;
 
 /**
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
@@ -101,6 +120,8 @@ struct CudfAggregateDefinitions {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
+  /// True if any aggregate is FIRST. Presence only; each FIRST is a column of the carried block.
+  bool has_first = false;
 };
 
 /**
@@ -119,6 +140,14 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Child column read by each FIRST slot, indexed by its `carried_idx`
+ *
+ * @param aggregate_slots One entry per aggregate expression
+ * @return The columns a grouped aggregate carries after its partials, in carried-block order
+ */
+std::vector<int> carried_inputs(std::vector<AggregateSlot> const& aggregate_slots);
 
 }  // namespace op
 }  // namespace sirius

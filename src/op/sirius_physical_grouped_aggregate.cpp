@@ -22,6 +22,8 @@
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <variant>
+
 namespace sirius {
 namespace op {
 
@@ -69,20 +71,22 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  has_first                         = cudf_defs.has_first;
 }
 
 duckdb::vector<sirius::logical_type>
 sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 {
   auto const aggregate_offset = group_idx.size();
-  if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
+  if (!has_count_distinct || has_avg || has_first ||
+      types.size() != aggregate_offset + aggregate_slots.size()) {
     throw std::runtime_error(
-      "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
+      "COUNT(DISTINCT) local schema requires a non-AVG, non-FIRST one-slot-per-aggregate layout");
   }
 
   auto local_types = types;
   for (size_t slot_idx = 0; slot_idx < aggregate_slots.size(); ++slot_idx) {
-    if (aggregate_slots[slot_idx].is_count_distinct) {
+    if (std::holds_alternative<count_distinct_slot>(aggregate_slots[slot_idx])) {
       local_types[aggregate_offset + slot_idx] = sirius::logical_type::make(sirius::type_id::LIST);
     }
   }
@@ -96,6 +100,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  auto const carried = carried_inputs(aggregate_slots);
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
@@ -104,6 +109,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
                                                               cudf_aggregate_struct_col_indices,
+                                                              carried,
                                                               stream,
                                                               *space,
                                                               batch_telemetry());

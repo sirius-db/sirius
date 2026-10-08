@@ -667,16 +667,20 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
   for (auto& type : types) {
-    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+    type = sirius_physical_plan_generator::planned_aggregate_type(type);
   }
   for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
-    }
+    expr->return_type = sirius_physical_plan_generator::planned_aggregate_type(expr->return_type);
   }
 }
 
 }  // namespace
+
+duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
+  duckdb::LogicalType const& type)
+{
+  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
@@ -719,6 +723,32 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
         (aggregate.children.size() != 1 || aggregate.children[0]->return_type.IsNested())) {
       throw duckdb::NotImplementedException(
         "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
+  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY. Any FIRST, grouped or not,
+  // refuses its own FILTER or ORDER BY; a grouped FIRST also refuses a FILTER beside it.
+  auto const aggregate_id_of = [](duckdb::unique_ptr<duckdb::Expression> const& expression) {
+    return sirius::from_duckdb_aggregate_name(
+      expression->Cast<duckdb::BoundAggregateExpression>().function.name);
+  };
+  bool const has_grouped_first =
+    !op.groups.empty() && std::ranges::any_of(op.expressions, [&](auto const& expression) {
+      return aggregate_id_of(expression) == sirius::aggregate_id::first;
+    });
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if ((aggregate.filter || aggregate.order_bys) &&
+        aggregate_id_of(expression) == sirius::aggregate_id::first) {
+      throw duckdb::NotImplementedException(
+        "first() with a FILTER or ORDER BY clause is not supported on the GPU (falling back to "
+        "CPU): " +
+        aggregate.ToString());
+    }
+    if (has_grouped_first && aggregate.filter) {
+      throw duckdb::NotImplementedException(
+        "FILTER beside first() is not supported on the GPU (falling back to CPU): " +
+        aggregate.ToString());
     }
   }
 

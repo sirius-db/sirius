@@ -59,6 +59,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<AggregateSlot> aggregate_slots,
     bool has_avg,
     bool has_count_distinct,
+    bool has_first,
     std::size_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
@@ -104,6 +105,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
   std::size_t current_partition_index = 0;
 
@@ -113,6 +115,13 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     std::vector<int> indices(group_idx.size());
     std::iota(indices.begin(), indices.end(), 0);
     return indices;
+  }
+
+  //! Whether the partial layout [keys..., partials..., carried...] is already the declared output.
+  //! An all-FIRST list qualifies because the converter numbers its carried block in slot order.
+  [[nodiscard]] bool partials_are_output() const noexcept
+  {
+    return !has_avg && !has_count_distinct && (!has_first || cudf_aggregates.empty());
   }
 
   // Source interface

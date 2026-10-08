@@ -463,6 +463,8 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       auto const& aggregate = op.Cast<sirius::op::sirius_physical_grouped_aggregate>();
       if (aggregate.grouping_sets.size() > 1) { break; }
       if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      // FIRST copies its carried columns out of the chosen row rather than aggregating them.
+      if (aggregate.has_first) { break; }
       if (op.types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {
         break;
       }

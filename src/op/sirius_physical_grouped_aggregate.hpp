@@ -85,6 +85,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
  public:
   std::vector<int> get_output_grouping_indices() const

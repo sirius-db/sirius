@@ -18,6 +18,7 @@
 
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -173,6 +174,8 @@ struct group_by_shape {
   /// Parallel to aggregate_idx: what each aggregate DOES with its input. A
   /// COUNT needs the row, not the value.
   std::vector<cudf::aggregation::Kind> const* aggregate_kinds = nullptr;
+  /// Local group-by only: the inputs its FIRST slots gather.
+  std::vector<int> carried;
 };
 
 std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node)
@@ -181,7 +184,8 @@ std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node
     return group_by_shape{&agg->group_idx,
                           &agg->cudf_aggregate_idx,
                           &agg->cudf_aggregate_struct_col_indices,
-                          &agg->cudf_aggregates};
+                          &agg->cudf_aggregates,
+                          op::carried_inputs(agg->aggregate_slots)};
   }
   if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
     return group_by_shape{&merge->group_idx,
@@ -351,13 +355,18 @@ step trace_through(sirius_physical_operator const& node,
           }
         }
       }
+      // A FIRST reads its carried input for the value, even when it is also a key or counted.
+      if (std::find(shape->carried.begin(), shape->carried.end(), in) != shape->carried.end()) {
+        aggregate_input = true;
+        counted_only    = false;
+      }
 
       // A group key lands at its index in group_idx: the output is
       // groups-then-aggregates, so group key k is output column k.
       auto const key = std::find(shape->group_idx->begin(), shape->group_idx->end(), in);
       if (key == shape->group_idx->end()) {
         // Not a key: read if an aggregate consumes it, and either way the
-        // aggregate's output carries no such column, so the ride ends here.
+        // ride ends here; a FIRST's carried column is treated as read.
         // A read that only COUNTS says so — the values are not needed, which is
         // what count-on-deferred trades on.
         if (counted_only) { return step::counts(); }
