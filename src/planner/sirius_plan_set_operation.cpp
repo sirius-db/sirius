@@ -308,9 +308,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> append_copy_count(
     std::move(tag_sums), std::move(count_types), std::move(count_list), estimated_cardinality);
 }
 
-//! Lowers an ALL form over its planned inputs, as Spark does: tag each input's rows, UNION ALL,
-//! sum the tags per group of every column, turn the sums into copies, and repeat each group's
-//! row that many times.
+//! Lowers an ALL form by counting, as Spark does: a distinct row seen `m` times in arm 0 and `n` in
+//! arm 1 is emitted `max(m - n, 0)` or `min(m, n)` times. Data flow: tagged arms -> UNION ALL ->
+//! GROUP BY every column, SUM each tag (the counts) -> copy-count projection -> REPLICATE.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_set_operation_all(
   duckdb::LogicalOperatorType op_type,
   std::array<duckdb::unique_ptr<sirius::op::sirius_physical_operator>, 2> arms,
