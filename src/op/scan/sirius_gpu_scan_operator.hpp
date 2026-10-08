@@ -50,6 +50,7 @@ class SiriusContext;
 }  // namespace duckdb
 
 namespace sirius::op::scan {
+class scan_operator_input;
 
 //===----------------------------------------------------------------------===//
 // sirius_gpu_scan_operator
@@ -177,6 +178,21 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
     return _read_views;
   }
 
+  void set_query_validation(uint64_t token, std::optional<key_held_witness> key)
+  {
+    _query_token  = token;
+    _expected_key = std::move(key);
+  }
+  [[nodiscard]] uint64_t query_token() const noexcept { return _query_token; }
+  [[nodiscard]] duckdb::SiriusContext* certificate_observer() const noexcept
+  {
+    return _compressed_materialization_observer;
+  }
+  // @p admit_resident performs the full resident witness check. The dequeue boundary uses it
+  // before prepare_for_processing; execute only rechecks the query/contract freshness because the
+  // immutable resident witness was already admitted for this input.
+  void validate_input(scan_operator_input const& input, bool admit_resident) const;
+
   scan_manager::split_connector& get_split_connector();
 
   /// Shared handle to the connector, for components (e.g. the memory
@@ -188,6 +204,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   }
 
  private:
+  uint64_t _query_token = 0;
+  std::optional<key_held_witness> _expected_key;
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<transparent::read_view_registry> _read_views;
   scan_contract_id _contract_id = 0;
