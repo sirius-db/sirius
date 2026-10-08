@@ -18,7 +18,6 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
-#include "duckdb/common/exception.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
@@ -73,14 +72,6 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
   has_first                         = cudf_defs.has_first;
-  // One carried row per key answers one grouping set, and a grouping function adds a column no
-  // slot computes.
-  if (has_first && (grouping_sets.size() > 1 ||
-                    this->types.size() != group_idx.size() + aggregate_slots.size())) {
-    throw duckdb::NotImplementedException(
-      "grouped FIRST is not supported over several grouping sets or beside a grouping function "
-      "(falling back to CPU)");
-  }
 }
 
 duckdb::vector<sirius::logical_type>
