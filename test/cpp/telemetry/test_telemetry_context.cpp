@@ -313,7 +313,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups",
   REQUIRE(any_line_with_all(lines, {"shared-thread-group", worker_id}));
   // Threads and queues point at their declared GPU resources.
   REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", gpu0_exec_id}));
-  REQUIRE(any_line_with_all(lines, {"gpu-0-exec-manager", gpu0_id}));
+  REQUIRE(any_line_with_all(lines, {"gpu-0-exec-manager", gpu0_mgr_id}));
   REQUIRE(any_line_with_all(lines, {"gpu_pipeline-task-queue", gpu0_id}));
 
   std::filesystem::remove_all(out_dir);

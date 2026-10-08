@@ -13,16 +13,16 @@ clap = { version = "4", features = ["derive", "env"] }
 sirius-telemetry-instrumentation = { package = "instrumentation-model", path = "../model", features = ["collector"] }
 sirius-telemetry-analyzer = { path = "../analyzer" }
 sirius-telemetry-store = { path = "../store" }
-nvtx-server = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-query-engine-server = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+nvtx-server = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-analyzer = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-io = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-query-engine-analyzer = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-query-engine-server = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-store = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 tracing = "0.1"
 
 [build-dependencies]
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "6e50ed6063d13dd72f2cc62043a1a1166bf67ef2" }
+quent-query-engine-ui = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
+quent-ui = { git = "https://github.com/dhruv9vats/quent.git", rev = "7d0aabd70478c0d1ccc17bf95bfae6f777ef5591" }
 ts-rs = { version = "12", features = ["uuid-impl", "serde-json-impl"] }

@@ -887,7 +887,10 @@ fn generated_ndjson_imports_into_analyzer() {
         filesystem::{self, Format},
     };
     use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
-    use quent_store::event::{ModelEventStore, filesystem::Store};
+    use quent_store::{
+        context::ContextSet,
+        event::{CombinedEventLoader, filesystem::Loader},
+    };
     use sirius_telemetry_instrumentation as instrumentation;
 
     let output = tempfile::tempdir().unwrap();
@@ -931,8 +934,8 @@ fn generated_ndjson_imports_into_analyzer() {
         (context_id, engine_id, query_id)
     };
 
-    let stored = Store::<s::Sirius>::new(output.path())
-        .events(context_id)
+    let stored = Loader::<s::Sirius>::new(output.path(), ContextSet::one(context_id))
+        .combined_events()
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -967,6 +970,16 @@ fn generated_ndjson_imports_into_analyzer() {
     let worker_dir = output.path().join(worker_context_id.to_string());
     let inventory = crate::Viewer::context_inventory(&worker_dir).unwrap();
     assert!(inventory.analysis_target_ids.contains(&engine_id));
+    // Keep imports within the selected context when the root contains others.
+    assert_eq!(
+        crate::Viewer::import_events(&worker_dir).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        crate::Viewer::import_events(&context_dir).unwrap().count(),
+        9
+    );
+
     let engine_events = crate::Viewer::import_events(&context_dir).unwrap();
     let worker_events = crate::Viewer::import_events(&worker_dir).unwrap();
     let combined =

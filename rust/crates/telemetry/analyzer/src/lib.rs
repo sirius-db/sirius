@@ -12,6 +12,11 @@ use quent_query_engine_analyzer::{
 use quent_query_engine_ui::{
     DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use quent_store::{
+    context::ContextSet,
+    event::{CombinedEventLoader, EventLoader, filesystem::Loader},
+};
 use quent_ui::{
     FiniteStateMachine, Resource as UiResource, ResourceGroup as UiResourceGroup,
     ResourceGroupNode, ResourceTree, convert_resource_tree,
@@ -59,7 +64,6 @@ use quent_analyzer::{
     },
 };
 #[cfg(not(target_arch = "wasm32"))]
-use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
@@ -369,15 +373,14 @@ impl QuentViewer for Viewer {
 
     fn context_inventory(dir: &std::path::Path) -> quent_io::ImporterResult<ContextInventory> {
         let (context_id, root) = context_location(dir)?;
-        let store = Store::<Sirius>::new(root);
-        let engine_ids = store
-            .entity_events::<schema::Engine>(context_id)
+        // Load only this context; neighboring contexts may belong to other runs.
+        let loader = Loader::<Sirius>::new(root, ContextSet::one(context_id));
+        let engine_ids = EventLoader::<schema::Engine>::events(&loader)
             .map_err(quent_io::ImporterError::other)?
             .map(|event| event.map(|event| event.id))
             .collect::<Result<HashSet<_>, _>>()
             .map_err(quent_io::ImporterError::other)?;
-        let worker_analysis_target_ids = store
-            .entity_events::<schema::Worker>(context_id)
+        let worker_analysis_target_ids = EventLoader::<schema::Worker>::events(&loader)
             .map_err(quent_io::ImporterError::other)?
             .filter_map(|event| match event {
                 Ok(Event {
@@ -405,8 +408,8 @@ impl QuentViewer for Viewer {
         dir: &std::path::Path,
     ) -> quent_io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
         let (context_id, root) = context_location(dir)?;
-        let events = Store::<Sirius>::new(root)
-            .events(context_id)
+        let events = Loader::<Sirius>::new(root, ContextSet::one(context_id))
+            .combined_events()
             .map_err(quent_io::ImporterError::other)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(quent_io::ImporterError::other)?;

@@ -9,7 +9,10 @@ use quent_query_engine_analyzer::ui::QuentViewer;
 use quent_query_engine_server::{
     analyzer_service_router_with_routes, collector_service, initialize_tracing,
 };
-use quent_store::event::{ModelEventStore, filesystem::Store};
+use quent_store::{
+    context::ContextSet,
+    event::{CombinedEventLoader, filesystem::Loader},
+};
 use sirius_telemetry_analyzer::{SiriusUiAnalyzer, Viewer};
 use sirius_telemetry_instrumentation as instrumentation;
 use sirius_telemetry_store::Sirius;
@@ -111,8 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // subdirectories; the analyzer cache chains this across all the contexts that
     // make up an engine instance.
     let importer = move |context_id| {
-        let events = Store::<Sirius>::new(&importer_output_dir)
-            .events(context_id)
+        let events = Loader::<Sirius>::new(&importer_output_dir, ContextSet::one(context_id))
+            .combined_events()
             .map_err(quent_io::ImporterError::other)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(quent_io::ImporterError::other)?;

@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             postcard: true,
             ..Default::default()
         },
+        nvtx: quent_schema_codegen_cpp::NvtxSupport::Enabled,
         ..Default::default()
     };
     let files = quent_schema_codegen_cpp::emit(&schema, &options)?;

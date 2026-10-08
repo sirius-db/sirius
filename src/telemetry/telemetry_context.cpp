@@ -41,9 +41,18 @@ quent::Context make_quent_context(const sirius::telemetry_config& config)
   detail::configure_nvtx_injection(config.enable_quent && config.enable_nvtx,
                                    config.nvtx_injection_lib);
   if (not config.enable_quent) { return quent::Context::none(); }
-  if (config.exporter == "ndjson") { return quent::Context::ndjson(config.output_directory); }
-  if (config.exporter == "msgpack") { return quent::Context::msgpack(config.output_directory); }
-  if (config.exporter == "postcard") { return quent::Context::postcard(config.output_directory); }
+
+  const auto capture =
+    config.enable_nvtx ? quent::NvtxCapture::Enabled : quent::NvtxCapture::Disabled;
+  if (config.exporter == "ndjson") {
+    return quent::Context::ndjson(config.output_directory, capture);
+  }
+  if (config.exporter == "msgpack") {
+    return quent::Context::msgpack(config.output_directory, capture);
+  }
+  if (config.exporter == "postcard") {
+    return quent::Context::postcard(config.output_directory, capture);
+  }
   throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
 }
 
