@@ -88,8 +88,11 @@ Wraps RMM device memory resource. On each allocation:
 
 ### Caller reservations for HOST conversions
 
-HOST conversions use caller-owned reservations. Materialized result transfer fails its query
-when HOST capacity cannot be reserved; it does not allocate unaccounted memory. Batch preparation
+HOST conversions use caller-owned reservations. Materialized result transfer retries a transient
+HOST reservation miss on the current batch before appending its rows. Earlier batches are not
+replayed. The wait holds no collector mutex, checks query interruption/retirement and runtime
+health, and uses the configurable memory reservation retry budget. It retains the executing
+worker and input batch while waiting; exhausting the budget fails only its query. Batch preparation
 and spill paths retain their conversion/viability protocols. Reservations belong to the work
 using them, while query work leases protect the underlying repositories and plans.
 
@@ -128,9 +131,14 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 **Monitor spill sizing:** crossing the *trigger* threshold starts a monitor-issued request sized to reach the *stop* threshold. The request also observes live pressure and stops once usage reaches that threshold, preserving the trigger→stop hysteresis band.
 
 **Pipeline integration:** The GPU manager never blocks on reservation or downgrade futures.
-It keeps at most one reclamation request outstanding per GPU, polls completion and reschedules
-waiting tasks with short retry deadlines. A reservation with no progress for 30 seconds fails
-its query. Spill candidates borrow their actual victim query until conversion settles. Query
+It keeps at most one reclamation request outstanding per GPU and requests only the shortfall
+between the reservation size and current reservation headroom. Requests recheck headroom before
+dispatching more spills, so concurrent releases can satisfy them. Waiting tasks return to the
+scheduler with backoff growing from 5 to 50 ms. The configurable
+`sirius.memory_reservation_timeout_ms` retry budget (default 30000) counts that requested backoff,
+excluding additional scheduler delay, and resets on observed memory availability increases or
+successful task execution on the device. Exhaustion fails only the waiting query.
+Spill candidates borrow their actual victim query until conversion settles. Query
 retirement does not cancel other queries' or monitor-owned reclamation requests.
 
 ### Spill Copy Granularity

@@ -54,7 +54,8 @@ task_scheduler::task_scheduler(
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
-  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors,
+  std::chrono::milliseconds memory_reservation_timeout)
   // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
   // belongs to; see pipeline::index_keys_for.
   : _task_queue(&index_keys_for),
@@ -106,7 +107,8 @@ task_scheduler::task_scheduler(
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
                                               dg_exec,
-                                              _telemetry_context));
+                                              _telemetry_context,
+                                              memory_reservation_timeout));
   }
 }
 

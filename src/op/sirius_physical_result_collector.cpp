@@ -19,6 +19,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
+#include <memory/reservation_wait.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
@@ -42,6 +43,7 @@
 // standard library
 #include <algorithm>
 #include <cassert>
+#include <thread>
 
 namespace sirius {
 namespace op {
@@ -153,17 +155,41 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
           "[GPUPhysicalMaterializedCollector] No HOST memory space available for result "
           "collection");
       }
-      // Reserve atomically, trying each host space. A sampled free-byte count is not an
-      // allocation guarantee when another query can reserve concurrently.
+      // Retry this batch before appending any of its rows. Earlier batches remain committed;
+      // replaying the whole sink on a transient miss would duplicate those rows. No collector
+      // mutex is held while waiting, so other collectors can finish and release HOST buffers.
       std::unique_ptr<cucascade::memory::reservation> host_reservation;
-      for (auto const* candidate : host_spaces) {
-        host_reservation =
-          const_cast<cucascade::memory::memory_space*>(candidate)->make_reservation_or_null(
-            data->get_size_in_bytes());
+      memory::reservation_wait wait;
+      while (!host_reservation) {
+        auto pipe = get_pipeline();
+        if (_client_ctx.IsInterrupted() ||
+            (pipe &&
+             !sirius_ctx->get_query_lifecycle_registry().accepts_work(pipe->get_query_id()))) {
+          throw duckdb::InterruptException();
+        }
+        if (sirius_ctx->get_runtime_health() != duckdb::SiriusContext::runtime_health::OK) {
+          throw std::runtime_error("Result collection stopped: Sirius runtime unavailable");
+        }
+        size_t available = 0;
+        for (auto const* candidate : host_spaces) {
+          host_reservation =
+            const_cast<cucascade::memory::memory_space*>(candidate)->make_reservation_or_null(
+              data->get_size_in_bytes());
+          if (host_reservation) { break; }
+          available = std::max(available, candidate->get_available_memory());
+        }
         if (host_reservation) { break; }
-      }
-      if (!host_reservation) {
-        throw std::runtime_error("Result collection cannot reserve HOST memory");
+        if (!wait.waiting()) {
+          SIRIUS_LOG_DEBUG("Result collection waiting for HOST reservation of {} bytes",
+                           data->get_size_in_bytes());
+        }
+        auto timeout = sirius_ctx->get_config().memory_reservation_timeout();
+        if (!wait.retry(memory::reservation_wait::clock::now(), available, 0, timeout)) {
+          throw std::runtime_error(
+            "Result collection exhausted its HOST memory-wait retry budget (" +
+            std::to_string(timeout.count()) + " ms without observed progress)");
+        }
+        std::this_thread::sleep_until(wait.retry_at());
       }
       auto& registry     = sirius::converter_registry::get();
       auto next_batch_id = sirius::get_next_batch_id();
