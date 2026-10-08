@@ -72,10 +72,16 @@ class scan_byte_ranges_state : public duckdb::ClientContextState {
 /**
  * @brief Extracts `path -> byte ranges` from every LocalFiles read in a Substrait plan.
  *
- * Only items carrying a real range (`start`/`length` not both zero) are returned; a whole-file
- * item contributes nothing. The relation walk is exhaustive over the rel types this engine can
- * receive and THROWS on an unknown one: skipping it could hide a ranged read, and a hidden
- * ranged read silently duplicates rows.
+ * Only items carrying a real range (`start`/`length` not both zero) are returned. Every ReadRel
+ * is found by a protobuf reflection walk, so no rel type can hide one and a plan without ranges
+ * is never refused for its shape.
+ *
+ * @throws sirius::invalid_input_exception when a ranged path cannot be attributed safely:
+ *         - it is read by more than one ReadRel (whole-file reads count), since ranges are
+ *           claimed per path after binding and the optimizer may drop or merge reads;
+ *         - one read names it both whole (`(0,0)`) and by range;
+ *         - it has a non-`file` URI scheme;
+ *         - a range's `start + length` overflows, or a ranged item is not a `uri_file`.
  */
 [[nodiscard]] std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
   const std::string& plan_bytes);

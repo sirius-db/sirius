@@ -19,6 +19,14 @@
 #include "sirius/exception.hpp"
 #include "substrait/plan.pb.h"
 
+#include <google/protobuf/message.h>
+
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <string>
+#include <vector>
+
 namespace sirius::planner {
 
 namespace {
@@ -76,55 +84,67 @@ void scan_byte_ranges_state::assert_all_consumed() const
 
 namespace {
 
-void collect_from_rel(const substrait::Rel& rel,
-                      std::map<std::string, std::vector<scan_byte_range>>& out);
+/// A non-`file` URI scheme (`s3://`, `gs://`, `hdfs://`, ...). Byte ranges are only defined for
+/// local parquet files; remote reads have their own footer and prefetch lifecycle.
+// The protobuf bundled with the Substrait reader lives under duckdb::.
+namespace pb = duckdb::google::protobuf;
 
-void collect_from_read(const substrait::ReadRel& read,
-                       std::map<std::string, std::vector<scan_byte_range>>& out)
+bool has_remote_scheme(const std::string& canonical_path)
 {
-  if (!read.has_local_files()) { return; }
-  for (const auto& item : read.local_files().items()) {
-    if (item.start() == 0 && item.length() == 0) { continue; }  // whole file
-    if (!item.has_uri_file()) {
-      throw sirius::invalid_input_exception(
-        "a byte-ranged LocalFiles item uses a path type other than uri_file; its range "
-        "cannot be attributed to a file");
-    }
-    out[canonical_scan_path(item.uri_file())].emplace_back(item.start(), item.length());
-  }
+  return canonical_path.find("://") != std::string::npos;
 }
 
-void collect_from_rel(const substrait::Rel& rel,
-                      std::map<std::string, std::vector<scan_byte_range>>& out)
+/// What one ReadRel says about one file: read whole, and/or these ranges.
+struct read_items {
+  bool whole = false;
+  std::vector<scan_byte_range> ranges;
+};
+
+/// Every ReadRel's LocalFiles items, grouped per canonical path. Visited by protobuf reflection,
+/// so a read nested under any rel type (or inside an expression) is seen without an exhaustive
+/// rel-type switch, and a plan with no ranges is never refused for its shape.
+void visit_reads(const pb::Message& message, std::vector<std::map<std::string, read_items>>& reads)
 {
-  switch (rel.rel_type_case()) {
-    case substrait::Rel::kRead: collect_from_read(rel.read(), out); return;
-    case substrait::Rel::kFilter: collect_from_rel(rel.filter().input(), out); return;
-    case substrait::Rel::kFetch: collect_from_rel(rel.fetch().input(), out); return;
-    case substrait::Rel::kAggregate: collect_from_rel(rel.aggregate().input(), out); return;
-    case substrait::Rel::kSort: collect_from_rel(rel.sort().input(), out); return;
-    case substrait::Rel::kProject: collect_from_rel(rel.project().input(), out); return;
-    case substrait::Rel::kJoin:
-      collect_from_rel(rel.join().left(), out);
-      collect_from_rel(rel.join().right(), out);
-      return;
-    case substrait::Rel::kCross:
-      collect_from_rel(rel.cross().left(), out);
-      collect_from_rel(rel.cross().right(), out);
-      return;
-    case substrait::Rel::kSet:
-      for (const auto& input : rel.set().inputs()) {
-        collect_from_rel(input, out);
+  if (auto const* read = dynamic_cast<const substrait::ReadRel*>(&message);
+      read != nullptr && read->has_local_files()) {
+    auto& files = reads.emplace_back();
+    for (const auto& item : read->local_files().items()) {
+      bool const ranged = item.start() != 0 || item.length() != 0;
+      if (!item.has_uri_file()) {
+        if (ranged) {
+          throw sirius::invalid_input_exception(
+            "a byte-ranged LocalFiles item uses a path type other than uri_file; its range "
+            "cannot be attributed to a file");
+        }
+        continue;  // a whole-directory/glob read; its files cannot be named here
       }
-      return;
-    case substrait::Rel::REL_TYPE_NOT_SET: return;
-    default:
-      // Skipping an unknown rel could hide a ranged read inside it, and a hidden ranged
-      // read degrades to a whole-file scan that duplicates rows across splits.
-      throw sirius::invalid_input_exception(
-        "byte-range extraction does not know Substrait rel type {}; refusing to guess "
-        "whether it hides a ranged read",
-        static_cast<int>(rel.rel_type_case()));
+      auto& entry = files[canonical_scan_path(item.uri_file())];
+      if (!ranged) {
+        entry.whole = true;
+        continue;
+      }
+      if (item.length() > std::numeric_limits<std::uint64_t>::max() - item.start()) {
+        throw sirius::invalid_input_exception(
+          "byte range ({}, {}) of '{}' overflows a 64-bit offset",
+          item.start(),
+          item.length(),
+          item.uri_file());
+      }
+      entry.ranges.emplace_back(item.start(), item.length());
+    }
+  }
+  auto const* reflection = message.GetReflection();
+  std::vector<const pb::FieldDescriptor*> fields;
+  reflection->ListFields(message, &fields);
+  for (auto const* field : fields) {
+    if (field->cpp_type() != pb::FieldDescriptor::CPPTYPE_MESSAGE) { continue; }
+    if (field->is_repeated()) {
+      for (int i = 0; i < reflection->FieldSize(message, field); ++i) {
+        visit_reads(reflection->GetRepeatedMessage(message, field, i), reads);
+      }
+    } else {
+      visit_reads(reflection->GetMessage(message, field), reads);
+    }
   }
 }
 
@@ -138,12 +158,40 @@ std::map<std::string, std::vector<scan_byte_range>> extract_scan_byte_ranges(
     throw sirius::invalid_input_exception(
       "failed to parse the Substrait plan while extracting scan byte ranges");
   }
+  std::vector<std::map<std::string, read_items>> reads;
+  visit_reads(plan, reads);
+
+  // Ranges are claimed per path after DuckDB binds the plan, so a path's ranges can be
+  // attributed to its read only when exactly one ReadRel names that path. With two, the
+  // optimizer may drop one read (its ranges then land on the other) or merge both into one
+  // shared subplan (one claim, rows returned twice).
+  std::map<std::string, std::size_t> reads_per_path;
+  for (const auto& files : reads) {
+    for (const auto& [path, items] : files) {
+      ++reads_per_path[path];
+    }
+  }
   std::map<std::string, std::vector<scan_byte_range>> out;
-  for (const auto& plan_rel : plan.relations()) {
-    if (plan_rel.has_root() && plan_rel.root().has_input()) {
-      collect_from_rel(plan_rel.root().input(), out);
-    } else if (plan_rel.has_rel()) {
-      collect_from_rel(plan_rel.rel(), out);
+  for (const auto& files : reads) {
+    for (const auto& [path, items] : files) {
+      if (items.ranges.empty()) { continue; }
+      if (has_remote_scheme(path)) {
+        throw sirius::invalid_input_exception(
+          "byte-range splits are only supported on local parquet files, not '{}'", path);
+      }
+      if (items.whole) {
+        throw sirius::invalid_input_exception(
+          "a read names '{}' both whole and by byte range; one scan cannot read a file both ways",
+          path);
+      }
+      if (reads_per_path[path] > 1) {
+        throw sirius::invalid_input_exception(
+          "'{}' is read by byte range in a plan that reads it {} times; the ranges cannot be "
+          "attributed to one read",
+          path,
+          reads_per_path[path]);
+      }
+      out[path] = items.ranges;
     }
   }
   return out;
