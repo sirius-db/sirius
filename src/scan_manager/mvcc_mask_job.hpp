@@ -59,8 +59,10 @@ namespace sirius::scan_manager {
  * slot — the join still fires and the completed-count check turns the drop
  * into a loud error instead of a deadlock. Task exceptions are captured (the
  * dispatcher swallows them) and the FIRST one is rethrown after the join.
+ * If submission throws, no further tasks are submitted; already accepted tasks
+ * are joined before rethrowing that submission error, preserving borrowed worksets.
  *
- * @throws whatever the first failing task threw; std::runtime_error when
+ * @throws the submission error, if any, otherwise the first task error; std::runtime_error when
  *         fewer than tasks.size() tasks ran (dispatcher stopped mid-fan-out).
  */
 void fan_out_and_join(exec::scoped_dispatcher& dispatcher,

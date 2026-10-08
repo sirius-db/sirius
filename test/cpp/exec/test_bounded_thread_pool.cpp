@@ -16,6 +16,9 @@
 
 #include "catch.hpp"
 #include "exec/bounded_thread_pool.hpp"
+#include "query_id.hpp"
+
+#include <absl/cleanup/cleanup.h>
 
 #include <atomic>
 #include <chrono>
@@ -344,4 +347,120 @@ TEST_CASE("bounded_thread_pool concurrent producers all tasks execute", "[bounde
 
   pool.wait_all();
   REQUIRE(counter.load() == num_threads * tasks_each);
+}
+
+//===----------------------------------------------------------------------===//
+// Per-query accounting: wait_for_query / drain_and_wait
+//===----------------------------------------------------------------------===//
+
+namespace {
+//! Releases a blocking task on every exit path, so a failed REQUIRE cannot leave a worker spinning
+//! and hang the pool destructor's join().
+struct release_on_exit {
+  std::atomic<bool>& flag;
+  ~release_on_exit() { flag.store(true, std::memory_order_release); }
+};
+}  // namespace
+
+TEST_CASE("wait_for_query runs the query's work and ignores other queries",
+          "[bounded_thread_pool][concurrency]")
+{
+  bounded_thread_pool pool(4, "test");
+  const auto qa = sirius::make_query_id(1);
+  const auto qb = sirius::make_query_id(2);
+
+  std::atomic<bool> release_b{false};
+  release_on_exit guard{release_b};
+  std::atomic<int> a_done{0};
+
+  // B blocks until told otherwise. If wait_for_query(A) waited on the whole pool it would hang
+  // here -- tracking per query is exactly what makes it return.
+  {
+    auto sb = pool.reserve();
+    sb.attach(qb);
+    pool.dispatch(std::move(sb), [&] {
+      while (!release_b.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    auto sa = pool.reserve();
+    sa.attach(qa);
+    pool.dispatch(std::move(sa), [&] { a_done.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.wait_for_query(qa);
+  // RUN, not dropped: the success path must never discard work the query scheduled.
+  REQUIRE(a_done.load() == 3);
+  REQUIRE(pool.active_for_query(qa) == 0);
+  REQUIRE(pool.active_for_query(qb) == 1);  // B untouched
+
+  release_b.store(true, std::memory_order_release);
+  pool.wait_all();
+}
+
+TEST_CASE("an untagged reservation does not block a per-query wait",
+          "[bounded_thread_pool][concurrency]")
+{
+  // The load-bearing case. Every manager loop in Sirius reserves a slot and THEN blocks waiting
+  // for a task, so a slot with no query is permanently held whenever a manager is idle. wait_all()
+  // can never return in that state; the per-query waits must, or query teardown deadlocks -- which
+  // is exactly how removing the manager-quiesce bracket broke the suite.
+  bounded_thread_pool pool(4, "test");
+  const auto q = sirius::make_query_id(7);
+
+  auto parked = pool.reserve();  // untagged, held for the whole test
+  REQUIRE(parked.is_valid());
+
+  std::atomic<int> ran{0};
+  {
+    auto s = pool.reserve();
+    s.attach(q);
+    pool.dispatch(std::move(s), [&] { ran.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.wait_for_query(q);  // must not hang despite `parked` still being held
+  REQUIRE(ran.load() == 1);
+  REQUIRE(pool.active_for_query(q) == 0);
+}
+
+TEST_CASE("drain_and_wait discards the query's queued work", "[bounded_thread_pool][concurrency]")
+{
+  bounded_thread_pool pool(3, "test");
+  const auto qa = sirius::make_query_id(3);
+  const auto qb = sirius::make_query_id(4);
+
+  auto first  = pool.reserve();
+  auto second = pool.reserve();
+  auto other  = pool.reserve();
+  first.attach(qa);
+  second.attach(qa);
+  other.attach(qb);
+
+  // Stop idle workers after reserving: existing slots remain owned, and dispatching them
+  // now leaves real queued work with no race against worker execution. No extra pool API
+  // is needed to prove that cancellation actually discards tasks.
+  pool.stop();
+  std::atomic<int> ran{0};
+  pool.dispatch(std::move(first), [&] { ++ran; });
+  pool.dispatch(std::move(second), [&] { ++ran; });
+  pool.dispatch(std::move(other), [&] { ++ran; });
+  absl::Cleanup cleanup = [&] {
+    pool.drain_and_wait(qa);
+    pool.drain_and_wait(qb);
+  };
+  REQUIRE(pool.active_for_query(qa) == 2);
+  REQUIRE(pool.active_for_query(qb) == 1);
+
+  pool.drain_and_wait(qa);
+  REQUIRE(ran.load() == 0);
+  REQUIRE(pool.active_for_query(qa) == 0);
+  REQUIRE(pool.active_for_query(qb) == 1);  // The other query's queued task is still owned.
+
+  pool.drain_and_wait(qb);
+  REQUIRE(ran.load() == 0);
+  REQUIRE(pool.active_for_query(qb) == 0);
+  pool.wait_all();
 }
