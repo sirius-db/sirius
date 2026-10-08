@@ -232,6 +232,85 @@ void set_spill_compression_suppressed(bool suppressed) noexcept;
 /// Whether compression is currently suppressed by memory pressure.
 [[nodiscard]] bool spill_compression_suppressed() noexcept;
 
+// ── Extreme-pressure gate ────────────────────────────────────────────────────
+//
+// Compression is an optimization of a spill, never a condition for it. Beyond the
+// suppression latch above (set by a compression OOM, cleared by the monitor),
+// two signals say an encode would only compete with the query for memory that is
+// not there, so the spill should go out raw without trying:
+//
+//  - the compression arena is nearly full (>= kArenaSkipFraction of it allocated
+//    by in-flight encodes) -- the next encode would most likely OOM in it;
+//  - the device reported a *physical* allocation failure recently (within
+//    kPhysicalOomSkipWindow) -- cuCascade's accounting is no guide then, and the
+//    SF3000 q3/q13 failures were exactly this state.
+//
+// Neither latches: each spill re-evaluates them, so compression resumes as soon
+// as the arena drains or the device stops failing.
+
+/// Fraction of the arena in use at which spills stop trying to compress.
+inline constexpr double kArenaSkipFraction = 0.9;
+/// How long after a physical device OOM spills stop trying to compress.
+inline constexpr std::uint64_t kPhysicalOomSkipWindowMs = 1000;
+
+/// Record a physical device allocation failure (cudaErrorMemoryAllocation from
+/// the device pool, as opposed to a reservation limit). Called by the OOM policy.
+void note_physical_device_oom() noexcept;
+
+/// Forget any recorded physical OOM. For tests.
+void clear_physical_device_oom_for_testing() noexcept;
+
+/// Why a spill should skip compression right now because memory is critically
+/// short, or nullptr when it may try. Does not consult the enable/suppress flags.
+[[nodiscard]] const char* spill_compression_pressure_skip_reason() noexcept;
+
+/// Compress-side skips and fallbacks since process start. Every one of these is
+/// a batch that was still spilled/published -- uncompressed -- not a failure.
+struct compression_fallback_counters {
+  /// Spills that skipped compression up front: extreme memory pressure.
+  std::uint64_t spill_skipped_pressure = 0;
+  /// Compressed spills that were attempted and fell back to uncompressed
+  /// because the encode (or its plan resolution) threw.
+  std::uint64_t spill_fell_back = 0;
+  /// In-place device compressions (downgrade tier 0) that threw and were skipped.
+  std::uint64_t in_place_fell_back = 0;
+  /// Sink-time output compressions that threw; the batch was published raw.
+  std::uint64_t output_fell_back = 0;
+};
+
+enum class compression_fallback_kind { spill_skipped_pressure, spill_fell_back, in_place, output };
+
+void note_compression_fallback(compression_fallback_kind kind) noexcept;
+[[nodiscard]] compression_fallback_counters read_compression_fallback_counters() noexcept;
+
+namespace testing {
+
+/// Failures the compress path can be made to raise, for tests that check each
+/// one ends in an uncompressed spill.
+enum class encode_fault : int {
+  none,
+  out_of_memory,      ///< rmm::out_of_memory from the encode (e.g. arena exhausted)
+  runtime_error,      ///< std::runtime_error from the encode
+  non_std_exception,  ///< an exception not derived from std::exception
+  plan_failure,       ///< std::runtime_error while resolving the spill plan
+  decode_cuda_oom,    ///< cudf::cuda_error(cudaErrorMemoryAllocation) from a decode
+  decode_corrupt,     ///< std::runtime_error from a decode (a non-transient failure)
+};
+
+/// Arm @p kind for the next @p count fault sites of its type. Process-wide.
+void inject_encode_fault(encode_fault kind, std::uint32_t count) noexcept;
+
+/// Throw the armed encode fault, if any. Called where a column is encoded.
+void maybe_throw_encode_fault();
+
+/// Throw the armed plan fault, if any. Called where a spill plan is resolved.
+void maybe_throw_plan_fault();
+
+/// Throw the armed decode fault, if any. Called at the start of each decode converter.
+void maybe_throw_decode_fault();
+
+}  // namespace testing
+
 /// Build a spill_context for @p repo from the process-global settings.
 [[nodiscard]] spill_context make_spill_context(
   const cucascade::shared_data_repository* repo) noexcept;

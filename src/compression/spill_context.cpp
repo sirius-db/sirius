@@ -16,7 +16,16 @@
 
 #include "spill_context.hpp"
 
+#include "compression_device_pool.hpp"
+
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/error.hpp>
+
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <stdexcept>
 
 namespace sirius::compression {
 
@@ -72,6 +81,135 @@ void set_spill_compression_settings(bool enabled,
   g_encode_min_headroom_fraction.store(encode_min_headroom_fraction, std::memory_order_relaxed);
 }
 
+namespace {
+
+/// steady_clock milliseconds of the last physical device OOM; 0 = never.
+std::atomic<std::int64_t> g_last_physical_oom_ms{0};
+
+std::atomic<std::uint64_t> g_spill_skipped_pressure{0};
+std::atomic<std::uint64_t> g_spill_fell_back{0};
+std::atomic<std::uint64_t> g_in_place_fell_back{0};
+std::atomic<std::uint64_t> g_output_fell_back{0};
+
+std::int64_t now_ms() noexcept
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
+
+}  // namespace
+
+void note_physical_device_oom() noexcept
+{
+  // Never 0, which means "never happened".
+  g_last_physical_oom_ms.store(std::max<std::int64_t>(1, now_ms()), std::memory_order_relaxed);
+}
+
+void clear_physical_device_oom_for_testing() noexcept
+{
+  g_last_physical_oom_ms.store(0, std::memory_order_relaxed);
+}
+
+const char* spill_compression_pressure_skip_reason() noexcept
+{
+  if (compression_device_pool_enabled()) {
+    const auto arena = compression_device_pool_bytes();
+    if (arena > 0 && static_cast<double>(compression_device_pool_used_bytes()) >=
+                       kArenaSkipFraction * static_cast<double>(arena)) {
+      return "compression arena nearly full";
+    }
+  }
+  const auto last = g_last_physical_oom_ms.load(std::memory_order_relaxed);
+  if (last != 0 && now_ms() - last < static_cast<std::int64_t>(kPhysicalOomSkipWindowMs)) {
+    return "recent physical device OOM";
+  }
+  return nullptr;
+}
+
+void note_compression_fallback(compression_fallback_kind kind) noexcept
+{
+  switch (kind) {
+    case compression_fallback_kind::spill_skipped_pressure:
+      g_spill_skipped_pressure.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case compression_fallback_kind::spill_fell_back:
+      g_spill_fell_back.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case compression_fallback_kind::in_place:
+      g_in_place_fell_back.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case compression_fallback_kind::output:
+      g_output_fell_back.fetch_add(1, std::memory_order_relaxed);
+      break;
+  }
+}
+
+compression_fallback_counters read_compression_fallback_counters() noexcept
+{
+  return {g_spill_skipped_pressure.load(std::memory_order_relaxed),
+          g_spill_fell_back.load(std::memory_order_relaxed),
+          g_in_place_fell_back.load(std::memory_order_relaxed),
+          g_output_fell_back.load(std::memory_order_relaxed)};
+}
+
+namespace testing {
+
+namespace {
+std::atomic<int> g_fault_kind{0};
+std::atomic<std::uint32_t> g_fault_remaining{0};
+
+/// Consume one armed fault of @p kind; false when none is armed.
+bool take_fault(encode_fault kind) noexcept
+{
+  if (g_fault_kind.load(std::memory_order_relaxed) != static_cast<int>(kind)) { return false; }
+  auto remaining = g_fault_remaining.load(std::memory_order_relaxed);
+  while (remaining > 0) {
+    if (g_fault_remaining.compare_exchange_weak(
+          remaining, remaining - 1, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+void inject_encode_fault(encode_fault kind, std::uint32_t count) noexcept
+{
+  g_fault_remaining.store(0, std::memory_order_relaxed);
+  g_fault_kind.store(static_cast<int>(kind), std::memory_order_relaxed);
+  g_fault_remaining.store(kind == encode_fault::none ? 0 : count, std::memory_order_relaxed);
+}
+
+void maybe_throw_encode_fault()
+{
+  if (take_fault(encode_fault::out_of_memory)) {
+    throw rmm::out_of_memory("injected encode fault: out of memory");
+  }
+  if (take_fault(encode_fault::runtime_error)) {
+    throw std::runtime_error("injected encode fault: runtime error");
+  }
+  if (take_fault(encode_fault::non_std_exception)) { throw 42; }
+}
+
+void maybe_throw_plan_fault()
+{
+  if (take_fault(encode_fault::plan_failure)) { throw std::runtime_error("injected plan fault"); }
+}
+
+void maybe_throw_decode_fault()
+{
+  if (take_fault(encode_fault::decode_cuda_oom)) {
+    throw cudf::cuda_error("injected decode fault: cudaErrorMemoryAllocation",
+                           cudaErrorMemoryAllocation);
+  }
+  if (take_fault(encode_fault::decode_corrupt)) {
+    throw std::runtime_error("injected decode fault: corrupt payload");
+  }
+}
+
+}  // namespace testing
+
 bool spill_compression_enabled() noexcept
 {
   return g_spill_enabled.load(std::memory_order_relaxed) &&
@@ -91,19 +229,18 @@ bool spill_compression_suppressed() noexcept
 spill_context make_spill_context(const cucascade::shared_data_repository* repo) noexcept
 {
   return spill_context{
-    .repo                    = repo,
-    .explore_beam_width      = g_explore_beam_width.load(std::memory_order_relaxed),
-    .explore_max_bytes       = g_explore_max_bytes.load(std::memory_order_relaxed),
-    .max_compressed_fraction = g_max_compressed_fraction.load(std::memory_order_relaxed),
-    .replan_after_uses       = g_replan_after_uses.load(std::memory_order_relaxed),
-    .error_tolerance         = g_error_tolerance.load(std::memory_order_relaxed),
-    .replan_change_threshold = g_replan_change_threshold.load(std::memory_order_relaxed),
-    .explore_sample_rows     = g_explore_sample_rows.load(std::memory_order_relaxed),
-    .min_batch_bytes         = g_spill_min_batch_bytes.load(std::memory_order_relaxed),
-    .release_columns_early   = g_spill_release_columns_early.load(std::memory_order_relaxed),
-    .encode_reserve_fraction = g_encode_reserve_fraction.load(std::memory_order_relaxed),
-    .encode_min_headroom_fraction =
-      g_encode_min_headroom_fraction.load(std::memory_order_relaxed),
+    .repo                         = repo,
+    .explore_beam_width           = g_explore_beam_width.load(std::memory_order_relaxed),
+    .explore_max_bytes            = g_explore_max_bytes.load(std::memory_order_relaxed),
+    .max_compressed_fraction      = g_max_compressed_fraction.load(std::memory_order_relaxed),
+    .replan_after_uses            = g_replan_after_uses.load(std::memory_order_relaxed),
+    .error_tolerance              = g_error_tolerance.load(std::memory_order_relaxed),
+    .replan_change_threshold      = g_replan_change_threshold.load(std::memory_order_relaxed),
+    .explore_sample_rows          = g_explore_sample_rows.load(std::memory_order_relaxed),
+    .min_batch_bytes              = g_spill_min_batch_bytes.load(std::memory_order_relaxed),
+    .release_columns_early        = g_spill_release_columns_early.load(std::memory_order_relaxed),
+    .encode_reserve_fraction      = g_encode_reserve_fraction.load(std::memory_order_relaxed),
+    .encode_min_headroom_fraction = g_encode_min_headroom_fraction.load(std::memory_order_relaxed),
   };
 }
 

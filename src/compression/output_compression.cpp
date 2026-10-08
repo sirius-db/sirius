@@ -43,9 +43,8 @@ bool try_compress_output_batch(cucascade::data_batch& batch,
   // is indistinguishable from being switched off: enabling it on q3/q5 changed
   // nothing and the log said nothing about why. Each reason is now traceable.
   auto decline = [repo](const char* why) {
-    SIRIUS_LOG_DEBUG("[output_compression] skip for repo={}: {}",
-                     static_cast<const void*>(repo),
-                     why);
+    SIRIUS_LOG_DEBUG(
+      "[output_compression] skip for repo={}: {}", static_cast<const void*>(repo), why);
     return false;
   };
 
@@ -117,8 +116,14 @@ bool try_compress_output_batch(cucascade::data_batch& batch,
     // deliver, or an allocation failure — and it is never fatal: convert_to only
     // installs the new representation after the converter returns, so the batch
     // is untouched and publication proceeds uncompressed.
+    note_compression_fallback(compression_fallback_kind::output);
     SIRIUS_LOG_DEBUG(
       "[output_compression] declined for repo={} ({})", static_cast<const void*>(repo), e.what());
+    return false;
+  } catch (...) {
+    note_compression_fallback(compression_fallback_kind::output);
+    SIRIUS_LOG_DEBUG("[output_compression] declined for repo={} (non-standard exception)",
+                     static_cast<const void*>(repo));
     return false;
   }
 }
@@ -250,9 +255,18 @@ std::size_t compress_in_place_for_downgrade(cucascade::data_batch& batch,
       freed);
     return freed;
   } catch (const std::exception& e) {
+    // convert_to installs the compressed form only on success, so the batch is
+    // untouched and stays a spill candidate for the tiers below.
+    note_compression_fallback(compression_fallback_kind::in_place);
     SIRIUS_LOG_DEBUG("[output_compression] in-place downgrade declined for repo={} ({})",
                      static_cast<const void*>(repo),
                      e.what());
+    return 0;
+  } catch (...) {
+    note_compression_fallback(compression_fallback_kind::in_place);
+    SIRIUS_LOG_DEBUG(
+      "[output_compression] in-place downgrade declined for repo={} (non-standard exception)",
+      static_cast<const void*>(repo));
     return 0;
   }
 }

@@ -57,6 +57,7 @@
 #include <filesystem>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1780,5 +1781,180 @@ TEST_CASE("stream pool: a decode whose streams cannot be created is retryable",
     REQUIRE(gpu_col_sum(gpu) == expected_sum_of(n));
   }
 
+  reset_spill_state(false);
+}
+
+// ── Compression is optional; decompression is not ────────────────────────────
+
+namespace {
+
+using sirius::compression::testing::encode_fault;
+
+/// Disarm every injected fault and the pressure signals a case may have set.
+void clear_faults()
+{
+  sirius::compression::testing::inject_encode_fault(encode_fault::none, 0);
+  simpatico::inject_stream_create_failures_for_testing(0);
+  sirius::compression::clear_physical_device_oom_for_testing();
+  sirius::compression::set_spill_compression_suppressed(false);
+}
+
+}  // namespace
+
+TEST_CASE("optional compression: every kind of encode failure spills uncompressed",
+          "[compression][spill][optional_compression][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  auto& e            = env();
+  const auto kind    = GENERATE(encode_fault::out_of_memory,
+                             encode_fault::runtime_error,
+                             encode_fault::non_std_exception,
+                             encode_fault::plan_failure);
+  const bool to_disk = GENERATE(false, true);
+  if (to_disk && e.disk_space == nullptr) {
+    SUCCEED("No DISK space configured — skipping");
+    return;
+  }
+  CAPTURE(static_cast<int>(kind), to_disk);
+
+  reset_spill_state();
+  clear_faults();
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+  const auto before   = sirius::compression::read_compression_fallback_counters();
+
+  // Enough faults to sink the planned encode and its raw-carrier retry alike.
+  sirius::compression::testing::inject_encode_fault(kind, 100);
+  auto* target = to_disk ? e.disk_space : e.host_space;
+  sirius::convertible_data_batch w(batch, &repo_a());
+  std::optional<std::vector<std::size_t>> moved;
+  REQUIRE_NOTHROW(moved = w.convert({target}, e.stream(), *e.mgr, true));
+  clear_faults();
+
+  // The batch moved, uncompressed, and nothing threw.
+  REQUIRE(moved.has_value());
+  REQUIRE(get_tier(*batch) == target->get_tier());
+  REQUIRE_FALSE(is_compressed_host(*batch));
+  REQUIRE_FALSE(is_compressed_disk(*batch));
+  REQUIRE(sirius::compression::read_compression_fallback_counters().spill_fell_back ==
+          before.spill_fell_back + 1);
+
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  reset_spill_state(false);
+}
+
+TEST_CASE("optional compression: an encode whose streams cannot be created spills uncompressed",
+          "[compression][spill][optional_compression][stream_pool][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  auto& e = env();
+  reset_spill_state();
+  clear_faults();
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+
+  outcome result = outcome::other_exception;
+  on_fresh_thread([&] {
+    simpatico::inject_stream_create_failures_for_testing(100);
+    sirius::convertible_data_batch w(batch, &repo_a());
+    result = outcome_of([&] { (void)w.convert({e.host_space}, e.stream(), *e.mgr, true); });
+    simpatico::inject_stream_create_failures_for_testing(0);
+  });
+  clear_faults();
+
+  REQUIRE(result == outcome::ok);
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(is_compressed_host(*batch));
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
+  reset_spill_state(false);
+}
+
+TEST_CASE("optional compression: a recent physical OOM skips compression up front",
+          "[compression][spill][optional_compression][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  auto& e = env();
+  reset_spill_state();
+  clear_faults();
+  set_plan_1col(&repo_a(), kOneColDsl);
+  auto& reg = sirius::compression::plan_register::global();
+
+  const std::size_t n = 5000;
+  auto skipped        = make_int32_gpu_batch(n);
+  const auto before   = sirius::compression::read_compression_fallback_counters();
+
+  sirius::compression::note_physical_device_oom();
+  REQUIRE(sirius::compression::spill_compression_pressure_skip_reason() != nullptr);
+  spill_to(skipped, e.host_space, &repo_a());
+  REQUIRE_FALSE(is_compressed_host(*skipped));
+  REQUIRE(sirius::compression::read_compression_fallback_counters().spill_skipped_pressure ==
+          before.spill_skipped_pressure + 1);
+  // A skip is not a verdict about the edge: its plan survives untouched.
+  REQUIRE(reg.decide_spill_plan(&repo_a(), /*replan_after_uses=*/0).verdict !=
+          sirius::compression::plan_register::spill_plan_verdict::skip);
+  require_restores_to(skipped, &repo_a(), expected_sum_of(n));
+
+  // Nothing latches: once the signal clears, spills compress again.
+  sirius::compression::clear_physical_device_oom_for_testing();
+  REQUIRE(sirius::compression::spill_compression_pressure_skip_reason() == nullptr);
+  auto compressed = make_int32_gpu_batch(n);
+  spill_to(compressed, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*compressed));
+  require_restores_to(compressed, &repo_a(), expected_sum_of(n));
+
+  reset_spill_state(false);
+}
+
+TEST_CASE("optional compression: a transient decode failure is retryable, a real one is not hidden",
+          "[compression][spill][optional_compression][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  auto& e = env();
+  reset_spill_state();
+  clear_faults();
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch));
+
+  sirius::convertible_data_batch w(batch, &repo_a());
+
+  // cudaErrorMemoryAllocation surfacing as a cudf::cuda_error: retried, not fatal.
+  sirius::compression::testing::inject_encode_fault(encode_fault::decode_cuda_oom, 1);
+  REQUIRE_THROWS_AS(w.convert({e.gpu_space}, e.stream(), *e.mgr, true), rmm::out_of_memory);
+  REQUIRE(is_compressed_host(*batch));
+
+  // A corrupt payload is not a retry candidate, and it is not swallowed either.
+  sirius::compression::testing::inject_encode_fault(encode_fault::decode_corrupt, 1);
+  std::string message;
+  REQUIRE(outcome_of([&] { (void)w.convert({e.gpu_space}, e.stream(), *e.mgr, true); }, &message) ==
+          outcome::other_exception);
+  REQUIRE_THAT(message, Catch::Matchers::ContainsSubstring("corrupt payload"));
+  REQUIRE(is_compressed_host(*batch));
+
+  clear_faults();
+  require_restores_to(batch, &repo_a(), expected_sum_of(n));
   reset_spill_state(false);
 }

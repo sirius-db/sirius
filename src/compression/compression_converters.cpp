@@ -32,9 +32,11 @@
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
@@ -70,6 +72,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -544,6 +547,7 @@ simpatico::compressed_table compress_columns_with_plans(cudf::table_view view,
                                                         rmm::cuda_stream_view stream,
                                                         rmm::device_async_resource_ref mr)
 {
+  compression::testing::maybe_throw_encode_fault();
   stream.synchronize();
   auto& pool = column_pool();
   return simpatico::compress_columns(view, plans, pool, mr, std::move(names));
@@ -777,6 +781,7 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
                                                         rmm::cuda_stream_view stream)
 {
   using verdict = compression::plan_register::spill_plan_verdict;
+  compression::testing::maybe_throw_plan_fault();
 
   // An unkeyed batch (no producing repository) has nothing to look up and no
   // lineage to follow, but it can still be carried by its dtype's default plan.
@@ -1504,7 +1509,10 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // safe; a column whose fallback also fails still declines the whole batch.
   if (ctx.release_columns_early && host_mr_early != nullptr) {
     column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
-    owned        = rep.try_release_table(stream);
+    // Likewise the encode's streams: created now, a failure is a clean decline;
+    // created inside the first column's encode, it would destroy the batch.
+    (void)column_pool();
+    owned = rep.try_release_table(stream);
     if (owned) {
       owned_columns = owned->release();
       owned_views.reserve(owned_columns.size());
@@ -2302,6 +2310,61 @@ void shutdown_explore_worker()
   if (auto* w = explore_worker::s_instance.load()) { w->stop(); }
 }
 
+namespace {
+
+/// Whether @p e is a device-resource failure that may clear on its own -- device
+/// memory or another CUDA resource (streams, events) was exhausted -- as opposed
+/// to a corrupt payload or a logic error.
+bool is_transient_device_resource_failure(const std::exception& e)
+{
+  if (dynamic_cast<const rmm::bad_alloc*>(&e) != nullptr) { return true; }
+  if (auto const* cuda = dynamic_cast<const cudf::cuda_error*>(&e)) {
+    return cuda->error_code() == cudaErrorMemoryAllocation;
+  }
+  // rmm::cuda_error, and simpatico's reconstruct errors (returned as strings and
+  // rethrown above as runtime_error), carry the CUDA error only in the text.
+  const std::string_view what = e.what();
+  return what.find("cudaErrorMemoryAllocation") != std::string_view::npos ||
+         what.find("out of memory") != std::string_view::npos;
+}
+
+/**
+ * Decompression is mandatory -- a compressed batch has no other way back -- so a
+ * decode failure can be neither skipped nor allowed to fail the query for a
+ * transient reason. The pipeline executor reschedules on rmm::out_of_memory only,
+ * so a transient device-resource failure in any shape is rethrown as one; every
+ * other failure propagates unchanged (it is a real error, not a retry candidate).
+ */
+template <typename Stream,
+          std::unique_ptr<cucascade::idata_representation> (*DecodeFn)(
+            cucascade::idata_representation&,
+            const cucascade::memory::memory_space*,
+            Stream,
+            cucascade::memory::reservation*)>
+std::unique_ptr<cucascade::idata_representation> retryable_decode(
+  cucascade::idata_representation& source,
+  const cucascade::memory::memory_space* target_memory_space,
+  Stream stream,
+  cucascade::memory::reservation* reservation)
+{
+  try {
+    compression::testing::maybe_throw_decode_fault();
+    return DecodeFn(source, target_memory_space, stream, reservation);
+  } catch (const rmm::out_of_memory&) {
+    throw;
+  } catch (const std::exception& e) {
+    if (!is_transient_device_resource_failure(e)) { throw; }
+    // A sticky-free CUDA error is still pending on this thread; clear it so the
+    // retry does not trip over it.
+    (void)cudaGetLastError();
+    throw rmm::out_of_memory(std::string("[compression_converters] decode hit a transient device "
+                                         "resource failure (retryable): ") +
+                             e.what());
+  }
+}
+
+}  // namespace
+
 void register_compression_converters(cucascade::representation_converter_registry& registry)
 {
   // Decompression paths used by prepare_for_processing / convert_to.
@@ -2309,19 +2372,19 @@ void register_compression_converters(cucascade::representation_converter_registr
          .has_converter<compressed_host_representation, cucascade::gpu_table_representation>()) {
     registry
       .register_converter<compressed_host_representation, cucascade::gpu_table_representation>(
-        decompress_host_to_gpu);
+        retryable_decode<::cuda::stream_ref, decompress_host_to_gpu>);
   }
   if (!registry
          .has_converter<compressed_device_representation, cucascade::gpu_table_representation>()) {
     registry
       .register_converter<compressed_device_representation, cucascade::gpu_table_representation>(
-        decompress_device_to_gpu);
+        retryable_decode<::cuda::stream_ref, decompress_device_to_gpu>);
   }
   if (!registry
          .has_converter<compressed_disk_representation, cucascade::gpu_table_representation>()) {
     registry
       .register_converter<compressed_disk_representation, cucascade::gpu_table_representation>(
-        decompress_disk_to_gpu);
+        retryable_decode<rmm::cuda_stream_view, decompress_disk_to_gpu>);
   }
 
   // Spill (compress) paths. These require a spill_context installed by

@@ -264,73 +264,99 @@ void downgrade_executor::processing_loop()
     // satisfied.
     std::size_t inplace_batches = 0;
     std::size_t inplace_freed   = 0;
-    if (compression::device_compression_downgrade_enabled() && !req->satisfied.load()) {
-      const std::size_t requested = req->target_bytes.value_or(0);  // 0 = predicate-only
-      std::vector<std::unique_ptr<convertible_data>> picks;
-      std::size_t predicted_total = 0;
+    // Strictly optional, like every compress-side tier: an exception anywhere in
+    // pricing or compressing is logged and the request carries on to the spill
+    // tiers below, which free the memory without it. Skipped outright under
+    // extreme pressure (a recent physical device OOM, or a nearly full arena),
+    // where the encode's working memory is not there to be had.
+    const char* inplace_skip = compression::device_compression_downgrade_enabled()
+                                 ? compression::spill_compression_pressure_skip_reason()
+                                 : nullptr;
+    if (inplace_skip != nullptr) {
+      SIRIUS_LOG_DEBUG(
+        "[downgrade] [{}] in-place compression skipped: {}", _source_label, inplace_skip);
+    }
+    if (compression::device_compression_downgrade_enabled() && inplace_skip == nullptr &&
+        !req->satisfied.load()) {
+      try {
+        const std::size_t requested = req->target_bytes.value_or(0);  // 0 = predicate-only
+        std::vector<std::unique_ptr<convertible_data>> picks;
+        std::size_t predicted_total = 0;
 
-      // Same traversal as TIER 1 below: memory pressure is global, so candidates come
-      // from every in-flight query, newest first (get_all() is ascending by query id).
-      auto const managers = _data_repo_registry.get_all();
-      for (auto const& manager : std::views::reverse(managers)) {
-        if (requested > 0 && predicted_total >= requested) break;
-        for (auto* repo : manager->get_repositories()) {
+        // Same traversal as TIER 1 below: memory pressure is global, so candidates come
+        // from every in-flight query, newest first (get_all() is ascending by query id).
+        auto const managers = _data_repo_registry.get_all();
+        for (auto const& manager : std::views::reverse(managers)) {
           if (requested > 0 && predicted_total >= requested) break;
-          convertible_data_batch_provider provider(repo);
-          for (auto& cand : provider.get_all_convertible(source_space,
-                                                         /*front_to_back=*/false,
-                                                         /*ignore_subscribed=*/true)) {
-            if (!cand) continue;
-            const std::size_t saving = cand->predicted_compression_saving();
-            if (saving == 0) continue;
-            predicted_total += saving;
-            picks.push_back(std::move(cand));
+          for (auto* repo : manager->get_repositories()) {
             if (requested > 0 && predicted_total >= requested) break;
+            convertible_data_batch_provider provider(repo);
+            for (auto& cand : provider.get_all_convertible(source_space,
+                                                           /*front_to_back=*/false,
+                                                           /*ignore_subscribed=*/true)) {
+              if (!cand) continue;
+              const std::size_t saving = cand->predicted_compression_saving();
+              if (saving == 0) continue;
+              predicted_total += saving;
+              picks.push_back(std::move(cand));
+              if (requested > 0 && predicted_total >= requested) break;
+            }
           }
         }
-      }
 
-      const bool set_is_sufficient = requested == 0 || predicted_total >= requested;
-      if (set_is_sufficient && !picks.empty()) {
-        auto exc_stream = _stream_pool->acquire_stream(
-          cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
-        for (auto& cand : picks) {
-          const std::size_t freed =
-            cand->compress_in_place(rmm::cuda_stream_view{exc_stream.get()});
-          if (freed > 0) {
-            ++inplace_batches;
-            inplace_freed += freed;
-            req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
-            req->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+        const bool set_is_sufficient = requested == 0 || predicted_total >= requested;
+        if (set_is_sufficient && !picks.empty()) {
+          auto exc_stream = _stream_pool->acquire_stream(
+            cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+          for (auto& cand : picks) {
+            const std::size_t freed =
+              cand->compress_in_place(rmm::cuda_stream_view{exc_stream.get()});
+            if (freed > 0) {
+              ++inplace_batches;
+              inplace_freed += freed;
+              req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
+              req->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+            }
+            // With no byte target the predicate is the only stopping condition, so
+            // check it per batch rather than compressing every candidate we found.
+            if (req->predicate && req->predicate()) {
+              req->satisfied.store(true);
+              break;
+            }
           }
-          // With no byte target the predicate is the only stopping condition, so
-          // check it per batch rather than compressing every candidate we found.
-          if (req->predicate && req->predicate()) {
-            req->satisfied.store(true);
-            break;
-          }
+          SIRIUS_LOG_DEBUG(
+            "[downgrade] [{}] in-place compression: {}/{} batches compressed, predicted {} bytes, "
+            "freed {} bytes (request target {} bytes)",
+            _source_label,
+            inplace_batches,
+            picks.size(),
+            predicted_total,
+            inplace_freed,
+            requested);
+        } else if (!picks.empty()) {
+          // Targeted request the set cannot meet: deliberately all-or-nothing.
+          // Compressing a subset would spend GPU time, still leave the request
+          // unmet, and leave every batch it touched needing a decode — strictly
+          // worse than spilling those same batches.
+          SIRIUS_LOG_DEBUG(
+            "[downgrade] [{}] in-place compression declined: {} candidates predict only {} of {} "
+            "bytes; spilling instead",
+            _source_label,
+            picks.size(),
+            predicted_total,
+            requested);
         }
+      } catch (const std::exception& e) {
+        compression::note_compression_fallback(compression::compression_fallback_kind::in_place);
+        SIRIUS_LOG_DEBUG("[downgrade] [{}] in-place compression pass failed ({}); spilling instead",
+                         _source_label,
+                         e.what());
+      } catch (...) {
+        compression::note_compression_fallback(compression::compression_fallback_kind::in_place);
         SIRIUS_LOG_DEBUG(
-          "[downgrade] [{}] in-place compression: {}/{} batches compressed, predicted {} bytes, "
-          "freed {} bytes (request target {} bytes)",
-          _source_label,
-          inplace_batches,
-          picks.size(),
-          predicted_total,
-          inplace_freed,
-          requested);
-      } else if (!picks.empty()) {
-        // Targeted request the set cannot meet: deliberately all-or-nothing.
-        // Compressing a subset would spend GPU time, still leave the request
-        // unmet, and leave every batch it touched needing a decode — strictly
-        // worse than spilling those same batches.
-        SIRIUS_LOG_DEBUG(
-          "[downgrade] [{}] in-place compression declined: {} candidates predict only {} of {} "
-          "bytes; spilling instead",
-          _source_label,
-          picks.size(),
-          predicted_total,
-          requested);
+          "[downgrade] [{}] in-place compression pass failed (non-standard exception); spilling "
+          "instead",
+          _source_label);
       }
     }
 
@@ -759,6 +785,20 @@ void downgrade_executor::monitor_loop()
             : 0.0);
         // Same cadence as occupancy so the two can be read together: what the
         // encode is asking the allocator for, against how much room there was.
+        // Compress-side skips and fallbacks: each is a batch that still moved, raw.
+        if (const auto fb = compression::read_compression_fallback_counters();
+            fb.spill_skipped_pressure + fb.spill_fell_back + fb.in_place_fell_back +
+              fb.output_fell_back >
+            0) {
+          SIRIUS_LOG_DEBUG(
+            "[compression_fallback] [{}] spill_skipped_pressure={} spill_fell_back={} "
+            "in_place_fell_back={} output_fell_back={}",
+            _source_label,
+            fb.spill_skipped_pressure,
+            fb.spill_fell_back,
+            fb.in_place_fell_back,
+            fb.output_fell_back);
+        }
         if (compression::alloc_stats_enabled()) {
           SIRIUS_LOG_DEBUG(
             "[compression_alloc] [{}] {}", _source_label, compression::alloc_stats_format());

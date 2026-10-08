@@ -17,6 +17,7 @@
 
 #include "memory/defragmenter_oom_policy.hpp"
 
+#include "compression/spill_context.hpp"
 #include "cuda_runtime_api.h"
 #include "log/logging.hpp"
 
@@ -189,6 +190,11 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
                      bytes);
     std::rethrow_exception(eptr);
   }
+
+  // A physical failure: the device itself is out of memory, whatever cuCascade's
+  // accounting says. Spill compression stops trying for a moment (see
+  // spill_compression_pressure_skip_reason) so its encodes do not compete for it.
+  compression::note_physical_device_oom();
 
   if (!oom_ex->pool_handle) {
     SIRIUS_LOG_DEBUG("[oom_defrag] no trim: allocation carries no pool handle, bytes={}", bytes);

@@ -61,4 +61,9 @@ bool compression_device_pool_enabled() noexcept;
 /// Configured arena size in bytes; 0 when disabled.
 std::size_t compression_device_pool_bytes() noexcept;
 
+/// Bytes currently allocated from the arena (0 when disabled). Counts what the
+/// encoders hold, not the pool's fragmentation, so "nearly full" by this measure
+/// is a lower bound on how full the arena really is.
+std::size_t compression_device_pool_used_bytes() noexcept;
+
 }  // namespace sirius::compression

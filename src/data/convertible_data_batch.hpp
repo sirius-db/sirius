@@ -19,18 +19,19 @@
 #include "compression/compressed_disk_representation.hpp"
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
+#include "compression/compression_device_pool.hpp"
 #include "compression/output_compression.hpp"
 #include "compression/plan_register.hpp"
-#include "compression/compression_device_pool.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
-#include <cuda/stream>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/error.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -274,76 +275,15 @@ class convertible_data_batch : public convertible_data {
                               cucascade::memory::reservation& reservation,
                               rmm::cuda_stream_view stream)
   {
-    // Each early return below is a *silent* skip that no other log line records,
-    // so a run where compression barely fires looks identical to one where it was
-    // never asked. On q3/SF1000 that hid the real limiter: 39 of 42 spilled
-    // batches bypassed the encoder with only one decline logged. Tagged one line
-    // per skip so the reasons can be counted from the log.
-    if (!compression::spill_compression_enabled()) {
-      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: suppressed-or-disabled");
-      return false;
-    }
-    // No edge key: the batch reached the downgrade executor without a producing
-    // repository, so the plan register has nothing to look up and no lineage to
-    // resolve. That is not a reason to spill it raw — compression does not need a
-    // plan, only a carrier. The converter falls back to `default_plan_for` per
-    // column (bitpack for fixed-width numerics, passthrough for strings), and the
-    // usual whole-batch threshold still declines the result if it does not pay.
-    //
-    // Worth doing because unkeyed batches are the bulk of the traffic: on
-    // q5/SF1000, 117,915 spill attempts skipped for this reason against 874
-    // compressed spills.
-    if (_source_repo == nullptr) {
-      SIRIUS_LOG_DEBUG(
-        "[convertible_data_batch] no source edge; compressing with dtype defaults");
-    }
-
-    auto& reg      = compression::plan_register::global();
-    const auto ctx = compression::make_spill_context(_source_repo);
-
-    // Too small to repay the encode. The cost per batch is roughly fixed — a
-    // per-column sync to read back data-dependent output sizes, plus staging —
-    // so beneath some size compressing is slower than spilling raw whatever the
-    // ratio. This matters most when operator batch limits are lowered to relieve
-    // GPU pressure, since that shrinks spill batches too: at SF1000 with 500 MB
-    // operator batches, spill batches arrived at ~500 KB and a downgrade request
-    // moved 1.06 GB across 79 of them at 71.7 MB/s, against 9,056 MB/s raw.
-    //
-    // Checked before decide_spill_plan so an undersized batch neither consumes a
-    // plan-register use nor perturbs an edge's verdict: the batch says nothing
-    // about whether that edge's *data* is compressible.
-    if (const auto* data = mut.get_data();
-        data != nullptr && data->get_size_in_bytes() < ctx.min_batch_bytes) {
-      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: batch {}B < min {}B",
-                       data->get_size_in_bytes(),
-                       ctx.min_batch_bytes);
-      return false;
-    }
-
-    // Count this attempt however it turns out. A skipped edge must still
-    // accumulate uses, otherwise its entry never expires and the "not worth
-    // compressing" verdict would stick for the rest of the query. Runs after
-    // convert_to, so an explore inside the converter (which resets the count)
-    // is followed by this increment rather than clobbered by it.
-    struct use_noter {
-      compression::plan_register& reg;
-      const cucascade::shared_data_repository* repo;
-      ~use_noter() { reg.note_spill_plan_use(repo); }
-    } noter{reg, _source_repo};
-
-    const auto decision = reg.decide_spill_plan(_source_repo, ctx.replan_after_uses);
-    if (decision.verdict == compression::plan_register::spill_plan_verdict::skip) {
-      // Compression already proved not worth it for this edge: skip the
-      // conversion entirely rather than compressing and discarding it again.
-      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: repo={} written off",
-                       static_cast<const void*>(_source_repo));
-      return false;
-    }
-
+    // Compression is strictly optional: every way this can go wrong -- the
+    // gates, the plan lookup, the encode, an allocation in the arena or the
+    // query pool, a stream that cannot be created, an exception of any type --
+    // ends in `return false` and the caller spills uncompressed. The one
+    // exception is spill_source_consumed (below), where no source is left to
+    // spill.
     try {
-      compression::scoped_spill_context guard(ctx);
-      mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
-      return true;
+      return try_convert_compressed_impl<CompressedRep>(
+        mut, converter_registry, reservation, stream);
     } catch (const sirius::spill_source_consumed&) {
       // The converter already owns (and has partly freed) this batch's columns,
       // so there is no intact source to spill uncompressed. Falling back would
@@ -372,12 +312,114 @@ class convertible_data_batch : public convertible_data {
           !compression::compression_device_pool_enabled()) {
         compression::set_spill_compression_suppressed(true);
       }
+      compression::note_compression_fallback(
+        compression::compression_fallback_kind::spill_fell_back);
       SIRIUS_LOG_DEBUG(
         "[convertible_data_batch] compressed spill declined ({}); "
         "falling back to uncompressed",
         e.what());
       return false;
+    } catch (...) {
+      compression::note_compression_fallback(
+        compression::compression_fallback_kind::spill_fell_back);
+      SIRIUS_LOG_DEBUG(
+        "[convertible_data_batch] compressed spill declined (non-standard exception); "
+        "falling back to uncompressed");
+      return false;
     }
+  }
+
+  template <typename CompressedRep>
+  bool try_convert_compressed_impl(cucascade::mutable_data_batch& mut,
+                                   cucascade::representation_converter_registry& converter_registry,
+                                   cucascade::memory::reservation& reservation,
+                                   rmm::cuda_stream_view stream)
+  {
+    // Each early return below is a *silent* skip that no other log line records,
+    // so a run where compression barely fires looks identical to one where it was
+    // never asked. On q3/SF1000 that hid the real limiter: 39 of 42 spilled
+    // batches bypassed the encoder with only one decline logged. Tagged one line
+    // per skip so the reasons can be counted from the log.
+    if (!compression::spill_compression_enabled()) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: suppressed-or-disabled");
+      return false;
+    }
+    // Extreme pressure: the encode would only compete with the query for memory
+    // that is not there. Skip before touching the plan register, so the skip
+    // neither consumes a plan use nor counts as an error against the edge.
+    if (const char* why = compression::spill_compression_pressure_skip_reason(); why != nullptr) {
+      compression::note_compression_fallback(
+        compression::compression_fallback_kind::spill_skipped_pressure);
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: {}", why);
+      return false;
+    }
+    // No edge key: the batch reached the downgrade executor without a producing
+    // repository, so the plan register has nothing to look up and no lineage to
+    // resolve. That is not a reason to spill it raw — compression does not need a
+    // plan, only a carrier. The converter falls back to `default_plan_for` per
+    // column (bitpack for fixed-width numerics, passthrough for strings), and the
+    // usual whole-batch threshold still declines the result if it does not pay.
+    //
+    // Worth doing because unkeyed batches are the bulk of the traffic: on
+    // q5/SF1000, 117,915 spill attempts skipped for this reason against 874
+    // compressed spills.
+    if (_source_repo == nullptr) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] no source edge; compressing with dtype defaults");
+    }
+
+    auto& reg      = compression::plan_register::global();
+    const auto ctx = compression::make_spill_context(_source_repo);
+
+    // Too small to repay the encode. The cost per batch is roughly fixed — a
+    // per-column sync to read back data-dependent output sizes, plus staging —
+    // so beneath some size compressing is slower than spilling raw whatever the
+    // ratio. This matters most when operator batch limits are lowered to relieve
+    // GPU pressure, since that shrinks spill batches too: at SF1000 with 500 MB
+    // operator batches, spill batches arrived at ~500 KB and a downgrade request
+    // moved 1.06 GB across 79 of them at 71.7 MB/s, against 9,056 MB/s raw.
+    //
+    // Checked before decide_spill_plan so an undersized batch neither consumes a
+    // plan-register use nor perturbs an edge's verdict: the batch says nothing
+    // about whether that edge's *data* is compressible.
+    if (const auto* data = mut.get_data();
+        data != nullptr && data->get_size_in_bytes() < ctx.min_batch_bytes) {
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: batch {}B < min {}B",
+                       data->get_size_in_bytes(),
+                       ctx.min_batch_bytes);
+      return false;
+    }
+
+    // Count this attempt however it turns out. A skipped edge must still
+    // accumulate uses, otherwise its entry never expires and the "not worth
+    // compressing" verdict would stick for the rest of the query. Runs after
+    // convert_to, so an explore inside the converter (which resets the count)
+    // is followed by this increment rather than clobbered by it. Never throws
+    // out of the destructor: a bookkeeping failure must not turn a spill that
+    // succeeded into one that did not.
+    struct use_noter {
+      compression::plan_register& reg;
+      const cucascade::shared_data_repository* repo;
+      ~use_noter()
+      {
+        try {
+          reg.note_spill_plan_use(repo);
+        } catch (...) {
+        }
+      }
+    } noter{reg, _source_repo};
+
+    const auto decision = reg.decide_spill_plan(_source_repo, ctx.replan_after_uses);
+    if (decision.verdict == compression::plan_register::spill_plan_verdict::skip) {
+      // Compression already proved not worth it for this edge: skip the
+      // conversion entirely rather than compressing and discarding it again.
+      SIRIUS_LOG_DEBUG("[convertible_data_batch] spill compression skip: repo={} written off",
+                       static_cast<const void*>(_source_repo));
+      return false;
+    }
+
+    compression::scoped_spill_context guard(ctx);
+    mut.convert_to<CompressedRep>(converter_registry, reservation, stream);
+    return true;
   }
 
   std::shared_ptr<cucascade::data_batch> _batch;
@@ -525,31 +567,22 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * @return A convertible_data_batch if the batch matches, nullptr otherwise.
    */
  public:
-
   std::unique_ptr<convertible_data> try_get_batch(uint64_t batch_id,
                                                   std::size_t partition_idx,
                                                   cucascade::memory::memory_space* space,
                                                   bool ignore_subscribed = true) const
   {
     auto batch = _repo->get_data_batch_by_id(batch_id, partition_idx);
-    if (!batch) {
-      return nullptr;
-    }
+    if (!batch) { return nullptr; }
 
     // A subscribed batch is being held by a task (queued or preparing); skip it so we don't
     // downgrade data a task is about to use.
-    if (ignore_subscribed && batch->get_subscriber_count() > 0) {
-      return nullptr;
-    }
+    if (ignore_subscribed && batch->get_subscriber_count() > 0) { return nullptr; }
 
-    if (batch->get_state() != cucascade::batch_state::idle) {
-      return nullptr;
-    }
+    if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
 
     auto ro = batch->try_to_read_only();
-    if (!ro) {
-      return nullptr;
-    }
+    if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch), _repo);
     }

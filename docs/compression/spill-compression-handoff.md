@@ -255,6 +255,19 @@ retry policy and the compression arena's device over-commit, not slower eviction
   on other threads' work if they were shared. pin_table's DuckDB threads are not
   prewarmed; their lazy failure is an OOM that the pin's existing per-chunk
   fallback turns into an uncompressed pin.
+- **Compression strictly optional, decompression retryable — done.** Any
+  compress-side failure (arena or query-pool OOM, stream creation, encode
+  exceptions of any type, plan/explore failures, output compression, the
+  in-place device tier) now ends in an uncompressed spill or publication; the
+  exception is a failure after `spill_release_columns_early` (default off)
+  released the source. Spills skip compression up front when the arena is ≥ 90%
+  allocated or within 1 s of a physical device OOM; skips and fallbacks are
+  counted (`[compression_fallback]` in the downgrade monitor's debug log). Decode
+  converters rethrow transient device-resource failures as `rmm::out_of_memory`
+  so the executor retries them. The compressed-scan decode inside an operator is
+  not wrapped (its stream creation is an OOM; other CUDA errors there propagate
+  as before). The arena-nearly-full gate has no unit test: installing an arena is
+  process-wide and permanent.
 - **Prefetching cache footprint at SF3000** — test the readahead hypothesis above
   (`REST_MAX_CONCURRENT_SCANS=16`; at SF1000 16 and 48 performed the same) before
   using the cache at this scale.

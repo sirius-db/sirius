@@ -193,6 +193,33 @@ accounting and the physical pool agree and `usage_limit_fraction` keeps meaning 
 footprint on the device. An arena that does not fit inside the capacity is a configuration
 error.
 
+### Compression is optional; decompression is not
+
+A compressed spill is an optimization of the spill, never a condition for it. Every compress-side
+failure ends in an ordinary uncompressed spill or publication and never fails a task or a
+conversion:
+
+- `convertible_data_batch::try_convert_compressed` catches everything (plan lookup and
+  exploration, arena or query-pool OOM, stream creation, encode errors, non-`std::exception`
+  throws) and returns `false`, so `convert()` spills uncompressed. The single exception is
+  `spill_source_consumed`: with `spill_release_columns_early`, a failure after the source columns
+  were released has nothing left to spill raw. Plans and streams are resolved before that release
+  so that their failures are still clean declines.
+- Sink-time output compression and the downgrade executor's in-place device compression (tier 0)
+  likewise log and continue; the request falls through to the spill tiers.
+- Under extreme pressure spills skip compression up front, before touching the plan register
+  (`spill_compression_pressure_skip_reason`): when the compression arena is ≥ 90% allocated, or
+  within 1 s of a physical device OOM reported by the defragmenter. Neither latches. This is in
+  addition to the suppression latch set by a compression OOM without an arena and cleared by the
+  downgrade monitor.
+- Skips and fallbacks are counted (`read_compression_fallback_counters`) and logged by the
+  downgrade monitor as `[compression_fallback]` at its occupancy cadence.
+
+Decompression has no alternative, so decode failures are never skipped: a transient device-resource
+failure in any shape (`rmm::bad_alloc`, `cudaErrorMemoryAllocation` from cuDF or Simpatico, a
+stream that cannot be created) is rethrown as `rmm::out_of_memory`, which the pipeline executor
+reschedules; any other decode failure propagates unchanged.
+
 ### Compression streams
 
 Simpatico encodes and decodes columns across a per-thread pool of four CUDA streams
