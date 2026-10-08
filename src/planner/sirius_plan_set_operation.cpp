@@ -29,6 +29,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -105,7 +106,8 @@ std::string_view set_operation_keyword(duckdb::LogicalOperatorType type)
   }
 }
 
-//! Whether DuckDB would wrap a key of @p type in a collation function before comparing it.
+//! Whether DuckDB would wrap a key of @p type in a collation or normalization function before
+//! comparing it.
 bool key_needs_collation(duckdb::ClientContext& context,
                          duckdb::LogicalType const& type,
                          duckdb::idx_t column)
@@ -352,10 +354,12 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
 
   for (duckdb::idx_t i = 0; i < op.types.size(); ++i) {
     reject_nested_column_type(op.types[i], "column " + std::to_string(i), name);
-    // DuckDB compares a collated key through its collation; the GPU would compare raw values.
+    // DuckDB compares such a key through its collation or normalization; the GPU would compare raw
+    // values.
     if (key_needs_collation(context, op.types[i], i)) {
       throw duckdb::NotImplementedException(
-        "%s on column %d (%s): collated keys not supported on the GPU path",
+        "%s on column %d (%s): keys DuckDB compares through a collation or normalization not "
+        "supported on the GPU path",
         name,
         i,
         op.types[i].ToString());
@@ -375,12 +379,14 @@ sirius_physical_plan_generator::plan_except_intersect(duckdb::LogicalSetOperatio
   std::array arms{create_plan(*op.children[0]), create_plan(*op.children[1])};
   // The ALL plan is typed from these, so each arm must actually produce them.
   auto const key_types = reconcile_input_types(arms, op.types, name);
+  // concat_batch_bytes = 0 asks for the smallest batches; REPLICATE needs a positive cap.
   return plan_set_operation_all(
     op.type,
     std::move(arms),
     key_types,
     op.estimated_cardinality,
-    {std::numeric_limits<cudf::size_type>::max(), op_params.concat_batch_bytes});
+    {.max_rows  = std::numeric_limits<cudf::size_type>::max(),
+     .max_bytes = std::max<std::size_t>(op_params.concat_batch_bytes, 1)});
 }
 
 }  // namespace sirius::planner

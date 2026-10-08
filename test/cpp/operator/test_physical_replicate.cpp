@@ -27,6 +27,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <catch.hpp>
 #include <op/replicate/gpu_replicate_impl.hpp>
@@ -61,10 +62,10 @@ std::unique_ptr<cudf::column> int64_column(std::vector<std::int64_t> const& valu
   auto column = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, size, cudf::mask_state::UNALLOCATED, stream, mr);
   if (size > 0) {
-    cudaMemcpy(column->mutable_view().data<std::int64_t>(),
-               values.data(),
-               values.size() * sizeof(std::int64_t),
-               cudaMemcpyHostToDevice);
+    CUDF_CUDA_TRY(cudaMemcpy(column->mutable_view().data<std::int64_t>(),
+                             values.data(),
+                             values.size() * sizeof(std::int64_t),
+                             cudaMemcpyHostToDevice));
   }
   if (valid) {
     auto mask             = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
@@ -129,7 +130,8 @@ void require_exact_tiling(replicate::plan const& expansion,
     output_row_source.insert(output_row_source.end(), counts[i], static_cast<std::int64_t>(i));
     output_row_bytes.insert(output_row_bytes.end(), counts[i], row_bytes[i]);
   }
-  auto const max_row_bytes = *std::ranges::max_element(row_bytes);
+  auto const max_bytes = static_cast<std::int64_t>(
+    std::min<std::size_t>(caps.max_bytes, std::numeric_limits<std::int64_t>::max()));
 
   std::int64_t next = 0;
   for (auto const& part : expansion.slices) {
@@ -140,12 +142,25 @@ void require_exact_tiling(replicate::plan const& expansion,
     for (auto row = part.output_begin; row < part.output_end; ++row) {
       bytes += output_row_bytes[row];
     }
-    CHECK(bytes <= static_cast<std::int64_t>(caps.max_bytes) + max_row_bytes);
+    // Only the slice's last row may cross the byte cap.
+    CHECK(bytes - output_row_bytes[part.output_end - 1] < max_bytes);
     CHECK(part.input_begin == output_row_source[part.output_begin]);
     CHECK(part.input_end == output_row_source[part.output_end - 1] + 1);
     next = part.output_end;
   }
   CHECK(next == static_cast<std::int64_t>(output_row_source.size()));
+}
+
+//! Bytes of one copy of each row of @p data, as `plan_slices` weighs it.
+std::vector<std::int64_t> row_bytes_of(cudf::table_view const& data)
+{
+  auto const bits =
+    cudf::row_bit_count(data, default_stream(), get_resource_ref(*get_default_gpu_space()));
+  std::vector<std::int64_t> bytes;
+  for (auto const row_bits : copy_column_to_host<std::int32_t>(bits->view())) {
+    bytes.push_back(std::max<std::int64_t>(1, (std::int64_t{row_bits} + 7) / 8));
+  }
+  return bytes;
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> run(
@@ -214,6 +229,23 @@ TEST_CASE("gpu_replicate_impl - a total past INT32_MAX is planned in 64 bits",
     CHECK(part.input_begin == 0);
     CHECK(part.input_end == 1);
   }
+}
+
+TEST_CASE("gpu_replicate_impl - a byte cap past INT64_MAX leaves only the row cap",
+          "[operator][replicate]")
+{
+  auto data_column = int64_column({10, 20});
+  std::vector<std::int64_t> const counts{3, 5};
+  auto counts_column = int64_column(counts);
+  cudf::table_view const data{{data_column->view()}};
+  replicate::limits const caps{4, std::numeric_limits<std::size_t>::max()};
+  auto const expansion = plan_of(data, counts_column->view(), caps);
+
+  REQUIRE(expansion.slices.size() == 2);
+  require_exact_tiling(expansion, counts, row_bytes_of(data), caps);
+  auto const output = materialize_all(data, expansion);
+  CHECK(copy_column_to_host<std::int64_t>(output->get_column(0).view()) ==
+        std::vector<std::int64_t>{10, 10, 10, 20, 20, 20, 20, 20});
 }
 
 TEST_CASE("gpu_replicate_impl - one count above the row cap splits that row",
@@ -310,8 +342,10 @@ TEST_CASE("gpu_replicate_impl - slices concatenate to the whole expansion", "[op
     expected_names.insert(expected_names.end(), counts[i], names[i]);
   }
 
-  auto const caps   = GENERATE(replicate::limits{4, unbounded_bytes}, replicate::limits{1000, 64});
-  auto const output = materialize_all(data, plan_of(data, counts_column->view(), caps));
+  auto const caps = GENERATE(replicate::limits{4, unbounded_bytes}, replicate::limits{1000, 64});
+  auto const expansion = plan_of(data, counts_column->view(), caps);
+  require_exact_tiling(expansion, counts, row_bytes_of(data), caps);
+  auto const output = materialize_all(data, expansion);
   REQUIRE(output->num_rows() == static_cast<cudf::size_type>(expected_values.size()));
   auto const host_valid = copy_validity_to_host(output->get_column(0).view());
   CHECK(host_valid == expected_valid);
@@ -342,6 +376,21 @@ TEST_CASE("gpu_replicate_impl - an invalid count column throws", "[operator][rep
     CHECK_THROWS_AS(plan_of(data, string_column({"1", "2"})->view(), caps),
                     sirius::internal_exception);
   }
+  SECTION("a count column of another length")
+  {
+    auto counts_column = int64_column({1, 2, 3});
+    CHECK_THROWS_AS(plan_of(data, counts_column->view(), caps), sirius::internal_exception);
+  }
+}
+
+TEST_CASE("gpu_replicate_impl - a zero cap throws", "[operator][replicate]")
+{
+  auto data_column   = int64_column({1, 2});
+  auto counts_column = int64_column({1, 1});
+  cudf::table_view const data{{data_column->view()}};
+  CHECK_THROWS_AS(plan_of(data, counts_column->view(), {0, unbounded_bytes}),
+                  sirius::internal_exception);
+  CHECK_THROWS_AS(plan_of(data, counts_column->view(), {4, 0}), sirius::internal_exception);
 }
 
 TEST_CASE("gpu_replicate_impl - a narrower integer count column is widened",
@@ -354,10 +403,10 @@ TEST_CASE("gpu_replicate_impl - a narrower integer count column is widened",
                                           default_stream(),
                                           get_resource_ref(*get_default_gpu_space()));
   std::vector<std::int8_t> const host_counts{2, 1};
-  cudaMemcpy(counts->mutable_view().data<std::int8_t>(),
-             host_counts.data(),
-             host_counts.size(),
-             cudaMemcpyHostToDevice);
+  CUDF_CUDA_TRY(cudaMemcpy(counts->mutable_view().data<std::int8_t>(),
+                           host_counts.data(),
+                           host_counts.size(),
+                           cudaMemcpyHostToDevice));
   cudf::table_view const data{{data_column->view()}};
   auto const output = materialize_all(data, plan_of(data, counts->view(), {4, unbounded_bytes}));
   CHECK(copy_column_to_host<std::int64_t>(output->get_column(0).view()) ==
@@ -479,4 +528,20 @@ TEST_CASE("sirius_physical_replicate rejects a bad count", "[operator][replicate
 
   CHECK_THROWS_AS(sirius_physical_replicate(logical_types({}), {4, 1}, 0),
                   sirius::internal_exception);
+}
+
+TEST_CASE("sirius_physical_replicate rejects zero limits and a batch of the wrong width",
+          "[operator][replicate]")
+{
+  auto const types = logical_types({duckdb::LogicalType::BIGINT});
+  CHECK_THROWS_AS(sirius_physical_replicate(types, {0, unbounded_bytes}, 0),
+                  sirius::internal_exception);
+  CHECK_THROWS_AS(sirius_physical_replicate(types, {4, 0}, 0), sirius::internal_exception);
+
+  sirius_physical_replicate op(types, {4, unbounded_bytes}, 0);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(int64_column({1, 2}));
+  columns.push_back(int64_column({3, 4}));
+  columns.push_back(int64_column({1, 1}));
+  CHECK_THROWS_AS(run(op, {batch_of(std::move(columns))}), sirius::internal_exception);
 }

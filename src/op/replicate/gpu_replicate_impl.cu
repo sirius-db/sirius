@@ -42,6 +42,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <span>
 #include <vector>
 
 namespace sirius::op::gpu_replicate_impl {
@@ -51,7 +53,7 @@ namespace {
 //! Whole bytes of one copy of a row; at least one, so every copy advances the byte prefix.
 __device__ std::int64_t bytes_of(std::int32_t bits)
 {
-  return ::cuda::std::max(std::int32_t{1}, (bits + 7) / 8);
+  return ::cuda::std::max(std::int64_t{1}, (std::int64_t{bits} + 7) / 8);
 }
 
 //! Bytes of all copies of row `i`.
@@ -126,14 +128,13 @@ std::vector<T> to_host(rmm::device_uvector<T> const& values, ::cuda::stream_ref 
   return host;
 }
 
-//! Queues a copy of the last of @p count values at @p values into @p host.
-void copy_last_async(std::int64_t const* values,
-                     cudf::size_type count,
+//! Queues a copy of the last of the non-empty device array @p values into @p host.
+void copy_last_async(std::span<std::int64_t const> values,
                      std::int64_t& host,
                      ::cuda::stream_ref stream)
 {
-  CUDF_CUDA_TRY(
-    cudaMemcpyAsync(&host, values + count - 1, sizeof(host), cudaMemcpyDeviceToHost, stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    &host, values.data() + values.size() - 1, sizeof(host), cudaMemcpyDeviceToHost, stream.get()));
 }
 
 }  // namespace
@@ -188,14 +189,16 @@ plan plan_slices(cudf::table_view const& data,
 
   std::int64_t total_rows  = 0;
   std::int64_t total_bytes = 0;
-  copy_last_async(row_prefix_data, rows, total_rows, stream);
-  copy_last_async(byte_prefix.data(), rows, total_bytes, stream);
+  copy_last_async({row_prefix_data, static_cast<std::size_t>(rows)}, total_rows, stream);
+  copy_last_async({byte_prefix.data(), byte_prefix.size()}, total_bytes, stream);
   stream.sync();
   if (total_rows == 0) { return {std::move(row_prefix), {}}; }
 
   // Cuts are output rows where a new slice starts: each multiple of max_rows, and the first row
   // starting at or past each multiple of max_bytes. Between two cuts both caps hold.
-  auto const max_bytes      = static_cast<std::int64_t>(caps.max_bytes);
+  // The byte total fits in INT64, so a larger cap acts as INT64_MAX.
+  auto const max_bytes = static_cast<std::int64_t>(
+    std::min<std::size_t>(caps.max_bytes, std::numeric_limits<std::int64_t>::max()));
   auto const byte_cut_count = (total_bytes - 1) / max_bytes;
   rmm::device_uvector<std::int64_t> device_byte_cuts(byte_cut_count, stream, mr);
   thrust::transform(policy,
@@ -237,8 +240,10 @@ plan plan_slices(cudf::table_view const& data,
   std::vector<slice> slices;
   slices.reserve(slice_count);
   for (std::size_t s = 0; s < slice_count; ++s) {
-    slices.push_back(
-      {output_ranges[s].first, output_ranges[s].second, row_ranges[s].first, row_ranges[s].second});
+    slices.push_back({.output_begin = output_ranges[s].first,
+                      .output_end   = output_ranges[s].second,
+                      .input_begin  = row_ranges[s].first,
+                      .input_end    = row_ranges[s].second});
   }
   return {std::move(row_prefix), std::move(slices)};
 }

@@ -28,15 +28,21 @@ namespace sirius {
 namespace op {
 
 //! Repeats each input row by a count column and drops that column. Input batches are the output
-//! columns followed by the count column, which must be last. Row `i` of an input batch
-//! appears `count[i]` times, copies adjacent, in input order. Streaming and stateless, like
-//! `FILTER`: it knows nothing of what the count means. A null or negative count is a planner bug
-//! and throws `sirius::internal_exception`. Each input batch becomes one or more output batches
-//! within `gpu_replicate_impl::limits`; one with no copies becomes one empty batch.
+//! columns followed by the count column, which must be last. Row `i` of an input batch appears
+//! `count[i]` times, copies adjacent, in input order. Streaming and stateless, like `FILTER`: it
+//! knows nothing of what the count means. A null or negative count is a planner bug and throws
+//! `sirius::internal_exception`. Each input batch becomes one or more output batches within
+//! `gpu_replicate_impl::limits`; one with no copies becomes one empty batch.
+//!
+//! One `execute` holds the whole expansion of its input batches in device memory, so the limits
+//! shape output batches but do not bound peak memory.
 class sirius_physical_replicate : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::REPLICATE;
 
+  //! @throws sirius::internal_exception if @p types is empty or a limit in @p output_limits is not
+  //! positive.
+  //!
   //! @param types  Output schema: the input schema without the count column.
   sirius_physical_replicate(duckdb::vector<sirius::logical_type> types,
                             gpu_replicate_impl::limits output_limits,

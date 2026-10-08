@@ -31,46 +31,79 @@
 #include <memory>
 #include <vector>
 
-//! Device work behind `sirius_physical_replicate`: repeat each row of a table by a count column.
-//! `plan_slices` cuts the whole expansion into slices of consecutive output rows before any row is
-//! copied, and `materialize` copies one slice. Output row `j` is a copy of input row `i` when
-//! `S[i-1] <= j < S[i]`, where `S` is the inclusive `INT64` prefix sum of the counts. Each
-//! `cudf::repeat` call covers one slice, so its unchecked 32-bit count sum never overflows.
+/**
+ * @brief Device work behind `sirius_physical_replicate`
+ *
+ * Repeats each row of a table by a count column. `plan_slices` cuts the whole expansion into slices
+ * of consecutive output rows before any row is copied, and `materialize` copies one slice. Output
+ * row `j` is a copy of input row `i` when `S[i-1] <= j < S[i]`, where `S` is the inclusive `INT64`
+ * prefix sum of the counts. Each `cudf::repeat` call covers one slice, so its unchecked 32-bit
+ * count sum never overflows.
+ */
 namespace sirius::op::gpu_replicate_impl {
 
-//! Caps on one output table.
+/**
+ * @brief Caps on one output table
+ *
+ * Both caps are positive. A `max_bytes` past `INT64_MAX` acts as `INT64_MAX`.
+ */
 struct limits {
-  cudf::size_type max_rows;  //!< Rows per output table; positive.
-  std::size_t max_bytes;     //!< Bytes per output table, exceeded by at most one row; positive.
+  cudf::size_type max_rows;  ///< Rows per output table
+  std::size_t max_bytes;     ///< Bytes per output table, exceeded by at most one row
 };
 
-//! Output rows `[output_begin, output_end)` of the whole expansion, and the input rows
-//! `[input_begin, input_end)` they copy.
+/**
+ * @brief Output rows `[output_begin, output_end)` of the whole expansion, and the input rows
+ * `[input_begin, input_end)` they copy
+ */
 struct slice {
-  std::int64_t output_begin;    //!< First output row.
-  std::int64_t output_end;      //!< One past the last output row.
-  cudf::size_type input_begin;  //!< First input row with a copy in the slice.
-  cudf::size_type input_end;    //!< One past the last input row with a copy in the slice.
+  std::int64_t output_begin;    ///< First output row
+  std::int64_t output_end;      ///< One past the last output row
+  cudf::size_type input_begin;  ///< First input row with a copy in the slice
+  cudf::size_type input_end;    ///< One past the last input row with a copy in the slice
 };
 
-//! The slices one input table expands into.
+/**
+ * @brief The slices one input table expands into
+ */
 struct plan {
-  std::unique_ptr<cudf::column> row_prefix;  //!< `S`, `INT64`, one row per input row.
-  std::vector<slice> slices;  //!< Non-empty, in order, tiling `[0, S[last])`; empty if no copies.
+  std::unique_ptr<cudf::column> row_prefix;  ///< `S`, `INT64`, one row per input row
+  std::vector<slice> slices;  ///< Non-empty, in order, tiling `[0, S[last])`; empty if no copies
 };
 
-//! Cuts the expansion of @p data by @p counts into slices of at most `caps.max_rows` rows and
-//! `caps.max_bytes` bytes plus one row, a row's size being its `cudf::row_bit_count` in whole
-//! bytes. Throws `sirius::internal_exception` if @p counts is not an integer column, has a null
-//! or a negative value, or differs from @p data in length.
+/**
+ * @brief Cuts the expansion of @p data by @p counts into slices within @p caps
+ *
+ * A row's size is its `cudf::row_bit_count` in whole bytes, at least one. The sum over all rows of
+ * `count * size` must fit in `INT64`; nothing checks it.
+ *
+ * @throws sirius::internal_exception if @p counts is not an integer column, differs from @p data in
+ * length, or has a null or a negative value
+ * @throws sirius::internal_exception if a cap in @p caps is not positive
+ *
+ * @param data Rows to repeat
+ * @param counts Copies of each row of @p data
+ * @param caps Caps on each slice
+ * @param stream CUDA stream for device work and copies
+ * @param mr Memory resource for the returned row prefix and temporary device memory
+ * @return The row prefix and the slices, in output order
+ */
 plan plan_slices(cudf::table_view const& data,
                  cudf::column_view const& counts,
                  limits const& caps,
                  ::cuda::stream_ref stream,
                  rmm::device_async_resource_ref mr);
 
-//! Output rows `[part.output_begin, part.output_end)` of @p expansion, which `plan_slices` returned
-//! for @p data.
+/**
+ * @brief Copies one slice of an expansion
+ *
+ * @param data The table @p expansion was planned for
+ * @param expansion What `plan_slices` returned for @p data
+ * @param part One of `expansion.slices`
+ * @param stream CUDA stream for device work
+ * @param mr Memory resource for the returned table and temporary device memory
+ * @return Output rows `[part.output_begin, part.output_end)` of the expansion
+ */
 std::unique_ptr<cudf::table> materialize(cudf::table_view const& data,
                                          plan const& expansion,
                                          slice const& part,

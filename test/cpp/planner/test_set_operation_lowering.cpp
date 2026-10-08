@@ -337,6 +337,16 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
+                 "set_operation - concat_batch_bytes = 0 caps REPLICATE batches at one byte",
+                 "[planner][set_operation][isolated_context]")
+{
+  sirius::test::scoped_sirius_setting const bytes{*con, "concat_batch_bytes", std::uint64_t{0}};
+  auto const plan = lower("SELECT k FROM ia EXCEPT ALL SELECT k FROM ib");
+  REQUIRE(plan->type == SiriusPhysicalOperatorType::REPLICATE);
+  CHECK(plan->Cast<sirius::op::sirius_physical_replicate>().output_limits().max_bytes == 1);
+}
+
+TEST_CASE_METHOD(set_operation_lowering_fixture,
                  "set_operation - the dispatch switch refuses only the distinct forms",
                  "[planner][set_operation][isolated_context]")
 {
@@ -377,19 +387,11 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form keeps the shared refusals",
+                 "set_operation - an ALL form keeps the shared nested-key refusal",
                  "[planner][set_operation][isolated_context]")
 {
-  SECTION("a collated key")
-  {
-    REQUIRE_THROWS_WITH(lower("SELECT s FROM icollated EXCEPT ALL SELECT s FROM icollated"),
-                        ContainsSubstring("EXCEPT ALL on column 0"));
-  }
-  SECTION("a nested key")
-  {
-    REQUIRE_THROWS_WITH(lower("SELECT l FROM ilist INTERSECT ALL SELECT l FROM ilist"),
-                        ContainsSubstring("nested column operation on column 'column 0'"));
-  }
+  REQUIRE_THROWS_WITH(lower("SELECT l FROM ilist INTERSECT ALL SELECT l FROM ilist"),
+                      ContainsSubstring("nested column operation on column 'column 0'"));
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
@@ -445,7 +447,7 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
 }
 
 TEST_CASE_METHOD(set_operation_lowering_fixture,
-                 "set_operation - an ALL form on a key DuckDB collates is refused",
+                 "set_operation - an ALL form on a key DuckDB collates or normalizes is refused",
                  "[planner][set_operation][isolated_context]")
 {
   SECTION("a VARCHAR column with a collation")
@@ -462,7 +464,8 @@ TEST_CASE_METHOD(set_operation_lowering_fixture,
   SECTION("an INTERVAL column")
   {
     REQUIRE_THROWS_WITH(lower("SELECT i FROM iduration INTERSECT ALL SELECT i FROM iduration"),
-                        ContainsSubstring("INTERSECT ALL on column 0"));
+                        ContainsSubstring("INTERSECT ALL on column 0 (INTERVAL): keys DuckDB "
+                                          "compares through a collation or normalization"));
   }
 }
 
