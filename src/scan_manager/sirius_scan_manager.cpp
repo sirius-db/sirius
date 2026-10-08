@@ -3703,16 +3703,37 @@ void build_survivor_row_ranges(pinned_entry const& entry,
     std::size_t const n_groups = entry.group_bounds.groups_in_chunk(chunk);
     if (n_groups == 0) { return; }
 
+    std::size_t const chunk_rows = n_groups * group_rows;
+
+    // A filter can only prune a group of this chunk if it rules out the interval every valid
+    // group contains: its evaluation is monotone in the bounds, so a group it rejects implies the
+    // common interval is rejected too. On data not ordered by the filtered column that interval
+    // is wide and survives, which skips a pass over every group (~6 ms for a lineitem pin).
+    std::vector<std::pair<lowered_bound_filter const*, packed_column_bounds>> pruning;
+    for (auto const& le : lowered) {
+      auto bounds = entry.group_bounds.cell(le.entry_pos, chunk);
+      if (bounds.size() != n_groups) { continue; }  // absent or shape disagreement: cannot narrow
+      bool const has_null = !bounds.column_has_no_nulls;
+      if (bounds.common_interval &&
+          !le.filter.provably_empty(
+            bounds.common_interval->first, bounds.common_interval->second, has_null, false)) {
+        continue;
+      }
+      pruning.emplace_back(&le.filter, std::move(bounds));
+    }
+    if (pruning.empty()) {
+      ranges.push_back({chunk, 0, chunk_rows});
+      continue;
+    }
+
     // A group survives unless SOME filter proves it empty — the same AND-over-filters the
     // chunk-level pass applies.
     std::vector<bool> keep(n_groups, true);
-    for (auto const& le : lowered) {
-      auto const bounds = entry.group_bounds.cell(le.entry_pos, chunk);
-      if (bounds.size() != n_groups) { continue; }  // absent or shape disagreement: cannot narrow
+    for (auto const& [filter, bounds] : pruning) {
       bool const has_null = !bounds.column_has_no_nulls;
       for (std::size_t g = 0; g < n_groups; ++g) {
         if (!keep[g] || bounds.valid[g] == 0) { continue; }  // absent cell never prunes
-        if (le.filter.provably_empty(bounds.mins[g], bounds.maxs[g], has_null, false)) {
+        if (filter->provably_empty(bounds.mins[g], bounds.maxs[g], has_null, false)) {
           keep[g] = false;
         }
       }
@@ -3721,7 +3742,6 @@ void build_survivor_row_ranges(pinned_entry const& entry,
     // Coalesce runs of surviving groups into row ranges. The final group of a chunk may be short;
     // the chunk's true row count is not known here, so the last range is clamped by the caller's
     // serve path (a range past the end of a chunk must be treated as ending at the chunk).
-    std::size_t const chunk_rows = n_groups * group_rows;
     std::size_t g                = 0;
     std::size_t kept_rows        = 0;
     while (g < n_groups) {

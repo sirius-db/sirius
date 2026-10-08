@@ -29,8 +29,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -182,6 +184,9 @@ struct packed_column_bounds {
   /// One byte per group rather than a bitset: the evaluator reads it per cell, and a bitset would
   /// trade a byte per group (0.01% of the region) for a shift and mask on the hot path.
   std::span<std::uint8_t const> valid;
+  /// [max of the valid groups' mins, min of their maxs]: the interval every valid group's bounds
+  /// contain. Absent when no group is valid or the groups share no value.
+  std::optional<std::pair<std::int64_t, std::int64_t>> common_interval;
 
   [[nodiscard]] std::size_t size() const noexcept { return mins.size(); }
   [[nodiscard]] bool empty() const noexcept { return mins.empty(); }
@@ -291,7 +296,10 @@ class group_bounds_arena {
     std::size_t offset{0};        ///< index into _storage of this (column, chunk)'s mins
     std::size_t valid_offset{0};  ///< index into _valid; _storage advances 2x faster
     std::size_t count{0};         ///< groups
+    std::optional<std::pair<std::int64_t, std::int64_t>> common_interval;
   };
+  /// Fill every slice's common_interval; each factory calls it once the bounds are in place.
+  void compute_common_intervals();
   /// _slices[column * _n_chunks + chunk]; mins at offset, maxs at offset + count.
   std::vector<slice> _slices;
   std::vector<std::int64_t> _storage;

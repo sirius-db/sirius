@@ -574,7 +574,31 @@ packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t ch
   out.mins                = std::span<std::int64_t const>{_storage.data() + sl.offset, sl.count};
   out.maxs  = std::span<std::int64_t const>{_storage.data() + sl.offset + sl.count, sl.count};
   out.valid = std::span<std::uint8_t const>{_valid.data() + sl.valid_offset, sl.count};
+  out.common_interval = sl.common_interval;
   return out;
+}
+
+void group_bounds_arena::compute_common_intervals()
+{
+  for (std::size_t col = 0; col < _n_columns; ++col) {
+    bool const is_unsigned = _is_unsigned[col];
+    auto const less        = [is_unsigned](std::int64_t a, std::int64_t b) {
+      return is_unsigned ? static_cast<std::uint64_t>(a) < static_cast<std::uint64_t>(b) : a < b;
+    };
+    for (std::size_t chunk = 0; chunk < _n_chunks; ++chunk) {
+      auto& sl = _slices[col * _n_chunks + chunk];
+      sl.common_interval.reset();
+      std::optional<std::int64_t> lo, hi;
+      for (std::size_t g = 0; g < sl.count; ++g) {
+        if (_valid[sl.valid_offset + g] == 0) { continue; }
+        auto const gmin = _storage[sl.offset + g];
+        auto const gmax = _storage[sl.offset + sl.count + g];
+        if (!lo || less(*lo, gmin)) { lo = gmin; }
+        if (!hi || less(gmax, *hi)) { hi = gmax; }
+      }
+      if (lo && hi && !less(*hi, *lo)) { sl.common_interval.emplace(*lo, *hi); }
+    }
+  }
 }
 
 group_bounds_arena group_bounds_arena::select_columns(std::span<const std::size_t> columns) const
@@ -600,8 +624,9 @@ group_bounds_arena group_bounds_arena::select_columns(std::span<const std::size_
     out._column_has_no_nulls.push_back(_column_has_no_nulls[c]);
     for (std::size_t chunk = 0; chunk < _n_chunks; ++chunk) {
       auto const& src = _slices[c * _n_chunks + chunk];
-      auto& dst       = out._slices[i * _n_chunks + chunk];
-      dst.count       = src.count;
+      auto& dst           = out._slices[i * _n_chunks + chunk];
+      dst.count           = src.count;
+      dst.common_interval = src.common_interval;
       if (src.count == 0) { continue; }
       // Mins and maxs are adjacent in the source and stay adjacent here; the copy is what makes
       // the result standalone, so the subset outlives the arena it came from.
@@ -752,6 +777,7 @@ group_bounds_arena group_bounds_arena::unpack(std::span<const std::uint8_t> byte
       bytes = bytes.subspan(n);
     }
   }
+  a.compute_common_intervals();
   return a;
 }
 
@@ -817,6 +843,7 @@ group_bounds_arena group_bounds_arena::from_capture(
       valid_cursor += n_groups;
     }
   }
+  out.compute_common_intervals();
   return out;
 }
 

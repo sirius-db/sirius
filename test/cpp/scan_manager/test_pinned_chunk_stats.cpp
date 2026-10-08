@@ -68,6 +68,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <random>
+#include <span>
 #include <utility>
 
 using duckdb::ExpressionType;
@@ -1537,6 +1540,143 @@ TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
     REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
     REQUIRE(plan.survivor_row_ranges.empty());
     REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+}
+
+TEST_CASE("build_cached_scan_plan - row ranges match a per-group reference on overlapping groups",
+          "[pinned_chunk_stats]")
+{
+  // Groups that overlap (natural order) are where the per-chunk common-interval check skips the
+  // group pass; narrow groups mixed in are where it must not. Either way the ranges have to be
+  // exactly the ones a group-by-group DuckDB statistics check keeps.
+  auto make_filters = [] {
+    std::vector<filter_ptr> f;
+    f.push_back(cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(30)));
+    f.push_back(cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(70)));
+    f.push_back(cmp(ExpressionType::COMPARE_EQUAL, Value::INTEGER(50)));
+    f.push_back(cmp(ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(50)));
+    f.push_back(and_of(cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(40)),
+                       cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(45))));
+    f.push_back(or_of(cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(5)),
+                      cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(95))));
+    duckdb::vector<Value> vals{Value::INTEGER(3), Value::INTEGER(55), Value::INTEGER(99)};
+    f.push_back(duckdb::make_uniq<duckdb::InFilter>(std::move(vals)));
+    return f;
+  };
+  std::size_t const n_filters = make_filters().size();
+
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+  std::mt19937 rng(20261008);
+  std::size_t const n_groups = 16, group_rows = 100;
+  std::size_t shortcut_shapes = 0, refined_shapes = 0;
+
+  for (int trial = 0; trial < 400; ++trial) {
+    // 0: every group wide (common interval exists); 1: wide plus a few narrow groups.
+    int const shape = trial % 2;
+    std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+    int64_t chunk_lo = 1000, chunk_hi = -1000;
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      int64_t lo = std::uniform_int_distribution<int>(0, 10)(rng);
+      int64_t hi = std::uniform_int_distribution<int>(90, 100)(rng);
+      if (shape == 1 && std::uniform_int_distribution<int>(0, 3)(rng) == 0) {
+        lo = std::uniform_int_distribution<int>(0, 95)(rng);
+        hi = lo + std::uniform_int_distribution<int>(0, 4)(rng);
+      }
+      cells.emplace_back(std::pair<int64_t, int64_t>{lo, hi});
+      chunk_lo = std::min(chunk_lo, lo);
+      chunk_hi = std::max(chunk_hi, hi);
+    }
+    pinned_entry entry;
+    entry.cache_info.column_ids.emplace_back(duckdb::ColumnIndex(3));
+    entry.cache_info.names.push_back("c0");
+    entry.tier = cucascade::memory::Tier::HOST;
+    entry.host_chunks.resize(1);
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> capture(1);
+    capture[0].push_back(make_stats(LogicalType::INTEGER,
+                                    Value::INTEGER(static_cast<int32_t>(chunk_lo)),
+                                    Value::INTEGER(static_cast<int32_t>(chunk_hi)))
+                           .ToUnique());
+    entry.zone_maps    = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 1);
+    entry.group_bounds = make_arena(cells, group_rows);
+    (entry.group_bounds.cell(0, 0).common_interval ? shortcut_shapes : refined_shapes)++;
+
+    auto filter = std::move(make_filters()[static_cast<std::size_t>(trial / 2) % n_filters]);
+    std::vector<sirius::scan_manager::chunk_row_range> expected;
+    for (std::size_t g = 0; g < n_groups;) {
+      auto const keeps = [&](std::size_t i) {
+        auto st = int_stats(static_cast<int32_t>(cells[i]->first),
+                            static_cast<int32_t>(cells[i]->second),
+                            false);
+        return !sirius::scan_manager::chunk_provably_empty(*filter, *st);
+      };
+      if (!keeps(g)) {
+        ++g;
+        continue;
+      }
+      auto const begin = g;
+      while (g < n_groups && keeps(g)) {
+        ++g;
+      }
+      expected.push_back({0, begin * group_rows, g * group_rows});
+    }
+
+    auto fs   = make_filter_set(0, std::move(filter));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+    INFO("trial " << trial);
+    if (!expected.empty()) { REQUIRE(plan.survivor_row_ranges == expected); }
+    if (expected.empty()) { REQUIRE(plan.survivor_row_ranges.empty()); }
+  }
+  REQUIRE(shortcut_shapes > 0);
+  REQUIRE(refined_shapes > 0);
+}
+
+TEST_CASE("group_bounds_arena - common interval of a chunk's groups", "[pinned_chunk_stats]")
+{
+  SECTION("overlapping groups share [max of mins, min of maxs]; absent groups are ignored")
+  {
+    auto const a =
+      make_arena({std::pair<int64_t, int64_t>{0, 90}, std::nullopt, std::pair<int64_t, int64_t>{5, 99}});
+    auto const ci = a.cell(0, 0).common_interval;
+    REQUIRE(ci.has_value());
+    REQUIRE(*ci == std::pair<int64_t, int64_t>{5, 90});
+  }
+  SECTION("disjoint groups have none")
+  {
+    auto const a =
+      make_arena({std::pair<int64_t, int64_t>{0, 9}, std::pair<int64_t, int64_t>{10, 19}});
+    REQUIRE_FALSE(a.cell(0, 0).common_interval.has_value());
+  }
+  SECTION("a chunk with no valid group has none")
+  {
+    auto const a = make_arena({std::nullopt, std::nullopt});
+    REQUIRE_FALSE(a.cell(0, 0).common_interval.has_value());
+  }
+  SECTION("unsigned bounds compare as unsigned, and survive pack/unpack and select_columns")
+  {
+    // UBIGINT values above INT64_MAX store as negative carriers; a signed comparison would find
+    // [0, 1] and [2^63, 2^64-1] overlapping.
+    sirius::scan_manager::chunk_group_stats cs;
+    cs.group_rows = 100;
+    cs.groups.resize(2);
+    auto add = [&](std::size_t g, uint64_t lo, uint64_t hi) {
+      auto st = duckdb::NumericStats::CreateUnknown(LogicalType::UBIGINT);
+      duckdb::NumericStats::SetMin(st, Value::UBIGINT(lo));
+      duckdb::NumericStats::SetMax(st, Value::UBIGINT(hi));
+      st.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+      cs.groups[g].push_back(st.ToUnique());
+    };
+    add(0, 0, uint64_t{1} << 63);
+    add(1, 5, ~uint64_t{0});
+    std::vector<sirius::scan_manager::chunk_group_stats> capture;
+    capture.push_back(std::move(cs));
+    auto const a =
+      group_bounds_arena::from_capture(duckdb::vector<LogicalType>{LogicalType::UBIGINT}, capture);
+    auto const expected = std::pair<int64_t, int64_t>{5, static_cast<int64_t>(uint64_t{1} << 63)};
+    REQUIRE(a.cell(0, 0).common_interval == expected);
+    REQUIRE(group_bounds_arena::unpack(a.pack()).cell(0, 0).common_interval == expected);
+    std::size_t const col0 = 0;
+    REQUIRE(a.select_columns(std::span<const std::size_t>{&col0, 1}).cell(0, 0).common_interval ==
+            expected);
   }
 }
 
