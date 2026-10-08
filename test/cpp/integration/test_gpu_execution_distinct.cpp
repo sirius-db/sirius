@@ -388,6 +388,16 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT ON carrying a grouped sum",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  // The carried sum is planned as BIGINT under a HUGEINT declaration. Each `k` is one row, so the
+  // carried value is determined, and sums at both ends of BIGINT catch a read at the wrong width.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT ON (k) k, s FROM (SELECT k, sum(x) AS s FROM dist_sum GROUP BY k)");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT inside a correlated subquery",
                  "[integration][gpu_execution][distinct][join]")
 {

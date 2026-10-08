@@ -1291,6 +1291,26 @@ TEST_CASE_METHOD(
     CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 2);
   }
 
+  SECTION("a carried column over a narrowed aggregate keeps the child's planned type")
+  {
+    // The DISTINCT node declares sum()'s HUGEINT for `s`; the aggregate below is planned as BIGINT.
+    auto plan = generate_sirius_plan(
+      *con,
+      "SELECT DISTINCT ON (k) k, s FROM (SELECT val AS k, sum(id) AS s FROM big_left GROUP BY "
+      "val)");
+    INFO(tree_to_string(plan.get()));
+
+    duckdb::vector<sirius::logical_type> const planned{
+      sirius::logical_type::make(sirius::type_id::INTEGER),
+      sirius::logical_type::make(sirius::type_id::BIGINT)};
+    auto* aggregate = require_all_first_chain(plan.get(), {1});
+    CHECK(aggregate->group_idx == std::vector<int>{0});
+    CHECK(aggregate->get_types() == planned);
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_GROUP_BY)->get_types() ==
+          planned);
+    CHECK(projections_over_merge(plan.get()).empty());
+  }
+
   SECTION("a FIRST beside another aggregate carries its column after the partials")
   {
     auto plan =
