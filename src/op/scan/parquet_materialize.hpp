@@ -60,6 +60,30 @@ struct parquet_source {
   cudf::io::parquet_reader_options const& options,
   std::vector<cudf::size_type> const& row_group_indices);
 
+/// @ref column_chunk_ranges over many row-group subsets, keeping the reader of
+/// the last file and reader options it was asked about.
+///
+/// Building a reader copies the whole footer, so a file split into many
+/// batches costs one copy instead of one per batch. The kept reader holds that
+/// copy until the next file, or until @ref clear.
+class column_chunk_range_cache {
+ public:
+  /// Same result as @ref column_chunk_ranges for @p metadata, @p options and
+  /// @p row_group_indices.
+  [[nodiscard]] std::vector<cudf::io::text::byte_range_info> ranges(
+    std::shared_ptr<cudf::io::parquet::FileMetaData const> const& metadata,
+    std::shared_ptr<cudf::io::parquet_reader_options const> const& options,
+    std::vector<cudf::size_type> const& row_group_indices);
+
+  /// Release the kept reader and its footer copy.
+  void clear() noexcept;
+
+ private:
+  std::shared_ptr<cudf::io::parquet::FileMetaData const> _metadata;
+  std::shared_ptr<cudf::io::parquet_reader_options const> _options;
+  std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader> _reader;
+};
+
 /// Materialize @p sources into one table.
 ///
 /// Takes one of two routes, picked from what the backend says it wants:
