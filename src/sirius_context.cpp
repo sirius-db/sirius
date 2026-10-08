@@ -373,13 +373,17 @@ void SiriusContext::QueryBegin(ClientContext& context)
   }
   if (conn_state) { query_ordinal = conn_state->next_query_ordinal(); }
 
+#if SIRIUS_ACTIVE_LOG_LEVEL > SIRIUS_LOG_LEVEL_INFO
+  (void)query_ordinal;  // the INFO line below is compiled out
+#else
   // QueryBegin holds no lock and mutates no shared state: slot ownership is
   // scope-bound (StandaloneQueryScope/SlotGuard) and the begin mutations run
   // inside the execution window. Everything below is observation only and
   // best-effort; a logging or allocation failure must not fail the query it
   // decorates.
   try {
-    auto query = context.GetCurrentQuery();
+    if (!sirius::log::get_sink()->should_log(sirius::log::level::info)) { return; }
+    auto const& query = context.GetCurrentQuery();
     std::string normalized_query;
     if (carries_credentials(query)) {
       normalized_query = "<credential statement redacted>";
@@ -417,6 +421,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
     }
   } catch (...) {  // best-effort observability
   }
+#endif
 }
 
 void SiriusContext::QueryEnd()
@@ -1917,7 +1922,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       sirius::transparent::require_non_s3_cpu_replay(source_policy, decision, message);
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}", message);
-      install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+      if (decision.s3_allowed) {
+        install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+      }
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
       auto const message = sirius::sanitized_message(e);
@@ -1930,7 +1937,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       sirius::transparent::require_non_s3_cpu_replay(source_policy, decision, message);
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}", message);
-      install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+      if (decision.s3_allowed) {
+        install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+      }
       return RebindQueryInfo::DO_NOT_REBIND;
     }
     if (!logical_plan) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -2095,7 +2104,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (!message.starts_with("read-view mismatch:")) {
       SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", message);
     }
-    install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+    if (decision.s3_allowed) {
+      install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+    }
   } catch (std::exception& e) {
     auto const message = sirius::sanitized_message(e);
     sirius::transparent::cpu_replay_decision const decision{s3_cpu_fallback_enabled(context)};
@@ -2106,7 +2117,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     sirius::transparent::require_non_s3_cpu_replay(source_policy, decision, message);
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", message);
-    install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+    if (decision.s3_allowed) {
+      install_cpu_only_root_if_s3(context, prepared, source_policy, current_query_sql, message);
+    }
   }
 
   return RebindQueryInfo::DO_NOT_REBIND;
