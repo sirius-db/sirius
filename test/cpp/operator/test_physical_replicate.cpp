@@ -25,6 +25,7 @@
 #include "operator_type_traits.hpp"
 
 #include <cudf/concatenate.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 
 #include <catch.hpp>
@@ -390,9 +391,11 @@ TEMPLATE_TEST_CASE("sirius_physical_replicate repeats every column type",
     input = make_two_column_batch<std::int64_t, typename Traits::type>(
       *space, counts, values, Traits::cudf_type, std::nullopt);
   }
+  // The helper puts the counts first; REPLICATE takes them last.
+  auto swapped = cudf::table{sirius::get_cudf_table_view(*input).select({1, 0})}.release();
 
-  sirius_physical_replicate op(logical_types({Traits::logical_type()}), 0, {4, unbounded_bytes}, 3);
-  auto const outputs = run(op, {input});
+  sirius_physical_replicate op(logical_types({Traits::logical_type()}), {4, unbounded_bytes}, 3);
+  auto const outputs = run(op, {batch_of(std::move(swapped))});
   REQUIRE(outputs.size() == 1);
   auto const view = sirius::get_cudf_table_view(*outputs[0]);
   REQUIRE(view.num_columns() == 1);
@@ -400,18 +403,16 @@ TEMPLATE_TEST_CASE("sirius_physical_replicate repeats every column type",
   CHECK(copy_column_to_host<typename Traits::type>(view.column(0)) == expected);
 }
 
-TEST_CASE("sirius_physical_replicate drops the count column wherever it is",
+TEST_CASE("sirius_physical_replicate repeats NULL data values and drops the count column",
           "[operator][replicate]")
 {
-  auto const position = GENERATE(0, 1, 2);
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(int64_column({1, 2}, std::vector<bool>{true, false}));
   columns.push_back(string_column({"a", "bb"}));
-  columns.insert(columns.begin() + position, int64_column({2, 1}));
+  columns.push_back(int64_column({2, 1}));
 
   sirius_physical_replicate op(
     logical_types({duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR}),
-    position,
     {4, unbounded_bytes},
     2);
   auto const outputs = run(op, {batch_of(std::move(columns))});
@@ -427,7 +428,7 @@ TEST_CASE("sirius_physical_replicate drops the count column wherever it is",
 TEST_CASE("sirius_physical_replicate splits and keeps batches apart", "[operator][replicate]")
 {
   sirius_physical_replicate op(
-    logical_types({duckdb::LogicalType::BIGINT}), 1, {4, unbounded_bytes}, 0);
+    logical_types({duckdb::LogicalType::BIGINT}), {4, unbounded_bytes}, 0);
 
   auto make_input = [](std::vector<std::int64_t> values, std::vector<std::int64_t> counts) {
     std::vector<std::unique_ptr<cudf::column>> columns;
@@ -453,7 +454,7 @@ TEST_CASE("sirius_physical_replicate emits one empty batch for an input with no 
           "[operator][replicate]")
 {
   sirius_physical_replicate op(
-    logical_types({duckdb::LogicalType::VARCHAR}), 1, {4, unbounded_bytes}, 0);
+    logical_types({duckdb::LogicalType::VARCHAR}), {4, unbounded_bytes}, 0);
   auto const counts = GENERATE(std::vector<std::int64_t>{}, std::vector<std::int64_t>{0, 0});
 
   std::vector<std::unique_ptr<cudf::column>> columns;
@@ -470,15 +471,12 @@ TEST_CASE("sirius_physical_replicate emits one empty batch for an input with no 
 TEST_CASE("sirius_physical_replicate rejects a bad count", "[operator][replicate]")
 {
   sirius_physical_replicate op(
-    logical_types({duckdb::LogicalType::BIGINT}), 1, {4, unbounded_bytes}, 0);
+    logical_types({duckdb::LogicalType::BIGINT}), {4, unbounded_bytes}, 0);
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(int64_column({1, 2}));
   columns.push_back(int64_column({1, -3}));
   CHECK_THROWS_AS(run(op, {batch_of(std::move(columns))}), sirius::internal_exception);
 
-  CHECK_THROWS_AS(
-    sirius_physical_replicate(logical_types({duckdb::LogicalType::BIGINT}), 2, {4, 1}, 0),
-    sirius::internal_exception);
-  CHECK_THROWS_AS(sirius_physical_replicate(logical_types({}), 0, {4, 1}, 0),
+  CHECK_THROWS_AS(sirius_physical_replicate(logical_types({}), {4, 1}, 0),
                   sirius::internal_exception);
 }

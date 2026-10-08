@@ -198,7 +198,6 @@ replicate_plan require_replicate_plan(sirius_physical_operator& plan,
   REQUIRE(plan.type == SiriusPhysicalOperatorType::REPLICATE);
   auto& replicate = plan.Cast<sirius::op::sirius_physical_replicate>();
   CHECK(replicate.types == types);
-  CHECK(replicate.count_column() == static_cast<cudf::size_type>(width));
   CHECK(replicate.output_limits().max_rows == std::numeric_limits<cudf::size_type>::max());
   REQUIRE(replicate.children.size() == 1);
 

@@ -327,10 +327,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_set_operation_all(
     append_copy_count(op_type, std::move(tag_sums), key_types, estimated_cardinality);
 
   auto replicate = duckdb::make_uniq<sirius::op::sirius_physical_replicate>(
-    key_types,
-    static_cast<cudf::size_type>(key_types.size()),
-    replicate_limits,
-    estimated_cardinality);
+    key_types, replicate_limits, estimated_cardinality);
   replicate->children.push_back(std::move(count_projection));
   return replicate;
 }

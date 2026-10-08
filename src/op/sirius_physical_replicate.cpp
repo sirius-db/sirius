@@ -25,37 +25,28 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
+#include <vector>
+
 namespace sirius {
 namespace op {
 
 sirius_physical_replicate::sirius_physical_replicate(duckdb::vector<sirius::logical_type> types,
-                                                     cudf::size_type count_column,
                                                      gpu_replicate_impl::limits output_limits,
                                                      std::size_t estimated_cardinality)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::REPLICATE, std::move(types), estimated_cardinality),
-    _count_column(count_column),
     _output_limits(output_limits)
 {
-  auto const input_width = static_cast<cudf::size_type>(this->types.size()) + 1;
   // A table with no columns has no row count to repeat.
-  if (this->types.empty() || count_column < 0 || count_column >= input_width) {
-    throw internal_exception(
-      "REPLICATE: count column {} is not one of {} input columns", count_column, input_width);
-  }
+  if (this->types.empty()) { throw internal_exception("REPLICATE: no output columns"); }
   if (output_limits.max_rows <= 0 || output_limits.max_bytes == 0) {
     throw internal_exception("REPLICATE: output limits must be positive");
-  }
-  _data_columns.reserve(this->types.size());
-  for (cudf::size_type column = 0; column < input_width; ++column) {
-    if (column != count_column) { _data_columns.push_back(column); }
   }
 }
 
 std::string sirius_physical_replicate::params_to_string() const
 {
-  return " (count_column=" + std::to_string(_count_column) +
-         ", max_rows=" + std::to_string(_output_limits.max_rows) +
+  return " (max_rows=" + std::to_string(_output_limits.max_rows) +
          ", max_bytes=" + std::to_string(_output_limits.max_bytes) + ")";
 }
 
@@ -71,17 +62,17 @@ std::unique_ptr<operator_data> sirius_physical_replicate::execute(const operator
   for (auto const& batch : input_batches) {
     auto const view =
       batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
-    if (view.num_columns() != static_cast<cudf::size_type>(_data_columns.size()) + 1) {
-      throw internal_exception("REPLICATE: input batch has {} columns, expected {}",
-                               view.num_columns(),
-                               _data_columns.size() + 1);
+    auto const width = static_cast<cudf::size_type>(types.size());
+    if (view.num_columns() != width + 1) {
+      throw internal_exception(
+        "REPLICATE: input batch has {} columns, expected {}", view.num_columns(), width + 1);
     }
-    auto& space     = *batch.get_memory_space();
-    auto const mr   = space.get_default_allocator();
-    auto const data = view.select(_data_columns);
+    auto& space   = *batch.get_memory_space();
+    auto const mr = space.get_default_allocator();
+    cudf::table_view const data{std::vector<cudf::column_view>(view.begin(), view.end() - 1)};
 
     auto const expansion =
-      gpu_replicate_impl::plan_slices(data, view.column(_count_column), _output_limits, stream, mr);
+      gpu_replicate_impl::plan_slices(data, view.column(width), _output_limits, stream, mr);
     if (expansion.slices.empty()) {
       output_batches.push_back(
         sirius::make_data_batch(cudf::empty_like(data), space, stream, batch_telemetry()));
