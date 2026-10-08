@@ -55,7 +55,6 @@
 #include <mutex>
 #include <optional>
 #include <set>
-#include <shared_mutex>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
@@ -112,12 +111,17 @@ class SiriusConnectionState : public ClientContextState {
   /// A new query on this connection invalidates any leftover capture.
   void QueryBegin(ClientContext& context) final
   {
+    if (is_internal_query_active()) return;
     captured_plan_.reset();
     captured_original_views_.reset();
+    // DuckDB has finished/abandoned the previous statement before starting another.
+    // Backstop a missing QueryEnd without releasing an outer writer during internal SQL.
+    pinned_update_guard_.reset();
   }
 
   void QueryEnd() final
   {
+    if (is_internal_query_active()) return;
     pinned_update_guard_.reset();
     execution_options.reset();
   }
@@ -128,13 +132,14 @@ class SiriusConnectionState : public ClientContextState {
   std::shared_ptr<const sirius::operator_params> execution_options;
   bool execution_window_active{false};
 
-  [[nodiscard]] bool has_pinned_update_guard() const noexcept
+  [[nodiscard]] bool has_pinned_update_guard() const noexcept { return bool(pinned_update_guard_); }
+  const sirius::exec::query_admission::permit& pinned_update_guard() const
   {
-    return pinned_update_guard_.has_value();
+    return pinned_update_guard_;
   }
-  void set_pinned_update_guard(std::shared_lock<std::shared_mutex> guard)
+  void set_pinned_update_guard(sirius::exec::query_admission::permit guard)
   {
-    pinned_update_guard_.emplace(std::move(guard));
+    pinned_update_guard_ = std::move(guard);
   }
 
   /// \brief Per-connection monotonic query ordinal, advanced by the shared
@@ -305,7 +310,7 @@ class SiriusConnectionState : public ClientContextState {
   std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
-  std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
+  sirius::exec::query_admission::permit pinned_update_guard_;
   uint64_t connection_id_;
   uint64_t query_ordinal_ = 0;
 };
@@ -743,9 +748,8 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
   [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
 
-  /// Coordinate update execution with pin-registry mutations.
-  std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
-  std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
+  /// Retain through the update-producing statement, excluding pin-registry maintenance.
+  sirius::exec::query_admission::permit acquire_pinned_update_guard(ClientContext& context);
 
   [[nodiscard]] std::shared_ptr<const sirius::telemetry::telemetry_context> get_telemetry_context()
     const;
@@ -889,9 +893,6 @@ class SiriusContext : public ClientContextState {
 
   mutable std::mutex mutex_;
   sirius::exec::query_admission admission_;
-  // Updates retain a shared pin lock until DuckDB query end; maintenance enters
-  // admission before acquiring the exclusive pin lock.
-  std::shared_mutex pinned_table_update_mutex_;
   // See runtime_health: latched when a mandatory cleanup step fails.
   std::atomic<bool> runtime_unavailable_{false};
   bool is_initialized_ = false;
