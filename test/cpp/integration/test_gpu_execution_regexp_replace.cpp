@@ -32,7 +32,11 @@ void create_regexp_replace_table(RegexpReplaceFixture& fx)
   fx.run_ok(
     "INSERT INTO regex_t VALUES"
     " (1, 'aAB'), (2, 'aAC'), (3, 'aA'), (4, 'a'), (5, 'aAB'),"
-    " (6, ''), (7, NULL), (8, 'AB'), (9, 'AC'), (10, 'éAB日C'), (11, 'no match');");
+    " (6, ''), (7, NULL), (8, 'AB'), (9, 'AC'), (10, 'éAB日C'), (11, 'no match'),"
+    " (12, 'aba aba aba'), (13, 'aa'), (14, 'baaa'), (15, '123-456-789'),"
+    " (16, 'éabaéaba'), (17, 'first' || chr(10) || 'aba aba'),"
+    " (18, 'https://www.example.com/a/b'), (19, 'http://other.example/x'),"
+    " (20, 'APPLE Orange APPLE'), (21, 'a' || chr(10) || 'a');");
   fx.run_ok("CHECKPOINT;");
 }
 
@@ -70,14 +74,77 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
 }
 
 TEST_CASE_METHOD(RegexpReplaceFixture,
-                 "regexp_replace options fall back without changing their semantics",
+                 "regexp_replace replaces only the first match on GPU",
                  "[integration][gpu_execution][regexp_replace]")
 {
   create_regexp_replace_table(*this);
-  for (auto const* options : {"g", "i", "gi", "c", ""}) {
-    CAPTURE(options);
-    expect_plan_fallback_matches_cpu(std::string("SELECT id, regexp_replace(s, '[A-Z]', '', '") +
+  for (auto const* expression : {
+         "regexp_replace(s, 'a', 'X')",
+         "regexp_replace(s, 'aba', 'X')",
+         "regexp_replace(s, 'a', '')",
+         "regexp_replace(s, '^a', 'X')",
+         "regexp_replace(s, 'a$', 'X')",
+         "regexp_replace(s, '[0-9]+', '#')",
+         "regexp_replace(s, '', 'X')",
+         "regexp_replace(s, '^', 'X')",
+         "regexp_replace(s, '$', 'X')",
+         "regexp_replace(s, 'a*', 'X')",
+         "regexp_replace(s, 'a?', 'X')",
+       }) {
+    INFO(expression);
+    compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace backreferences replace only the first match on GPU",
+                 "[integration][gpu_execution][regexp_replace]")
+{
+  create_regexp_replace_table(*this);
+  for (auto const* expression : {
+         R"(regexp_replace(s, '(a)', '<\1>'))",
+         R"(regexp_replace(s, '(a)(b)', '\2-\1-\2'))",
+         R"(regexp_replace(s, '(aba)', '\12'))",
+         R"(regexp_replace(s, 'aba', '<\0>'))",
+         R"(regexp_replace(s, '[A-Z]', '\0\0'))",
+         R"(regexp_replace(s, '\s', '\0\0'))",
+         R"(regexp_replace(s, '^(a)', '<\1>'))",
+         R"(regexp_replace(s, '(a)$', '<\1>'))",
+         R"(regexp_replace(s, '([0-9]+)', '<\1>'))",
+         R"(regexp_replace(s, '(a*)', '<\1>'))",
+         R"(regexp_replace(s, '(a?)', '<\1>'))",
+         R"(regexp_replace(s, '()', '<\1>'))",
+         R"(regexp_replace(s, '(a)|(b)', '<\1><\2>'))",
+         R"(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1'))",
+       }) {
+    INFO(expression);
+    compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace options and unsupported rewrites fall back during planning",
+                 "[integration][gpu_execution][regexp_replace]")
+{
+  create_regexp_replace_table(*this);
+  // Four-argument calls were never supported by the evaluator. All explicit options must
+  // retain DuckDB semantics, including global replacement and combinations of flags.
+  for (auto const* options : {"", "g", "c", "i", "l", "m", "n", "p", "s", "gi", "gs"}) {
+    INFO(options);
+    expect_plan_fallback_matches_cpu(std::string{"SELECT id, regexp_replace(s, 'a.', 'X', '"} +
                                      options + "') FROM regex_t");
+    expect_plan_fallback_matches_cpu(
+      std::string{R"(SELECT id, regexp_replace(s, '(a)', '<\1>', ')"} + options +
+      "') FROM regex_t");
+  }
+  for (auto const* expression : {
+         R"(regexp_replace(s, '(a)', '\\1'))",
+         R"(regexp_replace(s, '(a)', '\1${1}'))",
+         "regexp_replace(s, s, 'X')",
+         "regexp_replace(s, 'a', s)",
+       }) {
+    INFO(expression);
+    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
   }
   expect_plan_fallback_matches_cpu(
     "SELECT regexp_replace(s, '[A-Z]', '', 'g') AS k, count(*) FROM regex_t GROUP BY k");

@@ -58,6 +58,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -274,9 +275,32 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
-  // The GPU regexp_replace evaluator implements only the three-argument form. Options such
-  // as 'g' change its semantics and must be evaluated by DuckDB rather than silently ignored.
-  if (*func_id_opt == function_id::regexp_replace && expr.children.size() != 3) { return nullptr; }
+  if (*func_id_opt == function_id::regexp_replace) {
+    // The GPU implementation supports constant patterns/replacements and DuckDB's default
+    // options only. In particular, never silently discard the fourth (options) argument.
+    if (expr.children.size() != 3) { return nullptr; }
+    for (std::size_t i = 1; i < 3; ++i) {
+      if (expr.children[i]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+        return nullptr;
+      }
+      auto const& value = expr.children[i]->Cast<duckdb::BoundConstantExpression>().value;
+      if (value.IsNull() || value.type() != duckdb::LogicalType::VARCHAR) { return nullptr; }
+    }
+    auto const& replacement =
+      duckdb::StringValue::Get(expr.children[2]->Cast<duckdb::BoundConstantExpression>().value);
+    // cuDF's template syntax differs from RE2's. Only translate single-digit backreferences;
+    // leave escaped backslashes and invalid rewrite escapes to DuckDB. Braced references are
+    // reserved for the translated cuDF template below, but are literal text in DuckDB.
+    bool has_backrefs = false;
+    for (std::size_t i = 0; i < replacement.size(); ++i) {
+      if (replacement[i] != '\\') { continue; }
+      if (++i == replacement.size() || replacement[i] < '0' || replacement[i] > '9') {
+        return nullptr;
+      }
+      has_backrefs = true;
+    }
+    if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
+  }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
