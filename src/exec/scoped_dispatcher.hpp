@@ -60,9 +60,11 @@ class scoped_dispatcher {
   scoped_dispatcher(const scoped_dispatcher&)            = delete;
   scoped_dispatcher& operator=(const scoped_dispatcher&) = delete;
 
-  // @brief Non-blocking. Always returns immediately. Overflow goes to the
-  // dispatcher-local pending queue (unbounded by contract).
-  // After request_stop() or a pool submission failure, enqueue is a silent no-op.
+  // @brief Does not wait for an inflight slot. Overflow goes to the dispatcher-local
+  // pending queue (unbounded by contract). Callable wrapping and queue insertion can throw.
+  // A pool submission failure cancels pending work, releases the reserved slot, and rethrows.
+  // Once stopped, successfully wrapped calls silently drop their task. Wrapping happens
+  // before the stop check and can still throw even when the dispatcher is already stopped.
   void enqueue(scoped_dispatcher_task auto&& f)
   {
     auto task = wrap(std::forward<decltype(f)>(f));
