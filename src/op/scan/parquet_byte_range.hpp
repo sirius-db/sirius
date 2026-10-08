@@ -34,8 +34,13 @@ namespace sirius::op::scan::detail {
  * same start offset per row group — the FE load-balances splits assuming its readers follow
  * the StarRocks BE rule (be/src/formats/parquet/utils.cpp): the minimum of the first column
  * chunk's data/index/dictionary page offsets and the row group's own file_offset, where each
- * candidate counts only when present. cudf's thrift structs carry no __isset, so a page
- * offset of 0 is treated as absent (real offsets start after the 4-byte magic).
+ * candidate counts only when present. cudf's thrift structs carry no __isset, so an offset
+ * of 0 is treated as absent (real offsets start after the 4-byte magic).
+ *
+ * That differs from the BE in one case: a writer that sets `file_offset = 0` makes the BE start
+ * the row group at byte 0, while this rule falls back to the page offsets. Exactly-once reads
+ * only need every reader of a file to apply the same rule, so splits read by Sirius CNs alone
+ * stay correct; only a file split between BEs and Sirius CNs could disagree.
  *
  * @throws sirius::invalid_input_exception if no candidate offset is present — ownership
  *         would be undefined, and guessing risks reading rows twice or not at all.
@@ -53,6 +58,7 @@ namespace sirius::op::scan::detail {
  * scan. Together these make any exact tiling of the file read every row group exactly once.
  *
  * @return Indices into @p metadata.row_groups, ascending.
+ * @throws sirius::invalid_input_exception if `start + length` overflows.
  */
 [[nodiscard]] std::vector<cudf::size_type> row_groups_in_byte_range(
   cudf::io::parquet::FileMetaData const& metadata, std::uint64_t start, std::uint64_t length);

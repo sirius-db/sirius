@@ -53,6 +53,10 @@ std::vector<cudf::size_type> row_groups_in_byte_range(
 {
   std::vector<cudf::size_type> owned;
   if (length == 0) { return owned; }
+  if (length > std::numeric_limits<std::uint64_t>::max() - start) {
+    throw sirius::invalid_input_exception(
+      "byte range ({}, {}) overflows a 64-bit offset", start, length);
+  }
   auto const end = start + length;
   for (std::size_t i = 0; i < metadata.row_groups.size(); ++i) {
     auto const rg_start = static_cast<std::uint64_t>(row_group_start_offset(metadata, i));
