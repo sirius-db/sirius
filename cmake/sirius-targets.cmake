@@ -1,9 +1,8 @@
 # Keep the public context API's C++23 requirement local.
-add_library(sirius_context_config OBJECT src/context_config.cpp src/context.cpp)
-target_compile_features(sirius_context_config PRIVATE cxx_std_23)
-set_target_properties(
-  sirius_context_config PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                   CXX_VISIBILITY_PRESET hidden)
+add_library(sirius_public_api OBJECT src/context_config.cpp src/context.cpp)
+target_compile_features(sirius_public_api PRIVATE cxx_std_23)
+set_target_properties(sirius_public_api PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                                   CXX_VISIBILITY_PRESET hidden)
 
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
@@ -23,7 +22,7 @@ endif()
 foreach(_target sirius_core sirius_shared sirius_extension
                 sirius_loadable_extension)
   if(TARGET ${_target})
-    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>)
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_public_api>)
   endif()
 endforeach()
 
@@ -102,8 +101,8 @@ if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
 
-foreach(_target sirius_objects sirius_context_config sirius_core
-                sirius_extension sirius_loadable_extension sirius_shared)
+foreach(_target sirius_objects sirius_public_api sirius_core sirius_extension
+                sirius_loadable_extension sirius_shared)
   if(NOT TARGET ${_target})
     continue()
   endif()
@@ -113,7 +112,7 @@ foreach(_target sirius_objects sirius_context_config sirius_core
     set(_link_scope "")
   endif()
   set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-  if(NOT _target STREQUAL "sirius_context_config")
+  if(NOT _target STREQUAL "sirius_public_api")
     set_target_properties(
       ${_target}
       PROPERTIES CXX_STANDARD 20

@@ -28,7 +28,9 @@ namespace sirius {
  * context may succeed, but shared runtime resources can interfere with each other.
  * Multiple configurations may exist independently of the active context.
  * Destruction does not reset all process-wide settings: changing
- * `sirius.executor.downgrade.copy_chunk_bytes` between contexts is unsupported.
+ * `sirius.executor.downgrade.copy_chunk_bytes` after a successful creation is unsupported.
+ * CUDA/NVTX initialization persists even after failed creation; NVTX injection settings
+ * must remain unchanged for the process lifetime.
  * Forking a process with an active context is unsupported.
  *
  * Context has unique ownership: move its std::unique_ptr handle to transfer
@@ -41,7 +43,9 @@ class SIRIUS_EXPORT Context {
    * @brief Create an initialized engine from a validated configuration.
    * @param config Requested engine settings; hardware limits are checked here.
    * @return An owned context, or an Error with code ErrorCode::context_initialization.
-   * @throws std::bad_alloc if host allocation fails. GPU allocation failures are returned as Error.
+   * @throws std::bad_alloc for allocation failures other than RMM allocation errors.
+   * RMM allocation errors are returned as Error. Other allocators may throw
+   * std::bad_alloc without identifying whether host or device memory was exhausted.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -67,6 +71,7 @@ class SIRIUS_EXPORT Context {
     const ContextConfig& config);
 
   /// Release the engine and its resources without throwing.
+  /// An unrecoverable failure to stop workers or destroy resources terminates the process.
   ///
   /// @code{.cpp}
   /// #include <sirius/context/config_builder.hpp>
@@ -75,8 +80,8 @@ class SIRIUS_EXPORT Context {
   /// auto config = sirius::ContextConfigBuilder{}.build();
   /// if (config) {
   ///   auto context = sirius::Context::create(*config);
-  ///   if (context) { context->reset(); } // Release the engine now.
-  /// }
+  ///   // Use the context if creation succeeded.
+  /// } // The owned context is destroyed on leaving this scope.
   /// @endcode
   ~Context() noexcept;
 

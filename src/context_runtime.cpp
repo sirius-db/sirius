@@ -14,6 +14,7 @@ struct context_runtime::Impl {
 };
 
 context_runtime::context_runtime(const parsed_sirius_config& config)
+  // The default engine constructor initializes host state only.
   : impl_(std::make_unique<Impl>())
 {
   try {

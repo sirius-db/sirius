@@ -23,7 +23,6 @@ std::expected<std::unique_ptr<Context>, Error> Context::create(const ContextConf
     return std::unique_ptr<Context>(new Context(std::move(impl)));
   } catch (const std::bad_alloc&) {
     throw;
-
   } catch (const std::exception& e) {
     return std::unexpected(Error{ErrorCode::context_initialization, e.what()});
   } catch (...) {

@@ -97,13 +97,11 @@ Execution is out-of-core with tiered memory management (GPU/host/disk), automati
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
 
-Only one active Sirius engine context per process is supported. Connections sharing
-the same DuckDB database instance share its context. Loading Sirius into multiple
-independent database instances in one process is unsupported and is not prevented
-by a runtime check. Close all connections and handles owning the first instance
-before creating another. Use separate processes for independent engine instances;
-do not fork a process with an active Sirius context. A new process is required to
-change `sirius.executor.downgrade.copy_chunk_bytes`.
+Sirius supports one active engine context per process; this is not enforced at runtime.
+Connections to the same DuckDB database instance share that context.
+Destroy the first `duckdb::DuckDB` instance and release all its connections and owning
+handles before creating another. See the [Context API documentation](../include/sirius/context/context.hpp)
+for process-wide configuration and lifetime restrictions.
 
 The default Pixi environment includes DuckDB's Python package. Its DuckDB version must match
 the version used to build the Sirius extension. Forked or nightly DuckDB builds may also require
