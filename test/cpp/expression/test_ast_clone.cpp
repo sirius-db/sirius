@@ -173,3 +173,38 @@ TEST_CASE("native reference traversal covers every child shape without changing 
   CHECK(indices ==
         std::vector<uint32_t>{9, 1, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17});
 }
+
+TEST_CASE("native transforms preserve DECIMAL CASE and COALESCE types",
+          "[ast_clone][ast_substitute]")
+{
+  using namespace sirius::ast;
+  using sirius::ast::test::make_ref;
+  auto const decimal = sirius::logical_type::make_decimal(38, 12);
+  auto const boolean = sirius::logical_type::make(sirius::type_id::BOOLEAN);
+  std::vector<case_expr::when_then> cases;
+  cases.push_back({make_ref(0, boolean), make_ref(1, decimal)});
+  std::vector<node> roots;
+  roots.emplace_back(case_expr{std::move(cases), make_ref(2, decimal), decimal});
+  std::vector<std::unique_ptr<node>> children;
+  children.push_back(make_ref(1, decimal));
+  children.push_back(make_ref(2, decimal));
+  roots.emplace_back(coalesce{std::move(children), decimal});
+  std::vector<std::unique_ptr<node>> replacements;
+  replacements.push_back(make_ref(3, boolean));
+  replacements.push_back(make_ref(4, decimal));
+  replacements.push_back(make_ref(5, decimal));
+  for (auto const& root : roots) {
+    auto cloned      = clone(root);
+    auto substituted = substitute_references(root, replacements);
+    REQUIRE(cloned->return_type() == decimal);
+    REQUIRE(substituted->return_type() == decimal);
+    visit_references(*cloned, [&](reference const& ref) {
+      CHECK(ref.column_index < 3);
+      CHECK(ref.return_type() == (ref.column_index == 0 ? boolean : decimal));
+    });
+    visit_references(*substituted, [&](reference const& ref) {
+      CHECK(ref.column_index >= 3);
+      CHECK(ref.return_type() == (ref.column_index == 3 ? boolean : decimal));
+    });
+  }
+}
