@@ -81,8 +81,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<int> cudf_aggregate_idx;
   std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
-  // AVG decomposition metadata
+  // Partial aggregate layout and finalization metadata
   std::vector<AggregateSlot> aggregate_slots;
+  duckdb::vector<sirius::logical_type> local_types;
   bool has_avg            = false;
   bool has_count_distinct = false;
 
@@ -97,6 +98,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
+  [[nodiscard]] bool has_stddev_samp() const;
 
   // Source interface
   bool is_source() const override { return true; }

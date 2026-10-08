@@ -15,8 +15,8 @@
  */
 
 // Differential (GPU-vs-CPU) NULL-correctness coverage over a real TPC-DS dataset
-// (issue #1095, sub-issue: broad NULL regression net). These are hand-written,
-// NULL-focused queries over the TPC-DS *tables* (not the canonical q1-q99), which
+// (issue #1095, sub-issue: broad NULL regression net). Most are hand-written,
+// NULL-focused queries over the TPC-DS tables, which
 // naturally carry NULLs in measures, dimension foreign keys, dates and strings.
 // They exercise NULL handling in realistic multi-column / multi-table shapes:
 // three-valued predicate logic, NULL-skipping aggregates, NULL group keys,
