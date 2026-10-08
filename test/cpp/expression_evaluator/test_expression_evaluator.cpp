@@ -45,16 +45,22 @@
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <sirius/exception.hpp>
 
 // cudf, etc.
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/unary.hpp>
 
 #include <cuda_runtime_api.h>
 
 // standard library
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -3069,4 +3075,189 @@ TEST_CASE("native_ast - comparison DISTINCT_FROM / NOT_DISTINCT_FROM executes",
       REQUIRE(out_host[i] == ((valids[i] && values[i] == 30) ? 0U : 1U));
     }
   }
+}
+
+TEMPLATE_TEST_CASE("evaluate string case conversion",
+                   "[expression_evaluator][string_case]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  auto mr                 = get_resource_ref(*space);
+  auto stream             = cudf::get_default_stream();
+  auto string_type        = logical_type::make(type_id::VARCHAR);
+  auto const id           = GENERATE(sirius::function_id::upper, sirius::function_id::lower);
+
+  // Include ASCII, empty strings, NULL, Unicode, and mappings that expand into
+  // multiple code points. The expectations deliberately follow cuDF semantics.
+  std::vector<std::string> const values{"HeLLo 123!", "", "", "é", "ß", "İ"};
+  std::vector<std::unique_ptr<cudf::column>> rows;
+  std::vector<cudf::column_view> row_views;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    cudf::string_scalar scalar(values[i], i != 2, stream, mr);
+    rows.push_back(cudf::make_column_from_scalar(scalar, 1, stream, mr));
+    row_views.push_back(rows.back()->view());
+  }
+  auto input_column = cudf::concatenate(row_views, stream, mr);
+  cudf::table_view input({input_column->view()});
+
+  auto case_expr = [&](std::unique_ptr<ast_node> child) {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(std::move(child));
+    return make_func(id, std::move(args), string_type);
+  };
+  auto evaluate = [&](ast_node const& expr, cudf::table_view table) {
+    sirius::expression_evaluator evaluator(expr, mr, stream, strategy);
+    return evaluator.evaluate(table);
+  };
+
+  SECTION("column inputs preserve NULLs and use cuDF Unicode mappings")
+  {
+    auto expr           = case_expr(make_ref_typed(0, string_type));
+    auto result         = evaluate(*expr, input);
+    auto const output   = result->view().column(0);
+    auto const expected = id == sirius::function_id::upper
+                            ? std::vector<std::string>{"HELLO 123!", "", "", "É", "SS", "İ"}
+                            : std::vector<std::string>{"hello 123!", "", "", "é", "ß", "i\u0307"};
+    REQUIRE(copy_string_column_to_host(output) == expected);
+    REQUIRE(copy_valids_to_host(output) == std::vector<bool>{true, true, false, true, true, true});
+  }
+  SECTION("case conversion composes inside an AST predicate")
+  {
+    auto expr =
+      make_cmp(sirius::comparison_type::equal,
+               case_expr(make_ref_typed(0, string_type)),
+               make_str_const(id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+    sirius::expression_evaluator evaluator(*expr, mr, stream, strategy, /*min_ast_size=*/1);
+    auto result = evaluator.select(input);
+    REQUIRE(copy_string_column_to_host(result->view().column(0)) ==
+            std::vector<std::string>{"HeLLo 123!"});
+  }
+  SECTION("nested case conversion")
+  {
+    auto expr   = case_expr(case_expr(make_ref_typed(0, string_type)));
+    auto result = evaluate(*expr, input);
+    REQUIRE(result->num_rows() == input.num_rows());
+    REQUIRE(copy_valids_to_host(result->view().column(0)) == copy_valids_to_host(input.column(0)));
+    REQUIRE(copy_string_column_to_host(result->view().column(0))[0] ==
+            (id == sirius::function_id::upper ? "HELLO 123!" : "hello 123!"));
+  }
+  SECTION("empty input")
+  {
+    auto empty_column = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+    cudf::table_view empty({empty_column->view()});
+    auto expr   = case_expr(make_ref_typed(0, string_type));
+    auto result = evaluate(*expr, empty);
+    REQUIRE(result->num_rows() == 0);
+    REQUIRE(result->view().column(0).type().id() == cudf::type_id::STRING);
+  }
+}
+TEST_CASE("timestamp casts check microsecond overflow", "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const seconds  = GENERATE(true, false);
+  auto const source   = seconds ? sirius::type_id::TIMESTAMP_SEC : sirius::type_id::TIMESTAMP_MS;
+  auto const source_type = sirius::logical_type::make(source);
+  int64_t const scale    = seconds ? 1000000 : 1000;
+  int64_t const max      = std::numeric_limits<int64_t>::max();
+  int64_t const min      = std::numeric_limits<int64_t>::min();
+  auto expr              = sirius::ast::node{sirius::ast::cast{
+    make_ref_typed(0, source_type), sirius::logical_type::make(sirius::type_id::TIMESTAMP)}};
+  auto stream            = cudf::get_default_stream();
+  auto mr                = get_resource_ref(*space);
+  auto run               = [&](std::vector<int64_t> const& ticks, bool valid = true) {
+    auto col =
+      cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                ticks.size(),
+                                valid ? cudf::mask_state::UNALLOCATED : cudf::mask_state::ALL_NULL,
+                                stream,
+                                mr);
+    if (!ticks.empty()) {
+      REQUIRE(cudaMemcpy(col->mutable_view().data<int64_t>(),
+                         ticks.data(),
+                         ticks.size() * sizeof(int64_t),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+    }
+    auto view = cudf::bit_cast(col->view(), sirius::get_cudf_type(source_type));
+    return run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy);
+  };
+  SECTION("inclusive finite bounds and infinity sentinels")
+  {
+    auto out                      = run({min / scale, max / scale, -max, max, -1, 0, 1});
+    auto actual                   = copy_column_to_host<int64_t>(out->view().column(0));
+    std::vector<int64_t> expected = {
+      (min / scale) * scale, (max / scale) * scale, -max, max, -scale, 0, scale};
+    CHECK(actual == expected);
+  }
+  SECTION("finite values outside either bound fail")
+  {
+    for (auto ticks : {min / scale - 1, max / scale + 1, min, -max + 1, max - 1}) {
+      CAPTURE(ticks);
+      REQUIRE_THROWS_AS(run({0, ticks, max}), sirius::invalid_input_exception);
+    }
+  }
+  SECTION("null payloads do not cause overflow")
+  {
+    auto out = run({min, max - 1}, false);
+    CHECK(out->view().column(0).null_count() == 2);
+  }
+  SECTION("empty input")
+  {
+    auto out = run({});
+    CHECK(out->num_rows() == 0);
+  }
+}
+
+TEST_CASE("subsecond extraction preserves minimum finite ticks",
+          "[expression_evaluator][timestamp_bounds]")
+{
+  auto* space         = get_default_gpu_space();
+  auto const strategy = GENERATE(MAT, exp_strategy_enum::AST_INTERPRET, exp_strategy_enum::AST_JIT);
+  auto const days     = GENERATE(true, false);
+  auto const function =
+    GENERATE(sirius::function_id::millisecond, sirius::function_id::microsecond);
+  auto const type =
+    sirius::logical_type::make(days ? sirius::type_id::DATE : sirius::type_id::TIMESTAMP);
+  auto stream = cudf::get_default_stream();
+  auto mr     = get_resource_ref(*space);
+  auto col =
+    cudf::make_numeric_column(cudf::data_type{days ? cudf::type_id::INT32 : cudf::type_id::INT64},
+                              4,
+                              cudf::mask_state::ALL_VALID,
+                              stream,
+                              mr);
+  if (days) {
+    auto const max             = std::numeric_limits<int32_t>::max();
+    std::vector<int32_t> ticks = {std::numeric_limits<int32_t>::min(), -max, max, 0};
+    REQUIRE(cudaMemcpy(col->mutable_view().data<int32_t>(),
+                       ticks.data(),
+                       ticks.size() * sizeof(int32_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+  } else {
+    auto const max             = std::numeric_limits<int64_t>::max();
+    std::vector<int64_t> ticks = {std::numeric_limits<int64_t>::min(), -max, max, 0};
+    REQUIRE(cudaMemcpy(col->mutable_view().data<int64_t>(),
+                       ticks.data(),
+                       ticks.size() * sizeof(int64_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+  }
+  cudf::set_null_mask(col->mutable_view().null_mask(), 3, 4, false, stream);
+  col->set_null_count(1);
+  auto view = cudf::bit_cast(col->view(), sirius::get_cudf_type(type));
+  std::vector<std::unique_ptr<sirius::ast::node>> args;
+  args.push_back(make_ref_typed(0, type));
+  auto expr         = sirius::ast::node{sirius::ast::function_call{
+    function, std::move(args), sirius::logical_type::make(sirius::type_id::BIGINT)}};
+  auto out          = run_native_ast(*space, &expr, cudf::table_view{{view}}, strategy);
+  auto const result = out->view().column(0);
+  std::vector<bool> expected_valids = {true, false, false, false};
+  CHECK(copy_valids_to_host(result) == expected_valids);
+  // INT64_MIN microseconds lies 5.224192 seconds into its minute.
+  CHECK(copy_column_to_host<int64_t>(result)[0] == (days ? 0
+                                                    : function == sirius::function_id::microsecond
+                                                      ? 5224192
+                                                      : 5224));
 }

@@ -17,6 +17,9 @@
 #pragma once
 
 #include <functional>
+#include <optional>
+#include <span>
+#include <utility>
 
 namespace cucascade::memory {
 class memory_space;
@@ -51,5 +54,14 @@ class dynamic_filter_replica_space final {
   std::reference_wrapper<cucascade::memory::memory_space> _gpu_space;
   std::reference_wrapper<cucascade::memory::memory_space const> _host_staging_space;
 };
+
+/**
+ * @brief Finds the first ordered pair of distinct GPUs in @p device_ids without working peer DMA,
+ * as `cucascade::memory::probe_peer_dma_works` reports it.
+ *
+ * @return The pair (source, destination), or no value when peer DMA works between every pair
+ */
+[[nodiscard]] std::optional<std::pair<int, int>> find_pair_without_peer_dma(
+  std::span<int const> device_ids);
 
 }  // namespace sirius::op

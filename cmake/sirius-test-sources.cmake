@@ -69,6 +69,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_distinct_aggregate_fallback.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
+    test/cpp/integration/test_gpu_execution_dynamic_filter_multi_partition.cpp
     test/cpp/integration/test_gpu_execution_expression_fallback.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
     test/cpp/integration/test_gpu_execution_grouping_sets_fallback.cpp
@@ -83,6 +84,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_gpu_execution_setting_scope.cpp
     test/cpp/integration/test_gpu_execution_substring.cpp
+    test/cpp/integration/test_parquet_bloom_filter_pushdown.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_required_null_scan.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
@@ -107,6 +109,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_plan_estimates.cpp
     test/cpp/integration/test_transparent_provider_isolation.cpp
+    test/cpp/integration/test_timestamp_extraction.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/late_mat/test_column_origin.cpp
     test/cpp/late_mat/test_prepared_selection.cpp
@@ -139,6 +142,7 @@ set(TEST_SOURCES
     test/cpp/log/test_duckdb_sink.cpp
     test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
+    test/cpp/scan_manager/test_s3_config_scopes.cpp
     test/cpp/scan_manager/test_prefetching_scheduler.cpp
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
     test/cpp/scan_manager/test_scan_manager_query_state.cpp
@@ -197,6 +201,8 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_probe.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
+    test/cpp/operator/test_complete_build_inventory.cpp
+    test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
@@ -222,6 +228,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
+    test/cpp/pipeline/test_in_task_publication.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_data_size_estimator.cpp
@@ -293,7 +300,9 @@ set(TEST_SOURCES
     test/cpp/utils/utils.cpp
     test/cpp/utils/s3_backend.cpp
     test/cpp/io/s3/test_sirius_httpfs.cpp
+    test/cpp/io/s3/test_duckdb_secret_config.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
+    test/cpp/io/cache/test_cache_object_identity.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)

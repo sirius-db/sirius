@@ -27,6 +27,7 @@
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
@@ -644,11 +645,15 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   return {};
 }
 
-/// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend. Thin alias for the shared helper — kept so
-/// the cache-key and routing call sites below read as they did, while there is
-/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
-std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
+/// Strip a leading "file://" scheme and canonicalize the case-insensitive S3
+/// scheme. Bucket and key bytes remain byte-identical because they are part of
+/// the object-store identity and may be case-sensitive.
+std::string normalize_path(std::string const& p)
+{
+  auto normalized = sirius::io::strip_file_scheme(p);
+  if (sirius::io::s3::is_s3_path(normalized)) { normalized.replace(0, 5, "s3://"); }
+  return normalized;
+}
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -1388,12 +1393,13 @@ sirius_scan_manager::~sirius_scan_manager()
 
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
-  // Footer-probe only when we will actually read + parse the footer.  On a warm
-  // re-bind the metadata_store already holds the parsed footer, so a suffix GET
-  // would download footer bytes we won't reuse — a plain HEAD resolves the size.
+  // Footer-probe only when we will probably read + parse the footer.  When the
+  // metadata_store holds a parsed footer for this path, a suffix GET would most
+  // likely download bytes we won't reuse — a plain HEAD resolves the size, and
+  // the exact-generation lookup below decides whether the footer is reused.
   auto const cache_key     = normalize_path(uri);
   auto const io_ctx        = ioctx_for_path(uri);
-  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
   auto const hint =
     footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
 
@@ -1404,10 +1410,10 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   }
 
   // Reuse a previously parsed footer when present — a prior bind or scan of the
-  // same file parks it in the ioctx metadata store, which lives for the ioctx's
-  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
-  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
-  // so the footer is parsed exactly once per file per process.
+  // same object generation parks it in the ioctx metadata store, which lives
+  // for the ioctx's lifetime. On a miss, fetch + Thrift-parse the footer and
+  // park it so the subsequent scan can reuse it. Mirrors
+  // parquet_gpu_ingestible::build_file_scan_info.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   if (auto cached = datasource->metadata()) {
     if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
@@ -2001,7 +2007,7 @@ void sirius_scan_manager::list_objects_paged(
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: malformed prefix URI '" +
                              s3_prefix_uri + "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto rest = rest_ioctx_for_list(s3_prefix_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2016,7 +2022,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: malformed URI '" + s3_uri +
                              "'");
   }
-  auto* rest = rest_ioctx_for_list();
+  auto rest = rest_ioctx_for_list(s3_uri);
   if (rest == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
@@ -2026,50 +2032,96 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
-  // Normalize here so every caller (incl. the scan resolver, which forwards raw
-  // ingestible paths) routes `file://` the same way create_datasource does.
+  // Normalize raw ingestible paths before routing, including file:// URIs.
   auto file_path = normalize_path(std::string(path));
   auto type      = _ioctx_registry.lookup_path(file_path);
   if (!type) { return nullptr; }
-  return ioctx_for_type(*type);
+  return ioctx_for_type(*type, file_path);
 }
 
 std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_type(
-  sirius::io::io_context_type type)
+  sirius::io::io_context_type type, std::string_view path)
 {
-  // The local default `_io_ctx` already serves uring/kvikio; only an off-default
-  // backend (e.g. s3:// -> restful) needs a separate, lazily-built context.
-  if (_io_ctx && _io_ctx->type() == type) { return _io_ctx; }
+  auto const file_path    = path.empty() ? std::string{} : normalize_path(std::string(path));
+  std::uint64_t config_id = 0;
+  std::shared_ptr<const sirius::io::object_store_config> resolved_config;
+  auto const uses_object_store_config =
+    type == sirius::io::io_context_type::restful || type == sirius::io::io_context_type::kvikio;
+  if (uses_object_store_config && !file_path.empty()) {
+    if (auto snapshot = _s3_configs.resolve(file_path)) {
+      config_id       = snapshot->id;
+      resolved_config = std::move(snapshot->config);
+    }
+  }
+  // ID 0 denotes the manager's default config; installed snapshots have
+  // unique non-zero IDs, so a credential rotation cannot reuse an old ioctx.
+  auto const cache_key = routed_ioctx_key{type, config_id};
+  if (_io_ctx && _io_ctx->type() == type && !resolved_config) { return _io_ctx; }
 
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  // Build outside the map mutex: make_ioctx/start spawn reactor threads and
-  // initialize_cache allocates, so holding _routed_io_ctxs_mtx across them would
-  // park every concurrent lookup behind one long critical section. The build
-  // mutex serializes builders instead, so two first-touches of the same type
-  // never construct twice (a losing ioctx would need drain/stop teardown).
-  std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+  // Serialize construction, not ordinary lookups. A waiting builder rechecks
+  // the scope so it cannot publish an ioctx with superseded credentials.
+  std::unique_lock build_lk{_routed_io_ctxs_build_mtx};
+  if (uses_object_store_config && !file_path.empty()) {
+    auto latest          = _s3_configs.resolve(file_path);
+    auto const latest_id = latest ? latest->id : 0;
+    if (latest_id != config_id) {
+      build_lk.unlock();
+      return ioctx_for_type(type, file_path);
+    }
+  }
   {
     std::lock_guard lk{_routed_io_ctxs_mtx};
-    if (auto it = _routed_io_ctxs.find(type); it != _routed_io_ctxs.end()) { return it->second; }
+    if (auto it = _routed_io_ctxs.find(cache_key); it != _routed_io_ctxs.end()) {
+      return it->second;
+    }
   }
-  auto io_ctx = _ioctx_registry.make_ioctx(type);
+  auto backend_config = _config;
+  if (resolved_config) { backend_config.object_store = *resolved_config; }
+  auto io_ctx = _ioctx_registry.make_ioctx(type, backend_config);
   if (!io_ctx) { return nullptr; }
   io_ctx->start();
   if (_config.cache.use_prefetching_cache() && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
   }
   std::lock_guard lk{_routed_io_ctxs_mtx};
-  auto [it, inserted] = _routed_io_ctxs.emplace(type, std::move(io_ctx));
+  auto [it, inserted] = _routed_io_ctxs.emplace(cache_key, std::move(io_ctx));
   return it->second;
 }
 
-sirius::io::rest::rest_ioctx* sirius_scan_manager::rest_ioctx_for_list()
+std::shared_ptr<sirius::io::rest::rest_ioctx> sirius_scan_manager::rest_ioctx_for_list(
+  std::string_view path)
 {
-  auto io_ctx = ioctx_for_type(sirius::io::io_context_type::restful);
-  return dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
+  return std::dynamic_pointer_cast<sirius::io::rest::rest_ioctx>(
+    ioctx_for_type(sirius::io::io_context_type::restful, path));
+}
+
+void sirius_scan_manager::install_s3_config(std::string_view path,
+                                            sirius::io::object_store_config config)
+{
+  auto scope = normalize_path(std::string(path));
+  std::vector<std::shared_ptr<sirius::io::ioctx>> retired;
+  {
+    // Existing in-flight users retain shared ownership of the old context.
+    std::lock_guard build_lk{_routed_io_ctxs_build_mtx};
+    auto superseded_id = _s3_configs.install(scope, std::move(config));
+    if (superseded_id) {
+      std::lock_guard ctx_lk{_routed_io_ctxs_mtx};
+      for (auto const type :
+           {sirius::io::io_context_type::restful, sirius::io::io_context_type::kvikio}) {
+        auto it = _routed_io_ctxs.find(routed_ioctx_key{type, *superseded_id});
+        if (it != _routed_io_ctxs.end()) {
+          retired.push_back(std::move(it->second));
+          _routed_io_ctxs.erase(it);
+        }
+      }
+    }
+  }
 }
 
 void sirius_scan_manager::query_scan_manager_state::drain() noexcept
@@ -3012,11 +3064,10 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
 
   std::size_t total_bytes = 0;
   for (auto const& path : file_paths) {
-    auto const cache_key = normalize_path(path);
-    auto const io_ctx    = ioctx_for_path(path);
-    bool const footer_cached =
-      io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
-    auto datasource = create_datasource(
+    auto const cache_key     = normalize_path(path);
+    auto const io_ctx        = ioctx_for_path(path);
+    bool const footer_cached = io_ctx && io_ctx->metadata_store().has_path(cache_key);
+    auto datasource          = create_datasource(
       path,
       footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe);
     if (!datasource) {
@@ -3024,7 +3075,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     }
 
     // Same footer resolution as describe_parquet / build_file_scan_info, so a
-    // file is parsed at most once per process however it is first touched.
+    // footer already parsed for this generation is reused however it was first touched.
     std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
     if (auto cached_md = datasource->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached_md))) {

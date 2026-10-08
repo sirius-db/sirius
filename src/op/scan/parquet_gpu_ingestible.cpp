@@ -51,6 +51,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/version_config.hpp>
 
 #include <cuda/std/utility>
 
@@ -138,9 +139,76 @@ bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
          expression_has_null_predicate(expr);
 }
 
-/// @p expr minus every top-level AND conjunct the stats filter cannot handle;
-/// nullptr when none survive. Only meaningful when @p expr is itself unsafe —
-/// callers check that first.
+/// True when the parquet reader's bloom filter probe hashes literals as the
+/// column's parquet physical type: cuDF 26.12 and later (rapidsai/cudf#24320).
+constexpr bool cudf_bloom_filter_probe_is_fixed = CUDF_VERSION_MAJOR > 26 ||
+                                                  (CUDF_VERSION_MAJOR == 26 &&
+                                                   CUDF_VERSION_MINOR >= 12);
+
+/// True when the bloom filter probe of the cuDF we build against is unreliable
+/// for a column of @p type. Always false from cuDF 26.12.
+///
+/// Before 26.12, the probe hashes the literal as the cuDF type instead of the
+/// column's parquet physical type (rapidsai/cudf#24319). 8 and 16-bit integers
+/// (stored as INT32), TIME(MILLIS) and INT96 timestamps drop row groups that
+/// hold the value, a float `0.0` misses `-0.0`, and DECIMAL and BOOLEAN probes
+/// throw. Timestamps are listed because an INT96 column has the same DuckDB
+/// type as an INT64 one.
+bool has_unreliable_bloom_filter_probe(duckdb::LogicalType const& type)
+{
+  if constexpr (cudf_bloom_filter_probe_is_fixed) { return false; }
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN:
+    case duckdb::LogicalTypeId::TINYINT:
+    case duckdb::LogicalTypeId::SMALLINT:
+    case duckdb::LogicalTypeId::UTINYINT:
+    case duckdb::LogicalTypeId::USMALLINT:
+    case duckdb::LogicalTypeId::DECIMAL:
+    case duckdb::LogicalTypeId::FLOAT:
+    case duckdb::LogicalTypeId::DOUBLE:
+    case duckdb::LogicalTypeId::TIME:
+    case duckdb::LogicalTypeId::TIME_NS:
+    case duckdb::LogicalTypeId::TIMESTAMP:
+    case duckdb::LogicalTypeId::TIMESTAMP_SEC:
+    case duckdb::LogicalTypeId::TIMESTAMP_MS:
+    case duckdb::LogicalTypeId::TIMESTAMP_NS:
+    case duckdb::LogicalTypeId::TIMESTAMP_TZ: return true;
+    default: return false;
+  }
+}
+
+/// True when @p expr references a column for which has_unreliable_bloom_filter_probe holds.
+bool references_unreliable_bloom_filter_column(duckdb::Expression const& expr)
+{
+  if (expr.GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
+    return has_unreliable_bloom_filter_probe(expr.return_type);
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expr, [&found](duckdb::Expression const& child) {
+    if (!found) { found = references_unreliable_bloom_filter_column(child); }
+  });
+  return found;
+}
+
+/// True when @p expr contains an equality that cuDF's parquet reader would probe
+/// in a bloom filter of a column for which has_unreliable_bloom_filter_probe holds.
+bool has_unreliable_bloom_filter_equality(duckdb::Expression const& expr)
+{
+  auto const expr_type = expr.GetExpressionType();
+  if ((expr_type == duckdb::ExpressionType::COMPARE_EQUAL ||
+       expr_type == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+      references_unreliable_bloom_filter_column(expr)) {
+    return true;
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(expr, [&found](duckdb::Expression const& child) {
+    if (!found) { found = has_unreliable_bloom_filter_equality(child); }
+  });
+  return found;
+}
+
+/// @p expr minus every top-level AND conjunct for which @p is_dropped holds;
+/// nullptr when none survive. A non-AND @p expr is a single conjunct.
 ///
 /// Sound because pruning on part of a conjunction can only keep extra row
 /// groups, never drop wanted ones: nothing failing `id > 3000` can satisfy
@@ -148,15 +216,19 @@ bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
 /// post-decode.
 ///
 /// Only the top level is split: a compound conjunct (an OR, or a nested AND)
-/// containing anything unsafe is dropped whole. Conservative, not wrong.
-duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression const& expr)
+/// for which @p is_dropped holds is dropped whole. Conservative, not wrong.
+template <typename Predicate>
+duckdb::unique_ptr<duckdb::Expression> conjuncts_without(duckdb::Expression const& expr,
+                                                         Predicate is_dropped)
 {
-  if (expr.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) { return nullptr; }
+  if (expr.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) {
+    return is_dropped(expr) ? nullptr : expr.Copy();
+  }
 
   auto const& conjunction = expr.Cast<duckdb::BoundConjunctionExpression>();
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> kept;
   for (auto const& child : conjunction.children) {
-    if (!is_unsafe_for_stats_filter(*child)) { kept.push_back(child->Copy()); }
+    if (!is_dropped(*child)) { kept.push_back(child->Copy()); }
   }
   if (kept.empty()) { return nullptr; }
   if (kept.size() == 1) { return std::move(kept[0]); }
@@ -661,7 +733,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
         _static_pushdown_expression = std::move(stats_candidate);
       } else if (stats_candidate) {
         _static_pushdown_is_complete = false;
-        _static_pushdown_expression  = stats_safe_conjuncts(*stats_candidate);
+        _static_pushdown_expression  = conjuncts_without(
+          *stats_candidate,
+          [](duckdb::Expression const& conjunct) { return is_unsafe_for_stats_filter(conjunct); });
         // Whatever survives must itself be safe, or the crash returns.
         D_ASSERT(!_static_pushdown_expression ||
                  !is_unsafe_for_stats_filter(*_static_pushdown_expression));
@@ -669,6 +743,23 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
           "[parquet_gpu_ingestible] Predicate is unsupported by the row-group stats filter; "
           "pushing only the safe conjuncts ({}), full predicate applied post-decode: {}",
           _static_pushdown_expression ? _static_pushdown_expression->ToString() : "none",
+          _duckdb_filter_expression->ToString());
+      }
+
+      _reader_pushdown_expression  = _static_pushdown_expression;
+      _reader_pushdown_is_complete = _static_pushdown_is_complete;
+      if (_static_pushdown_expression &&
+          has_unreliable_bloom_filter_equality(*_static_pushdown_expression)) {
+        _reader_pushdown_is_complete = false;
+        _reader_pushdown_expression =
+          conjuncts_without(*_static_pushdown_expression, [](duckdb::Expression const& conjunct) {
+            return has_unreliable_bloom_filter_equality(conjunct);
+          });
+        SIRIUS_LOG_DEBUG(
+          "[parquet_gpu_ingestible] Predicate has an equality on a column with an unreliable "
+          "bloom filter probe. Pushing only the other conjuncts into the reader ({}), full "
+          "predicate applied post-decode: {}",
+          _reader_pushdown_expression ? _reader_pushdown_expression->ToString() : "none",
           _duckdb_filter_expression->ToString());
       }
     }
@@ -796,10 +887,11 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // cuDF's footer reads are served locally (no HEAD, no separate trailer/body
   // GETs). Fall back to a plain cudf datasource only for local paths no sirius
   // backend claims.
-  // Probe only when the footer will actually be read: once the metadata store
-  // holds this file's parsed footer, a suffix GET would download bytes nothing
-  // consumes, and the open only needs the size. Mirrors describe_parquet.
-  bool const footer_cached = io_ctx->metadata_store().get_metadata(file_path) != nullptr;
+  // Probe only when the footer will probably be read: once the metadata store
+  // holds a parsed footer for this path, a suffix GET would most likely download
+  // bytes nothing consumes, and the open only needs the size; the exact
+  // generation lookup below decides reuse. Mirrors describe_parquet.
+  bool const footer_cached = io_ctx->metadata_store().has_path(file_path);
   std::shared_ptr<io::sirius_datasource> sirius_ds;
   {
     sirius_ds = io_ctx->open_datasource(
@@ -1328,8 +1420,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   sirius::op::dynamic_filter_snapshot dynamic_snapshot;
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
-  if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
-    auto sirius_filter_ast = sirius::ast::from_duckdb(*_static_pushdown_expression);
+  if (_reader_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
+    auto sirius_filter_ast = sirius::ast::from_duckdb(*_reader_pushdown_expression);
     D_ASSERT(sirius_filter_ast != nullptr);
     auto name_resolver = [plan = split.plan](duckdb::idx_t ref_index) -> std::string {
       return plan->batch_column_name(ref_index);
@@ -1471,7 +1563,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // The reader discharged the row filter only if it pushed the WHOLE predicate.
   // After a partial push the dropped conjuncts still have to be applied below.
   bool const reader_applied_full_filter =
-    ast_expression.has_value() && _static_pushdown_is_complete;
+    ast_expression.has_value() && _reader_pushdown_is_complete;
 
   if (_plan->has_partitions()) {
     owning_table_view view{std::move(table)};

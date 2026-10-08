@@ -63,6 +63,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -130,6 +131,7 @@ extern "C" int cudaProfilerStop();
 // <blockingconcurrentqueue.h> (used by pipeline / duckdb
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
+#include "io/s3/duckdb_secret_config.hpp"
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
 #include "io/types.hpp"                // sirius::io::ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
@@ -264,6 +266,12 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   // after the runtime is latched unavailable.
   if (sirius_ctx->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE) {
     sirius_ctx->throw_runtime_unavailable();
+  }
+
+  if (sirius::io::s3::is_s3_path(uri)) {
+    auto s3_config = sirius::io::s3::resolve_duckdb_s3_secret(
+      context, uri, sirius_ctx->get_config().get_scan_manager_config().object_store);
+    sirius_ctx->get_scan_manager().install_s3_config(uri, std::move(s3_config));
   }
 
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
@@ -2760,6 +2768,36 @@ static void SetEnableDynamicZoneMapFilter(ClientContext& context, SetScope scope
                    params->enable_dynamic_zone_map_filter);
 }
 
+static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
+                                                 SetScope scope,
+                                                 Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                     = lock_operator_params_slot(context);
+  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
+                   params->enable_dynamic_filter_multi_partition);
+}
+
+static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException(
+      "max_dynamic_filter_bloom_bytes_per_gpu must be greater than zero; set "
+      "enable_dynamic_filter_multi_partition = false to disable Bloom accumulation");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                      = lock_operator_params_slot(context);
+  params->max_dynamic_filter_bloom_bytes_per_gpu = bytes;
+  SIRIUS_LOG_DEBUG("Updated config MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU to {}",
+                   params->max_dynamic_filter_bloom_bytes_per_gpu);
+}
+
 static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                                                     SetScope scope,
                                                     Value& parameter)
@@ -3200,6 +3238,26 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
     Value::DOUBLE(compression_defaults.max_compressed_fraction),
     SetPinTableCompressionMaxCompressedFraction);
 
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_dynamic_filter_multi_partition",
+    "Enable Bloom accumulation for eligible non-broadcast hash builds with more than one "
+    "partition; requires enable_dynamic_filter",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_dynamic_filter_multi_partition),
+    SetEnableDynamicFilterMultiPartition);
+
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "max_dynamic_filter_bloom_bytes_per_gpu",
+    "Aggregate aligned Bloom-array budget in bytes per GPU for multi-partition accumulation; "
+    "must be greater than zero",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(operator_defaults.max_dynamic_filter_bloom_bytes_per_gpu),
+    SetMaxDynamicFilterBloomBytesPerGpu);
+
   config.AddExtensionOption(
     "dynamic_filter_domain_coverage_threshold",
     "Skip publishing a key's dynamic filters when the hash-join build covers at least this "
@@ -3331,6 +3389,10 @@ static void LoadInternal(ExtensionLoader& loader)
   SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusRegistration::RegisterGPUFunctions(db);
   if (!sirius_disabled) { sirius::planner::register_scan_source_callbacks(db); }
+
+  // SIRIUS_S3 is Sirius's S3 secret type. Registering it here lets clients use
+  // CREATE SECRET without installing DuckDB's httpfs extension.
+  sirius::io::s3::register_sirius_s3_secret(SecretManager::Get(db));
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes
