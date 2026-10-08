@@ -56,10 +56,11 @@ jobs:
       - name: Init build submodules
         run: git submodule update --init --depth=1 --jobs 5 duckdb substrait cucascade sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
@@ -158,10 +159,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
           cache: false
-          pixi-version: v0.71.1
+          locked: true
+          pixi-version: v0.81.0
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
