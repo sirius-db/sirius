@@ -161,12 +161,9 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
     throw InternalException("Sirius connection state is unavailable while guarding UPDATE");
   }
 
-  std::optional<SiriusContext::SlotGuard> planning_guard;
-  std::shared_lock<std::shared_mutex> update_guard;
+  sirius::exec::query_admission::permit update_guard;
   if (!connection_state->has_pinned_update_guard()) {
-    planning_guard.emplace(
-      sirius_context, context, sirius::exec::query_admission::access::planning);
-    update_guard = sirius_context.lock_pinned_table_updates();
+    update_guard = sirius_context.acquire_pinned_update_guard(context);
   }
   {
     auto pinned_name = pinned_name_for_table(sirius_context.get_scan_manager(), *target);
@@ -179,9 +176,7 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
     }
   }
 
-  if (update_guard.owns_lock()) {
-    connection_state->set_pinned_update_guard(std::move(update_guard));
-  }
+  if (update_guard) { connection_state->set_pinned_update_guard(std::move(update_guard)); }
 }
 
 /// Resolve the config file path. Search order:
@@ -1364,14 +1359,10 @@ const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const
   return *cuvs_index_cache_;
 }
 
-std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
+sirius::exec::query_admission::permit SiriusContext::acquire_pinned_update_guard(
+  ClientContext& context)
 {
-  return std::shared_lock(pinned_table_update_mutex_);
-}
-
-std::unique_lock<std::shared_mutex> SiriusContext::lock_pinned_table_registry()
-{
-  return std::unique_lock(pinned_table_update_mutex_);
+  return acquire_query_lifecycle_slot(&context, sirius::exec::query_admission::access::writer);
 }
 
 std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_telemetry_context()
@@ -2033,17 +2024,27 @@ void SiriusContext::throw_if_not_initialized() const
 sirius::exec::query_admission::permit SiriusContext::acquire_query_lifecycle_slot(
   ClientContext* context, sirius::exec::query_admission::access kind)
 {
+  const sirius::exec::query_admission::permit* writer = nullptr;
   if (context) {
     auto state = get_sirius_connection_state(*context);
     if (state && state->execution_window_active)
       throw InvalidInputException(
         "Nested Sirius execution windows are unsupported; concurrent FFI fragments require "
         "separate execution contexts");
+    if (state && state->has_pinned_update_guard()) {
+      if (kind == sirius::exec::query_admission::access::maintenance)
+        throw InvalidInputException(
+          "Sirius maintenance cannot run inside a guarded update-producing statement");
+      writer = &state->pinned_update_guard();
+    }
   }
-  return admission_.acquire(kind, [&] {
-    if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
-    if (context && context->IsInterrupted()) throw InterruptException();
-  });
+  return admission_.acquire(
+    kind,
+    [&] {
+      if (get_runtime_health() == runtime_health::UNAVAILABLE) throw_runtime_unavailable();
+      if (context && context->IsInterrupted()) throw InterruptException();
+    },
+    writer);
 }
 
 // ================= Free Functions ================= //
