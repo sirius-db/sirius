@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <set>
 #include <vector>
@@ -127,6 +128,16 @@ TEST_CASE("row_group_start_offset follows the StarRocks reader convention", "[pa
     REQUIRE(row_group_start_offset(meta, 0) == 30);
   }
 
+  SECTION("a file_offset of 0 is absent, so the page offsets decide (the BE would pick 0)")
+  {
+    chunk.meta_data.data_page_offset       = 100;
+    chunk.meta_data.dictionary_page_offset = 60;
+    rg.columns.push_back(chunk);
+    rg.file_offset = 0;
+    meta.row_groups.push_back(rg);
+    REQUIRE(row_group_start_offset(meta, 0) == 60);
+  }
+
   SECTION("no candidate offset at all is a loud error, never a guess")
   {
     rg.columns.push_back(chunk);  // all offsets zero
@@ -163,6 +174,26 @@ TEST_CASE("any exact tiling reads every row group exactly once", "[parquet_byte_
   }
 }
 
+TEST_CASE("a tiling stays exactly-once when a writer leaves file_offset at 0",
+          "[parquet_byte_range]")
+{
+  // Every row group carries file_offset = 0 (written by a writer that never sets it). The rule
+  // ignores that value, so starts come from the page offsets and stay distinct; a rule that took
+  // the 0 would put every row group in the first split.
+  cudf::io::parquet::FileMetaData meta;
+  for (auto const start : std::vector<std::int64_t>{4, 3000, 6000}) {
+    cudf::io::parquet::RowGroup rg;
+    cudf::io::parquet::ColumnChunk chunk;
+    chunk.meta_data.data_page_offset = start;
+    rg.columns.push_back(chunk);
+    rg.file_offset = 0;
+    meta.row_groups.push_back(rg);
+  }
+  REQUIRE(row_groups_in_byte_range(meta, 0, 3000) == std::vector<cudf::size_type>{0});
+  REQUIRE(row_groups_in_byte_range(meta, 3000, 3000) == std::vector<cudf::size_type>{1});
+  REQUIRE(row_groups_in_byte_range(meta, 6000, 3000) == std::vector<cudf::size_type>{2});
+}
+
 TEST_CASE("byte-range ownership edge cases", "[parquet_byte_range]")
 {
   auto const meta = make_metadata({4, 1000, 5000});
@@ -189,6 +220,15 @@ TEST_CASE("byte-range ownership edge cases", "[parquet_byte_range]")
   {
     REQUIRE(row_groups_in_byte_range(meta, 0, 0).empty());
     REQUIRE(row_groups_in_byte_range(meta, 6000, 0).empty());
+  }
+
+  SECTION("an overflowing range is refused, not read as an empty split")
+  {
+    // start + length wraps to 3: without the check this owned nothing and returned no rows.
+    REQUIRE_THROWS_AS(row_groups_in_byte_range(meta, 4, std::numeric_limits<std::uint64_t>::max()),
+                      sirius::invalid_input_exception);
+    REQUIRE(row_groups_in_byte_range(meta, 4, std::numeric_limits<std::uint64_t>::max() - 4) ==
+            std::vector<cudf::size_type>{0, 1, 2});
   }
 
   SECTION("a boundary exactly on a row-group start assigns it to the right-hand range")

@@ -1259,6 +1259,16 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     std::vector<cudf::size_type> owned;
     for (auto const& [start, length] : _info->resolved_file_ranges[file_index]) {
       auto const in_range = detail::row_groups_in_byte_range(metadata, start, length);
+      // A range past EOF means the producer sized the split against a different file. A
+      // zero-length range owns nothing wherever it sits.
+      if (length != 0 && sirius_ds && start + length > sirius_ds->size()) {
+        throw sirius::invalid_input_exception(
+          "byte range ({}, {}) of '{}' ends past the file's {} bytes",
+          start,
+          length,
+          file_path,
+          sirius_ds->size());
+      }
       owned.insert(owned.end(), in_range.begin(), in_range.end());
     }
     std::sort(owned.begin(), owned.end());

@@ -1505,17 +1505,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
   // resolved file later, so install the matching secret snapshot for each path before the bind
   // data moves into the GPU ingestible.
   install_parquet_s3_configs(*table_info, context, sirius_ctx.get());
+  // Remote paths never carry ranges here: extract_scan_byte_ranges refuses them.
   if (auto byte_ranges = context.registered_state->Get<sirius::planner::scan_byte_ranges_state>(
         sirius::planner::scan_byte_ranges_state::kStateKey)) {
-    // The S3 read path has its own footer/prefetch lifecycle that byte ranges were never tested
-    // against; refuse rather than risk a quiet whole-file read.
-    if (scan.function.name == "sirius_read_parquet" &&
-        std::any_of(table_info->resolved_file_paths.begin(),
-                    table_info->resolved_file_paths.end(),
-                    [&](auto const& path) { return byte_ranges->has(path); })) {
-      throw sirius::invalid_input_exception(
-        "byte-range splits are not supported on the sirius_read_parquet (S3) path");
-    }
     attach_byte_ranges(*table_info, *byte_ranges);
   }
   return make_gpu_scan_leaf(std::move(table_info), scan, op_params, mode, sirius_ctx.get());
