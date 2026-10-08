@@ -467,14 +467,6 @@ struct parquet_bind_result {
   std::size_t total_num_rows{0};
 };
 
-/// Number of concurrent queries the scan manager sizes its thread pool for.
-///
-/// Each query's coalescer runs exactly ONE sequencer task that BLOCKS in
-/// queue.wait_dequeue, and is unblocked only by that query's own split_provider tasks
-/// running on the same pool. So every concurrent query needs a parked thread on top of the
-/// working budget. With Q concurrent queries and a pool of size P, Q >= P is a hard
-/// deadlock: every thread parked in a sequencer, none left to feed them.
-///
 /**
  * @brief Manages scan-side preparation for a query.
  *
