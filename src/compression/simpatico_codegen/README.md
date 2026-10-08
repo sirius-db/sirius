@@ -203,11 +203,12 @@ NVRTC options (including `-arch=sm_XX`). See [CACHE_FORMAT.md](CACHE_FORMAT.md).
    half-written file. On a hit the cubin is loaded directly, skipping NVRTC. A corrupt or
    toolchain-incompatible file simply fails to load and falls through to a fresh compile.
 
-The **epoch** is a build-time hash of the objects that generate kernels: the renderers, the
-NVRTC driver with its options, and the embedded headers. Changing any of them, or the
-compiler, starts a new epoch, so stale cubins are never read and there is nothing to clear
-or bump by hand. Other code changes keep the epoch, so the cache stays warm. Each process
-prunes epochs that are no longer recently used.
+The **epoch** is a build-time hash of the objects that compile kernels: the NVRTC driver
+with its options, and the embedded headers. Changing any of them, or the compiler, starts a
+new epoch, so stale cubins are never read and there is nothing to clear or bump by hand.
+Other code changes keep the epoch. A renderer change only recompiles the kernels whose
+source it changes, because the key hashes the source. Each process prunes epochs that are
+no longer recently used.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
 both levels).

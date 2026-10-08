@@ -106,17 +106,17 @@ function(simpatico_apply_build_settings target)
             "${SIMPATICO_XXHASH_INCLUDE_DIR}")
 endfunction()
 
-# The code that turns a JIT cache key into a cubin: the renderers, the NVRTC
-# driver (options + embedded headers), and the key encoding. The JIT cache epoch
-# hashes exactly these objects (see cmake/jit_epoch.cmake), so changing anything
-# else in simpatico keeps the on-disk cubin cache warm.
-# simpatico_jitgen_link_check below keeps this set closed under linking.
+# The code that turns a JIT cache key into a cubin: the NVRTC driver (options +
+# embedded headers) and the key encoding. The key already hashes the rendered
+# source, so the renderers are not needed here. The JIT cache epoch hashes
+# exactly these objects (see cmake/jit_epoch.cmake), so changing anything else
+# in simpatico keeps the on-disk cubin cache warm. simpatico_jitgen_link_check
+# below keeps this set closed under linking.
 add_library(
   simpatico_jitgen OBJECT
   # Generated: complete CCCL header bundle embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}" src/jit/nvrtc_compiler.cpp
-  src/jit/cache_identity.cpp src/encode/jit/renderer.cpp
-  src/decode/jit/renderer.cpp)
+  src/jit/cache_identity.cpp)
 simpatico_apply_build_settings(simpatico_jitgen)
 # Usage requirements (include directories, definitions) only; an OBJECT library
 # links nothing itself.
@@ -165,8 +165,10 @@ add_library(
   src/operators/dictionary_compressor.cu
   src/operators/str_split_compressor.cu
   src/operators/nvcomp_batched_codec.cu
-  # Plain-CUDA JIT host (renderers + NVRTC driver are in simpatico_jitgen)
+  # Plain-CUDA JIT host (the NVRTC driver is in simpatico_jitgen)
   src/jit/kernel_cache.cpp
+  src/encode/jit/renderer.cpp
+  src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
   src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
@@ -245,8 +247,8 @@ add_codegen_host_test(test_decompress_column_rows)
 add_codegen_host_test(test_render_signature_contract)
 
 # Links simpatico_jitgen's objects without the rest of simpatico (or libcudf),
-# so a renderer or NVRTC-driver call into code outside the JIT cache epoch fails
-# the build. See tests/jitgen_link_check.cpp.
+# so an NVRTC-driver call into code outside the JIT cache epoch fails the build.
+# See tests/jitgen_link_check.cpp.
 add_executable(
   simpatico_jitgen_link_check
   tests/jitgen_link_check.cpp $<TARGET_OBJECTS:simpatico_jitgen>

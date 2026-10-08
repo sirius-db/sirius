@@ -20,7 +20,6 @@ fixed for a process. Hash collisions remain theoretically possible.
 `cmake/jit_epoch.cmake` hashes the compiled objects of `simpatico_jitgen` and emits the
 result as `codegen::jit::kJitEpoch` (`src/codegen/jit/jit_epoch.h`). The objects are:
 
-- the encode and decode renderers;
 - the NVRTC driver, which holds the compile options and the embedded project headers;
 - the complete embedded CCCL header bundle;
 - the request encoding below.
@@ -28,13 +27,14 @@ result as `codegen::jit::kJitEpoch` (`src/codegen/jit/jit_epoch.h`). The objects
 The hash covers the SHA-256 of each object's contents, in source order, and is truncated to
 32 lowercase hex digits. Object paths are not part of it.
 
-Any change that can alter the cubin for a given request alters these objects. That
-includes renderer logic, inline header code, emitted CUDA text, embedded headers, NVRTC
-options, and compiler version or flags. Such a change starts a new epoch automatically, so
-there is no version to bump by hand. Changes elsewhere in simpatico (operators, plans,
-launchers, tests) only decide *which* request is made, so they keep the epoch and the
-cache stays warm. Comment-only edits normally keep it as well, unless debug info records
-line numbers.
+A cubin is determined by the request plus what NVRTC sees besides it: embedded headers,
+options and the compiler. Any change to those, including compiler version or flags, alters
+these objects and starts a new epoch automatically, so there is no version to bump by hand.
+The renderers are deliberately outside: the request hashes the rendered source itself, so
+a renderer change that alters a kernel's source already selects a new request, and one that
+doesn't leaves the cubin valid. Changes elsewhere in simpatico (renderers, operators,
+plans, launchers, tests) therefore keep the epoch, and only the affected kernels recompile.
+Comment-only edits normally keep it as well, unless debug info records line numbers.
 
 `simpatico_jitgen_link_check` links the jitgen objects without the rest of simpatico, and
 with section garbage collection disabled. If jitgen code starts calling a non-inline

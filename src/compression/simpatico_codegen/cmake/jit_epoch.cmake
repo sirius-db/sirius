@@ -1,10 +1,10 @@
 # Derive the JIT cache epoch from the compiled objects of simpatico_jitgen: the
-# renderers, the NVRTC driver with its options and embedded headers (project and
-# CCCL), and the cache-key encoding. Any change to the code that turns a cache
-# key into a cubin changes these objects, so cubins cached by an older build are
-# never looked up again. Code outside simpatico_jitgen (operators, plan,
-# launchers, tests) cannot change the cubin for a given key and does not affect
-# the epoch. Invoked via `cmake -P`.
+# NVRTC driver with its options and embedded headers (project and CCCL), and the
+# cache-key encoding. Any change to the code that turns a cache key into a cubin
+# changes these objects, so cubins cached by an older build are never looked up
+# again. Code outside simpatico_jitgen (renderers, operators, plan, launchers,
+# tests) cannot change the cubin for a given key: the key hashes the rendered
+# source itself. Invoked via `cmake -P`.
 #
 # Required -D inputs: OBJECTS_FILE lists the object files, one per line; OUT is
 # the .cpp to generate; STAMP is touched on every run. OUT is rewritten only
