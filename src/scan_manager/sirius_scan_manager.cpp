@@ -1315,13 +1315,9 @@ sirius_scan_manager::sirius_scan_manager(
     _reservation_manager(reservation_manager),
     _topology_index(std::move(topology_index)),
     _physical_counters(std::move(physical_counters)),
-    // num_threads + k_max_concurrent_queries, not num_threads + 1: each query's coalescer
-    // sequencer task BLOCKS (worker_loop -> process_provider_inputs -> queue.wait_dequeue)
-    // and is unblocked only by that query's own split_provider tasks, which run on this same
-    // pool. With Q concurrent queries, Q threads are parked in sequencers at all times, so
-    // sizing for a single sequencer would let Q queries consume the entire working budget
-    // and deadlock by starvation. See k_max_concurrent_queries for the bound and its TODO.
-    _thread_pool(_config.thread_pool.num_threads + k_max_concurrent_queries,
+    // Query execution is serialized by SiriusContext's lifecycle slot. Reserve one extra
+    // worker for the query's blocking coalescer so its producers retain their working budget.
+    _thread_pool(_config.thread_pool.num_threads + 1,
                  _config.thread_pool.thread_name_prefix,
                  _config.thread_pool.cpu_affinity_list),
     _ioctx_registry(config, reservation_manager)
