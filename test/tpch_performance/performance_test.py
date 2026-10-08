@@ -630,6 +630,19 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(
+                f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})"
+            )
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "")
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
 
     if data_source != "duckdb":
         log("Registering TPC-H parquet views")
