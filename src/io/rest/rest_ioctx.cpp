@@ -18,12 +18,16 @@
 
 #include "io/rest/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
+#include "log/logging.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <format>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace sirius::io::rest {
@@ -33,34 +37,6 @@ rest_ioctx::rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::rea
       return std::make_unique<rest_reactor>(ctx, std::format("rest-{}", i++));
     })
 {
-}
-
-rest_perf_snapshot rest_ioctx::perf_snapshot() const noexcept
-{
-  rest_perf_snapshot agg;
-  for (auto const& r : _reactors) {
-    auto const s = r->perf_snapshot();
-    agg.chunk_get_ns_total += s.chunk_get_ns_total;
-    agg.chunk_get_count += s.chunk_get_count;
-    agg.chunk_get_ns_max = std::max(agg.chunk_get_ns_max, s.chunk_get_ns_max);
-    agg.queue_wait_ns_total += s.queue_wait_ns_total;
-    agg.queue_wait_count += s.queue_wait_count;
-    if (s.ttfb_ns != 0 && (agg.ttfb_ns == 0 || s.ttfb_ns < agg.ttfb_ns)) {
-      agg.ttfb_ns = s.ttfb_ns;  // earliest (min non-zero) first-byte across the pool
-    }
-    agg.h2d_observed_ns_total += s.h2d_observed_ns_total;
-    agg.h2d_observed_count += s.h2d_observed_count;
-    agg.h2d_observed_ns_max = std::max(agg.h2d_observed_ns_max, s.h2d_observed_ns_max);
-    agg.retries_total += s.retries_total;
-    agg.terminal_failures_total += s.terminal_failures_total;
-    agg.device_stream_sync_total += s.device_stream_sync_total;
-    agg.payload_bytes_read_total += s.payload_bytes_read_total;
-    agg.blocking_host_get_count += s.blocking_host_get_count;
-    agg.blocking_host_get_wall_ns_total += s.blocking_host_get_wall_ns_total;
-    agg.blocking_host_get_wall_ns_max =
-      std::max(agg.blocking_host_get_wall_ns_max, s.blocking_host_get_wall_ns_max);
-  }
-  return agg;
 }
 
 void rest_ioctx::list_objects_paged(
@@ -162,14 +138,35 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
   if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
 
   // A blocking HEAD on the caller thread (a one-time metadata round-trip) via
-  // any reactor's authorizer — head_object_size uses a local easy handle and
+  // any reactor's authorizer — head_object uses a local easy handle and
   // does not touch worker state, so any reactor is equivalent.
-  auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          head.object_size,
-                                          std::move(head.etag));
+  auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           head.object_size,
+                                                           std::move(head.etag)));
+}
+
+std::shared_ptr<io_object> rest_ioctx::note_unqualified(std::shared_ptr<io_object> obj)
+{
+  if (rest_io_object::is_strong_tag(obj->validation_tag())) { return obj; }
+  constexpr std::size_t k_max_warned_paths = 64;
+  auto const& path                         = obj->object_path();
+  {
+    std::lock_guard lk(_unqualified_mtx);
+    if (std::ranges::find(_unqualified_paths, path) != _unqualified_paths.end()) { return obj; }
+    if (_unqualified_paths.size() == k_max_warned_paths) { _unqualified_paths.clear(); }
+    _unqualified_paths.push_back(path);
+  }
+  auto const tag = obj->validation_tag();
+  SIRIUS_LOG_WARN(
+    "rest_ioctx: '{}' opened with {} ETag; its bytes and metadata are cached only within this open",
+    path,
+    tag.empty()             ? "no"
+    : tag.starts_with("W/") ? "a weak"
+                            : "a malformed");
+  return obj;
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
@@ -189,10 +186,68 @@ std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::u
   }
   // The size came from a ListObjectsV2 response: build the io_object with zero
   // network — no HEAD, no probe.
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          static_cast<size_t>(known_size));
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           static_cast<size_t>(known_size)));
+}
+
+namespace {
+
+/// The bucket out of an @c s3:// URL, whether or not it names an object.
+///
+/// @c io::parse cannot serve this: it rejects a bucket-only URL with "empty
+/// object key", which is exactly the shape a warm-up takes -- warming is about
+/// the endpoint, and naming a data file to reach it would be beside the point.
+std::optional<std::string> bucket_of(std::string_view url)
+{
+  constexpr std::string_view k_scheme = "s3://";
+  if (url.size() <= k_scheme.size()) { return std::nullopt; }
+  for (std::size_t i = 0; i < k_scheme.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(url[i])) != k_scheme[i]) { return std::nullopt; }
+  }
+  auto const rest   = url.substr(k_scheme.size());
+  auto const bucket = rest.substr(0, rest.find('/'));
+  if (bucket.empty()) { return std::nullopt; }
+  return std::string{bucket};
+}
+
+}  // namespace
+
+void rest_ioctx::warmup(std::string_view bucket_url) noexcept
+{
+  try {
+    // Only the bucket is read: an object key, if the caller passed one, names
+    // nothing the connection pool cares about.
+    auto const bucket = bucket_of(bucket_url);
+    if (!bucket.has_value()) { return; }
+
+    // Connections are per-endpoint, so the bucket -- not the object -- is the
+    // identity that decides whether a warm-up is redundant. A thousand-file
+    // scan calling this per file collapses to one round.
+    {
+      std::lock_guard lk{_warm_mtx};
+      auto const now = std::chrono::steady_clock::now();
+      // conn_max_age of 0 means "no cap" to libcurl, which leaves us no honest
+      // staleness horizon; fall back to a minute rather than re-warm forever.
+      auto const stale_after =
+        _config.conn_max_age.count() > 0
+          ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
+          : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::seconds{60});
+      bool const same_bucket = _warmed_bucket == *bucket;
+      if (same_bucket && _warmed_at.has_value() && now - *_warmed_at < stale_after) { return; }
+      _warmed_bucket = *bucket;
+      _warmed_at     = now;
+    }
+
+    for (auto& reactor : _reactors) {
+      if (reactor) { reactor->warmup(*bucket); }
+    }
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Warming is an optimization; a query that would have run without it still
+    // runs. Nothing here is worth failing a read over.
+  }
 }
 
 std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string path)
@@ -211,20 +266,20 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
   if (!probe.bytes) {
     // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
     // fall back to a plain HEAD for the size, with no stash.
-    auto head = _reactors.front()->head_object_size(parsed.host, parsed.path);
-    return std::make_shared<rest_io_object>(std::move(path),
-                                            std::move(parsed.host),
-                                            std::move(parsed.path),
-                                            head.object_size,
-                                            std::move(head.etag));
+    auto head = _reactors.front()->head_object(parsed.host, parsed.path);
+    return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                             std::move(parsed.host),
+                                                             std::move(parsed.path),
+                                                             head.object_size,
+                                                             std::move(head.etag)));
   }
-  return std::make_shared<rest_io_object>(std::move(path),
-                                          std::move(parsed.host),
-                                          std::move(parsed.path),
-                                          probe.object_size,
-                                          probe.window_lo,
-                                          probe.bytes,
-                                          std::move(probe.etag));
+  return note_unqualified(std::make_shared<rest_io_object>(std::move(path),
+                                                           std::move(parsed.host),
+                                                           std::move(parsed.path),
+                                                           probe.object_size,
+                                                           probe.window_lo,
+                                                           probe.bytes,
+                                                           std::move(probe.etag)));
 }
 
 }  // namespace sirius::io::rest

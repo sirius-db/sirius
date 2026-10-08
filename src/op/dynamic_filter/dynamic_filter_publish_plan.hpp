@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter/config.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
@@ -54,9 +55,11 @@ struct dynamic_filter_publication_policy {
   static constexpr double k_default_domain_coverage_threshold = 0.9;
   static constexpr double k_default_inlist_max_l2_fraction    = 0.125;
 
-  bool emit_zone_map_filters       = false;
-  double domain_coverage_threshold = k_default_domain_coverage_threshold;
-  double inlist_max_l2_fraction    = k_default_inlist_max_l2_fraction;
+  bool emit_zone_map_filters            = false;
+  double domain_coverage_threshold      = k_default_domain_coverage_threshold;
+  double inlist_max_l2_fraction         = k_default_inlist_max_l2_fraction;
+  bool enable_multi_partition           = false;
+  std::uint64_t max_bloom_bytes_per_gpu = default_max_dynamic_filter_bloom_bytes_per_gpu;
 };
 
 /**
@@ -88,7 +91,8 @@ class dynamic_filter_publish_plan final {
     std::size_t admitted_key_index = 0;
     // Target consumer output ordinal.
     std::size_t channel_push_ordinal = 0;
-    // EMPTY suppresses zone maps; direct routes require an exact INT32 or INT64 match.
+    // EMPTY suppresses zone maps; direct routes require an exact match of a membership-supported
+    // type (see membership_key_supported).
     cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
 
     [[nodiscard]] bool operator==(key_binding const&) const = default;
@@ -142,6 +146,14 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] double inlist_max_l2_fraction() const noexcept
   {
     return _policy.inlist_max_l2_fraction;
+  }
+  [[nodiscard]] bool multi_partition_enabled() const noexcept
+  {
+    return _policy.enable_multi_partition && enabled();
+  }
+  [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
+  {
+    return _policy.max_bloom_bytes_per_gpu;
   }
 
   /**

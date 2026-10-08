@@ -26,9 +26,10 @@
  *
  * A carried `DISTINCT ON` column may come from any row of its group on either engine, so a full row
  * comparison is only valid over `dist_fd`, whose carried column is a function of its key. Elsewhere
- * `compare_gpu_vs_cpu_on_keys` compares the row count and the key columns alone. The floating-point
- * cases use it too, because a group holding both 0.0 and -0.0, or NaN and -NaN, prints as whichever
- * member each engine keeps.
+ * `compare_gpu_vs_cpu_on_keys` compares the row count and the key columns alone.
+ *
+ * The floating-point cases use `compare_gpu_vs_cpu_canonical` instead: a group holding both 0.0 and
+ * -0.0, or NaN and -NaN, prints as whichever member each engine keeps.
  *
  * Every DISTINCT guard throws during `create_plan`, before any GPU work is scheduled, so the
  * guarded shapes use `expect_plan_fallback_matches_cpu` and assert the plan-time fallback counter
@@ -38,55 +39,16 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace {
-
-/// Sets a session/global setting for the enclosing scope and resets it on the way out, including
-/// when a REQUIRE fails and unwinds. Every `[integration]` fixture borrows its connection from the
-/// shared `g_integration_env`, which outlives the case, and `default_collation` is
-/// GLOBAL_DEFAULT-scoped -- so a setting left behind by a failed assertion would reach every later
-/// integration case in the binary.
-class scoped_setting {
- public:
-  /// @p literal is spliced into the SET statement verbatim, so string values carry their quotes.
-  scoped_setting(sirius::test::GpuExecutionFixture& fixture,
-                 std::string name,
-                 std::string const& literal)
-    : fixture_(fixture), name_(std::move(name))
-  {
-    fixture_.run_ok("SET " + name_ + " = " + literal + ";");
-  }
-
-  /// Resets through the raw connection rather than run_ok(): a Catch2 assertion during unwinding
-  /// terminates, and a poisoned connection here is already being reported by the failure above.
-  ~scoped_setting() { fixture_.con->Query("RESET " + name_ + ";"); }
-
-  scoped_setting(scoped_setting const&)            = delete;
-  scoped_setting& operator=(scoped_setting const&) = delete;
-  scoped_setting(scoped_setting&&)                 = delete;
-  scoped_setting& operator=(scoped_setting&&)      = delete;
-
- private:
-  sirius::test::GpuExecutionFixture& fixture_;
-  std::string name_;
-};
-
-/// NaN and -NaN, and 0.0 and -0.0, are one group to both engines and print differently, so either
-/// engine may report either member. Maps each pair to one spelling.
-std::string canonical_key(std::string cell)
-{
-  if (cell == "-nan") { return "nan"; }
-  if (cell.size() > 1 && cell.front() == '-' &&
-      cell.find_first_not_of("0.", 1) == std::string::npos) {
-    cell.erase(0, 1);
-  }
-  return cell;
-}
 
 /// Runs @p query on the GPU and on the CPU and compares the row count and the @p key_columns of
 /// each row, after asserting one GPU execution with no fallback. Reads the query's own result
@@ -119,7 +81,7 @@ void compare_gpu_vs_cpu_on_keys(sirius::test::GpuExecutionFixture& fixture,
       std::vector<std::string> key;
       for (auto const column : key_columns) {
         REQUIRE(column < row.size());
-        key.push_back(canonical_key(row[column]));
+        key.push_back(sirius::test::GpuExecutionFixture::canonical_float_key(row[column]));
       }
       keys.push_back(std::move(key));
     }
@@ -158,11 +120,19 @@ class DistinctFixture : public sirius::test::GpuExecutionFixture {
     );
     run_ok("CREATE TABLE dist_r (a INTEGER, x INTEGER);");
     run_ok("INSERT INTO dist_r VALUES (1, 10), (2, 20), (2, 21), (3, 30), (NULL, 40);");
+    run_ok("CREATE TABLE dist_empty (a INTEGER, b INTEGER);");
     // `v` is a function of `k`, so a DISTINCT ON over `k` has one correct answer whichever row
     // represents a group. The carried and guarded shapes need that: DISTINCT ON without ORDER BY
     // may pick a different row on each run and on each engine.
     run_ok("CREATE TABLE dist_fd (k INTEGER, v INTEGER);");
     run_ok("INSERT INTO dist_fd VALUES (1, 10), (1, 10), (2, 20), (2, 20), (3, 30), (NULL, NULL);");
+    // Per-`k` sums reach both ends of BIGINT exactly, plus a negative, a zero and a NULL group.
+    run_ok("CREATE TABLE dist_sum (k INTEGER, x BIGINT);");
+    run_ok(
+      "INSERT INTO dist_sum VALUES "
+      "(1, -4611686018427387904), (1, -4611686018427387904),"
+      "(2, 4611686018427387904), (2, 4611686018427387903),"
+      "(3, -5), (3, 2), (4, 0), (NULL, 7);");
     run_ok("CHECKPOINT;");
   }
 };
@@ -411,6 +381,13 @@ TEST_CASE_METHOD(DistinctFixture,
 }
 
 TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT directly over a grouped sum",
+                 "[integration][gpu_execution][distinct][aggregate]")
+{
+  compare_gpu_vs_cpu("SELECT DISTINCT k, sum(x) FROM dist_sum GROUP BY k");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT inside a correlated subquery",
                  "[integration][gpu_execution][distinct][join]")
 {
@@ -444,6 +421,30 @@ TEST_CASE_METHOD(DistinctFixture,
     "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
   compare_gpu_vs_cpu(
     "SELECT DISTINCT a FROM (WITH c AS MATERIALIZED (SELECT a, b FROM dist_t) SELECT * FROM c) s");
+  // Nested: `d` is read twice and joined on `b`, so it stays wider than the body under `c`.
+  compare_gpu_vs_cpu(
+    "SELECT DISTINCT * FROM (WITH c AS MATERIALIZED (SELECT a FROM dist_t), "
+    "d AS MATERIALIZED (SELECT a, b FROM dist_t) "
+    "SELECT d1.a FROM d d1 JOIN d d2 ON d1.b = d2.b JOIN c ON c.a = d1.a) s");
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT over zero input rows",
+                 "[integration][gpu_execution][distinct]")
+{
+  SECTION("empty table") { compare_gpu_vs_cpu("SELECT DISTINCT a, b FROM dist_empty"); }
+
+  // 15 lies inside x's min/max, so the scan and its filter survive planning.
+  SECTION("filter that keeps no row")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT a, x FROM dist_r WHERE x = 15");
+  }
+
+  // Outside a's min/max, statistics fold the scan (not the DISTINCT) to EMPTY_RESULT.
+  SECTION("scan folded to an empty result")
+  {
+    compare_gpu_vs_cpu("SELECT DISTINCT a, b FROM dist_t WHERE a > 1000");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -492,7 +493,8 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // The default batch size scans dist_dup in one batch, leaving the merge nothing to combine.
   SECTION("many scan batches")
   {
-    scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+    sirius::test::scoped_sirius_setting batch_size{
+      *con, "scan_task_batch_size", std::uint64_t{1048576}};
     compare_gpu_vs_cpu("SELECT DISTINCT k FROM dist_dup");
   }
 }
@@ -512,7 +514,8 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // group_idx rather than on its leading column would dedup on `payload` and return every row.
   SECTION("many scan batches")
   {
-    scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+    sirius::test::scoped_sirius_setting batch_size{
+      *con, "scan_task_batch_size", std::uint64_t{1048576}};
     compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT ON (k) k, payload FROM dist_dup", {0});
     compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT ON (k) payload, k FROM dist_dup", {1});
   }
@@ -525,7 +528,8 @@ TEST_CASE_METHOD(DistinctBulkFixture,
   // Small scan batches make the merge combine partial rows. `payload` varies within each group, so
   // the check is structural rather than a row comparison: `a % 10 = k` catches a gather from the
   // wrong group, `a + b` two FIRSTs taken from different rows, and `c` a column swap.
-  scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
   compare_gpu_vs_cpu(
     "SELECT count(*) FROM ("
     "  SELECT k, first(payload) AS a, first(1000000 - payload) AS b, count(*) AS c,"
@@ -553,7 +557,8 @@ TEST_CASE_METHOD(DistinctBulkFixture,
                  "gpu_execution nested carried columns over many batches",
                  "[integration][gpu_execution][distinct][aggregate]")
 {
-  scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+  sirius::test::scoped_sirius_setting batch_size{
+    *con, "scan_task_batch_size", std::uint64_t{1048576}};
   run_ok("CREATE TABLE dist_dup_arr AS SELECT k, [k, k]::BIGINT[2] AS arr FROM dist_dup;");
   run_ok("CHECKPOINT;");
   compare_gpu_vs_cpu("SELECT DISTINCT ON (k) k, arr FROM dist_dup_arr");
@@ -642,8 +647,43 @@ TEST_CASE_METHOD(DistinctFixture,
   // default_collation the key arrives as a call rather than as a bare reference and the builder's
   // uncovered-output guard refuses it. Every `s_short` value is already lower case, so each nocase
   // group holds one original value and the two CPU runs cannot disagree about which row it is.
-  scoped_setting collation(*this, "default_collation", "'nocase'");
-  expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
+  auto const prior_result = con->Query("SELECT current_setting('default_collation');");
+  REQUIRE(prior_result);
+  REQUIRE_FALSE(prior_result->HasError());
+  auto const prior = prior_result->GetValue(0, 0);
+  {
+    sirius::test::scoped_sirius_setting collation{*con, "default_collation", "nocase"};
+    expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
+  }
+  // A failed restore would leak nocase into every later integration case.
+  REQUIRE(con->Query("SELECT current_setting('default_collation');")->GetValue(0, 0) == prior);
+}
+
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution distinct UNION falls back at plan time",
+                 "[integration][gpu_execution][distinct]")
+{
+  // Each binds as a DISTINCT directly over a UNION ALL, the shape the builder refuses. The
+  // message check pins the refusal to that guard: a fallback from any other refusal, such as a
+  // compress projection when compressed materialization is on, must fail here. Another fixture
+  // may have cleared the mask Sirius publishes at load, so restate it.
+  sirius::test::scoped_sirius_setting optimizer_mask{
+    *con, "disabled_optimizers", "in_clause,compressed_materialization,late_materialization"};
+  auto const expect_union_refused = [this](std::string const& query) {
+    expect_plan_fallback_matches_cpu(query);
+    sirius::test::scoped_sirius_setting no_fallback{*con, "enable_duckdb_fallback", false};
+    auto const result = con->Query(query);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Matchers::ContainsSubstring("DISTINCT over a UNION"));
+  };
+  expect_union_refused("SELECT a FROM dist_t UNION SELECT a FROM dist_r");
+  expect_union_refused("SELECT a, x FROM dist_r UNION BY NAME SELECT x, a FROM dist_r");
+  expect_union_refused(
+    "SELECT a FROM dist_t UNION SELECT a FROM dist_r UNION SELECT k FROM dist_fd");
+  expect_union_refused(
+    "SELECT a FROM dist_t UNION ALL SELECT a FROM dist_r UNION SELECT k FROM dist_fd");
+  expect_union_refused("SELECT a FROM dist_t UNION SELECT a FROM dist_r ORDER BY a NULLS LAST");
 }
 
 /// Floating-point keys carrying every value whose equality is decided by something other than
@@ -694,16 +734,13 @@ TEST_CASE_METHOD(DistinctFloatFixture,
   // groups both pairs. A disagreement is a wrong answer, not a fallback: the exact row count
   // catches a pair that fails to collapse, and the keys are compared with each pair's two spellings
   // treated as one, because either engine may keep either member.
-  SECTION("DOUBLE") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d FROM dist_fp", {0}); }
+  SECTION("DOUBLE") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT d FROM dist_fp"); }
 
-  SECTION("REAL") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT f FROM dist_fp", {0}); }
+  SECTION("REAL") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT f FROM dist_fp"); }
 
   // A composite key runs the same comparator over a two-column row, which is the shape the
   // single-column cases cannot reach.
-  SECTION("both columns")
-  {
-    compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d, f FROM dist_fp", {0, 1});
-  }
+  SECTION("both columns") { compare_gpu_vs_cpu_canonical("SELECT DISTINCT d, f FROM dist_fp"); }
 
   // Exact, not canonicalized: the sections above prove nothing if the scan drops the sign bit.
   SECTION("the GPU scan keeps a negative zero")

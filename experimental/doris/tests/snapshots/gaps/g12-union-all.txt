@@ -1,0 +1,9 @@
+# g12-union-all: 4 fragments (root first):
+#   fragment_id=4 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=3 sink=DATA_STREAM_SINK nodes=[UNION_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/gaps/g12-union-all/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: UNION_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+translation error: unsupported plan node UNION_NODE at node 4: plan node type is not translated (see the node table in node_translator.rs)

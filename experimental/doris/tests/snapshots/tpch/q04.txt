@@ -1,0 +1,37 @@
+# q04: 5 fragments (root first):
+#   fragment_id=5 sink=RESULT_SINK nodes=[SORT_NODE > EXCHANGE_NODE]
+#   fragment_id=4 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=3 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q04/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_boolean
+  @  3: extension:io.substrait:functions_aggregate_generic
+Functions:
+  #  1 @  1: gte
+  #  2 @  1: lt
+  #  3 @  2: and
+  #  4 @  1: equal
+  #  5 @  3: count
+
+=== Plan
+Root[o_orderpriority, order_count]
+  Project[$0, $1]
+    Sort[($0, &AscNullsFirst) => $0, $1]
+      Project[$0, ($1)::!i64]
+        Aggregate[$0 => $0, count():i64]
+          Project[$1]
+            Join[&LeftSemi, equal($0, $2):boolean? => $0, $1]
+              Project[$0, $2]
+                Filter[and(gte($1, '1993-07-01':date):boolean?, lt($1, '1993-10-01':date):boolean?):boolean? => $0, $1, $2]
+                  Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_orderdate:date?, o_orderpriority:string?]
+              Project[$0]
+                Filter[lt($1, $2):boolean? => $0, $1, $2]
+                  Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_orderkey:i64?, l_commitdate:date?, l_receiptdate:date?]

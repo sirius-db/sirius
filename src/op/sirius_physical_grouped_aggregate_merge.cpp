@@ -160,7 +160,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
-  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, num_gpus());
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
@@ -173,7 +173,12 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
       }
     }
   }
-  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+  return partition_strategy{natural,
+                            /*broadcast=*/false,
+                            /*build_probe=*/false,
+                            natural == 1 ? partition_placement::unpinned(1)
+                                         : partition_placement::round_robin(
+                                             static_cast<std::size_t>(natural), active_gpu_ids())};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
@@ -195,11 +200,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
     }
     current_partition_index++;
     if (input_batch.empty()) { return nullptr; }
-    // Tag with the source partition index so the scheduler pins this task to
-    // partition_idx % num_gpus. merge_group_by materializes a cuco hash table
-    // to combine its input batches, so — like hash_join — every task of a
-    // given partition must stay on a single GPU.
-    return std::make_unique<partitioned_operator_data>(std::move(input_batch), this_partition_id);
+    // Each partition is drained into one task; its merge state is task-local. A lone partition
+    // follows input locality, while multiple partitions retain round-robin placement.
+    auto const placement = this->placement();
+    return std::make_unique<partitioned_operator_data>(
+      std::move(input_batch), this_partition_id, *placement);
   } else {
     return nullptr;
   }

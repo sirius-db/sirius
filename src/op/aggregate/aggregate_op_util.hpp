@@ -21,10 +21,17 @@
 #include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -44,6 +51,26 @@ namespace op {
  * the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
+
+/// The type a SUM over a column of type @p type is computed in when it must not overflow the
+/// input width: the next wider decimal type for DECIMAL32 and DECIMAL64, nullopt otherwise.
+std::optional<cudf::data_type> widened_decimal_sum_type(cudf::data_type type);
+
+/// The columns among @p candidates (indices into @p table; DECIMAL32 or DECIMAL64) whose SUM over
+/// this batch could overflow the column's own storage width and so must be summed over a wider
+/// decimal type.
+///
+/// A sum of n values of magnitude at most m is at most n * m, so rows * max|value| within the
+/// storage width (2^31-1 or 2^63-1) rules out wrap-around in every group. The bound is exact. It
+/// lets columns with small values, such as TPC-H's DECIMAL(15,2), skip the widening copy and the
+/// 128-bit accumulation. Nulls are skipped, and a column with no valid value cannot overflow.
+/// All cudf::minmax passes are launched first and their results come back in one device-to-host
+/// copy, so a batch costs a single stream synchronization. Throws sirius::internal_exception if a
+/// candidate is not DECIMAL32 or DECIMAL64.
+std::unordered_set<int> decimal_sums_needing_widening(cudf::table_view const& table,
+                                                      std::vector<int> const& candidates,
+                                                      ::cuda::stream_ref stream,
+                                                      rmm::device_async_resource_ref mr);
 
 /** @brief An aggregate answered by one cuDF request whose partial is also its output. */
 struct plain_slot {

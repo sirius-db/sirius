@@ -58,7 +58,7 @@ namespace sirius::op::scan {
 class iceberg_metadata_connection {
  public:
   explicit iceberg_metadata_connection(duckdb::ClientContext& context)
-    : _conn(*context.db), _conn_guard(*_conn.context)
+    : _conn(duckdb::SiriusContext::open_internal_connection(context))
   {
     // Session-scoped settings that change which tables are LEGIBLE. Every site that reads Iceberg
     // metadata must agree on this set: if the delete gate and the delete discovery disagree about
@@ -74,11 +74,12 @@ class iceberg_metadata_connection {
       if (!context.TryGetCurrentSetting(setting, value) || value.IsNull()) { continue; }
       bool const outer_effective =
         value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
-      _conn.Query(std::string("SET ") + setting + " = " + (outer_effective ? "true" : "false"));
+      _conn.Query(std::string("SET SESSION ") + setting + " = " +
+                  (outer_effective ? "true" : "false"));
     }
   }
 
-  duckdb::Connection& get() { return _conn; }
+  duckdb::SiriusContext::internal_connection& get() { return _conn; }
 
   duckdb::unique_ptr<duckdb::MaterializedQueryResult> Query(std::string const& sql)
   {
@@ -86,12 +87,7 @@ class iceberg_metadata_connection {
   }
 
  private:
-  duckdb::Connection _conn;
-  // Per-connection bracket. Opening a connection to the same database re-registers the SAME
-  // SiriusContext, whose query-lifecycle callbacks would otherwise fire QueryBegin/QueryEnd
-  // underneath the query being planned; and unbracketed these contend for the plan slot the outer
-  // query already holds. Declared after _conn so it is constructed from a live connection.
-  duckdb::SiriusContext::InternalQueryGuard _conn_guard;
+  duckdb::SiriusContext::internal_connection _conn;
 };
 
 }  // namespace sirius::op::scan

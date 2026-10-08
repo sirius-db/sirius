@@ -1,0 +1,190 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    cntrycode[#52]
+    numcust[#53]
+    totacctbal[#54]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  15:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: cntrycode[#52]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: cntrycode[#46]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    UNPARTITIONED
+IS_MERGE: true
+
+  14:VSORT(1580)
+  |  order by: cntrycode[#52] ASC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  13:VAGGREGATE (merge finalize)(1576)
+  |  output: count(partial_count(*)[#48])[#50], sum(partial_sum(c_acctbal)[#47])[#51]
+  |  group by: cntrycode[#46]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: cntrycode[#46]
+  |  
+  12:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    HASH_PARTITIONED: cntrycode[#46]
+
+  11:VAGGREGATE (update serialize)(1568)
+  |  STREAMING
+  |  output: partial_sum(c_acctbal[#45])[#47], partial_count(*)[#48]
+  |  group by: cntrycode[#44]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  10:VNESTED LOOP JOIN(1560)
+  |  join op: INNER JOIN()
+  |  join conjuncts: (cast(c_acctbal as DECIMALV3(38, 4))[#43] > avg(c_acctbal)[#40])
+  |  cardinality=0
+  |  vIntermediate tuple ids: 10 
+  |  final projections: substring(c_phone[#41], 1, 2), c_acctbal[#42]
+  |  final project output tuple id: 11
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----5:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  9:VAGGREGATE (merge finalize)(1522)
+  |  output: avg(partial_avg(c_acctbal)[#38])[#39]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  8:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    UNPARTITIONED
+
+  7:VAGGREGATE (update serialize)(1514)
+  |  output: partial_avg(c_acctbal[#37])[#38]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  6:VTVF_SCAN_NODE(1502)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.c_acctbal[#34] > 0.00), substring(_tvf_local.c_phone[#33], 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')
+     inputSplitNum=1, totalFileSize=10766836, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.c_acctbal[#34]
+     final project output tuple id: 7
+
+PLAN FRAGMENT 4
+
+  PARTITION: HASH_PARTITIONED: o_custkey[#21]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    UNPARTITIONED
+
+  4:VHASH JOIN(1548)
+  |  join op: RIGHT ANTI JOIN(PARTITIONED)[]
+  |  equal join conjunct: (o_custkey[#21] = c_custkey[#11])
+  |  cardinality=0
+  |  vec output tuple id: 5
+  |  output tuple id: 5
+  |  vIntermediate tuple ids: 4 
+  |  hash output slot ids: 8 9 10 
+  |  final projections: c_phone[#22], c_acctbal[#23], cast(c_acctbal as DECIMALV3(38, 4))[#24]
+  |  final project output tuple id: 5
+  |  distribute expr lists: o_custkey[#21]
+  |  distribute expr lists: c_custkey[#11]
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  3:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: o_custkey[#21]
+
+  2:VTVF_SCAN_NODE(1523)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=41097446, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.o_custkey[#13]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 6
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: c_custkey[#11]
+
+  0:VTVF_SCAN_NODE(1532)
+     table: null.null.LocalTableValuedFunction
+     predicates: substring(_tvf_local.c_phone[#4], 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')
+     inputSplitNum=1, totalFileSize=10766836, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.c_phone[#4], _tvf_local.c_acctbal[#5], CAST(_tvf_local.c_acctbal[#5] AS decimalv3(38,4)), _tvf_local.c_custkey[#0]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

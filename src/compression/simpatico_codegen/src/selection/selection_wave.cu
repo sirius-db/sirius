@@ -144,14 +144,20 @@ __global__ void chunk_offsets_tail_kernel(uint32_t const* __restrict__ counts,
 // mask -> ascending survivor row ids. One warp per chunk: lane l owns word l,
 // warp-exclusive shfl_up prefix of popcounts gives each word's output base
 // inside the chunk; bits are drained in ascending order so the global output
-// is fully ordered (cudf gather map contract). Ported from the microbench's
-// load_mask_scan/k2a idiom, flattened to warp shuffles (no smem, no block sync).
+// is fully ordered (cudf gather map contract).
+//
+// The chunk's ids are staged in a per-warp shared buffer and written out as one contiguous run:
+// draining straight to global makes every store instruction hit 32 different cache lines (each
+// lane writes its own slice), while the staged copy is one coalesced 128-byte store per 32 ids.
 __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
                                        uint32_t const* __restrict__ chunk_offsets,
                                        int64_t num_chunks,
                                        int32_t* __restrict__ out)
 {
+  extern __shared__ int32_t staged_all[];
   int const lane               = threadIdx.x & 31;
+  int const warp_in_block      = threadIdx.x >> 5;
+  int32_t* const staged        = staged_all + warp_in_block * SELECTION_CHUNK_ROWS;
   int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
   int64_t warp                 = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
   for (; warp < num_chunks; warp += warps_per_grid) {
@@ -162,32 +168,72 @@ __global__ void mask_to_indices_kernel(uint32_t const* __restrict__ words,
       int const y = __shfl_up_sync(kFullWarp, x, o);
       if (lane >= o) x += y;
     }
-    int64_t base       = chunk_offsets[warp] + static_cast<int64_t>(x - pc);
+    int const total    = __shfl_sync(kFullWarp, x, 31);
+    int local          = x - pc;
     int32_t const row0 = static_cast<int32_t>(warp * SELECTION_CHUNK_ROWS) + lane * 32;
     while (wv) {
       int const b = __ffs(wv) - 1;
       wv &= wv - 1u;
-      out[base++] = row0 + b;
+      staged[local++] = row0 + b;
     }
+    __syncwarp();
+    int32_t* const dst = out + chunk_offsets[warp];
+    for (int i = lane; i < total; i += 32)
+      dst[i] = staged[i];
+    __syncwarp();
   }
 }
 
-// BOOL8 flags -> packed mask words. One warp per word: lane l tests row
-// w*32+l, ballot packs the word, lane 0 stores it. Grid-stride over the FULL
-// padded strip; rows beyond num_rows ballot to 0 (tail-zero invariant).
+// Bit k of the result is set iff byte k of the 16 flag bytes in `v` is non-zero. Per 32-bit lane,
+// bit 7 of each byte is set iff that byte is non-zero (the add cannot carry across bytes because
+// the operand is masked to 7 bits), and one multiply gathers the four bit-7s into bits 28..31.
+__device__ __forceinline__ uint32_t pack16_nonzero(uint4 v)
+{
+  auto const nibble = [](uint32_t x) {
+    uint32_t const m = ((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x;
+    return ((m & 0x80808080u) * 0x00204081u) >> 28;
+  };
+  return nibble(v.x) | (nibble(v.y) << 4) | (nibble(v.z) << 8) | (nibble(v.w) << 12);
+}
+
+// Bit i of the result is set iff p[i] is non-zero, for i in [0, count).
+__device__ __forceinline__ uint32_t pack_bytes_nonzero(uint8_t const* p, int count)
+{
+  uint32_t bits = 0;
+  for (int i = 0; i < count; ++i)
+    bits |= (p[i] != 0) ? (1u << i) : 0u;
+  return bits;
+}
+
+// BOOL8 flags -> packed mask words.
+// One thread per word: a full word's 32 flags arrive as two 16-byte loads packed in registers. The
+// 16-byte path needs a 16-byte aligned base and a misaligned vector load is a sticky
+// cudaErrorMisalignedAddress that kills the context, so the base alignment is tested once and an
+// unaligned base takes the byte-wise path instead.
 __global__ void mask_from_bool8_kernel(uint8_t const* __restrict__ flags,
                                        int64_t num_rows,
                                        int64_t num_words,
                                        uint32_t* __restrict__ words)
 {
-  int const lane               = threadIdx.x & 31;
-  int64_t const warps_per_grid = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 5;
-  int64_t w                    = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
-  for (; w < num_words; w += warps_per_grid) {
-    int64_t const r  = w * 32 + lane;
-    bool const p     = (r < num_rows) && (flags[r] != 0);
-    uint32_t const b = __ballot_sync(kFullWarp, p);
-    if (lane == 0) words[w] = b;
+  int64_t const stride     = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t const full_words = num_rows >> 5;
+  bool const aligned       = (reinterpret_cast<std::uintptr_t>(flags) & 15u) == 0;
+  for (int64_t w = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; w < num_words;
+       w += stride) {
+    uint32_t bits = 0;
+    if (w < full_words) {
+      uint8_t const* p = flags + (w << 5);
+      if (aligned) {
+        auto const* v = reinterpret_cast<uint4 const*>(p);
+        bits          = pack16_nonzero(v[0]) | (pack16_nonzero(v[1]) << 16);
+      } else {
+        bits = pack_bytes_nonzero(p, 32);
+      }
+    } else {
+      int64_t const live = num_rows - (w << 5);
+      if (live > 0) bits = pack_bytes_nonzero(flags + (w << 5), static_cast<int>(live));
+    }
+    words[w] = bits;
   }
 }
 
@@ -279,9 +325,8 @@ void mask_from_bool8(uint8_t const* flags,
 {
   if (flags == nullptr || mask_words == nullptr || num_rows <= 0)
     throw std::runtime_error("selection_wave: mask_from_bool8 on unbound buffers");
-  int64_t const num_words   = selection_mask::WordsFor(num_rows);
-  int const warps_per_block = kBlock / 32;
-  mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.get()>>>(
+  int64_t const num_words = selection_mask::WordsFor(num_rows);
+  mask_from_bool8_kernel<<<grid_for(num_words, kBlock), kBlock, 0, stream.get()>>>(
     flags, num_rows, num_words, mask_words);
   throw_on_cuda(cudaPeekAtLastError(), "mask_from_bool8 launch");
 }
@@ -314,7 +359,8 @@ void mask_to_row_indices(selection_mask const& mask,
   if (mask.survivor_count == 0) return;
   int64_t const nc          = selection_mask::ChunksFor(mask.num_rows);
   int const warps_per_block = kBlock / 32;
-  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.get()>>>(
+  size_t const smem = static_cast<size_t>(warps_per_block) * SELECTION_CHUNK_ROWS * sizeof(int32_t);
+  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, smem, stream.get()>>>(
     mask.words, mask.chunk_offsets, nc, out_indices);
   throw_on_cuda(cudaPeekAtLastError(), "mask_to_indices launch");
 }

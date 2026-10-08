@@ -109,17 +109,17 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
 }  // namespace
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
-                             sirius_interface& sirius_iface,
-                             sirius::query_id_t query_id)
+                             sirius::query_id_t query_id,
+                             const std::optional<std::string>& query_label,
+                             const std::optional<std::string>& session_label)
   : context(context),
-    sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_handle_(quent::query::create(
       telemetry_context_->context(),
       quent::query::Init{
-        .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-        .query_group_id = telemetry_context_->query_group_id_for(sirius_iface.session_label),
+        .instance_name  = query_label.value_or("unnamed_query"),
+        .query_group_id = telemetry_context_->query_group_id_for(session_label),
       }))
 {
 }

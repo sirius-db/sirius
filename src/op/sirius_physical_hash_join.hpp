@@ -96,9 +96,13 @@ struct build_probe_decision {
 /// Decide the next BUILD_PROBE action from a per-partition snapshot. Prefers scheduling a build for
 /// the first NOT_BUILT partition that has both its build and a probe batch, then probing the first
 /// BUILT partition with probe data; otherwise reports whether it is waiting on build or probe
-/// input.
+/// input, or (once @p probe_finished is true and nothing else is outstanding) that the operator is
+/// complete. A slot only counts as "waiting on probe" while the probe side could still deliver more
+/// data for it -- once probe_finished, a NOT_BUILT build-only orphan or a BUILT-and-drained slot
+/// has nothing left to do, whether or not it has been torn down yet (teardown is a resource-release
+/// side effect, not a precondition for completion).
 [[nodiscard]] build_probe_decision select_build_probe_action(
-  std::vector<build_probe_slot_view> const& slots);
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished);
 
 /// Pure decision for how a PARTITION operator should partition its input for a hash join, folding
 /// the natural-count, broadcast-candidacy, and BUILD_PROBE-eligibility logic into one place.
@@ -120,11 +124,19 @@ struct build_probe_decision {
 /// when it is below `max_broadcast_join_size` AND the probe side is large relative to the build
 /// (`estimated_probe_to_build_ratio >= num_gpus * 1.25`) — replicating a medium build avoids
 /// shuffling a much larger probe across GPUs.
+///
+/// `num_gpus` is `active_gpu_ids.size()` (1 when empty). Placement: a broadcast join puts one
+/// partition on each GPU; a single-partition BUILD_PROBE join goes to
+/// `select_gpu_subset(active_gpu_ids, 1, single_partition_rotation)`, so several small joins in one
+/// query spread across GPUs; a single STANDARD partition is unpinned, and multiple partitions
+/// use `round_robin` over `active_gpu_ids`. An empty
+/// `active_gpu_ids` yields unpinned placements.
 [[nodiscard]] partition_strategy compute_hash_join_partition_strategy(
   uint64_t total_bytes,
   bool is_build_side,
   bool build_foldable,
-  int num_gpus,
+  std::vector<int> const& active_gpu_ids,
+  std::size_t single_partition_rotation,
   uint64_t hash_partition_bytes,
   uint64_t max_build_hash_table_bytes,
   uint64_t max_broadcast_join_size,
@@ -307,6 +319,15 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
   void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
+  /**
+   * @brief The session that publishes this join's dynamic filters, through which the build-side
+   * `sirius_physical_partition` accumulates a multi-partition filter.
+   */
+  [[nodiscard]] dynamic_filter_publication_session& dynamic_filter_session() noexcept
+  {
+    return _dynamic_filter_session;
+  }
+
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
@@ -437,7 +458,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.
   uint64_t _max_broadcast_join_size = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE;
-  // _num_gpus lives on sirius_physical_partition_consumer_operator (set via set_num_gpus).
+  // The GPU list lives on sirius_physical_partition_consumer_operator (set via set_active_gpu_ids).
 
   // Broadcast (small build table) BUILD_PROBE join: the build side is replicated to every slot and
   // the probe side is streamed unpartitioned.

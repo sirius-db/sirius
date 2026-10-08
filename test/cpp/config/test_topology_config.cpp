@@ -46,6 +46,38 @@ struct scoped_yaml {
 
 }  // namespace
 
+TEST_CASE("parsed hardware configuration resolves independently after copying",
+          "[topology_config][config]")
+{
+  scoped_yaml yaml("sirius_deferred_topology.yaml",
+                   "sirius:\n"
+                   "  topology: { num_gpus: 1 }\n"
+                   "  memory:\n"
+                   "    gpu: { usage_limit_bytes: 1Gi }\n"
+                   "    host: { capacity_bytes: 2Gi }\n"
+                   "  operator_params: { concat_batch_bytes: 123456789 }\n"
+                   "  telemetry: { exporter: msgpack, output_directory: deferred_telemetry }\n");
+  auto parsed = sirius::parsed_sirius_config::from_file(yaml.path);
+  CHECK(parsed.get_telemetry_config().exporter == "msgpack");
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
+
+  auto copy = parsed;
+  cucascade::memory::topology_discovery discovery;
+  REQUIRE(discovery.discover(cucascade::memory::NetworkDeviceVerification::EXISTS_ACTIVE_IP,
+                             /*with_runtime_attributes=*/true));
+  auto resolved = copy.resolve(discovery.get_topology());
+  REQUIRE_FALSE(resolved.get_memory_space_configs().empty());
+  CHECK(resolved.get_operator_params().scan_task_batch_size == (1ULL << 30) / 40);
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 123456789);
+  CHECK(parsed.get_operator_params().concat_batch_bytes == 123456789);
+
+  // A new resolution leaves existing runtime overrides and the specification unchanged.
+  resolved.get_operator_params().concat_batch_bytes = 987654321;
+  auto another                                      = parsed.resolve(discovery.get_topology());
+  CHECK(resolved.get_operator_params().concat_batch_bytes == 987654321);
+  CHECK(another.get_operator_params().concat_batch_bytes == 123456789);
+}
+
 TEST_CASE("sirius_config parses topology.gpus_per_query", "[topology_config][config]")
 {
   scoped_yaml yaml("sirius_gpus_per_query.yaml",

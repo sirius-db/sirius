@@ -945,7 +945,7 @@ TEST_CASE("dense_count_join exact rare-path BIGINT product validation",
 
   REQUIRE_NOTHROW(throw_if_count_product_overflows(lhs_view, safe_rhs_view, stream, mr));
   REQUIRE_THROWS_WITH(throw_if_count_product_overflows(lhs_view, overflow_rhs_view, stream, mr),
-                      Catch::Contains("COUNT result exceeds BIGINT max"));
+                      Catch::Matchers::ContainsSubstring("COUNT result exceeds BIGINT max"));
 }
 
 TEST_CASE("dense_count_join: a retried task re-executes on the same input",

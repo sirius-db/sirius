@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "helper/cuda_launch_error.hpp"
 #include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
@@ -527,7 +528,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::strea
         "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
     } catch (const thrust::system_error& cuda_err) {
       auto err = static_cast<cudaError_t>(cuda_err.code().value());
-      if (err == cudaErrorLaunchOutOfResources || err == cudaErrorInvalidValue) {
+      if (is_retryable_launch_error(err)) {
         SIRIUS_LOG_WARN(
           "Pipeline {}: CUDA launch error [{}] {} at operator {} (id={}, index {}/{}), "
           "rescheduling task {}",
@@ -695,7 +696,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                      pipeline->get_pipeline_id());
     throw oom_reschedule_exception(
       std::move(local_state._input_data),
-      0,
+      local_state._start_operator_index,
       std::string("OOM while preparing batches for processing: ") + oom.what());
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Unknown error in prepare_for_processing for pipeline {}: {}",
@@ -811,8 +812,9 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
         }
       }
       auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
-      // Mid-pipeline retries use intermediate input units and must not affect the aggregate ratio.
-      // An OOM before processing restarts at index 0 with the original input and remains eligible.
+      // A prepare OOM resumes at the attempt's current start index. Only a start index of 0 keeps
+      // the original input and remains ratio-eligible. Mid-pipeline retries use intermediate input
+      // units and must not affect the aggregate ratio.
       bool const ratio_eligible = local_state._start_operator_index == 0;
       global.get_memory_history().record({input_basis, peak_bytes, output_bytes, ratio_eligible});
       SIRIUS_LOG_TRACE(

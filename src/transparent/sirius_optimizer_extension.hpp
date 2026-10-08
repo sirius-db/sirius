@@ -53,11 +53,23 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
+/// \brief Copy the cardinality estimates of every node in \p from onto the matching node in \p to.
+///
+/// Walks both trees in lockstep and copies \c estimated_cardinality and
+/// \c has_estimated_cardinality. A node whose type or child count differs from its counterpart is
+/// left untouched along with its subtree.
+///
+/// \param from  The tree to read estimates from.
+/// \param to    The tree to write estimates to.
+/// \return      True if the two trees have the same shape, false if any subtree was skipped.
+bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::LogicalOperator& to);
+
 /// \brief Copy a logical plan for Sirius's transparent execution path.
 ///
-/// Wraps \c duckdb::LogicalOperator::Copy. Serialization omits DuckDB join-filter metadata, but
-/// Sirius discovers targets from plan structure and does not consume that metadata. The original
-/// plan remains unchanged for CPU fallback.
+/// Wraps \c duckdb::LogicalOperator::Copy and then copies the cardinality estimates, which
+/// serialization omits, with \c copy_cardinality_estimates. Serialization also omits DuckDB
+/// join-filter metadata, but Sirius discovers targets from plan structure and does not consume
+/// that metadata. The original plan remains unchanged for CPU fallback.
 ///
 /// \param plan     The plan to copy. Not consumed.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.

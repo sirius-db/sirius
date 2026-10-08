@@ -115,6 +115,8 @@ for (auto& batch : output_batches) {
 }
 ```
 
+`push_data_batch()` calls the receiving operator's `on_input_batch_pushed(port_id, batch)` hook inside the pushing task, before the batch becomes poppable. The hook must not block or touch device memory. The default does nothing; the build PARTITION of a join that accumulates dynamic filters records each arrival in its `build_arrival_ledger` (see [Dynamic Filters](dynamic-filters.md#multi-partition-build-accumulation)).
+
 `next_port_after_sink` is configured when repository wiring is materialized: the pipeline converter emits pure-data `repository_wiring` descriptors at plan time, and `pipeline::materialize_repository_wiring(wirings, *repo_manager)` creates the repositories and calls `source_op->add_next_port_after_sink({next_op, port_id})` at query setup (see [Multi-GPU Architecture](multi-gpu-architecture.md) for the two-phase split).
 
 ### Port Names
@@ -141,12 +143,14 @@ Key methods:
 - `get_read_only_batches(bool leave_locked)` — acquires `to_read_only()` on each idle batch; if `leave_locked=true`, caches result in `_read_only_data_batches`.
 - `prepare_for_processing(memory_space*, stream)` — **void**, throws on failure. Calls `lock_or_prepare_batch()` for each batch (clones/converts to the target memory space if needed, then acquires a shared lock). Stores resulting `read_only_data_batch` handles in `_read_only_data_batches` and resets `_data_batches` to `std::nullopt` — accessor *i* may reference a cross-GPU *clone* rather than the original batch, so the idle view is lazily rebuilt from the accessors rather than kept alongside them. Called by the GPU pipeline executor before `execute()`.
 - `remove_read_only_lock()` — releases `_read_only_data_batches` while ensuring `_data_batches` is populated first (so the data stays alive).
+- `original_batch_ids()` — the IDs of the non-null input batches in input order, as constructed. Preparation may replace a batch with a cross-GPU clone that has a new ID, and a retry reuses the same object, so these IDs identify the logical inputs across both (used by multi-partition dynamic filters). Only a replacement records an ID; other batches answer with their current ID.
+- A certified dynamic-filter input may spill and re-upgrade before contribution. Only its original ID, exact row count, and active key types must match; payload child layouts may change during conversion.
 - Created by `get_next_task_input_data()` from port pops.
 - Passed through the operator chain during `execute()`.
 
 ### `partitioned_operator_data`
 
-Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, MERGE_SORT, MERGE_GROUP_BY) to track which partition the data belongs to.
+Extends `pipelineable_operator_data` with a partition index (`get_partition_idx()`). Used by partition-aware operators (CONCAT, HASH_JOIN, MERGE_GROUP_BY, DENSE_COUNT_JOIN) to track which partition the data belongs to. Constructing it with an index takes the exchange's `partition_placement`, and a partition pinned to a GPU becomes the data's preferred device, so the task creator runs every task of a partition on one GPU. Data with no index carries no preference and is placed by locality.
 
 ### Class Hierarchy
 

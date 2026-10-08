@@ -23,6 +23,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_stream.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -108,7 +109,7 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
                   cudaMemcpyHostToDevice,
                   stream.get());
 
-  rmm::device_buffer mask{};
+  auto mask                  = cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr);
   cudf::size_type null_count = 0;
   if (with_nulls) {
     std::size_t const num_words = (num_rows + 31) / 32;
@@ -117,7 +118,8 @@ std::unique_ptr<cudf::column> make_patterned_column(std::size_t num_rows,
       words[i / 32] &= ~(std::uint32_t{1} << (i % 32));
       ++null_count;
     }
-    mask = rmm::device_buffer{num_words * sizeof(std::uint32_t), stream, mr};
+    mask = cudf::create_null_mask(
+      static_cast<cudf::size_type>(num_rows), cudf::mask_state::UNINITIALIZED, stream, mr);
     cudaMemcpyAsync(mask.data(),
                     words.data(),
                     num_words * sizeof(std::uint32_t),
@@ -154,22 +156,24 @@ std::unique_ptr<cudf::column> make_strings_column_patterned(std::size_t num_rows
                   offsets.size() * sizeof(std::int32_t),
                   cudaMemcpyHostToDevice,
                   stream.get());
-  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
-                                                    static_cast<cudf::size_type>(num_rows + 1),
-                                                    std::move(offsets_buf),
-                                                    rmm::device_buffer{},
-                                                    0);
+  auto offsets_col = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::INT32},
+    static_cast<cudf::size_type>(num_rows + 1),
+    std::move(offsets_buf),
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr),
+    0);
 
   rmm::device_buffer chars_buf{chars.size(), stream, mr};
   cudaMemcpyAsync(
     chars_buf.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.get());
   stream.sync();
 
-  return cudf::make_strings_column(static_cast<cudf::size_type>(num_rows),
-                                   std::move(offsets_col),
-                                   std::move(chars_buf),
-                                   0,
-                                   rmm::device_buffer{});
+  return cudf::make_strings_column(
+    static_cast<cudf::size_type>(num_rows),
+    std::move(offsets_col),
+    std::move(chars_buf),
+    0,
+    cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED, stream, mr));
 }
 
 /// Host-resident batch; converting it back to GPU tier allocates the rebuilt

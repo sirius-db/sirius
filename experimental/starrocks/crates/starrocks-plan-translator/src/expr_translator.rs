@@ -6,8 +6,9 @@ use substrait::proto::expression::reference_segment;
 use substrait::proto::expression::{self, FieldReference, ReferenceSegment};
 use substrait::proto::{Expression, FunctionArgument, Type, function_argument};
 
-use crate::descriptor_table::DescriptorTable;
+use crate::descriptor_table::SlotKey;
 use crate::error::{Result, TranslateError};
+use crate::row_layout::RowLayout;
 use crate::type_mapper;
 use crate::{
     ExtensionRegistry, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON, URN_DATETIME, URN_STRING,
@@ -15,45 +16,14 @@ use crate::{
 
 /// Mutable state needed while translating one StarRocks expression tree.
 pub(crate) struct ExprContext<'a> {
-    /// Descriptor lookups for slot references and row layouts.
-    desc: &'a DescriptorTable,
     /// Substrait extension registry shared with the enclosing plan translation.
     registry: &'a mut ExtensionRegistry,
-    /// Tuple ids that describe the input row visible to this expression.
-    row_tuples: &'a [i32],
-    /// Synthetic StarRocks slots appended while evaluating common project expressions.
-    slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
+    layout: &'a RowLayout,
 }
 
 impl<'a> ExprContext<'a> {
-    /// Creates an expression context for a specific input row layout.
-    pub(crate) fn new(
-        desc: &'a DescriptorTable,
-        registry: &'a mut ExtensionRegistry,
-        row_tuples: &'a [i32],
-    ) -> Self {
-        Self {
-            desc,
-            registry,
-            row_tuples,
-            slot_overrides: None,
-        }
-    }
-
-    /// Creates an expression context that can resolve synthetic slots not present
-    /// in the descriptor table.
-    pub(crate) fn with_slot_overrides(
-        desc: &'a DescriptorTable,
-        registry: &'a mut ExtensionRegistry,
-        row_tuples: &'a [i32],
-        slot_overrides: &'a std::collections::HashMap<(i32, i32), usize>,
-    ) -> Self {
-        Self {
-            desc,
-            registry,
-            row_tuples,
-            slot_overrides: Some(slot_overrides),
-        }
+    pub(crate) fn new(registry: &'a mut ExtensionRegistry, layout: &'a RowLayout) -> Self {
+        Self { registry, layout }
     }
 }
 
@@ -167,17 +137,8 @@ fn translate_slot_ref(
         field: "slot_ref",
     })?;
     let field = ctx
-        .slot_overrides
-        .and_then(|overrides| {
-            overrides
-                .get(&(slot_ref.tuple_id, slot_ref.slot_id))
-                .copied()
-        })
-        .map(Ok)
-        .unwrap_or_else(|| {
-            ctx.desc
-                .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
-        })? as i32;
+        .layout
+        .resolve(SlotKey::new(slot_ref.tuple_id, slot_ref.slot_id))? as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(

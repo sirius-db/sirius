@@ -24,9 +24,22 @@ void metadata_store::register_metadata(io_object const& obj,
                                        std::shared_ptr<io_object_metadata> metadata)
 {
   if (!metadata) return;
-  auto const& key = obj.raw_file_cache_id();
+  auto const& key  = obj.raw_file_cache_id();
+  auto const& path = obj.object_path();
   std::unique_lock lk(_mtx);
+  if (auto it = _key_by_path.find(path); it != _key_by_path.end() && it->second != key) {
+    _by_key.erase(it->second);
+    it->second = key;
+  } else if (it == _key_by_path.end()) {
+    _key_by_path.emplace(path, key);
+  }
   _by_key[key] = std::move(metadata);
+}
+
+bool metadata_store::has_path(std::string_view object_path) const noexcept
+{
+  std::shared_lock lk(_mtx);
+  return _key_by_path.contains(object_path);
 }
 
 std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
@@ -34,7 +47,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const
   return get_metadata(obj.raw_file_cache_id());
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string const& cache_key) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
 {
   std::shared_lock lk(_mtx);
   auto it = _by_key.find(cache_key);

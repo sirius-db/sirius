@@ -41,8 +41,7 @@ namespace sirius::test {
 /// Sets SIRIUS_DISABLE=1 for a scope, restoring whatever was there before.
 ///
 /// The harness deliberately keeps SIRIUS_DISABLE=1 so untagged tests' DuckDB
-/// instances do not auto-initialize a SiriusContext (see
-/// scoped_sirius_disable_clear in test_plan_printer.cpp). Plain
+/// instances do not auto-initialize a SiriusContext. Plain
 /// setenv/unsetenv therefore leaks a changed global into later tests, and a
 /// REQUIRE that throws in between skips the unset entirely. Restoring in a
 /// destructor fixes both.

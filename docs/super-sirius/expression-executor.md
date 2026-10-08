@@ -135,6 +135,44 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 String concatenation covers the `concat(a, b, …)` function and the `||` operator, which have **different** NULL semantics and therefore resolve to **distinct** ids: `concat()` ignores NULL arguments (`concat(NULL, 'x') = 'x'`) and maps to `function_id::concat`; the `||` operator propagates NULL (`'a' || NULL = NULL`) and maps to `function_id::concat_operator` (DuckDB lowers `||` to a function named `"||"`). Both are dispatched as a materialize-only function in `src/expression_evaluator/specializations/function.cpp`: every argument is materialized, any scalar argument is broadcast to a full-length column via `cudf::make_column_from_scalar`, and the columns are joined with `cudf::strings::concatenate` using an empty separator. The two semantics are selected by the narep scalar: a valid empty string for `concat()` (NULL → `""`, ignored) and an invalid narep for `||` (NULL → NULL, propagated).
 
+### String case conversion
+
+`upper()` and `lower()` materialize their input and call `cudf::strings::to_upper` and
+`cudf::strings::to_lower`, respectively. Like `strlen()` and `length()`, these handlers
+require column inputs and rely on DuckDB to constant-fold scalar calls before GPU evaluation.
+Scalar inputs that survive constant folding are not yet supported.
+NULLs propagate and empty strings remain empty. These functions are AST breakers and can
+compose inside projections, filters, and materialized join-condition operands.
+
+Case conversion follows cuDF's Unicode semantics, which differ from DuckDB
+for some inputs. For example `upper('ß')` produces `SS`, and `lower('İ')`
+produces `i` followed by combining dot U+0307. In contrast DuckDB produces
+`ẞ` and `i`. So cuDF round-trips `upper(lower('İ'))` as the identity, where
+DuckDB produces `upper(lower('İ')) == I`, in contrast cuDF produces
+`lower(upper('ß')) == ss` whereas DuckDB produces `ß` for the round-trip.
+See cuDF's [Unicode
+limitations](https://docs.rapids.ai/api/libcudf/stable/md_doxygen_unicode)
+for its supported code points and context-sensitive conversion limitations.
+### Temporal semantics
+
+`src/helper/timestamp_semantics.hpp` defines reusable GPU helpers in `sirius::temporal`.
+The current contract matches DuckDB: signed epoch ticks reserve exactly `+MAX` and
+`-MAX` for infinity, while `MIN` remains finite. NULLs propagate. Frontends must
+normalize their temporal values to this representation before using these helpers;
+the helpers do not depend on DuckDB types or a frontend identity.
+
+`cast_to_microseconds_checked()` converts second, millisecond, and nanosecond
+columns to microseconds. It checks finite values before multiplying, preserves
+infinity, and truncates nanoseconds toward zero. Overflow raises
+`sirius::invalid_input_exception`; reading the overflow result synchronizes the
+supplied stream. The cast evaluator dispatches to this helper for semantic casts.
+
+`finite_mask()` returns a nullable boolean column for DATE or any timestamp
+precision. Both checked conversion and millisecond/microsecond extraction use it,
+so sentinel handling has one implementation. The evaluator boundary regressions
+are tagged `[timestamp_bounds]`; SQL extraction comparisons against DuckDB are
+tagged `[timestamp_extraction]`.
+
 ### Logical AND/OR NULL semantics
 
 SQL `AND`/`OR` use Kleene three-valued logic (`TRUE OR NULL = TRUE`, `FALSE AND NULL = FALSE`), so conjunctions map to cuDF's Kleene operators — `NULL_LOGICAL_AND`/`NULL_LOGICAL_OR` as AST operators and `cudf::binary_operator::NULL_LOGICAL_*` on the materialize path — never the null-propagating `LOGICAL_*` variants. The plain `LOGICAL_AND` still appears for internal structural conjunctions where operands cannot be NULL, such as the BETWEEN lowering and the AND that combines multi-condition join predicates.

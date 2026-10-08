@@ -19,7 +19,9 @@
 #include "log/level.hpp"
 #include "log/sink.hpp"
 
+#include <concepts>
 #include <format>
+#include <functional>
 #include <source_location>
 #include <utility>
 
@@ -38,6 +40,25 @@ void format_and_log(level level,
 }
 
 }  // namespace sirius::log::detail
+
+namespace sirius::log {
+
+/**
+ * @brief Runs @p emit, which logs through a `SIRIUS_LOG_*` macro, and discards any exception it
+ * throws (formatting may fail to allocate).
+ *
+ * For code that must not throw, or whose outcome must not depend on whether a message was logged.
+ */
+template <std::invocable Emit>
+void log_noexcept(Emit&& emit) noexcept
+{
+  try {
+    std::invoke(std::forward<Emit>(emit));
+  } catch (...) {  // The caller's outcome stands without its message.
+  }
+}
+
+}  // namespace sirius::log
 
 #define SIRIUS_LOG_IMPL(lvl, ...) \
   ::sirius::log::detail::format_and_log(lvl, std::source_location::current(), __VA_ARGS__)

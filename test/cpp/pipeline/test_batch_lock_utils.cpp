@@ -29,12 +29,16 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/oom_reschedule_exception.hpp"
+#include "utils/sirius_test_env.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
 #include <cuda/stream>
@@ -90,19 +94,14 @@ bool enable_p2p_for_test(int num_gpus)
   return all_enabled;
 }
 
-/// Skip idiom for multi-GPU tests (Catch2 v2): WARN + return true when fewer than two GPUs
+/// Skip idiom for multi-GPU tests (Catch2): WARN + return true when fewer than two GPUs
 /// are present. These tests validate lock/clone semantics, which hold on both cross-GPU
 /// transfer flavors, so P2P is enabled best-effort rather than required: with it the clone
 /// peer-DMAs, without it cucascade host-stages — exactly as production would on the same
 /// hardware. The WARN records which flavor a run exercised.
 bool skip_if_not_mgpu()
 {
-  int device_count = 0;
-  cudaGetDeviceCount(&device_count);
-  if (device_count < 2) {
-    WARN("skipping: requires >=2 GPUs");
-    return true;
-  }
+  if (!sirius::test::has_gpus(2)) { return true; }
   if (!enable_p2p_for_test(2)) {
     WARN("GPUs 0 and 1 are not P2P-capable — cross-GPU copies will host-stage");
   }
@@ -248,7 +247,7 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                                           std::move(offsets),
                                           std::move(values),
                                           0,
-                                          rmm::device_buffer{});
+                                          cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(list_col));
   return std::make_unique<cudf::table>(std::move(cols));
@@ -258,8 +257,81 @@ constexpr std::size_t kNumRows = 4096;
 
 }  // namespace
 
+TEST_CASE("operator-data provenance retains original input order through preparation and moves",
+          "[batch_lock_utils][dynamic_filter][task_input_provenance]")
+{
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(1));
+  rmm::cuda_stream stream;
+  auto first  = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  auto second = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
+  std::vector<std::uint64_t> const expected{second->get_batch_id(), first->get_batch_id()};
+  sirius::op::pipelineable_operator_data input({second, first});
+  auto require_ids = [&expected](auto const& data) {
+    auto const ids = data.original_batch_ids();
+    REQUIRE(std::vector<std::uint64_t>(ids.begin(), ids.end()) == expected);
+  };
+  require_ids(input);
+  input.prepare_for_processing(f.gpu0, stream);
+  require_ids(input);
+  input.remove_read_only_lock();
+  input.prepare_for_processing(f.gpu0, stream);
+  require_ids(input);
+  auto moved = std::move(input);
+  require_ids(moved);
+}
+
+TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM rescheduling",
+          "[batch_lock_utils][mgpu][multi_gpu][dynamic_filter][task_input_provenance]")
+{
+  if (skip_if_not_mgpu()) { return; }
+  batch_lock_utils_fixture f;
+  REQUIRE(f.setup(2));
+  auto const source_stream = f.gpu0->acquire_stream();
+  auto source              = f.make_gpu_batch(kNumRows, *f.gpu0, source_stream);
+  auto const original_id   = source->get_batch_id();
+  auto input               = std::make_unique<sirius::op::pipelineable_operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{source});
+  auto require_identity = [original_id](auto const& data) {
+    REQUIRE(data.original_batch_ids().size() == 1);
+    REQUIRE(data.original_batch_ids()[0] == original_id);
+    REQUIRE(data.get_data_batches().size() == 1);
+  };
+
+  // A task prepares on its own device with its own stream: GPU 1 clones the batch.
+  std::uint64_t clone_id = 0;
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{f.gpu1->get_device_id()}};
+    rmm::cuda_stream task_stream;
+    input->prepare_for_processing(f.gpu1, task_stream);
+    task_stream.synchronize();
+    require_identity(*input);
+    clone_id = input->get_data_batches()[0]->get_batch_id();
+    REQUIRE(clone_id != original_id);
+  }
+
+  // A reschedule hands the same operator data to the retry, which may prepare on GPU 0.
+  sirius::pipeline::oom_reschedule_exception retry(std::move(input), 0, "provenance test");
+  auto intermediate = retry.release_intermediate_data();
+  auto& retry_input = dynamic_cast<sirius::op::pipelineable_operator_data&>(*intermediate);
+  retry_input.remove_read_only_lock();
+  require_identity(retry_input);
+  sirius::pipeline::gpu_pipeline_task_local_state resumed(std::move(intermediate),
+                                                          retry.get_resume_operator_index());
+  {
+    rmm::cuda_set_device_raii device{rmm::cuda_device_id{f.gpu0->get_device_id()}};
+    rmm::cuda_stream task_stream;
+    resumed._input_data->prepare_for_processing(f.gpu0, task_stream);
+    task_stream.synchronize();
+  }
+  auto const& resumed_input =
+    dynamic_cast<sirius::op::pipelineable_operator_data const&>(*resumed._input_data);
+  require_identity(resumed_input);
+  REQUIRE(resumed_input.get_data_batches()[0]->get_batch_id() != clone_id);
+}
+
 TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -304,7 +376,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
 }
 
 TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -501,7 +573,8 @@ TEST_CASE("host to GPU upgrade normalizes LIST offsets to INT32", "[batch_lock_u
   REQUIRE(column_values_to_host<int32_t>(lcv.child(), stream) == expected_list_values(kNumLists));
 }
 
-TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_lock_utils][mgpu]")
+TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets",
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -531,7 +604,7 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
 }
 
 TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -568,7 +641,7 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
 }
 
 TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target space",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;
@@ -595,7 +668,7 @@ TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target spa
 }
 
 TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
-          "[batch_lock_utils][mgpu]")
+          "[batch_lock_utils][mgpu][multi_gpu]")
 {
   if (skip_if_not_mgpu()) { return; }
   batch_lock_utils_fixture f;

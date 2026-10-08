@@ -35,6 +35,7 @@
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <op/scan/table_scan/scan_contract.hpp>
 #include <scan_manager/insert_delta_job.hpp>
 #include <unistd.h>
 
@@ -303,10 +304,16 @@ TEST_CASE("insert-delta job: per-operator cuts subset the union and share storag
 
   // Op A projects only column v (storage index 1).
   std::vector<sirius::op::scan::projected_column> op_a{real_col(1)};
-  auto splits_a =
-    cut_delta_splits_for_op(request, op_a, /*datasource=*/nullptr, /*block_manager=*/nullptr);
+  constexpr sirius::op::scan::scan_contract_id contract_a = 101;
+  auto splits_a                                           = cut_delta_splits_for_op(
+    request, op_a, /*datasource=*/nullptr, /*block_manager=*/nullptr, contract_a);
   REQUIRE(splits_a.size() == 1);
   auto const& info_a = *splits_a[0].info;
+  REQUIRE(info_a.contract_id() == contract_a);
+  REQUIRE_FALSE(info_a.certificates().empty());
+  for (auto const& certificate : info_a.certificates()) {
+    CHECK(certificate.contract_id == contract_a);
+  }
   REQUIRE(info_a.host_backed_only);
   REQUIRE(info_a.row_groups.size() == 1);
   REQUIRE(info_a.row_groups[0].columns.size() == 1);
@@ -320,8 +327,15 @@ TEST_CASE("insert-delta job: per-operator cuts subset the union and share storag
 
   // Op B projects both columns; masks share the same words.
   std::vector<sirius::op::scan::projected_column> op_b{real_col(0), real_col(1)};
-  auto splits_b = cut_delta_splits_for_op(request, op_b, nullptr, nullptr);
+  constexpr sirius::op::scan::scan_contract_id contract_b = 202;
+  auto splits_b = cut_delta_splits_for_op(request, op_b, nullptr, nullptr, contract_b);
   REQUIRE(splits_b.size() == 1);
+  REQUIRE(splits_b[0].info->contract_id() == contract_b);
+  REQUIRE_FALSE(splits_b[0].info->certificates().empty());
+  for (auto const& certificate : splits_b[0].info->certificates()) {
+    CHECK(certificate.contract_id == contract_b);
+  }
+  REQUIRE(splits_a[0].info->contract_id() != splits_b[0].info->contract_id());
   REQUIRE(splits_b[0].info->row_groups[0].columns.size() == 2);
   REQUIRE(splits_a[0].mask.words.get() == splits_b[0].mask.words.get());
   REQUIRE(splits_a[0].mask.has_mask());  // the delete keeps the mask alive
@@ -355,7 +369,8 @@ TEST_CASE("insert-delta job: file-backed splits each own a duplicated datasource
   std::shared_ptr<sirius::io::sirius_datasource> datasource = ioctx->open_datasource(tdb.path);
 
   std::vector<sirius::op::scan::projected_column> op{real_col(0)};
-  auto splits = cut_delta_splits_for_op(request, op, datasource, /*block_manager=*/nullptr);
+  auto splits =
+    cut_delta_splits_for_op(request, op, datasource, /*block_manager=*/nullptr, /*contract_id=*/1);
   REQUIRE(splits.size() == request.bundles.size());
 
   // The datasource's prefetch handle is per-scan state: every file-backed
@@ -409,7 +424,7 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
   // persistent descriptors are all blockless: nothing reads the file, so the
   // split is host-backed-only and carries no datasource.
   std::vector<sirius::op::scan::projected_column> op{real_col(1)};
-  auto splits             = cut_delta_splits_for_op(request, op, datasource, nullptr);
+  auto splits = cut_delta_splits_for_op(request, op, datasource, nullptr, /*contract_id=*/1);
   bool saw_blockless_only = false;
   for (auto const& split : splits) {
     auto const& segs = split.info->row_groups.at(0).columns.at(0).data_segments;

@@ -667,16 +667,20 @@ static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
                                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
 {
   for (auto& type : types) {
-    if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
+    type = sirius_physical_plan_generator::planned_aggregate_type(type);
   }
   for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
-    }
+    expr->return_type = sirius_physical_plan_generator::planned_aggregate_type(expr->return_type);
   }
 }
 
 }  // namespace
+
+duckdb::LogicalType sirius_physical_plan_generator::planned_aggregate_type(
+  duckdb::LogicalType const& type)
+{
+  return type == duckdb::LogicalType::HUGEINT ? duckdb::LogicalType::BIGINT : type;
+}
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
@@ -692,22 +696,50 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and the grouped operator also
-  // computes a DISTINCT sum or avg without the DISTINCT. Any FIRST, grouped or not, refuses its own
-  // FILTER or ORDER BY; a grouped FIRST also refuses a FILTER or a DISTINCT sum or avg beside it.
+  // The GPU aggregates compute a single grouping set and have no GROUPING() support.
+  // See https://github.com/sirius-db/sirius/pull/1928.
+  if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
+    throw duckdb::NotImplementedException(
+      "ROLLUP, CUBE, GROUPING SETS and GROUPING() are not supported in GPU aggregates");
+  }
+
+  // The GPU aggregates support DISTINCT only in COUNT, but not with FILTER.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (!aggregate.IsDistinct()) { continue; }
+    if (aggregate.filter) {
+      throw duckdb::NotImplementedException(
+        "DISTINCT aggregates with a FILTER clause not supported in GPU");
+    }
+    if (sirius::from_duckdb_aggregate_name(aggregate.function.name) !=
+        sirius::aggregate_id::count) {
+      throw duckdb::NotImplementedException(op.groups.empty()
+                                              ? "DISTINCT in ungrouped aggregates other than "
+                                                "COUNT not supported in GPU"
+                                              : "DISTINCT in grouped aggregates other than "
+                                                "COUNT not supported in GPU");
+    }
+    if (op.groups.empty() &&
+        (aggregate.children.size() != 1 || aggregate.children[0]->return_type.IsNested())) {
+      throw duckdb::NotImplementedException(
+        "Ungrouped COUNT(DISTINCT) on a nested or multi-column input not supported in GPU");
+    }
+  }
+
+  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY. Any FIRST, grouped or not,
+  // refuses its own FILTER or ORDER BY; a grouped FIRST also refuses a FILTER beside it.
   auto const aggregate_id_of = [](duckdb::unique_ptr<duckdb::Expression> const& expression) {
     return sirius::from_duckdb_aggregate_name(
       expression->Cast<duckdb::BoundAggregateExpression>().function.name);
   };
   bool const has_grouped_first =
-    (!op.groups.empty() || op.grouping_sets.size() > 1) &&
-    std::ranges::any_of(op.expressions, [&](auto const& expression) {
+    !op.groups.empty() && std::ranges::any_of(op.expressions, [&](auto const& expression) {
       return aggregate_id_of(expression) == sirius::aggregate_id::first;
     });
   for (auto const& expression : op.expressions) {
     auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    auto const id         = aggregate_id_of(expression);
-    if ((aggregate.filter || aggregate.order_bys) && id == sirius::aggregate_id::first) {
+    if ((aggregate.filter || aggregate.order_bys) &&
+        aggregate_id_of(expression) == sirius::aggregate_id::first) {
       throw duckdb::NotImplementedException(
         "first() with a FILTER or ORDER BY clause is not supported on the GPU (falling back to "
         "CPU): " +
@@ -716,13 +748,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     if (has_grouped_first && aggregate.filter) {
       throw duckdb::NotImplementedException(
         "FILTER beside first() is not supported on the GPU (falling back to CPU): " +
-        aggregate.ToString());
-    }
-    if (has_grouped_first && aggregate.IsDistinct() &&
-        (id == sirius::aggregate_id::sum || id == sirius::aggregate_id::sum_no_overflow ||
-         id == sirius::aggregate_id::avg)) {
-      throw duckdb::NotImplementedException(
-        "a DISTINCT sum or avg beside first() is not supported on the GPU (falling back to CPU): " +
         aggregate.ToString());
     }
   }

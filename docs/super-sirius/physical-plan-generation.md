@@ -23,6 +23,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_AGGREGATE_AND_GROUP_BY` | `HASH_GROUP_BY` / `UNGROUPED_AGGREGATE` | `src/planner/sirius_plan_aggregate.cpp` |
 | `LOGICAL_DISTINCT` | `HASH_GROUP_BY` (zero aggregates, or `FIRST` per carried column) | `src/planner/sirius_plan_distinct.cpp` (some shapes fall back to CPU) |
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
+| `LOGICAL_CROSS_PRODUCT` | `NESTED_LOOP_JOIN` (no conditions) | `src/planner/sirius_plan_cross_product.cpp` |
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
 | `LOGICAL_TOP_N` | `TOP_N` | `src/planner/sirius_plan_top_n.cpp` |
@@ -36,7 +37,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
-`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+`LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_RECURSIVE_CTE`
 
 **Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, DISTINCT, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
@@ -52,6 +53,8 @@ The `plan_comparison_join()` method selects the join implementation:
 Left side = probe (streamed), right side = build (materialized).
 
 Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
+
+A `LOGICAL_CROSS_PRODUCT` (`CROSS JOIN`, a comma join without a join predicate, `JOIN ... ON true`) becomes a `NESTED_LOOP_JOIN` without conditions (`src/planner/sirius_plan_cross_product.cpp`). It is refused when its estimated output exceeds the row limit of a cuDF column.
 
 ### Aggregate Planning
 
@@ -72,7 +75,7 @@ Before either is chosen, `materialize_expression_join_keys()` pushes a projectio
 
 - **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
 - **Carried columns** — an output column that no distinct target covers (`SELECT DISTINCT ON (k) k, v`, or `SELECT DISTINCT k FROM t ORDER BY v`) becomes a `FIRST` aggregate over that column, as DuckDB's own builder does. Every `FIRST` of one operator reads the same arbitrary row of its group, so the result keeps one row per key; with no other aggregate the grouped kernels do this with `cudf::distinct`. `SELECT k, first(v) FROM t GROUP BY k` runs on the GPU the same way, and so does a `first` beside other aggregates (`SELECT k, first(v), sum(w) FROM t GROUP BY k`), provided no `first` carries a `FILTER` or an `ORDER BY` and the `GROUP BY` has one grouping set
-- **Unsupported shapes** — each is refused during `create_plan`, so it falls back to the CPU at plan time. `create_plan(LogicalDistinct&)` refuses `DISTINCT ON` under an `ORDER BY`, a node with no distinct targets, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares. `create_plan(LogicalAggregate&)` refuses a `first` with a `FILTER` or `ORDER BY` clause, and a grouped `first` beside any `FILTER` or beside a `DISTINCT` `sum` or `avg`. The `sirius_physical_grouped_aggregate` constructor refuses a `FIRST` over several grouping sets or beside a grouping function (`GROUP BY ROLLUP (k)`, `GROUPING(k)`)
+- **Unsupported shapes** — each is refused during `create_plan`, so it falls back to the CPU at plan time. `create_plan(LogicalDistinct&)` refuses `DISTINCT ON` under an `ORDER BY`, a node with no distinct targets, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares. `create_plan(LogicalAggregate&)` refuses a `first` with a `FILTER` or `ORDER BY` clause, and a grouped `first` beside any `FILTER`. The `sirius_physical_grouped_aggregate` constructor refuses a `FIRST` over several grouping sets or beside a grouping function (`GROUP BY ROLLUP (k)`, `GROUPING(k)`)
 - **The ordered guard tests `LogicalDistinct::order_by`, not `distinct_type`** — the binder sets `order_by` only for `DISTINCT ON`, so a plain `SELECT DISTINCT a, b FROM t ORDER BY a` runs on the GPU with its `ORDER BY` as a separate `LOGICAL_ORDER` above the node. Turning that guard into a `distinct_type` check would send every ordered `DISTINCT` to the CPU
 
 ### Filter Pushdown
@@ -216,7 +219,7 @@ The plan generator inserts every GPU pipeline operator into the plan tree (Part 
 3. `setup_pipeline_parents()` — derive parent pipeline edges from the wiring descriptors
 4. `finalize_pipeline_structure()` — populate `dependencies`, build-side-first for joins (see [Pipeline Finalization](#pipeline-finalization))
 5. `link_join_partition_siblings()` — link PARTITION/JOIN/CONCAT sibling chains
-6. `configure_partition_min_partitions()` — apply the multi-GPU partition floor
+6. `configure_partition_consumers()` — hand the admitted GPU ids to every partition consumer, which derives its partition count, multi-GPU floor, and partition placement from them
 7. `reorder_pipelines_topologically()` — permute the schedule into a strict leaf-first topological order (every pipeline after its producers) and renumber pipeline IDs to match; join dependencies stay build-side-first so a join publishes its dynamic filters before the probe-side scans they prune are launched
 
 `sirius_engine::initialize_internal()` is a thin orchestrator calling `sirius_pipeline_converter(build_ctx, op_params).convert(*root_pipeline)` and materializing the wiring descriptors into runtime repositories and ports.

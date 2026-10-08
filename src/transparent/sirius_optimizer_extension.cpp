@@ -16,6 +16,7 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
 
@@ -245,10 +246,28 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   }
 }
 
+bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::LogicalOperator& to)
+{
+  if (from.type != to.type || from.children.size() != to.children.size()) { return false; }
+  to.estimated_cardinality     = from.estimated_cardinality;
+  to.has_estimated_cardinality = from.has_estimated_cardinality;
+  bool matched                 = true;
+  for (std::size_t i = 0; i < from.children.size(); ++i) {
+    if (!copy_cardinality_estimates(*from.children[i], *to.children[i])) { matched = false; }
+  }
+  return matched;
+}
+
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  return plan.Copy(context);
+  auto copy = plan.Copy(context);
+  if (!copy_cardinality_estimates(plan, *copy)) {
+    SIRIUS_LOG_DEBUG(
+      "Transparent execution: plan copy differs in shape from the original, some cardinality "
+      "estimates were not copied");
+  }
+  return copy;
 }
 
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
@@ -275,6 +294,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // Plan-copy failures make the query ineligible for GPU execution. Optimizer
   // hooks must not throw, so log a readable message and decline the plan.
   try {
+    // Capture the optimizer-hook original before Copy() or Sirius lowering can
+    // transform the scans. These table-indexed views remain the logical-original
+    // side of the candidate comparison.
+    conn_state->set_captured_original_views(
+      sirius::op::scan::capture_bound_read_views(*plan, context));
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

@@ -17,15 +17,21 @@
 #pragma once
 
 #include "io/io_context.hpp"
+#include "io/object_store_config.hpp"
 #include "sirius_config.hpp"
 
 #include <absl/functional/any_invocable.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace sirius {
 struct sirius_config;
@@ -36,6 +42,41 @@ class memory_reservation_manager;
 }
 
 namespace sirius::io {
+
+/// Per-connection registry of immutable S3 configs resolved while binding a
+/// path. Replacing a scope publishes a new ID so already-created ioctxs remain
+/// bound to the previous snapshot for in-flight work.
+class scoped_object_store_configs {
+ public:
+  struct snapshot {
+    std::uint64_t id;
+    std::shared_ptr<const object_store_config> config;
+  };
+
+  [[nodiscard]] std::optional<std::uint64_t> install(std::string_view path,
+                                                     object_store_config config);
+  [[nodiscard]] std::optional<snapshot> resolve(std::string_view path) const;
+
+ private:
+  struct transparent_string_hash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view value) const noexcept
+    {
+      return std::hash<std::string_view>{}(value);
+    }
+  };
+  struct stored_snapshot {
+    snapshot value;
+    std::size_t scope_refs{0};
+    std::size_t config_hash{0};
+  };
+  mutable std::mutex _mtx;
+  std::unordered_map<std::string, std::uint64_t, transparent_string_hash, std::equal_to<>>
+    _scope_ids;
+  std::unordered_map<std::uint64_t, stored_snapshot> _snapshots;
+  std::unordered_map<std::size_t, std::vector<std::uint64_t>> _config_ids_by_hash;
+  std::uint64_t _next_id{1};
+};
 
 // ---------------------------------------------------------------------------
 // datasource_registry
@@ -89,11 +130,15 @@ class io_context_registry {
   /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
   /// never resolves to kvikio and a local file routes to uring before the
   /// universal fallback.  When the registry was built with
-  /// `use_sirius_datasource=false`, the uring local backend is suppressed so local
+  /// `backend: kvikio`, the uring local backend is suppressed so local
   /// files fall through to kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
+
+  /// Build an ioctx using a query-resolved scan configuration. The registry
+  /// factory remains immutable; this overload is used for per-path S3 secrets.
+  std::shared_ptr<ioctx> make_ioctx(io_context_type type, const config_type& config) const noexcept;
 
   /**
    * @brief Drop all registered ioctxs. Callers are responsible for shutting
@@ -109,7 +154,10 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
-  bool _prefer_kvikio_for_file_scheme{false};
+  /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
+  /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
+  /// still goes to the REST backend, which the scan manager obtains by type.
+  bool _prefer_kvikio{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
 };
@@ -126,13 +174,13 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// kvikio fallback backend (cudf default datasource).  Takes no reservation
-/// manager — kvikio owns no reactor staging.
+/// kvikio fallback backend (drives @c kvikio::FileHandle directly).  Takes no
+/// reservation manager — kvikio owns no reactor staging.
 io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
-/// size) and @c config.uring_n_reactors.
+/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
+/// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
 

@@ -45,14 +45,18 @@
 #include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -162,8 +166,8 @@ void collect_field_id_names(std::vector<duckdb::MultiFileColumnDefinition> const
  * @warning Reads every data file's Parquet footer on the planning thread. Fold into the footer
  *          cache the scan needs anyway rather than leaving two passes.
  */
-std::optional<std::string> iceberg_schema_evolution_decline_reason(duckdb::LogicalGet& op,
-                                                                   duckdb::Connection& conn)
+std::optional<std::string> iceberg_schema_evolution_decline_reason(
+  duckdb::LogicalGet& op, duckdb::SiriusContext::internal_connection& conn)
 {
   auto const* bind_data = dynamic_cast<duckdb::MultiFileBindData const*>(op.bind_data.get());
   if (bind_data == nullptr) { return std::nullopt; }
@@ -529,14 +533,13 @@ std::vector<cudf::data_type> scan_physical_schema(duckdb::LogicalGet& op,
   return changed ? result : std::vector<cudf::data_type>{};
 }
 
-// An OPTIONAL_FILTER is advisory and an IS_NOT_NULL is applied by the scan itself, so
-// neither contributes to the predicate convert_table_filters_to_expression builds
-// (scan_utils.cpp). This must stay in step with that skip set: probing a filter the
+// Only OPTIONAL_FILTER is advisory. Required predicates, including IS_NOT_NULL,
+// must translate for the scan's row-level evaluator. Keep this in step with
+// convert_table_filters_to_expression (scan_utils.cpp): probing a filter the
 // scan discharges would reject plans the scan handles correctly.
 [[nodiscard]] bool is_discharged_without_translation(duckdb::TableFilterType filter_type)
 {
-  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-         filter_type == duckdb::TableFilterType::IS_NOT_NULL;
+  return filter_type == duckdb::TableFilterType::OPTIONAL_FILTER;
 }
 
 // Pushed-down filters bypass LogicalFilter, so validate the remaining predicate at plan
@@ -553,6 +556,28 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
     throw duckdb::NotImplementedException("Unsupported filter predicate on column '" + column_name +
                                           "' (falling back to CPU): " + expression->ToString());
   }
+}
+
+// True when the MVCC-blind disk-native read of @p table would not reproduce this
+// transaction's view of it: rows the last checkpoint did not write (transaction-local
+// appends, transient segments), rows it deleted that the image still carries, or
+// in-memory update chains. Every physical column is walked, so a projection-free scan is
+// covered too. Walks every row group, so call it only where a scan is about to be
+// refused anyway (see #1160).
+[[nodiscard]] bool diverges_from_checkpointed_image(duckdb::ClientContext& context,
+                                                    duckdb::DuckTableEntry& table)
+{
+  auto& storage = table.GetStorage();
+  if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+    return true;
+  }
+  std::vector<duckdb::storage_t> all_columns(storage.ColumnCount());
+  std::iota(all_columns.begin(), all_columns.end(), static_cast<duckdb::storage_t>(0));
+  if (sirius::op::scan::any_uncheckpointed_appends(storage, all_columns)) { return true; }
+  auto& transaction = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+  return sirius::op::scan::check_native_read_mvcc_state(
+           storage, all_columns, duckdb::TransactionData(transaction)) !=
+         sirius::op::scan::native_read_mvcc_state::exact;
 }
 
 }  // namespace
@@ -579,6 +604,12 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   return table_filter_set;
 }
 
+std::optional<std::string> registered_iceberg_decline_reason(duckdb::LogicalGet& op,
+                                                             duckdb::ClientContext& context)
+{
+  return iceberg_gpu_scan_decline_reason(op, context);
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet& op)
 {
@@ -600,8 +631,30 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
       static_cast<unsigned long long>(column_ids.size()));
   }
 
-  auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
-    binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
+  auto view = std::make_shared<sirius::op::scan::bound_read_view const>(
+    sirius::op::scan::capture_bound_read_view(op, context));
+  sirius::op::scan::column_requirements columns;
+  columns.column_ids = op.GetColumnIds();
+  sirius::op::scan::materializer_contract_identity materializer{
+    sirius::op::scan::materializer_kind::stream, "sirius.stream.v1"};
+  auto const contract_id =
+    sirius::op::scan::allocate_scan_contract(*read_views,
+                                             contract_provenance.window_id,
+                                             contract_provenance.finalize_generation,
+                                             next_scan_node_id++,
+                                             std::move(view),
+                                             std::move(columns),
+                                             {},
+                                             std::move(materializer),
+                                             op.returned_types,
+                                             op.table_index);
+  auto source =
+    duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(binding.types,
+                                                                    op.EstimateCardinality(context),
+                                                                    binding.repository,
+                                                                    binding.expected_senders,
+                                                                    read_views,
+                                                                    contract_id);
 
   // Plan owns op; catalog.built back-pointer for session registration.
   catalog->set_built(bind->stream_id, source.get());
@@ -613,18 +666,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
 
-  // Only GPU-route known table scan functions; all others (pragma, system catalog
-  // functions, etc.) must fall back to CPU.
-  static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan",
-    "parquet_scan",
-    "read_parquet",
-    "sirius_read_parquet",
-    "iceberg_scan",
-    sirius::exec::kStreamSourceFunctionName};
-  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
-                                          op.function.name);
+  auto const* source = lookup_connector(op, context);
+  if (!source) {
+    throw duckdb::NotImplementedException(
+      "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "
+      "data)",
+      op.function.name);
   }
 
   // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
@@ -636,8 +683,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   //
   // Ordered ahead of the residency probing below because this path throws: declining first
   // keeps a refused table from paying for pinned-entry lookup and schema resolution.
-  if (op.function.name == "iceberg_scan") {
-    if (auto reason = iceberg_gpu_scan_decline_reason(op, context)) {
+  if (source->decline_reason) {
+    if (auto reason = source->decline_reason(op, context)) {
       throw duckdb::NotImplementedException("iceberg_scan declines the GPU scan path: " + *reason);
     }
   }
@@ -653,19 +700,41 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // One pinned-entry probe per scan: the compressed-materialization residency gate and
   // the seq_scan MVCC cache-or-CPU guard below share the result. The parquet identity
   // feeds only the gate, so its file resolution runs only when the feature is on.
+  // Both probes are OWNING: the shared_ptr holds the entry alive across the guards below, so a
+  // concurrent UNPIN on another connection cannot invalidate it mid-check. `pinned` is the
+  // shared raw view over whichever probe matched.
+  std::shared_ptr<sirius::scan_manager::pinned_entry const> pinned_owner;
   sirius::scan_manager::pinned_entry const* pinned = nullptr;
   bool serves_insert_deltas                        = false;
-  bool mvcc_pin_serves_scan                        = false;
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table.ParentCatalog().GetName(),
-        table.ParentSchema().name,
-        table.name,
-        &column_ids,
-        &op.returned_types);
+      auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& scan_manager = sirius_state->get_scan_manager();
+      auto const catalog = table.ParentCatalog().GetName();
+      auto const& schema = table.ParentSchema().name;
+      sirius::duckdb_table_identity const identity{table.oid,
+                                                   table.GetStorage().GetRowGroupCollection()};
+      pinned_owner = scan_manager.find_pinned_entry_for_duckdb_table(
+        catalog, schema, table.name, identity, &column_ids, &op.returned_types);
+      pinned = pinned_owner.get();
+      // A same-name pin for an older table cannot serve this scan, and the disk-native
+      // read behind it is MVCC-blind, so it may still hold the dropped table's image or
+      // this table's deleted rows.
+      if (pinned == nullptr) {
+        auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
+          catalog, schema, table.name, identity);
+        if (superseded && diverges_from_checkpointed_image(context, table)) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
+            "pin_table, so pinned entry '%s' holds a different table, and this table has "
+            "diverged from its last-checkpointed image, which is all the disk-native read "
+            "sees. Run CHECKPOINT, or CALL unpin_table('%s') and pin_table again",
+            table.name,
+            *superseded,
+            *superseded);
+        }
+      }
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the
@@ -680,7 +749,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     auto const files =
       resolve_parquet_scan_file_paths(op.function.name, op.bind_data.get(), op.parameters);
     if (!files.empty()) {
-      pinned = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned_owner = sirius_state->get_scan_manager().find_pinned_entry_for_parquet_files(files);
+      pinned       = pinned_owner.get();
     }
   }
 
@@ -800,7 +870,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
             table.name);
         }
         // Every guard passed, so the pinned entry serves this scan.
-        mvcc_pin_serves_scan = true;
 #if 0
         // Disabled — these guards walk every row group of the table at plan
         // time, per query. With this block off, (d) above has no clean-table
@@ -915,14 +984,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // With FILTER_PUSHDOWN enabled, filters from WHERE clauses are pushed into table_filters.
   // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
   // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
-  // We track the original projection_ids so we can project back after filtering.
-  duckdb::vector<std::size_t> original_projection_ids = projection_ids;
+  // Empty projection_ids means all column_ids are already read and emitted.
+  // Do not turn that into an explicit projection containing only filter columns.
 
   // Save the original types before we modify projection_ids, because modifying projection_ids
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
 
-  if (table_filters) {
+  if (table_filters && !projection_ids.empty()) {
     for (auto& entry : table_filters->filters) {
       // entry.first is the column index in the table_filters (after remapping by
       // create_table_filter_set) We need to ensure this column is in projection_ids so it gets
@@ -1001,9 +1070,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       op.estimated_cardinality,
       std::move(op.extra_info),
       std::move(op.parameters),
-      std::move(op.virtual_columns));
-    node->named_parameters     = std::move(op.named_parameters);
-    node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
+      std::move(op.virtual_columns),
+      op.returned_types);
+    node->named_parameters = std::move(op.named_parameters);
+    node->read_views       = read_views;
+    node->scan_node_id     = next_scan_node_id++;
+    node->table_index      = op.table_index;
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -1067,15 +1139,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     op.estimated_cardinality,
     std::move(op.extra_info),
     std::move(op.parameters),
-    std::move(op.virtual_columns));
+    std::move(op.virtual_columns),
+    original_types);
   if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =
       pinned != nullptr && pinned->tier == cucascade::memory::Tier::GPU;
-    if (sirius_state) { sirius_state->record_compressed_materialization_scan_sidecar_installed(); }
+    if (sirius_state) {
+      sirius_state->get_event_publisher().publish_compressed_materialization(
+        sirius::event::compressed_materialization_activity::scan_sidecar_installed);
+    }
   }
-  node->named_parameters     = std::move(op.named_parameters);
-  node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
+  node->named_parameters = std::move(op.named_parameters);
+  node->read_views       = read_views;
+  node->scan_node_id     = next_scan_node_id++;
+  node->table_index      = op.table_index;
   if (filter) {
     filter->children.push_back(std::move(node));
     return filter;

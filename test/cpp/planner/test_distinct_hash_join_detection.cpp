@@ -23,6 +23,7 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -196,10 +197,7 @@ struct distinct_hash_join_fixture {
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
-    setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-    unsetenv("SIRIUS_DISABLE");
-    db = std::make_unique<DuckDB>(db_path.path());
-    setenv("SIRIUS_DISABLE", "1", 1);
+    db  = sirius::test::open_sirius_db(db_path.path().c_str(), cfg);
     con = std::make_unique<Connection>(*db);
 
     // Create all test tables upfront
@@ -242,8 +240,6 @@ struct distinct_hash_join_fixture {
     con->Query("CREATE TABLE delim_big (okey INTEGER, k INTEGER)");
     con->Query("INSERT INTO delim_big SELECT i, i % 9 FROM range(3000) t(i)");
   }
-
-  ~distinct_hash_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
   scoped_temp_db_path db_path;
   std::unique_ptr<DuckDB> db;
