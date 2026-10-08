@@ -17,7 +17,6 @@
 #include "sirius_context.hpp"
 
 #include "config.hpp"
-#include "context_runtime.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
@@ -69,14 +68,10 @@
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>  // for isatty/fileno
 
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>   // for fprintf/fileno (fallback banner)
@@ -87,7 +82,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -223,52 +217,6 @@ bool sirius_disabled_by_env()
 
 // ================= sirius_context ================= //
 
-struct SiriusContext::process_lease {
-  int socket_fd              = -1;
-  bool release_on_destroy    = true;
-  bool batch_telemetry_owned = false;
-
-  process_lease()
-  {
-    // An abstract Unix socket reserves a process-specific name across separately
-    // loaded Sirius DSOs. It creates no filesystem entry and carries no traffic.
-    struct stat pid_namespace{};
-    if (stat("/proc/self/ns/pid", &pid_namespace) != 0) {
-      throw std::system_error(errno, std::generic_category(), "Identifying Sirius PID namespace");
-    }
-    const auto name = "sirius.context." + std::to_string(pid_namespace.st_ino) + "." +
-                      std::to_string(static_cast<long>(getpid()));
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    if (name.size() >= sizeof(address.sun_path)) {
-      throw std::runtime_error("Sirius context lease name is too long");
-    }
-    std::copy(name.begin(), name.end(), address.sun_path + 1);
-    socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (socket_fd < 0) {
-      throw std::system_error(errno, std::generic_category(), "Creating Sirius context lease");
-    }
-    const auto length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name.size());
-    if (bind(socket_fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
-      const int error = errno;
-      close(socket_fd);
-      socket_fd = -1;
-      if (error == EADDRINUSE) {
-        throw sirius::context_in_use_error(
-          "The Sirius process runtime is already in use or retained after a teardown failure");
-      }
-      throw std::system_error(error, std::generic_category(), "Acquiring Sirius context lease");
-    }
-  }
-
-  ~process_lease()
-  {
-    // Retain a failed teardown's reservation until process exit rather than
-    // letting another engine reuse potentially unsafe process-global resources.
-    if (release_on_destroy) { close(socket_fd); }
-  }
-};
-
 SiriusContext::SiriusContext() = default;
 
 SiriusContext::~SiriusContext() noexcept
@@ -281,13 +229,6 @@ SiriusContext::~SiriusContext() noexcept
     // the common path -- this is the backstop for any other drop-while-
     // uninitialized route.
     restore_cudf_pinned_memory_resource();
-    if (process_lease_ && process_lease_->batch_telemetry_owned) {
-      try {
-        sirius::telemetry::batch_telemetry_registry::instance().uninstall();
-      } catch (...) {
-        process_lease_->release_on_destroy = false;
-      }
-    }
     event_publisher_->stop();
     return;
   }
@@ -295,19 +236,16 @@ SiriusContext::~SiriusContext() noexcept
   try {
     terminate();
   } catch (const std::exception& e) {
-    process_lease_->release_on_destroy = false;
     try {
       SIRIUS_LOG_ERROR("SiriusContext teardown failed: {}", e.what());
     } catch (...) {
     }
   } catch (...) {
-    process_lease_->release_on_destroy = false;
     try {
       SIRIUS_LOG_ERROR("SiriusContext teardown failed with an unknown error");
     } catch (...) {
     }
   }
-  restore_cudf_pinned_memory_resource();
   event_publisher_->stop();
 }
 
@@ -865,11 +803,6 @@ void SiriusContext::restore_cudf_pinned_memory_resource() noexcept
 void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
-  if (process_lease_) {
-    throw std::runtime_error(
-      "Destroy a failed Sirius context before attempting initialization again");
-  }
-  process_lease_ = std::make_unique<process_lease>();
 
   // A throw anywhere after the cuDF pinned resource is installed (and before
   // is_initialized_ is set) must restore cuDF's global pinned resource before
@@ -935,7 +868,6 @@ void SiriusContext::initialize(const sirius::parsed_sirius_config& config)
 
   if (config_.get_telemetry_config().enable_quent &&
       config_.get_telemetry_config().enable_batch_events) {
-    process_lease_->batch_telemetry_owned = true;
     sirius::telemetry::batch_telemetry_registry::instance().install(telemetry_context_,
                                                                     *memory_manager_);
   }
@@ -1218,7 +1150,6 @@ void SiriusContext::terminate()
   task_creator_.reset();
   downgrade_executors_.clear();
   sirius::telemetry::batch_telemetry_registry::instance().uninstall();
-  process_lease_->batch_telemetry_owned = false;
   telemetry_context_.reset();
 
   peer_access_enabled_pairs_.clear();
@@ -1261,7 +1192,6 @@ void SiriusContext::terminate()
   topology_index_.reset();
 
   is_initialized_ = false;
-  process_lease_.reset();
 }
 
 sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager()

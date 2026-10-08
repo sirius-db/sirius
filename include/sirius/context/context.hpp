@@ -22,11 +22,13 @@ namespace sirius {
  * engine. Destruction releases its resources. There is no partially initialized
  * public state and no explicit initialization or shutdown operation.
  *
- * Only one active Sirius engine context is supported per process. A second
- * creation attempt fails while another context is initializing, active, or
- * shutting down. Contexts managed by other Sirius integrations share this limit.
- * Multiple configurations may exist independently of the active context. If
- * teardown fails, the runtime remains reserved until the process exits.
+ * Only one active Sirius engine context is supported per process, including
+ * contexts managed by other Sirius integrations. This restriction is not enforced:
+ * callers must ensure context lifetimes do not overlap. Constructing another
+ * context may succeed, but shared runtime resources can interfere with each other.
+ * Multiple configurations may exist independently of the active context.
+ * Destruction does not reset all process-wide settings: changing
+ * `sirius.executor.downgrade.copy_chunk_bytes` between contexts is unsupported.
  * Forking a process with an active context is unsupported.
  *
  * Context has unique ownership: move its std::unique_ptr handle to transfer
@@ -38,8 +40,7 @@ class SIRIUS_EXPORT Context {
   /**
    * @brief Create an initialized engine from a validated configuration.
    * @param config Requested engine settings; hardware limits are checked here.
-   * @return An owned context, or an Error with code ErrorCode::context_in_use or
-   *         ErrorCode::context_initialization.
+   * @return An owned context, or an Error with code ErrorCode::context_initialization.
    * @throws std::bad_alloc if host allocation fails. GPU allocation failures are returned as Error.
    *
    * @code{.cpp}

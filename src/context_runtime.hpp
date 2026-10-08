@@ -2,16 +2,10 @@
 #pragma once
 
 #include <memory>
-#include <stdexcept>
 
 namespace sirius {
 
 class parsed_sirius_config;
-
-class context_in_use_error : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
 
 // Keeps engine headers and their C++20 dependencies behind the public API implementation.
 class context_runtime {

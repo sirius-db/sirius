@@ -5,6 +5,8 @@
 
 #include <rmm/error.hpp>
 
+#include <stdexcept>
+
 namespace sirius {
 
 struct context_runtime::Impl {

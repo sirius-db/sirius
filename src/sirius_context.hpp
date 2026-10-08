@@ -777,10 +777,6 @@ class SiriusContext : public ClientContextState {
   /// queued tasks. Each step is separately guarded; neither can throw.
   void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
-  struct process_lease;
-  // Declared before runtime resources so failed initialization releases the process last.
-  std::unique_ptr<process_lease> process_lease_;
-
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation
   // and engine execution must be serialized (single-flight). The slot is
