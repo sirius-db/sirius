@@ -2080,24 +2080,6 @@ std::shared_ptr<const sirius::operator_params> query_operator_options(ClientCont
   if (state && state->execution_options) return state->execution_options;
   auto options = std::make_shared<sirius::operator_params>(session_operator_params(context));
   options->like_swar_fastpath = like_swar_fastpath_enabled(context);
-  auto runtime                = context.registered_state->Get<SiriusContext>("sirius_state");
-  if (runtime && runtime->is_initialized()) {
-    std::size_t cap = std::numeric_limits<std::size_t>::max();
-    for (auto* space :
-         runtime->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-      cap = std::min(cap,
-                     static_cast<std::size_t>(space->get_max_memory() /
-                                              runtime->get_config().max_concurrent_queries() *
-                                              options->max_sort_partition_memory_fraction));
-    }
-    if (cap != std::numeric_limits<std::size_t>::max()) {
-      cap = std::max<std::size_t>(cap, 1);
-      options->max_sort_partition_bytes =
-        options->max_sort_partition_bytes
-          ? std::min<std::uint64_t>(cap, options->max_sort_partition_bytes)
-          : cap;
-    }
-  }
   return options;
 }
 
