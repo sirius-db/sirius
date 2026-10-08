@@ -2344,13 +2344,14 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       port_id, batch, partition_idx);
   };
   if (port_id == "build" && batch) {
+    bool const accumulated = _dynamic_filter_session.accumulation_claimed();
     bool whole             = false;
     bool report_incomplete = false;
     {
       std::scoped_lock lock(op_state_mutex);
-      whole = _build_arrives_whole;
-      report_incomplete =
-        !whole && _dynamic_filter_session.plan().enabled() && !_build_not_whole_reported;
+      whole             = _build_arrives_whole;
+      report_incomplete = !whole && !accumulated && _dynamic_filter_session.plan().enabled() &&
+                          !_build_not_whole_reported;
       if (report_incomplete) { _build_not_whole_reported = true; }
     }
     if (report_incomplete) {
@@ -2374,7 +2375,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 
 void sirius_physical_hash_join::on_finalize_operator()
 {
-  _dynamic_filter_session.finish_input();
+  _dynamic_filter_session.finalize_input();
   std::scoped_lock lg(op_state_mutex);
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {

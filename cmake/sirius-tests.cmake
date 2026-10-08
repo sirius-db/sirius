@@ -12,6 +12,29 @@ else()
   link_extension_libraries(sirius_unittest "")
 endif()
 
+# Compile the public API test separately so engine tests remain C++20.
+add_library(sirius_context_config_test OBJECT
+            test/cpp/config/test_context_config.cpp)
+target_compile_features(sirius_context_config_test PRIVATE cxx_std_23)
+target_compile_definitions(sirius_context_config_test
+                           PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+set_target_properties(sirius_context_config_test PROPERTIES CXX_SCAN_FOR_MODULES
+                                                            OFF)
+target_include_directories(
+  sirius_context_config_test BEFORE
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(sirius_context_config_test PRIVATE ${sirius_test_library}
+                                                         Catch2::Catch2)
+if(VCPKG_BUILD)
+  set_target_properties(sirius_context_config_test
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(sirius_context_config_test BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+target_sources(sirius_unittest
+               PRIVATE $<TARGET_OBJECTS:sirius_context_config_test>)
+
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
   target_include_directories(sirius_unittest BEFORE PRIVATE ${_VCPKG_INC})
@@ -32,8 +55,14 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
 )
 
-target_link_libraries(sirius_unittest ${sirius_test_library} duckdb_static
-                      ZLIB::ZLIB Catch2::Catch2 ${SIRIUS_CURL_TARGET})
+target_link_libraries(
+  sirius_unittest
+  ${sirius_test_library}
+  duckdb_static
+  ZLIB::ZLIB
+  Catch2::Catch2
+  ${SIRIUS_CURL_TARGET}
+  ${CMAKE_DL_LIBS})
 
 target_include_directories(
   sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
@@ -68,6 +97,19 @@ add_dependencies(sirius_unittest sirius_nvtx_startup)
 # that conflict with inline definitions from headers included in test files.
 target_link_options(sirius_unittest PRIVATE
                     "LINKER:--allow-multiple-definition")
+
+# Isolated opt-in host allocation fault tests; the runner supplies exact
+# call-site ranges.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_library(sirius_host_allocation_fault SHARED EXCLUDE_FROM_ALL
+              test/cpp/utils/dynamic_filter_host_allocation_fault.cpp)
+  target_link_libraries(sirius_host_allocation_fault PRIVATE ${CMAKE_DL_LIBS})
+  set_target_properties(
+    sirius_host_allocation_fault
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_SCAN_FOR_MODULES OFF)
+endif()
 
 set_target_properties(
   sirius_unittest

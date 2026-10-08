@@ -48,8 +48,8 @@ manually re-run old `Distribution` build to never regress `latest` backward.
   `push`-triggered `Distribution` run on `main` actually publishes, everything else is a
   deliberate no-op.
 
-## Changelog fallback behavior
+## Release notes change link
 
-The `latest` changelog uses `stable..<sha>` when a `stable` tag exists, and falls back to the
-last 50 commits of the entire repo history when it doesn't. If `stable` is ever deleted, promote
-it again before the next `latest` publish so the changelog stays meaningful.
+The `latest` release notes link to a GitHub comparison between the `stable` commit and the
+released commit. Both revisions are pinned to their commit SHAs, so the link remains accurate
+when the tags move. Without a `stable` tag, the notes link to the released commit's history.

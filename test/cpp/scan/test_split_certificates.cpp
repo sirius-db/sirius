@@ -42,6 +42,7 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -49,6 +50,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -242,7 +244,11 @@ void check_parquet_file_split(scan_info const& info,
   CHECK(split->partition_values == file.partition_values);
   CHECK(split->disable_filter_pushdown == file.disable_filter_pushdown);
   CHECK(split->reader_options == file.reader_options);
-  REQUIRE_NOTHROW(validate_split_for_gpu(file.contract_id(), *split));
+  REQUIRE_NOTHROW(validate_split_for_gpu(
+    file.contract_id(),
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file),
+    {},
+    *split));
 }
 
 bound_read_view test_view()
@@ -260,11 +266,11 @@ bound_read_view test_view()
 
 class certificate_test_split final : public scan_info {
  public:
-  explicit certificate_test_split(scan_contract_id id) : id_(id)
+  explicit certificate_test_split(scan_contract_id id, bool omit_dependency = false) : id_(id)
   {
-    certificates_.push_back(
-      split_materializer_certificate{id, 7, "one.parquet|footer=128", "projection=0", "host"});
-    dependencies_.emplace_back();
+    certificates_.push_back(split_materializer_certificate{
+      id, 7, "one.parquet|footer=128", 0, check_bit(later_check::host_staged)});
+    if (!omit_dependency) dependencies_.emplace_back();
   }
 
   [[nodiscard]] std::span<split_materializer_certificate const> certificates() const override
@@ -350,16 +356,46 @@ TEST_CASE("Split certificates expose parallel dependencies and unevaluated eligi
   CHECK(eligibility.evidence_scope == certificate_evidence_scope::none);
 }
 
+TEST_CASE("Certificate diagnostic reports retained checks and profiles without identity",
+          "[scan][certificate][diagnostic]")
+{
+  scan_info split;
+  auto profiles = std::make_shared<physical_profile_table>();
+  physical_profile profile;
+  profile.storage_version = 7;
+  profile.columns.push_back(
+    physical_column_profile{.type = 2, .data_codecs = 4, .validity_or_encodings = 8});
+  auto id = profiles->add(std::move(profile));
+  split_materializer_certificate certificate;
+  certificate.contract_id    = 41;
+  certificate.input_identity = "sensitive-source-path";
+  certificate.profile        = id;
+  certificate.validation =
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
+  split_dependencies dependency;
+  dependency.profiles = profiles;
+  split.set_contract_payload(41, {certificate}, {dependency});
+  auto text = format_split_certificates_for_dump(split);
+  CHECK(text.find("validation=segments_per_range,matrix_per_range") != std::string::npos);
+  CHECK(text.find("storage_version:7") != std::string::npos);
+  CHECK(text.find("data_codecs:4") != std::string::npos);
+  CHECK(text.find("sensitive-source-path") == std::string::npos);
+
+  certificate.profile = 0;
+  split.set_contract_payload(41, {certificate}, {dependency});
+  CHECK(format_split_certificates_for_dump(split).find("profile=missing") != std::string::npos);
+}
+
 TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certificate]")
 {
   struct expectation {
     materializer_kind kind;
-    std::vector<std::string> later_checks;
+    later_check_set later_checks;
   };
   auto const expectations = std::vector<expectation>{
-    {materializer_kind::duckdb_native, {"segments_per_range"}},
-    {materializer_kind::parquet, {"footer_per_file"}},
-    {materializer_kind::iceberg, {"footer_per_file"}},
+    {materializer_kind::duckdb_native, check_bit(later_check::segments_per_range)},
+    {materializer_kind::parquet, check_bit(later_check::footer_per_file)},
+    {materializer_kind::iceberg, check_bit(later_check::footer_per_file)},
     {materializer_kind::stream, {}},
   };
 
@@ -378,13 +414,51 @@ TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certif
   }
 }
 
+TEST_CASE("Certification budget charges only explicit added work", "[scan][certificate]")
+{
+  certification_budget budget(std::chrono::milliseconds{5}, 1024, true);
+  budget.charge(std::chrono::microseconds{2500}, 512);
+  CHECK_FALSE(budget.exceeded());
+  std::this_thread::sleep_for(std::chrono::milliseconds{6});
+  CHECK_FALSE(budget.exceeded());
+  budget.charge(std::chrono::microseconds{2500}, 512);
+  CHECK_FALSE(budget.exceeded());  // Exact allowance is admitted.
+  budget.charge(std::chrono::microseconds{1}, 0);
+  CHECK(budget.exceeded());
+  CHECK(budget.declines());
+  CHECK(budget.consumed().added_time_us == 5001);
+
+  certification_budget production(std::chrono::milliseconds{5}, 1024);
+  production.charge(std::chrono::microseconds{0}, 1025);
+  CHECK(production.exceeded());
+  CHECK_FALSE(production.declines());
+}
+
 TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][certificate]")
 {
   constexpr scan_contract_id contract_id = 51;
   auto const combine_files               = GENERATE(false, true);
-  CAPTURE(combine_files);
+  auto const warm_cache                  = GENERATE(false, true);
+  auto const iceberg_schema              = GENERATE(false, true);
+  CAPTURE(combine_files, warm_cache, iceberg_schema);
   temporary_directory files;
-  auto info         = parquet_info(contract_id);
+  auto make_info = [&] {
+    auto result = parquet_info(contract_id);
+    if (iceberg_schema) {
+      result->resolved_file_paths = {
+        (project_root() /
+         "test/cpp/integration/data/iceberg_conformance/rename_col/conf/rename_col/data/"
+         "00000-0-571c62d9-f336-4fc6-b0c0-6ee9232f603c.parquet")
+          .string()};
+      result->names          = {"id", "value"};
+      result->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                sirius::logical_type::make(sirius::type_id::VARCHAR)};
+      result->physical_schema =
+        iceberg_table_schema{{{"id", 1, "INTEGER"}, {"value", 2, "VARCHAR"}}};
+    }
+    return result;
+  };
+  auto info         = make_info();
   auto const source = info->resolved_file_paths.front();
   std::vector<std::string> paths;
   for (auto const* name : {"first.parquet", "second.parquet"}) {
@@ -396,7 +470,19 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
   info->approximate_batch_size = 64 * 1024 * 1024;
   auto ingestible              = make_ingestible(std::move(info));
   auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
-  auto coalescer               = ingestible->create_batch_coalescer();
+  if (warm_cache) {
+    auto warm_info                 = make_info();
+    warm_info->resolved_file_paths = paths;
+    auto warmer                    = make_ingestible(std::move(warm_info));
+    for (auto const& path : paths) {
+      auto provider = warmer->next_split_provider(
+        [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+      REQUIRE(provider);
+      REQUIRE(provider());
+      REQUIRE(ioctx->open_datasource(path)->metadata());
+    }
+  }
+  auto coalescer = ingestible->create_batch_coalescer();
   std::vector<std::unique_ptr<scan_info>> splits;
   std::vector<std::string> identities;
   auto collect = [&](auto emitted) {
@@ -442,6 +528,13 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
       REQUIRE(group.datasource);
       CHECK(dependency.footer == group.file_metadata);
       CHECK(&dependency.datasource->get_io_object() == &group.datasource->get_io_object());
+      auto required =
+        check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+      if (iceberg_schema) required |= check_bit(later_check::schema_per_file);
+      CHECK(certificate.validation == required);
+      REQUIRE(dependency.profiles);
+      REQUIRE(certificate.profile != 0);
+      CHECK_FALSE(dependency.profiles->get(certificate.profile).columns.empty());
     }
   }
   CHECK(position == paths.size());
@@ -516,7 +609,9 @@ TEST_CASE("Parquet split validation requires one matching certificate per slice"
   REQUIRE(split->rg_slices.size() == 2);
   REQUIRE(split->certificates().size() == 2);
   REQUIRE(split->dependencies().size() == 2);
-  REQUIRE_NOTHROW(validate_split_for_gpu(fixture.contract_id, *split));
+  auto const required =
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+  REQUIRE_NOTHROW(validate_split_for_gpu(fixture.contract_id, required, {}, *split));
 
   std::vector<split_materializer_certificate> certificates(split->certificates().begin(),
                                                            split->certificates().end());
@@ -537,7 +632,8 @@ TEST_CASE("Parquet split validation requires one matching certificate per slice"
   }
   split->set_contract_payload(
     fixture.contract_id, std::move(certificates), std::move(dependencies));
-  REQUIRE_THROWS_AS(validate_split_for_gpu(fixture.contract_id, *split), std::runtime_error);
+  REQUIRE_THROWS_AS(validate_split_for_gpu(fixture.contract_id, required, {}, *split),
+                    std::runtime_error);
 }
 
 TEST_CASE("Parquet certificates include physical-original file evidence after comparison",
@@ -592,7 +688,7 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   info->read_views          = registry;
   auto ingestible           = make_ingestible(std::move(info));
   // Finalize can publish evidence after constructing the ingestible, before metadata dispatch.
-  registry->publish_supported(
+  registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
   auto ioctx   = std::make_shared<sirius::io::kvikio_context>();
   auto resolve = [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; };
@@ -665,7 +761,7 @@ TEST_CASE("Local glob evidence reaches Parquet certificates through physical com
     sirius::transparent::candidate_origin::copy, &logical, physical, *registry);
   INFO(sirius::transparent::describe_read_view_mismatch(comparison));
   REQUIRE(comparison.equal);
-  registry->publish_supported(
+  registry->publish_correspondence(
     certificate_evidence_scope::binding_correspondence, comparison.correspondence, physical);
   auto const evidence = registry->entry(id).physical_evidence;
   REQUIRE(evidence);
@@ -746,7 +842,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   constexpr scan_contract_id contract_id = 61;
   native_database fixture;
   exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
-  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(300000)");
+  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(1000000)");
   exec_ok(*fixture.connection, "CHECKPOINT");
 
   auto info                    = native_info(fixture, contract_id);
@@ -755,10 +851,12 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
   auto coalescer               = ingestible->create_batch_coalescer();
   std::size_t input_slices     = 0;
+  std::size_t input_ranges     = 0;
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
     auto range = provider();
+    ++input_ranges;
     REQUIRE(range);
     auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
     REQUIRE(native_range);
@@ -777,6 +875,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   }
 
   REQUIRE(input_slices > 1);
+  REQUIRE(input_ranges > 1);
   REQUIRE(splits.size() > 1);
   std::size_t output_slices = 0;
   for (auto const& split : splits) {
@@ -789,8 +888,22 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
       auto const& certificate = split->certificates()[i];
       auto const& dependency  = split->dependencies()[i];
       CHECK(certificate.contract_id == contract_id);
-      CHECK(certificate.input_identity.find(fixture.path.string()) == 0);
+      auto const& group = native_split->row_groups[i];
+      CHECK(certificate.split_id == static_cast<uint64_t>(group.row_group_index));
       REQUIRE(dependency.checkpoint_iteration.has_value());
+      CHECK(certificate.input_identity == fixture.path.string() + "|checkpoint=" +
+                                            std::to_string(*dependency.checkpoint_iteration) +
+                                            "|row_group=" + std::to_string(group.row_group_index));
+      CHECK(certificate.validation == (check_bit(later_check::segments_per_range) |
+                                       check_bit(later_check::matrix_per_range)));
+      REQUIRE(dependency.profiles);
+      REQUIRE(certificate.profile != 0);
+      auto profile = dependency.profiles->get(certificate.profile);
+      CHECK(profile.storage_version != 0);
+      CHECK(profile.columns.size() == group.columns.size());
+      REQUIRE(dependency.datasource);
+      REQUIRE(native_split->datasource);
+      CHECK(&dependency.datasource->get_io_object() == &native_split->datasource->get_io_object());
       CHECK(certificate.input_identity.find(
               "|checkpoint=" + std::to_string(*dependency.checkpoint_iteration) + "|row_group=") !=
             std::string::npos);
@@ -867,7 +980,11 @@ TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback sp
   CHECK(empty->contract_id() == contract_id);
   CHECK(empty->certificates().empty());
   CHECK(empty->dependencies().empty());
-  CHECK_NOTHROW(validate_split_for_gpu(contract_id, *empty));
+  CHECK_NOTHROW(validate_split_for_gpu(
+    contract_id,
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range),
+    {},
+    *empty));
 }
 
 TEST_CASE("GPU scan construction requires an explicit contract",
@@ -902,4 +1019,212 @@ TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][cer
                       Catch::Matchers::ContainsSubstring("contract"));
   auto const after = observer.get_transparent_execution_stats();
   CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
+}
+
+TEST_CASE("Consumption requires per-unit coverage and matching dependencies",
+          "[scan][certificate][consumption]")
+{
+  auto info       = parquet_info(81);
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(provider());
+  auto tail      = coalescer->flush();
+  for (auto& s : tail)
+    splits.push_back(std::move(s));
+  REQUIRE(splits.size() == 1);
+  auto& split   = *splits[0];
+  auto* parquet = dynamic_cast<parquet_split_info*>(&split);
+  REQUIRE(parquet);
+  auto required =
+    check_bit(later_check::footer_per_file) | check_bit(later_check::profile_per_file);
+  REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, split));
+  std::vector<split_materializer_certificate> certificates(split.certificates().begin(),
+                                                           split.certificates().end());
+  std::vector<split_dependencies> dependencies(split.dependencies().begin(),
+                                               split.dependencies().end());
+  SECTION("missing coverage") { certificates[0].validation.reset(); }
+  SECTION("missing profile") { certificates[0].profile = 0; }
+  SECTION("wrong footer identity")
+  {
+    certificates[0].input_identity = parquet->rg_slices[0].file_path + "|footer=0";
+  }
+  SECTION("missing file approval") { dependencies[0].parquet_approval.reset(); }
+  SECTION("row group outside approved set")
+  {
+    auto approval = std::make_shared<parquet_input_approval>(*dependencies[0].parquet_approval);
+    approval->row_groups.clear();
+    dependencies[0].parquet_approval = std::move(approval);
+  }
+  SECTION("foreign file") { certificates[0].input_identity = "other.parquet|footer=1"; }
+  SECTION("foreign footer")
+  {
+    dependencies[0].footer = std::make_shared<cudf::io::parquet::FileMetaData>();
+  }
+  SECTION("missing datasource") { dependencies[0].datasource.reset(); }
+  SECTION("non-parallel dependency")
+  {
+    certificate_test_split malformed(81, true);
+    REQUIRE_THROWS_WITH(validate_split_for_gpu(81, required, {}, malformed),
+                        "scan certificate incomplete: non-parallel dependencies");
+    return;
+  }
+  SECTION("nonempty payload with empty certificates")
+  {
+    certificates.clear();
+    dependencies.clear();
+  }
+  SECTION("surplus certificate")
+  {
+    certificates.push_back(certificates[0]);
+    dependencies.push_back(dependencies[0]);
+  }
+  SECTION("invalid row group") { parquet->rg_slices[0].row_group_indices = {999999}; }
+  SECTION("schema check required") { required |= check_bit(later_check::schema_per_file); }
+  SECTION("zero-work empty certificates")
+  {
+    for (auto& slice : parquet->rg_slices)
+      slice.row_group_indices.clear();
+    split.set_contract_payload(81, {}, {});
+    REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, split));
+    return;
+  }
+  split.set_contract_payload(81, std::move(certificates), std::move(dependencies));
+  REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, split), certificate_incomplete);
+}
+
+TEST_CASE("Delta consumption derives coverage from actual segment lanes and expected key",
+          "[scan][certificate][consumption]")
+{
+  auto const kind = GENERATE(0, 1, 2);  // transient, persistent blockless, mixed
+  CAPTURE(kind);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  exec_ok(con, "BEGIN TRANSACTION");
+  auto& database = duckdb::Catalog::GetCatalog(*con.context, "").GetAttached();
+  key_held_witness key{&database, "fixture.db", 31};
+  duckdb_native_scan_info split;
+  split.is_insert_delta  = true;
+  split.host_backed_only = true;  // must NOT decide coverage
+  duckdb_row_group_metadata group{};
+  group.row_group_index = 4;
+  group.row_count       = 2;
+  duckdb_column_metadata column{};
+  std::uint8_t staged[8]{};
+  duckdb_segment_descriptor segment{};
+  segment.block_id     = -1;
+  segment.is_transient = true;
+  segment.host_ptr     = staged;
+  auto required        = check_bit(later_check::key_held);
+  if (kind != 1) {
+    column.data_segments.push_back(segment);
+    required |= check_bit(later_check::host_staged);
+  }
+  if (kind != 0) {
+    segment.is_transient = false;
+    segment.host_ptr     = nullptr;
+    column.array_child_validity_segments.push_back(segment);
+    required |=
+      check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
+  }
+  group.columns.push_back(column);
+  split.row_groups.push_back(group);
+  auto profiles = std::make_shared<physical_profile_table>();
+  auto id       = profiles->add({});
+  split_materializer_certificate cert{81, 4, "table|row_group=4", id, required, key};
+  auto install = [&] {
+    split.set_contract_payload(81, {cert}, {{nullptr, nullptr, {}, profiles}});
+  };
+  install();
+  auto fresh_required =
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
+  REQUIRE_NOTHROW(validate_split_for_gpu(81, fresh_required, key, split));
+  SECTION("missing union bit") { cert.validation.reset(); }
+  SECTION("wrong query") { cert.key_held->query_token++; }
+  SECTION("wrong database") { cert.key_held->database = nullptr; }
+  SECTION("wrong path") { cert.key_held->db_path = "other.db"; }
+  SECTION("missing witness") { cert.key_held.reset(); }
+  SECTION("wrong group") { cert.split_id++; }
+  SECTION("wrong identity") { cert.input_identity = "table|row_group=5"; }
+  SECTION("no expected key")
+  {
+    REQUIRE_THROWS_AS(validate_split_for_gpu(81, fresh_required, {}, split),
+                      certificate_incomplete);
+    return;
+  }
+  install();
+  REQUIRE_THROWS_AS(validate_split_for_gpu(81, fresh_required, key, split), certificate_incomplete);
+}
+
+TEST_CASE("Resident admission requires pin facts and this query's applicable checks",
+          "[scan][certificate][consumption]")
+{
+  pin_validation v;
+  v.identity = v.layout = v.structure = {true, true};
+  v.query_token                       = 17;
+  REQUIRE_NOTHROW(admit_resident_batch(81, v, 17));  // Parquet N/A
+  v.iteration = v.visibility = {true, true};
+  REQUIRE_NOTHROW(admit_resident_batch(81, v, 17));
+  SECTION("identity missing") { v.identity.applies = false; }
+  SECTION("identity failed") { v.identity.passed = false; }
+  SECTION("layout missing") { v.layout.applies = false; }
+  SECTION("layout failed") { v.layout.passed = false; }
+  SECTION("structure missing") { v.structure.applies = false; }
+  SECTION("structure failed") { v.structure.passed = false; }
+  SECTION("iteration failed") { v.iteration.passed = false; }
+  SECTION("visibility failed") { v.visibility.passed = false; }
+  SECTION("applicability mismatch") { v.iteration.applies = false; }
+  SECTION("stale query") { v.query_token++; }
+  try {
+    admit_resident_batch(81, v, 17);
+    FAIL("invalid resident witness admitted");
+  } catch (certificate_incomplete const& error) {
+    CHECK(error.contract == 81);
+    CHECK(error.missing.none());
+  }
+}
+
+TEST_CASE("Native consumption rejects shuffled groups and missing iteration evidence",
+          "[scan][certificate][consumption][integration]")
+{
+  native_database fixture;
+  exec_ok(*fixture.connection,
+          "CREATE TABLE items AS SELECT i::INTEGER id FROM range(300000) t(i)");
+  exec_ok(*fixture.connection, "CHECKPOINT");
+  auto ingestible = make_ingestible(native_info(fixture, 81));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  auto split = provider();
+  auto required =
+    check_bit(later_check::segments_per_range) | check_bit(later_check::matrix_per_range);
+  REQUIRE_NOTHROW(validate_split_for_gpu(81, required, {}, *split));
+  std::vector<split_materializer_certificate> certificates(split->certificates().begin(),
+                                                           split->certificates().end());
+  std::vector<split_dependencies> dependencies(split->dependencies().begin(),
+                                               split->dependencies().end());
+  REQUIRE(certificates.size() > 1);
+  SECTION("shuffled certificates") { std::swap(certificates[0], certificates[1]); }
+  SECTION("missing iteration") { dependencies[0].checkpoint_iteration.reset(); }
+  SECTION("wrong iteration") { ++*dependencies[0].checkpoint_iteration; }
+  SECTION("missing datasource") { dependencies[0].datasource.reset(); }
+  SECTION("missing matrix")
+  {
+    certificates[0].validation &= ~check_bit(later_check::matrix_per_range);
+  }
+  SECTION("missing profile") { dependencies[0].profiles.reset(); }
+  SECTION("nonempty payload empty list")
+  {
+    certificates.clear();
+    dependencies.clear();
+  }
+  SECTION("missing group certificate")
+  {
+    certificates.pop_back();
+    dependencies.pop_back();
+  }
+  split->set_contract_payload(81, std::move(certificates), std::move(dependencies));
+  REQUIRE_THROWS_AS(validate_split_for_gpu(81, required, {}, *split), certificate_incomplete);
 }

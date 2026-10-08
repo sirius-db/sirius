@@ -10,7 +10,7 @@ platforms = [
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
   { name = "linux-aarch64-cuda12", platform = "linux-aarch64", cuda = "12" },
 ]
-requires-pixi = ">=0.71"
+requires-pixi = ">=0.78"
 
 [activation]
 scripts = ["scripts/pixi_activate.sh"]
@@ -62,11 +62,13 @@ sqlite = "3.*"
 rust-src = "*"
 liburing = "*"
 openssl = "*"
+xxhash = "0.8.*"
 libcurl = "*"
 pnpm = "*"
 python = "3.14.*"
 pyarrow = ">=14"
 seaweedfs = ">=4.48"
+fastavro = "1.12.2.*"
 
 [tasks]
 
