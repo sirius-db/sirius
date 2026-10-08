@@ -713,11 +713,6 @@ The task-creator, downgrade, and scan-manager pools support optional CPU affinit
 (`cpu_affinity`) for core pinning. GPU pipeline affinity is derived per executor from the selected
 GPU's CPU topology. `num_threads` must be `> 0` for every pool.
 
-At execution, sort partition caps are bounded by the smallest configured GPU capacity divided
-by `max_concurrent_queries`, multiplied by `max_sort_partition_memory_fraction`. Explicit
-`max_sort_partition_bytes` values can reduce that cap further. The bound uses configured capacity
-rather than another query's momentary free-memory usage.
-
 ## DuckDB Settings Changed by Sirius
 
 Loading Sirius changes the database-wide default of one DuckDB setting. A session `SET` still wins, and a value the database already carries explicitly (from the connection config or a `SET GLOBAL` before `LOAD`) is left alone.
