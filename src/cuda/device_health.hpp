@@ -15,6 +15,10 @@
  */
 
 #pragma once
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/error.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <exception>
@@ -47,37 +51,66 @@ class fatal_device_error : public std::runtime_error {
  public:
   explicit fatal_device_error(cudaError_t status)
     : std::runtime_error(std::string("Sirius CUDA context unavailable: ") +
-                         cudaGetErrorName(status))
+                         cudaGetErrorName(status)),
+      status_(status)
   {
   }
+  [[nodiscard]] cudaError_t error_code() const noexcept { return status_; }
+
+ private:
+  cudaError_t status_;
 };
 inline void check_cuda_health(cudaError_t status)
 {
   if (fatal_cuda_status(status)) throw fatal_device_error(status);
 }
+namespace detail {
+// RMM's pinned version does not retain cudaError_t. Decode only its CUDA macro's
+// status field, and only for RMM exception types. Never inspect arbitrary SQL/error text.
+inline bool fatal_rmm_cuda_message(std::string_view message) noexcept
+{
+  constexpr std::string_view allocation_prefix = "std::bad_alloc: ";
+  if (message.starts_with(allocation_prefix)) message.remove_prefix(allocation_prefix.size());
+  if (!message.starts_with("CUDA error at: ") &&
+      !message.starts_with("CUDA error (failed to allocate "))
+    return false;
+  auto const status_start = message.rfind(": ");
+  if (status_start == std::string_view::npos) return false;
+  message.remove_prefix(status_start + 2);
+  auto const status_end = message.find(' ');
+  auto const name       = message.substr(0, status_end);
+  // Match the complete status token, not occurrences in the file path or error description.
+  for (auto status : {cudaErrorIllegalInstruction,
+                      cudaErrorMisalignedAddress,
+                      cudaErrorInvalidAddressSpace,
+                      cudaErrorInvalidPc,
+                      cudaErrorHardwareStackError,
+                      cudaErrorIllegalAddress,
+                      cudaErrorAssert,
+                      cudaErrorLaunchFailure,
+                      cudaErrorLaunchTimeout,
+                      cudaErrorECCUncorrectable,
+                      cudaErrorContextIsDestroyed,
+                      cudaErrorUnknown}) {
+    if (name == cudaGetErrorName(status)) return true;
+  }
+  return false;
+}
+}  // namespace detail
+
 inline bool fatal_device_exception(std::exception_ptr error) noexcept
 {
   try {
     if (error) std::rethrow_exception(error);
-  } catch (fatal_device_error const&) {
-    return true;
-  } catch (std::exception const& e) {
-    // cuDF/RMM wrap CUDA statuses in exceptions after consuming the sticky error.
-    // Their error names preserve the fatal classification even after that reset.
-    std::string_view message(e.what());
-    for (auto name : {"cudaErrorIllegalInstruction",
-                      "cudaErrorMisalignedAddress",
-                      "cudaErrorInvalidAddressSpace",
-                      "cudaErrorInvalidPc",
-                      "cudaErrorHardwareStackError",
-                      "cudaErrorIllegalAddress",
-                      "cudaErrorAssert",
-                      "cudaErrorLaunchFailure",
-                      "cudaErrorLaunchTimeout",
-                      "cudaErrorECCUncorrectable",
-                      "cudaErrorContextIsDestroyed",
-                      "cudaErrorUnknown"})
-      if (message.find(name) != std::string_view::npos) return true;
+  } catch (fatal_device_error const& e) {
+    return fatal_cuda_status(e.error_code());
+  } catch (cudf::cuda_error const& e) {
+    return fatal_cuda_status(e.error_code());
+  } catch (rmm::cuda_error const& e) {
+    return detail::fatal_rmm_cuda_message(e.what());
+  } catch (rmm::bad_alloc const& e) {
+    // RMM_CUDA_TRY_ALLOC also uses bad_alloc for non-OOM CUDA failures.
+    return detail::fatal_rmm_cuda_message(e.what());
   } catch (...) {
   }
   return false;

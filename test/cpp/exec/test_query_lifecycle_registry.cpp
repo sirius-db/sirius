@@ -564,10 +564,18 @@ TEST_CASE("failed runtime closes existing publishers and refuses late initializa
   query_lifecycle_registry registry;
   registry.open_query(make_query_id(1));
   auto already_publishing = registry.try_begin_submission(make_query_id(1));
-  registry.mark_runtime_failed();
-  registry.quiesce_all();
+  registry.open_query(make_query_id(2));
+  CHECK_FALSE(registry.report_failure(
+    std::make_exception_ptr(std::runtime_error("SQL literal cudaErrorUnknown")), make_query_id(1)));
+  CHECK_FALSE(registry.runtime_failed());
+  CHECK(registry.accepts_work(make_query_id(1)));
+  CHECK(registry.accepts_work(make_query_id(2)));
+  auto fatal = std::make_exception_ptr(cudf::cuda_error("device failed", cudaErrorIllegalAddress));
+  CHECK(registry.report_failure(fatal, make_query_id(1)));
+  CHECK(registry.report_failure(fatal));  // Idempotent; also works without a query owner.
+  CHECK_FALSE(registry.accepts_work(make_query_id(2)));
   CHECK_FALSE(registry.try_begin_submission(make_query_id(1)));
-  CHECK_THROWS(registry.open_query(make_query_id(2)));
+  CHECK_THROWS(registry.open_query(make_query_id(3)));
   already_publishing.finish();
   registry.wait_for_work(make_query_id(1));
   registry.close(make_query_id(1));

@@ -106,14 +106,7 @@ void memory_prefetcher::stop()
 
 void memory_prefetcher::handle_error(std::exception_ptr error) noexcept
 {
-  if (!fatal_device_exception(error)) return;
-  _running.store(false, std::memory_order_relaxed);
-
-  _lifecycle.mark_runtime_failed();
-  try {
-    _lifecycle.quiesce_all();
-  } catch (...) {
-  }
+  if (_lifecycle.report_failure(error)) _running.store(false, std::memory_order_relaxed);
 }
 
 void memory_prefetcher::worker_loop(std::size_t worker_index)
