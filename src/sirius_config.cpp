@@ -233,6 +233,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
   r.optional("footer_probe_bytes", yaml::bytes(opt.footer_probe_bytes));
   r.optional("list_max_matches", opt.list_max_matches);
   r.optional("list_max_scanned", opt.list_max_scanned);
+  r.optional("staging_reserve_bytes", yaml::bytes(opt.staging_reserve_bytes));
+  r.optional("staging_wait_timeout_ms", opt.staging_wait_timeout);
   r.reject_unknown();
 }
 

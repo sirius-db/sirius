@@ -26,6 +26,7 @@
 
 #include <blockingconcurrentqueue.h>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -214,10 +215,17 @@ class rest_reactor {
   /// injected collaborators from the plain, file-settable tunables).
   class reactor_context {
    public:
+    /// @param host_space HOST-tier space that owns @p host_mr. When given, each
+    /// reactor reserves @c config::staging_reserve_bytes of it at start and serves
+    /// staging from that reservation first.
     reactor_context(config cfg,
                     std::shared_ptr<request_authorizer> authorizer,
-                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr)
-      : _config(std::move(cfg)), _authorizer(std::move(authorizer)), _host_mr(host_mr)
+                    cucascade::memory::fixed_size_host_memory_resource* host_mr = nullptr,
+                    cucascade::memory::memory_space* host_space                 = nullptr)
+      : _config(std::move(cfg)),
+        _authorizer(std::move(authorizer)),
+        _host_mr(host_mr),
+        _host_space(host_space)
     {
     }
 
@@ -231,11 +239,16 @@ class rest_reactor {
     {
       return _host_mr;
     }
+    [[nodiscard]] cucascade::memory::memory_space* host_space() const noexcept
+    {
+      return _host_space;
+    }
 
    private:
     config _config;
     std::shared_ptr<request_authorizer> _authorizer;
     cucascade::memory::fixed_size_host_memory_resource* _host_mr{nullptr};
+    cucascade::memory::memory_space* _host_space{nullptr};
   };
 
   using io_object_type       = rest_io_object;

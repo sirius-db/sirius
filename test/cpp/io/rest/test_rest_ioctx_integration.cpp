@@ -35,7 +35,9 @@
 
 #include <arpa/inet.h>
 #include <config.hpp>
+#include <cucascade/memory/config.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 #include <log/logging.hpp>
@@ -2808,4 +2810,153 @@ TEST_CASE("rest fails or retries every constituent of a fused GET together",
       CHECK(log.count(&c->chunk) == span_t{1, 0});
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned staging under pressure: the reactor's staging reservation, and reads
+// that wait for staging instead of failing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::size_t staging_tier_bytes = 64UL << 20;
+
+/// A HOST memory space whose pinned resource stages the reactor's device reads.
+struct staging_fixture {
+  explicit staging_fixture(range_http_server& server,
+                           std::size_t reserve_bytes,
+                           std::chrono::milliseconds wait_timeout)
+    : space([] {
+        cucascade::memory::host_memory_space_config c;
+        c.numa_id                    = 0;
+        c.memory_capacity            = staging_tier_bytes;
+        c.reservation_limit_fraction = 1.0;
+        c.block_size                 = fusion_chunk;
+        c.pool_size                  = 16;
+        c.initial_number_pools       = 1;
+        return c;
+      }())
+  {
+    auto cfg                  = direct_rest_test_config();
+    cfg.staging_reserve_bytes = reserve_bytes;
+    cfg.staging_wait_timeout  = wait_timeout;
+    auto authorizer           = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto ctx                  = std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(
+      cfg, std::move(authorizer), host_mr(), &space);
+    ioctx = std::make_shared<rest_ioctx>(1, std::move(ctx));
+    ioctx->start();
+  }
+
+  cucascade::memory::fixed_size_host_memory_resource* host_mr()
+  {
+    return space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  }
+
+  /// Take every block the shared tier still has, leaving only reserved bytes.
+  cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation exhaust()
+  {
+    auto const available = host_mr()->get_available_memory();
+    return host_mr()->allocate_multiple_blocks(available / fusion_chunk * fusion_chunk);
+  }
+
+  cucascade::memory::memory_space space;
+  std::shared_ptr<rest_ioctx> ioctx;
+};
+
+/// One staged device read filling @p dst from @p offset.
+std::vector<sirius::io::prepared_io_slice> staged_read(rmm::device_buffer& dst,
+                                                       std::size_t offset,
+                                                       rmm::cuda_stream& stream)
+{
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.emplace_back(sirius::io::range{offset, dst.size()},
+                      sirius::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream});
+  return slices;
+}
+
+}  // namespace
+
+TEST_CASE("rest staging is served from the reactor's reservation when the tier is full",
+          "[s3][integration][rest][staging]")
+{
+  if (!has_cuda_device()) {
+    WARN("Skipping staging test: no CUDA device for pinned staging");
+    return;
+  }
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  staging_fixture fixture(server, 8 * fusion_chunk, std::chrono::milliseconds{0});
+  auto datasource =
+    fixture.ioctx->open_datasource("s3://reserve-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+
+  // A first read starts the worker, which takes the reservation.
+  rmm::device_buffer warm(fusion_chunk, stream);
+  REQUIRE(std::move(fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                              staged_read(warm, 0, stream)))
+            .get(10s) == fusion_chunk);
+  REQUIRE(fixture.host_mr()->get_total_reserved_bytes() >= 8 * fusion_chunk);
+
+  // With wait_timeout 0 a read that found no staging would fail at once.
+  auto hold = fixture.exhaust();
+  REQUIRE(fixture.host_mr()->get_available_memory() < fusion_chunk);
+  std::size_t const size = 2 * fusion_chunk + 7;
+  rmm::device_buffer dst(size, stream);
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          staged_read(dst, 3, stream));
+  REQUIRE(std::move(future).get(10s) == size);
+  require_bytes_equal(copy_device_to_host(dst, size, stream),
+                      std::span<std::uint8_t const>(payload.data() + 3, size));
+}
+
+TEST_CASE("rest read parks while staging is exhausted and completes once it frees",
+          "[s3][integration][rest][staging]")
+{
+  if (!has_cuda_device()) {
+    WARN("Skipping staging test: no CUDA device for pinned staging");
+    return;
+  }
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  staging_fixture fixture(server, 0, std::chrono::minutes{1});
+  auto datasource = fixture.ioctx->open_datasource("s3://park-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+
+  auto hold              = fixture.exhaust();
+  std::size_t const size = fusion_chunk + 11;
+  rmm::device_buffer dst(size, stream);
+  auto future = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          staged_read(dst, 5, stream));
+  std::this_thread::sleep_for(300ms);
+  CHECK_FALSE(future.is_ready());
+  CHECK(server.get_count() == 0);
+
+  hold.reset();
+  REQUIRE(std::move(future).get(10s) == size);
+  require_bytes_equal(copy_device_to_host(dst, size, stream),
+                      std::span<std::uint8_t const>(payload.data() + 5, size));
+}
+
+TEST_CASE("rest read fails after staging_wait_timeout without staging",
+          "[s3][integration][rest][staging]")
+{
+  if (!has_cuda_device()) {
+    WARN("Skipping staging test: no CUDA device for pinned staging");
+    return;
+  }
+  auto payload = deterministic_payload(4 * fusion_chunk);
+  range_http_server server(payload);
+  staging_fixture fixture(server, 0, std::chrono::milliseconds{200});
+  auto datasource =
+    fixture.ioctx->open_datasource("s3://timeout-bucket/object.bin", payload.size());
+  rmm::cuda_stream stream;
+
+  auto hold = fixture.exhaust();
+  rmm::device_buffer dst(fusion_chunk, stream);
+  auto const start = std::chrono::steady_clock::now();
+  auto future      = fixture.ioctx->host_device_readv_async_io(datasource->get_io_object(),
+                                                          staged_read(dst, 0, stream));
+  CHECK_THROWS_AS(std::move(future).get(10s), rmm::out_of_memory);
+  CHECK(std::chrono::steady_clock::now() - start >= 200ms);
+  CHECK(server.get_count() == 0);
 }

@@ -21,8 +21,10 @@
 #include "io/types.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -86,6 +88,9 @@ struct rest_io_op_request {
   /// physical range is staged (the unfused shape). A null iovec that is NOT
   /// listed here is a hole: bytes a fused GET bridges and discards.
   std::vector<std::size_t> staging_slots;
+  /// When this request first found no staging; it fails once it has waited
+  /// @c config::staging_wait_timeout. Unset while it has never had to wait.
+  std::optional<std::chrono::steady_clock::time_point> staging_wait_start;
 
   [[nodiscard]] bool is_device() const noexcept { return first_device_copy() != nullptr; }
 

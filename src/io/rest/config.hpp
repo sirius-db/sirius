@@ -129,6 +129,20 @@ struct config {
   /// workloads.
   std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
 
+  /// Pinned host bytes each reactor reserves for staging at start
+  /// (@c memory_space::make_reservation_upto on the HOST tier).  Staging for
+  /// device reads is served from this reservation first, so spills filling the
+  /// shared pinned tier cannot starve the reads a query is waiting on.  The
+  /// default covers 32 maximum-size (16 MiB) fused GETs per reactor; 0 takes
+  /// no reservation.
+  std::size_t staging_reserve_bytes{512UL << 20};  // 512 MiB
+
+  /// How long a read whose staging cannot be allocated waits for staging to
+  /// free before it fails with rmm::out_of_memory.  While waiting it is parked
+  /// on the reactor and retried with backoff and whenever a read completes.
+  /// 0 fails at once.
+  std::chrono::milliseconds staging_wait_timeout{std::chrono::minutes{5}};
+
   /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never
   /// truncate).  @c list_max_matches bounds the files a glob keeps / a
   /// whole-listing accumulates (result memory); @c list_max_scanned bounds the

@@ -1321,6 +1321,32 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     std::deque<std::unique_ptr<rest_io_op_request>> pending;
     std::unique_ptr<grouped_io_request> active_group;
 
+    // Staging floor: the pinned host tier is shared with spills and the
+    // prefetching cache, which can fill it and starve the reads.
+    std::shared_ptr<cucascade::memory::reservation> staging_reservation;
+    if (auto* space = _ctx->host_space(); space != nullptr && _config.staging_reserve_bytes > 0 &&
+                                          _ctx->host_memory_resource() != nullptr) {
+      try {
+        staging_reservation = space->make_reservation_upto(_config.staging_reserve_bytes);
+      } catch (std::exception const& error) {
+        SIRIUS_LOG_WARN("rest_reactor: staging reservation failed: {}", error.what());
+      }
+      auto const reserved = staging_reservation ? staging_reservation->size() : 0;
+      if (reserved < _config.staging_reserve_bytes) {
+        SIRIUS_LOG_WARN(
+          "rest_reactor: reserved {} of {} staging bytes", reserved, _config.staging_reserve_bytes);
+      }
+    }
+
+    // Reads whose staging could not be allocated wait here instead of failing.
+    // They go back to the front of `ready` when staging_retry_due passes; a read
+    // completing makes them due at once, since that is what frees staging.
+    constexpr auto staging_backoff_min = std::chrono::milliseconds{1};
+    constexpr auto staging_backoff_max = std::chrono::milliseconds{100};
+    std::deque<std::unique_ptr<rest_io_op_request>> staging_parked;
+    auto staging_retry_due = std::chrono::steady_clock::time_point{};
+    auto staging_backoff   = staging_backoff_min;
+
     struct parked_copy {
       slot_pool::token token;
       cucascade::cuda::cuda_event* event{nullptr};
@@ -1434,15 +1460,24 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       for (auto const index : request.staging_slots) {
         staged += op.iovecs.at(index).iov_len;
       }
-      auto allocation = resource->allocate_multiple_blocks(staged);
+      // Drawn from the reservation first; bytes beyond it come from the shared tier.
+      auto allocation = resource->allocate_multiple_blocks(staged, staging_reservation.get());
       if (allocation == nullptr || allocation->size_bytes() < staged) {
         throw std::runtime_error("rest_reactor: failed to allocate complete staging range");
       }
       op.iovecs = carve_staging(op.iovecs, request.staging_slots, *allocation);
       request.staging_slots.clear();
-      using allocation_type =
-        cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-      op.staging_owner = std::shared_ptr<allocation_type>(std::move(allocation));
+      // The lease keeps the reservation alive until its blocks are returned:
+      // an allocation may outlive the worker, and returning blocks against a
+      // released reservation would mis-account them.
+      struct staging_lease {
+        std::shared_ptr<cucascade::memory::reservation> reservation;
+        cucascade::memory::fixed_size_host_memory_resource::fixed_multiple_blocks_allocation blocks;
+      };
+      op.staging_owner =
+        std::make_shared<staging_lease>(staging_lease{staging_reservation, std::move(allocation)});
+      request.staging_wait_start.reset();
+      staging_backoff = staging_backoff_min;
     };
 
     // Serve the longest fusable prefix of the active group with one GET (see
@@ -1728,6 +1763,15 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     int running  = 0;
     int inflight = 0;
     auto submit  = [&] {
+      if (!staging_parked.empty() && std::chrono::steady_clock::now() >= staging_retry_due) {
+        // Retried ahead of everything else, in the order they parked. A read that
+        // fails again parks behind a fresh due time, so this pass cannot spin.
+        while (!staging_parked.empty()) {
+          ready.push_front(std::move(staging_parked.back()));
+          staging_parked.pop_back();
+        }
+      }
+      bool parked_this_pass = false;
       for (;;) {
         auto token = pool.try_acquire_token();
         if (!token) break;
@@ -1771,21 +1815,42 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           }
           ++inflight;
         } catch (rmm::out_of_memory const& e) {
-          // Pinned staging is shared with the prefetching cache.  When it is
-          // exhausted the read fails rather than waits; say so loudly, since the
-          // allocator's own text names neither the reactor nor the object.  It
-          // stays an rmm::out_of_memory: the engine retries those, and treats a
-          // runtime_error as fatal.
-          auto const what = "rest_reactor: pinned staging exhausted for " +
-                            slot.req->object.bucket + "/" + slot.req->object.key + " (" +
-                            std::to_string(slot.req->op->io_rng.size) + " bytes): " + e.what();
-          SIRIUS_LOG_ERROR("{}", what);
-          slot.req->op->finish_error(std::make_exception_ptr(rmm::out_of_memory(what.c_str())));
-          slot.reset();
+          // Pinned staging (reservation and shared tier) is exhausted. Park the
+          // read until staging frees; fail only after staging_wait_timeout. The
+          // failure stays an rmm::out_of_memory: the engine retries those, and
+          // treats a runtime_error as fatal.
+          auto const now     = std::chrono::steady_clock::now();
+          auto& req          = *slot.req;
+          auto const started = req.staging_wait_start.value_or(now);
+          auto const waited  = std::chrono::duration_cast<std::chrono::milliseconds>(now - started);
+          if (waited >= _config.staging_wait_timeout) {
+            auto const what = "rest_reactor: pinned staging exhausted for " + req.object.bucket +
+                              "/" + req.object.key + " (" + std::to_string(req.op->io_rng.size) +
+                              " bytes) after waiting " + std::to_string(waited.count()) +
+                              " ms: " + e.what();
+            SIRIUS_LOG_ERROR("{}", what);
+            req.op->finish_error(std::make_exception_ptr(rmm::out_of_memory(what.c_str())));
+            slot.reset();
+          } else {
+            if (!req.staging_wait_start) {
+              req.staging_wait_start = now;
+              SIRIUS_LOG_DEBUG("rest_reactor: no pinned staging for {}/{} ({} bytes); waiting",
+                               req.object.bucket,
+                               req.object.key,
+                               req.op->io_rng.size);
+            }
+            staging_parked.push_back(std::move(slot.req));
+            slot.reset();
+            staging_retry_due = now + staging_backoff;
+            parked_this_pass  = true;
+          }
         } catch (...) {
           slot.req->op->finish_error(std::current_exception());
           slot.reset();
         }
+      }
+      if (parked_this_pass) {
+        staging_backoff = std::min(staging_backoff * 2, staging_backoff_max);
       }
       // One sample per submit pass: the depth the reactor managed to reach with
       // whatever the callers had queued. A ceiling that is never approached means
@@ -1945,6 +2010,10 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         if (request != nullptr) request->op->finish_error(terminal_error);
       }
       ready.clear();
+      for (auto& request : staging_parked) {
+        if (request != nullptr) request->op->finish_error(terminal_error);
+      }
+      staging_parked.clear();
       for (auto& request : pending) {
         if (request == nullptr) continue;
         _queued_bytes.fetch_sub(request->logical_bytes, std::memory_order_relaxed);
@@ -1963,7 +2032,14 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       maybe_prime();
       submit();
       while (!stop_token.stop_requested()) {
-        auto const timeout_ms = copying.empty() ? -1 : 1;
+        auto timeout_ms = copying.empty() ? -1 : 1;
+        if (!staging_parked.empty()) {
+          auto const until = std::chrono::ceil<std::chrono::milliseconds>(
+                               staging_retry_due - std::chrono::steady_clock::now())
+                               .count();
+          auto const wait = static_cast<int>(std::clamp<std::int64_t>(until, 0, 1000));
+          timeout_ms      = timeout_ms < 0 ? wait : std::min(timeout_ms, wait);
+        }
         auto const count =
           ::epoll_wait(epoll_fd.get(), events.data(), static_cast<int>(events.size()), timeout_ms);
         if (count < 0) {
@@ -1999,8 +2075,13 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             curl_multi_socket_action(multi.get(), fd, action, &running);
           }
         }
+        auto const busy_before = static_cast<std::size_t>(inflight) + copying.size();
         process_completions();
         poll_copy_completions();
+        // A finished read returned its staging: retry parked reads now.
+        if (static_cast<std::size_t>(inflight) + copying.size() < busy_before) {
+          staging_retry_due = std::chrono::steady_clock::time_point{};
+        }
         maybe_prime();
         submit();
       }

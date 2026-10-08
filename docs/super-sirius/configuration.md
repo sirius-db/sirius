@@ -399,6 +399,8 @@ and transport use one trust policy; there are no separate REST YAML controls.
 | `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
 | `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
 | `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+| `staging_reserve_bytes` | bytes | 512Mi | Pinned host bytes each REST reactor reserves from the HOST tier at start for device-read staging. Staging is drawn from this reservation first, so spills filling the shared pinned tier cannot starve reads. 0 takes no reservation. |
+| `staging_wait_timeout_ms` | int (ms) | 300000 | How long a read waits (parked on the reactor, retried with backoff and whenever a read completes) for staging to free before it fails with `rmm::out_of_memory`. 0 fails at once. |
 
 Two REST values are deliberately not YAML keys. **Connections per reactor** is
 fixed at 64 — the useful number is a property of one reactor thread, not of a
