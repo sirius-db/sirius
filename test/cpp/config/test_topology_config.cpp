@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <variant>
 
 namespace {
 
@@ -154,4 +155,66 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   sirius::sirius_config cfg;
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
+}
+
+TEST_CASE("the spill-compression arena is carved out of the GPU memory space",
+          "[topology_config][config][compression]")
+{
+  auto gpu_capacity = [](sirius::sirius_config const& cfg) -> std::size_t {
+    for (auto const& space : cfg.get_memory_space_configs()) {
+      if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+        return gpu->memory_capacity;
+      }
+    }
+    return 0;
+  };
+
+  SECTION("enabled with an arena: the capacity shrinks by the arena")
+  {
+    scoped_yaml yaml("sirius_arena_carve.yaml",
+                     "sirius:\n"
+                     "  topology: { num_gpus: 1 }\n"
+                     "  memory:\n"
+                     "    gpu: { usage_limit_bytes: 4Gi }\n"
+                     "    host: { capacity_bytes: 2Gi }\n"
+                     "  compression: { enable_spill_compression: true, device_pool_bytes: 1Gi }\n");
+    sirius::sirius_config cfg;
+    cfg.parse_from_file(yaml.path);
+    cfg.resolve_hardware();
+    CHECK(gpu_capacity(cfg) == (3ULL << 30));
+    CHECK(cfg.compression_arena_device_id() >= 0);
+    // The operator defaults derive from the reduced capacity, not the configured one.
+    CHECK(cfg.get_operator_params().scan_task_batch_size == (3ULL << 30) / 40);
+  }
+
+  SECTION("spill compression off: the arena is never installed, so nothing is carved")
+  {
+    scoped_yaml yaml(
+      "sirius_arena_off.yaml",
+      "sirius:\n"
+      "  topology: { num_gpus: 1 }\n"
+      "  memory:\n"
+      "    gpu: { usage_limit_bytes: 4Gi }\n"
+      "    host: { capacity_bytes: 2Gi }\n"
+      "  compression: { enable_spill_compression: false, device_pool_bytes: 1Gi }\n");
+    sirius::sirius_config cfg;
+    cfg.parse_from_file(yaml.path);
+    cfg.resolve_hardware();
+    CHECK(gpu_capacity(cfg) == (4ULL << 30));
+    CHECK(cfg.compression_arena_device_id() == -1);
+  }
+
+  SECTION("an arena that does not fit is a configuration error")
+  {
+    scoped_yaml yaml("sirius_arena_too_big.yaml",
+                     "sirius:\n"
+                     "  topology: { num_gpus: 1 }\n"
+                     "  memory:\n"
+                     "    gpu: { usage_limit_bytes: 1Gi }\n"
+                     "    host: { capacity_bytes: 2Gi }\n"
+                     "  compression: { enable_spill_compression: true, device_pool_bytes: 1Gi }\n");
+    sirius::sirius_config cfg;
+    cfg.parse_from_file(yaml.path);
+    CHECK_THROWS_WITH(cfg.resolve_hardware(), Catch::Matchers::ContainsSubstring("does not fit"));
+  }
 }

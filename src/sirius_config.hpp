@@ -415,10 +415,11 @@ struct compression_config {
   /// certain to fail. Measured on q3/SF1000 with no arena, compression latched
   /// off and on 11 times while the monitor issued 111,641 downgrade requests.
   ///
-  /// This is a partition of the device, not extra memory: reserving N bytes
-  /// requires lowering `memory.gpu.usage_limit_fraction` by the same N. Undersizing
-  /// is a cliff rather than a gradient — at 1 GiB, too small for the concurrent
-  /// encodes, the same query failed outright. Size it for
+  /// This is a partition of the device, not extra memory: resolve_hardware()
+  /// subtracts it from the (first) GPU memory space's capacity, so the query pool
+  /// shrinks by the same N and `usage_limit_fraction` keeps meaning the whole
+  /// Sirius footprint on the device. Undersizing is a cliff rather than a gradient — at 1 GiB, too
+  /// small for the concurrent encodes, the same query failed outright. Size it for
   /// `downgrade.num_threads` concurrent encodes of the largest spill batch.
   std::size_t device_pool_bytes{0};
 
@@ -531,8 +532,34 @@ struct sirius_config {
   /// active-GPU list; the rest are left available for future concurrent queries.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
+  /// Device the spill-compression arena (`compression.device_pool_bytes`) is carved
+  /// from, or -1 when no arena is configured. Set by resolve_hardware(), which also
+  /// lowers that GPU memory space's capacity by the arena size; SiriusContext
+  /// installs the arena on exactly this device so the two stay consistent.
+  [[nodiscard]] int compression_arena_device_id() const noexcept
+  {
+    return _compression_arena_device_id;
+  }
+
  private:
   struct hardware_config;
+
+  /// Carve the spill-compression arena out of the GPU budget.
+  ///
+  /// The arena is a separate RMM pool taken at startup, outside cuCascade's
+  /// accounting. Left on top of a GPU space sized from `usage_limit_fraction`, the
+  /// device is over-committed: at SF3000 on a 32 GB card the 0.86 query pool
+  /// (~30 GB) plus a 3 GiB arena exceeded the ~33.7 GB device, and q3/q13 hit 1,313
+  /// and 809 physical `cudaErrorMemoryAllocation`s that cuCascade's accounting said
+  /// could not happen (0 with compression off). Subtracting the arena from the
+  /// space's capacity shrinks both the accounting and the physical pool (cuCascade
+  /// sizes the device pool from the same capacity), so they agree again.
+  ///
+  /// Applied only when the arena will actually be installed (spill compression on
+  /// and a non-zero `device_pool_bytes`), and only to the first configured GPU
+  /// space: the arena is a single pool on that device. Throws when the arena does
+  /// not fit inside the space.
+  void carve_compression_arena();
 
   /// Apply the knobs derived from the rest of the configuration: the readahead
   /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
@@ -556,7 +583,8 @@ struct sirius_config {
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::shared_ptr<const hardware_config> _hardware_config;
-  int _gpus_per_query = 0;
+  int _gpus_per_query              = 0;
+  int _compression_arena_device_id = -1;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};

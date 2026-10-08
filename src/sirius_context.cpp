@@ -922,7 +922,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     // Before any query runs, so the arena comes off the top of a device that is
     // still empty rather than being asked for once the query pool has grown.
     if (comp.enable_spill_compression && comp.device_pool_bytes > 0) {
-      sirius::compression::init_compression_device_pool(comp.device_pool_bytes);
+      sirius::compression::init_compression_device_pool(comp.device_pool_bytes,
+                                                        config_.compression_arena_device_id());
     }
     sirius::compression::set_output_compression_settings(
       comp.enable_output_compression,

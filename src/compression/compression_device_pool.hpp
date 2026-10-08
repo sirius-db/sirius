@@ -38,16 +38,18 @@ namespace sirius::compression {
  *
  * The arena is a fixed allocation taken once at startup and never grown, so it
  * cannot compete with the query later. It is a *partition* of the device, not
- * extra memory: reserving N bytes requires lowering
- * `memory.gpu.usage_limit_fraction` by the same N, and getting that wrong is not
- * a gradient but a cliff — at 1 GiB (too small for the concurrent encodes) the
- * same query failed outright and fell back to DuckDB.
+ * extra memory: sirius_config::resolve_hardware() subtracts it from the GPU
+ * memory space's capacity (see sirius_config::carve_compression_arena), so the
+ * query pool and the arena together stay inside the configured usage limit.
+ * Sizing it is still a cliff, not a gradient — at 1 GiB (too small for the
+ * concurrent encodes) the same query failed outright and fell back to DuckDB.
  */
 
-/// Allocate the arena. @p bytes == 0 disables it and the compress path falls back
-/// to the current device resource. Idempotent; returns false when the arena could
-/// not be reserved, leaving the fallback in effect.
-bool init_compression_device_pool(std::size_t bytes);
+/// Allocate the arena on @p device_id (the current device when negative).
+/// @p bytes == 0 disables it and the compress path falls back to the current
+/// device resource. Idempotent; returns false when the arena could not be
+/// reserved, leaving the fallback in effect.
+bool init_compression_device_pool(std::size_t bytes, int device_id = -1);
 
 /// The resource spill compression allocates its transients from: the arena when
 /// one is installed, else the current device resource (the query's pool).

@@ -21,7 +21,7 @@ Key configuration (`sirius.compression.*`):
 | Key | Notes |
 |---|---|
 | `enable_spill_compression` | Master switch. |
-| `device_pool_bytes` | The encoder's arena. **Installed only from the config file at startup**: `SET spill_compression = true` at session start flips the flag but leaves the encoder allocating from the query pool — the documented pathology (compression latching on/off, a downgrade-request storm, the query killed). Sizing is a cliff, not a gradient: 1 GiB was too small for concurrent encodes on a 96 GB card and the query failed outright; 4 GiB worked there. 3 GiB is used on the 32 GB card and fills on SF3000 q18. |
+| `device_pool_bytes` | The encoder's arena. Carved out of the GPU memory space's capacity (the query pool shrinks by the same amount; logged at startup), so it no longer over-commits the device. **Installed only from the config file at startup**: `SET spill_compression = true` at session start flips the flag but leaves the encoder allocating from the query pool — the documented pathology (compression latching on/off, a downgrade-request storm, the query killed). Sizing is a cliff, not a gradient: 1 GiB was too small for concurrent encodes on a 96 GB card and the query failed outright; 4 GiB worked there. 3 GiB is used on the 32 GB card and fills on SF3000 q18. |
 | `input_plan_dir` | Offline table plans. Loaded whenever set, because the spill path seeds per-column plans from them through lineage, independent of pin compression. Only `lineitem` and `orders` plans are enabled under `plans/tpch_sf1000`; the rest were renamed `*_disabled.txt` in cbd95163 pending validation. |
 
 ## Branch state (2026-10-07)
@@ -227,7 +227,15 @@ retry policy and the compression arena's device over-commit, not slower eviction
   wedged by readahead (above), so GPU memory has nowhere to spill. Candidates:
   count a retry only when a full reservation was granted, wait on a
   memory-release event instead of a fixed sleep, reset on query progress with a
-  wall-clock backstop; subtract the compression arena from the GPU pool size.
+  wall-clock backstop.
+  **Done (P6):** the arena is now subtracted from the GPU memory space's capacity
+  (`sirius_config::carve_compression_arena`), so cuCascade's accounting and the
+  physical pool agree, and the defragmenter trims at 1x the request once 8
+  physical failures have accumulated since its last trim. Consequence for A/B
+  runs: at the same `usage_limit_fraction` the compression arm now has
+  `device_pool_bytes` less query pool than the baseline, where before it had the
+  same pool plus an over-committed arena. Not yet re-measured at SF3000; the
+  retry-policy candidates above remain open.
 - **Lazy per-thread stream pools in the compressed decode path.**
   `simpatico::thread_device_stream_pool` (`src/util/stream_pool.cpp`) creates 4
   CUDA streams the first time each thread decodes. Deep in a memory-starved query

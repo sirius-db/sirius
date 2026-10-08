@@ -878,6 +878,10 @@ void sirius_config::resolve_hardware()
       _memory_space_configs = builder.build(_hw_topology);
     }
 
+    // Before the operator defaults: they derive batch sizes from the GPU
+    // capacity, which must already exclude the arena.
+    carve_compression_arena();
+
     auto resolved_operator_params =
       operator_defaults_for(_memory_space_configs, pending.use_effective_gpu_capacity);
     if (pending.operator_node) {
@@ -893,6 +897,44 @@ void sirius_config::resolve_hardware()
     throw;
   }
   _hardware_config.reset();
+}
+
+void sirius_config::carve_compression_arena()
+{
+  _compression_arena_device_id = -1;
+  auto const& comp             = _compression_config;
+  if (!comp.enable_spill_compression || comp.device_pool_bytes == 0) { return; }
+
+  for (auto& space : _memory_space_configs) {
+    auto* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space);
+    if (gpu == nullptr) { continue; }
+    if (gpu->memory_capacity == 0) {
+      SIRIUS_LOG_WARN(
+        "sirius_config: GPU {} has no resolved capacity; the {} byte compression arena cannot "
+        "be subtracted from it and the device may be over-committed",
+        gpu->device_id,
+        comp.device_pool_bytes);
+      _compression_arena_device_id = gpu->device_id;
+      return;
+    }
+    if (comp.device_pool_bytes >= gpu->memory_capacity) {
+      throw std::runtime_error(
+        "compression.device_pool_bytes (" + std::to_string(comp.device_pool_bytes) +
+        ") does not fit in GPU " + std::to_string(gpu->device_id) + "'s memory capacity (" +
+        std::to_string(gpu->memory_capacity) + "); the arena is carved out of that capacity");
+    }
+    auto const before            = gpu->memory_capacity;
+    gpu->memory_capacity         = before - comp.device_pool_bytes;
+    _compression_arena_device_id = gpu->device_id;
+    SIRIUS_LOG_INFO(
+      "sirius_config: GPU {} memory capacity {} MiB -> {} MiB after carving out the {} MiB "
+      "spill-compression arena",
+      gpu->device_id,
+      before >> 20,
+      gpu->memory_capacity >> 20,
+      comp.device_pool_bytes >> 20);
+    return;  // one arena, on the first GPU space
+  }
 }
 
 void sirius_config::finalize_derived_config()

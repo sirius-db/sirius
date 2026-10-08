@@ -67,11 +67,11 @@ double oom_trim_factor()
 std::chrono::nanoseconds oom_trim_min_interval()
 {
   static const std::chrono::nanoseconds interval = [] {
-    long ms          = 2000;
-    const char* env  = std::getenv("SIRIUS_OOM_TRIM_MIN_INTERVAL_MS");
+    long ms         = 2000;
+    const char* env = std::getenv("SIRIUS_OOM_TRIM_MIN_INTERVAL_MS");
     if (env != nullptr) {
-      char* end     = nullptr;
-      const long v  = std::strtol(env, &end, 10);
+      char* end    = nullptr;
+      const long v = std::strtol(env, &end, 10);
       if (end != env && v >= 0) { ms = v; }
     }
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(ms));
@@ -104,7 +104,10 @@ struct pool_state {
   bool ok{false};
   std::uint64_t reserved{};
   std::uint64_t used{};
-  [[nodiscard]] std::uint64_t free_reserved() const { return reserved > used ? reserved - used : 0; }
+  [[nodiscard]] std::uint64_t free_reserved() const
+  {
+    return reserved > used ? reserved - used : 0;
+  }
 };
 
 pool_state read_pool_state(cudaMemPool_t pool)
@@ -131,15 +134,34 @@ pool_state read_pool_state(cudaMemPool_t pool)
  * If the gap between the two is at least `factor x bytes` the pool holds enough
  * free, fragmented blocks that a trim may consolidate into a contiguous region.
  */
-bool is_pool_fragmented(const pool_state& s, std::size_t bytes)
+bool is_pool_fragmented(const pool_state& s, std::size_t bytes, std::uint64_t failures_since_trim)
 {
   if (!s.ok) { return false; }
-  const double factor = oom_trim_factor();
-  if (factor <= 0.0) { return true; }  // check disabled: always try the trim
-  return s.free_reserved() >= static_cast<std::uint64_t>(factor * static_cast<double>(bytes));
+  return detail::should_trim(s.free_reserved(), bytes, oom_trim_factor(), failures_since_trim);
 }
 
+/// Physical (ALLOCATION_FAILED) failures seen since the last trim; see
+/// detail::should_trim for why repetition relaxes the rule.
+std::atomic<std::uint64_t> g_failures_since_trim{0};
+
 }  // namespace
+
+namespace detail {
+
+bool should_trim(std::uint64_t free_reserved,
+                 std::size_t bytes,
+                 double factor,
+                 std::uint64_t failures_since_trim) noexcept
+{
+  if (factor <= 0.0) { return true; }  // check disabled: always try the trim
+  if (free_reserved >= static_cast<std::uint64_t>(factor * static_cast<double>(bytes))) {
+    return true;
+  }
+  return failures_since_trim >= kRelaxTrimAfterFailures &&
+         free_reserved >= static_cast<std::uint64_t>(bytes);
+}
+
+}  // namespace detail
 
 std::string defragmenter_oom_policy::get_policy_name() const noexcept { return "defragmenter"; }
 
@@ -175,19 +197,22 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
 
   // Read once and reuse, so the decision and the diagnostic describe the same
   // observation rather than two reads either side of a racing allocation.
-  const auto state = read_pool_state(oom_ex->pool_handle);
+  const auto state    = read_pool_state(oom_ex->pool_handle);
+  const auto failures = g_failures_since_trim.fetch_add(1, std::memory_order_relaxed) + 1;
 
   // If the pool doesn't look fragmented, trimming won't help — bail out.
-  if (!is_pool_fragmented(state, bytes)) {
+  if (!is_pool_fragmented(state, bytes, failures)) {
     SIRIUS_LOG_DEBUG(
       "[oom_defrag] no trim: pool not fragmented enough for {}B - reserved={}B used={}B "
-      "free_reserved={}B, need >= {}x ({}B){}",
+      "free_reserved={}B, need >= {}x ({}B), or >= 1x after {} failures (at {}){}",
       bytes,
       state.reserved,
       state.used,
       state.free_reserved(),
       oom_trim_factor(),
       static_cast<std::uint64_t>(oom_trim_factor() * static_cast<double>(bytes)),
+      detail::kRelaxTrimAfterFailures,
+      failures,
       state.ok ? "" : " [pool attributes unreadable]");
     std::rethrow_exception(eptr);
   }
@@ -206,6 +231,7 @@ void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
     state.used,
     state.free_reserved(),
     g_trims_skipped.exchange(0, std::memory_order_relaxed));
+  g_failures_since_trim.store(0, std::memory_order_relaxed);
   cudaMemPoolTrimTo(oom_ex->pool_handle, /*minBytesToKeep=*/0);
   cudaDeviceSynchronize();  // Ensure that the trim operation is complete before retrying.
 

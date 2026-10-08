@@ -19,12 +19,14 @@
 #include "compression_alloc_stats.hpp"
 #include "log/logging.hpp"
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
 #include <atomic>
 #include <mutex>
+#include <optional>
 
 namespace sirius::compression {
 
@@ -39,7 +41,7 @@ std::atomic<std::size_t> g_pool_bytes{0};
 
 }  // namespace
 
-bool init_compression_device_pool(std::size_t bytes)
+bool init_compression_device_pool(std::size_t bytes, int device_id)
 {
   std::lock_guard<std::mutex> lock(g_pool_mutex);
 
@@ -58,6 +60,10 @@ bool init_compression_device_pool(std::size_t bytes)
     // initial == maximum: take the whole arena up front and never grow. Growing
     // later would defeat the point — compression's demand is decided before the
     // query starts competing for the device, not renegotiated under pressure.
+    // On the device the config carved the arena out of, so the capacity it
+    // subtracted and the memory taken here are the same device's.
+    std::optional<rmm::cuda_set_device_raii> set_device;
+    if (device_id >= 0) { set_device.emplace(rmm::cuda_device_id{device_id}); }
     g_pool = new rmm::mr::pool_memory_resource(rmm::mr::cuda_memory_resource{}, bytes, bytes);
   } catch (const std::exception& e) {
     delete g_pool;
@@ -71,8 +77,11 @@ bool init_compression_device_pool(std::size_t bytes)
   }
 
   g_pool_bytes.store(bytes, std::memory_order_relaxed);
-  SIRIUS_LOG_INFO("[compression] reserved {} MiB device arena for spill compression",
-                  bytes / (1024 * 1024));
+  SIRIUS_LOG_INFO(
+    "[compression] reserved {} MiB device arena for spill compression on device {} (carved out "
+    "of the GPU memory space's capacity)",
+    bytes / (1024 * 1024),
+    device_id);
   return true;
 }
 

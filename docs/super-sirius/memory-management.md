@@ -171,10 +171,27 @@ A cached scan input (a resident `scan_operator_input`) is sized by a dedicated b
 
 On allocation failure:
 1. Check CUDA pool fragmentation via `cudaMemPoolGetAttribute()` (reserved vs. used)
-2. If `reserved > used + (10× requested bytes)`: pool is fragmented
-3. Trim pool with `cudaMemPoolTrimTo()` to release free blocks to driver
+2. If `reserved > used + (10× requested bytes)` (`SIRIUS_OOM_TRIM_FACTOR`): pool is fragmented.
+   Once 8 physical (`ALLOCATION_FAILED`) failures have accumulated since the last trim, the bar
+   drops to `reserved - used >= requested bytes` — the free memory exists and only its shape is
+   wrong. A physically over-committed device never clears the 10× bar (SF3000 q3/q13 logged
+   1,313 and 809 `cudaErrorMemoryAllocation`s without a single trim).
+3. Trim pool with `cudaMemPoolTrimTo()` to release free blocks to driver (rate-limited to one
+   trim per `SIRIUS_OOM_TRIM_MIN_INTERVAL_MS`, default 2 s, process-wide)
 4. Retry allocation
 5. If still fails: rethrow original exception
+
+## Spill-Compression Arena
+
+`compression.device_pool_bytes` reserves a fixed device pool for spill-compression encodes
+(`src/compression/compression_device_pool.*`). It is installed at startup, outside cuCascade's
+accounting, so it is **carved out of the GPU budget**: `sirius_config::resolve_hardware()`
+subtracts the arena from the first GPU memory space's capacity (and logs the adjusted size)
+whenever spill compression is enabled with a non-zero arena, and `SiriusContext` installs the
+arena on that same device. cuCascade sizes the device pool from the same capacity, so its
+accounting and the physical pool agree and `usage_limit_fraction` keeps meaning Sirius's whole
+footprint on the device. An arena that does not fit inside the capacity is a configuration
+error.
 
 ## Pinned Host Memory
 
