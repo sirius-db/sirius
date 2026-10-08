@@ -1812,8 +1812,8 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
     mark_column    = std::move(scattered->release()[0]);
   }
 
-  // Under EQUAL matching every comparison is definite, so the scattered values are the whole
-  // answer -- no null mask, no three-valued logic.
+  // Null-safe comparisons and an empty build both produce definite marks. In particular,
+  // NULL IN (empty) is FALSE: there is no build row that can make the comparison UNKNOWN.
   if (marks_are_definite) {
     mark_out_cols.push_back(std::move(mark_column));
     auto definite_table = std::make_unique<cudf::table>(std::move(mark_out_cols));
@@ -1996,13 +1996,15 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       if (join_type == duckdb::JoinType::MARK) {
         // Reuse the persistent filtered_join (built on the right/filter side): probe with this left
         // batch to get its matched left-row indices, then materialize all left rows + BOOL8 mark.
-        auto semi_indices = slot.filtered_table->semi_join(probe_keys, stream);
+        // A zero-row build batch reaches this path rather than the no-batches fast path above.
+        auto const build_empty = get_cudf_table_view(slot.build_table.value()).num_rows() == 0;
+        auto semi_indices      = slot.filtered_table->semi_join(probe_keys, stream);
         return resolve_mark_join_result(*semi_indices,
                                         left_full,
                                         lhs_output_columns.col_idxs,
                                         probe_keys,
                                         _build_has_null.load(std::memory_order_acquire) > 0,
-                                        mark_is_null_safe(),
+                                        mark_is_null_safe() || build_empty,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -2111,7 +2113,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                       lhs_output_columns.col_idxs,
                                       left_eq,
                                       _build_has_null.load(std::memory_order_acquire) > 0,
-                                      mark_is_null_safe(),
+                                      mark_is_null_safe() || right_eq.num_rows() == 0,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
@@ -2296,7 +2298,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                         lhs_output_columns.col_idxs,
                                         left_keys,
                                         _build_has_null.load(std::memory_order_acquire) > 0,
-                                        mark_is_null_safe(),
+                                        mark_is_null_safe() || right_keys.num_rows() == 0,
                                         input_batches[0],
                                         stream,
                                         batch_telemetry());
@@ -2309,7 +2311,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                       lhs_output_columns.col_idxs,
                                       left_keys,
                                       _build_has_null.load(std::memory_order_acquire) > 0,
-                                      mark_is_null_safe(),
+                                      mark_is_null_safe() || right_keys.num_rows() == 0,
                                       input_batches[0],
                                       stream,
                                       batch_telemetry());
