@@ -77,9 +77,8 @@ before their buffers can be released; cancellation does not preempt them.
 
 Reservations use nonblocking attempts. Waiting tasks remain visible to scheduling/spilling and
 retry after a short delay. A reservation that makes no progress for 30 seconds fails its query.
-Operator OOM/batch-contention retries are separately bounded. Sort caps derive from configured
-GPU capacity divided by the admission limit, avoiding the assumption that current free memory
-belongs to one query. HOST result transfer must obtain a real reservation.
+Operator OOM/batch-contention retries are separately bounded. HOST result transfer must obtain
+a real reservation.
 
 Illegal device access, device assertion, launch failure/timeout, uncorrectable ECC and destroyed
 CUDA contexts latch shared GPU-runtime unavailability. Existing owners stop/retire and later GPU
