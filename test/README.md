@@ -14,6 +14,9 @@ pixi run python scripts/run_unit_tests.py -- --order rand --rng-seed 5   # Catch
 pixi run make test UNITTEST_ARGS="-- --abort"                            # options through make
 ```
 
+Dynamic scan checks launch `sirius_extension_host`, built alongside `sirius_unittest`.
+This DuckDB-only process loads the wrapper without an embedded Sirius copy.
+
 The script runs three steps:
 
 | Step | What runs |

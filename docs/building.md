@@ -109,5 +109,7 @@ Static consumers select their own compiler runtime linkage. The distribution
 extension uses `-static-libgcc -static-libstdc++` to bundle those runtimes.
 
 `make test` builds the shared wrapper and sets `SIRIUS_EXTENSION_PATH` for
-extension-loading checks. When running `scripts/run_unit_tests.py` or the test
+extension-loading checks. Dynamic scan checks run in the DuckDB-only
+`sirius_extension_host` executable; engine tests use static Sirius registration.
+When running `scripts/run_unit_tests.py` or the test
 binary directly, set this variable to the wrapper's absolute path. CI supplies it.

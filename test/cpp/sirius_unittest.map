@@ -1,6 +1,0 @@
-{
-  local:
-    extern "C++" {
-      sirius::*;
-    };
-};

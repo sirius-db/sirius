@@ -2,19 +2,27 @@ find_package(Catch2 3 REQUIRED CONFIG)
 
 add_executable(sirius_unittest ${TEST_SOURCES} src/sirius_extension_entry.cpp
                                test/cpp/utils/sirius_extension_loader.cpp)
-# Loadable DuckDB extensions resolve their host API from the test executable.
+# Export DuckDB's host API for third-party extensions such as Iceberg.
 set_target_properties(sirius_unittest PROPERTIES ENABLE_EXPORTS ON)
-# A loaded shared wrapper must call its own Sirius, not the test's static copy.
-target_link_options(
-  sirius_unittest
-  PRIVATE
-  "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/sirius_unittest.map"
-)
-set_property(
-  TARGET sirius_unittest
-  APPEND
-  PROPERTY LINK_DEPENDS
-           "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/sirius_unittest.map")
+# Load Sirius in a DuckDB-only host to avoid a second embedded engine copy.
+add_executable(sirius_extension_host test/cpp/utils/duckdb_extension_host.cpp)
+target_link_libraries(
+  sirius_extension_host
+  PRIVATE Catch2::Catch2WithMain sirius::duckdb_dependency
+          duckdb_generated_extension_loader)
+target_include_directories(sirius_extension_host
+                           PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp")
+target_compile_definitions(
+  sirius_extension_host
+  PRIVATE SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(
+  sirius_extension_host
+  PROPERTIES ENABLE_EXPORTS ON
+             CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+add_dependencies(sirius_unittest sirius_extension_host)
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
