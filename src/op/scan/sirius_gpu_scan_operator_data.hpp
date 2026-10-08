@@ -118,6 +118,9 @@ class scan_operator_input : public op::operator_data {
   scan_operator_input(scan_operator_input const&)            = delete;
   scan_operator_input& operator=(scan_operator_input const&) = delete;
 
+  scan_contract_id resident_contract_id = 0;
+  std::optional<pin_validation> resident_validation;
+
   [[nodiscard]] op::operator_data_type get_type() const override
   {
     return op::operator_data_type::GPU_SCAN;

@@ -16,12 +16,21 @@
 
 #include "transparent/read_view_registry.hpp"
 
+#include "io/sirius_datasource.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/sirius_physical_table_scan.hpp"
+#include "planner/connector_registry.hpp"
+#include "transparent/replay_admission.hpp"
+
+#include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -412,14 +421,113 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
   return result;
 }
 
-void read_view_registry::publish_supported(
+void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,
+                                                   uint64_t elapsed_us)
+{
+  entries_.at(by_contract_id_.at(id)).eligibility.cost.delete_preparation_time_us += elapsed_us;
+}
+
+void read_view_registry::record_verdict(op::scan::scan_contract_id id,
+                                        op::scan::certification_result const& result)
+{
+  auto const found = by_contract_id_.find(id);
+  if (found == by_contract_id_.end()) {
+    throw std::runtime_error("unknown scan contract id " + std::to_string(id));
+  }
+  auto& certificate = entries_[found->second].eligibility;
+  if (certificate.verdict != op::scan::eligibility_verdict::not_evaluated) {
+    throw std::logic_error("scan verdict already recorded for contract " + std::to_string(id));
+  }
+  if (result.verdict == op::scan::eligibility_verdict::not_evaluated) {
+    throw std::logic_error("cannot record an unevaluated scan verdict");
+  }
+  if ((result.verdict == op::scan::eligibility_verdict::supported &&
+       result.reason != op::scan::verdict_reason::none) ||
+      (result.verdict != op::scan::eligibility_verdict::supported &&
+       result.reason == op::scan::verdict_reason::none)) {
+    throw std::logic_error("scan verdict and reason disagree");
+  }
+  if (result.verdict == op::scan::eligibility_verdict::incomplete &&
+      result.reason != op::scan::verdict_reason::budget_time &&
+      result.reason != op::scan::verdict_reason::budget_bytes &&
+      result.reason != op::scan::verdict_reason::evidence_missing &&
+      result.reason != op::scan::verdict_reason::interface_unavailable) {
+    throw std::logic_error("incomplete scan verdict has a non-incomplete reason");
+  }
+  certificate.verdict          = result.verdict;
+  certificate.reason           = result.reason;
+  certificate.reason_text      = result.reason_text;
+  certificate.later_checks     = result.later_checks;
+  certificate.cost             = result.cost;
+  certificate.storage_version  = result.storage_version;
+  certificate.semantic_columns = result.semantic_columns;
+}
+
+bool read_view_registry::record_declined_lookup(duckdb::LogicalGet const& get,
+                                                planner::lookup_decline decline)
+{
+  using L  = planner::lookup_decline;
+  using R  = op::scan::verdict_reason;
+  R reason = R::none;
+  switch (decline) {
+    case L::unknown_function: reason = R::unknown_function; break;
+    case L::bind_data_mismatch: reason = R::bind_data_mismatch; break;
+    case L::catalog_entry_missing: reason = R::catalog_entry_missing; break;
+    case L::no_trusted_reference: reason = R::no_trusted_reference; break;
+    case L::callback_mismatch: reason = R::callback_mismatch; break;
+    case L::none: return false;
+  }
+  return declined_lookups_
+    .emplace(get.table_index,
+             declined_lookup_record{op::scan::eligibility_verdict::unsupported, reason})
+    .second;
+}
+
+op::scan::scan_contract_id read_view_registry::allocate_declined_scan(
+  op::sirius_physical_table_scan const& scan, planner::connector const& connector)
+{
+  if (!scan.read_views || scan.read_views.get() != this) {
+    throw std::logic_error("declined scan is not owned by this read-view registry");
+  }
+  op::scan::column_requirements columns;
+  columns.column_ids     = scan.column_ids;
+  columns.projection_ids = scan.projection_ids;
+  for (auto const& column : scan.column_ids) {
+    if (column.IsRowIdColumn()) columns.requires_row_id = true;
+    if (column.IsVirtualColumn() && column.HasPrimaryIndex()) {
+      columns.virtual_columns.push_back(column.GetPrimaryIndex());
+    }
+  }
+  auto kind = op::scan::materializer_kind::parquet;
+  if (connector.kind == op::scan::source_kind::duckdb_native) {
+    kind = op::scan::materializer_kind::duckdb_native;
+  } else if (connector.kind == op::scan::source_kind::stream_source) {
+    kind = op::scan::materializer_kind::stream;
+  } else if (connector.function_name == "iceberg_scan") {
+    kind = op::scan::materializer_kind::iceberg;
+  }
+  return op::scan::allocate_scan_contract(*this,
+                                          scan.contract_window_id,
+                                          scan.contract_finalize_generation,
+                                          scan.scan_node_id,
+                                          nullptr,
+                                          std::move(columns),
+                                          {},
+                                          {kind, connector.registry_profile},
+                                          scan.duckdb_types,
+                                          scan.table_index);
+}
+
+void read_view_registry::publish_correspondence(
   op::scan::certificate_evidence_scope scope,
   std::string correspondence,
   std::span<op::scan::bound_read_view const> physical_original)
 {
   std::vector<bool> consumed(physical_original.size(), false);
   for (auto& entry : entries_) {
-    entry.eligibility.verdict        = op::scan::eligibility_verdict::supported;
+    if (entry.eligibility.verdict == op::scan::eligibility_verdict::not_evaluated) {
+      entry.eligibility.verdict = op::scan::eligibility_verdict::supported;
+    }
     entry.eligibility.evidence_scope = scope;
     entry.eligibility.correspondence = correspondence;
     if (entry.contract.view && entry.contract.view->identity) {
@@ -514,9 +622,13 @@ scan_contract_id allocate_scan_contract(transparent::read_view_registry& registr
   eligibility.depth        = contract.view ? contract.view->depth : evidence_depth::path;
   eligibility.materializer = contract.materializer;
   switch (contract.materializer.kind) {
-    case materializer_kind::duckdb_native: eligibility.later_checks = {"segments_per_range"}; break;
+    case materializer_kind::duckdb_native:
+      eligibility.later_checks = check_bit(later_check::segments_per_range);
+      break;
     case materializer_kind::parquet:
-    case materializer_kind::iceberg: eligibility.later_checks = {"footer_per_file"}; break;
+    case materializer_kind::iceberg:
+      eligibility.later_checks = check_bit(later_check::footer_per_file);
+      break;
     case materializer_kind::stream: eligibility.later_checks = {}; break;
   }
 
@@ -534,32 +646,197 @@ bound_table_scan const& contract_of(transparent::read_view_registry const& regis
   return registry.entry(contract_id).contract;
 }
 
-void validate_split_for_gpu(scan_contract_id expected, scan_info const& split)
+std::string format_split_certificates_for_dump(scan_info const& split)
 {
-  if (split.contract_id() != expected) {
-    throw std::runtime_error("scan split contract mismatch: expected " + std::to_string(expected) +
-                             ", got " + std::to_string(split.contract_id()));
+  static constexpr char const* checks[] = {"footer_per_file",
+                                           "profile_per_file",
+                                           "schema_per_file",
+                                           "segments_per_range",
+                                           "matrix_per_range",
+                                           "host_staged",
+                                           "key_held"};
+  auto const certificates               = split.certificates();
+  auto const dependencies               = split.dependencies();
+  std::ostringstream out;
+  if (certificates.empty()) return "certificates=none";
+  for (std::size_t index = 0; index < certificates.size(); ++index) {
+    auto const& certificate = certificates[index];
+    if (index) out << '\n';
+    out << "certificate[" << index << "] validation=";
+    bool any = false;
+    for (std::size_t bit = 0; bit < std::size(checks); ++bit) {
+      if (!certificate.validation.test(bit)) continue;
+      if (any) out << ',';
+      out << checks[bit];
+      any = true;
+    }
+    if (!any) out << "none";
+    out << " profile=";
+    if (index >= dependencies.size() || !dependencies[index].profiles ||
+        !dependencies[index].profiles->contains(certificate.profile)) {
+      out << "missing";
+      continue;
+    }
+    auto profile = dependencies[index].profiles->get(certificate.profile);
+    out << "storage_version:" << profile.storage_version << " columns:[";
+    for (std::size_t column = 0; column < profile.columns.size(); ++column) {
+      if (column) out << ',';
+      auto const& value = profile.columns[column];
+      out << "{type:" << value.type << " data_codecs:" << value.data_codecs
+          << " validity_or_encodings:" << value.validity_or_encodings
+          << " type_mismatch:" << value.type_mismatch
+          << " logical_annotation:" << value.logical_annotation
+          << " converted_annotation:" << value.converted_annotation << " scale:" << value.scale
+          << " precision:" << value.precision << " checked_chunks:" << value.checked_chunks << '}';
+    }
+    out << ']';
   }
-  if (split.certificates().size() != split.dependencies().size()) {
-    throw std::runtime_error("scan split contract has non-parallel certificates and dependencies");
+  return out.str();
+}
+
+void validate_split_for_gpu(scan_contract_id expected,
+                            later_check_set const& required,
+                            std::optional<key_held_witness> const& expected_key,
+                            scan_info const& split)
+{
+  // Preserve R1's handle mismatch and its precedence.
+  if (split.contract_id() != expected) {
+    throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
+                                                  "scan split contract mismatch: expected " +
+                                                    std::to_string(expected) + ", got " +
+                                                    std::to_string(split.contract_id()));
   }
   for (auto const& certificate : split.certificates()) {
     if (certificate.contract_id != expected) {
-      throw std::runtime_error("scan split certificate contract mismatch: expected " +
-                               std::to_string(expected) + ", got " +
-                               std::to_string(certificate.contract_id));
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::certificate,
+        "scan split certificate contract mismatch: expected " + std::to_string(expected) +
+          ", got " + std::to_string(certificate.contract_id));
     }
   }
+  auto fail = [&](std::string text, later_check_set missing = {}) {
+    throw certificate_incomplete(expected, missing, "scan certificate incomplete: " + text);
+  };
+  auto certificates = split.certificates();
+  auto dependencies = split.dependencies();
+  if (certificates.size() != dependencies.size()) fail("non-parallel dependencies");
+  auto same_source = [](auto const& a, auto const& b) {
+    return a && b && &a->get_io_object() == &b->get_io_object();
+  };
+  auto coverage = [&](std::size_t i, later_check_set checks) {
+    auto missing = checks & ~certificates[i].validation;
+    if (missing.any()) fail("missing physical checks", missing);
+    if (!dependencies[i].profiles || !dependencies[i].profiles->contains(certificates[i].profile))
+      fail("missing physical profile");
+  };
   if (auto const* parquet = dynamic_cast<parquet_split_info const*>(&split)) {
-    if (split.certificates().size() != parquet->rg_slices.size()) {
-      throw std::runtime_error("parquet split requires one certificate and dependency per slice");
+    bool empty = std::all_of(parquet->rg_slices.begin(),
+                             parquet->rg_slices.end(),
+                             [](auto const& s) { return s.row_group_indices.empty(); });
+    if (certificates.empty() && empty) return;
+    if (certificates.size() != parquet->rg_slices.size()) fail("Parquet slice count");
+    for (std::size_t i = 0; i < certificates.size(); ++i) {
+      auto const& slice      = parquet->rg_slices[i];
+      auto const& dependency = dependencies[i];
+      if (!dependency.parquet_approval || !dependency.parquet_approval->footer_bytes)
+        fail("Parquet file approval missing");
+      auto const prefix =
+        slice.file_path + "|footer=" + std::to_string(dependency.parquet_approval->footer_bytes);
+      auto const& identity = certificates[i].input_identity;
+      if (!slice.file_metadata || dependency.footer != slice.file_metadata ||
+          !same_source(dependency.datasource, slice.datasource) ||
+          (identity != prefix && !identity.starts_with(prefix + "|")))
+        fail("Parquet slice identity or dependencies");
+      for (auto rg : slice.row_group_indices)
+        if (rg < 0 || static_cast<std::size_t>(rg) >= slice.file_metadata->row_groups.size())
+          fail("Parquet row group outside footer");
+        else if (!std::binary_search(dependency.parquet_approval->row_groups.begin(),
+                                     dependency.parquet_approval->row_groups.end(),
+                                     rg))
+          fail("Parquet row group was not physically checked");
+      coverage(i, required);
     }
-    for (std::size_t i = 0; i < parquet->rg_slices.size(); ++i) {
-      if (split.dependencies()[i].footer != parquet->rg_slices[i].file_metadata) {
-        throw std::runtime_error("parquet split dependency footer does not match its slice");
-      }
-    }
+    return;
   }
+  if (auto const* native = dynamic_cast<duckdb_native_scan_info const*>(&split)) {
+    if (certificates.empty() && native->row_groups.empty()) return;
+    if (certificates.size() != native->row_groups.size()) fail("native row-group count");
+    for (std::size_t i = 0; i < certificates.size(); ++i) {
+      auto const& group       = native->row_groups[i];
+      auto const& certificate = certificates[i];
+      auto const& dependency  = dependencies[i];
+      auto suffix             = "|row_group=" + std::to_string(group.row_group_index);
+      if (certificate.split_id != group.row_group_index ||
+          !certificate.input_identity.ends_with(suffix))
+        fail("native row-group identity");
+      if (dependency.footer) fail("native unit carries a file footer");
+      later_check_set checks = required;
+      if (native->is_insert_delta) {
+        checks         = check_bit(later_check::key_held);
+        bool file_read = false;
+        auto segments  = [&](auto const& lane) {
+          for (auto const& segment : lane) {
+            checks |= segment.is_transient ? check_bit(later_check::host_staged)
+                                            : check_bit(later_check::segments_per_range) |
+                                               check_bit(later_check::matrix_per_range);
+            if (segment.is_transient && !segment.all_null && !segment.host_ptr)
+              fail("transient segment has no staged bytes");
+            file_read |= !segment.is_transient && segment.block_id >= 0;
+          }
+        };
+        for (auto const& column : group.columns) {
+          segments(column.data_segments);
+          segments(column.validity_segments);
+          segments(column.array_child_data_segments);
+          segments(column.array_child_validity_segments);
+        }
+        if (!expected_key || !expected_key->database || !certificate.key_held ||
+            certificate.key_held->database != expected_key->database ||
+            certificate.key_held->db_path != expected_key->db_path ||
+            certificate.key_held->query_token != expected_key->query_token)
+          fail("delta checkpoint key does not belong to this query/database",
+               check_bit(later_check::key_held));
+        if (dependency.checkpoint_iteration) fail("delta carries a fresh-native iteration");
+        if (file_read && !same_source(dependency.datasource, native->datasource))
+          fail("delta file dependency");
+        if (dependency.datasource && !same_source(dependency.datasource, native->datasource))
+          fail("delta datasource mismatch");
+      } else {
+        if (!dependency.checkpoint_iteration ||
+            !same_source(dependency.datasource, native->datasource))
+          fail("native datasource or iteration missing");
+        auto const identity = native->datasource->get_io_object().object_path() +
+                              "|checkpoint=" + std::to_string(*dependency.checkpoint_iteration) +
+                              suffix;
+        if (certificate.input_identity != identity) fail("native identity/iteration mismatch");
+        if (!native->block_manager ||
+            native->block_manager->GetCheckpointIteration() != *dependency.checkpoint_iteration)
+          fail("native checkpoint iteration changed");
+      }
+      coverage(i, checks);
+    }
+    return;
+  }
+  fail("unknown input class");
+}
+
+void admit_resident_batch(scan_contract_id expected,
+                          pin_validation const& validation,
+                          uint64_t query_token)
+{
+  auto fail = [&](std::string const& check) {
+    throw certificate_incomplete(expected, {}, "resident certificate incomplete: " + check);
+  };
+  if (validation.query_token != query_token) fail("query token mismatch");
+  auto check = [&](char const* name, pin_validation::check value, bool mandatory) {
+    if ((mandatory && !value.applies) || (value.applies && !value.passed)) fail(name);
+  };
+  check("identity", validation.identity, true);
+  check("layout", validation.layout, true);
+  check("structure", validation.structure, true);
+  if (validation.iteration.applies != validation.visibility.applies) fail("native applicability");
+  check("iteration", validation.iteration, false);
+  check("visibility", validation.visibility, false);
 }
 
 }  // namespace sirius::op::scan

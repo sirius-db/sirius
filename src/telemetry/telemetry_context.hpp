@@ -40,9 +40,8 @@ struct telemetry_config;
 namespace sirius::telemetry {
 
 /// Configures NVTX discovery and creates the Quent context described by `config`.
-/// This installs the process-global capture hook, so call it before topology
-/// discovery or anything else emits NVTX. Throws `std::invalid_argument` for an
-/// unrecognised `exporter` value.
+/// Call it before topology discovery or anything else emits NVTX.
+/// Throws `std::invalid_argument` for an unrecognised `exporter` value.
 [[nodiscard]] quent::Context make_quent_context(const sirius::telemetry_config& config);
 
 /// Owns the top-level telemetry states for a single SiriusContext.

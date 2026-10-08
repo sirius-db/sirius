@@ -20,6 +20,7 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/connector_reference_cache.hpp"
 #include "planner/connector_registry.hpp"
@@ -27,6 +28,7 @@
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/gpu_execution_fixture.hpp"
 #include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
@@ -445,6 +447,46 @@ TEST_CASE("Native read-view identity includes catalog schema and table incarnati
   REQUIRE(make(1, "main", 2) != make(1, "main", 3));
 }
 
+TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
+                 "Native connector certifies type before storage metadata",
+                 "[scan][certificate][integration]")
+{
+  run_ok("CREATE TABLE r2a_certified_native(i INTEGER)");
+  run_ok("CREATE TEMP TABLE r2a_unqualified_native(v DECIMAL(38,2))");
+  run_ok("CHECKPOINT");
+  run_ok("SET gpu_execution=false");
+  run_ok("BEGIN TRANSACTION READ ONLY");
+
+  auto certify = [&](std::string const& table) {
+    auto logical = con->ExtractPlan("SELECT * FROM " + table);
+    REQUIRE(logical);
+    registry_test_generator generator(*con->context);
+    auto physical = generator.create_plan(first_get(*logical));
+    REQUIRE(physical);
+    REQUIRE(physical->type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN);
+    auto& scan = physical->Cast<sirius::op::sirius_physical_table_scan>();
+    auto const* connector =
+      sirius::planner::lookup_connector(scan.function, scan.bind_data.get(), *con->context);
+    REQUIRE(connector);
+    REQUIRE(connector->certify);
+    return connector->certify({}, scan, *con->context, generator.contract_provenance);
+  };
+
+  auto supported = certify("r2a_certified_native");
+  CHECK(supported.verdict == eligibility_verdict::supported);
+  REQUIRE(supported.storage_version);
+  CHECK(*supported.storage_version >= 1);
+  CHECK(*supported.storage_version <= 7);
+  CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::segments_per_range)));
+  CHECK(supported.later_checks.test(static_cast<std::size_t>(later_check::matrix_per_range)));
+
+  auto rejected = certify("r2a_unqualified_native");
+  CHECK(rejected.verdict == eligibility_verdict::unsupported);
+  CHECK(rejected.reason == verdict_reason::native_type_decimal128);
+  CHECK(rejected.reason_text.find("DECIMAL128") != std::string::npos);
+  run_ok("ROLLBACK");
+}
+
 TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts][shared_context]")
 {
   REQUIRE(sirius::test::g_shared_env);
@@ -458,8 +500,14 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   REQUIRE(sirius::planner::lookup_connector(native_get, *con.context));
 
   std::set<std::string> names;
-  for (auto const& entry : sirius::planner::registered_connectors())
+  for (auto const& entry : sirius::planner::registered_connectors()) {
     names.insert(entry.function_name);
+    if (entry.function_name == "sirius_stream_source") {
+      CHECK(entry.certify == nullptr);
+    } else {
+      CHECK(entry.certify != nullptr);
+    }
+  }
   REQUIRE(names == std::set<std::string>{"seq_scan",
                                          "parquet_scan",
                                          "read_parquet",
@@ -643,7 +691,7 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   auto const& contract_entry = source.read_views()->entry(source.contract_id());
   CHECK(contract_entry.window_id == 42);
   CHECK(contract_entry.finalize_generation == 0);
-  CHECK(contract_entry.eligibility.later_checks.empty());
+  CHECK(contract_entry.eligibility.later_checks.none());
   CHECK_FALSE(contract_entry.contract.view->replay_policy.permits_cpu_replay);
   CHECK(contract_entry.contract.view->replay_policy.reason == "stream");
   sirius::pipeline::pipeline_build_context build_context(nullptr);

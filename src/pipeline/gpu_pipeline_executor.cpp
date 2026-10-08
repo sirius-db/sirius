@@ -21,6 +21,7 @@
 #include "cuda_runtime_api.h"
 #include "downgrade/downgrade_executor.hpp"
 #include "log/logging.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -376,6 +377,7 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
+          if (completion) completion->record_task_started();
           task->execute(::cuda::stream_ref{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {
@@ -412,7 +414,9 @@ void gpu_pipeline_executor::manager_loop()
           // too short. With 100 retries × 50 ms backoff (~5 s) the probe
           // tasks get enough patience to clear the contention window while
           // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_RETRIES = 100;
+          auto const MAX_RETRIES = completion && completion->injections
+                                     ? completion->injections->gpu_task_retry_limit
+                                     : 100;
           if (next_retry_count > MAX_RETRIES) {
             SIRIUS_LOG_ERROR(
               "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
@@ -423,9 +427,13 @@ void gpu_pipeline_executor::manager_loop()
               ex.get_resume_operator_index(),
               ex.what());
             if (completion) {
-              completion->report_error(std::make_exception_ptr(std::runtime_error(
-                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
-                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
+              completion->report_error(
+                std::make_exception_ptr(std::runtime_error(
+                  "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
+                  ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())),
+                dynamic_cast<oom_reschedule_exception*>(&ex)
+                  ? transparent::late_failure_cause::oom_exhausted
+                  : transparent::late_failure_cause::retry_exhausted);
             }
             return;
           }
@@ -473,7 +481,9 @@ void gpu_pipeline_executor::manager_loop()
           // (cross-GPU processing contention, follow-up #17). 50 ms gives
           // typical SF100 probe tasks time to finish their current work
           // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          std::this_thread::sleep_for(std::chrono::milliseconds(
+            completion && completion->injections ? completion->injections->gpu_task_retry_backoff_ms
+                                                 : 50));
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
@@ -489,12 +499,18 @@ void gpu_pipeline_executor::manager_loop()
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: Exception during task execution: {}", e.what());
           if (_task_creator) { _task_creator->stop(); }
-          if (completion) { completion->report_error(std::current_exception()); }
+          if (completion) {
+            completion->report_error(std::current_exception(),
+                                     transparent::late_failure_cause::gpu_error);
+          }
           return;
         } catch (...) {
           SIRIUS_LOG_ERROR("GPU Pipeline Executor: unknown error during task execution");
           if (_task_creator) { _task_creator->stop(); }
-          if (completion) { completion->report_error(std::current_exception()); }
+          if (completion) {
+            completion->report_error(std::current_exception(),
+                                     transparent::late_failure_cause::gpu_error);
+          }
           return;
         }
         if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
@@ -529,7 +545,10 @@ void gpu_pipeline_executor::manager_loop()
           } catch (const std::exception& e) {
             SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
                              e.what());
-            if (completion) { completion->report_error(std::current_exception()); }
+            if (completion) {
+              completion->report_error(std::current_exception(),
+                                       transparent::late_failure_cause::gpu_error);
+            }
             return;
           }
         }

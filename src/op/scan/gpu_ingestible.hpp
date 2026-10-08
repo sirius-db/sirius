@@ -49,6 +49,9 @@ namespace sirius {
 class like_multiliteral_cache;
 }  // namespace sirius
 
+namespace sirius::pipeline {
+class completion_handler;
+}
 namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
@@ -80,6 +83,11 @@ class scan_operator_input;
  */
 class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
  public:
+  void set_execution_completion(std::shared_ptr<pipeline::completion_handler> completion)
+  {
+    _execution_completion = std::move(completion);
+  }
+
   using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
 
   virtual ~gpu_ingestible() = default;
@@ -272,6 +280,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   }
 
  protected:
+  std::shared_ptr<pipeline::completion_handler> _execution_completion;
   gpu_ingestible() noexcept = default;
 };
 

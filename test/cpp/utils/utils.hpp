@@ -78,9 +78,7 @@ inline duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context(
   auto& client_ctx = *con.context;
   auto sirius_ctx  = client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
-    sirius::converter_registry::initialize();
-    ::sirius::sirius_config config;
-    config.load_from_file(config_path);
+    auto config  = ::sirius::parsed_sirius_config::from_file(config_path);
     auto new_ctx = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     new_ctx->initialize(config);
     client_ctx.registered_state->Insert("sirius_state", new_ctx);
