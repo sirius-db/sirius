@@ -236,6 +236,9 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_pending
     engine.execute();
     SIRIUS_LOG_DEBUG("Done executing sirius_engine");
   } catch (std::exception& e) {
+    if (auto runtime = client_context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+      runtime->get_query_lifecycle_registry().report_failure(std::current_exception(),
+                                                             engine.query_id());
     duckdb::ErrorData error(e);
     SIRIUS_LOG_ERROR("Error in sirius_execute_pending_query_result: {}", error.RawMessage());
     return sirius_error_result<duckdb::MaterializedQueryResult>(error);
@@ -285,6 +288,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
     if (sirius_active_query) { cleanup_internal(nullptr, false); }
     throw;
   } catch (std::exception& e) {
+    if (auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+      runtime->get_query_lifecycle_registry().report_failure(std::current_exception(), query_id);
     if (sirius_active_query) { cleanup_internal(nullptr, false); }
     return sirius_error_result<duckdb::MaterializedQueryResult>(duckdb::ErrorData(e));
   }

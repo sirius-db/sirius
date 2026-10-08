@@ -1393,11 +1393,7 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     window.finish();
   } catch (...) {
     auto error = std::current_exception();
-    sirius_ctx->get_query_lifecycle_registry().record_error(window.query_id(), error);
-    if (sirius::fatal_device_exception(error)) {
-      sirius_ctx->mark_runtime_unavailable();
-      sirius_ctx->get_query_lifecycle_registry().quiesce_all();
-    }
+    sirius_ctx->get_query_lifecycle_registry().report_failure(error, window.query_id());
     throw;
   }
 }

@@ -704,11 +704,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   completion_ = std::make_shared<sirius::pipeline::completion_handler>(
     ctx.window_task_counter(),
     [registry = &ctx_.query_lifecycle_, id = window_id_](std::exception_ptr error) {
-      registry->record_error(id, error);
-      if (sirius::fatal_device_exception(error)) {
-        registry->mark_runtime_failed();
-        registry->quiesce_all();
-      }
+      registry->report_failure(error, id);
     });
   completion_->injections = sirius::transparent::latch_replay_injections(context);
   if (completion_->injections) ctx.record_certification_budget(false, false, 10);
@@ -738,16 +734,28 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     }
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
     lease_release_.state = lease_release_state::cleanup_failed;
-  } catch (std::exception& e) {
-    // Roll back this execution's registrations. Only a failed cleanup latches shared
-    // unavailability; an ordinary setup failure does not poison another connection.
+  } catch (SiriusRuntimeUnavailableException&) {
+    // begin_execution_window checks health before any initialization mutation. Preserve
+    // the typed refusal so a failure racing slot acquisition can still fall back to CPU.
     state_ = scope_state::FAILED;
     {
       std::lock_guard lock(ctx_.window_completions_mutex_);
       ctx_.window_completions_.erase(sirius::value_of(window_id_));
     }
     lease_release_.state = lease_release_state::begin_failed;
-    ctx_.query_lifecycle_.record_error(window_id_, std::current_exception());
+    log_window_event("end", "unavailable");
+    ctx_.release_query_lifecycle_slot();
+    throw;
+  } catch (std::exception& e) {
+    // Roll back this execution's registrations. Report fatal CUDA evidence before wrapping
+    // the error; ordinary setup failures do not poison another connection.
+    state_ = scope_state::FAILED;
+    {
+      std::lock_guard lock(ctx_.window_completions_mutex_);
+      ctx_.window_completions_.erase(sirius::value_of(window_id_));
+    }
+    lease_release_.state = lease_release_state::begin_failed;
+    ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
@@ -760,7 +768,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     }
     state_               = scope_state::FAILED;
     lease_release_.state = lease_release_state::begin_failed;
-    ctx_.query_lifecycle_.record_error(window_id_, std::current_exception());
+    ctx_.query_lifecycle_.report_failure(std::current_exception(), window_id_);
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();

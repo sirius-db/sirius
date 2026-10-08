@@ -20,6 +20,8 @@
 // PhysicalSiriusExecution fail *after* plan generation succeeds — i.e. a runtime
 // failure, distinct from a plan-time (create_plan) fallback.
 
+#include "sirius_context.hpp"
+
 #include <catch.hpp>
 #include <config.hpp>
 #include <duckdb.hpp>
@@ -291,13 +293,17 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   const std::string q = "SELECT count(*) AS n, sum(val) AS s FROM rf_basic WHERE val > 100;";
 
   // With injection: GPU is attempted (rebind + execution), fails, falls back to CPU.
-  inject();
+  inject("operator input contains cudaErrorUnknown");
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto gpu    = con->Query(q);
   REQUIRE(gpu);
   REQUIRE_FALSE(gpu->HasError());
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+
+  auto runtime = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(runtime);
+  CHECK(runtime->get_runtime_health() == duckdb::SiriusContext::runtime_health::OK);
 
   // Same query with no injection runs fully on the GPU (no runtime fallback).
   clear_injection();
