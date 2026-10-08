@@ -832,7 +832,10 @@ class rewriter {
   /// `SET vector_join_probes = p` makes a join that can go through cluster lists approximate, as
   /// `ivfflat.probes` does in pgvector: each probe row searches its p nearest clusters. The lists
   /// are those of the clustering `vector_join_clustering` names, when it is one of this column's,
-  /// or else lists that would answer exactly. With no such lists the setting does not apply.
+  /// or else lists that would answer exactly. With no such lists they are built inside the query
+  /// (build_lists_in_query) and kept for later statements, the way a hash join builds its table:
+  /// a join amortizes its index over one statement, so the build is charged to it. The setting
+  /// does not apply when the build is refused or disabled (SIRIUS_VSS_BUILD_IN_QUERY=0).
   bool use_approximate_lists(vector_join_request& req,
                              duckdb::SiriusContext& ctx,
                              const std::string& catalog,
@@ -856,6 +859,12 @@ class rewriter {
         find_named_lists(ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
     }
     if (!choice) { choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows); }
+    if (!choice) {
+      auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
+      if (build_env != nullptr && std::strcmp(build_env, "0") == 0) { return false; }
+      if (req.dim % 16 != 0) { return false; }
+      choice = build_lists_in_query(ctx, req, catalog, schema, table, column, rows);
+    }
     if (!choice) { return false; }
     req.search_mode = vector_join_search_mode::approx;
     req.clustering  = choice->clustering;

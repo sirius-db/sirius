@@ -520,6 +520,51 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "SET vector_join_probes with no lists builds them inside the query",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // No clustering exists for the corpus: the setting has the rewrite fit one and write its lists
+  // inside the statement, then search p of them. The lists stay, so the table function over the
+  // auto-built clustering returns the same answer, and probing every cluster is DuckDB's.
+  SqlRewriteTables tables(*this);
+  auto const bytes = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
+           ") % 256)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_fresh AS SELECT i::INTEGER AS id, " + bytes("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_fresh_probe AS SELECT i::INTEGER AS id, " + bytes("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_fresh', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit() { con.Query("RESET vector_join_probes;"); }
+  } reset{*con};
+  auto const sql =
+    "SELECT p.id, n.id, n.d FROM sr_fresh_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_fresh c ORDER BY d LIMIT 5) n;";
+  run_ok("SET vector_join_probes = 2;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto const got    = sorted_rows(*con, sql);
+  sirius::test::require_transparent_execution_delta(
+    before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
+  auto centroids =
+    con->Query("SELECT count(*) FROM sirius_kmeans_centroids('__sirius_auto_sr_fresh_vec');");
+  REQUIRE_FALSE(centroids->HasError());
+  auto const n_clusters = centroids->GetValue(0, 0).GetValue<std::int64_t>();
+  REQUIRE(n_clusters > 2);
+  auto const tvf = sorted_rows(
+    *con,
+    "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_fresh_probe','vec','sr_fresh',"
+    "'vec', probe_source => 'scan', search_mode => 'approx', "
+    "clustering => '__sirius_auto_sr_fresh_vec', n_probes => 2, k => 5);");
+  REQUIRE(rows_match(got, tvf));
+  run_ok("SET vector_join_probes = " + std::to_string(n_clusters) + ";");
+  require_gpu_matches_duckdb(*con, sql);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
