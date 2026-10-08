@@ -53,6 +53,7 @@
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <re2/re2.h>
 
 // standard library
 #include <cstddef>
@@ -300,6 +301,17 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
       has_backrefs = true;
     }
     if (has_backrefs && replacement.find("${") != std::string::npos) { return nullptr; }
+    if (has_backrefs) {
+      auto const& pattern =
+        duckdb::StringValue::Get(expr.children[1]->Cast<duckdb::BoundConstantExpression>().value);
+      duckdb_re2::RE2::Options options;
+      options.set_log_errors(false);
+      duckdb_re2::RE2 const regex(pattern, options);
+      std::string error;
+      // RE2 leaves the input unchanged for an out-of-range reference; cuDF throws.
+      // Validate against the original captures before adding the GPU wrapper groups.
+      if (!regex.ok() || !regex.CheckRewriteString(replacement, &error)) { return nullptr; }
+    }
   }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }

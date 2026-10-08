@@ -105,6 +105,8 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
          R"(regexp_replace(s, '(a)', '<\1>'))",
          R"(regexp_replace(s, '(a)(b)', '\2-\1-\2'))",
          R"(regexp_replace(s, '(aba)', '\12'))",
+         R"(regexp_replace(s, '(?:a)(b)', '<\1>'))",
+         R"(regexp_replace(s, '(a)(b)(a)( )(a)(b)(a)( )(aba)', '<\9>'))",
          R"(regexp_replace(s, 'aba', '<\0>'))",
          R"(regexp_replace(s, '[A-Z]', '\0\0'))",
          R"(regexp_replace(s, '\s', '\0\0'))",
@@ -119,6 +121,27 @@ TEST_CASE_METHOD(RegexpReplaceFixture,
        }) {
     INFO(expression);
     compare_gpu_vs_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
+  }
+}
+
+TEST_CASE_METHOD(RegexpReplaceFixture,
+                 "regexp_replace out-of-range backreferences fall back during planning",
+                 "[integration][gpu_execution][regexp_replace]")
+{
+  create_regexp_replace_table(*this);
+  for (auto const* expression : {
+         R"(regexp_replace(s, '(a)', '\9'))",
+         R"(regexp_replace(s, '(a)', '\2'))",
+         R"(regexp_replace(s, 'a', '\1'))",
+         R"(regexp_replace(s, '(?:a)', '\1'))",
+         R"(regexp_replace(s, '\(a\)', '\1'))",
+         R"(regexp_replace(s, '[(]a[)]', '\1'))",
+         R"(regexp_replace(s, '(a)', '\0\1\2'))",
+         R"(regexp_replace(s, 'a', '\12'))",
+       }) {
+    INFO(expression);
+    // Use a column to prevent constant folding, and assert fallback occurs before GPU execution.
+    expect_plan_fallback_matches_cpu(std::string{"SELECT id, "} + expression + " FROM regex_t");
   }
 }
 

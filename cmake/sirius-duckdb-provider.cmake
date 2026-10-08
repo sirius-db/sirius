@@ -41,6 +41,7 @@ target_include_directories(
   sirius_duckdb_dependency
   INTERFACE "${SIRIUS_DUCKDB_SOURCE_DIR}/src/include"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fmt/include"
+            "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/re2"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/concurrentqueue"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/fastpforlib"
             "${SIRIUS_DUCKDB_SOURCE_DIR}/third_party/yyjson/include"
