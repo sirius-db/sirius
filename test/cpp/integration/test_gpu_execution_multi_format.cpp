@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -3722,4 +3723,110 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
   }
   CHECK(provider->outstanding() == 0);
   CHECK(provider->seen->allocated_bytes == 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "Connection interruption drains a held DV read without new preparation or replay",
+                 "[integration][scan_preparation][iceberg][interrupt]")
+{
+  auto fallback = GENERATE(false, true);
+  sirius::test::scoped_setting fallback_setting(*con, "enable_duckdb_fallback", fallback);
+  struct exact_provider : sirius::scan_manager::reservation_provider {
+    sirius::scan_manager::test::test_reservation_provider provider;
+    uint64_t allocation_granularity(sirius::scan_manager::memory_space_id) const override
+    {
+      return 1;
+    }
+    std::optional<sirius::scan_manager::reservation_grant> request(
+      sirius::scan_manager::memory_space_id space, uint64_t bytes) override
+    {
+      provider.grant_bytes = bytes;
+      return provider.request(space, bytes);
+    }
+  };
+  auto provider = std::make_shared<exact_provider>();
+  auto state    = sirius::test::get_registered_sirius_context(*con);
+  auto counters = state->physical_counters();
+  struct reset_hooks {
+    decltype(counters) value;
+    ~reset_hooks()
+    {
+      value->preparation_provider_for_testing.reset();
+      value->iceberg_dv_phase_for_testing = {};
+      value->parquet_phase_for_testing    = {};
+    }
+  } reset{counters};
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool entered = false, release = false;
+  std::atomic<unsigned> started{0}, finished{0}, footers{0}, decoded{0};
+  counters->preparation_provider_for_testing = provider;
+  counters->iceberg_dv_phase_for_testing     = [&](auto const&, bool start) {
+    if (!start) {
+      ++finished;
+      return;
+    }
+    ++started;
+    std::unique_lock lock(mutex);
+    entered = true;
+    changed.notify_all();
+    if (!changed.wait_for(lock, std::chrono::seconds(10), [&] { return release; }))
+      throw std::runtime_error("held DV read was not released");
+  };
+  counters->parquet_phase_for_testing = [&](auto const&, bool footer) {
+    if (footer)
+      ++footers;
+    else
+      ++decoded;
+  };
+  auto sql     = "SELECT fruit, count FROM " + pinned_scan(inventory_fixture("dv_three"));
+  auto before  = sirius::test::get_transparent_execution_stats(*con);
+  auto query   = std::async(std::launch::async, [&] { return con->Query(sql); });
+  auto cleanup = std::shared_ptr<void>(nullptr, [&](void*) {
+    std::lock_guard lock(mutex);
+    release = true;
+    changed.notify_all();
+  });
+  {
+    std::unique_lock lock(mutex);
+    REQUIRE(changed.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+  }
+  con->Interrupt();
+  CHECK(state->get_scan_manager().wait_for_preparation_error_for_testing(std::chrono::seconds(1)));
+  CHECK(query.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+  CHECK(provider->provider.outstanding() == 1);
+  CHECK(state->get_scan_manager().num_active_queries() == 1);
+  CHECK(started == 1);
+  cleanup.reset();
+  REQUIRE(query.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  auto result = query.get();
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetErrorType() == duckdb::ExceptionType::INTERRUPT);
+  CHECK(started == 1);
+  CHECK(finished == 1);
+  CHECK(footers == 1);
+  CHECK(decoded == 0);
+  CHECK(provider->provider.outstanding() == 0);
+  CHECK(provider->provider.seen->allocated_bytes == 0);
+  CHECK(state->get_scan_manager().num_active_queries() == 0);
+  auto after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.executions == before.executions + 1);
+  CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+  CHECK(after.fallbacks == before.fallbacks);
+  for (size_t cause = 0; cause < before.late_replays.size(); ++cause)
+    CHECK(after.late_replays[cause] == before.late_replays[cause]);
+  counters->iceberg_dv_phase_for_testing = {};
+  counters->parquet_phase_for_testing    = {};
+  expect_iceberg_rows(sql,
+                      gpu_route::gpu,
+                      {{"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"},
+                       {"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"},
+                       {"apple", "1"},
+                       {"cherry", "3"},
+                       {"elderberry", "5"}});
 }

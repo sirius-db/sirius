@@ -32,7 +32,9 @@ TEST_CASE("Preparation options have finite defaults and preserve explicit intern
   CHECK(defaults.max_pending_results >= defaults.max_inflight_jobs);
   CHECK(defaults.max_control_work > 0);
   CHECK(defaults.drain_quantum > 0);
+  CHECK(defaults.interrupt_check_interval == std::chrono::milliseconds(10));
   CHECK_FALSE(defaults.underfilled_batch_residence.has_value());  // benchmark precedes activation
+  config.preparation.interrupt_check_interval    = std::chrono::milliseconds(3);
   config.preparation.max_inflight_jobs           = 2;
   config.preparation.max_active_units            = 7;
   config.preparation.max_pending_results         = 9;
@@ -55,6 +57,7 @@ TEST_CASE("Preparation options have finite defaults and preserve explicit intern
   CHECK(snapshot.max_pending_results == 9);
   CHECK(snapshot.max_control_work == 4);
   CHECK(snapshot.drain_quantum == 5);
+  CHECK(snapshot.interrupt_check_interval == std::chrono::milliseconds(3));
   CHECK(snapshot.underfilled_batch_residence == std::chrono::milliseconds(11));
   config.preparation.max_inflight_jobs = 1;
   CHECK(snapshot.max_inflight_jobs == 2);  // independent attempt value
@@ -75,6 +78,14 @@ TEST_CASE("Invalid preparation options fail before constructing a scan manager",
   SECTION("negative duration")
   {
     config.preparation.underfilled_batch_residence = std::chrono::milliseconds(-1);
+  }
+  SECTION("zero interrupt interval")
+  {
+    config.preparation.interrupt_check_interval = std::chrono::milliseconds(0);
+  }
+  SECTION("negative interrupt interval")
+  {
+    config.preparation.interrupt_check_interval = std::chrono::milliseconds(-1);
   }
   SECTION("no workers") { config.thread_pool.num_threads = 0; }
   CHECK_THROWS_AS(sirius::scan_manager::validate_scan_manager_config(config),

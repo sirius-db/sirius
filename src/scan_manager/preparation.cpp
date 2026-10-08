@@ -16,9 +16,18 @@
 
 #include "scan_manager/preparation.hpp"
 
+#include "duckdb/common/exception.hpp"
 #include "op/scan/iceberg_delete_set.hpp"
 
 namespace sirius::scan_manager {
+void preparation_gate::check_interrupted()
+{
+  if (interrupted && interrupted()) {
+    closed = true;
+    cv.notify_all();
+    throw duckdb::InterruptException();
+  }
+}
 void preparation_failure::validate() const
 {
   if (reason && cause != transparent::late_failure_cause::physical_input)

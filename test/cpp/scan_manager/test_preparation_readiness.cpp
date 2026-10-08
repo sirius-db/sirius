@@ -143,11 +143,14 @@ struct fixture {
   sirius::pipeline::completion_handler completion;
   preparation_coordinator coordinator;
   std::vector<std::shared_ptr<hold>> holds;
-  explicit fixture(size_t workers = 2, size_t slots = 4)
+  explicit fixture(size_t workers                               = 2,
+                   size_t slots                                 = 4,
+                   std::chrono::milliseconds interrupt_interval = k_interrupt_check_interval)
     : pool(static_cast<int>(workers)),
       dispatcher(pool),
-      coordinator(
-        completion, dispatcher, preparation_options{workers, slots, slots, workers, 1, 20ms})
+      coordinator(completion,
+                  dispatcher,
+                  preparation_options{workers, slots, slots, workers, 1, 20ms, interrupt_interval})
   {
   }
   std::thread owner;
@@ -231,7 +234,8 @@ struct fixture {
 TEST_CASE("Ready partial batches publish while every preparation worker is blocked",
           "[scan_preparation][coordinator]")
 {
-  fixture f;
+  fixture f(2, 4, 500ms);
+  f.coordinator.set_interrupt_check([] { return false; });
   auto a   = std::make_shared<accumulator>();
   auto out = std::make_shared<sink>();
   auto h1 = f.make_hold(), h2 = f.make_hold();
@@ -576,11 +580,16 @@ TEST_CASE("A deterministic clock drives the coordinator at the original absolute
   std::this_thread::sleep_for(5ms);
   CHECK(out->count() == 1);
 }
-TEST_CASE("Cancel racing with a deadline never publishes after stop returns",
+TEST_CASE("Cancellation racing with a deadline never publishes after recognition",
           "[scan_preparation][coordinator]")
 {
+  auto use_interrupt_signal = GENERATE(false, true);
   for (int iteration = 0; iteration < 12; ++iteration) {
+    std::atomic<bool> interrupted{false};
     fixture f;
+    if (use_interrupt_signal) {
+      f.coordinator.set_interrupt_check([&] { return interrupted.load(); });
+    }
     auto out = std::make_shared<sink>();
     auto h   = f.make_hold();
     int next = 0;
@@ -599,13 +608,17 @@ TEST_CASE("Cancel racing with a deadline never publishes after stop returns",
     f.start();
     REQUIRE(h->await());
     std::this_thread::sleep_for(std::chrono::milliseconds(15 + iteration));
-    f.coordinator.request_stop(stop_reason::user_cancel);
+    if (use_interrupt_signal) {
+      interrupted = true;
+    } else {
+      f.coordinator.request_stop(stop_reason::user_cancel);
+    }
+    REQUIRE(done.wait_for(1s) == std::future_status::ready);
+    CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
     auto count = out->count();
     h->release();
     f.finish();
     CHECK(out->count() == count);
-    REQUIRE(done.wait_for(1s) == std::future_status::ready);
-    CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
   }
 }
 
@@ -1149,4 +1162,57 @@ TEST_CASE(
   CHECK(out->count() == (cancel ? 0 : 2));
   CHECK(ledger.permits_in_flight() == 0);
   CHECK(provider.seen->allocated_bytes == 0);
+}
+
+TEST_CASE("Observed interruption stops claims and publication while owned work drains",
+          "[scan_preparation][coordinator][interrupt]")
+{
+  enum class point { waiting_for_worker, constructing_input, submitting_work };
+  auto interruption =
+    GENERATE(point::waiting_for_worker, point::constructing_input, point::submitting_work);
+  CAPTURE(static_cast<int>(interruption));
+  fixture f(1, 1);
+  auto out     = std::make_shared<sink>();
+  auto blocked = f.make_hold();
+  std::atomic<bool> interrupted{false};
+  std::atomic<unsigned> claims{0}, reads{0};
+  f.coordinator.set_interrupt_check([&] { return interrupted.load(); });
+  if (interruption == point::submitting_work)
+    f.coordinator.before_submission_for_testing([&] { interrupted = true; });
+  f.source(
+    std::make_shared<accumulator>(1),
+    out,
+    [&]() -> std::optional<preparation_coordinator::job> {
+      if (claims++ != 0) return {};
+      return preparation_coordinator::job{[&] {
+                                            ++reads;
+                                            if (interruption == point::waiting_for_worker)
+                                              blocked->wait();
+                                            return std::make_unique<tagged>(7);
+                                          },
+                                          {}};
+    },
+    interruption == point::constructing_input ? blocked : nullptr);
+  auto guard = f.shutdown_guard();
+  auto done  = f.completion.get_awaitable();
+  f.start();
+  if (interruption != point::submitting_work) {
+    REQUIRE(blocked->await());
+    interrupted = true;
+    if (interruption == point::constructing_input) blocked->release();
+  }
+  REQUIRE(done.wait_for(1s) == std::future_status::ready);
+  CHECK_THROWS_AS(done.get(), duckdb::InterruptException);
+  CHECK_FALSE(f.coordinator.admit_unit({92, 2}, {}));
+  CHECK_FALSE(f.coordinator.external_use());
+  CHECK(claims == 1);
+  if (interruption == point::waiting_for_worker)
+    CHECK(f.coordinator.snapshot().phase != preparation_coordinator::lifecycle::quiescent);
+  blocked->release();
+  f.finish();
+  CHECK(out->count() == 0);
+  CHECK(claims == 1);
+  CHECK(reads == (interruption == point::submitting_work ? 0 : 1));
+  CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
+  CHECK_THROWS_AS(f.coordinator.set_interrupt_check({}), std::logic_error);
 }

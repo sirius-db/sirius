@@ -1433,7 +1433,8 @@ void sirius_scan_manager::prepare_for_query(
   const sirius::planner::query& query,
   bool enable_pinned_zone_map_pruning,
   const std::vector<int>& allocated_gpu_ids,
-  std::shared_ptr<pipeline::completion_handler> completion)
+  std::shared_ptr<pipeline::completion_handler> completion,
+  std::function<bool()> interrupted)
 {
   auto const query_id = query.query_id();
   _execution_completion.store(completion);
@@ -1974,10 +1975,11 @@ void sirius_scan_manager::prepare_for_query(
     _query_states.emplace(query_id, state);
   }
 
-  start_metadata_processing(*state);
+  start_metadata_processing(*state, std::move(interrupted));
 }
 
-void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state)
+void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& state,
+                                                    std::function<bool()> interrupted)
 {
   std::shared_ptr<preparation_admission> admission;
   for (auto const& entry : state.scans) {
@@ -1998,6 +2000,7 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
     if (auto* disk = std::get_if<query_scan_manager_state::disk_scan>(&scan.source))
       state.metadata_processor->register_coordinator_source(
         scan.op, *disk->provider, *state.coordinator);
+  state.coordinator->set_interrupt_check(std::move(interrupted));
   state.coordinator->arm();
 }
 

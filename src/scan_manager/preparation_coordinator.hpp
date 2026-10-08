@@ -61,6 +61,7 @@ class preparation_coordinator {
   void add_source(source);
   std::shared_ptr<void> external_use();
   std::shared_ptr<preparation_gate> publication_gate() const;
+  void set_interrupt_check(std::function<bool()>);
   void arm();
   void run_on_query_thread();
   void request_stop(stop_reason) noexcept;

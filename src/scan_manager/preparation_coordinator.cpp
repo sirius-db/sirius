@@ -174,6 +174,7 @@ preparation_coordinator::preparation_coordinator(pipeline::completion_handler& c
 {
   if (!options.max_inflight_jobs || !options.max_pending_results || !options.max_active_units ||
       !options.max_control_work || !options.drain_quantum ||
+      options.interrupt_check_interval.count() <= 0 ||
       (options.underfilled_batch_residence && options.underfilled_batch_residence->count() <= 0))
     throw std::invalid_argument("query driver needs positive limits");
 }
@@ -222,6 +223,13 @@ std::shared_ptr<void> preparation_coordinator::external_use()
   guard->active = true;
   return guard;
 }
+void preparation_coordinator::set_interrupt_check(std::function<bool()> interrupted)
+{
+  std::lock_guard lock(state_->gate->mutex);
+  if (state_->phase != lifecycle::constructed)
+    throw std::logic_error("interrupt check must be bound before preparation arms");
+  state_->gate->interrupted = std::move(interrupted);
+}
 void preparation_coordinator::arm()
 {
   {
@@ -269,6 +277,7 @@ std::shared_ptr<preparation_unit> preparation_coordinator::admit_unit(unit_key k
 {
   std::lock_guard lock(state_->gate->mutex);
   if (state_->gate->closed) return {};
+  state_->gate->check_interrupted();
   if (auto it = state_->units.find(k); it != state_->units.end()) return it->second;
   if (state_->units.size() >= state_->options.max_active_units) return {};
   auto u = std::make_shared<preparation_unit>(k, required, state_->gate);
@@ -385,6 +394,7 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
     auto publication = source.hooks.construct(std::move(batch.batch));
     {
       std::lock_guard commit(gate->mutex);
+      gate->check_interrupted();
       if (!gate->closed && !completion->has_error()) {
         source.hooks.publish(std::move(publication));
         stats.publisher  = std::this_thread::get_id();
@@ -454,6 +464,7 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
   if (source == sources.end()) return false;
   // The nonblocking temporary-memory check shares the wait lock: settlement cannot be lost between
   // observing exhausted credit and sleeping. It allocates no payload and performs no I/O.
+  gate->check_interrupted();
   if (source->hooks.can_claim && !source->hooks.can_claim()) return false;
   auto ticket   = std::make_shared<job_ticket>();
   auto index    = static_cast<size_t>(free - slots.begin());
@@ -467,6 +478,10 @@ bool preparation_coordinator::state::submit_job(lock_type& lock, std::shared_ptr
     // Workers cannot see this slot until enqueue; source registration is already frozen.
     free->unit = work->unit;
     if (before_submit) before_submit();
+    {
+      std::lock_guard check(gate->mutex);
+      gate->check_interrupted();
+    }
     dispatcher->enqueue([ticket = std::move(ticket), work = std::move(work->work)]() mutable {
       auto& owner = *ticket->st;
       std::unique_ptr<op::scan::scan_info> value;
@@ -600,9 +615,14 @@ void preparation_coordinator::run_on_query_thread()
       std::unique_lock lock(g.mutex);
       ++st->stats.wakes;
       if (g.closed) break;
+      g.check_interrupted();
       // Deadlines run first. Every step is bounded and leaves the gate locked on return.
       size_t actions = st->emit_due_batch(lock) ? 1 : 0;
-      auto available = [&] { return !g.closed && actions < st->options.max_control_work; };
+      auto available = [&] {
+        if (g.closed || actions >= st->options.max_control_work) return false;
+        g.check_interrupted();
+        return true;
+      };
       if (available() && st->publish_batch(lock)) ++actions;
       if (available() && st->advance_result(lock)) ++actions;
       if (available() && st->submit_job(lock, st)) ++actions;
@@ -610,7 +630,12 @@ void preparation_coordinator::run_on_query_thread()
       if (st->inputs_settled()) break;
       if (actions) continue;
       auto deadline = st->nearest_deadline();
-      if (deadline && !st->manual_clock)
+      if (st->manual_clock) deadline.reset();
+      if (g.interrupted) {
+        auto poll = op::scan::batch_coalescer::clock::now() + st->options.interrupt_check_interval;
+        deadline  = deadline ? std::min(*deadline, poll) : poll;
+      }
+      if (deadline)
         g.cv.wait_until(lock, *deadline);
       else
         g.cv.wait(lock);

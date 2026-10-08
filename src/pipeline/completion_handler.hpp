@@ -198,6 +198,11 @@ class completion_handler {
       return publications_ > 0 || has_error();
     }) && publications_ > 0;
   }
+  bool wait_for_error_for_testing(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock lock(publication_mutex_);
+    return published_changed_.wait_for(lock, timeout, [&] { return has_error(); });
+  }
   void release_footer_for_testing(uint64_t file)
   {
     std::lock_guard lock(publication_mutex_);

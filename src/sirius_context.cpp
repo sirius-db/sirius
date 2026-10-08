@@ -1410,7 +1410,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
   sirius::query_id_t query_id,
   std::shared_ptr<sirius::pipeline::completion_handler> handler,
-  sirius::telemetry::query_telemetry_info telemetry_info)
+  sirius::telemetry::query_telemetry_info telemetry_info,
+  std::function<bool()> interrupted)
 {
   throw_if_not_initialized();
   auto query = duckdb::make_shared_ptr<sirius::planner::query>(
@@ -1424,7 +1425,8 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning,
                                    task_creator_->get_active_gpu_ids(query_id),
-                                   handler);
+                                   handler,
+                                   std::move(interrupted));
   return query;
 }
 

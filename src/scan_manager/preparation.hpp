@@ -72,6 +72,9 @@ struct checkpoint_input {
 struct preparation_gate {
   std::mutex mutex;
   std::condition_variable cv;
+  // Bound before arm; callers hold mutex while checking admission or publication.
+  std::function<bool()> interrupted;
+  void check_interrupted();
   bool closed      = false;
   size_t callbacks = 0;
   std::function<void(std::exception_ptr)> report_error;

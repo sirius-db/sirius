@@ -262,7 +262,8 @@ void sirius_engine::execute()
                                         .telemetry_query_id = telemetry_uuid,
                                         .worker_id          = telemetry_context_->worker_id(),
                                         .query_id           = query_id_,
-                                      });
+                                      },
+                                      [&client = context] { return client.IsInterrupted(); });
     sirius_ctx->get_task_scheduler().start_query(*query_);
     sirius_ctx->get_scan_manager().run_preparation_on_query_thread(query_id_);
   } catch (...) {

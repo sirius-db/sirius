@@ -346,6 +346,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
     if (publication) {
       gate = std::unique_lock(publication->mutex);
       if (publication->closed) return false;
+      publication->check_interrupted();
     }
     connector.push_split_sized(std::move(split), bytes);
     return true;
@@ -362,12 +363,14 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
       if (publication) {
         std::lock_guard gate(publication->mutex);
         if (publication->closed) break;
+        publication->check_interrupted();
       }
       auto next = provider.get_next_batch();
       // The external-use guard was acquired before this worker could touch the query.
       if (publication) {
         std::lock_guard gate(publication->mutex);
         if (publication->closed) break;
+        publication->check_interrupted();
       }
       if (next.data) {
         auto validation = provider.validation;

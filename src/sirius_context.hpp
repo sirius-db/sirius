@@ -735,7 +735,8 @@ class SiriusContext : public ClientContextState {
     std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
     sirius::query_id_t query_id,
     std::shared_ptr<sirius::pipeline::completion_handler> handler,
-    sirius::telemetry::query_telemetry_info telemetry_info);
+    sirius::telemetry::query_telemetry_info telemetry_info,
+    std::function<bool()> interrupted = {});
 
   /// \brief Get the current query.
   /// \brief Get the current Sirius configuration (const).

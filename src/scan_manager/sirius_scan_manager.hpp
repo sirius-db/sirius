@@ -555,7 +555,8 @@ class sirius_scan_manager {
   void prepare_for_query(const sirius::planner::query& query,
                          bool enable_pinned_zone_map_pruning,
                          const std::vector<int>& allocated_gpu_ids,
-                         std::shared_ptr<pipeline::completion_handler> completion = nullptr);
+                         std::shared_ptr<pipeline::completion_handler> completion = nullptr,
+                         std::function<bool()> interrupted                        = {});
   // Called by execute after task_scheduler starts the GPU consumers.
   void run_preparation_on_query_thread(sirius::query_id_t);
   void close_preparation(sirius::query_id_t, stop_reason) noexcept;
@@ -563,6 +564,11 @@ class sirius_scan_manager {
   {
     if (auto completion = _execution_completion.load())
       completion->release_footer_for_testing(file_number);
+  }
+  bool wait_for_preparation_error_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_error_for_testing(timeout);
   }
   bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
   {
@@ -1023,7 +1029,8 @@ class sirius_scan_manager {
   };
 
   /// \brief Register scan sources and arm the completion gate without submitting disk work.
-  void start_metadata_processing(query_scan_manager_state& state);
+  void start_metadata_processing(query_scan_manager_state& state,
+                                 std::function<bool()> interrupted);
 
   //! Resolve a query's state, or nullptr when it has already been reset.
   [[nodiscard]] std::shared_ptr<query_scan_manager_state> get_query_state(
