@@ -8,7 +8,7 @@ if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")
 else()
   find_package(sirius REQUIRED CONFIG)
 endif()
-add_executable(consumer main.cpp)
+add_executable(consumer main.cpp context.cpp)
 target_link_libraries(consumer PRIVATE ${SIRIUS_TARGET})
 
 if(SIRIUS_TARGET STREQUAL "sirius::sirius_static")

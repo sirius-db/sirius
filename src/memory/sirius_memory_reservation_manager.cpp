@@ -64,7 +64,8 @@ void sirius_memory_reservation_manager::restore_device_resources() noexcept
 {
   int previous_device = -1;
   (void)cudaGetDevice(&previous_device);
-  for (auto& registration : prev_device_mrs_) {
+  for (auto it = prev_device_mrs_.rbegin(); it != prev_device_mrs_.rend(); ++it) {
+    auto& registration = *it;
     // Drain stream-ordered frees before the base class destroys GPU pools.
     // Restore the registration even when CUDA is already in an error state.
     if (cudaSetDevice(registration.device_id) == cudaSuccess) { (void)cudaDeviceSynchronize(); }

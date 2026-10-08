@@ -239,6 +239,7 @@ bool batch_telemetry_registry::install(
 
 void batch_telemetry_registry::uninstall() noexcept
 {
+  // Also clean up a partial install, which has not enabled event recording yet.
   impl_->enabled.store(false, std::memory_order_release);
   // Export failures must not retain a context or prevent allocator teardown.
   auto emit = [](auto&& action) noexcept {
@@ -252,7 +253,11 @@ void batch_telemetry_registry::uninstall() noexcept
     std::lock_guard lock(shard.mutex);
     for (auto& [batch_id, placements] : shard.placements) {
       for (auto& p : placements) {
-        emit([&] { p.handle->batch_consumed({.instance_name = "", .reason = "query_end"}); });
+        emit([&] {
+          p.handle->batch_consumed(
+            {.instance_name = "",
+             .reason        = std::string(to_string_view(batch_consumed_reason::query_end))});
+        });
         emit([&] { p.handle->exit(); });
       }
     }
