@@ -483,7 +483,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       return cudf::strings::replace_re(cudf::strings_column_view(input.get_column_view()),
                                        *regex_prog,
                                        cudf::string_scalar(replace_str, true, _stream, _mr),
-                                       std::nullopt,
+                                       1,  // DuckDB replaces only the first match without 'g'.
                                        _stream,
                                        _mr);
     }

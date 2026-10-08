@@ -274,6 +274,9 @@ std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& 
   }
   if (*func_id_opt == function_id::substring && !gpu_supports_substring(expr)) { return nullptr; }
   if (*func_id_opt == function_id::round && !gpu_supports_round(expr)) { return nullptr; }
+  // The GPU regexp_replace evaluator implements only the three-argument form. Options such
+  // as 'g' change its semantics and must be evaluated by DuckDB rather than silently ignored.
+  if (*func_id_opt == function_id::regexp_replace && expr.children.size() != 3) { return nullptr; }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);
