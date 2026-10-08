@@ -384,7 +384,7 @@ class SiriusContext : public ClientContextState {
                                     RebindQueryInfo current_rebind) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
-  void initialize(const sirius::sirius_config& config);
+  void initialize(const sirius::parsed_sirius_config& config);
 
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
@@ -916,20 +916,23 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   //! Called after an extension fails to load loading
   void OnExtensionLoadFail(DatabaseInstance& db, const string& name, const ErrorData& error) final;
 
-  /// \brief The configuration this callback read from sirius.yaml, or compiled defaults when no
-  ///        file was found.
-  ///
-  /// The constructor reads the file, so this is populated before InitialGPUConfigs registers the
-  /// extension options. Options whose value DuckDB stores per connection take their registered
-  /// default from here, which is what makes a YAML value the default every connection inherits
-  /// and reports through `current_setting`.
-  [[nodiscard]] const sirius::sirius_config& get_loaded_config() const noexcept { return config_; }
+  /// Defaults for DuckDB options. Active contexts supply resolved values; when
+  /// Sirius is disabled, registration uses hardware-independent defaults.
+  [[nodiscard]] const sirius::operator_params& get_operator_defaults() const noexcept
+  {
+    return context_ ? context_->get_config().get_operator_params() : config_.get_operator_params();
+  }
+  [[nodiscard]] const sirius::compression_config& get_compression_defaults() const noexcept
+  {
+    return context_ ? context_->get_config().get_compression_config()
+                    : config_.get_compression_config();
+  }
 
  private:
   void read_config_file_if_exists();
 
   bool disabled_{false};
-  sirius::sirius_config config_;
+  sirius::parsed_sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
 

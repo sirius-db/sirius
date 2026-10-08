@@ -1,3 +1,10 @@
+# Keep the public configuration implementation's C++23 requirement local.
+add_library(sirius_context_config OBJECT src/context_config.cpp)
+target_compile_features(sirius_context_config PRIVATE cxx_std_23)
+set_target_properties(
+  sirius_context_config PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                   CXX_VISIBILITY_PRESET hidden)
+
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)
@@ -5,6 +12,11 @@ set_target_properties(sirius_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(sirius_shared SHARED src/sirius_library_anchor.cpp
                                  $<TARGET_OBJECTS:sirius_objects>)
+# Link the public configuration implementation into both Sirius libraries.
+foreach(_target sirius_core sirius_shared)
+  target_sources(${_target} PRIVATE $<TARGET_OBJECTS:sirius_context_config>)
+endforeach()
+
 if(VCPKG_BUILD AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(_sirius_cuda_link_script
       "${CMAKE_CURRENT_LIST_DIR}/sirius-cuda-fatbin.ld")
@@ -55,17 +67,20 @@ if(BUILD_WITH_CTRACK)
   list(APPEND SIRIUS_LINK_LIBRARIES $<BUILD_INTERFACE:ctrack::ctrack>)
 endif()
 
-foreach(_target sirius_objects sirius_core sirius_shared)
-  set_target_properties(
-    ${_target}
-    PROPERTIES CXX_SCAN_FOR_MODULES OFF
-               CXX_STANDARD 20
-               CXX_STANDARD_REQUIRED ON
-               CUDA_STANDARD 20
-               CUDA_STANDARD_REQUIRED ON
-               CUDA_SEPARABLE_COMPILATION ON)
-  if(NOT _target STREQUAL "sirius_objects")
-    set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+foreach(_target sirius_objects sirius_context_config sirius_core sirius_shared)
+  set_target_properties(${_target} PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+  if(NOT _target STREQUAL "sirius_context_config")
+    set_target_properties(
+      ${_target}
+      PROPERTIES CXX_STANDARD 20
+                 CXX_STANDARD_REQUIRED ON
+                 CUDA_STANDARD 20
+                 CUDA_STANDARD_REQUIRED ON
+                 CUDA_SEPARABLE_COMPILATION ON)
+    if(NOT _target STREQUAL "sirius_objects")
+      set_target_properties(${_target} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                  ON)
+    endif()
   endif()
 
   # cuco's device APIs need nvcc's extended device lambda; cuco compiles its own
@@ -155,7 +170,10 @@ set_target_properties(
              SOVERSION 0
              INSTALL_RPATH "$ORIGIN"
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON)
-target_compile_features(sirius_shared PUBLIC cxx_std_20)
+target_compile_features(sirius_shared INTERFACE cxx_std_23)
+# Installed static consumers use the public headers too. Keep this requirement
+# out of DuckDB's in-tree build graph.
+target_compile_features(sirius_core INTERFACE "$<INSTALL_INTERFACE:cxx_std_23>")
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
@@ -212,7 +230,6 @@ if(SIRIUS_BUILD_STATIC)
       parquet_extension
       "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_NAME:dummy_static_extension_loader>>"
   )
-  target_compile_features(sirius_core PUBLIC cxx_std_20)
   target_link_options(
     sirius_core INTERFACE "LINKER:--undefined=InitializeInjectionNvtx2"
     "LINKER:--allow-multiple-definition")
