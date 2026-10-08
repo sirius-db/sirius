@@ -16,11 +16,10 @@
 
 #pragma once
 
-#include <stdexcept>
-
 #include <cucascade/data/representation_converter.hpp>
 
 #include <cstddef>
+#include <stdexcept>
 
 namespace cucascade {
 class idata_representation;
@@ -41,7 +40,6 @@ class spill_source_consumed : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
-
 
 /**
  * @brief Register Simpatico compression/decompression converters into @p registry.
@@ -88,5 +86,30 @@ void register_compression_converters(cucascade::representation_converter_registr
  * Idempotent, and a no-op if no explore has ever been submitted.
  */
 void shutdown_explore_worker();
+
+/**
+ * @brief Whether long-lived worker threads should pre-create their compression
+ * streams (see prewarm_compression_streams). Set at context initialization when
+ * any compression feature is configured; off by default so a deployment that
+ * never compresses creates no extra streams.
+ */
+void set_compression_stream_prewarm(bool enabled) noexcept;
+
+/**
+ * @brief Create the calling thread's Simpatico stream pool on the current device
+ * now, rather than on its first encode or decode.
+ *
+ * The pool is per thread and was created lazily, which put its four
+ * cudaStreamCreateWithFlags calls deep inside whatever query first compressed or
+ * decompressed on that thread — at SF3000 that was a memory-starved q3, where the
+ * creation failed and the query died with it. Called from the GPU pipeline and
+ * downgrade executors' per-thread init, after the thread has bound its device.
+ *
+ * No-op unless enabled by set_compression_stream_prewarm. Never throws: a failure
+ * is logged and left to the lazy path, which reports it as rmm::out_of_memory.
+ *
+ * @return false when the streams could not be created.
+ */
+bool prewarm_compression_streams() noexcept;
 
 }  // namespace sirius

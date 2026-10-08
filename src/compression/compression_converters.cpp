@@ -78,7 +78,13 @@ namespace sirius {
 
 namespace {
 
-// Thread-local pool of 4 CUDA streams for per-column encode and decode.
+// The calling thread's pool of 4 CUDA streams for per-column encode and decode
+// on the current device: simpatico::thread_device_stream_pool, the same pool the
+// compressed-scan decode and pin_table use, so a thread holds one set of streams
+// rather than one per call site. Created eagerly on worker threads (see
+// prewarm_compression_streams); if it still has to be created here and that
+// fails, the failure is an rmm::out_of_memory, which the decode path's callers
+// retry and the encode path declines to an uncompressed spill.
 //
 // Work must be submitted from the calling thread: cuCascade's reservation state
 // is thread_local (reservation_aware_resource_adaptor), so a spawned worker
@@ -96,14 +102,14 @@ namespace {
 // The streams are distinct but columns do not run concurrently: simpatico's
 // encoders and decoders each block the submitting thread mid-column (see
 // compress_columns_with_plans), so column i completes before i+1 is submitted.
+constexpr std::size_t kColumnStreams = 4;
+
 simpatico::stream_pool& column_pool()
 {
-  thread_local simpatico::stream_pool pool;
-  if (pool.streams.empty()) {
-    if (!pool.init(4)) throw std::runtime_error("[compression_converters] stream_pool init failed");
-  }
-  return pool;
+  return simpatico::thread_device_stream_pool(kColumnStreams);
 }
+
+std::atomic<bool> g_prewarm_streams{false};
 
 // Rebind a column's buffers (recursively) to `s` for ordered teardown.
 // The decode's stream pool is long-lived (thread-local), but the caller's
@@ -613,7 +619,9 @@ class explore_worker {
       // allocation, so dropping the pointers is the safe move; a search that never
       // ran has no result anyone is waiting for.
       for (auto& t : _queue) {
-        for (auto& col : t.columns) { (void)col.release(); }
+        for (auto& col : t.columns) {
+          (void)col.release();
+        }
       }
       _queue.clear();
     }
@@ -2266,6 +2274,26 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
 }
 
 }  // namespace
+
+void set_compression_stream_prewarm(bool enabled) noexcept
+{
+  g_prewarm_streams.store(enabled, std::memory_order_relaxed);
+}
+
+bool prewarm_compression_streams() noexcept
+{
+  if (!g_prewarm_streams.load(std::memory_order_relaxed)) { return true; }
+  try {
+    (void)column_pool();
+    return true;
+  } catch (const std::exception& e) {
+    // Not fatal: the pool is retried lazily on first use, where a failure is an
+    // rmm::out_of_memory the caller can retry or decline.
+    SIRIUS_LOG_WARN("[compression_converters] could not pre-create this thread's streams: {}",
+                    e.what());
+    return false;
+  }
+}
 
 void shutdown_explore_worker()
 {

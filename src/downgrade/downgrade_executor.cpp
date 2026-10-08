@@ -17,6 +17,7 @@
 #include "downgrade/downgrade_executor.hpp"
 
 #include "compression/compression_alloc_stats.hpp"
+#include "compression/compression_converters.hpp"
 #include "compression/output_compression.hpp"
 #include "compression/spill_context.hpp"
 #include "data/convertible_data.hpp"
@@ -101,6 +102,9 @@ void downgrade_executor::start()
                          device_id,
                          cudaGetErrorString(err));
       }
+      // Spill encodes run on these workers; create their streams before the
+      // pressure that triggers the spills, not during it.
+      (void)sirius::prewarm_compression_streams();
     };
   }
 
@@ -176,6 +180,8 @@ void downgrade_executor::processing_loop()
                        device_id,
                        cudaGetErrorString(err));
     }
+    // The in-place compression pass encodes on this thread too.
+    (void)sirius::prewarm_compression_streams();
   }
 
   while (_running.load()) {
@@ -289,7 +295,8 @@ void downgrade_executor::processing_loop()
         auto exc_stream = _stream_pool->acquire_stream(
           cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
         for (auto& cand : picks) {
-          const std::size_t freed = cand->compress_in_place(rmm::cuda_stream_view{exc_stream.get()});
+          const std::size_t freed =
+            cand->compress_in_place(rmm::cuda_stream_view{exc_stream.get()});
           if (freed > 0) {
             ++inplace_batches;
             inplace_freed += freed;
@@ -747,15 +754,14 @@ void downgrade_executor::monitor_loop()
           cap > 0 ? 100.0 * static_cast<double>(used) / static_cast<double>(cap) : 0.0,
           pressure_cycles,
           suppressed_cycles,
-          pressure_cycles > 0 ? 100.0 * static_cast<double>(suppressed_cycles) /
-                                  static_cast<double>(pressure_cycles)
-                              : 0.0);
+          pressure_cycles > 0
+            ? 100.0 * static_cast<double>(suppressed_cycles) / static_cast<double>(pressure_cycles)
+            : 0.0);
         // Same cadence as occupancy so the two can be read together: what the
         // encode is asking the allocator for, against how much room there was.
         if (compression::alloc_stats_enabled()) {
-          SIRIUS_LOG_DEBUG("[compression_alloc] [{}] {}",
-                           _source_label,
-                           compression::alloc_stats_format());
+          SIRIUS_LOG_DEBUG(
+            "[compression_alloc] [{}] {}", _source_label, compression::alloc_stats_format());
         }
       }
     }

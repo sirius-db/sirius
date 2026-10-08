@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "compression/compression_converters.hpp"
 #include "creator/task_creator.hpp"
 #include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
@@ -62,7 +63,6 @@ struct pending_reservation {
   //! second one that nobody ever consumes.
   bool abandoned = false;
 };
-
 
 }  // namespace
 
@@ -111,6 +111,9 @@ sirius::exec::invocable<void() noexcept> gpu_pipeline_executor::get_per_thread_i
                        cudaGetErrorString(err));
     }
     sirius::util::enable_log_on_default_stream();
+    // Create this worker's compression streams now, while the device is idle,
+    // instead of on its first decode inside a memory-starved query.
+    (void)sirius::prewarm_compression_streams();
   };
 }
 

@@ -33,7 +33,11 @@ struct stream_pool {
   }
 
   /// Initialize with n streams. Returns false on error.
-  bool init(size_t n);
+  bool init(size_t n) { return try_init(n) == cudaSuccess; }
+  /// Initialize with n streams. Returns the CUDA error of the first stream that
+  /// could not be created (all-or-nothing: on failure no streams are kept), so
+  /// callers can report why rather than just that it failed.
+  cudaError_t try_init(size_t n);
   /// Destroy all streams.
   void shutdown();
   /// Synchronize all streams. Returns the first failure while still
@@ -55,7 +59,20 @@ struct stream_pool {
 /// the stream they were built on for their eventual async free, so a handle has
 /// to stay valid for as long as anything allocated on it might be freed.
 ///
-/// @throws std::runtime_error if the streams cannot be created.
+/// Creating streams needs device resources, and the first use of a thread's pool
+/// can land deep in a memory-starved query: at TPC-H SF3000 a decode on a GPU
+/// pipeline worker failed `cudaStreamCreateWithFlags` there. A creation failure is
+/// therefore reported as `rmm::out_of_memory` (carrying the CUDA error), which the
+/// Sirius executor retries, rather than a plain runtime_error that failed the
+/// query. Long-lived worker threads should call this once at thread start so the
+/// pool exists before memory gets tight.
+///
+/// @throws rmm::out_of_memory if the streams cannot be created.
+/// @throws std::runtime_error if the current device cannot be queried.
 stream_pool& thread_device_stream_pool(size_t n);
+
+/// Test hook: make the next @p count stream_pool creations fail as if
+/// `cudaStreamCreateWithFlags` had returned cudaErrorMemoryAllocation. Process-wide.
+void inject_stream_create_failures_for_testing(size_t count) noexcept;
 
 }  // namespace simpatico

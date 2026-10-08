@@ -32,10 +32,12 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <codegen/util/stream_pool.hpp>
 #include <compression/compressed_disk_representation.hpp>
 #include <compression/compressed_representation.hpp>
 #include <compression/compression_converters.hpp>
@@ -55,6 +57,8 @@
 #include <filesystem>
 #include <memory>
 #include <numeric>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -1641,4 +1645,140 @@ TEST_CASE("plan_register: clear_all removes spill plans", "[compression][plan_re
 
   reg.clear_all();
   REQUIRE_FALSE(reg.resolve_spill_plan(&repo_a()).has_value());
+}
+
+// ── Stream pools ─────────────────────────────────────────────────────────────
+//
+// Each case runs its CUDA work on a fresh std::thread: the pool is per thread, so
+// the Catch thread's pool (created by earlier cases) would hide the creation under
+// test. Assertions stay on the Catch thread; the worker only records outcomes.
+
+namespace {
+
+/// Run @p fn on a new thread bound to device 0 and wait for it.
+template <typename Fn>
+void on_fresh_thread(Fn&& fn)
+{
+  std::thread t([&] {
+    cudaSetDevice(0);
+    fn();
+  });
+  t.join();
+}
+
+enum class outcome { ok, oom, other_exception };
+
+template <typename Fn>
+outcome outcome_of(Fn&& fn, std::string* message = nullptr)
+{
+  try {
+    fn();
+    return outcome::ok;
+  } catch (rmm::out_of_memory const& e) {
+    if (message) { *message = e.what(); }
+    return outcome::oom;
+  } catch (std::exception const& e) {
+    if (message) { *message = e.what(); }
+    return outcome::other_exception;
+  } catch (...) {
+    return outcome::other_exception;
+  }
+}
+
+}  // namespace
+
+TEST_CASE("stream pool: a creation failure surfaces as rmm::out_of_memory",
+          "[compression][stream_pool]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  outcome first = outcome::ok, second = outcome::oom;
+  std::string message;
+  std::size_t streams = 0;
+  on_fresh_thread([&] {
+    simpatico::inject_stream_create_failures_for_testing(1);
+    first  = outcome_of([] { (void)simpatico::thread_device_stream_pool(4); }, &message);
+    second = outcome_of([&] { streams = simpatico::thread_device_stream_pool(4).streams.size(); });
+    simpatico::inject_stream_create_failures_for_testing(0);
+  });
+  // The executor retries rmm::out_of_memory; a plain runtime_error failed the query.
+  REQUIRE(first == outcome::oom);
+  // The CUDA error is in the message, not just "failed".
+  REQUIRE_THAT(message, Catch::Matchers::ContainsSubstring("cudaErrorMemoryAllocation"));
+  // The failure is not latched: the next use creates the pool.
+  REQUIRE(second == outcome::ok);
+  REQUIRE(streams == 4);
+}
+
+TEST_CASE("stream pool: prewarming creates the pool and never throws", "[compression][stream_pool]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  sirius::set_compression_stream_prewarm(true);
+  outcome failed_prewarm = outcome::other_exception, later_use = outcome::other_exception;
+  bool failed_result = true, retried_result = false;
+  on_fresh_thread([&] {
+    simpatico::inject_stream_create_failures_for_testing(1);
+    failed_prewarm = outcome_of([&] { failed_result = sirius::prewarm_compression_streams(); });
+    retried_result = sirius::prewarm_compression_streams();
+    // The prewarmed pool is the one later encodes and decodes use: no new
+    // creation happens, so an injected failure now goes unnoticed.
+    simpatico::inject_stream_create_failures_for_testing(1);
+    later_use = outcome_of([] { (void)simpatico::thread_device_stream_pool(4); });
+    simpatico::inject_stream_create_failures_for_testing(0);
+  });
+  sirius::set_compression_stream_prewarm(false);
+
+  REQUIRE(failed_prewarm == outcome::ok);
+  REQUIRE_FALSE(failed_result);
+  REQUIRE(retried_result);
+  REQUIRE(later_use == outcome::ok);
+}
+
+TEST_CASE("stream pool: a decode whose streams cannot be created is retryable",
+          "[compression][stream_pool][spill][isolated_context]")
+{
+  if (!has_gpu()) {
+    SUCCEED("No GPU available — skipping");
+    return;
+  }
+
+  auto& e = env();
+  reset_spill_state();
+  set_plan_1col(&repo_a(), kOneColDsl);
+
+  const std::size_t n = 5000;
+  auto batch          = make_int32_gpu_batch(n);
+  spill_to(batch, e.host_space, &repo_a());
+  REQUIRE(is_compressed_host(*batch));
+
+  outcome first = outcome::ok, retry = outcome::oom;
+  std::string message;
+  on_fresh_thread([&] {
+    sirius::convertible_data_batch w(batch, &repo_a());
+    simpatico::inject_stream_create_failures_for_testing(1);
+    first = outcome_of([&] { (void)w.convert({e.gpu_space}, e.stream(), *e.mgr, true); }, &message);
+    simpatico::inject_stream_create_failures_for_testing(0);
+    retry = outcome_of([&] { (void)w.convert({e.gpu_space}, e.stream(), *e.mgr, true); });
+  });
+  // Decompression is mandatory, so the failure must neither be swallowed nor be
+  // fatal: it is an OOM the pipeline executor reschedules.
+  INFO(message);
+  REQUIRE(first == outcome::oom);
+  // The retry decodes the untouched batch.
+  REQUIRE(retry == outcome::ok);
+  REQUIRE(get_tier(*batch) == cucascade::memory::Tier::GPU);
+  {
+    auto ro   = batch->to_read_only();
+    auto& gpu = ro.get_data()->cast<cucascade::gpu_table_representation>();
+    REQUIRE(gpu_col_sum(gpu) == expected_sum_of(n));
+  }
+
+  reset_spill_state(false);
 }

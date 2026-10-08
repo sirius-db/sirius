@@ -193,6 +193,16 @@ accounting and the physical pool agree and `usage_limit_fraction` keeps meaning 
 footprint on the device. An arena that does not fit inside the capacity is a configuration
 error.
 
+### Compression streams
+
+Simpatico encodes and decodes columns across a per-thread pool of four CUDA streams
+(`simpatico::thread_device_stream_pool`, shared by the spill converters, the compressed scan and
+`pin_table`). When any compression feature is configured, GPU pipeline workers and downgrade
+threads create their pool in their per-thread init (`prewarm_compression_streams`) rather than on
+first use deep inside a memory-starved query. If a pool still has to be created later and
+`cudaStreamCreateWithFlags` fails, the failure is an `rmm::out_of_memory` with the CUDA error, so
+the pipeline executor reschedules the task instead of failing the query.
+
 ## Pinned Host Memory
 
 **File:** referenced in `src/sirius_context.hpp`

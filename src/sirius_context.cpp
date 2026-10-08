@@ -925,6 +925,13 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
       sirius::compression::init_compression_device_pool(comp.device_pool_bytes,
                                                         config_.compression_arena_device_id());
     }
+    // Any compression feature means worker threads will encode or decode with
+    // Simpatico; have them create their streams at thread start (the executors
+    // below are built after this).
+    sirius::set_compression_stream_prewarm(
+      comp.enable_spill_compression || comp.enable_output_compression ||
+      comp.enable_device_compression_downgrade || comp.enable_pin_table_compression ||
+      !comp.input_plan_dir.empty());
     sirius::compression::set_output_compression_settings(
       comp.enable_output_compression,
       comp.output_compression_min_ratio,

@@ -18,6 +18,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime.h>
 
@@ -192,7 +193,13 @@ struct leased_pool {
     pool.streams =
       global_stream_cache().checkout(device, static_cast<size_t>(std::max(1, column_threads)));
 
-    if (pool.streams.empty()) throw plan_error("failed to lease internal streams");
+    if (pool.streams.empty()) {
+      // Stream creation failed under resource pressure, not a plan problem:
+      // report it as an OOM so callers that retry on OOM can do so.
+      (void)cudaGetLastError();
+      throw rmm::out_of_memory("failed to lease internal streams on device " +
+                               std::to_string(device));
+    }
   }
 
   ~leased_pool()

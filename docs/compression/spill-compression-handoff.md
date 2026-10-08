@@ -244,6 +244,17 @@ retry policy and the compression arena's device over-commit, not slower eviction
   fails: SF3000 q3, capped cache, compression on (`stream_pool: failed to create 4
   streams on device 0`). Create the pools eagerly, or throw an OOM so it retries,
   or fall back to the caller's stream.
+  **Done (P7):** a creation failure is now `rmm::out_of_memory` carrying the CUDA
+  error (so the executor reschedules instead of failing the query); the GPU
+  pipeline workers and the downgrade workers/processing thread create their pool
+  at thread start whenever a compression feature is configured
+  (`prewarm_compression_streams`); and the converters' separate thread-local
+  `column_pool` now shares `thread_device_stream_pool`, so a thread holds one set
+  of four streams per device instead of two. The pool stays per thread: every
+  column-parallel call ends with a `sync_all()` over its streams, which would wait
+  on other threads' work if they were shared. pin_table's DuckDB threads are not
+  prewarmed; their lazy failure is an OOM that the pin's existing per-chunk
+  fallback turns into an uncompressed pin.
 - **Prefetching cache footprint at SF3000** — test the readahead hypothesis above
   (`REST_MAX_CONCURRENT_SCANS=16`; at SF1000 16 and 48 performed the same) before
   using the cache at this scale.
