@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -33,6 +34,35 @@ struct thread_pool_config {
   int num_threads{0};
   std::string thread_name_prefix{"thread"};
   std::vector<int> cpu_affinity_list;
+};
+
+/// Retry policy for GPU pipeline tasks rescheduled after an OOM or a transient
+/// launch failure (`sirius.executor.pipeline.retry`).
+///
+/// A rescheduled task waits for a memory-release event (a task completing or a
+/// downgrade freeing bytes) instead of sleeping a fixed interval, and is failed
+/// only when the whole engine has made no progress for `no_progress_timeout`, it
+/// kept failing while nothing else was running (`max_idle_retries`), or it has
+/// used up `max_retries` attempts that had their full reservation. The
+/// count ignores attempts that ran on a partial reservation: those failed
+/// because memory was short, which waiting is meant to fix.
+struct gpu_task_retry_config {
+  /// Attempts with a full reservation a task may fail before the query fails.
+  /// The sanity cap behind the wall-clock limit; 0 disables it.
+  std::uint32_t max_retries{10000};
+  /// Consecutive retries a task may fail while the engine is idle -- no progress
+  /// since its previous retry, no other GPU task executing, no downgrade in
+  /// flight -- before the query fails: nothing is left that could free memory,
+  /// so waiting longer cannot help. 0 disables the limit.
+  std::uint32_t max_idle_retries{10};
+  /// Fail a retrying task when nothing anywhere completed a GPU task or freed
+  /// memory through a downgrade for this long. 0 disables the limit.
+  std::chrono::milliseconds no_progress_timeout{std::chrono::minutes{10}};
+  /// Minimum wait before a retry, and the first retry's longest wait.
+  std::chrono::milliseconds initial_backoff{20};
+  /// Longest wait for a memory-release event before retrying anyway; the wait
+  /// doubles from `initial_backoff` per consecutive retry without progress.
+  std::chrono::milliseconds max_backoff{2000};
 };
 
 /// Configuration for the downgrade executor.

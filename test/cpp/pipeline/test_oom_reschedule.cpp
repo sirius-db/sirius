@@ -431,7 +431,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
 }
 
 // ---------------------------------------------------------------------------
-// Test: tasks that can never succeed exhaust their retry budget (MAX_OOM_RETRIES=10)
+// Test: tasks that can never succeed exhaust their retry budget (max_retries=10, set below)
 // and cause the query to fail, while small tasks that fit in memory still complete.
 //
 // Memory layout:
@@ -456,6 +456,13 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
 
   auto global_state = std::make_shared<oom_test_global_state>();
   global_state->set_completion_handler(f.completion);
+
+  // Each XL attempt holds its full reservation, so every retry counts against max_retries.
+  sirius::exec::gpu_task_retry_config retry_config;
+  retry_config.max_retries     = 10;
+  retry_config.initial_backoff = std::chrono::milliseconds{5};
+  retry_config.max_backoff     = std::chrono::milliseconds{50};
+  f.executor->set_retry_config(retry_config);
 
   const int num_small = 5;
   const int num_xl    = 3;

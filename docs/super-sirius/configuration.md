@@ -300,7 +300,16 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`). No extra keys.
+Thread pool (default `num_threads: 4`) plus a `retry` sub-block for tasks rescheduled after an
+OOM or a transient launch failure (see [Retry policy](pipeline-execution.md#retry-policy)):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `retry.max_retries` | int | 10000 | Retries with a **full** reservation a task may fail before its query fails. Retries on a partial reservation are not counted. `0` disables the cap. |
+| `retry.max_idle_retries` | int | 10 | Consecutive retries without engine progress while no other GPU task runs and no downgrade is in flight before the query fails. `0` disables. |
+| `retry.no_progress_timeout` | int (ms) | 600000 | Fail a retrying task after this long without any GPU task completing or downgrade freeing memory. `0` disables. |
+| `retry.initial_backoff` | int (ms) | 20 | Minimum wait before a retry, and the first retry's longest wait for a memory-release event. |
+| `retry.max_backoff` | int (ms) | 2000 | Cap on the wait, which doubles per consecutive retry without progress. |
 
 ### `sirius.executor.downgrade`
 

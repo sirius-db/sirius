@@ -225,6 +225,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
+    test/cpp/pipeline/test_gpu_task_retry_policy.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
     test/cpp/pipeline/test_data_size_estimator.cpp

@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/gpu_task_retry_policy.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
@@ -92,6 +93,12 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
+  /// Retry-policy bookkeeping for this task's lineage, carried across reschedules.
+  gpu_task_retry_state retry_state;
+  /// Whether the executor granted this attempt its full reservation request. Only such attempts
+  /// count against the retry limit: one that ran short failed for lack of memory, which waiting
+  /// for a release is meant to fix.
+  bool had_full_reservation = true;
 
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
@@ -119,8 +126,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
     auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
     next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
     next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
-    _retry_reservation_floor =
-      clamp_to_floor_cap(std::max(_retry_reservation_floor, next_floor));
+    _retry_reservation_floor = clamp_to_floor_cap(std::max(_retry_reservation_floor, next_floor));
   }
 
   void inherit_retry_reservation_floor(const gpu_pipeline_task_local_state& previous) noexcept

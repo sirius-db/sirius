@@ -147,7 +147,7 @@ The GPU executor's manager loop:
    - Lock input batches and convert to GPU if needed (`lock_or_prepare_batch`)
    - `compute_task()`: iterate **all** operators in the pipeline (source through sink), calling `execute()` on each
    - `publish_output()`: call the sink's `sink()` method to push results to downstream ports
-   - On OOM: catch `oom_reschedule_exception`, retry up to 10 times with 5ms backoff
+   - On OOM: catch `oom_reschedule_exception`, wait for a memory-release event and retry (policy in [pipeline-execution](pipeline-execution.md#retry-policy))
    - On success: check if query is complete (RESULT_COLLECTOR sink + pipeline finished)
    - If not complete: schedule downstream consumers via `task_creator->schedule()`
    - If complete: `completion_handler->mark_completed()`

@@ -237,8 +237,13 @@ retry policy and the compression arena's device over-commit, not slower eviction
   physical failures have accumulated since its last trim. Consequence for A/B
   runs: at the same `usage_limit_fraction` the compression arm now has
   `device_pool_bytes` less query pool than the baseline, where before it had the
-  same pool plus an over-committed arena. Not yet re-measured at SF3000; the
-  retry-policy candidates above remain open.
+  same pool plus an over-committed arena.
+  **Done:** the retry policy now waits for memory
+  (`src/pipeline/gpu_task_retry_policy.hpp`, `sirius.executor.pipeline.retry`): only
+  full-reservation attempts count (cap 10,000), the wait ends on a task completion or a
+  downgrade freeing a batch (20 ms floor, doubling to 2 s without progress), and the
+  backstops are 10 min without engine progress or 10 idle retries with nothing in flight.
+  Not yet re-measured at SF3000.
 - **Lazy per-thread stream pools in the compressed decode path.**
   `simpatico::thread_device_stream_pool` (`src/util/stream_pool.cpp`) creates 4
   CUDA streams the first time each thread decodes. Deep in a memory-starved query

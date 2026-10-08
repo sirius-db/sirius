@@ -25,6 +25,7 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
+#include "pipeline/gpu_task_retry_policy.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -189,6 +190,8 @@ void downgrade_executor::processing_loop()
     if (!request) break;  // interrupted
 
     auto& req = request;
+    // In-flight downgrade work: retrying GPU tasks do not treat the engine as idle meanwhile.
+    auto activity = sirius::pipeline::memory_progress_signal::global().track_activity();
 
     auto t_start = std::chrono::steady_clock::now();
 
@@ -316,6 +319,8 @@ void downgrade_executor::processing_loop()
               inplace_freed += freed;
               req->bytes_freed.fetch_add(freed, std::memory_order_relaxed);
               req->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+              // Wakes GPU tasks waiting to retry for memory (gpu_task_retry_policy).
+              sirius::pipeline::memory_progress_signal::global().notify();
             }
             // With no byte target the predicate is the only stopping condition, so
             // check it per batch rather than compressing every candidate we found.
@@ -513,6 +518,7 @@ void downgrade_executor::processing_loop()
                   std::move(rollback).Cancel();
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                  sirius::pipeline::memory_progress_signal::global().notify();
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   for (size_t i = 0; i < result->size(); ++i) {
@@ -593,6 +599,7 @@ void downgrade_executor::processing_loop()
                 std::move(rollback).Cancel();
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
+                sirius::pipeline::memory_progress_signal::global().notify();
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 for (size_t i = 0; i < result->size(); ++i) {

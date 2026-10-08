@@ -426,15 +426,43 @@ Retryable execution failures are modeled as a small exception hierarchy: `task_r
 The GPU executor catches the **base** `task_reschedule_exception` and:
 
 1. Checks if the completion handler already has an error (skip if so)
-2. Increments `retry_count` (max 100 retries, `MAX_RETRIES`)
+2. Applies the retry policy (`on_gpu_task_retry`, `src/pipeline/gpu_task_retry_policy.hpp`) to the lineage's `gpu_task_retry_state`, carried from each rescheduled task to the next
 3. Logs the retry attempt
 4. Marks the original task as rescheduled (skips pipeline completion tracking)
 5. Transitions intermediate data from idle to `task_created` state
 6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 50ms for backoff
+7. Waits for a memory-release event (see below)
 8. Reschedules the new task back through the manager loop
 
-If max retries are exceeded, the error propagates and terminates the query.
+### Retry policy
+
+Configured by `sirius.executor.pipeline.retry` (`exec::gpu_task_retry_config`, see
+[configuration](configuration.md#siriusexecutorpipeline)). It replaced a fixed budget of 100
+retries per original task with a 50 ms sleep, which failed TPC-H SF3000 q3/q13 run to run:
+a task burned its budget in seconds (e.g. 18,727 PARTITION retries in 105 s) while other
+tasks were still completing and freeing memory, and a downgrade that freed 0 bytes still
+sent the task straight back.
+
+- **Progress signal.** `memory_progress_signal::global()` is a process-wide epoch with a
+  condition variable. It is bumped when a GPU task completes (its reservation and inputs are
+  released) and whenever a downgrade frees a batch (spill or in-place compression). Its
+  epoch is the engine's progress clock.
+- **Wait.** A rescheduled task waits at least `initial_backoff`, then until the epoch moves
+  or `initial_backoff × 2^(retries since progress − 1)` elapses, capped at `max_backoff`.
+  The wait runs on the executor worker, as the old sleep did.
+- **What counts.** `max_retries` counts only attempts that ran with their **full**
+  reservation (`gpu_pipeline_task_local_state::had_full_reservation`, set by the manager
+  loop). An attempt on a partial reservation failed for lack of memory, which waiting fixes.
+- **Failing.** The task fails the query when (a) the engine made no progress for
+  `no_progress_timeout` (default 10 min), (b) it failed `max_idle_retries` (default 10)
+  consecutive times with no progress while the engine was idle — no other GPU task executing
+  and no downgrade request in flight (`memory_progress_signal::track_activity`), so nothing
+  can free memory; this keeps an unsatisfiable task (for example one that needs more pinned
+  host memory than exists) failing in seconds — or (c) `max_retries` (default 10,000) is
+  exceeded, the sanity cap.
+
+Progress is engine-wide, not per query: a task of one query keeps waiting while another
+query's tasks are completing, because those completions release memory.
 
 ## Error Handling and Draining
 

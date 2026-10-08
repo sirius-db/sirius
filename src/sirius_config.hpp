@@ -516,6 +516,12 @@ struct sirius_config {
   [[nodiscard]] const exec::downgrade_executor_config& get_downgrade_executor_config()
     const noexcept;
 
+  /// Retry policy for rescheduled GPU pipeline tasks (`sirius.executor.pipeline.retry`).
+  [[nodiscard]] const exec::gpu_task_retry_config& get_gpu_task_retry_config() const noexcept
+  {
+    return _gpu_task_retry_config;
+  }
+
   [[nodiscard]] const operator_params& get_operator_params() const noexcept
   {
     return _operator_params;
@@ -602,6 +608,7 @@ struct sirius_config {
   exec::thread_pool_config _gpu_pipeline_executor_config{
     .num_threads = exec::default_gpu_pipeline_num_threads, .thread_name_prefix = "gpu_pipeline"};
   exec::downgrade_executor_config _downgrade_executor_config;
+  exec::gpu_task_retry_config _gpu_task_retry_config;
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;

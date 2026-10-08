@@ -25,6 +25,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
+#include "pipeline/gpu_task_retry_policy.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -417,6 +418,10 @@ void gpu_pipeline_executor::manager_loop()
         gpu_task->get_task_id(),
         reservation->size());
     }
+    if (auto* attempt_local =
+          dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state())) {
+      attempt_local->had_full_reservation = reservation && reservation->size() >= bytes_needs;
+    }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -447,7 +452,12 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
-          task->execute(::cuda::stream_ref{exc_stream.get()});
+          {
+            // Ends before any catch below runs, so a failing task does not see itself as
+            // in-flight work when the retry policy asks whether the engine is idle.
+            auto activity = memory_progress_signal::global().track_activity();
+            task->execute(::cuda::stream_ref{exc_stream.get()});
+          }
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {
           // Only THIS query's error state suppresses the reschedule. Previously one query's
@@ -474,38 +484,62 @@ void gpu_pipeline_executor::manager_loop()
             orig_task_id     = cur_local->original_task_id.value();
           }
 
-          // Bumped from 10 to 100 as part of follow-up #17. SF100 Q11 with
-          // cache=table_gpu + num_gpus=2 exhausted the old 10-retry budget
-          // against cross-GPU BUILD_PROBE batch-lock contention: the batch
-          // was held in `processing` on one GPU while the probe task on the
-          // other GPU needed it. Each convert-release cycle is O(100ms) at
-          // SF100 scale, so 10 retries × 5ms backoff (50 ms total) was far
-          // too short. With 100 retries × 50 ms backoff (~5 s) the probe
-          // tasks get enough patience to clear the contention window while
-          // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_RETRIES = 100;
-          if (next_retry_count > MAX_RETRIES) {
+          // Retry policy: sirius.executor.pipeline.retry; see pipeline-execution.md "Retry policy".
+          gpu_task_retry_state retry_state =
+            cur_local ? cur_local->retry_state : gpu_task_retry_state{};
+          bool const full_reservation = cur_local ? cur_local->had_full_reservation : true;
+          auto& progress              = memory_progress_signal::global();
+          auto const decision         = on_gpu_task_retry(retry_state,
+                                                  _retry_config,
+                                                  full_reservation,
+                                                  progress.epoch(),
+                                                  progress.idle(),
+                                                  std::chrono::steady_clock::now());
+          if (decision.verdict != gpu_task_retry_verdict::retry) {
+            std::string reason;
+            switch (decision.verdict) {
+              case gpu_task_retry_verdict::fail_no_progress:
+                reason = std::format("made no engine progress for {} ms",
+                                     _retry_config.no_progress_timeout.count());
+                break;
+              case gpu_task_retry_verdict::fail_idle:
+                reason = std::format(
+                  "kept failing for {} retries with no other work in flight to free memory",
+                  _retry_config.max_idle_retries);
+                break;
+              default:
+                reason =
+                  std::format("exceeded maximum retry limit ({}) of full-reservation attempts",
+                              _retry_config.max_retries);
+                break;
+            }
             SIRIUS_LOG_ERROR(
-              "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
-              "operator index {} — terminating query: {}",
+              "GPU Pipeline Executor: task {} (original task {}) {} after {} retries ({} with a "
+              "full reservation) at operator index {} — terminating query: {}",
               gpu_task->get_task_id(),
               orig_task_id,
-              MAX_RETRIES,
+              reason,
+              retry_state.total_retries,
+              retry_state.charged_retries,
               ex.get_resume_operator_index(),
               ex.what());
             if (completion) {
-              completion->report_error(std::make_exception_ptr(std::runtime_error(
-                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
-                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
+              completion->report_error(std::make_exception_ptr(
+                std::runtime_error("GPU pipeline task " + reason + " for original task " +
+                                   std::to_string(orig_task_id) + ": " + ex.what())));
             }
             return;
           }
 
           SIRIUS_LOG_WARN(
-            "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
-            "resuming from operator index {}: {}",
+            "GPU Pipeline Executor: reschedule (retry {}, {} charged of {}, {} since progress, "
+            "full reservation: {}) for task {} (original task {}), resuming from operator index "
+            "{}: {}",
             next_retry_count,
-            MAX_RETRIES,
+            retry_state.charged_retries,
+            _retry_config.max_retries,
+            retry_state.retries_since_progress,
+            full_reservation,
             gpu_task->get_task_id(),
             orig_task_id,
             ex.get_resume_operator_index(),
@@ -524,6 +558,7 @@ void gpu_pipeline_executor::manager_loop()
             std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
+          new_local_state->retry_state      = retry_state;
           if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
 
           // Preserve the per-task device pin across reschedule. Dropping it lets
@@ -539,12 +574,10 @@ void gpu_pipeline_executor::manager_loop()
           auto new_task =
             gpu_task->create_rescheduled_task(new_task_id, std::move(new_local_state));
 
-          // Backoff before rescheduling to allow other tasks to complete and
-          // free memory (true OOM case) or release a contended batch
-          // (cross-GPU processing contention, follow-up #17). 50 ms gives
-          // typical SF100 probe tasks time to finish their current work
-          // without putting the rescheduled task into a tight busy-spin.
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          // Waits from this failure's epoch, so only a release posted after it ends the wait.
+          progress.wait_for_progress(
+            retry_state.last_seen_epoch, decision.min_wait, decision.max_wait);
+          if (completion && completion->has_error()) { return; }
 
           // Schedule the rescheduled task. It goes back through manager_loop()
           // to acquire a fresh reservation before execution.
@@ -578,6 +611,9 @@ void gpu_pipeline_executor::manager_loop()
           pipeline_task->set_telemetry_finalized();
         }
         task.reset();
+        // The task's reservation and inputs are released: wake rescheduled tasks waiting for
+        // memory, and count it as engine progress for their no-progress limit.
+        memory_progress_signal::global().notify();
 
         // Check if query is complete BEFORE scheduling downstream tasks.
         // mark_completed() signals the future that engine.execute() is waiting on,

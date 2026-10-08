@@ -136,6 +136,14 @@ class task_scheduler {
     }
   }
 
+  /// Apply the rescheduled-task retry policy to every GPU executor. Call before start().
+  void set_gpu_retry_config(const exec::gpu_task_retry_config& config)
+  {
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_retry_config(config); }
+    }
+  }
+
   /**
    * @brief Get a pointer to the pipeline-level task queue.
    */

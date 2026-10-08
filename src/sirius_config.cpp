@@ -136,10 +136,29 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_spa
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, exec::thread_pool_config& opt)
+static void from_yaml(const YAML::Node& node, exec::gpu_task_retry_config& opt)
+{
+  yaml::reader r(node, "retry");
+  r.optional("max_retries", opt.max_retries);
+  r.optional("max_idle_retries", opt.max_idle_retries);
+  r.optional("no_progress_timeout", opt.no_progress_timeout);
+  r.optional("initial_backoff", opt.initial_backoff);
+  r.optional("max_backoff", opt.max_backoff);
+  r.reject_unknown();
+  if (opt.initial_backoff.count() < 0 || opt.max_backoff.count() < 0 ||
+      opt.no_progress_timeout.count() < 0) {
+    throw std::runtime_error("sirius.executor.pipeline.retry: durations must not be negative");
+  }
+}
+
+/// `sirius.executor.pipeline`: the GPU pipeline thread pool plus its task retry policy.
+static void from_yaml_pipeline(const YAML::Node& node,
+                               exec::thread_pool_config& pool,
+                               exec::gpu_task_retry_config& retry)
 {
   yaml::reader r(node, "thread_pool");
-  r.optional("num_threads", opt.num_threads, yaml::greater_than<int>{0});
+  r.optional("num_threads", pool.num_threads, yaml::greater_than<int>{0});
+  if (auto n = r.optional_node("retry")) from_yaml(*n, retry);
   r.reject_unknown();
 }
 
@@ -777,7 +796,9 @@ void sirius_config::parse_from_file(const std::filesystem::path& config_path)
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
       if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
-      if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
+      if (auto n = er.optional_node("pipeline")) {
+        from_yaml_pipeline(*n, _gpu_pipeline_executor_config, _gpu_task_retry_config);
+      }
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       er.reject_unknown();
     }

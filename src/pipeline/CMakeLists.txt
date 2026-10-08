@@ -2,6 +2,7 @@ target_sources(
   sirius_objects
   PRIVATE gpu_pipeline_executor.cpp
           gpu_pipeline_task.cpp
+          gpu_task_retry_policy.cpp
           sirius_pipeline_itask.cpp
           task_scheduler.cpp
           sirius_meta_pipeline.cpp

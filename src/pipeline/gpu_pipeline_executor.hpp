@@ -94,6 +94,14 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     _query_event_publisher = publisher.shared_from_this();
   }
 
+  /// Set the policy for rescheduled (OOM / transient-failure) tasks. Call before start().
+  void set_retry_config(const exec::gpu_task_retry_config& config) { _retry_config = config; }
+
+  [[nodiscard]] const exec::gpu_task_retry_config& get_retry_config() const noexcept
+  {
+    return _retry_config;
+  }
+
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
   gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
@@ -154,6 +162,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
     std::make_shared<sirius::event::query_event_publisher>()};
   sirius::creator::task_creator* _task_creator{nullptr};
   std::atomic<size_t> _tasks_executed{0};
+  exec::gpu_task_retry_config _retry_config;
 };
 
 }  // namespace pipeline
