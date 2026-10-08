@@ -1209,3 +1209,50 @@ TEST_CASE("sirius_physical_nested_loop_join RIGHT keeps asymmetric predicate sid
   REQUIRE(unmatched_zero == 1);
   REQUIRE(unmatched_null == 1);
 }
+
+TEST_CASE("native mixed join admission keeps reference overlap local to each side",
+          "[physical_hash_join][native_join_analysis]")
+{
+  auto const type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto ref        = [&](uint32_t index) {
+    return std::make_unique<sirius::ast::node>(sirius::ast::reference{index, type});
+  };
+  auto const left_overlap  = GENERATE(false, true);
+  auto const right_overlap = GENERATE(false, true);
+  duckdb::vector<sirius::join_condition> conditions;
+  conditions.push_back({ref(0), ref(1), sirius::comparison_type::equal});
+  // Wrap the residual references in casts: collection must reach their children and must
+  // retain each side's original index space, even when the opposite side uses that index.
+  conditions.push_back(
+    {std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(left_overlap ? 0 : 1), type}),
+     std::make_unique<sirius::ast::node>(sirius::ast::cast{ref(right_overlap ? 1 : 0), type}),
+     sirius::comparison_type::lt});
+  CHECK(sirius_physical_hash_join::are_conditions_supported(conditions, JoinType::INNER) ==
+        !(left_overlap || right_overlap));
+}
+
+TEST_CASE("native nested-loop support retains nested type and join type gates",
+          "[native_join_analysis]")
+{
+  auto const id   = GENERATE(sirius::type_id::INTEGER,
+                           sirius::type_id::STRUCT,
+                           sirius::type_id::LIST,
+                           sirius::type_id::ARRAY);
+  auto const type = sirius::logical_type::make(id);
+  duckdb::vector<sirius::join_condition> conditions;
+  conditions.push_back({std::make_unique<sirius::ast::node>(sirius::ast::reference{0, type}),
+                        std::make_unique<sirius::ast::node>(sirius::ast::reference{0, type}),
+                        sirius::comparison_type::lt});
+  CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::INNER) ==
+        (id == sirius::type_id::INTEGER));
+  CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::MARK));
+  if (id == sirius::type_id::INTEGER) {
+    CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::SEMI));
+    CHECK(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::ANTI));
+    conditions.push_back({std::make_unique<sirius::ast::node>(sirius::ast::reference{1, type}),
+                          std::make_unique<sirius::ast::node>(sirius::ast::reference{1, type}),
+                          sirius::comparison_type::gt});
+    CHECK_FALSE(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::SEMI));
+    CHECK_FALSE(sirius_physical_nested_loop_join::is_supported(conditions, JoinType::ANTI));
+  }
+}

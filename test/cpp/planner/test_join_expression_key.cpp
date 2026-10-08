@@ -21,7 +21,7 @@
  *        plain column reference so PARTITION/CONCAT/hash-join see an ordinary column index.
  */
 
-#include "expression/ast/to_duckdb.hpp"
+#include "expression/ast/node.hpp"
 #include "expression/join_condition.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -141,11 +141,7 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   return nullptr;
 }
 
-bool is_bound_ref(const sirius::ast::node& side)
-{
-  auto expr = sirius::ast::to_duckdb(side);
-  return expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF;
-}
+bool is_bound_ref(const sirius::ast::node& side) { return side.holds<sirius::ast::reference>(); }
 
 /// Assert that every equality condition side of @p hj is a plain column reference (BOUND_REF),
 /// i.e. any complex expression was materialized out into a projection below the join.

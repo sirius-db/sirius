@@ -37,9 +37,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/to_duckdb.hpp"
+#include "expression/ast/utils.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/numeric_narrowing.hpp"
@@ -77,16 +77,10 @@
 namespace sirius {
 namespace op {
 
-/// Recursively collect all BoundReferenceExpression indices from an expression tree.
-static void collect_bound_ref_indices(const duckdb::Expression& expr,
+static void collect_reference_indices(sirius::ast::node const& expr,
                                       std::unordered_set<std::size_t>& indices)
 {
-  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
-    return;
-  }
-  duckdb::ExpressionIterator::EnumerateChildren(
-    expr, [&](const duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+  sirius::ast::visit_references(expr, [&](auto const& ref) { indices.insert(ref.column_index); });
 }
 
 // cuDF 26.08 mixed SEMI/ANTI deduplication derives conditional-column null handling from the
@@ -107,8 +101,7 @@ static cudf::table_view prepare_mixed_filter_build(
   std::unordered_set<std::size_t> indices;
   for (std::size_t i = first_residual; i < conditions.size(); ++i) {
     auto const& side = build_is_left ? conditions[i].left : conditions[i].right;
-    auto expression  = sirius::ast::to_duckdb(*side);
-    collect_bound_ref_indices(*expression, indices);
+    collect_reference_indices(*side, indices);
   }
   std::vector<cudf::column_view> columns(build.begin(), build.end());
   for (auto const index : indices) {
@@ -300,10 +293,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
   std::unordered_set<std::size_t> equality_left_cols, equality_right_cols;
   for (auto const& cond : conditions) {
     if (!is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
-    auto left_owned  = sirius::ast::to_duckdb(*cond.left);
-    auto right_owned = sirius::ast::to_duckdb(*cond.right);
-    collect_bound_ref_indices(*left_owned, equality_left_cols);
-    collect_bound_ref_indices(*right_owned, equality_right_cols);
+    collect_reference_indices(*cond.left, equality_left_cols);
+    collect_reference_indices(*cond.right, equality_right_cols);
   }
 
   // For each conditional condition (inequality or a routed null-safe key), verify its
@@ -312,10 +303,8 @@ bool sirius_physical_hash_join::are_conditions_supported(
   for (auto const& cond : conditions) {
     if (is_hash_equality_key(cond.comparison, route_null_safe)) { continue; }
     std::unordered_set<std::size_t> ineq_left_cols, ineq_right_cols;
-    auto left_owned  = sirius::ast::to_duckdb(*cond.left);
-    auto right_owned = sirius::ast::to_duckdb(*cond.right);
-    collect_bound_ref_indices(*left_owned, ineq_left_cols);
-    collect_bound_ref_indices(*right_owned, ineq_right_cols);
+    collect_reference_indices(*cond.left, ineq_left_cols);
+    collect_reference_indices(*cond.right, ineq_right_cols);
     for (auto const idx : ineq_left_cols) {
       if (equality_left_cols.count(idx) > 0) { return false; }
     }

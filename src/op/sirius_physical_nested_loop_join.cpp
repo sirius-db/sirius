@@ -214,10 +214,9 @@ bool sirius_physical_nested_loop_join::is_supported(
   if (!is_join_type_supported(join_type)) { return false; }
   if (join_type == duckdb::JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
-    auto left_expr = sirius::ast::to_duckdb(*cond.left);
-    if (left_expr->return_type.InternalType() == duckdb::PhysicalType::STRUCT ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::LIST ||
-        left_expr->return_type.InternalType() == duckdb::PhysicalType::ARRAY) {
+    auto const id = cond.left->return_type().id();
+    if (id == sirius::type_id::STRUCT || id == sirius::type_id::LIST ||
+        id == sirius::type_id::ARRAY) {
       return false;
     }
   }
@@ -243,8 +242,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_nested_loop_join::get_join_
 {
   duckdb::vector<sirius::logical_type> result;
   for (auto& op : conditions) {
-    auto right_expr = sirius::ast::to_duckdb(*op.right);
-    result.push_back(sirius::from_duckdb(right_expr->return_type));
+    result.push_back(op.right->return_type());
   }
   return result;
 }

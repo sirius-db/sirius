@@ -32,7 +32,6 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
-#include "expression/ast/to_duckdb.hpp"
 #include "expression/join_condition.hpp"
 #include "expression_evaluator/ast_supported_types.hpp"
 #include "helper/type_conversions.hpp"
@@ -737,12 +736,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       bool keys_extractable = true;
       for (const auto& c : hj.conditions) {
         if (c.comparison != sirius::comparison_type::equal) { continue; }
-        auto right_expr = sirius::ast::to_duckdb(*c.right);
-        if (right_expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        if (!c.right->holds<sirius::ast::reference>()) {
           keys_extractable = false;
           break;
         }
-        build_key_cols.insert(right_expr->Cast<duckdb::BoundReferenceExpression>().index);
+        build_key_cols.insert(c.right->get<sirius::ast::reference>().column_index);
       }
       if (keys_extractable && !build_key_cols.empty()) {
         // build_side_unique_cols was computed before create_plan (which moves logical node data).
