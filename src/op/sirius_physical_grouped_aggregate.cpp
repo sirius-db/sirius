@@ -57,7 +57,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*group_validity*/,
-  duckdb::TupleDataValidityType /*distinct_validity*/)
+  duckdb::TupleDataValidityType /*distinct_validity*/,
+  std::vector<std::optional<std::uint64_t>> aggregate_input_max_abs)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
@@ -76,6 +77,13 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  // A bound belongs to the aggregate's SUM slot; AVG's COUNT_VALID slot (cudf_idx + 1) needs none.
+  cudf_aggregate_input_max_abs.assign(cudf_aggregates.size(), std::nullopt);
+  for (size_t i = 0; i < aggregate_slots.size() && i < aggregate_input_max_abs.size(); ++i) {
+    if (aggregate_input_max_abs[i] && !aggregate_slots[i].is_count_distinct) {
+      cudf_aggregate_input_max_abs[aggregate_slots[i].cudf_idx] = aggregate_input_max_abs[i];
+    }
+  }
 }
 
 duckdb::vector<sirius::logical_type>
@@ -117,7 +125,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                           grouping_functions,
                                                           stream,
                                                           *space,
-                                                          batch_telemetry()));
+                                                          batch_telemetry(),
+                                                          cudf_aggregate_input_max_abs));
       continue;
     }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -127,7 +136,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_struct_col_indices,
                                                               stream,
                                                               *space,
-                                                              batch_telemetry());
+                                                              batch_telemetry(),
+                                                              cudf_aggregate_input_max_abs);
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

@@ -32,10 +32,27 @@ struct scan_column_origin {
   std::size_t ordinal;  ///< position in the scan's output
 };
 
-/// Trace unchanged columns through row subsets to their base scan and output ordinal.
-/// Returns nullopt for computed columns, unmodelled operators, or joins that can repeat rows.
-/// Types and column bindings must be resolved on the subtree.
+/// What an output column must preserve of the scan column it descends from.
+enum class origin_policy {
+  /// Every output row is a scan row at most once, so the scan's row count bounds the output
+  /// (dynamic-filter domain coverage): a join contributes only a side it cannot duplicate, and an
+  /// aggregate with several grouping sets is refused.
+  row_subset,
+  /// Only the values are unchanged (magnitude bounds): either side of any join or cross product
+  /// qualifies, since row multiplication and NULL padding add no values.
+  value_preserving,
+};
+
+/**
+ * @brief Traces @p output_ordinal of @p subtree to the base-scan column it carries, or nullopt
+ *
+ * Follows projections of bare references, filters, sorts, limits, DISTINCT and GROUP BY keys, and
+ * joins as @p policy allows. Stops at a computed column, an unmodelled operator, a table in-out
+ * function, or an ordinal past the scan's width.
+ *
+ * @pre Types and column bindings are resolved on @p subtree.
+ */
 [[nodiscard]] std::optional<scan_column_origin> resolve_scan_column_origin(
-  duckdb::LogicalOperator const& subtree, std::size_t output_ordinal) noexcept;
+  duckdb::LogicalOperator const& subtree, std::size_t output_ordinal, origin_policy policy);
 
 }  // namespace sirius::planner

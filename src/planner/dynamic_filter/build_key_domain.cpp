@@ -30,7 +30,8 @@ namespace detail {
 duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
                                                     std::size_t output_ordinal) noexcept
 {
-  auto const origin = resolve_scan_column_origin(subtree, output_ordinal);
+  auto const origin =
+    resolve_scan_column_origin(subtree, output_ordinal, origin_policy::row_subset);
   return origin ? origin->get : nullptr;
 }
 
