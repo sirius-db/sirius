@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "cuda/device_health.hpp"
 #include "query_id.hpp"
 
 #include <array>
@@ -255,7 +256,21 @@ class query_lifecycle_registry {
     } catch (...) {
     }  // Diagnostics must never interfere with completion/retirement.
   }
-  void mark_runtime_failed() noexcept { runtime_failed_.store(true, std::memory_order_release); }
+  /// Classify while the original exception type is available, before error-result conversion.
+  /// Fatal device errors close publication for every query; ordinary errors stay query-local.
+  /// Does not wait for work (safe inside workers) or replace the caller's original exception.
+  bool report_failure(std::exception_ptr error, std::optional<query_id_t> id = {}) noexcept
+  {
+    if (id) record_error(*id, error);
+    if (!fatal_device_exception(error)) return false;
+    runtime_failed_.store(true, std::memory_order_release);
+    try {
+      quiesce_all();
+    } catch (...) {
+      // Health remains latched even if closing a gate fails.
+    }
+    return true;
+  }
   bool runtime_failed() const noexcept { return runtime_failed_.load(std::memory_order_acquire); }
 
   /// Live owners plus the last 128 retired owners. No plans/buffers are retained by history.
