@@ -474,7 +474,8 @@ class sirius_physical_operator {
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<sirius::logical_type>& get_types() const { return types; }
 
-  //! Schema of the rows this operator's parent receives; defaults to `types`.
+  //! Schema of the rows this operator's parent receives; defaults to `types`. Exists only for the
+  //! materialized CTE, whose `types` describe the definition rather than the rows it emits.
   [[nodiscard]] virtual const duckdb::vector<sirius::logical_type>& get_output_types() const
   {
     return types;
