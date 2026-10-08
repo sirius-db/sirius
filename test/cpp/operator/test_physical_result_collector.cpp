@@ -15,9 +15,14 @@
  */
 
 // test
+#include <absl/cleanup/cleanup.h>
 #include <catch.hpp>
 #include <helper/type_conversions.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/utils.hpp>
+
+#include <fstream>
+#include <future>
 
 // sirius
 #include <data/data_batch_utils.hpp>
@@ -466,4 +471,106 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
   std::sort(actual_rows.begin(), actual_rows.end());
   std::sort(expected_rows.begin(), expected_rows.end());
   REQUIRE(actual_rows == expected_rows);
+}
+
+TEST_CASE("result collection retries HOST pressure without replaying committed batches",
+          "[physical_result_collector][isolated_context][memory_wait]")
+{
+  using namespace std::chrono_literals;
+  enum class outcome { release, timeout, cancel };
+  outcome action = outcome::release;
+  SECTION("transient shortage preserves every row once") {}
+  SECTION("persistent shortage exhausts the configured budget") { action = outcome::timeout; }
+  SECTION("interruption terminates waiting without affecting another connection")
+  {
+    action = outcome::cancel;
+  }
+  auto path                   = std::filesystem::temp_directory_path() / "sirius_result_wait.yaml";
+  absl::Cleanup remove_config = [&] { std::filesystem::remove(path); };
+  {
+    std::ofstream out(path);
+    out << "sirius:\n  memory_reservation_timeout_ms: " << (action == outcome::timeout ? 50 : 2000)
+        << "\n  topology: {num_gpus: 1}\n  memory:\n"
+           "    gpu: {usage_limit_bytes: 128MiB}\n    host: {capacity_bytes: 256MiB}\n"
+           "  executor:\n    scan_manager: {uring_n_reactors: 1}\n";
+  }
+  auto db = sirius::test::open_sirius_db(nullptr, path);
+  duckdb::Connection con(*db), other(*db);
+  auto ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(ctx);
+  auto* space = get_default_gpu_space(ctx);
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  auto make_batch = [&] {
+    auto table = sirius::create_cudf_table_with_random_data(3,
+                                                            {cudf::data_type{cudf::type_id::INT32}},
+                                                            {std::make_pair(1, 10)},
+                                                            stream,
+                                                            space->get_default_allocator(),
+                                                            false);
+    return sirius::make_data_batch(
+      std::move(table), *space, stream, sirius::telemetry::batch_telemetry_info{});
+  };
+  auto first  = make_batch();
+  auto second = make_batch();
+  convert_batch_to_host(ctx, first, stream);
+  stream.synchronize();
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::INTEGER};
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->types = types;
+  prepared->names = {"value"};
+  auto plan =
+    duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(sirius::from_duckdb_vec(types), 0);
+  auto sirius_prepared =
+    duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
+  sirius::op::sirius_physical_materialized_collector other_collector(*sirius_prepared,
+                                                                     *other.context);
+
+  std::vector<std::unique_ptr<reservation>> held;
+  for (auto const* host : ctx->get_memory_manager().get_memory_spaces_for_tier(Tier::HOST)) {
+    while (auto res = const_cast<memory_space*>(host)->make_reservation_or_null(1ULL << 20)) {
+      held.push_back(std::move(res));
+    }
+  }
+  sirius::test::scoped_recording_log_sink logs;
+  auto worker          = std::async(std::launch::async, [&] {
+    collector.sink(pipelineable_operator_data({first, second}), stream);
+  });
+  absl::Cleanup settle = [&] {
+    con.Interrupt();
+    held.clear();
+    if (worker.valid()) worker.wait();
+  };
+  bool observed_wait = false;
+  auto deadline      = std::chrono::steady_clock::now() + 2s;
+  while (!observed_wait && std::chrono::steady_clock::now() < deadline) {
+    for (const auto& entry : logs.records()) {
+      if (entry.message.find("Result collection waiting for HOST reservation") !=
+          std::string::npos) {
+        observed_wait = true;
+      }
+    }
+    if (!observed_wait) std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(observed_wait);
+  if (action == outcome::release) held.clear();
+  if (action == outcome::cancel) con.Interrupt();
+  REQUIRE(worker.wait_for(2s) == std::future_status::ready);
+  if (action == outcome::release) {
+    REQUIRE_NOTHROW(worker.get());
+    CHECK(collector.result_collection->Count() == 6);
+  } else if (action == outcome::cancel) {
+    REQUIRE_THROWS_AS(worker.get(), duckdb::InterruptException);
+    CHECK(collector.result_collection->Count() == 3);
+  } else {
+    REQUIRE_THROWS_WITH(worker.get(),
+                        Catch::Matchers::ContainsSubstring("HOST memory-wait retry budget"));
+    CHECK(collector.result_collection->Count() == 3);
+  }
+  held.clear();
+  // An error on con must leave another connection's collection usable.
+  REQUIRE_NOTHROW(other_collector.sink(pipelineable_operator_data({second}), stream));
+  CHECK(other_collector.result_collection->Count() == 3);
 }

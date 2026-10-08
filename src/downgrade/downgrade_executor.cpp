@@ -21,6 +21,7 @@
 #include "data/convertible_gpu_pipeline_task.hpp"
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
+#include "memory/reservation_headroom.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -654,6 +655,26 @@ void downgrade_executor::set_pipeline_task_queue(
 }
 
 // --- Public request API ---
+
+std::future<size_t> downgrade_executor::request_reservation_capacity(size_t bytes)
+{
+  if (!_memory_space || _memory_space->get_tier() != cucascade::memory::Tier::GPU) {
+    throw std::logic_error("Reservation capacity reclamation requires a GPU memory space");
+  }
+  auto available    = sirius::memory::gpu_reservation_headroom(*_memory_space);
+  auto deficit      = bytes > available ? bytes - available : 0;
+  auto req          = std::make_unique<downgrade_request>();
+  req->target_bytes = deficit;
+  req->predicate    = [space = _memory_space, &freed = req->bytes_freed, deficit, bytes]() {
+    return freed.load(std::memory_order_relaxed) >= deficit ||
+           sirius::memory::gpu_reservation_headroom(*space) >= bytes;
+  };
+  auto future = req->result.get_future();
+  if (!_request_queue.push(std::move(req))) {
+    SIRIUS_LOG_WARN("[downgrade] reservation capacity request dropped: queue inactive");
+  }
+  return future;
+}
 
 std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
 {

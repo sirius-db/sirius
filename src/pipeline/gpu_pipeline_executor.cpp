@@ -23,6 +23,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "expression_evaluator/query_policy.hpp"
 #include "log/logging.hpp"
+#include "memory/reservation_headroom.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -53,13 +54,15 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
   sirius::parallel::downgrade_executor* downgrade_executor,
-  std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
+  std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+  std::chrono::milliseconds memory_reservation_timeout)
   : sirius::parallel::itask_executor(
       lifecycle, config, std::move(telemetry_context), mem_space->get_device_id()),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space),
-    _downgrade_executor(downgrade_executor)
+    _downgrade_executor(downgrade_executor),
+    _memory_reservation_timeout(memory_reservation_timeout)
 {
 }
 
@@ -222,8 +225,7 @@ void gpu_pipeline_executor::process_task(
     if (!reservation || reservation->size() < bytes_needs) {
       reservation.reset();
       const auto now = std::chrono::steady_clock::now();
-      if (pipeline_task->memory_wait_started == std::chrono::steady_clock::time_point{}) {
-        pipeline_task->memory_wait_started = now;
+      if (!pipeline_task->memory_wait.waiting()) {
         pipeline_task->memory_wait_activity = _query_lifecycle.begin_memory_wait(query_id);
         if (_query_event_publisher) {
           _query_event_publisher->publish_wait_for_memory_for_task(
@@ -233,11 +235,17 @@ void gpu_pipeline_executor::process_task(
             bytes_needs);
         }
       }
-      // No manager or worker waits on a reservation/future. Bound persistent exhaustion;
-      // interruption can dispose of this task from the scheduler queue at any time.
-      if (now - pipeline_task->memory_wait_started > std::chrono::seconds(30)) {
+      // Charge only requested backoff, excluding scheduler queue delay. Memory releases or
+      // successful work on this GPU refresh the budget, even when another task wins the space.
+      if (!pipeline_task->memory_wait.retry(now,
+                                            memory::gpu_reservation_headroom(*_memory_space),
+                                            _tasks_executed.load(std::memory_order_relaxed),
+                                            _memory_reservation_timeout,
+                                            _memory_space->get_device_id())) {
         if (iteration_completion) {
-          iteration_completion->report_error("GPU reservation made no progress for 30 seconds");
+          iteration_completion->report_error(
+            "GPU reservation exhausted its memory-wait retry budget (" +
+            std::to_string(_memory_reservation_timeout.count()) + " ms without observed progress)");
         }
         return;
       }
@@ -255,15 +263,15 @@ void gpu_pipeline_executor::process_task(
       if (_downgrade_executor && !_pending_reclamation.valid() && now >= _next_reclamation) {
         // Runtime-owned pressure request: it borrows victims independently and captures no
         // stack variables or requesting query. Finishing one query cannot cancel another's IO.
-        _pending_reclamation = _downgrade_executor->request_free_memory(bytes_needs);
+        _pending_reclamation = _downgrade_executor->request_reservation_capacity(bytes_needs);
         _next_reclamation    = now + std::chrono::milliseconds(50);
       }
-      pipeline_task->retry_not_before = now + std::chrono::milliseconds(5);
+      pipeline_task->retry_not_before = pipeline_task->memory_wait.retry_at();
       if (!_task_creator) { throw std::logic_error("GPU retry requires a task creator"); }
       _task_creator->reschedule(std::move(pipeline_task));
       return;  // releases the reserved worker slot
     }
-    pipeline_task->memory_wait_started = {};
+    pipeline_task->memory_wait.reset();
     pipeline_task->memory_wait_activity.reset();
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {

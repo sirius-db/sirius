@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "memory/reservation_wait.hpp"
 #include "op/dynamic_filter/config.hpp"
 #include "scan_manager/config.hpp"
 
@@ -380,6 +381,11 @@ struct sirius_config {
   /// active-GPU list; the rest are left available for future concurrent queries.
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
+  [[nodiscard]] std::chrono::milliseconds memory_reservation_timeout() const noexcept
+  {
+    return std::chrono::milliseconds{_memory_reservation_timeout_ms};
+  }
+
  private:
   friend class parsed_sirius_config;
 
@@ -403,7 +409,8 @@ struct sirius_config {
   void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{};
-  int _gpus_per_query = 0;
+  int _gpus_per_query                    = 0;
+  int64_t _memory_reservation_timeout_ms = memory::reservation_wait::default_timeout.count();
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   creator::task_creator_config _task_creator_config;
   scan_manager::scan_manager_config _scan_manager_config{};
