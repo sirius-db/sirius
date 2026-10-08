@@ -6,7 +6,9 @@ API.
 ## Getting started
 
 New fallible public C++ operations report errors through
-`std::expected<T, sirius::Error>`. Allocation failures may throw.
+`std::expected<T, sirius::Error>`. These operations return allocation failures as
+`ErrorCode::allocation_failure` with an empty diagnostic message. Constructing a
+default configuration builder or preparing arguments can still throw.
 The public API therefore requires C++23 and standard-library support for
 `std::expected`.
 

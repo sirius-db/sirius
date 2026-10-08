@@ -42,10 +42,8 @@ class SIRIUS_EXPORT Context {
   /**
    * @brief Create an initialized engine from a validated configuration.
    * @param config Requested engine settings; hardware limits are checked here.
-   * @return An owned context, or an Error with code ErrorCode::context_initialization.
-   * @throws std::bad_alloc for allocation failures other than RMM allocation errors.
-   * RMM allocation errors are returned as Error. Other allocators may throw
-   * std::bad_alloc without identifying whether host or device memory was exhausted.
+   * @return An owned context, or an Error with code ErrorCode::context_initialization
+   *         or ErrorCode::allocation_failure. Allocation failures have an empty message.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -68,7 +66,7 @@ class SIRIUS_EXPORT Context {
    * @endcode
    */
   [[nodiscard]] static std::expected<std::unique_ptr<Context>, Error> create(
-    const ContextConfig& config);
+    const ContextConfig& config) noexcept;
 
   /// Release the engine and its resources without throwing.
   /// An unrecoverable failure to stop workers or destroy resources terminates the process.

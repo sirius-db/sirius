@@ -16,8 +16,8 @@ struct Context::Impl {
 Context::Context(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 Context::~Context() noexcept = default;
 
-std::expected<std::unique_ptr<Context>, Error> Context::create(const ContextConfig& config)
-{
+std::expected<std::unique_ptr<Context>, Error> Context::create(const ContextConfig& config) noexcept
+try {
   try {
     auto impl = std::make_unique<Impl>(config.impl_->config);
     return std::unique_ptr<Context>(new Context(std::move(impl)));
@@ -29,6 +29,9 @@ std::expected<std::unique_ptr<Context>, Error> Context::create(const ContextConf
     return std::unexpected(
       Error{ErrorCode::context_initialization, "Unknown failure while initializing Sirius"});
   }
+} catch (const std::bad_alloc&) {
+  // Also covers allocation while constructing another error's diagnostic.
+  return std::unexpected(Error{ErrorCode::allocation_failure, {}});
 }
 
 }  // namespace sirius

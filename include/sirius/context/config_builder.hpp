@@ -44,7 +44,8 @@ namespace sirius {
  * from_yaml() and build() validate settings without hardware access. They can be
  * used on machines without GPUs. GPU availability and capacity are checked during
  * context creation. Ordinary configuration failures are returned as Error values;
- * allocation failures may throw std::bad_alloc.
+ * allocation failures in from_yaml() and build() return ErrorCode::allocation_failure.
+ * Constructing a default builder may throw std::bad_alloc.
  *
  * Create a configuration from defaults:
  * @code{.cpp}
@@ -149,8 +150,8 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * @param path Configuration file to read; relative paths use the working directory.
    * @return A builder on success, otherwise an Error with code
    *         ErrorCode::configuration_io, ErrorCode::malformed_yaml,
-   *         or ErrorCode::invalid_configuration.
-   * @throws std::bad_alloc if allocation fails.
+   *         ErrorCode::invalid_configuration, or ErrorCode::allocation_failure.
+   *         Allocation failures have an empty message.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -175,8 +176,8 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * The source file is never reread, and hardware is never queried. This operation
    * leaves the builder unchanged.
    *
-   * @return A valid ContextConfig. Settings are validated when loaded.
-   * @throws std::bad_alloc if allocation fails.
+   * @return A valid ContextConfig, or ErrorCode::allocation_failure with an empty message.
+   *         Settings are validated when loaded.
    *
    * @code{.cpp}
    * #include <sirius/context/config_builder.hpp>
@@ -188,7 +189,7 @@ class SIRIUS_EXPORT ContextConfigBuilder {
    * }
    * @endcode
    */
-  [[nodiscard]] std::expected<ContextConfig, Error> build() const;
+  [[nodiscard]] std::expected<ContextConfig, Error> build() const noexcept;
 
  private:
   struct Impl;

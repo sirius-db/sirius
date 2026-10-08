@@ -31,6 +31,8 @@ enum class ErrorCode {
   invalid_configuration,
   /// Hardware resolution or engine initialization failed.
   context_initialization,
+  /// An allocation failed. The diagnostic message is empty.
+  allocation_failure,
 };
 
 /// @brief A failure returned through std::expected by the public API.
@@ -43,7 +45,9 @@ enum class ErrorCode {
 /// auto config = sirius::ContextConfigBuilder::from_yaml("sirius.yaml");
 /// if (!config) {
 ///   const sirius::Error& error = config.error();
-///   if (error.code == sirius::ErrorCode::invalid_configuration) {
+///   if (error.code == sirius::ErrorCode::allocation_failure) {
+///     std::cerr << "Unable to allocate memory\n";
+///   } else {
 ///     std::cerr << error.message << '\n';
 ///   }
 /// }
@@ -52,6 +56,7 @@ struct Error {
   /// Category for programmatic error handling.
   ErrorCode code;
   /// Human-readable diagnostic, including file or setting context when available.
+  /// Empty for allocation_failure so reporting it requires no message allocation.
   /// Its wording is not a stable interface and should not be parsed.
   std::string message;
 };

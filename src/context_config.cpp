@@ -45,37 +45,46 @@ ContextConfigBuilder::~ContextConfigBuilder() noexcept = default;
 
 std::expected<ContextConfigBuilder, Error> ContextConfigBuilder::from_yaml(
   const std::filesystem::path& path)
-{
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    return std::unexpected(
-      Error{ErrorCode::configuration_io, "Cannot open configuration file: " + path.string()});
-  }
-  std::string contents;
-  char buffer[8192];
-  while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
-    contents.append(buffer, static_cast<std::size_t>(file.gcount()));
-  }
-  if (!file.eof()) {
-    return std::unexpected(
-      Error{ErrorCode::configuration_io, "Cannot read configuration file: " + path.string()});
-  }
-
-  auto impl = std::make_shared<Impl>();
+try {
   try {
+    std::ifstream file;
+    // Rethrow allocation failures from stream operations instead of masking them as badbit.
+    file.exceptions(std::ios::badbit);
+    file.open(path, std::ios::binary);
+    if (!file) {
+      return std::unexpected(
+        Error{ErrorCode::configuration_io, "Cannot open configuration file: " + path.string()});
+    }
+    std::string contents;
+    char buffer[8192];
+    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+      contents.append(buffer, static_cast<std::size_t>(file.gcount()));
+    }
+    if (!file.eof()) {
+      return std::unexpected(
+        Error{ErrorCode::configuration_io, "Cannot read configuration file: " + path.string()});
+    }
+
+    auto impl    = std::make_shared<Impl>();
     auto root    = YAML::Load(contents);
     impl->config = parsed_sirius_config::from_node(root, path);
+    return ContextConfigBuilder(std::move(impl));
+  } catch (const std::ios_base::failure& e) {
+    return std::unexpected(Error{ErrorCode::configuration_io, path.string() + ": " + e.what()});
   } catch (const YAML::Exception& e) {
     return std::unexpected(Error{ErrorCode::malformed_yaml, path.string() + ": " + e.what()});
   } catch (const configuration_input_error& e) {
     return std::unexpected(Error{ErrorCode::invalid_configuration, e.what()});
   }
-  return ContextConfigBuilder(std::move(impl));
+} catch (const std::bad_alloc&) {
+  return std::unexpected(Error{ErrorCode::allocation_failure, {}});
 }
 
-std::expected<ContextConfig, Error> ContextConfigBuilder::build() const
-{
+std::expected<ContextConfig, Error> ContextConfigBuilder::build() const noexcept
+try {
   return ContextConfig(std::make_shared<ContextConfig::Impl>(ContextConfig::Impl{impl_->config}));
+} catch (const std::bad_alloc&) {
+  return std::unexpected(Error{ErrorCode::allocation_failure, {}});
 }
 
 }  // namespace sirius
