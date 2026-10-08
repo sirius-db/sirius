@@ -234,6 +234,13 @@ std::optional<pre_decline> iceberg_gpu_scan_decline_reason(
     return iceberg_decline(scan_reason::iceberg_field_id_gap, std::move(*reason));
   }
 
+  if (!iceberg_table_schema_has_field_ids(op.bind_data.get())) {
+    return iceberg_decline(
+      scan_reason::iceberg_table_schema_no_field_ids,
+      "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
+      "field IDs to prove per-file schema correspondence");
+  }
+
   std::optional<int64_t> snapshot_id;
   // Inspect the same snapshot the scan will read.
   auto sid_it = op.named_parameters.find("snapshot_from_id");

@@ -245,7 +245,7 @@ struct duckdb_native_row_group_range {
   /// `row_groups` is then partial and must not be consumed.
   bool viable = true;
   std::string viability_failure_reason;
-  verdict_reason failure_reason = verdict_reason::native_segment_codec;
+  verdict_reason failure_reason = verdict_reason::native_unknown;
 };
 duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   const duckdb_native_walk_plan& plan, std::size_t rg_begin, std::size_t rg_end);

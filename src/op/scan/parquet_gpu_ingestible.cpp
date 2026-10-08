@@ -23,6 +23,7 @@
 #include <expression_evaluator/gpu_expression_translator_internal.hpp>
 #include <helper/type_conversions.hpp>
 #include <io/io_context.hpp>
+#include <io/io_errors.hpp>
 #include <io/parquet_helpers.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
@@ -50,6 +51,7 @@
 #include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/version_config.hpp>
@@ -63,6 +65,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // duckdb
+#include <duckdb/common/exception.hpp>
 #include <duckdb/common/hive_partitioning.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression/bound_operator_expression.hpp>
@@ -84,6 +87,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -894,9 +898,22 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
       throw;
     } catch (transparent::classified_execution_error const&) {
       throw;
-    } catch (std::exception const& error) {
+    } catch (duckdb::IOException const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
                                                     error.what());
+    } catch (io::credential_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (std::system_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (cudf::logic_error const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    } catch (duckdb::InterruptException const&) {
+      throw;
+    } catch (std::bad_alloc const&) {
+      throw;
     }
   };
 }
@@ -961,6 +978,18 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   } catch (unsupported_physical_input const& error) {
     if (_info->profiles->counters && !_info->physical_schema)
       _info->profiles->counters->record(error.reason);
+    throw;
+  } catch (duckdb::IOException const&) {
+    throw;
+  } catch (io::credential_error const&) {
+    throw;
+  } catch (std::system_error const&) {
+    throw;
+  } catch (duckdb::InterruptException const&) {
+    throw;
+  } catch (std::bad_alloc const&) {
+    throw;
+  } catch (std::logic_error const&) {
     throw;
   } catch (std::exception const& error) {
     if (_info->physical_schema && !_info->physical_schema->fields.empty()) {

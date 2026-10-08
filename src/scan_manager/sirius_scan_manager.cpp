@@ -1411,31 +1411,12 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
                              uri);
   }
 
-  // Reuse a previously parsed footer when present — a prior bind or scan of the
-  // same object generation parks it in the ioctx metadata store, which lives
-  // for the ioctx's lifetime. On a miss, fetch + Thrift-parse the footer and
-  // park it so the subsequent scan can reuse it. Mirrors
-  // parquet_gpu_ingestible::build_file_scan_info.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  if (auto cached = datasource->metadata()) {
-    if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
-      file_metadata = pm->file_metadata();
-    }
-  }
-  if (!file_metadata) {
-    auto footer_buffer = op::scan::fetch_plaintext_parquet_footer(*datasource, 0, uri);
-    auto encryption =
-      op::scan::inspect_parquet_encryption({footer_buffer->data(), footer_buffer->size()});
-    auto const footer_byte_len = footer_buffer->size();
-    auto reader_options        = cudf::io::parquet_reader_options::builder().build();
-    cudf::io::parquet::experimental::hybrid_scan_reader reader{
-      cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-      reader_options};
-    file_metadata =
-      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-    [[maybe_unused]] auto const stored = datasource->store_metadata(
-      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len, encryption));
-  }
+  // Resolve through the shared path so describe_parquet publishes the same
+  // complete footer evidence as scans and pinned parquet tables, including the
+  // raw schema and logical annotations normalized away by cuDF.
+  auto const reader_options = cudf::io::parquet_reader_options::builder().build();
+  auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, uri, reader_options);
+  auto const file_metadata = metadata->file_metadata();
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
@@ -3194,26 +3175,11 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
       throw std::runtime_error("[pin_table] no backend supports parquet path: " + path);
     }
 
-    // Same footer resolution as describe_parquet / build_file_scan_info, so a
-    // footer already parsed for this generation is reused however it was first touched.
-    std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-    if (auto cached_md = datasource->metadata()) {
-      if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached_md))) {
-        file_metadata = pm->file_metadata();
-      }
-    }
-    if (!file_metadata) {
-      auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
-      auto const footer_byte_len = footer_buffer->size();
-      auto probe_options         = cudf::io::parquet_reader_options::builder().build();
-      cudf::io::parquet::experimental::hybrid_scan_reader reader{
-        cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-        probe_options};
-      file_metadata =
-        std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-      std::ignore = datasource->store_metadata(
-        std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
-    }
+    // Use the shared resolver so a pin publishes complete footer evidence and
+    // later scans reuse the exact same metadata record.
+    auto const probe_options = cudf::io::parquet_reader_options::builder().build();
+    auto const metadata = op::scan::resolve_parquet_metadata(*datasource, 0, path, probe_options);
+    auto const file_metadata = metadata->file_metadata();
 
     if (file_metadata->row_groups.empty()) { continue; }
     std::vector<cudf::size_type> row_groups(file_metadata->row_groups.size());

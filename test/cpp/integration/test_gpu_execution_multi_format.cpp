@@ -3132,7 +3132,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "[integration][iceberg][verdict]")
 {
   REQUIRE_FALSE(con->Query("SET gpu_execution=false")->HasError());
-  auto which   = GENERATE(1, 2, 3, 4, 5, 6, 7, 8, 9);
+  auto which   = GENERATE(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
   auto logical = con->ExtractPlan("SELECT fruit, count FROM " + pinned_scan(v1_path));
   auto* node   = logical.get();
   while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET)
@@ -3178,6 +3178,21 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
       expected                                 = reason::iceberg_snapshot_id_not_integer;
       break;
     case 9: expected = reason::interface_unavailable; break;
+    case 10: {
+      auto& bind    = get.bind_data->Cast<duckdb::MultiFileBindData>();
+      auto& columns = bind.reader_bind.schema.empty() ? bind.columns : bind.reader_bind.schema;
+      REQUIRE_FALSE(columns.empty());
+      std::function<void(std::vector<duckdb::MultiFileColumnDefinition>&)> clear_ids =
+        [&](auto& fields) {
+          for (auto& field : fields) {
+            field.identifier = duckdb::Value();
+            clear_ids(field.children);
+          }
+        };
+      clear_ids(columns);
+      expected = reason::iceberg_table_schema_no_field_ids;
+      break;
+    }
   }
   auto before = sirius::test::get_transparent_execution_stats(*con);
   sirius::planner::scan_contract_provenance provenance;
@@ -3197,7 +3212,8 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                                        "without 'snapshot_from_id'",
                                        "gap in its Iceberg field ids",
                                        "snapshot_from_id is not an integer",
-                                       "could not acquire the Sirius context"};
+                                       "could not acquire the Sirius context",
+                                       "table schema has no complete field-id mapping"};
   CHECK(result.decline->text.find(texts.at(which - 1)) != std::string::npos);
   CHECK(result.decline->verdict == (which == 9
                                       ? sirius::op::scan::eligibility_verdict::incomplete

@@ -320,7 +320,9 @@ std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_t
 {
   auto info = std::make_unique<sirius::op::scan::iceberg_ingestible_table_info>();
   populate_parquet_table_info(*info, scan_op, op_params);
-  if (auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get())) {
+  if (iceberg_table_schema_has_field_ids(scan_op.bind_data.get())) {
+    auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(scan_op.bind_data.get());
+    D_ASSERT(bind != nullptr);
     sirius::op::scan::iceberg_table_schema schema;
     collect_iceberg_schema(
       bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema, schema);
@@ -1742,7 +1744,6 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
       ? sirius_ctx->get_config().get_operator_params()
       : sirius::operator_params::with_batch_size(sirius::config::derived_default_batch_size());
 
-  if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
   std::unordered_map<op::sirius_physical_operator*, plan_lineage> lineage_aliases;
   auto lineage_started = std::chrono::steady_clock::now();
   collect_semantic_lineage(

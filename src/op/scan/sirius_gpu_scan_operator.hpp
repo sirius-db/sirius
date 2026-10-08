@@ -188,7 +188,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   {
     return _compressed_materialization_observer;
   }
-  void validate_input(scan_operator_input const& input) const;
+  // @p admit_resident performs the full resident witness check. The dequeue boundary uses it
+  // before prepare_for_processing; execute only rechecks the query/contract freshness because the
+  // immutable resident witness was already admitted for this input.
+  void validate_input(scan_operator_input const& input, bool admit_resident) const;
 
   scan_manager::split_connector& get_split_connector();
 

@@ -134,6 +134,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   inspect("SELECT a FROM r2a_lineage ORDER BY b", true);
   inspect("SELECT a FROM r2a_lineage LIMIT 1", false);
   inspect("SELECT a FROM r2a_lineage UNION ALL SELECT b FROM r2a_lineage", false);
+  // A UNION common-type cast is evaluated in the branch projection, so its source input must be
+  // semantic before the batch reaches the UNION forwarder.
+  inspect("SELECT a FROM r2a_lineage UNION ALL SELECT CAST(b AS BIGINT) FROM r2a_lineage", true);
   inspect(
     "SELECT a FROM r2a_lineage UNION ALL SELECT b FROM r2a_lineage UNION ALL SELECT c FROM "
     "r2a_lineage",

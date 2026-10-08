@@ -425,7 +425,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
-    if (scan_input->is_resident()) validate_input(*scan_input);
+    if (scan_input->is_resident()) validate_input(*scan_input, true);
     // Share the operator's "compaction is unprofitable" latch with the split
     // BEFORE any reservation estimate runs: one such batch decides the whole
     // scan (uniform per-batch selectivity), and both the working-set estimator
@@ -444,7 +444,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
 //===----------------------------------------------------------------------===//
 gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_ingestible; }
 
-void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input) const
+void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input,
+                                              bool admit_resident) const
 {
   if (!_contract_id) return;  // standalone unbound operator fixtures
   try {
@@ -470,7 +471,11 @@ void sirius_gpu_scan_operator::validate_input(scan_operator_input const& input) 
           (!input.resident_validation->iteration.applies ||
            !input.resident_validation->visibility.applies))
         throw certificate_incomplete(_contract_id, {}, "resident native applicability missing");
-      admit_resident_batch(_contract_id, *input.resident_validation, _query_token);
+      if (admit_resident) {
+        admit_resident_batch(_contract_id, *input.resident_validation, _query_token);
+      } else if (input.resident_validation->query_token != _query_token) {
+        throw certificate_incomplete(_contract_id, {}, "resident query token mismatch");
+      }
     } else {
       throw certificate_incomplete(_contract_id, {}, "scan payload missing");
     }
@@ -510,7 +515,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
       std::string(typeid(input_data).name()));
   }
-  validate_input(*scan_input);
+  validate_input(*scan_input, false);
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   auto const has_explicit_physical_schema      = has_physical_overrides();

@@ -63,6 +63,18 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
+bool collect_iceberg_field_ids(std::vector<duckdb::MultiFileColumnDefinition> const& columns)
+{
+  if (columns.empty()) return false;
+  for (auto const& column : columns) {
+    if (column.identifier.IsNull() ||
+        column.identifier.type().id() != duckdb::LogicalTypeId::INTEGER)
+      return false;
+    if (!column.children.empty() && !collect_iceberg_field_ids(column.children)) return false;
+  }
+  return true;
+}
+
 op::scan::certification_result supported_parquet(op::scan::bound_table_scan const&,
                                                  op::sirius_physical_table_scan const&,
                                                  duckdb::ClientContext&,
@@ -81,6 +93,15 @@ op::scan::certification_result supported_iceberg(op::scan::bound_table_scan cons
                                                  scan_contract_provenance& provenance)
 {
   auto result = supported_parquet(contract, scan, context, provenance);
+  if (!iceberg_table_schema_has_field_ids(scan.bind_data.get())) {
+    result.verdict = op::scan::eligibility_verdict::unsupported;
+    result.reason  = op::scan::verdict_reason::iceberg_table_schema_no_field_ids;
+    result.reason_text =
+      "iceberg_scan table schema has no complete field-id mapping; the GPU path requires "
+      "field IDs to prove per-file schema correspondence";
+    result.later_checks = {};
+    return result;
+  }
   result.later_checks |= op::scan::check_bit(op::scan::later_check::schema_per_file);
   return result;
 }
@@ -499,6 +520,14 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 }  // namespace
 
 std::span<connector const> registered_connectors() { return entries; }
+
+bool iceberg_table_schema_has_field_ids(duckdb::FunctionData const* bind_data)
+{
+  auto const* bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
+  if (bind == nullptr) return false;
+  auto const& columns = bind->reader_bind.schema.empty() ? bind->columns : bind->reader_bind.schema;
+  return collect_iceberg_field_ids(columns);
+}
 
 void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
 {

@@ -215,6 +215,7 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
       auto& segment          = node.GetNode();
       auto const compression = segment.GetCompressionFunction().type;
       if (!is_supported_data_compression(compression)) {
+        reason_out = verdict_reason::native_segment_codec;
         return std::string(label) + " segment on column " + std::to_string(column_id) +
                " row group " + std::to_string(rg_idx) + ": unsupported compression " +
                duckdb::CompressionTypeToString(compression);
@@ -247,6 +248,7 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
   col_md.is_array = true;
   auto* array_col = dynamic_cast<duckdb::ArrayColumnData*>(&col_data);
   if (!array_col) {
+    reason_out = verdict_reason::native_unknown;
     return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
            ": expected ArrayColumnData but got " + col_data.GetType().ToString();
   }
@@ -254,6 +256,7 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
   // Array-level validity to data_segments
   auto* array_validity = array_column_access::get_validity(*array_col);
   if (!array_validity) {
+    reason_out = verdict_reason::native_unknown;
     return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
            ": no array validity column";
   }
@@ -266,11 +269,13 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
   // storage is StandardColumnData.
   auto* child = array_column_access::get_child(*array_col);
   if (!child) {
+    reason_out = verdict_reason::native_unknown;
     return "ARRAY column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
            ": no child column found";
   }
   auto* child_std = dynamic_cast<duckdb::StandardColumnData*>(child);
   if (!child_std) {
+    reason_out = verdict_reason::native_unknown;
     return "ARRAY child on column " + std::to_string(column_id) + " row group " +
            std::to_string(rg_idx) + ": child storage is not StandardColumnData";
   }
@@ -297,6 +302,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
 {
   auto* std_col = dynamic_cast<duckdb::StandardColumnData*>(&col_data);
   if (!std_col) {
+    reason_out = verdict_reason::native_unknown;
     return "column " + std::to_string(column_id) + " row group " + std::to_string(rg_idx) +
            ": column storage for type " + col_data.GetType().ToString() +
            " is not StandardColumnData (nested/unsupported)";
@@ -307,6 +313,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
     auto& segment          = node.GetNode();
     auto const compression = segment.GetCompressionFunction().type;
     if (!is_supported_data_compression(compression)) {
+      reason_out = verdict_reason::native_segment_codec;
       return "data segment on column " + std::to_string(column_id) + " row group " +
              std::to_string(rg_idx) + ": unsupported compression " +
              duckdb::CompressionTypeToString(compression);
@@ -315,6 +322,7 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
     if (is_varchar) {
       // The varchar decoder cannot read CONSTANT-compressed segments.
       if (compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        reason_out = verdict_reason::native_segment_codec;
         return "varchar segment on column " + std::to_string(column_id) + " row group " +
                std::to_string(rg_idx) + ": CONSTANT compression is unsupported for varchar";
       }

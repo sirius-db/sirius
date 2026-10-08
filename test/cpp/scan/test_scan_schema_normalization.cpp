@@ -276,6 +276,22 @@ TEST_CASE("scan execute rejects a materialized column count its output types do 
                       Catch::Matchers::ContainsSubstring("output schema width mismatch"));
 }
 
+TEST_CASE("scan execute rechecks resident query freshness",
+          "[scan_normalization][gpu_scan][certificate]")
+{
+  auto& e    = env();
+  auto batch = make_resident_batch(e, kRows);
+  auto scan  = make_bigint_scan(
+    std::make_shared<stub_ingestible>([] { return std::make_unique<cudf::table>(); }));
+  auto input              = std::make_unique<sirius::op::scan::scan_operator_input>(batch);
+  input->gpu_memory_space = e.gpu_space;
+  admit_fixture_resident_input(*input);
+  input->resident_validation->query_token = 17;
+  scan.set_query_validation(18, {});
+
+  REQUIRE_THROWS_AS(scan.execute(*input, e.stream()), sirius::op::scan::certificate_incomplete);
+}
+
 TEST_CASE("scan execute rejects a native carrier no restoring cast can reach its output type",
           "[scan_normalization][gpu_scan]")
 {
