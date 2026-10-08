@@ -21,7 +21,7 @@
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
-TEST_CASE("Preparation options have finite defaults and preserve explicit internal overrides",
+TEST_CASE("Preparation options have finite defaults and preserve post-resolution overrides",
           "[scan_preparation][preparation_config]")
 {
   sirius::scan_manager::scan_manager_config config;
@@ -41,17 +41,18 @@ TEST_CASE("Preparation options have finite defaults and preserve explicit intern
   config.preparation.max_control_work            = 4;
   config.preparation.drain_quantum               = 5;
   config.preparation.underfilled_batch_residence = std::chrono::milliseconds(11);
-  sirius::sirius_config engine;
-  engine.set_scan_manager_config(config);
-  // Exercise the real defaults path with deterministic capacities, without creating memory spaces.
-  auto& topology = const_cast<cucascade::memory::system_topology_info&>(engine.get_hw_topology());
-  topology       = {};
+  // Resolve defaults against deterministic capacities before applying internal overrides.
+  // apply_defaults() replaces all settings and discovers the machine's actual topology.
+  cucascade::memory::system_topology_info topology{};
   topology.num_gpus       = 1;
   topology.num_numa_nodes = 1;
   topology.gpus           = {{.id = 0, .numa_node = 0}};
   topology.numa_nodes     = {{.id = 0, .memory_capacity = 1ULL << 30, .has_cpus = true}};
-  engine.apply_defaults();  // default derivation must preserve explicit preparation values
-  auto snapshot = engine.get_scan_manager_config().preparation.resolve(3);
+  auto engine             = sirius::parsed_sirius_config{}.resolve(topology);
+  engine.set_scan_manager_config(config);
+  auto const& resolved = engine.get_scan_manager_config();
+  REQUIRE(resolved.thread_pool.num_threads == 3);
+  auto snapshot = resolved.preparation.resolve(resolved.thread_pool.num_threads);
   CHECK(snapshot.max_inflight_jobs == 2);
   CHECK(snapshot.max_active_units == 7);
   CHECK(snapshot.max_pending_results == 9);

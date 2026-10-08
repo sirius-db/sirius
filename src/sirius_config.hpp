@@ -315,6 +315,8 @@ struct sirius_config {
   // Explicit hardware-resolving helpers for internal configuration consumers.
   // Runtime startup takes parsed_sirius_config instead.
   void load_from_file(const std::filesystem::path& config_path);
+  /// Replace all settings with hardware-resolved defaults. Apply programmatic
+  /// overrides afterwards; use parsed_sirius_config::resolve for a supplied topology.
   void apply_defaults();
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
