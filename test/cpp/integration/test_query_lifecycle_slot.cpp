@@ -2323,7 +2323,9 @@ void run_concurrent_admission(std::string const& variant,
       if (error.find("isolated failure") == std::string::npos)
         out.error = "expected query-local injected failure: " + error;
     } else if (!error.empty() &&
-               !(memory_timeout && error.find("reservation made no progress") != std::string::npos))
+               !(memory_timeout &&
+                 error.find("GPU reservation exhausted its memory-wait retry budget") !=
+                   std::string::npos))
       out.error = error;
   }
   if (mvcc) { run_statement(*connections[0], "COMMIT", "close old snapshot", out.error); }
