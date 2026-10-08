@@ -161,9 +161,6 @@ PhysicalSiriusExecution& PhysicalSiriusExecution::make_cpu_only(
   return root;
 }
 
-// The CPU-only root: no GPU attempt is made; the admission is re-decided on
-// every execution so a prepared statement follows the settings and runtime
-// health current at Execute, not at Prepare.
 void PhysicalSiriusExecution::execute_cpu_only(duckdb::ExecutionContext& context,
                                                SiriusGlobalSourceState& state) const
 {
@@ -484,8 +481,6 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         gpu_error.Throw();
       }
 
-      // One decision for this execution: it governs both source checks below and
-      // the sirius_httpfs gates the replay reaches through CpuFallbackGuard.
       cpu_replay_decision const decision{duckdb::s3_cpu_fallback_enabled(context.client)};
       try {
         require_s3_cpu_replay(source_policy_, decision, query_sql_, gpu_msg);
@@ -549,9 +544,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         gpu_msg);
       if (state.sirius_context) { state.sirius_context->record_transparent_runtime_fallback(); }
 
-      // CpuFallbackGuard marks the replay and carries its decision to the
-      // sirius_httpfs gates, which otherwise refuse s3:// reached indirectly
-      // (e.g. through a view). Binds to the TARGET executing connection's state.
+      // Binds to the TARGET executing connection's state.
       duckdb::SiriusContext::CpuFallbackGuard fallback_guard(context.client, decision);
       state.result =
         run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);

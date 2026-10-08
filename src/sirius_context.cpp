@@ -317,10 +317,11 @@ std::size_t skip_spaces(std::string const& sql, std::size_t i) noexcept
   return i;
 }
 
-/// True when the argument list starting at @p i (just past the function name)
-/// is exactly one plain string literal: `( '…' )`.  Anything else — a
-/// concatenation, a function call, a parameter — assembles the SQL at bind
-/// time, where no lexical rule can see it.
+/// True when the argument list starting at @p i (just past the matched word)
+/// is exactly one plain string literal: `( '…' )`.  Only that shape exposes
+/// the carried SQL to the lexical rule; every other shape (a concatenation, a
+/// function call, a parameter, a comment, or no call at all) is conservatively
+/// redacted.
 bool single_literal_argument(std::string const& sql, std::size_t i) noexcept
 {
   i = skip_spaces(sql, i);
@@ -340,8 +341,8 @@ bool single_literal_argument(std::string const& sql, std::size_t i) noexcept
   return i < sql.size() && sql[i] == ')';
 }
 
-/// A statement whose text must not reach the log: it mentions SECRET, or it
-/// hands SQL to gpu_execution() in a form other than one plain literal.
+/// A statement whose text must not reach the log: it mentions SECRET, or a
+/// gpu_execution token is followed by anything but one plain string literal.
 bool carries_credentials(std::string const& sql) noexcept
 {
   if (find_word(sql, "secret", 0) != std::string::npos) { return true; }
@@ -383,9 +384,8 @@ void SiriusContext::QueryBegin(ClientContext& context)
     if (carries_credentials(query)) {
       normalized_query = "<credential statement redacted>";
     } else {
-      // Collapse every run of whitespace (incl. newlines/tabs) to a single space,
-      // trim leading/trailing whitespace, and log the full normalized query so
-      // log_analysis tools can correlate by SQL text without truncation.
+      // Whitespace-normalized and untruncated so log_analysis tools can
+      // correlate by SQL text.
       normalized_query.reserve(query.size());
       bool in_ws = true;  // skip leading whitespace
       for (char c : query) {
@@ -1707,8 +1707,8 @@ namespace {
 }
 
 // A declined GPU plan over Sirius-owned S3 keeps its retained CPU plan behind a
-// root that re-decides the S3 admission on every execution (see
-// PhysicalSiriusExecution::make_cpu_only); other declines keep the bare plan.
+// root that re-decides the S3 admission on every execution; other declines keep
+// the bare plan.
 void install_cpu_only_root_if_s3(ClientContext& context,
                                  PreparedStatementData& prepared,
                                  sirius::transparent::plan_source_policy const& source_policy,

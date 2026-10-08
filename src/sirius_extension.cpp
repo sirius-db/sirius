@@ -241,11 +241,8 @@ cpu_replay_result run_internal_cpu_fallback_query(
   duckdb::SiriusContext* test_context               = nullptr,
   sirius::transparent::cpu_replay_decision decision = {})
 {
-  // Without the sirius_s3_cpu_fallback admission, Sirius reads s3:// only on
-  // the GPU path and a query that reads s3:// cannot fall back to CPU: surface
-  // a clear error (with the underlying GPU cause) instead of replaying a query
-  // that would fail anyway. Local / non-s3 queries are unaffected and fall
-  // through to the normal DuckDB CPU replay below.
+  // Literal s3:// in the replay text is refused up front; the validator below
+  // covers sources the text cannot show.
   if (!decision.s3_allowed && sirius::references_sirius_owned_s3_parquet(query)) {
     throw std::runtime_error(
       "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, and "
@@ -253,13 +250,9 @@ cpu_replay_result run_internal_cpu_fallback_query(
       gpu_error);
   }
 
-  // CpuFallbackGuard marks this replay and carries the outer decision, so the
-  // sirius_httpfs gates serve s3:// reached indirectly (e.g. through a view)
-  // only when it allows — the string-level references_sirius_owned_s3_parquet
-  // check above only catches a literal read_parquet('s3://') in the query
-  // text. Both guards bind to the TARGET executing connection (the replay runs
-  // on `connection`, not on the context that issued the original query) and
-  // are no-ops when Sirius has no per-connection state there.
+  // Both guards bind to the TARGET executing connection (the replay runs on
+  // `connection`, not on the context that issued the original query) and are
+  // no-ops when Sirius has no per-connection state there.
   duckdb::SiriusContext::InternalQueryGuard guard(*connection.context);
   duckdb::SiriusContext::CpuFallbackGuard cpu_fallback_guard(*connection.context, decision);
   auto& states                 = *connection.context->registered_state;
@@ -645,10 +638,6 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       // once the decision admits S3 — for S3 bound behind a view; with the
       // switch off the view case keeps the bound-source veto text below.
       if (gpu_error.Type() == ExceptionType::INTERRUPT) { gpu_error.Throw(); }
-      // One decision for this execution: it governs the bound-source checks
-      // here, the SQL-text check in the helper, and the replay connection's
-      // gates. S3 hidden behind a view is only consulted when the decision
-      // admits it; otherwise the bound-source veto below keeps refusing it.
       sirius::transparent::cpu_replay_decision const decision{s3_cpu_fallback_enabled(context)};
       if (runtime_unavailable_error &&
           (sirius::references_sirius_owned_s3_parquet(data.cpu_fallback_query) ||

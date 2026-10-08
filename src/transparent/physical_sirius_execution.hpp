@@ -33,6 +33,8 @@ class PreparedStatementData;
 
 namespace sirius::transparent {
 
+struct SiriusGlobalSourceState;
+
 /// \brief A DuckDB PhysicalOperator that transparently wraps Sirius GPU execution.
 ///
 /// This operator replaces DuckDB's normal physical plan when transparent GPU execution is
@@ -42,8 +44,6 @@ namespace sirius::transparent {
 /// Created by SiriusContext::OnFinalizePrepare when the query is GPU-acceleratable, and —
 /// through make_cpu_only — when GPU planning declined a plan that reads Sirius-owned S3 and
 /// the retained CPU plan may run under the S3 CPU-fallback admission.
-struct SiriusGlobalSourceState;
-
 class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
  public:
   static constexpr const duckdb::PhysicalOperatorType TYPE =

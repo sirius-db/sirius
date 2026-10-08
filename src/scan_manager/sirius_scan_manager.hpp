@@ -895,10 +895,11 @@ class sirius_scan_manager {
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
 
   /// Resolve the ioctx that should serve @p path (normalized internally, so callers
-  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
-  /// building it once per backend on first use.  Routes by path through the registry
-  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
+  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI).  Routes
+  /// by path through the registry per the configured backend (`s3://` data reads go
+  /// to REST, or to kvikIO when `backend: kvikio`); contexts are built on first use
+  /// and cached per (backend, credential snapshot).  Returns nullptr when no backend
+  /// supports the path.
   std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
 
   /// The second half of create_datasource: open @p path on an ioctx the caller

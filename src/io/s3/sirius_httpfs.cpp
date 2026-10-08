@@ -76,12 +76,10 @@ sirius_httpfs_file_handle& as_httpfs_handle(duckdb::FileHandle& handle)
   return static_cast<sirius_httpfs_file_handle&>(handle);
 }
 
-/// What the gate decided for one s3:// access.
 struct gated_access {
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;
   /// A CPU consumer: gpu_execution is off, or this connection is executing a
-  /// CPU replay.  GPU-path opens (the binder's footer reads for a GPU scan)
-  /// are not CPU accesses.
+  /// CPU replay.  A GPU scan's bind-time footer read is not one.
   bool cpu_path = false;
 };
 
@@ -280,10 +278,6 @@ duckdb::unique_ptr<duckdb::FileHandle> sirius_httpfs::OpenFile(
   auto s3_config = resolve_duckdb_s3_secret(
     *client, path, sirius_ctx->get_config().get_scan_manager_config().object_store);
   sirius_ctx->get_scan_manager().install_s3_config(path, std::move(s3_config));
-  // Resolve through the scan_manager's routed seam: the returned
-  // sirius_datasource performs the HEAD and carries the backend; HEAD failures
-  // (missing key / auth / network) propagate as exceptions for DuckDB to
-  // surface at bind time.
   auto datasource = sirius_ctx->get_scan_manager().open_datasource_on(
     route_for_open(access, path, "reading"), path);
   if (!datasource) {
@@ -386,11 +380,9 @@ duckdb::vector<duckdb::OpenFileInfo> sirius_httpfs::Glob(const std::string& path
     if (CanHandleFile(path)) { result.emplace_back(path); }
     return result;
   }
-  // Wildcard expansion needs the connection's backend (one paginated LIST) and
-  // is gated like OpenFile: expansion is metadata-only, but its file list is
-  // only ever consumed by a scan that would hit the same gate at open, so
-  // failing here gives the clear error at the earliest point.  LIST always
-  // runs on the REST context, so the backend rule does not apply here.
+  // Wildcard expansion is gated like OpenFile so a refused access fails at the
+  // earliest point. LIST always runs on the REST context, so the data-backend
+  // rule does not apply here.
   auto sirius_ctx = resolve_gated_sirius_context(opener, path, "glob-expanding").sirius_ctx;
   auto client     = duckdb::FileOpener::TryGetClientContext(opener);
   if (!client) {
