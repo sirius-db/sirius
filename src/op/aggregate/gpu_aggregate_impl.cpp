@@ -534,8 +534,10 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
   for (std::size_t set_idx = 0; set_idx < grouping_sets.size(); ++set_idx) {
     auto const& set = grouping_sets[set_idx];
     auto& owner     = owned[set_idx];
+    owner.reserve(num_keys + aggregates.size() + 1 + grouping_functions.size());
     std::vector<cudf::column_view> keys(num_keys);
     std::vector<cudf::column_view> values;
+    values.reserve(aggregates.size());
     cudf::size_type num_rows = 0;
 
     if (set.size() == num_keys) {
@@ -549,6 +551,7 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       num_rows = partial.num_rows();
     } else {
       std::vector<cudf::column_view> set_keys;
+      set_keys.reserve(set.empty() ? 1 : set.size());
       std::unique_ptr<cudf::column> constant_key;
       if (set.empty()) {
         constant_key = make_constant_column<int8_t>(0, partial.num_rows(), stream, mr);
@@ -601,7 +604,9 @@ std::unique_ptr<cudf::table> expand_grouping_sets(
       }
     }
 
-    std::vector<cudf::column_view> cols(keys.begin(), keys.end());
+    std::vector<cudf::column_view> cols;
+    cols.reserve(num_keys + 1 + grouping_functions.size() + aggregates.size());
+    cols.assign(keys.begin(), keys.end());
     auto set_id =
       make_constant_column<int32_t>(static_cast<int32_t>(set_idx), num_rows, stream, mr);
     cols.push_back(set_id->view());
