@@ -1,10 +1,11 @@
 #include "codegen/jit/kernel_cache.hpp"
 
-#include <cuda.h>
-#include <cuda_runtime_api.h>
+#include "codegen/jit/jit_epoch.h"
+#include "jit/cache_identity.hpp"
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -12,9 +13,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
+#include <regex>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace codegen::jit {
@@ -61,21 +67,67 @@ const std::string& disk_cache_dir()
   return dir;
 }
 
-// Cubin filename mirrors the in-memory ShapeKey: source+entry digest plus the
-// arch / cuda-runtime / driver the cubin was built against, so a stale
-// toolchain or renderer change never yields a false hit.
-std::string cubin_path_for(const std::string& key_material, int arch_cc)
+namespace fs = std::filesystem;
+
+// Epochs other than the current one are kept while among the most recently
+// used kKeptEpochs, or while used within kEpochGracePeriod: another process
+// from a different build may share the directory.
+constexpr std::size_t kKeptEpochs = 4;
+constexpr auto kEpochGracePeriod  = std::chrono::hours(1);
+
+bool is_epoch_name(const std::string& name)
 {
-  int driver = 0;
-  cuDriverGetVersion(&driver);
-  char suffix[64];
-  std::snprintf(suffix,
-                sizeof(suffix),
-                "_a%d_c%u_d%d.cubin",
-                arch_cc,
-                static_cast<unsigned>(CUDART_VERSION),
-                driver);
-  return disk_cache_dir() + "/" + source_digest(key_material) + suffix;
+  return name.size() == 32 && std::all_of(name.begin(), name.end(), [](char c) {
+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+         });
+}
+
+// <16 hex>_a<arch>_c<cudart>_d<driver>.cubin (+ ".tmp.<pid>"), written by
+// builds before the epoch layout. Never read by this scheme.
+bool is_legacy_cubin_name(const std::string& name)
+{
+  static const std::regex legacy(R"([0-9a-f]{16}_a\d+_c\d+_d\d+\.cubin(\.tmp\.\d+)?)");
+  return std::regex_match(name, legacy);
+}
+
+// Directory holding this build's cubins. Pruning runs once per process, the
+// first time the disk cache is used; failures are ignored.
+const std::string& epoch_dir()
+{
+  static const std::string dir = []() -> std::string {
+    const std::string& root = disk_cache_dir();
+    if (root.empty()) return "";
+    std::string current = root + "/" + kJitEpoch;
+    std::error_code ec;
+    fs::create_directories(current, ec);
+    // Directory mtimes record last use, so the pruning below sees this epoch
+    // as live even when every lookup hits and nothing is written.
+    fs::last_write_time(current, fs::file_time_type::clock::now(), ec);
+
+    std::vector<std::pair<fs::file_time_type, fs::path>> others;
+    for (const auto& entry : fs::directory_iterator(root, ec)) {
+      const std::string name = entry.path().filename().string();
+      if (entry.is_directory(ec) && is_epoch_name(name) && name != kJitEpoch) {
+        others.emplace_back(entry.last_write_time(ec), entry.path());
+      } else if (entry.is_regular_file(ec) && is_legacy_cubin_name(name)) {
+        fs::remove(entry.path(), ec);
+      }
+    }
+    std::sort(others.begin(), others.end(), std::greater<>{});
+    const auto cutoff = fs::file_time_type::clock::now() - kEpochGracePeriod;
+    for (std::size_t i = kKeptEpochs - 1; i < others.size(); ++i) {
+      if (others[i].first < cutoff) fs::remove_all(others[i].second, ec);
+    }
+    return current;
+  }();
+  return dir;
+}
+
+std::string cubin_path_for(const detail::Digest& key)
+{
+  const int nvrtc = nvrtc_version();
+  return epoch_dir() + "/nvrtc-" + std::to_string(nvrtc / 1000) + "." +
+         std::to_string((nvrtc % 1000) / 10) + "/" + detail::hex_digest(key) + ".cubin";
 }
 
 bool read_cubin_file(const std::string& path, std::vector<char>& out)
@@ -115,66 +167,21 @@ void clear_jit_disk_cache()
   const std::string& d = disk_cache_dir();
   if (d.empty()) return;
   std::error_code ec;
-  for (auto const& entry : std::filesystem::directory_iterator(d, ec)) {
-    if (entry.path().extension() == ".cubin") std::filesystem::remove(entry.path(), ec);
+  for (auto const& entry : fs::directory_iterator(d, ec)) {
+    const std::string name = entry.path().filename().string();
+    if (entry.is_directory(ec) && is_epoch_name(name)) {
+      fs::remove_all(entry.path(), ec);
+    } else if (entry.is_regular_file(ec) && is_legacy_cubin_name(name)) {
+      fs::remove(entry.path(), ec);
+    }
   }
 }
 
-namespace {
+static_assert(std::is_same_v<std::array<unsigned char, 16>, detail::Digest>);
 
-constexpr uint64_t kFnvOffsetBasis = 0xcbf29ce484222325ULL;
-constexpr uint64_t kFnvPrime       = 0x100000001b3ULL;
-
-uint64_t fnv1a_64(const void* data, std::size_t len) noexcept
+std::size_t KernelCache::KeyHash::operator()(const Key& key) const noexcept
 {
-  auto p     = static_cast<const unsigned char*>(data);
-  uint64_t h = kFnvOffsetBasis;
-  for (std::size_t i = 0; i < len; ++i) {
-    h ^= p[i];
-    h *= kFnvPrime;
-  }
-  return h;
-}
-
-std::string to_hex16(uint64_t v)
-{
-  char buf[17];
-  std::snprintf(buf, sizeof(buf), "%016lx", static_cast<unsigned long>(v));
-  return std::string(buf, 16);
-}
-
-uint64_t mix(uint64_t a, uint64_t b) noexcept
-{
-  return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
-}
-
-}  // namespace
-
-std::string source_digest(const std::string& rendered_source)
-{
-  return to_hex16(fnv1a_64(rendered_source.data(), rendered_source.size()));
-}
-
-std::size_t ShapeKeyHash::operator()(const ShapeKey& k) const noexcept
-{
-  uint64_t h = fnv1a_64(k.source_hash.data(), k.source_hash.size());
-  h          = mix(h, static_cast<uint64_t>(k.arch_cc));
-  h          = mix(h, static_cast<uint64_t>(k.cuda_runtime));
-  h          = mix(h, static_cast<uint64_t>(k.driver_version));
-  return static_cast<std::size_t>(h);
-}
-
-ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc)
-{
-  int driver_version = 0;
-  cuDriverGetVersion(&driver_version);
-
-  return ShapeKey{
-    source_digest(rendered_source),
-    arch_cc,
-    static_cast<uint32_t>(CUDART_VERSION),
-    static_cast<uint32_t>(driver_version),
-  };
+  return detail::DigestHash{}(key);
 }
 
 KernelCache& KernelCache::instance()
@@ -187,11 +194,9 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
                                                         const std::string& entry_symbol,
                                                         const CompileOptions& opts)
 {
-  std::string key_material = source;
-  key_material += '|';
-  key_material += entry_symbol;
-
-  ShapeKey key = shape_key_from(key_material, opts.arch_cc);
+  const std::vector<std::string> options = nvrtc_options(opts);
+  const std::vector<std::string_view> option_views(options.begin(), options.end());
+  Key key = detail::request_identity({source, entry_symbol, kNvrtcProgramName, option_views});
 
   {
     std::lock_guard<std::mutex> lock(mu_);
@@ -204,10 +209,10 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
   // On-disk cache: a shape another process/run already compiled loads from its
   // cubin (skips nvrtc). A corrupt or toolchain-incompatible file just fails
   // the load and falls through to a fresh compile.
-  const std::string& cdir = disk_cache_dir();
+  const std::string& cdir = epoch_dir();
   std::string path;
   if (!cdir.empty()) {
-    path = cubin_path_for(key_material, opts.arch_cc);
+    path = cubin_path_for(key);
     std::vector<char> bytes;
     if (read_cubin_file(path, bytes)) {
       try {

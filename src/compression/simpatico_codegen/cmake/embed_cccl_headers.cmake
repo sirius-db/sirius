@@ -4,7 +4,6 @@
 # so content edits, additions, removals, and search-root shadowing regenerate
 # it.
 cmake_minimum_required(VERSION 3.24)
-include("${CMAKE_CURRENT_LIST_DIR}/jit_header_manifest.cmake")
 file(STRINGS "${INCLUDE_DIRS_FILE}" include_dirs)
 
 set(names "")
@@ -58,7 +57,6 @@ string(
   "#include \"codegen/jit/cccl_embedded_headers.h\"\nnamespace codegen::jit {\n"
 )
 string(APPEND body "const EmbeddedJitHeader kCcclEmbeddedHeaders[] = {\n")
-set(manifest "simpatico-headers-v2\n")
 foreach(name IN LISTS names)
   foreach(include_dir IN LISTS include_dirs)
     set(header "${include_dir}/${name}")
@@ -67,19 +65,14 @@ foreach(name IN LISTS names)
     endif()
   endforeach()
   list(APPEND dependencies "${header}")
-  jit_read_header("${header}" content)
+  file(READ "${header}" content)
   string(FIND "${content}" ")${D}\"" delimiter_collision)
   if(NOT delimiter_collision EQUAL -1)
     message(FATAL_ERROR "Embedded raw-string delimiter occurs in ${header}")
   endif()
-  jit_manifest_record("${name}" "${content}" record)
-  string(APPEND manifest "${record}")
   string(APPEND body "  {\"${name}\", R\"${D}(${content})${D}\"},\n")
 endforeach()
 string(APPEND body "};\nconst int kCcclEmbeddedHeaderCount = ${count};\n")
-jit_bundle_identity("${manifest}" digest)
-string(APPEND body
-       "const char kCcclEmbeddedHeadersIdentity[] = \"${digest}\";\n")
 string(APPEND body "}  // namespace codegen::jit\n")
 file(WRITE "${OUT}" "${body}")
 

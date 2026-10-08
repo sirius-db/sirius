@@ -12,6 +12,10 @@ namespace codegen::jit::detail {
 // XXH3-128 in canonical (big-endian) byte order, matching xxhsum -H128.
 using Digest = std::array<unsigned char, 16>;
 
+// Everything handed to NVRTC for one compilation that can vary within a build:
+// the rendered source, entry symbol, program name, and the effective options
+// (including -arch). Embedded headers and the renderers themselves are fixed
+// per build and covered by the cache epoch (codegen/jit/jit_epoch.h).
 struct RequestView {
   std::string_view source;
   std::string_view entry;
@@ -19,28 +23,9 @@ struct RequestView {
   std::span<const std::string_view> options;
 };
 
-struct EnvironmentView {
-  std::string_view provider;
-  std::string_view project_headers;
-  std::string_view cccl_headers;
-  std::string_view compiler;
-  uint32_t cuda_runtime;
-  uint32_t driver;
-};
-
 Digest request_identity(const RequestView& request);
-Digest environment_identity(const EnvironmentView& environment);
 Digest content_identity(std::string_view content);
-// Returns false on unreadable/changed files. Used during compiler discovery only.
-bool file_identity(const std::string& path, Digest& result);
 std::string hex_digest(const Digest& digest);
-
-struct CompilationIdentity {
-  Digest environment;
-  Digest request;
-
-  std::string relative_path() const;
-};
 
 struct DigestHash {
   std::size_t operator()(const Digest& digest) const noexcept;

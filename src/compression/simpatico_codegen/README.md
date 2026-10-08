@@ -192,18 +192,22 @@ kernel per compression-tree *shape* — then compiled with NVRTC and cached so a
 is compiled only once. The beam-search explorer alone enumerates hundreds of thousands of
 candidate shapes, so this cache is what makes runtime codegen practical.
 
-There are two levels, both keyed by the same tuple: a 64-bit FNV-1a digest of the rendered
-source (plus the kernel entry symbol), the GPU architecture (`sm_XX`), the CUDA runtime
-version, and the driver version. Header contents are not currently part of the key; after
-changing JIT headers, restart with an empty or disabled disk cache.
+Both levels key on an XXH3-128 digest of the rendered source, entry symbol, and effective
+NVRTC options (including `-arch=sm_XX`). See [CACHE_FORMAT.md](CACHE_FORMAT.md).
 
 1. **In-memory** (per process, thread-safe): `shape → compiled kernel`. A shape compiled
    during `compress` is reused by `decompress` in the same process.
 2. **On-disk** (persistent, shared across processes and runs): each cubin is stored as
-   `<dir>/<digest>_a<arch>_c<cudart>_d<driver>.cubin`, published atomically (write to a
-   pid-unique temp, then `rename`) so concurrent processes never observe a half-written
-   file. On a hit the cubin is loaded directly, skipping NVRTC. A corrupt or
+   `<dir>/<epoch>/nvrtc-<major>.<minor>/<digest>.cubin`. It is published atomically (written
+   to a pid-unique temp file, then `rename`d), so concurrent processes never observe a
+   half-written file. On a hit the cubin is loaded directly, skipping NVRTC. A corrupt or
    toolchain-incompatible file simply fails to load and falls through to a fresh compile.
+
+The **epoch** is a build-time hash of the objects that generate kernels: the renderers, the
+NVRTC driver with its options, and the embedded headers. Changing any of them, or the
+compiler, starts a new epoch, so stale cubins are never read and there is nothing to clear
+or bump by hand. Other code changes keep the epoch, so the cache stays warm. Each process
+prunes epochs that are no longer recently used.
 
 Lookup order per shape: in-memory → on-disk → NVRTC compile (a fresh compile then populates
 both levels).
@@ -227,11 +231,9 @@ packages and source checkouts with separate CUB, Thrust, and libcudacxx include 
 For nonstandard installations, use the usual CMake package discovery settings such as
 `CMAKE_PREFIX_PATH` or `cudf_DIR`.
 
-Each bundle has one XXH3-128 identity over sorted logical names and normalized
-header contents (CRLF/CR become LF). CMake invokes the package-provided `xxhsum -H128`
-at build time; runtime identity code uses xxHash header-only, with no xxHash shared
-library dependency. Pixi supplies `xxhash`; vcpkg supplies the headers and a host
-`xxhash[xxhsum]` tool. Header edits, additions, removals, and renames rebuild the bundle.
+Header edits, additions, removals, and renames rebuild the bundle, which also starts a new
+cache epoch. The cache key uses xxHash header-only (Pixi and vcpkg both supply `xxhash`), with
+no xxHash shared-library dependency.
 
 The embedded libraries are the approved runtime header inventory. No runtime include
 directory override is supported, and source-directory include lookup is disabled.
@@ -246,6 +248,7 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 | --- | --- |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
 | `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` per process at exit. |
+| `SIMPATICO_JIT_CACHE_CLEAR` | Sweep tests only: if set, empties the on-disk cache first, to time cold compiles. Never needed for correctness. |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
 | `CODEGEN_JIT_DUMP_ENCODE_SOURCE` / `CODEGEN_JIT_DUMP_DECODE_SOURCE` | Debug: if set to a path, writes the rendered encode/decode CUDA source there. |
 

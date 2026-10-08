@@ -4,42 +4,27 @@
 #include "fused_tree.hpp"
 #include "nvrtc_compiler.hpp"
 
-#include <cstdint>
+#include <array>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 namespace codegen::jit {
 
-struct ShapeKey {
-  std::string source_hash;
-  int arch_cc;
-  uint32_t cuda_runtime;
-  uint32_t driver_version;
-
-  bool operator==(const ShapeKey& other) const noexcept
-  {
-    return arch_cc == other.arch_cc && cuda_runtime == other.cuda_runtime &&
-           driver_version == other.driver_version && source_hash == other.source_hash;
-  }
-};
-
-struct ShapeKeyHash {
-  std::size_t operator()(const ShapeKey& k) const noexcept;
-};
-
-std::string source_digest(const std::string& rendered_source);
-ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc);
-
-// Persistent (on-disk) cubin cache. Compiled kernels are keyed by the same
-// (source, arch, cuda runtime, driver) tuple as the in-memory cache and stored
-// as <dir>/<hash>.cubin, so a shape compiled once is reused across processes
-// and across runs. Location resolves to $SIMPATICO_JIT_CACHE_DIR, else
+// Persistent (on-disk) cubin cache, shared across processes and runs. A cubin
+// is stored as <dir>/<epoch>/nvrtc-<major>.<minor>/<request>.cubin, where
+// <epoch> identifies the code that generates kernels (codegen/jit/jit_epoch.h)
+// and <request> hashes the rendered source, entry symbol, and NVRTC options
+// (jit/cache_identity.hpp). A rebuild that changes kernel generation therefore
+// starts a new epoch instead of reading stale cubins; old epochs are pruned
+// automatically. Location resolves to $SIMPATICO_JIT_CACHE_DIR, else
 // ${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit; set SIMPATICO_JIT_CACHE_DIR
 // to "off" (or empty) to disable and fall back to in-memory only.
 //
-// clear_jit_disk_cache() removes every cached cubin (best-effort); call it
-// before any compilation happens (e.g. from a test's main / orchestrator).
+// clear_jit_disk_cache() removes every cached cubin (best-effort), e.g. to time
+// cold compiles; call it before any compilation happens. Correctness never
+// requires it.
 void clear_jit_disk_cache();
 
 class KernelCache {
@@ -57,11 +42,17 @@ class KernelCache {
   KernelCache& operator=(const KernelCache&) = delete;
 
  private:
+  // XXH3-128 request identity; see jit/cache_identity.hpp.
+  using Key = std::array<unsigned char, 16>;
+  struct KeyHash {
+    std::size_t operator()(const Key& key) const noexcept;
+  };
+
   KernelCache()  = default;
   ~KernelCache() = default;
 
   mutable std::mutex mu_;
-  std::unordered_map<ShapeKey, CompiledKernel, ShapeKeyHash> table_;
+  std::unordered_map<Key, CompiledKernel, KeyHash> table_;
 };
 
 }  // namespace codegen::jit

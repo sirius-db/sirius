@@ -1,17 +1,24 @@
 // Layer-1 decode-side cache smoke test (plain-CUDA renderer).
 //
-// Three properties to pin down:
-//   1. `source_digest` is deterministic and hex-encoded.
+// Properties to pin down:
+//   1. Cubins land in <dir>/<epoch>/nvrtc-<version>/<request>.cubin, and the
+//      first disk-cache use prunes stale epochs and legacy flat cubins.
 //   2. Two structurally identical rendered sources hit the same cache slot.
 //   3. A different shape gets its own slot.
 
 #include "codegen/decode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/jit/jit_epoch.h"
 #include "codegen/jit/kernel_cache.hpp"
 #include "test_utils.hpp"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace cdj = codegen::decode::jit;
@@ -34,22 +41,65 @@ static double timed_ms(F&& fn)
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+namespace fs = std::filesystem;
+
+// A private disk cache seeded with other epochs and a legacy flat cubin. Must be
+// set up before the first KernelCache lookup, which resolves the directory and
+// prunes it once per process.
+static fs::path seed_disk_cache()
+{
+  const fs::path dir =
+    fs::temp_directory_path() / ("simpatico_jit_cache_test_" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  const auto now = fs::file_time_type::clock::now();
+  auto make_dir  = [&](const std::string& name, std::chrono::hours age) {
+    fs::create_directories(dir / name / "nvrtc-1.0");
+    std::ofstream(dir / name / "nvrtc-1.0" / "stale.cubin") << "stale";
+    fs::last_write_time(dir / name, now - age);
+  };
+  // a, b, c are the three most recently used other epochs and survive (b and c
+  // only because of the kept count); d is older and past the grace period.
+  make_dir(std::string(32, 'a'), std::chrono::hours(0));
+  make_dir(std::string(32, 'b'), std::chrono::hours(48));
+  make_dir(std::string(32, 'c'), std::chrono::hours(72));
+  make_dir(std::string(32, 'd'), std::chrono::hours(96));
+  make_dir("v2", std::chrono::hours(96));  // not an epoch: left alone
+  std::ofstream(dir / "0123456789abcdef_a89_c12090_d12090.cubin") << "legacy";
+  std::ofstream(dir / "notes.cubin") << "not ours";
+  setenv("SIMPATICO_JIT_CACHE_DIR", dir.c_str(), 1);
+  return dir;
+}
+
+static int check_disk_cache(const fs::path& dir)
+{
+  const fs::path epoch = dir / jit::kJitEpoch;
+  int cubins           = 0;
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(epoch, ec)) {
+    if (entry.path().extension() != ".cubin") continue;
+    if (entry.path().parent_path().filename().string().rfind("nvrtc-", 0) != 0 ||
+        entry.path().stem().string().size() != 32)
+      return report_fail("unexpected cubin path", entry.path().string());
+    ++cubins;
+  }
+  if (cubins != 1) return report_fail("expected one cubin in the epoch directory");
+  for (char kept : {'a', 'b', 'c'}) {
+    if (!fs::exists(dir / std::string(32, kept)))
+      return report_fail("recent epoch was pruned", std::string(1, kept));
+  }
+  if (fs::exists(dir / std::string(32, 'd'))) return report_fail("stale epoch not pruned");
+  if (fs::exists(dir / "0123456789abcdef_a89_c12090_d12090.cubin"))
+    return report_fail("legacy cubin not pruned");
+  if (!fs::exists(dir / "v2") || !fs::exists(dir / "notes.cubin"))
+    return report_fail("pruned a file the cache does not own");
+  return 0;
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) return report_fail("cudaSetDevice(0) failed");
 
-  {
-    auto a = jit::source_digest("hello world");
-    auto b = jit::source_digest("hello world");
-    auto c = jit::source_digest("hello world!");
-    if (a != b) return report_fail("digest not deterministic");
-    if (a == c) return report_fail("digest collided across inputs");
-    if (a.size() != 16) return report_fail("digest length != 16", "got: " + a);
-    for (char ch : a) {
-      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')))
-        return report_fail("digest contains non-hex char", "got: " + a);
-    }
-  }
+  const fs::path cache_dir = seed_disk_cache();
 
   jit::CompileOptions opts;
   opts.arch_cc = jit::arch_cc_for_current_device();
@@ -83,6 +133,7 @@ int main()
   if (k1->rendered_source.find("simpatico_bp_at") == std::string::npos) {
     return report_fail("rendered_source missing simpatico_bp_at decode primitive");
   }
+  if (int rc = check_disk_cache(cache_dir); rc != 0) return rc;
 
   const jit::CompiledKernel* k2 = nullptr;
   double warm_ms                = 0;
@@ -136,6 +187,7 @@ int main()
   if (!k4 || k4 == k1) return report_fail("dtype change did not change cache slot");
   if (cache.size() != 3) return report_fail("cache size != 3 after dtype variant");
 
+  fs::remove_all(cache_dir);
   std::printf("test_jit_kernel_cache: OK (cold=%.1f ms, warm=%.3f ms, size=%zu)\n",
               cold_ms,
               warm_ms,

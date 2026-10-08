@@ -12,7 +12,8 @@ if(NOT TARGET nvcomp::nvcomp)
   find_package(nvcomp REQUIRED CONFIG)
 endif()
 
-include(cmake/jit_header_manifest.cmake)
+# Header-only xxHash for the JIT cache key (SIMPATICO_XXHASH_INCLUDE_DIR).
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -25,13 +26,11 @@ add_custom_command(
     ${CMAKE_COMMAND}
     "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
     "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
-    "-DOUT=${EMBED_JIT_HEADERS_OUT}" "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+    "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
-          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
-          "${XXHSUM_EXECUTABLE}"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
 add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
@@ -59,19 +58,95 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} "-DINCLUDE_DIRS_FILE=${EMBED_CCCL_INCLUDE_DIRS}"
     "-DOUT=${EMBED_CCCL_HEADERS_OUT}" "-DDEPFILE=${EMBED_CCCL_HEADERS_DEPFILE}"
-    "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}" -P
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
-          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
-          "${EMBED_CCCL_INCLUDE_DIRS}" "${XXHSUM_EXECUTABLE}"
+          "${EMBED_CCCL_INCLUDE_DIRS}"
   DEPFILE "${EMBED_CCCL_HEADERS_DEPFILE}"
   COMMENT "Embedding CCCL JIT header bundle into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
 
+# Name of the NVTX domain simpatico's (and Sirius's) ranges are published into.
+# The parent project sets this from its own project name; the fallback only
+# applies to the standalone simpatico_codegen build, whose PROJECT_NAME is not
+# "sirius". PUBLIC so consumers — sirius_extension and, transitively,
+# sirius_unittest and parquet_benchmark — compile their copy of the tag type
+# against the same name.
+if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
+  set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
+endif()
+
+# Compile settings shared by simpatico and its simpatico_jitgen objects, so the
+# objects hashed into the JIT cache epoch are built exactly like the rest.
+function(simpatico_apply_build_settings target)
+  target_compile_definitions(
+    ${target}
+    PUBLIC LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
+           CCCL_DISABLE_WARPSPEED_SCAN CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
+           SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
+  # Keep libcudf's CCCL includes ahead of the toolkit's implicit headers.
+  # Imported -isystem paths would otherwise be searched after ordinary -I paths.
+  set_target_properties(
+    ${target}
+    PROPERTIES POSITION_INDEPENDENT_CODE ON
+               NO_SYSTEM_FROM_IMPORTED ON
+               CXX_SCAN_FOR_MODULES OFF
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON)
+  target_compile_options(
+    ${target}
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+            $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-relaxed-constexpr>)
+  target_compile_features(${target} PUBLIC cxx_std_20)
+  # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
+  add_dependencies(${target} simpatico_embedded_headers)
+  target_include_directories(
+    ${target}
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            "${SIMPATICO_XXHASH_INCLUDE_DIR}")
+endfunction()
+
+# The code that turns a JIT cache key into a cubin: the renderers, the NVRTC
+# driver (options + embedded headers), and the key encoding. The JIT cache epoch
+# hashes exactly these objects (see cmake/jit_epoch.cmake), so changing anything
+# else in simpatico keeps the on-disk cubin cache warm.
+# simpatico_jitgen_link_check below keeps this set closed under linking.
+add_library(
+  simpatico_jitgen OBJECT
+  # Generated: complete CCCL header bundle embedded for the runtime JIT.
+  "${EMBED_CCCL_HEADERS_OUT}" src/jit/nvrtc_compiler.cpp
+  src/jit/cache_identity.cpp src/encode/jit/renderer.cpp
+  src/decode/jit/renderer.cpp)
+simpatico_apply_build_settings(simpatico_jitgen)
+# Usage requirements (include directories, definitions) only; an OBJECT library
+# links nothing itself.
+target_link_libraries(simpatico_jitgen PRIVATE cudf::cudf CUDA::cuda_driver)
+
+set(JIT_EPOCH_OBJECTS
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/jit_epoch_objects-$<CONFIG>.txt")
+file(
+  GENERATE
+  OUTPUT "${JIT_EPOCH_OBJECTS}"
+  CONTENT "$<JOIN:$<TARGET_OBJECTS:simpatico_jitgen>,\n>\n")
+set(JIT_EPOCH_OUT "${CMAKE_CURRENT_BINARY_DIR}/generated/jit_epoch.cpp")
+add_custom_command(
+  OUTPUT "${JIT_EPOCH_OUT}.stamp"
+  BYPRODUCTS "${JIT_EPOCH_OUT}"
+  COMMAND
+    ${CMAKE_COMMAND} "-DOBJECTS_FILE=${JIT_EPOCH_OBJECTS}"
+    "-DOUT=${JIT_EPOCH_OUT}" "-DSTAMP=${JIT_EPOCH_OUT}.stamp" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_epoch.cmake"
+  DEPENDS simpatico_jitgen $<TARGET_OBJECTS:simpatico_jitgen>
+          "${JIT_EPOCH_OBJECTS}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_epoch.cmake"
+  COMMENT "Computing the JIT cache epoch"
+  VERBATIM)
+add_custom_target(simpatico_jit_epoch DEPENDS "${JIT_EPOCH_OUT}.stamp")
+
 add_library(
   simpatico STATIC
-  # Generated: complete CCCL header bundle embedded for the runtime JIT.
-  "${EMBED_CCCL_HEADERS_OUT}"
+  $<TARGET_OBJECTS:simpatico_jitgen>
+  "${JIT_EPOCH_OUT}"
   # CUDA kernels: operators + offsets
   src/bridge/offsets_cumsum.cu
   src/selection/selection_wave.cu
@@ -90,11 +165,8 @@ add_library(
   src/operators/dictionary_compressor.cu
   src/operators/str_split_compressor.cu
   src/operators/nvcomp_batched_codec.cu
-  # Plain-CUDA JIT host
-  src/jit/nvrtc_compiler.cpp
+  # Plain-CUDA JIT host (renderers + NVRTC driver are in simpatico_jitgen)
   src/jit/kernel_cache.cpp
-  src/encode/jit/renderer.cpp
-  src/decode/jit/renderer.cpp
   # Runtime: plan executor + bridge + API + rep glue
   src/selection/decompression_pushdown_policy.cpp
   src/plan/bit_spec.cpp
@@ -112,42 +184,11 @@ add_library(
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
   src/explore/compression_explorer.cpp)
-# Keep libcudf's CCCL includes ahead of the toolkit's implicit headers. Imported
-# -isystem paths would otherwise be searched after ordinary -I paths.
-set_target_properties(
-  simpatico
-  PROPERTIES POSITION_INDEPENDENT_CODE ON
-             NO_SYSTEM_FROM_IMPORTED ON
-             CXX_SCAN_FOR_MODULES OFF
-             CUDA_STANDARD 20
-             CUDA_STANDARD_REQUIRED ON)
+simpatico_apply_build_settings(simpatico)
+add_dependencies(simpatico simpatico_jit_epoch)
 if(VCPKG_BUILD)
   set_target_properties(simpatico PROPERTIES CUDA_RUNTIME_LIBRARY Static)
 endif()
-target_compile_options(
-  simpatico
-  PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
-          $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-relaxed-constexpr>)
-target_compile_features(simpatico PUBLIC cxx_std_20)
-# Name of the NVTX domain simpatico's (and Sirius's) ranges are published into.
-# The parent project sets this from its own project name; the fallback only
-# applies to the standalone simpatico_codegen build, whose PROJECT_NAME is not
-# "sirius". PUBLIC so consumers — sirius_extension and, transitively,
-# sirius_unittest and parquet_benchmark — compile their copy of the tag type
-# against the same name.
-if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
-  set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
-endif()
-target_compile_definitions(
-  simpatico
-  PUBLIC LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
-         CCCL_DISABLE_WARPSPEED_SCAN CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
-         SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
-# nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
-add_dependencies(simpatico simpatico_embedded_headers)
-target_include_directories(
-  simpatico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
 # Standalone / pixi builds use the toolkit's shared NVRTC target.
@@ -203,6 +244,29 @@ add_codegen_host_test(test_chunk_row_set_convert)
 add_codegen_host_test(test_decompress_column_rows)
 add_codegen_host_test(test_render_signature_contract)
 
+# Links simpatico_jitgen's objects without the rest of simpatico (or libcudf),
+# so a renderer or NVRTC-driver call into code outside the JIT cache epoch fails
+# the build. See tests/jitgen_link_check.cpp.
+add_executable(
+  simpatico_jitgen_link_check
+  tests/jitgen_link_check.cpp $<TARGET_OBJECTS:simpatico_jitgen>
+  "${JIT_EPOCH_OUT}")
+add_dependencies(simpatico_jitgen_link_check simpatico_jit_epoch
+                 simpatico_embedded_headers)
+set_target_properties(simpatico_jitgen_link_check
+                      PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+# Keep every section of the jitgen objects, so a reference to code outside them
+# fails the link even when nothing in this check reaches it (conda's toolchain
+# links with --gc-sections, which would drop such references unreported).
+target_link_options(simpatico_jitgen_link_check PRIVATE LINKER:--no-gc-sections)
+target_compile_features(simpatico_jitgen_link_check PRIVATE cxx_std_20)
+target_include_directories(simpatico_jitgen_link_check
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(
+  simpatico_jitgen_link_check
+  PRIVATE ${SIMPATICO_CUDART_LIB} ${SIMPATICO_NVRTC_LIB} CUDA::cuda_driver
+          ${CMAKE_DL_LIBS})
+
 # Multi-mode CLI. Target is simpatico_cli to avoid clashing with the lib target;
 # the installed binary is named 'simpatico'.
 add_executable(simpatico_cli cli/simpatico_main.cpp)
@@ -234,3 +298,4 @@ add_test(NAME row_id_space COMMAND test_row_id_space)
 add_test(NAME chunk_row_set_convert COMMAND test_chunk_row_set_convert)
 add_test(NAME decompress_column_rows COMMAND test_decompress_column_rows)
 add_test(NAME render_signature_contract COMMAND test_render_signature_contract)
+add_test(NAME jitgen_link_check COMMAND simpatico_jitgen_link_check)

@@ -12,18 +12,9 @@ static void require(bool condition, const char* message)
   if (!condition) throw std::runtime_error(message);
 }
 
-int main(int argc, char** argv)
+int main()
 {
   try {
-    // Test-only bridge for comparing CMake's xxhsum output with the runtime
-    // implementation, including files larger than its streaming buffer.
-    if (argc == 3 && std::string_view(argv[1]) == "--hash-file") {
-      Digest digest{};
-      require(file_identity(argv[2], digest), "file hashing failed");
-      std::puts(hex_digest(digest).c_str());
-      return 0;
-    }
-    require(argc == 1, "unexpected arguments");
     require(hex_digest(content_identity({})) == "99aa06d3014798d86001c324468d497f",
             "XXH3-128 empty vector");
     require(hex_digest(content_identity("abc")) == "06b05ab6733a618578af5f94892f3950",
@@ -65,31 +56,6 @@ int main(int argc, char** argv)
     changed.source = "a";
     changed.entry  = request.entry;
     require(request_identity(request) != request_identity(changed), "embedded NUL boundary");
-
-    EnvironmentView environment{
-      "embedded-libcudf", "project-bytes", "cccl-bytes", "compiler-build-1", 13030, 13030};
-    const auto env = environment_identity(environment);
-    for (int component = 0; component < 6; ++component) {
-      auto variant = environment;
-      switch (component) {
-        case 0: variant.provider = "nvrtc-bundled"; break;
-        case 1: variant.project_headers = "project-byteS"; break;
-        case 2: variant.cccl_headers = "cccl-byteS"; break;
-        case 3: variant.compiler = "compiler-build-2"; break;
-        case 4: ++variant.cuda_runtime; break;
-        case 5: ++variant.driver; break;
-      }
-      require(env != environment_identity(variant), "environment component omitted");
-      require(CompilationIdentity{env, expected}.relative_path() !=
-                CompilationIdentity{environment_identity(variant), expected}.relative_path(),
-              "persistent path omitted environment");
-    }
-    require(CompilationIdentity{env, expected}.relative_path() ==
-              "v2/" + hex_digest(env) + "/" + hex_digest(expected) + ".cubin",
-            "versioned path");
-    require(CompilationIdentity{env, expected}.relative_path() !=
-              CompilationIdentity{env, request_identity(changed)}.relative_path(),
-            "persistent path omitted request");
     std::puts("cache identity: OK");
     return 0;
   } catch (const std::exception& error) {
