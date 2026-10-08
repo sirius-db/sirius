@@ -30,13 +30,13 @@
 
 namespace sirius::exec {
 
-/// One monitor coordinates bounded execution, shared planning and exclusive maintenance.
+/// One monitor coordinates bounded execution, planning, writers and exclusive maintenance.
 /// Tokens are transferable: no mutex remains locked across user work or across threads.
 class query_admission {
  public:
-  enum class access { query, planning, maintenance };
+  enum class access { query, planning, writer, maintenance };
   struct counts {
-    std::size_t queued_queries{}, active_queries{}, planners{}, maintenance_waiters{};
+    std::size_t queued_queries{}, active_queries{}, planners{}, writers{}, maintenance_waiters{};
     bool maintenance_active{}, closing{};
     std::uint64_t completed_queries{};
     std::chrono::steady_clock::time_point last_queued{}, last_admitted{}, last_completed{};
@@ -46,6 +46,7 @@ class query_admission {
   struct waiter {
     access kind;
     std::uint64_t ticket;
+    bool writer_continuation;
   };
   struct state {
     std::mutex mutex;
@@ -91,6 +92,8 @@ class query_admission {
           s->current.last_completed = std::chrono::steady_clock::now();
         } else if (_kind == access::planning)
           --s->current.planners;
+        else if (_kind == access::writer)
+          --s->current.writers;
         else
           s->current.maintenance_active = false;
       }
@@ -113,23 +116,31 @@ class query_admission {
     if (limit == 0) throw std::invalid_argument("query admission limit must be positive");
     std::lock_guard lock(_state->mutex);
     auto const& c = _state->current;
-    if (c.active_queries || c.planners || c.maintenance_active || !_state->waiting.empty())
+    if (c.active_queries || c.planners || c.writers || c.maintenance_active ||
+        !_state->waiting.empty())
       throw std::logic_error("cannot reconfigure active query admission");
     _state->limit = limit;
   }
 
   /// check_cancel throws the caller's cancellation/health error. Polling is bounded because
   /// DuckDB interruption does not currently offer a condition-variable notification hook.
+  /// A held writer permit may authorize query/planning continuations ahead of pending
+  /// maintenance: otherwise maintenance and the writer could each wait for the other.
+  /// The caller must retain that permit throughout acquire(), without concurrently resetting it.
   template <class CheckCancel>
-  permit acquire(access kind, CheckCancel check_cancel)
+  permit acquire(access kind, CheckCancel check_cancel, const permit* writer = nullptr)
   {
     auto s = _state;
     std::unique_lock lock(s->mutex);
     check_cancel();
+    if (writer && (writer->_state != s || writer->_kind != access::writer ||
+                   (kind != access::query && kind != access::planning)))
+      throw std::logic_error("invalid writer continuation permit");
     if (s->current.closing) throw std::runtime_error("Sirius admission is closed");
     if (s->next_ticket > max_query_id)
       throw std::overflow_error("Sirius admission ID exhausted; restart the runtime");
-    auto it = s->waiting.insert(s->waiting.end(), waiter{kind, s->next_ticket++});
+    auto it =
+      s->waiting.insert(s->waiting.end(), waiter{kind, s->next_ticket++, writer != nullptr});
     if (kind == access::query) {
       ++s->current.queued_queries;
       s->current.last_queued = std::chrono::steady_clock::now();
@@ -147,17 +158,23 @@ class query_admission {
         auto const& c = s->current;
         bool ready    = !c.maintenance_active;
         if (kind == access::maintenance) {
-          ready = ready && !c.active_queries && !c.planners &&
+          ready = ready && !c.active_queries && !c.planners && !c.writers &&
                   std::none_of(s->waiting.begin(), it, [](auto const& w) {
                     return w.kind == access::maintenance;
                   });
         } else {
-          ready = ready && !c.maintenance_waiters;
+          ready = ready && (!c.maintenance_waiters || it->writer_continuation);
           if (kind == access::query) {
-            ready =
-              ready && c.active_queries < s->limit &&
-              std::none_of(
-                s->waiting.begin(), it, [](auto const& w) { return w.kind == access::query; });
+            ready = ready && c.active_queries < s->limit &&
+                    std::none_of(
+                      s->waiting.begin(),
+                      it,
+                      [&](auto const& w) {
+                        // Ordinary queries blocked by maintenance cannot prevent an existing
+                        // writer from finishing. FIFO still applies among eligible queries.
+                        return w.kind == access::query &&
+                               (!c.maintenance_waiters || w.writer_continuation);
+                      });
           }
         }
         if (ready) break;
@@ -170,6 +187,8 @@ class query_admission {
         s->current.last_admitted = std::chrono::steady_clock::now();
       } else if (kind == access::planning)
         ++s->current.planners;
+      else if (kind == access::writer)
+        ++s->current.writers;
       else
         s->current.maintenance_active = true;
       lock.unlock();
@@ -201,7 +220,8 @@ class query_admission {
     std::unique_lock lock(_state->mutex);
     _state->changed.wait(lock, [&] {
       auto const& c = _state->current;
-      return !c.active_queries && !c.planners && !c.maintenance_active && _state->waiting.empty();
+      return !c.active_queries && !c.planners && !c.writers && !c.maintenance_active &&
+             _state->waiting.empty();
     });
   }
 

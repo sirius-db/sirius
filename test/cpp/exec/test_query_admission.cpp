@@ -157,3 +157,112 @@ TEST_CASE("admission permits transfer threads and shutdown wakes waiters", "[que
   monitor.wait_until_idle();
   CHECK(monitor.snapshot().closing);
 }
+
+TEST_CASE("writers finish ahead of pending maintenance without exceeding capacity",
+          "[query_admission]")
+{
+  query_admission monitor;
+  auto writer  = monitor.acquire(access_kind::writer, [] {});
+  auto busy    = monitor.acquire(access_kind::query, [] {});
+  auto acquire = [&](access_kind kind, const query_admission::permit* parent = nullptr) {
+    return std::async(std::launch::async, [&, kind, parent] {
+      try {
+        return monitor.acquire(kind, [] {}, parent);
+      } catch (std::runtime_error const&) {
+        return query_admission::permit{};  // close() bounds failure cleanup.
+      }
+    });
+  };
+  auto maintenance    = acquire(access_kind::maintenance);
+  bool waiting        = await([&] { return monitor.snapshot().maintenance_waiters == 1; });
+  auto unrelated      = acquire(access_kind::query);
+  bool queued         = await([&] { return monitor.snapshot().queued_queries == 1; });
+  auto new_writer     = acquire(access_kind::writer);
+  auto planning       = acquire(access_kind::planning, &writer);
+  bool planning_ready = planning.wait_for(1s) == std::future_status::ready;
+  auto continuation   = acquire(access_kind::query, &writer);
+  bool both_queued    = await([&] { return monitor.snapshot().queued_queries == 2; });
+  bool exceeded_limit = continuation.wait_for(0ms) == std::future_status::ready;
+  busy.reset();
+  bool progressed        = continuation.wait_for(1s) == std::future_status::ready;
+  bool maintenance_early = maintenance.wait_for(0ms) == std::future_status::ready;
+  bool unrelated_early   = unrelated.wait_for(0ms) == std::future_status::ready;
+  bool writer_early      = new_writer.wait_for(0ms) == std::future_status::ready;
+  if (!progressed || !planning_ready) monitor.close();
+  continuation.get().reset();
+  planning.get().reset();
+  writer.reset();
+  bool exclusive = maintenance.wait_for(1s) == std::future_status::ready;
+  if (!exclusive) monitor.close();
+  auto maintenance_permit = maintenance.get();
+  bool maintenance_active = monitor.snapshot().maintenance_active;
+  maintenance_permit.reset();
+  monitor.close();
+  unrelated.get().reset();
+  new_writer.get().reset();
+  monitor.wait_until_idle();
+
+  CHECK(waiting);
+  CHECK(queued);
+  CHECK(planning_ready);
+  CHECK(both_queued);
+  CHECK_FALSE(exceeded_limit);
+  CHECK(progressed);
+  CHECK_FALSE(maintenance_early);
+  CHECK_FALSE(unrelated_early);
+  CHECK_FALSE(writer_early);
+  CHECK(exclusive);
+  CHECK(maintenance_active);
+}
+
+TEST_CASE("maintenance waiting on a writer is cancellable", "[query_admission]")
+{
+  query_admission monitor;
+  auto writer = monitor.acquire(access_kind::writer, [] {});
+  std::atomic<bool> cancel{false};
+  auto maintenance = std::async(std::launch::async, [&] {
+    try {
+      auto p = monitor.acquire(access_kind::maintenance, [&] {
+        if (cancel) throw std::runtime_error("cancelled");
+      });
+      return false;
+    } catch (std::runtime_error const& e) {
+      return std::string(e.what()) == "cancelled";
+    }
+  });
+  bool waiting     = await([&] { return monitor.snapshot().maintenance_waiters == 1; });
+  bool active      = monitor.snapshot().maintenance_active;
+  cancel           = true;
+  bool ready       = maintenance.wait_for(1s) == std::future_status::ready;
+  if (!ready) monitor.close();
+  CHECK(maintenance.get());
+  CHECK(waiting);
+  CHECK_FALSE(active);
+  REQUIRE(ready);
+  CHECK(monitor.snapshot().maintenance_waiters == 0);
+  CHECK(monitor.snapshot().writers == 1);
+  auto query = monitor.acquire(access_kind::query, [] {});
+  CHECK(monitor.snapshot().active_queries == 1);
+}
+
+TEST_CASE("writer permits enforce ownership and participate in shutdown", "[query_admission]")
+{
+  query_admission monitor, other;
+  auto writer = monitor.acquire(access_kind::writer, [] {});
+  auto query  = monitor.acquire(access_kind::query, [] {});
+  query_admission::permit empty;
+  CHECK_THROWS_AS(monitor.acquire(access_kind::planning, [] {}, &empty), std::logic_error);
+  CHECK_THROWS_AS(monitor.acquire(access_kind::planning, [] {}, &query), std::logic_error);
+  CHECK_THROWS_AS(other.acquire(access_kind::planning, [] {}, &writer), std::logic_error);
+  CHECK_THROWS_AS(monitor.acquire(access_kind::maintenance, [] {}, &writer), std::logic_error);
+  query.reset();
+  CHECK_THROWS_AS(monitor.configure(2), std::logic_error);
+  monitor.close();
+  auto idle   = std::async(std::launch::async, [&] { monitor.wait_until_idle(); });
+  bool waited = idle.wait_for(50ms) == std::future_status::timeout;
+  std::thread release([token = std::move(writer)]() mutable { token.reset(); });
+  release.join();
+  idle.get();
+  CHECK(waited);
+  CHECK(monitor.snapshot().writers == 0);
+}

@@ -42,7 +42,13 @@ IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 Planning takes shared access and stable configuration/pin snapshots. Pin/unpin, cache reset and
 resource-changing index operations take exclusive maintenance access. ANN operations remain
 conservative maintenance users. Once maintenance is waiting, new query/planning admissions stop;
-existing queries retire before maintenance begins. Maintenance never waits while retaining an
+existing queries retire before maintenance begins. Update-producing statements retain a writer
+permit from pin validation through statement completion, preventing pin changes during the update.
+Maintenance waits for those writers in the same cancellable admission queue. An existing writer's
+GPU execution or planning can pass pending maintenance and unrelated queries blocked behind it,
+so the writer can finish; GPU execution still obeys the configured concurrency limit. New writers
+wait behind maintenance. Requesting maintenance from inside a guarded writer statement is rejected
+because it would wait for its own writer permit. Maintenance never waits while retaining an
 execution permit that it needs to drain. Internal pin queries reuse the outer maintenance ownership.
 
 Operator/expression/compression SET values are connection-local overrides of YAML defaults.
@@ -102,7 +108,7 @@ The implementation journal records which hardware and tests were available for t
 
 C++ runtime diagnostics are available without enabling telemetry:
 
-- `SiriusContext::admission_counts()` reports queued/admitted queries, planning and maintenance
+- `SiriusContext::admission_counts()` reports queued/admitted queries, planning, writers and maintenance
   occupancy, completion count and the most recent queue/admission/completion timestamps.
 - `get_query_lifecycle_registry().diagnostics()` returns live query IDs with submission/work and
   memory-wait counts, admission/retirement/first-memory-wait timestamps and first-error text. It
