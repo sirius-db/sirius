@@ -105,8 +105,8 @@ class bounded_thread_pool {
     void attach(sirius::query_id_t query_id)
     {
       if (pool_ == nullptr || query_.has_value()) { return; }
-      query_ = query_id;
       pool_->attach_slot(query_id);
+      query_ = query_id;  // Claim attribution only after registration succeeds.
     }
 
     /// \brief The query this slot is attributed to, or nullopt while untagged.
@@ -236,22 +236,23 @@ class bounded_thread_pool {
   {
     if (not s) { return; }
     const auto query = s.query();
+    // Construct before locking: a failed insertion must release the slot outside mu_.
+    work_item item{query, [s = std::move(s), fn = std::move(fn)]() mutable noexcept {
+                     try {
+                       fn();
+                     } catch (const std::exception& e) {
+                       SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
+                     } catch (...) {
+                       SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
+                     }
+                     // Destroy before slot is released upon lambda exit.
+                     fn = nullptr;
+                     // When slot, s, goes out of scope, release_slot is automatically
+                     // invoked, clearing the path for another task to pick up that slot.
+                   }};
     {
       std::lock_guard lock(mu_);
-      work_queue_.push_back(
-        work_item{query, [s = std::move(s), fn = std::move(fn)]() mutable noexcept {
-                    try {
-                      fn();
-                    } catch (const std::exception& e) {
-                      SIRIUS_LOG_ERROR("Exception in bounded_thread_pool task: {}", e.what());
-                    } catch (...) {
-                      SIRIUS_LOG_ERROR("Unknown exception in bounded_thread_pool task");
-                    }
-                    // Destroy before slot is released upon lambda exit.
-                    fn = nullptr;
-                    // When slot, s, goes out of scope, release_slot is automatically
-                    // invoked, clearing the path for another task to pick up that slot.
-                  }});
+      work_queue_.push_back(std::move(item));
     }
     cv_work_.notify_one();
   }
