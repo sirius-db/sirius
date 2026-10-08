@@ -39,6 +39,13 @@ that can use a ready GPU. Running kernels are not preempted. A task waiting for 
 worker slot, letting another task run and potentially free memory. Equal GPU shares are not promised.
 IDs fail explicitly at the 31-bit scheduling limit rather than wrapping.
 
+The shared scan metadata pool also uses strict query-age priority: older queries' queued tasks
+run before newer queries' tasks, with FIFO ordering within a query. Workers return to the shared
+queue after each task; running tasks are not preempted. Consequently, a newly admitted query's
+metadata work can wait while older queries continue supplying work to that pool. Admission permits
+concurrent execution but does not guarantee an equal share of metadata workers or bounded metadata
+startup latency for each query.
+
 Planning takes shared access and stable configuration/pin snapshots. Pin/unpin, cache reset and
 resource-changing index operations take exclusive maintenance access. ANN operations remain
 conservative maintenance users. Once maintenance is waiting, new query/planning admissions stop;
