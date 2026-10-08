@@ -42,15 +42,16 @@ void split_connector::set_consumption_callback(std::function<void()> callback)
   std::lock_guard lock(_mutex);
   _on_consumption = std::move(owning);
 }
-void split_connector::push_split_sized(std::unique_ptr<op::operator_data> split, size_t split_bytes)
+void split_connector::push_split_sized(std::unique_ptr<op::operator_data>&& split,
+                                       size_t split_bytes)
 {
   {
     std::lock_guard<std::mutex> lock(_mutex);
     assert(!_closed && "push_split after close() is forbidden");
+    _splits.push_back(std::move(split));
     // A zero estimate means unknown, not empty; latch it so the total remains conservative.
     _discovered_bytes += split_bytes;
     _has_unsized_splits = _has_unsized_splits || split_bytes == 0;
-    _splits.push_back(std::move(split));
   }
   _cv.notify_one();
 }

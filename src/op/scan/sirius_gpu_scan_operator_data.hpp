@@ -92,6 +92,7 @@ struct membership_snapshot {
  */
 class scan_operator_input : public op::operator_data {
  public:
+  enum class prefetch_start { immediate, deferred };
   /// Hint the IO layer about every range this split will read, then publish it
   /// to @p readahead -- in that order, which is why both belong here.
   /// Registration makes the split eligible for prefetching and takes the
@@ -101,11 +102,17 @@ class scan_operator_input : public op::operator_data {
   /// datasources have no prefetch handle yet, and would leave the handle write
   /// racing the worker's read of it.  @p preferred_device is passed in for the
   /// same reason: an fadvise names the GPU its bytes are headed for.
+  /// With @p start set to deferred, call initialize_prefetch() after publication admission.
   explicit scan_operator_input(
     std::shared_ptr<scan_info> metadata,
     std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
     std::size_t operator_id                                         = 0,
-    std::optional<int> preferred_device                             = std::nullopt);
+    std::optional<int> preferred_device                             = std::nullopt,
+    prefetch_start start                                            = prefetch_start::immediate);
+
+  /// Initialize hints, buffers and readahead before exposing this input to consumers.
+  /// Single-owner, at most once; an exception requires discarding the input, not retrying it.
+  void initialize_prefetch();
 
   explicit scan_operator_input(
     std::shared_ptr<cucascade::data_batch> cached_batch,
@@ -327,6 +334,7 @@ class scan_operator_input : public op::operator_data {
   std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
   /// Operator id this split was emitted under, the key @ref _readahead uses.
   std::size_t _operator_id{0};
+  bool _prefetch_started{false};
 };
 
 }  // namespace sirius::op::scan

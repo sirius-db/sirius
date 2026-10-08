@@ -130,11 +130,18 @@ void load_balancing_scan_batch_coalescer::register_coordinator_source(
   source.construct = [slot](std::unique_ptr<op::scan::scan_info> batch) {
     auto device = slot->balancer->get_next_gpu(slot->pipeline_id);
     auto input  = std::make_unique<op::scan::scan_operator_input>(
-      std::move(batch), slot->readahead, slot->op_id, device);
+      std::move(batch),
+      slot->readahead,
+      slot->op_id,
+      device,
+      op::scan::scan_operator_input::prefetch_start::deferred);
     auto bytes = input->get_estimated_size_in_bytes();
     return preparation_coordinator::publication{std::move(input), bytes};
   };
-  source.publish = [slot](preparation_coordinator::publication publication) {
+  source.prepare_publish = [](preparation_coordinator::publication& publication) {
+    static_cast<op::scan::scan_operator_input&>(*publication.input).initialize_prefetch();
+  };
+  source.publish = [slot](preparation_coordinator::publication& publication) {
     slot->connector->push_split_sized(std::move(publication.input), publication.bytes);
   };
   source.close = [slot] {
@@ -348,6 +355,8 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
       if (publication->closed) return false;
       publication->check_interrupted();
     }
+    auto& input = static_cast<op::scan::scan_operator_input&>(*split);
+    if (input.has_scan_metadata()) input.initialize_prefetch();
     connector.push_split_sized(std::move(split), bytes);
     return true;
   };
@@ -409,13 +418,17 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(
       }
       if (next.scan_info) {
         // Insert-delta split. row_filter_pending stays false: scan_info
-        // splits fold filter costs into their own estimates. The constructor
-        // fadvises and publishes, as on the walk path; host-backed splits have
-        // no file ranges, so the hints no-op.
+        // splits fold filter costs into their own estimates. Prefetch initialization
+        // follows publication admission; host-backed splits have no file ranges,
+        // so the hints no-op.
         std::optional<int> device;
         if (next.preferred_device >= 0) { device = next.preferred_device; }
         auto split = std::make_unique<op::scan::scan_operator_input>(
-          std::move(next.scan_info), readahead, operator_id, device);
+          std::move(next.scan_info),
+          readahead,
+          operator_id,
+          device,
+          op::scan::scan_operator_input::prefetch_start::deferred);
         split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         if (!publish(std::move(split))) break;
         continue;

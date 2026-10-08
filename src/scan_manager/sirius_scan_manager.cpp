@@ -1481,8 +1481,10 @@ void sirius_scan_manager::prepare_for_query(
 
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
-  auto state = std::make_shared<query_scan_manager_state>(
-    _config.preparation.resolve(_config.thread_pool.num_threads));
+  auto preparation           = _config.preparation.resolve(_config.thread_pool.num_threads);
+  preparation.collect_timing = _physical_counters && _physical_counters->track_units &&
+                               _physical_counters->preparation_timing_for_testing;
+  auto state               = std::make_shared<query_scan_manager_state>(std::move(preparation));
   state->query_token       = sirius::value_of(query_id);
   state->physical_counters = _physical_counters;
   state->pruning_enabled   = enable_pinned_zone_map_pruning;
@@ -1994,9 +1996,6 @@ void sirius_scan_manager::start_metadata_processing(query_scan_manager_state& st
     }
     info->deferred->ledger = state.ledger;
   }
-  state.preparation.collect_timing = state.physical_counters &&
-                                     state.physical_counters->track_units &&
-                                     state.physical_counters->preparation_timing_for_testing;
   state.coordinator = std::make_unique<preparation_coordinator>(
     *state.completion, *state.dispatcher, state.preparation);
   for (auto& scan : state.scans)

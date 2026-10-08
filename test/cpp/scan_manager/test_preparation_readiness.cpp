@@ -117,6 +117,7 @@ struct sink {
   std::function<void()> consumed;
   std::atomic<bool> closed{false};
   std::atomic<size_t> close_calls{0};
+  std::atomic<size_t> preparations{0};
   size_t count()
   {
     std::lock_guard l(mutex);
@@ -211,10 +212,16 @@ struct fixture {
        std::move(claim),
        [construction](std::unique_ptr<sirius::op::scan::scan_info> batch) {
          if (construction) construction->wait();
-         auto input = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+         using sirius::op::scan::scan_operator_input;
+         auto input =
+           std::make_unique<scan_operator_input>(std::move(batch),
+                                                 nullptr,
+                                                 0,
+                                                 std::nullopt,
+                                                 scan_operator_input::prefetch_start::deferred);
          return preparation_coordinator::publication{std::move(input), 0};
        },
-       [out](preparation_coordinator::publication p) {
+       [out](preparation_coordinator::publication& p) {
          auto& input = dynamic_cast<sirius::op::scan::scan_operator_input&>(*p.input);
          auto metadata =
            std::get<std::shared_ptr<sirius::op::scan::scan_info>>(input.materialization_info);
@@ -229,7 +236,12 @@ struct fixture {
          out->closed = true;
          out->cv.notify_all();
        },
-       [out](std::function<void()> consume) { out->consumed = std::move(consume); }});
+       [out](std::function<void()> consume) { out->consumed = std::move(consume); },
+       {},
+       [out](preparation_coordinator::publication& p) {
+         static_cast<sirius::op::scan::scan_operator_input&>(*p.input).initialize_prefetch();
+         ++out->preparations;
+       }});
   }
 };
 }  // namespace
@@ -343,6 +355,7 @@ TEST_CASE("A partial emission is not EOS and subsequent input forms another batc
   REQUIRE(out->await(2));
   REQUIRE(out->await_closed());
   CHECK(out->published == std::vector<int>{0, 1});
+  CHECK(out->preparations == 2);
 }
 TEST_CASE("Publication is refused after cancellation wins during input construction",
           "[scan_preparation][coordinator]")
@@ -369,6 +382,7 @@ TEST_CASE("Publication is refused after cancellation wins during input construct
   construction->release();
   f.finish();
   CHECK(out->count() == 0);
+  CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
 }
 TEST_CASE("Unresolved typed input forbids scan input construction until the whole unit is ready",
@@ -823,6 +837,15 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   auto out       = std::make_shared<sink>();
   auto coalescer = std::make_shared<accumulator>(1);
   bool claimed = false, fail_construct = false, fail_close = false, normal_close_failure = false;
+  bool fail_initialize = false, destroyed_outside_gate = false;
+  struct observed_input : sirius::op::scan::scan_operator_input {
+    using scan_operator_input::scan_operator_input;
+    std::function<void()> on_destroy;
+    ~observed_input() override
+    {
+      if (on_destroy) on_destroy();
+    }
+  };
   size_t publications        = 0;
   std::string expected_error = "push injected";
   SECTION("construction throws")
@@ -831,6 +854,11 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
     expected_error = "construct injected";
   }
   SECTION("visible queue push throws") {}
+  SECTION("prefetch initialization throws")
+  {
+    fail_initialize = true;
+    expected_error  = "prefetch initialization failed";
+  }
   SECTION("tail publication throws followed by a close failure")
   {
     fail_close          = true;
@@ -853,10 +881,30 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   };
   source.construct = [&](std::unique_ptr<sirius::op::scan::scan_info> batch) {
     if (fail_construct) throw std::runtime_error("construct injected");
-    return preparation_coordinator::publication{
-      std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch)), 0};
+    auto input = std::make_unique<observed_input>(
+      std::move(batch), nullptr, 0, std::nullopt, observed_input::prefetch_start::deferred);
+    input->on_destroy = [&, gate = f.coordinator.publication_gate()] {
+      // Probe from another thread so a cleanup-under-lock regression fails instead of hanging.
+      std::thread probe([&] {
+        auto deadline = std::chrono::steady_clock::now() + 100ms;
+        do {
+          std::unique_lock lock(gate->mutex, std::try_to_lock);
+          if (lock.owns_lock()) {
+            destroyed_outside_gate = true;
+            return;
+          }
+          std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < deadline);
+      });
+      probe.join();
+    };
+    return preparation_coordinator::publication{std::move(input), 0};
   };
-  source.publish = [&](preparation_coordinator::publication) {
+  source.prepare_publish = [&](preparation_coordinator::publication& p) {
+    static_cast<observed_input&>(*p.input).initialize_prefetch();
+    if (fail_initialize) throw std::runtime_error(expected_error);
+  };
+  source.publish = [&](preparation_coordinator::publication&) {
     ++publications;
     if (!normal_close_failure) throw std::runtime_error(expected_error);
   };
@@ -880,7 +928,8 @@ TEST_CASE("Construction and publication failures drain once and preserve the fir
   f.coordinator.drain();
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   CHECK(out->count() == 0);
-  CHECK(publications == (fail_construct ? 0 : 1));
+  CHECK(publications == (fail_construct || fail_initialize ? 0 : 1));
+  CHECK(destroyed_outside_gate == !fail_construct);
   CHECK(out->close_calls == 1);
 }
 
@@ -1134,7 +1183,7 @@ TEST_CASE(
     return preparation_coordinator::publication{
       std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch)), 0};
   };
-  source.publish = [out](preparation_coordinator::publication) {
+  source.publish = [out](preparation_coordinator::publication&) {
     std::lock_guard lock(out->mutex);
     out->published.push_back(1);
     out->cv.notify_all();
@@ -1219,6 +1268,7 @@ TEST_CASE("Observed interruption stops claims and publication while owned work d
   CHECK(out->count() == 0);
   CHECK(claims == 1);
   CHECK(reads == (interruption == point::submitting_work ? 0 : 1));
+  CHECK(out->preparations == 0);
   CHECK(f.coordinator.snapshot().phase == preparation_coordinator::lifecycle::quiescent);
   CHECK_THROWS_AS(f.coordinator.set_interrupt_check({}), std::logic_error);
 }

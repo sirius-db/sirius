@@ -109,7 +109,7 @@ struct scoped_sql_file_logs {
       "FROM duckdb_logs_parsed('FileSystem') WHERE starts_with(path, '" +
       prefix + "')");
     REQUIRE(result);
-    INFO(result->HasError() ? result->GetError() : "");
+    INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());
     return {result->GetValue(0, 0).GetValue<uint64_t>(),
             result->GetValue(1, 0).GetValue<uint64_t>(),
@@ -4082,7 +4082,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     auto sql_before = sql_logs.metadata_reads(table);
     auto result     = con->SendQuery(sql);
     REQUIRE(result);
-    INFO(result->HasError() ? result->GetError() : "");
+    INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());
     CHECK(observed.fetch(*result) == expected);
     REQUIRE(observed.routes.size() == 1);
@@ -4181,7 +4181,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     sirius::test::scoped_setting cpu(*con, "gpu_execution", false);
     reference = con->Query(sql);
     REQUIRE(reference);
-    INFO(reference->HasError() ? reference->GetError() : "");
+    INFO((reference->HasError() ? reference->GetError() : ""));
     REQUIRE_FALSE(reference->HasError());
   }
   auto expected = collect_rows(*reference);
@@ -4227,7 +4227,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     auto cpu_us     = thread_cpu() - cpu_begin;
     REQUIRE(getrusage(RUSAGE_SELF, &usage_end) == 0);
     REQUIRE(result);
-    INFO(result->HasError() ? result->GetError() : "");
+    INFO((result->HasError() ? result->GetError() : ""));
     REQUIRE_FALSE(result->HasError());
     REQUIRE(result->names == reference->names);
     REQUIRE(result->types == reference->types);

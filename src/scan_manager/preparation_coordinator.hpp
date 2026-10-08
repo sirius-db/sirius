@@ -38,11 +38,15 @@ class preparation_coordinator {
   struct source {
     std::shared_ptr<op::scan::batch_coalescer> coalescer;
     std::function<std::optional<job>()> claim;
+    // Construct without prefetch side effects. Failed inputs are destroyed outside the gate.
     std::function<publication(std::unique_ptr<op::scan::scan_info>)> construct;
-    std::function<void(publication)> publish;
+    // Keep input owned by the caller on failure so cleanup does not run under the gate.
+    std::function<void(publication&)> publish;
     std::function<void()> close;
     std::function<void(std::function<void()>)> bind_consumption;
     std::function<bool()> can_claim;
+    // Runs under the publication gate before publish; must not wait for I/O or reenter the gate.
+    std::function<void(publication&)> prepare_publish;
   };
   enum class lifecycle { constructed, armed, running, quiescent };
   struct statistics {

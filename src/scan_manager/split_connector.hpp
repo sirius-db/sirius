@@ -128,7 +128,8 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   ///        Reachable only via @ref split_provider::push_to_connector so all
   ///        producers route through the provider's friendship channel.
   void push_split(std::unique_ptr<op::operator_data> split);
-  void push_split_sized(std::unique_ptr<op::operator_data> split, size_t bytes);
+  /// On insertion failure, leave ownership with the caller for cleanup outside its publish lock.
+  void push_split_sized(std::unique_ptr<op::operator_data>&& split, size_t bytes);
   std::shared_ptr<std::function<void()> const> _on_consumption;
 
   mutable std::mutex _mutex;

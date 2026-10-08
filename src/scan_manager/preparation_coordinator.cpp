@@ -396,10 +396,11 @@ bool preparation_coordinator::state::publish_batch(lock_type& lock)
       std::lock_guard commit(gate->mutex);
       gate->check_interrupted();
       if (!gate->closed && !completion->has_error()) {
+        if (source.hooks.prepare_publish) source.hooks.prepare_publish(publication);
         auto first_publication = stats.first_publication;
         if (options.collect_timing && !first_publication)
           first_publication = std::chrono::steady_clock::now();
-        source.hooks.publish(std::move(publication));
+        source.hooks.publish(publication);
         stats.first_publication = first_publication;
         stats.publisher         = std::this_thread::get_id();
         ticket.published        = true;
